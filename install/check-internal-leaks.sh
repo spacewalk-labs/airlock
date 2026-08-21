@@ -48,7 +48,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # The separator is a class, not a hyphen: `swk:airlock-btn-pos-v1` was a
 # published localStorage key that the hyphen-only version of this pattern did
 # not see, so the prefix scan missed a name it existed to catch.
-PATTERN='spacewalk|sparrow-spectrum|\b[a-z0-9]+-(dev|mgmt)\b|TeamSPWK|swk[-:_.]|\bmacmini-[0-9]+\b|@spacewalk\.tech|doc\.spacewalk\.dev|\bairlock-work\b'
+PATTERN='spacewalk|sparrow-spectrum|\b[a-z0-9]+-(dev|mgmt)\b|TeamSPWK|swk[-:_.]|\bmacmini-[0-9]+\b|@spacewalk\.tech|doc\.spacewalk\.dev'
 
 # The allowlist holds two kinds of string, and they leave for different reasons.
 #
@@ -82,21 +82,30 @@ SELF='install/check-internal-leaks.sh'
 # SCOPE: this scan reads what LEAVES, not what exists.
 #
 # It used to read the whole tree, and that was a category error with two costs. It could
-# not be taught the private repository's own name — `airlock-work` appears legitimately
-# in the cutline catalog, in task documents, in worklogs — so the one internal name most
+# not be taught the private repository's own name, which appears legitimately in the
+# cutline catalog, in task documents and in worklogs — so the one internal name most
 # likely to end up published was the one name the scan could never learn. And it forced
 # redaction of records that never publish: preserving the public repository's only pull
 # request under docs/tasks/evidence/ failed on the hostname in its body, in a file the
 # mirror has never seen.
 #
-# Measured 2026-08-21, after the scan was still whole-tree: `spacewalk-labs/airlock-work`
-# was published in six files, twelve times, four of them the full org-qualified name. The
-# allowlist entry for the public org slug stripped `spacewalk-labs` and left `/airlock-work`,
-# which matched nothing. The scan was working exactly as told, over the wrong domain.
+# Measured 2026-08-21, while the scan was still whole-tree: that name was published in six
+# files, twelve times, four of them org-qualified. The allowlist entry for the public org
+# slug stripped the org and left a remainder that matched nothing. The scan was working
+# exactly as told, over the wrong domain.
 #
 # This is not the boundary gate in disguise. install/public-manifest.sh decides WHAT
 # leaves; this decides whether what leaves is CLEAN. They are a pipeline, and each still
 # fails closed on its own — an unclassified path stops the manifest before this ever runs.
+#
+# The private repository's own name is NOT in the pattern above, and the rescope is why it
+# could have been but must not be. Scoping made it expressible — it no longer collides
+# with the catalog and the task documents that hold it legitimately — and for a few hours
+# it was in there. Then the published tree was checked and the name was in it, four times,
+# inside this file. The header thirty lines up already said so: every name spelled out
+# here is published by the guard that exists to stop exactly that, and a name no shape can
+# express belongs in the publish-sync scan, which is never mirrored. It lives there now.
+# Scoping a scan does not change which side of the mirror the scan is on.
 MANIFEST="$ROOT/install/public-manifest.sh"
 
 # The upstream bundle we do not write. Its minified strings coin tokens like
