@@ -1,0 +1,1312 @@
+<!doctype html>
+<html lang="en" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Markwand</title>
+  <meta name="apple-mobile-web-app-title" content="Markwand">
+  <!-- Icons are generated from the launcher tile — bin/gen-app-icons.py, SoT hub/index.html.
+       Same-origin subpath app: /assets/ is the hub's, copied there by the installer.
+       These used to be the hub's own porthole marks, which said "Airlock" on a tab
+       that is Markwand's. -->
+  <link rel="icon" type="image/svg+xml" href="/assets/app-icons/markwand.svg">
+  <link rel="apple-touch-icon" href="/assets/app-icons/markwand.png">
+  <meta name="theme-color" content="#0f766e">
+  <link rel="stylesheet" href="/__mw/markwand-tokens.css">
+  <!-- highlight.js (self-hosted, common build) — the parent colours code, so the
+       code srcdoc keeps static markup and runs no scripts. -->
+  <script src="/__mw/highlight.min.js" defer></script>
+  <!-- marked + DOMPurify (self-hosted) — for rendering .ipynb markdown cells. The
+       parent parses/sanitizes, then injects static HTML. -->
+  <script src="/__mw/marked.min.js" defer></script>
+  <script src="/__mw/purify.min.js" defer></script>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100vh; overflow: hidden; max-width: none; }
+    body { display: flex; flex-direction: column; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: var(--fs-md); line-height: var(--lh-normal); }
+
+    /* ===== topbar ===== */
+    #ms-bar {
+      flex: 0 0 auto;
+      display: flex; align-items: center; gap: var(--sp-3);
+      padding: var(--sp-2) var(--sp-4);
+      padding-left: 60px;   /* reserve room for the corner return widget (top-left) */
+      background: var(--bg-elev);
+      background-image: var(--surface-wash);
+      border-bottom: 1px solid var(--border-muted);
+      font-size: var(--fs-sm);
+      color: var(--text-muted);
+      box-shadow: var(--shadow-sm);
+    }
+    #ms-bar .ms-brand {
+      font-weight: var(--fw-semibold); color: var(--accent);
+      font-family: var(--font-sans);
+      letter-spacing: 0.02em;
+    }
+    #ms-bar .ms-path {
+      flex: 1 1 auto;
+      font-family: var(--font-mono);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      cursor: pointer;
+      padding: 0 var(--sp-2);
+    }
+    #ms-bar .ms-mtime {
+      font-family: var(--font-mono);
+      font-size: var(--fs-xs);
+      color: var(--text-muted);
+      flex: 0 0 auto;
+      padding: 0 var(--sp-2);
+      opacity: 0.75;
+    }
+    #ms-bar .ms-mtime:empty { display: none; }
+    #ms-bar button, #ms-bar a.btn {
+      background: transparent; border: 1px solid var(--border); color: var(--text);
+      padding: 4px 10px;
+      border-radius: var(--r-pill);
+      cursor: pointer; font-size: var(--fs-sm);
+      text-decoration: none;
+      font-family: var(--font-sans);
+    }
+    #ms-bar button:hover, #ms-bar a.btn:hover { background: var(--bg-hover); }
+    #ms-bar button[disabled] { opacity: 0.35; cursor: not-allowed; }
+    #ms-bar button[aria-pressed="true"]:not([disabled]) { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
+    #ms-bar #ms-edit { font-weight: var(--fw-semibold); }
+    #ms-bar #ms-save { font-weight: var(--fw-semibold); background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
+    #ms-bar #ms-save[hidden] { display: none; }
+    #ms-bar #ms-save:hover:not([disabled]) { background: var(--accent-hover); border-color: var(--accent-hover); }
+    #ms-bar #ms-save.dirty::after { content: " ●"; color: var(--color-warning); }
+
+    /* path copy toast */
+    #ms-toast {
+      position: fixed; bottom: var(--sp-6); left: 50%; transform: translateX(-50%);
+      background: var(--bg-elev); color: var(--text);
+      border: 1px solid var(--border); border-radius: var(--r-pill);
+      padding: var(--sp-2) var(--sp-5);
+      font-size: var(--fs-sm); font-family: var(--font-sans);
+      box-shadow: var(--shadow-md);
+      opacity: 0; pointer-events: none;
+      transition: opacity var(--duration-normal) var(--ease-standard);
+      z-index: var(--z-toc);
+    }
+    #ms-toast.show { opacity: 1; }
+
+    /* ===== main split ===== */
+    main { flex: 1 1 auto; display: flex; min-height: 0; position: relative; }
+    #ms-tree {
+      flex: 0 0 320px;
+      overflow: auto;
+      background: var(--bg-elev);
+      border-right: 1px solid var(--border-muted);
+      padding: var(--sp-3) var(--sp-2);
+      font-size: var(--fs-sm);
+      transition: flex-basis var(--duration-normal) var(--ease-standard), padding var(--duration-normal) var(--ease-standard);
+    }
+    #ms-tree.collapsed {
+      flex: 0 0 36px !important;   /* wins over an inline flex-basis set by drag-resize */
+      padding: var(--sp-2) 0;
+      overflow: hidden;
+    }
+    #ms-tree.collapsed .ms-name,
+    #ms-tree.collapsed .ms-chev,
+    #ms-tree.collapsed .ms-children { display: none; }
+    #ms-tree.collapsed .ms-row { justify-content: center; }
+    /* sidebar drag-resize handle (touch-aware) */
+    #ms-resize {
+      flex: 0 0 5px;
+      cursor: col-resize;
+      background: transparent;
+      transition: background var(--duration-fast) var(--ease-standard);
+      touch-action: none;   /* stop the browser from hijacking scroll/gestures while dragging */
+    }
+    #ms-resize:hover, #ms-resize.dragging { background: var(--accent); }
+    #ms-viewer { flex: 1 1 auto; border: none; background: var(--bg); width: 100%; height: 100%; }
+
+    /* ===== tree node ===== */
+    .ms-node { user-select: none; }
+    .ms-row {
+      display: flex; align-items: center; gap: 6px;
+      padding: 5px 6px;
+      min-height: 28px; box-sizing: border-box;
+      border-radius: var(--r-sm);
+      cursor: pointer;
+      color: var(--text);
+      white-space: nowrap;
+    }
+    .ms-row:hover { background: var(--bg-hover); }
+    .ms-row.active { background: var(--badge-bg); color: var(--badge-text); font-weight: var(--fw-semibold); }
+    .ms-chev {
+      display: inline-block;
+      width: 12px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 10px;
+      transition: transform var(--duration-fast) var(--ease-standard);
+    }
+    .ms-chev.collapsed::before { content: "▸"; }
+    .ms-chev.expanded::before  { content: "▾"; }
+    .ms-chev.leaf { visibility: hidden; }
+    .ms-icon {
+      display: inline-block;
+      width: 14px; text-align: center;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .ms-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+    .ms-children {
+      margin-left: var(--sp-3);
+      border-left: 1px dashed var(--border-muted);
+      padding-left: 4px;
+    }
+    .ms-loading { color: var(--text-muted); font-style: italic; padding: 4px 12px; }
+    .ms-error { color: var(--color-danger); padding: 4px 12px; font-size: var(--fs-xs); }
+
+    @media (max-width: 800px) {
+      main { flex-direction: column; }
+      #ms-tree { flex: 0 0 35vh; border-right: none; border-bottom: 1px solid var(--border-muted); }
+      /* stacked layout = an easy-to-grab horizontal grip; drag vertically to resize */
+      #ms-resize {
+        flex: 0 0 14px; cursor: row-resize;
+        background: var(--bg-elev); border-bottom: 1px solid var(--border-muted);
+        display: flex; align-items: center; justify-content: center;
+      }
+      #ms-resize::after {
+        content: ""; width: 40px; height: 4px; border-radius: 2px;
+        background: var(--text-muted); opacity: 0.55;
+      }
+      #ms-resize.dragging { background: var(--accent); }
+      #ms-resize.dragging::after { background: var(--accent-contrast); opacity: 1; }
+      /* collapsing with the toggle fully hides the tree so the body goes full-screen */
+      #ms-tree.collapsed { flex: 0 0 0px !important; padding: 0; border-bottom: none; }
+      #ms-tree.collapsed + #ms-resize { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="ms-bar">
+    <button id="ms-tree-toggle" aria-label="Toggle sidebar tree" title="Toggle sidebar">≡</button>
+    <span class="ms-brand" title="Markwand">Markwand</span>
+    <span class="ms-path" id="ms-path" title="Click path to copy" aria-label="Current file path (click to copy)">—</span>
+    <span class="ms-mtime" id="ms-mtime" title="Last modified" aria-label="Document last modified"></span>
+    <button id="ms-copy" disabled aria-label="Copy file contents to clipboard" title="Copy contents">📋 Copy</button>
+    <button id="ms-download" disabled aria-label="Download current file" title="Download">⬇ Download</button>
+    <button id="ms-rawtoggle" hidden aria-label="Toggle structured / raw view" title="Tree/Table ↔ Raw">⧉ Raw</button>
+    <button id="ms-edit" disabled aria-label="Edit the current file in the right pane" aria-pressed="false">✏️ Edit</button>
+    <button id="ms-save" hidden aria-label="Save changes (Ctrl+S)">💾 Save</button>
+    <button data-theme-btn="system" aria-label="Follow system theme" title="System" aria-pressed="true">⊙</button>
+    <button data-theme-btn="light"  aria-label="Light theme"          title="Light"  aria-pressed="false">☀</button>
+    <button data-theme-btn="dark"   aria-label="Dark theme"           title="Dark"   aria-pressed="false">☾</button>
+    <a class="btn" id="ms-open" href="/markwand/" target="_blank" rel="noopener" aria-label="Open the viewer in a new tab" title="New tab">↗ open</a>
+  </div>
+  <main>
+    <div id="ms-tree">
+      <div class="ms-loading">Loading tree…</div>
+    </div>
+    <div id="ms-resize" aria-hidden="true"></div>
+    <iframe id="ms-viewer" title="viewer" src="about:blank"></iframe>
+  </main>
+  <div id="ms-toast" role="status" aria-live="polite">Copied!</div>
+
+  <script>
+  'use strict';
+  // ====================================================================
+  // markwand-split — vanilla indented tree + markserv viewer iframe.
+  // Multitype preview: image, PDF (browser-native, same-origin), audio/video,
+  // code (highlight.js), collapsible JSON tree, CSV/TSV table, Jupyter .ipynb.
+  // ====================================================================
+
+  // ---- THEME ----
+  var STORAGE_KEY = 'markwand-theme';
+  var theme = localStorage.getItem(STORAGE_KEY) || 'system';
+  document.documentElement.setAttribute('data-theme', theme);
+
+  function setTheme(next) {
+    theme = next;
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem(STORAGE_KEY, next); } catch (_) {}
+    document.querySelectorAll('#ms-bar [data-theme-btn]').forEach(function (b) {
+      b.setAttribute('aria-pressed', b.dataset.themeBtn === next ? 'true' : 'false');
+    });
+    // propagate the theme into the viewer iframe as well
+    try {
+      var viewerDoc = viewer.contentDocument;
+      if (viewerDoc && viewerDoc.documentElement) {
+        viewerDoc.documentElement.setAttribute('data-theme', next);
+      }
+    } catch (_) {}
+  }
+
+  // ---- ELEMENTS ----
+  var tree     = document.getElementById('ms-tree');
+  var viewer   = document.getElementById('ms-viewer');
+  var pathEl   = document.getElementById('ms-path');
+  var openLink = document.getElementById('ms-open');
+  var editBtn  = document.getElementById('ms-edit');
+  var saveBtn  = document.getElementById('ms-save');
+  var copyBtn  = document.getElementById('ms-copy');
+  var dlBtn    = document.getElementById('ms-download');
+  var rawToggleBtn = document.getElementById('ms-rawtoggle');
+  var mtimeEl  = document.getElementById('ms-mtime');
+  var resizeHandle = document.getElementById('ms-resize');
+  var toastEl  = document.getElementById('ms-toast');
+
+  // ---- STATE ----
+  var currentPath = '/';           // current viewer path
+  var currentMd   = null;          // last opened file path (for the Edit toggle)
+  var currentView = null;          // current file's descriptor.v (for the Raw toggle re-render)
+  var rawOverride = false;         // force a structured view (json/csv) to show as raw text
+  var inEditMode  = false;
+  var savedContent = null;         // last-saved content (for the dirty check)
+
+  // ---- TOAST ----
+  var toastTimer = null;
+  function showToast(msg) {
+    if (toastTimer) clearTimeout(toastTimer);
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, 1500);
+  }
+
+  // ---- SIDEBAR/TREE DRAG-RESIZE (touch + vertical/mobile axis aware) ----
+  var mainEl = document.querySelector('main');
+  var SIDEBAR_KEY = 'markwand-sidebar-width';   // desktop (horizontal): tree 'width' (px)
+  var TREEH_KEY   = 'markwand-tree-height';     // mobile (stacked): tree 'height' (px)
+  function isColumn() { return window.matchMedia('(max-width: 800px)').matches; }
+  // Apply the saved size for the current layout. If none, clear the inline value so
+  // the CSS default takes over (horizontal 320px / vertical 35vh).
+  function applyTreeSize() {
+    var v = parseInt(localStorage.getItem(isColumn() ? TREEH_KEY : SIDEBAR_KEY) || '0', 10);
+    var lo = isColumn() ? 80 : 200, hi = isColumn() ? 2000 : 800;
+    tree.style.flexBasis = (v >= lo && v <= hi) ? v + 'px' : '';
+  }
+  applyTreeSize();
+  window.addEventListener('resize', applyTreeSize);   // swap axis/saved value on rotation
+
+  var dragging = false;
+  function dragStart(ev) {
+    dragging = true; resizeHandle.classList.add('dragging');
+    document.body.style.cursor = isColumn() ? 'row-resize' : 'col-resize';
+    document.body.style.userSelect = 'none';
+    if (ev.cancelable) ev.preventDefault();
+  }
+  function dragTo(x, y) {
+    if (!dragging) return;
+    if (isColumn()) {
+      var top = mainEl.getBoundingClientRect().top;   // vertical: tree height = pointer y - main top
+      tree.style.flexBasis = Math.max(80, Math.min(window.innerHeight - 120, y - top)) + 'px';
+    } else {
+      tree.style.flexBasis = Math.max(200, Math.min(800, x)) + 'px';
+    }
+  }
+  function dragEnd() {
+    if (!dragging) return;
+    dragging = false; resizeHandle.classList.remove('dragging');
+    document.body.style.cursor = ''; document.body.style.userSelect = '';
+    var r = tree.getBoundingClientRect();
+    try { localStorage.setItem(isColumn() ? TREEH_KEY : SIDEBAR_KEY, String(Math.round(isColumn() ? r.height : r.width))); } catch (_) {}
+  }
+  resizeHandle.addEventListener('mousedown', dragStart);
+  document.addEventListener('mousemove', function (ev) { dragTo(ev.clientX, ev.clientY); });
+  document.addEventListener('mouseup', dragEnd);
+  resizeHandle.addEventListener('touchstart', dragStart, { passive: false });
+  document.addEventListener('touchmove', function (ev) {
+    if (!dragging) return;
+    var t = ev.touches[0]; if (!t) return;
+    if (ev.cancelable) ev.preventDefault();   // stop the page from scrolling while dragging
+    dragTo(t.clientX, t.clientY);
+  }, { passive: false });
+  document.addEventListener('touchend', dragEnd);
+  document.addEventListener('touchcancel', dragEnd);
+
+  // ---- JWT bootstrap (zero-login, filebrowser noauth) ----
+  var jwtCache = sessionStorage.getItem('markwand-jwt') || null;
+  function getJwt() {
+    if (jwtCache) return Promise.resolve(jwtCache);
+    return fetch('/markwand/edit/api/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}'
+    }).then(function (r) {
+      if (!r.ok) throw new Error('login ' + r.status);
+      return r.text();
+    }).then(function (jwt) {
+      jwtCache = jwt;
+      try { sessionStorage.setItem('markwand-jwt', jwt); } catch (_) {}
+      return jwt;
+    });
+  }
+
+  function fetchListing(dirPath) {
+    return getJwt().then(function (jwt) {
+      var url = '/markwand/edit/api/resources' + (dirPath === '/' ? '/' : dirPath);
+      if (!url.endsWith('/')) url += '/';
+      return fetch(url, { headers: { 'X-Auth': jwt } });
+    }).then(function (r) {
+      if (r.status === 401) {
+        // JWT expired — reissue and retry
+        jwtCache = null; sessionStorage.removeItem('markwand-jwt');
+        return fetchListing(dirPath);
+      }
+      if (!r.ok) throw new Error('resources ' + r.status + ' for ' + dirPath);
+      return r.json();
+    }).then(function (data) {
+      return data.items || [];
+    });
+  }
+
+  // ---- TREE RENDER ----
+  function extOf(name) {
+    var m = name.match(/\.([a-zA-Z0-9]+)$/);
+    return m ? m[1].toLowerCase() : '';
+  }
+  function fileIcon(name) {
+    var ext = extOf(name);
+    if (ext === 'md') return '📄';
+    if (ext === 'pdf') return '📕';
+    if (ext === 'ipynb') return '📓';
+    if (['png','jpg','jpeg','gif','webp','avif','bmp','ico','svg'].indexOf(ext) >= 0) return '🖼';
+    if (['mp4','webm','mov','m4v'].indexOf(ext) >= 0) return '🎬';
+    if (['mp3','wav','ogg','m4a','flac','aac'].indexOf(ext) >= 0) return '🎵';
+    if (['json','yaml','yml','toml','ini','cfg','conf','env'].indexOf(ext) >= 0) return '⚙';
+    if (['js','ts','jsx','tsx','py','sh','go','rs','java','c','cpp','h','css','html','xml','sql','tf'].indexOf(ext) >= 0) return '‹›';
+    if (['csv','tsv'].indexOf(ext) >= 0) return '📊';
+    if (['zip','tar','gz','tgz','bz2','xz','7z','rar'].indexOf(ext) >= 0) return '📦';
+    return '·';
+  }
+
+  function sortItems(items) {
+    return items.slice().sort(function (a, b) {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      // .md files next
+      var aMd = a.name.endsWith('.md'), bMd = b.name.endsWith('.md');
+      if (aMd !== bMd) return aMd ? -1 : 1;
+      return a.name.localeCompare(b.name, 'en');
+    });
+  }
+
+  /**
+   * Render one node (dir or file). Returns a DOM element.
+   */
+  function renderNode(item, depth) {
+    var node = document.createElement('div');
+    node.className = 'ms-node';
+    node.dataset.path = item.path;
+    node.dataset.isdir = item.isDir ? '1' : '0';
+
+    var row = document.createElement('div');
+    row.className = 'ms-row';
+
+    var chev = document.createElement('span');
+    chev.className = 'ms-chev ' + (item.isDir ? 'collapsed' : 'leaf');
+    row.appendChild(chev);
+
+    var icon = document.createElement('span');
+    icon.className = 'ms-icon';
+    icon.textContent = item.isDir ? '📁' : fileIcon(item.name);
+    row.appendChild(icon);
+
+    var name = document.createElement('span');
+    name.className = 'ms-name';
+    name.textContent = item.name;
+    row.appendChild(name);
+
+    node.appendChild(row);
+
+    row.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (item.isDir) {
+        toggleDir(node);
+      } else {
+        openFile(item.path);
+      }
+    });
+
+    return node;
+  }
+
+  function toggleDir(node) {
+    var existing = node.querySelector(':scope > .ms-children');
+    var chev = node.querySelector(':scope > .ms-row > .ms-chev');
+    if (existing) {
+      existing.remove();
+      chev.className = 'ms-chev collapsed';
+      return Promise.resolve();
+    }
+    chev.className = 'ms-chev expanded';
+    var children = document.createElement('div');
+    children.className = 'ms-children';
+    children.innerHTML = '<div class="ms-loading">…</div>';
+    node.appendChild(children);
+
+    return fetchListing(node.dataset.path).then(function (items) {
+      children.innerHTML = '';
+      var sorted = sortItems(items);
+      for (var i = 0; i < sorted.length; i++) {
+        children.appendChild(renderNode(sorted[i], 0));
+      }
+    }).catch(function (e) {
+      children.innerHTML = '<div class="ms-error">' + e.message + '</div>';
+    });
+  }
+
+  function highlightActive(path) {
+    document.querySelectorAll('#ms-tree .ms-row.active').forEach(function (r) {
+      r.classList.remove('active');
+    });
+    var node = document.querySelector('#ms-tree .ms-node[data-path="' + cssEscape(path) + '"]');
+    if (node) node.querySelector(':scope > .ms-row').classList.add('active');
+  }
+
+  function cssEscape(s) {
+    return s.replace(/(["\\])/g, '\\$1');
+  }
+
+  // ---- VIEWER / EDITOR swap ----
+  function escapeHTML(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
+    });
+  }
+  function langByExt(path) {
+    var m = path.match(/\.([a-zA-Z0-9]+)$/);
+    if (!m) return '';
+    var ext = m[1].toLowerCase();
+    return ({
+      json:'json', js:'javascript', ts:'typescript', py:'python', sh:'bash',
+      yaml:'yaml', yml:'yaml', toml:'toml', conf:'ini', cfg:'ini', ini:'ini',
+      env:'bash', gitignore:'bash', dockerignore:'bash',
+      html:'html', css:'css', md:'markdown', xml:'xml', sql:'sql', go:'go',
+      rs:'rust', java:'java', cpp:'cpp', c:'c', tf:'hcl'
+    })[ext] || '';
+  }
+  // ---- RENDERER REGISTRY (extension -> descriptor) ----
+  // transport: 'url'  = the browser requests markserv directly (nginx's Tailscale
+  //                     gate authenticates; Content-Type/Range/cache are automatic).
+  //                     No filebrowser JWT needed.
+  //            'text' = JS fetches the raw file via filebrowser and transforms it
+  //                     (the default fallback).
+  // view: how to render. Any extension not registered as a url flows through text and
+  //       hits the size/binary guards.
+  var VIEW_MAP = {
+    // images — <img> (svg included, scripts do not execute)
+    png:{t:'url',v:'img'}, jpg:{t:'url',v:'img'}, jpeg:{t:'url',v:'img'},
+    gif:{t:'url',v:'img'}, webp:{t:'url',v:'img'}, avif:{t:'url',v:'img'},
+    bmp:{t:'url',v:'img'}, ico:{t:'url',v:'img'}, svg:{t:'url',v:'img'},
+    // PDF — the browser's built-in viewer (same-origin document)
+    pdf:{t:'url',v:'pdf'},
+    // media — native elements (Range seek verified)
+    mp4:{t:'url',v:'video'}, webm:{t:'url',v:'video'}, mov:{t:'url',v:'video'}, m4v:{t:'url',v:'video'},
+    mp3:{t:'url',v:'audio'}, wav:{t:'url',v:'audio'}, ogg:{t:'url',v:'audio'},
+    m4a:{t:'url',v:'audio'}, flac:{t:'url',v:'audio'}, aac:{t:'url',v:'audio'},
+    // markdown — markserv-rendered page (same-origin, target of enhance.js injection)
+    md:{t:'url',v:'page'},
+    // structured text (text transport, parsed by the parent into a static srcdoc)
+    json:{t:'text',v:'json'}, csv:{t:'text',v:'csv'}, tsv:{t:'text',v:'csv'}, ipynb:{t:'text',v:'ipynb'}
+  };
+  function descriptorFor(path) {
+    var ext = extOf(path.split('/').pop());
+    return VIEW_MAP[ext] || { t:'text', v:'code' };  // fallback: text (binary/oversize guarded inside)
+  }
+  // Direct markserv URL — per-segment encoding + traversal block. nginx gates auth.
+  function markservUrl(path) {
+    var segs = path.split('/');
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i] === '..' || segs[i] === '.') throw new Error('unsafe path segment');
+      if (/[\x00-\x1f]/.test(segs[i])) throw new Error('control char in path');
+    }
+    return '/markwand' + segs.map(function (s) { return encodeURIComponent(s); }).join('/');
+  }
+
+  var TEXT_MAX_BYTES = 3 * 1024 * 1024;   // text-preview ceiling (over it, offer a download)
+  var HLJS_MAX_BYTES = 256 * 1024;        // above this, skip highlighting -> plain <pre> (avoids locking the parent thread)
+  var JSON_MAX_NODES = 10000, JSON_MAX_DEPTH = 100, JSON_OPEN_DEPTH = 2, JSON_STR_CLAMP = 2048, JSON_HTML_MAX = 4 * 1024 * 1024;
+  var CSV_MAX_ROWS = 2000, CSV_MAX_CELLS = 50000, CSV_MAX_COLS = 100, CSV_CELL_CLAMP = 2048;
+
+  // ---- SANDBOX POLICY ----
+  // Every srcdoc we generate (media/text/json/csv/notice) is isolated with
+  // sandbox="" — this blocks any access to the parent's sessionStorage (the
+  // filebrowser write JWT). No scripts are needed inside. Conversely the markserv
+  // .md render / the browser PDF viewer / the filebrowser editor need same-origin,
+  // so the sandbox is removed for them.
+  function sandboxViewer() { viewer.setAttribute('sandbox', ''); }
+  function unsandboxViewer() { viewer.removeAttribute('sandbox'); }
+  // Defense-in-depth CSP — even if our own escaping slips once, external resource
+  // loads and script execution are blocked.
+  function cspMeta(kind) {
+    var p;
+    if (kind === 'media') p = "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'";
+    else if (kind === 'ipynb') p = "default-src 'none'; img-src data:; style-src 'self' 'unsafe-inline'; font-src 'self'";  // output images = renderer-produced data URIs only
+    else p = "default-src 'none'; style-src 'self' 'unsafe-inline'; font-src 'self'";
+    return '<meta http-equiv="Content-Security-Policy" content="' + p + '">';
+  }
+  function stripBom(s) { return s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s; }
+  function commitSrcdoc(srcdoc) {
+    sandboxViewer();
+    if (viewer.hasAttribute('src')) viewer.removeAttribute('src');
+    viewer.srcdoc = srcdoc;
+  }
+  // The single source of truth for the srcdoc skeleton — doctype+theme+CSP(kind)+
+  // tokens CSS in one place. headExtra = additional <link> tags.
+  function docShell(cspKind, headExtra, styleCss, bodyHtml) {
+    return '<!doctype html><html data-theme="' + theme + '"><head><meta charset="utf-8">' + cspMeta(cspKind) +
+      '<link rel="stylesheet" href="/__mw/markwand-tokens.css">' + (headExtra || '') +
+      '<style>' + styleCss + '</style></head><body>' + bodyHtml + '</body></html>';
+  }
+
+  // shared srcdoc for notices/errors (sandbox + CSP)
+  function renderNoticeSrcdoc(inner) {
+    commitSrcdoc(docShell('text', '',
+      'html,body{margin:0;padding:0;max-width:none;}' +
+      'body{background:var(--bg);color:var(--text);font-family:var(--font-sans);}' +
+      '.notice{max-width:640px;margin:12vh auto;text-align:center;color:var(--text-muted);padding:0 var(--sp-6);}' +
+      '.notice h2{color:var(--text);font-size:var(--fs-lg);font-weight:var(--fw-semibold);}' +
+      '.notice code{background:var(--code-bg);padding:2px 8px;border-radius:var(--r-sm);color:var(--text);font-family:var(--font-mono);}',
+      '<div class="notice">' + inner + '</div>'));
+  }
+  function renderDownloadNotice(path, bytes, reason) {
+    var fname = escapeHTML(path.split('/').pop());
+    var sizeStr = bytes ? ' <code>' + (bytes / 1024 / 1024).toFixed(1) + ' MB</code>' : '';
+    renderNoticeSrcdoc('<h2>' + escapeHTML(reason) + '</h2>' +
+      '<p><code>' + fname + '</code>' + sizeStr + ' is not previewed.</p>' +
+      '<p>Use the <strong>⬇ Download</strong> button above to download it.</p>');
+  }
+  function renderErrorInViewer(msg) {
+    renderNoticeSrcdoc('<h2>Load failed</h2><p><code>' + escapeHTML(msg) + '</code></p>');
+  }
+
+  // ---- image / audio / video (direct markserv src, sandbox srcdoc + CSP) ----
+  function renderMediaInViewer(path, kind) {
+    var url = markservUrl(path);   // may throw -> caught by openFile
+    var fname = escapeHTML(path.split('/').pop());
+    var body;
+    if (kind === 'img') {
+      body = '<div class="media-wrap"><img src="' + url + '" alt="' + escapeHTML(path) + '"></div>';
+    } else if (kind === 'video') {
+      body = '<div class="media-wrap"><video src="' + url + '" controls playsinline></video></div>';
+    } else { // audio
+      body = '<div class="media-wrap audio"><audio src="' + url + '" controls></audio>' +
+             '<div class="fname">' + fname + '</div></div>';
+    }
+    commitSrcdoc(docShell('media', '',
+      'html,body{margin:0;padding:0;height:100%;max-width:none;}' +
+      'body{background:var(--bg);color:var(--text);}' +
+      '.media-wrap{height:100vh;display:flex;align-items:center;justify-content:center;padding:var(--sp-4);box-sizing:border-box;}' +
+      '.media-wrap img,.media-wrap video{max-width:100%;max-height:100%;object-fit:contain;border-radius:var(--r-md);box-shadow:var(--shadow-md);background:var(--bg-elev);}' +
+      '.media-wrap.audio{flex-direction:column;gap:var(--sp-4);}' +
+      '.media-wrap audio{width:min(560px,80vw);}' +
+      '.media-wrap .fname{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text-muted);}',
+      body));
+  }
+
+  // shared shell for text/structured views (bar + body). CSP(kind) + hljs theme link.
+  function viewerDoc(styleExtra, bodyHtml, cspKind) {
+    return docShell(cspKind || 'text', '<link rel="stylesheet" href="/__mw/hljs-theme.css">',
+      'html,body{margin:0;padding:0;max-width:none;}' +
+      'body{padding:var(--sp-6) var(--sp-8);background:var(--bg);color:var(--text);font-family:var(--font-sans);}' +
+      '.vbar{display:flex;align-items:center;gap:var(--sp-3);margin-bottom:var(--sp-4);padding-bottom:var(--sp-3);border-bottom:1px solid var(--border-muted);font-size:var(--fs-sm);color:var(--text-muted);}' +
+      '.vbar code{background:var(--code-bg);padding:2px 8px;border-radius:var(--r-sm);color:var(--text);}' +
+      '.vbar .warn{color:var(--color-warning);font-weight:var(--fw-semibold);}' +
+      styleExtra,
+      bodyHtml);
+  }
+  function vbar(path, badge, warn) {
+    return '<div class="vbar"><span>' + badge + '</span><code>' + escapeHTML(path) + '</code>' +
+      (warn ? '<span class="warn">⚠ ' + escapeHTML(warn) + '</span>' : '') +
+      '<span style="flex:1"></span>' +
+      '<span style="color:var(--text-muted)">Copy / Download in the top bar</span></div>';
+  }
+
+  // filebrowser raw fetch + guards (oversize/binary). Promise<string|null>.
+  // null = already handled (notice shown). maxBytes sets the per-type ceiling.
+  function fetchTextGuarded(path, maxBytes) {
+    var cap = maxBytes || TEXT_MAX_BYTES;
+    return getJwt().then(function (jwt) {
+      return fetch('/markwand/edit/api/raw' + path + '?algo=none', { headers: { 'X-Auth': jwt } });
+    }).then(function (r) {
+      if (path !== currentPath) return null;   // another file opened meanwhile -> stale, suppress render/notice/error
+      if (!r.ok) throw new Error('raw ' + r.status);
+      var len = parseInt(r.headers.get('content-length') || '0', 10);
+      if (len && len > cap) { renderDownloadNotice(path, len, 'File too large'); return null; }
+      return r.text();
+    }).then(function (text) {
+      if (text == null) return null;
+      if (path !== currentPath) return null;   // guard against a switch during r.text() await
+      // re-check against the actual length in case content-length was absent (close the guard hole)
+      if (text.length > cap) { renderDownloadNotice(path, text.length, 'File too large'); return null; }
+      // binary sniff: a NUL byte within the first 8KB -> not text (defends unregistered binary extensions)
+      if (text.slice(0, 8192).indexOf(String.fromCharCode(0)) !== -1) { renderDownloadNotice(path, null, 'Binary file'); return null; }
+      return text;
+    });
+  }
+
+  // text/code render — the parent colours with hljs (skipped when large) -> static
+  // srcdoc. banner shows the fallback reason.
+  function renderCodeText(path, text, langOverride, banner) {
+    var lang = langOverride || langByExt(path);
+    var body = text;
+    if (lang === 'json') {
+      try { body = JSON.stringify(JSON.parse(stripBom(text)), null, 2); } catch (_) { body = text; }
+    }
+    var H = window.hljs;
+    var codeHtml;
+    if (H && lang && H.getLanguage(lang) && body.length <= HLJS_MAX_BYTES) {
+      try { codeHtml = H.highlight(body, { language: lang, ignoreIllegals: true }).value; }
+      catch (_) { codeHtml = escapeHTML(body); }
+    } else {
+      codeHtml = escapeHTML(body);   // unknown language / hljs not loaded / oversize -> plain
+    }
+    var badge = '📎 raw' + (lang ? ' <span style="color:var(--text-muted)">(' + lang + ')</span>' : '');
+    var style = 'pre{background:var(--code-bg);color:var(--text);padding:var(--sp-4);border-radius:var(--r-md);overflow:auto;font-family:var(--font-mono);font-size:var(--fs-md);line-height:var(--lh-normal);margin:0;}' +
+      'pre code{background:transparent;padding:0;color:inherit;}';
+    commitSrcdoc(viewerDoc(style, vbar(path, badge, banner) + '<pre><code class="hljs language-' + lang + '">' + codeHtml + '</code></pre>'));
+  }
+  // Original entry point (fetch + code render). Path for code / unknown text.
+  function renderRawInViewer(path) {
+    return fetchTextGuarded(path).then(function (text) {
+      if (text == null) return;
+      renderCodeText(path, text, null, null);
+    }).catch(function (e) { renderErrorInViewer(e.message); });
+  }
+
+  // ---- JSON collapsible tree (native <details>, zero scripts) ----
+  // The parent JSON.parses, then recurses into static tree HTML. On a node/depth/
+  // HTML overflow it falls back to raw text (never a partial tree).
+  function jtNode(label, value, depth, budget) {
+    if (++budget.nodes > JSON_MAX_NODES) throw new Error('JSON_TOO_BIG');
+    if (depth > JSON_MAX_DEPTH) throw new Error('JSON_TOO_DEEP');
+    var lab = label != null ? '<span class="hljs-attr">"' + escapeHTML(label) + '"</span><span class="jt-pun">: </span>' : '';
+    var t = typeof value;
+    if (value === null) return '<div class="jt-row">' + lab + '<span class="hljs-keyword">null</span></div>';
+    if (t === 'number' || t === 'boolean') return '<div class="jt-row">' + lab + '<span class="hljs-number">' + escapeHTML(String(value)) + '</span></div>';
+    if (t === 'string') {
+      var s = value.length > JSON_STR_CLAMP ? value.slice(0, JSON_STR_CLAMP) + '…(' + value.length + ')' : value;
+      return '<div class="jt-row">' + lab + '<span class="hljs-string">"' + escapeHTML(s) + '"</span></div>';
+    }
+    var isArr = Array.isArray(value);
+    var keys = isArr ? null : Object.keys(value);
+    var count = isArr ? value.length : keys.length;
+    var brO = isArr ? '[' : '{', brC = isArr ? ']' : '}';
+    if (count === 0) return '<div class="jt-row">' + lab + '<span class="jt-pun">' + brO + brC + '</span></div>';
+    var openAttr = depth < JSON_OPEN_DEPTH ? ' open' : '';
+    var parts = ['<details class="jt-node"' + openAttr + '><summary>' + lab +
+      '<span class="jt-pun">' + brO + '</span> <span class="jt-count">' + count + '</span> <span class="jt-pun">' + brC + '</span></summary><div class="jt-body">'];
+    if (isArr) { for (var i = 0; i < count; i++) parts.push(jtNode(null, value[i], depth + 1, budget)); }
+    else { for (var j = 0; j < count; j++) parts.push(jtNode(keys[j], value[keys[j]], depth + 1, budget)); }
+    parts.push('</div></details>');
+    return parts.join('');
+  }
+  function renderJson(path) {
+    return fetchTextGuarded(path).then(function (text) {
+      if (text == null) return;
+      var clean = stripBom(text);
+      var parsed;
+      try { parsed = JSON.parse(clean); }
+      catch (_) { renderCodeText(path, clean, 'json', 'JSON parse failed — showing raw'); return; }  // partial JSON / JSONL
+      var treeHtml;
+      try {
+        treeHtml = jtNode(null, parsed, 0, { nodes: 0 });
+        if (treeHtml.length > JSON_HTML_MAX) throw new Error('JSON_TOO_BIG');
+      } catch (e) {
+        renderCodeText(path, clean, 'json', 'Tree disabled (too large) — showing raw');   // no partial tree: full raw
+        return;
+      }
+      var style = '.jt-body{margin-left:var(--sp-4);border-left:1px solid var(--border-muted);padding-left:var(--sp-3);}' +
+        '.jt-node,.jt-row{font-family:var(--font-mono);font-size:var(--fs-md);line-height:var(--lh-loose);}' +
+        '.jt-row{white-space:pre-wrap;word-break:break-word;}' +   /* preserve newlines inside string values */
+        '.jt-node>summary{cursor:pointer;list-style:none;}' +
+        '.jt-node>summary::-webkit-details-marker{display:none;}' +
+        '.jt-node>summary::before{content:"▸";display:inline-block;width:1em;color:var(--text-muted);}' +
+        '.jt-node[open]>summary::before{content:"▾";}' +
+        '.jt-pun{color:var(--syn-pun,var(--text-muted));}' +
+        '.jt-count{color:var(--text-muted);font-size:var(--fs-xs);}';
+      commitSrcdoc(viewerDoc(style, vbar(path, '🗂 json', null) + '<div class="jt-root">' + treeHtml + '</div>'));
+    }).catch(function (e) { renderErrorInViewer(e.message); });
+  }
+
+  // ---- CSV/TSV table ----
+  // Hand-written RFC 4180 state machine — handles quoted delimiters/newlines, ""
+  // escapes, CRLF/lone CR, and trailing empty fields. Parses the whole file to get
+  // the total row count, but only stores up to maxRows/maxCells. No dynamic typing
+  // (raw values preserved).
+  function parseDelimited(text, delim, maxRows, maxCells) {
+    var rows = [], row = [], field = '', inQ = false, total = 0, maxCols = 0, truncated = false, cells = 0;
+    var i = 0, n = text.length;
+    function endRow() {
+      row.push(field); field = '';
+      total++;
+      if (row.length > maxCols) maxCols = row.length;
+      if (rows.length < maxRows && cells + row.length <= maxCells) { rows.push(row); cells += row.length; }
+      else { truncated = true; }
+      row = [];
+    }
+    while (i < n) {
+      var c = text[i];
+      if (inQ) {
+        if (c === '"') { if (text[i + 1] === '"') { field += '"'; i += 2; continue; } inQ = false; i++; continue; }
+        field += c; i++; continue;
+      }
+      if (c === '"') {
+        if (field === '') { inQ = true; i++; continue; }   // a quote opens a quoted field only at the field start (RFC 4180)
+        field += '"'; i++; continue;                        // a mid-field quote is a literal (avoids swallowing delimiters)
+      }
+      if (c === delim) { row.push(field); field = ''; i++; continue; }
+      if (c === '\r') { if (text[i + 1] === '\n') i++; endRow(); i++; continue; }
+      if (c === '\n') { endRow(); i++; continue; }
+      field += c; i++;
+    }
+    if (field !== '' || row.length > 0) endRow();   // last row without a trailing newline
+    return { rows: rows, total: total, cols: maxCols, truncated: truncated };
+  }
+  function sniffDelim(text) {
+    var nl = text.indexOf('\n');
+    var first = nl < 0 ? text : text.slice(0, nl);
+    return (first.split(';').length > first.split(',').length) ? ';' : ',';
+  }
+  function renderCsv(path) {
+    return fetchTextGuarded(path).then(function (text) {
+      if (text == null) return;
+      var clean = stripBom(text);
+      var ext = extOf(path.split('/').pop());
+      var delim = ext === 'tsv' ? '\t' : sniffDelim(clean);
+      var res;
+      try { res = parseDelimited(clean, delim, CSV_MAX_ROWS, CSV_MAX_CELLS); }
+      catch (_) { renderCodeText(path, clean, null, 'CSV parse failed — showing raw'); return; }
+      if (res.rows.length === 0) { renderCodeText(path, clean, null, 'Empty table — showing raw'); return; }
+      if (res.cols > CSV_MAX_COLS) { renderCodeText(path, clean, null, 'Too many columns (' + res.cols + ') — showing raw'); return; }
+      function cell(c) {
+        var v = c.length > CSV_CELL_CLAMP ? c.slice(0, CSV_CELL_CLAMP) + '…' : c;
+        return escapeHTML(v);
+      }
+      var head = res.rows[0].map(function (c) { return '<th>' + cell(c) + '</th>'; }).join('');
+      var bodyRows = [];
+      for (var r = 1; r < res.rows.length; r++) {
+        bodyRows.push('<tr>' + res.rows[r].map(function (c) { return '<td>' + cell(c) + '</td>'; }).join('') + '</tr>');
+      }
+      var banner = res.truncated ? ('Showing ' + res.rows.length + ' of ' + res.total + ' rows — download for all') : null;
+      var style = '.tbl-wrap{overflow:auto;max-width:100%;border:1px solid var(--border-muted);border-radius:var(--r-md);}' +
+        'table{border-collapse:collapse;font-family:var(--font-mono);font-size:var(--fs-sm);white-space:pre;}' +
+        'th,td{padding:4px var(--sp-3);border-right:1px solid var(--border-muted);border-bottom:1px solid var(--border-muted);text-align:left;vertical-align:top;}' +
+        'thead th{position:sticky;top:0;background:var(--bg-elev);color:var(--text);font-weight:var(--fw-semibold);z-index:1;}' +
+        'tbody tr:nth-child(even){background:var(--code-bg);}';
+      var tableHtml = '<div class="tbl-wrap"><table><thead><tr>' + head + '</tr></thead><tbody>' + bodyRows.join('') + '</tbody></table></div>';
+      commitSrcdoc(viewerDoc(style, vbar(path, '📊 ' + ext, banner) + tableHtml));
+    }).catch(function (e) { renderErrorInViewer(e.message); });
+  }
+
+  // ---- Jupyter notebook (.ipynb) render (nbformat v4, parent-parsed -> static srcdoc, sandbox="" + CSP img-src data:) ----
+  var IPYNB_MAX_BYTES = 20 * 1024 * 1024;
+  var IPYNB_MAX_CELLS = 300, IPYNB_MAX_OUTPUTS = 20;
+  var IPYNB_TEXT_CLAMP = 64 * 1024, IPYNB_HTML_IN = 256 * 1024, IPYNB_HTML_OUT = 512 * 1024;
+  var IPYNB_IMG_MAX = 3 * 1024 * 1024, IPYNB_IMG_GLOBAL = 12 * 1024 * 1024, IPYNB_IMG_COUNT = 100;
+  var IPYNB_HTML_TOTAL = 16 * 1024 * 1024;
+
+  function joinSrc(s) { return Array.isArray(s) ? s.join('') : (s == null ? '' : String(s)); }
+  // Strip ANSI/OSC/control sequences (no colour conversion — Pike). ESC=27 is built
+  // via fromCharCode so no literal control char is typed into the source.
+  function stripAnsi(s) {
+    var ESC = String.fromCharCode(27), BEL = String.fromCharCode(7), CSI8 = String.fromCharCode(0x9b);
+    return s.replace(new RegExp('(?:' + ESC + '\\[|' + CSI8 + ')[0-9:;<=>?]*[ -/]*[@-~]', 'g'), '')  // CSI (7/8-bit) — full ECMA-48 parameter bytes (colon-form SGR included)
+            .replace(new RegExp(ESC + '\\][^' + BEL + ESC + ']*(' + BEL + '|' + ESC + '\\\\)?', 'g'), '')  // OSC … BEL/ST
+            .replace(new RegExp(ESC + '[ -/]*[0-~]', 'g'), '')  // nF escape sequences (charset select ESC(B etc.)
+            .replace(new RegExp(ESC, 'g'), '');                 // leftover ESC
+  }
+  function clampText(s, cap) { return s.length > cap ? s.slice(0, cap) + '\n…(' + s.length + ' chars, truncated)' : s; }
+  function preBlock(s, cls) { return '<pre class="nb-out ' + (cls || '') + '">' + escapeHTML(s) + '</pre>'; }
+
+  function hlCode(src, lang) {
+    var H = window.hljs;
+    if (H && lang && H.getLanguage(lang) && src.length <= HLJS_MAX_BYTES) {
+      try { return H.highlight(src, { language: lang, ignoreIllegals: true }).value; } catch (_) {}
+    }
+    return escapeHTML(src);
+  }
+  // Strict DOMPurify profile — img/meta/link/style/svg/… FORBID (blocks image-guard
+  // bypass). Returns null when DOMPurify is not loaded.
+  function sanitizeHtml(html) {
+    var DP = window.DOMPurify;
+    if (!DP) return null;
+    return DP.sanitize(html, {
+      USE_PROFILES: { html: true },
+      FORBID_TAGS: ['style', 'svg', 'math', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'video', 'audio', 'img', 'meta', 'link'],
+      FORBID_ATTR: ['style', 'srcset'],
+      ALLOW_DATA_ATTR: false
+    });
+  }
+  function renderMdCell(src) {
+    var M = window.marked;
+    if (M && window.DOMPurify) {
+      try {
+        var html = (typeof M.parse === 'function') ? M.parse(src) : M(src);
+        var safe = sanitizeHtml(html);
+        if (safe != null) return '<div class="nb-md">' + safe + '</div>';
+      } catch (_) {}
+    }
+    return preBlock(src, 'nb-mdsrc');   // marked/DOMPurify not loaded/failed -> source fallback
+  }
+  // One output: branch on output_type -> for data bundles, pick one representation
+  // by priority (png>jpeg>html>plain>json). Unknown MIME = a badge.
+  function renderOutput(out, budget) {
+    var ot = out.output_type;
+    if (ot === 'stream') return preBlock(clampText(stripAnsi(joinSrc(out.text)), IPYNB_TEXT_CLAMP), out.name === 'stderr' ? 'nb-stderr' : '');
+    if (ot === 'error') {
+      var tb = clampText(stripAnsi(joinSrc(out.traceback)), IPYNB_TEXT_CLAMP);
+      if (!tb) tb = (out.ename || '') + ': ' + (out.evalue || '');
+      return preBlock(tb, 'nb-error');
+    }
+    if (ot === 'execute_result' || ot === 'display_data') {
+      var data = out.data || {};
+      if (data['image/png'] || data['image/jpeg']) {
+        var mime = data['image/png'] ? 'image/png' : 'image/jpeg';
+        var b64 = joinSrc(data[mime]).replace(/\s+/g, '');
+        if (budget.imgCount >= IPYNB_IMG_COUNT || b64.length > IPYNB_IMG_MAX || budget.imgBytes + b64.length > IPYNB_IMG_GLOBAL) {
+          return '<div class="nb-badge">🖼 Image omitted (size/count limit)</div>';
+        }
+        budget.imgCount++; budget.imgBytes += b64.length;
+        return '<div class="nb-img"><img src="data:' + mime + ';base64,' + b64 + '" alt="output"></div>';
+      }
+      if (data['text/html']) {
+        var safe = sanitizeHtml(clampText(joinSrc(data['text/html']), IPYNB_HTML_IN));
+        if (safe == null) return '<div class="nb-badge">⚠ HTML output — sanitizer not loaded</div>';
+        return '<div class="nb-html">' + safe.slice(0, IPYNB_HTML_OUT) + '</div>';
+      }
+      if (data['text/plain']) return preBlock(clampText(joinSrc(data['text/plain']), IPYNB_TEXT_CLAMP), '');
+      if (data['application/json']) {
+        var j = joinSrc(data['application/json']);
+        try { j = JSON.stringify(JSON.parse(j), null, 2); } catch (_) {}
+        return preBlock(clampText(j, IPYNB_TEXT_CLAMP), '');
+      }
+      return '<div class="nb-badge">Unsupported MIME: ' + escapeHTML(Object.keys(data).join(', ')) + '</div>';
+    }
+    return '';   // unknown output_type
+  }
+  function nbStyle() {
+    return '.nb{max-width:960px;}' +
+      '.nb-cell{margin:0 0 var(--sp-4);border:1px solid var(--border-muted);border-radius:var(--r-md);overflow:hidden;}' +
+      '.nb-cell-md{padding:var(--sp-3) var(--sp-5);}' +
+      '.nb-md{line-height:var(--lh-normal);} .nb-md h1,.nb-md h2,.nb-md h3{margin:var(--sp-3) 0;} .nb-md code{background:var(--code-bg);padding:1px 5px;border-radius:var(--r-sm);}' +
+      '.nb-in{display:flex;gap:var(--sp-2);align-items:flex-start;background:var(--code-bg);}' +
+      '.nb-prompt{flex:0 0 auto;padding:var(--sp-3) var(--sp-2);color:var(--text-muted);font-family:var(--font-mono);font-size:var(--fs-xs);user-select:none;}' +
+      '.nb-src{flex:1 1 auto;margin:0;padding:var(--sp-3) var(--sp-4);overflow:auto;font-family:var(--font-mono);font-size:var(--fs-md);line-height:var(--lh-normal);}' +
+      '.nb-src code{background:transparent;} .nb-outputs{padding:var(--sp-2) var(--sp-4);border-top:1px solid var(--border-muted);}' +
+      '.nb-out{margin:var(--sp-2) 0;white-space:pre-wrap;font-family:var(--font-mono);font-size:var(--fs-sm);}' +
+      '.nb-stderr{color:var(--color-warning);} .nb-error{color:var(--color-danger);}' +
+      '.nb-img img{max-width:100%;height:auto;border-radius:var(--r-sm);background:#fff;} .nb-html{overflow:auto;}' +
+      '.nb-html table{border-collapse:collapse;} .nb-html th,.nb-html td{border:1px solid var(--border-muted);padding:2px 6px;}' +
+      '.nb-badge{display:inline-block;margin:var(--sp-2) 0;padding:2px 10px;border-radius:var(--r-pill);background:var(--code-bg);color:var(--text-muted);font-size:var(--fs-xs);}';
+  }
+  function renderIpynb(path) {
+    return fetchTextGuarded(path, IPYNB_MAX_BYTES).then(function (text) {
+      if (text == null) return;
+      var clean = stripBom(text), nb;
+      try { nb = JSON.parse(clean); }
+      catch (_) { renderCodeText(path, clean, 'json', 'ipynb parse failed — showing raw'); return; }
+      if (rawOverride) { renderCodeText(path, clean, 'json', null); return; }          // Raw toggle -> raw JSON
+      if (!nb || typeof nb !== 'object' || !Array.isArray(nb.cells)) { renderCodeText(path, clean, 'json', 'Not a cells structure — showing raw'); return; }
+      if ((nb.nbformat || 0) < 4) { renderCodeText(path, clean, 'json', 'nbformat v' + (nb.nbformat || '?') + ' unsupported (v4 only) — showing raw'); return; }
+      var lang = (nb.metadata && nb.metadata.kernelspec && nb.metadata.kernelspec.language) ||
+                 (nb.metadata && nb.metadata.language_info && nb.metadata.language_info.name) || 'python';
+      var budget = { imgCount: 0, imgBytes: 0 };
+      var cells = nb.cells, shown = Math.min(cells.length, IPYNB_MAX_CELLS), parts = [], htmlLen = 0;
+      for (var i = 0; i < shown; i++) {
+        var cell = cells[i], srcTxt = joinSrc(cell.source), sec;
+        if (cell.cell_type === 'markdown') {
+          sec = '<section class="nb-cell nb-cell-md">' + renderMdCell(srcTxt) + '</section>';
+        } else if (cell.cell_type === 'code') {
+          var ec = (cell.execution_count != null) ? cell.execution_count : ' ';
+          var outs = Array.isArray(cell.outputs) ? cell.outputs.slice(0, IPYNB_MAX_OUTPUTS) : [];
+          var outHtml = '';
+          for (var o = 0; o < outs.length; o++) outHtml += renderOutput(outs[o], budget);
+          if (Array.isArray(cell.outputs) && cell.outputs.length > IPYNB_MAX_OUTPUTS) {
+            outHtml += '<div class="nb-badge">' + (cell.outputs.length - IPYNB_MAX_OUTPUTS) + ' outputs omitted</div>';
+          }
+          sec = '<section class="nb-cell nb-cell-code">' +
+            '<div class="nb-in"><span class="nb-prompt">[' + escapeHTML(String(ec)) + ']:</span>' +
+            '<pre class="nb-src"><code class="hljs">' + hlCode(srcTxt, lang) + '</code></pre></div>' +
+            (outHtml ? '<div class="nb-outputs">' + outHtml + '</div>' : '') + '</section>';
+        } else {
+          sec = '<section class="nb-cell nb-cell-raw">' + preBlock(srcTxt, 'nb-mdsrc') + '</section>';
+        }
+        parts.push(sec);
+        htmlLen += sec.length;
+        if (htmlLen > IPYNB_HTML_TOTAL) { shown = i + 1; break; }   // total-HTML hard stop (running counter = O(n))
+      }
+      var banner = shown < cells.length ? ('Showing ' + shown + '/' + cells.length + ' cells — rest truncated') : null;
+      commitSrcdoc(viewerDoc(nbStyle(), vbar(path, '📓 ipynb (' + escapeHTML(lang) + ')', banner) + '<div class="nb">' + parts.join('') + '</div>', 'ipynb'));
+    }).catch(function (e) { renderErrorInViewer(e.message); });
+  }
+
+  // text-transport dispatch (honours the Raw toggle). When rawOverride, always code text.
+  function renderStructured(path, view) {
+    if (view === 'ipynb') return renderIpynb(path);   // rawOverride handled inside renderIpynb
+    if (!rawOverride && view === 'json') return renderJson(path);
+    if (!rawOverride && view === 'csv') return renderCsv(path);
+    return renderRawInViewer(path);
+  }
+
+  function openFile(path) {
+    currentPath = path;
+    currentMd = path;  // every file is editable (dotfiles like .env included)
+    var d = descriptorFor(path);
+    currentView = d.v;
+    rawOverride = false;
+    var structured = (d.t === 'text' && (d.v === 'json' || d.v === 'csv' || d.v === 'ipynb'));
+    rawToggleBtn.hidden = !structured;
+    rawToggleBtn.textContent = '⧉ Raw';
+    try {
+      if (d.t === 'url' && (d.v === 'page' || d.v === 'pdf')) {
+        // markserv .md render / browser PDF viewer — same-origin document, sandbox removed
+        unsandboxViewer();
+        if (viewer.hasAttribute('srcdoc')) viewer.removeAttribute('srcdoc');
+        viewer.src = markservUrl(path);
+      } else if (d.t === 'url') {
+        renderMediaInViewer(path, d.v);         // image/audio/video (sandbox srcdoc)
+      } else {
+        renderStructured(path, d.v);            // text/code/json/csv + guards (sandbox srcdoc)
+      }
+    } catch (e) {
+      renderErrorInViewer(e.message);
+    }
+    inEditMode = false;
+    savedContent = null;
+    updateBarPath(path, false);
+    updateMtime(path);
+    highlightActive(path);
+    history.replaceState(null, '', '?path=' + encodeURIComponent(path));
+  }
+
+  // Show the last-modified time (fb api/resources/<path> .modified).
+  function updateMtime(path) {
+    mtimeEl.textContent = '';
+    if (!path || path === '/') return;
+    getJwt().then(function (jwt) {
+      return fetch('/markwand/edit/api/resources' + path, { headers: { 'X-Auth': jwt } });
+    }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d || !d.modified) return;
+        var dt = new Date(d.modified);
+        if (isNaN(dt)) return;
+        var now = new Date();
+        var diffMs = now - dt;
+        var diffMin = Math.floor(diffMs / 60000);
+        var label;
+        if (diffMin < 1) label = 'just now';
+        else if (diffMin < 60) label = diffMin + 'm ago';
+        else if (diffMin < 60*24) label = Math.floor(diffMin/60) + 'h ago';
+        else if (diffMin < 60*24*7) label = Math.floor(diffMin/(60*24)) + 'd ago';
+        else label = dt.toISOString().slice(0,10);
+        mtimeEl.textContent = '✎ ' + label;
+        mtimeEl.title = 'Last modified: ' + dt.toLocaleString();
+      }).catch(function () {});
+  }
+  function openEditor(path) {
+    currentPath = path;
+    currentMd = path;
+    rawToggleBtn.hidden = true;   // hide the structured/raw toggle in edit mode
+    unsandboxViewer();   // the editor (ace) needs same-origin access — remove sandbox
+    if (viewer.hasAttribute('srcdoc')) viewer.removeAttribute('srcdoc');
+    viewer.src = '/markwand/edit/files' + path + '?edit=true';
+    inEditMode = true;
+    // entering the editor -> capture the current file's raw as savedContent (dirty baseline)
+    getJwt().then(function (jwt) {
+      return fetch('/markwand/edit/api/raw' + path + '?algo=none', {
+        headers: { 'X-Auth': jwt }
+      }).then(function (r) { return r.ok ? r.text() : ''; });
+    }).then(function (text) { if (path === currentPath) savedContent = text; });   // avoid a stale baseline if the file changed meanwhile
+    updateBarPath(path, true);
+    updateMtime(path);
+    highlightActive(path);
+    history.replaceState(null, '', '?path=' + encodeURIComponent(path));
+  }
+
+  // ---- EDITOR helpers (fb editor iframe — ace.edit access, same-origin) ----
+  function getEditorValue() {
+    try {
+      var win = viewer.contentWindow;
+      if (!win) return null;
+      // filebrowser uses the ace editor — the ace instance inside #editor
+      if (win.ace) {
+        var ed = win.ace.edit(win.document.querySelector('.ace_editor'));
+        return ed.getValue();
+      }
+      // fallback: textarea
+      var ta = win.document.querySelector('textarea');
+      return ta ? ta.value : null;
+    } catch (_) { return null; }
+  }
+  function isDirty() {
+    if (!inEditMode || savedContent == null) return false;
+    var cur = getEditorValue();
+    if (cur == null) return false;
+    return cur !== savedContent;
+  }
+  function triggerSave() {
+    if (!inEditMode) return Promise.resolve(false);
+    var cur = getEditorValue();
+    if (cur == null) {
+      showToast('Editor access failed — use the editor\'s own Ctrl/Cmd+S');
+      // fallback: dispatch filebrowser's own save shortcut
+      try {
+        var win = viewer.contentWindow;
+        var ev = new win.KeyboardEvent('keydown', { key: 's', ctrlKey: true, metaKey: true, bubbles: true });
+        win.document.dispatchEvent(ev);
+      } catch (_) {}
+      return Promise.resolve(false);
+    }
+    // PUT /api/resources/<path> with the raw value
+    return getJwt().then(function (jwt) {
+      return fetch('/markwand/edit/api/resources' + currentPath, {
+        method: 'PUT',
+        headers: { 'X-Auth': jwt, 'content-type': 'text/plain' },
+        body: cur
+      });
+    }).then(function (r) {
+      if (r.ok) {
+        savedContent = cur;
+        saveBtn.classList.remove('dirty');
+        showToast('Saved ✓');
+        return true;
+      }
+      showToast('Save failed: ' + r.status);
+      return false;
+    }).catch(function (e) {
+      showToast('Save error: ' + e.message);
+      return false;
+    });
+  }
+
+  // dirty polling (once a second while in edit mode)
+  setInterval(function () {
+    if (!inEditMode || !saveBtn) return;
+    if (isDirty()) saveBtn.classList.add('dirty');
+    else saveBtn.classList.remove('dirty');
+  }, 1000);
+  function updateBarPath(path, isEdit) {
+    pathEl.textContent = path || '/';
+    openLink.href = '/markwand' + (path || '/');
+    // a file (has an extension, or is a dotfile) is editable/copyable/downloadable
+    var isFile = !!path && (/[^/]\.[^/]+$/.test(path) || /\/\.[^/]+$/.test(path));
+    if (isFile) {
+      editBtn.disabled = false;
+      copyBtn.disabled = false;
+      dlBtn.disabled = false;
+      dlBtn.title = 'Download ' + path.split('/').pop();
+      copyBtn.title = 'Copy contents to clipboard';
+      if (isEdit) {
+        editBtn.textContent = '👁 View';
+        editBtn.setAttribute('aria-pressed', 'true');
+        editBtn.title = 'Back to the viewer (warns if there are unsaved changes)';
+        saveBtn.hidden = false;
+      } else {
+        editBtn.textContent = '✏️ Edit';
+        editBtn.setAttribute('aria-pressed', 'false');
+        editBtn.title = 'Edit in the right pane (inline editing)';
+        saveBtn.hidden = true;
+        saveBtn.classList.remove('dirty');
+      }
+    } else {
+      editBtn.disabled = true;
+      copyBtn.disabled = true;
+      dlBtn.disabled = true;
+      editBtn.textContent = '✏️ Edit';
+      editBtn.setAttribute('aria-pressed', 'false');
+      editBtn.title = 'Select a file to enable';
+      saveBtn.hidden = true;
+    }
+  }
+
+  // Copy / Download wiring (any file — .md/.json/.env/.gitignore, etc.)
+  function fetchCurrentRaw() {
+    if (!currentPath || currentPath === '/') return Promise.resolve(null);
+    return getJwt().then(function (jwt) {
+      return fetch('/markwand/edit/api/raw' + currentPath + '?algo=none', { headers: { 'X-Auth': jwt } });
+    }).then(function (r) { return r.ok ? r.text() : null; });
+  }
+  copyBtn.addEventListener('click', function () {
+    if (copyBtn.disabled) return;
+    fetchCurrentRaw().then(function (text) {
+      if (text == null) { showToast('Copy failed'); return; }
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text)
+          .then(function () { showToast('Copied content (' + text.length + ' chars)'); })
+          .catch(function () { showToast('Clipboard permission denied'); });
+      } else {
+        showToast('Clipboard API unavailable');
+      }
+    });
+  });
+  dlBtn.addEventListener('click', function () {
+    if (dlBtn.disabled || !currentPath) return;
+    // The JWT header is required, so fetch the blob and download it directly
+    // (binaries stay intact; .text() would corrupt images/PDFs).
+    getJwt().then(function (jwt) {
+      return fetch('/markwand/edit/api/raw' + currentPath + '?algo=none&inline=false', {
+        headers: { 'X-Auth': jwt }
+      });
+    }).then(function (r) {
+      if (!r.ok) throw new Error('download ' + r.status);
+      return r.blob();
+    }).then(function (blob) {
+      var fname = currentPath.split('/').pop() || 'file';
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      showToast('Downloading ' + fname);
+    }).catch(function (e) {
+      showToast('Download failed: ' + e.message);
+    });
+  });
+
+  // ---- topbar wiring ----
+  document.querySelectorAll('#ms-bar [data-theme-btn]').forEach(function (b) {
+    b.addEventListener('click', function () { setTheme(b.dataset.themeBtn); });
+  });
+  setTheme(theme);
+
+  pathEl.addEventListener('click', function () {
+    if (navigator.clipboard && pathEl.textContent) navigator.clipboard.writeText(pathEl.textContent.trim());
+    showToast('Copied: ' + pathEl.textContent.trim());
+  });
+
+  // tree fold toggle
+  var TREE_FOLD_KEY = 'markwand-tree-collapsed';
+  if (localStorage.getItem(TREE_FOLD_KEY) === '1') tree.classList.add('collapsed');
+  document.getElementById('ms-tree-toggle').addEventListener('click', function () {
+    tree.classList.toggle('collapsed');
+    var fold = tree.classList.contains('collapsed');
+    try { localStorage.setItem(TREE_FOLD_KEY, fold ? '1' : '0'); } catch (_) {}
+  });
+
+  editBtn.addEventListener('click', function () {
+    if (editBtn.disabled || !currentMd) return;
+    if (inEditMode) {
+      // back to View — confirm if dirty (unsaved guard)
+      if (isDirty()) {
+        if (!confirm('You have unsaved changes.\n\nOK = discard changes and return to the viewer\nCancel = keep editing')) {
+          return;
+        }
+      }
+      openFile(currentMd);
+    } else {
+      openEditor(currentMd);
+    }
+  });
+  saveBtn.addEventListener('click', function () { triggerSave(); });
+
+  // Ctrl+S parent capture -> triggerSave
+  document.addEventListener('keydown', function (ev) {
+    if ((ev.ctrlKey || ev.metaKey) && ev.key === 's') {
+      ev.preventDefault();
+      if (inEditMode) triggerSave();
+    }
+  });
+
+  // When the deferred vendors (hljs/marked/dompurify) finish loading, re-render the
+  // current text file if it opened before they were ready (deep-link early open —
+  // code colouring / ipynb md cells).
+  function reRenderIfStructured() {
+    if (!inEditMode && currentPath && currentPath !== '/' && descriptorFor(currentPath).t === 'text') {
+      renderStructured(currentPath, currentView);
+    }
+  }
+  ['/__mw/highlight.min.js', '/__mw/marked.min.js', '/__mw/purify.min.js'].forEach(function (s) {
+    var el = document.querySelector('script[src="' + s + '"]');
+    if (el) el.addEventListener('load', reRenderIfStructured);
+  });
+
+  // Raw toggle — structured view (json/csv) <-> raw. The parent swaps the srcdoc
+  // (the sandbox stays script-free).
+  rawToggleBtn.addEventListener('click', function () {
+    if (rawToggleBtn.hidden) return;
+    rawOverride = !rawOverride;
+    rawToggleBtn.textContent = rawOverride ? (currentView === 'csv' ? '⊞ Table' : '⊞ Tree') : '⧉ Raw';
+    renderStructured(currentPath, currentView);
+  });
+
+  // ---- tree bootstrap ----
+  function bootstrapTree() {
+    tree.innerHTML = '';
+    return fetchListing('/').then(function (items) {
+      var sorted = sortItems(items);
+      for (var i = 0; i < sorted.length; i++) {
+        tree.appendChild(renderNode(sorted[i], 0));
+      }
+    }).catch(function (e) {
+      tree.innerHTML = '<div class="ms-error">tree load failed: ' + e.message + '</div>';
+    });
+  }
+
+  // ---- deep link path expand ----
+  function expandPathChain(targetPath) {
+    // /a/b/c.md -> ['/a', '/a/b'] (directories only)
+    var parts = targetPath.split('/').filter(Boolean);
+    if (parts.length <= 1) return Promise.resolve();   // root file
+    var chain = [];
+    for (var i = 0; i < parts.length - 1; i++) {
+      chain.push('/' + parts.slice(0, i + 1).join('/'));
+    }
+    var p = Promise.resolve();
+    chain.forEach(function (dirPath) {
+      p = p.then(function () {
+        var node = document.querySelector('#ms-tree .ms-node[data-path="' + cssEscape(dirPath) + '"]');
+        if (!node) return;
+        var hasChildren = node.querySelector(':scope > .ms-children');
+        if (!hasChildren) return toggleDir(node);
+      });
+    });
+    return p;
+  }
+
+  // ---- viewer iframe path polling (sync markserv link clicks) ----
+  var lastViewerPath = null;
+  setInterval(function () {
+    try {
+      var u = viewer.contentWindow.location.pathname;
+      if (u && u !== lastViewerPath) {
+        lastViewerPath = u;
+        var mView = u.match(/^\/markwand(.*)$/);
+        var mEdit = u.match(/^\/markwand\/edit\/files(.*)$/);
+        var p = (mEdit && mEdit[1]) || (mView && mView[1]) || '';
+        if (p && p !== currentPath) {
+          currentPath = p;
+          if (p.endsWith('.md')) currentMd = p;
+          updateBarPath(p, !!mEdit);
+          highlightActive(p);
+          history.replaceState(null, '', '?path=' + encodeURIComponent(p));
+        }
+        // propagate theme
+        try {
+          var doc = viewer.contentDocument;
+          if (doc && doc.documentElement) doc.documentElement.setAttribute('data-theme', theme);
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }, 500);
+
+  // ---- start ----
+  bootstrapTree().then(function () {
+    var qs   = new URLSearchParams(location.search);
+    var DEEP = qs.get('path');
+    if (DEEP) {
+      return expandPathChain(DEEP).then(function () {
+        // a file (has an extension — .md/.json/.gitignore, etc.) or a directory both
+        // go through openFile (the branch is inside)
+        var looksLikeFile = /[^/]\.[^/]+$/.test(DEEP) || /\/\.[^/]+$/.test(DEEP);
+        if (looksLikeFile) openFile(DEEP);
+        else {
+          updateBarPath(DEEP, false);
+          highlightActive(DEEP);
+        }
+      });
+    } else {
+      // default = root, with an empty-viewer placeholder
+      sandboxViewer();
+      viewer.srcdoc = '<!doctype html><html data-theme="' + theme + '"><meta charset="utf-8"><link rel="stylesheet" href="/__mw/markwand-tokens.css"><body style="background:var(--bg);height:100vh;margin:0;display:flex;align-items:center;justify-content:center;max-width:none;padding:0"><pre style="font-family:\'SF Mono\',\'Menlo\',\'Monaco\',\'Consolas\',\'Courier New\',monospace,monospace;line-height:1.25;color:var(--accent);font-size:14px;white-space:pre;text-align:center;tab-size:1;margin:0;">.   *   .   *\n*   .   .   *\n\n^\n/|\\\n/_M_\\\n|   |\n| W |\n| E |\n|_V_|\n/|||\\\n/=====\\\n^\n\nready for liftoff\nM A R K W A N D\n\n.   *   .   *</pre></body></html>';
+    }
+  });
+  </script>
+  <!-- Shared "return to Airlock" widget (corner mode). Served at /airlock-return.js
+       by the hub gate; it also polls the unread-message badge. Hidden inside iframes. -->
+  <script src="/airlock-return.js" data-mode="corner" defer></script>
+</body>
+</html>

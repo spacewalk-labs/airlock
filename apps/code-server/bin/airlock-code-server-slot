@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Launch one code-server slot. Invoked by the templated systemd unit
+# (airlock-code-server@N.service) as: airlock-code-server-slot N
+#
+# Slot N binds 127.0.0.1:<base + N>, where base = AIRLOCK_CS_BACKEND_BASE
+# (= backend_port - 1, so slot 1 lands on backend_port). Keeping the port math
+# here — not in the unit file — avoids systemd/shell arithmetic on the %i
+# specifier and keeps a single, config-driven source of truth for the port.
+#
+# --auth none is safe ONLY because the sole external path is the identity gate
+# and this binds loopback (see SECURITY.md). Each slot has its own user-data-dir
+# (isolated workbench state) and a shared extensions-dir (install once, use in all).
+set -euo pipefail
+
+slot="${1:?slot number required}"
+case "$slot" in
+  ''|*[!0-9]*) echo "[FATAL] slot must be a positive integer: $slot" >&2; exit 1 ;;
+esac
+base="${AIRLOCK_CS_BACKEND_BASE:?AIRLOCK_CS_BACKEND_BASE not set}"
+port=$(( base + slot ))
+
+share="$HOME/.local/share/airlock-code-server"
+exec "$HOME/.local/bin/code-server" \
+  --bind-addr "127.0.0.1:${port}" \
+  --user-data-dir "${share}/slots/${slot}" \
+  --extensions-dir "${share}/extensions" \
+  --auth none --disable-telemetry --disable-update-check

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# airlock-smoke — run every enabled app's smoke against the LIVE install.
+# Each apps/<app>/smoke.sh verifies its gate (owner=200/302, denied=403,
+# missing-header=403) and backend. Exit non-zero if any app fails.
+#
+#   bash bin/airlock-smoke
+#
+# Exit status:
+#   0  every gate passed AND the serve frontend was checked
+#   3  every gate passed BUT the serve frontend could not be checked from here
+#      (this box cannot resolve its own tailnet name — MagicDNS off, some
+#      container runtimes). Coverage genuinely varies by environment, so a
+#      caller that treats "smoke passed" as "ingress verified" is wrong on
+#      some boxes and, before this code existed, had no way to know which.
+#   1  something failed (an app gate, the serve frontend, or both)
+# 3 is deliberately not 0. A caller that only asks `!= 0` now stops on a skip
+# instead of recording unverified ingress as verified, which is the whole point;
+# a caller that knows the difference can accept 3 explicitly. Say which you mean.
+#
+# Run this after `install/airlock-install.sh` (the gate must be live). It is the
+# same check the orchestrator runs at the end of a deploy, callable on demand.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=/dev/null
+. "$ROOT/install/lib.sh"
+
+require_cmd python3 curl
+airlock_pin_state_dir
+airlock_config validate >/dev/null
+
+# Packaged apps resolve from their [packages.*] dir under the D5 ABI, exactly
+# as the orchestrator's smoke loop does. Standalone smoke mutates nothing, so
+# it takes no ledger lock. AIRLOCK_CONFIG is pinned so an app script's own
+# airlock_config calls resolve the same config from the package cwd.
+AIRLOCK_PKG_INFO="$(airlock_config package-info)"
+export AIRLOCK_PKG_INFO
+AIRLOCK_CONFIG="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print(json.load(sys.stdin)["config_path"])')"
+export AIRLOCK_CONFIG
+
+fail=0 ran=0
+# Child 4/P3: validate already refused any enabled app that is neither hub
+# nor a resolvable package (shipped or explicit) — pkg_dir is unconditionally
+# non-empty here, so the legacy "no smoke for '$app' (skipping)" fallback
+# (a bare apps/$app/smoke.sh with no package) is retired.
+while read -r app; do
+  [ "$app" = hub ] && continue
+  pkg_dir="$(airlock_pkg_dir "$app")"
+  s="$pkg_dir/smoke.sh"
+  # F6: validate proved this was a regular non-symlink file for every
+  # manifest package. Absence now is a validate-then-delete race, and a
+  # symlink would run content the D6 digest never covered — both FAIL,
+  # never skip.
+  if [ ! -f "$s" ] || [ -L "$s" ]; then
+    log "FAILED '$app': smoke.sh is missing or not a regular non-symlink file (F6)"
+    fail=1; continue
+  fi
+  ran=$((ran + 1))
+  if (cd "$pkg_dir" && AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$pkg_dir" AIRLOCK_APP_ID="$app" bash "$s"); then :
+  else log "smoke FAILED: $app"; fail=1; fi
+done < <(airlock_config apps)
+
+if [ "$ran" -eq 0 ]; then
+  log "no app smokes ran (only hub enabled?)"
+fi
+# Everything above is loopback. Check the layer in front of it (serve mapping, TLS, a
+# live target) — and then say plainly that reachability from another device was NOT
+# established, because nothing runnable here can establish it. See install/lib.sh.
+serve_rc=0; airlock_serve_check || serve_rc=$?
+case "$serve_rc" in
+  0) serve_note="and the serve frontend answered" ;;
+  2) serve_note="but the serve frontend was NOT checked (see the skip reason above)" ;;
+  *) fail=1; serve_note="" ;;
+esac
+
+if [ "$fail" = 0 ]; then
+  log "all $ran app smoke(s) passed, $serve_note"
+  airlock_ingress_unverified
+  # The human output above is unchanged and stays the primary signal. This is the
+  # same fact in the one channel a script can read: passing with the ingress
+  # unchecked is not the same run as passing with it checked.
+  # Written as if/exit rather than `[ ... ] && exit 3`, which under `set -uo
+  # pipefail` (no -e) would make a *false* test the script's last command and exit 1.
+  if [ "$serve_rc" = 2 ]; then exit 3; fi
+  exit 0
+else
+  airlock_ingress_unverified
+  die "smoke failed — an app gate, the serve frontend, or both (see above)"
+fi

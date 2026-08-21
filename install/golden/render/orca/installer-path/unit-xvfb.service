@@ -1,0 +1,26 @@
+[Unit]
+Description=airlock-orca-xvfb — dedicated virtual display (:59) for Orca ADE
+# NOT After=default.target: this unit is WantedBy=default.target below, and a
+# unit both Wanted by a target and ordered After that same target is a
+# guaranteed ordering cycle (the target gets an implicit After= on everything
+# it Wants — systemd.unit(5) "Default Dependencies"). Same anti-pattern
+# measured and fixed in apps/paseo/render.sh — see that comment for the exact
+# boot-log signature. network.target matches every other non-dependent app
+# unit in this repo and carries no such back-edge.
+After=network.target
+
+[Service]
+Type=simple
+# Clear a stale lock/socket for our own display (:59) before Xvfb recreates it.
+ExecStartPre=-/bin/sh -c 'rm -f /tmp/.X59-lock /tmp/.X11-unix/X59'
+# -extension GLX: on boxes with NVIDIA userspace EGL/GBM libs, Xvfb SIGSEGVs while
+#   loading libEGL_nvidia during GLX init (no real GPU in a container). orca renders
+#   with LIBGL_ALWAYS_SOFTWARE so it never needs server GLX -> disabling it is safe.
+ExecStart=/usr/bin/Xvfb :59 -screen 0 1280x1024x24 -nolisten tcp -extension GLX
+# active != socket-ready -> poll for the socket (up to ~10s) so orca's After holds.
+ExecStartPost=/bin/sh -c 'for _ in $(seq 1 100); do [ -S /tmp/.X11-unix/X59 ] && exit 0; sleep 0.1; done; exit 1'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

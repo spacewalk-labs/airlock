@@ -1,0 +1,10 @@
+import{g as h}from"./diff-comment-compat-gCGQ-XhG.js";const l=8,f=60;function m(e){return[...e].sort((t,r)=>{const i=t.filePath.localeCompare(r.filePath);if(i!==0)return i;const n=t.startLine??t.lineNumber,o=r.startLine??r.lineNumber;return n!==o?n-o:t.lineNumber!==r.lineNumber?t.lineNumber-r.lineNumber:t.createdAt-r.createdAt})}function d(e,t){const r=Math.max(1,t.startLine??t.lineNumber),i=Math.max(r,t.lineNumber),n=w(e,r,i);return n.count===0?"":(n.count<=l?n.lines:[...n.headLines,"...",...n.tailLines]).map(a=>`> ${a}`).join(`
+`)}function w(e,t,r){const i=Math.ceil(l/2),n=Math.floor(l/2),o=[],a=[];let u=0;return g(e,(c,s)=>{if(!(s<t))return s>r?!1:(u+=1,u<=l?(o.push(c),s>=r?!1:void 0):u===l+1?(a.push(...o.slice(-(n-1)),c),s>=r?!1:void 0):(a.push(c),a.length>n&&a.shift(),s>=r?!1:void 0))}),{count:u,lines:o,headLines:o.slice(0,i),tailLines:a}}function g(e,t){let r=0,i=1;for(let n=0;n<=e.length;n+=1){if(n<e.length&&e.charCodeAt(n)!==10)continue;const o=n>r&&e.charCodeAt(n-1)===13?n-1:n;if(t(e.slice(r,o),i)===!1)return;r=n+1,i+=1}}function p(e,t){const r=t.selectedText?.trim();return r||d(e,t).replace(/^> ?/gm,"").trim()}function M(e){if(e!=null)return v(e)}function v(e){let t="",r=!1;for(let i=0;i<e.length;i+=1){const n=e.charCodeAt(i);if(R(n)){r=t.length>0;continue}if(r&&(t+=" ",r=!1),t+=e.charAt(i),t.length>f)return`${t.slice(0,f-3).trimEnd()}...`}return t.length>0?t:void 0}function R(e){return e===32||e>=9&&e<=13||e===160||e===5760||e>=8192&&e<=8202||e===8232||e===8233||e===8239||e===8287||e===12288||e===65279}function N(e,t){return M(p(e,t))}function k(e){return e.replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/\r/g,"\\r").replace(/\n/g,"\\n")}function L(e,t){const r=e.selectedText?x(p(t,e)):d(t,e);return[h(e),r?`Excerpt:
+${r}`:null,`User comment: "${k(e.body)}"`].filter(n=>n!==null).join(`
+`)}function x(e){return`> ${e.replace(/\r\n|\r|\n/g,`
+> `)}`}function A(e,t){const r=new Map;for(const i of m(e)){const n=r.get(i.filePath);n?n.push(i):r.set(i.filePath,[i])}return[...r.entries()].map(([i,n])=>[`File: ${i}`,"Source: markdown","",n.map(o=>L(o,t)).join(`
+
+`)].join(`
+`)).join(`
+
+`)}export{M as a,A as f,N as g,m as s};

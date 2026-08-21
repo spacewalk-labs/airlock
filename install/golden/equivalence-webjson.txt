@@ -1,0 +1,44 @@
+{
+  "apps": {
+    "devterm": {
+      "audience": "owner",
+      "packaged": true,
+      "port": 8443,
+      "source_class": "shipped",
+      "tile": {
+        "cat": "coding",
+        "glyph": "app-devterm",
+        "label": "DevTerm",
+        "sub": "web shell"
+      }
+    },
+    "hub": {
+      "port": 443
+    },
+    "notepad": {
+      "packaged": true,
+      "source_class": "shipped",
+      "tile": {
+        "cat": "docs",
+        "glyph": "app-notepad",
+        "label": "Clip Bridge",
+        "path": "/notepad/",
+        "sub": "clipboard"
+      }
+    },
+    "publish": {
+      "packaged": true,
+      "source_class": "shipped",
+      "tile": {
+        "cat": "docs",
+        "glyph": "app-publish",
+        "label": "Publish",
+        "path": "/publish/",
+        "sub": "static publish"
+      }
+    }
+  },
+  "fqdn": "box.example.ts.net",
+  "product": "Airlock",
+  "site": "Equivalence"
+}

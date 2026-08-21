@@ -1,0 +1,69 @@
+--- a/model-manifest.js
++++ b/model-manifest.js
+@@ -12,6 +12,7 @@
+ export const CLAUDE_DISABLED_THINKING_OPTION_ID = "off";
+ export const CLAUDE_ULTRACODE_THINKING_OPTION_ID = "ultracode";
+ export const CLAUDE_MODEL_MANIFEST = [
++    // [airlock-model-prune] removed 6 superseded models (picker only — execution does not consult the manifest).
+     {
+         id: "claude-opus-5",
+         label: "Opus 5",
+@@ -74,58 +75,6 @@
+         supportsThinkingDisabled: true,
+     },
+     {
+-        id: "claude-opus-4-7[1m]",
+-        label: "Opus 4.7 1M",
+-        description: "Opus 4.7 with 1M context window",
+-        contextWindowMaxTokens: 1000000,
+-        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
+-        supportsThinkingDisabled: true,
+-        supportsFastMode: true,
+-    },
+-    {
+-        id: "claude-opus-4-7",
+-        label: "Opus 4.7",
+-        description: "Opus 4.7 · Previous release",
+-        contextWindowMaxTokens: 200000,
+-        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
+-        supportsThinkingDisabled: true,
+-        supportsFastMode: true,
+-    },
+-    {
+-        id: "claude-opus-4-6[1m]",
+-        label: "Opus 4.6 1M",
+-        description: "Opus 4.6 with 1M context window",
+-        contextWindowMaxTokens: 1000000,
+-        effortLevels: CLAUDE_EFFORT_LEVELS.standard,
+-        supportsThinkingDisabled: true,
+-        supportsFastMode: true,
+-    },
+-    {
+-        id: "claude-opus-4-6",
+-        label: "Opus 4.6",
+-        description: "Opus 4.6 · Most capable for complex work",
+-        contextWindowMaxTokens: 200000,
+-        effortLevels: CLAUDE_EFFORT_LEVELS.standard,
+-        supportsThinkingDisabled: true,
+-        supportsFastMode: true,
+-    },
+-    {
+-        id: "claude-sonnet-4-6[1m]",
+-        label: "Sonnet 4.6 1M",
+-        description: "Sonnet 4.6 with 1M context window",
+-        contextWindowMaxTokens: 1000000,
+-        effortLevels: CLAUDE_EFFORT_LEVELS.standard,
+-        supportsThinkingDisabled: true,
+-    },
+-    {
+-        id: "claude-sonnet-4-6",
+-        label: "Sonnet 4.6",
+-        description: "Sonnet 4.6 · Best for everyday tasks",
+-        contextWindowMaxTokens: 200000,
+-        effortLevels: CLAUDE_EFFORT_LEVELS.standard,
+-        supportsThinkingDisabled: true,
+-    },
+-    {
+         id: "claude-haiku-4-5",
+         label: "Haiku 4.5",
+         description: "Haiku 4.5 · Fastest for quick answers",

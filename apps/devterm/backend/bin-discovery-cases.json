@@ -1,0 +1,196 @@
+{
+  "schema": "bin-discovery-cases/v1",
+  "purpose": "Canonical contract for locating user-installed CLIs (codex, claude, paseo) from non-interactive contexts. Vendored verbatim into every repo that implements the lookup; each repo's test asserts this file's sha256 so a one-sided edit turns the other repos red.",
+  "candidate_order": [
+    {"id": "env_override", "kind": "env", "spec": "<CMD>_BIN", "note": "explicit operator override; if set it is the only candidate"},
+    {"id": "path", "kind": "which", "note": "operator put it on PATH -> operator intent"},
+    {"id": "local_bin", "kind": "dir", "spec": "~/.local/bin", "note": "canonical shim dir; Ubuntu default .profile puts it on PATH"},
+    {"id": "npm_global", "kind": "dir", "spec": "~/.npm-global/bin"},
+    {"id": "fnm_alias", "kind": "glob", "spec": "~/.local/share/fnm/aliases/*/bin", "note": "version-independent alias; survives node upgrades"},
+    {"id": "fnm_versions", "kind": "glob", "spec": "~/.local/share/fnm/node-versions/*/installation/bin", "sort": "semver_desc"},
+    {"id": "nvm_versions", "kind": "glob", "spec": "~/.nvm/versions/node/*/bin", "sort": "semver_desc", "note": "this manager has no stable alias path; a version bump makes the old dir vanish"},
+    {"id": "volta", "kind": "dir", "spec": "~/.volta/bin"},
+    {"id": "mise", "kind": "dir", "spec": "~/.local/share/mise/shims"},
+    {"id": "asdf", "kind": "dir", "spec": "~/.asdf/shims"},
+    {"id": "bun", "kind": "dir", "spec": "~/.bun/bin"},
+    {"id": "pnpm", "kind": "dir", "spec": "~/.local/share/pnpm"},
+    {"id": "claude_versions", "kind": "glob_exe", "spec": "~/.local/share/claude/versions/*", "sort": "semver_desc", "only_for": ["claude"], "note": "the glob matches the executable itself, not a bin dir. Final real file when the .local/bin symlink is dangling"},
+    {"id": "system_local", "kind": "dir", "spec": "/usr/local/bin"},
+    {"id": "system_usr", "kind": "dir", "spec": "/usr/bin"},
+    {"id": "snap", "kind": "dir", "spec": "/snap/bin"},
+    {"id": "extra_dirs", "kind": "env_pathlist", "spec": "<CMD>_EXTRA_BIN_DIRS", "note": "operator-supplied, colon separated. LAST on purpose: a misconfigured entry must not shadow every standard path. Subject to the same trust checks."}
+  ],
+  "trust_rules": {
+    "resolve": "follow symlinks to the real file (realpath)",
+    "must_be": ["existing file", "executable by the caller"],
+    "reject_if": [
+      "the real file, or its directory, is world-writable",
+      "the real file, or its directory, is group-writable by a group the caller is not in (a group of one's own is normal: npm creates its prefix dirs 0775)",
+      "the real file is owned by neither the calling uid nor root"
+    ],
+    "on_reject": "drop the candidate and record the reason; never fail silently, never fall through to a path string"
+  },
+  "not_found_contract": {
+    "return": null,
+    "message_must_contain": ["the command name", "the effective PATH", "the number of candidate locations searched"],
+    "message_must_not_be": "a single internal path presented as if it were the cause"
+  },
+  "cases": [
+    {
+      "id": "npm-global-only",
+      "why": "npm prefix install, the common shape",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/.npm-global/bin/codex": "exe"},
+      "expect": "~/.npm-global/bin/codex"
+    },
+    {
+      "id": "local-bin-only",
+      "why": "a shim in the canonical dir pointing into a private node distribution",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/private-node/bin/codex": "exe", "~/.local/bin/codex": "symlink:~/private-node/bin/codex"},
+      "expect": "~/.local/bin/codex"
+    },
+    {
+      "id": "fnm-alias-only",
+      "why": "the outage shape: nothing on PATH, no shim, install lives only under a node version manager",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/.local/share/fnm/node-versions/v24.15.0/installation/bin/codex": "exe", "~/.local/share/fnm/aliases/default/bin": "symlink:~/.local/share/fnm/node-versions/v24.15.0/installation/bin"},
+      "expect": "~/.local/share/fnm/aliases/default/bin/codex"
+    },
+    {
+      "id": "nvm-only",
+      "why": "nvm without any alias",
+      "cmd": "claude",
+      "path_dirs": [],
+      "tree": {"~/.nvm/versions/node/v22.23.1/bin/claude": "exe"},
+      "expect": "~/.nvm/versions/node/v22.23.1/bin/claude"
+    },
+    {
+      "id": "nvm-picks-newest",
+      "why": "glob order is not version order",
+      "cmd": "claude",
+      "path_dirs": [],
+      "tree": {"~/.nvm/versions/node/v22.9.0/bin/claude": "exe", "~/.nvm/versions/node/v22.23.1/bin/claude": "exe"},
+      "expect": "~/.nvm/versions/node/v22.23.1/bin/claude"
+    },
+    {
+      "id": "fnm-alias-beats-version-dir",
+      "why": "the alias is the stable path; prefer it even when a version dir also matches",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/.local/share/fnm/node-versions/v24.15.0/installation/bin/codex": "exe", "~/.local/share/fnm/aliases/default/bin": "symlink:~/.local/share/fnm/node-versions/v24.15.0/installation/bin", "~/.local/share/fnm/node-versions/v20.1.0/installation/bin/codex": "exe"},
+      "expect": "~/.local/share/fnm/aliases/default/bin/codex"
+    },
+    {
+      "id": "path-wins-over-candidates",
+      "why": "an operator-set PATH is operator intent, even when another candidate exists",
+      "cmd": "codex",
+      "path_dirs": ["~/opt/bin"],
+      "tree": {"~/opt/bin/codex": "exe", "~/.npm-global/bin/codex": "exe"},
+      "expect": "~/opt/bin/codex"
+    },
+    {
+      "id": "env-override-wins",
+      "why": "explicit override is the only unconditional winner",
+      "cmd": "codex",
+      "env": {"CODEX_BIN": "~/custom/codex"},
+      "path_dirs": ["~/opt/bin"],
+      "tree": {"~/custom/codex": "exe", "~/opt/bin/codex": "exe", "~/.npm-global/bin/codex": "exe"},
+      "expect": "~/custom/codex"
+    },
+    {
+      "id": "env-override-missing-fails",
+      "why": "an override that points at nothing must fail loudly, not silently fall back",
+      "cmd": "codex",
+      "env": {"CODEX_BIN": "~/custom/codex"},
+      "tree": {"~/.npm-global/bin/codex": "exe"},
+      "expect": null
+    },
+    {
+      "id": "dangling-symlink-rejected",
+      "why": "the shim survives but its target is gone after a node upgrade",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/.local/bin/codex": "symlink:~/gone/codex", "~/.npm-global/bin/codex": "exe"},
+      "expect": "~/.npm-global/bin/codex"
+    },
+    {
+      "id": "non-executable-rejected",
+      "why": "present but not +x is not a usable candidate",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/.local/bin/codex": "file", "~/.npm-global/bin/codex": "exe"},
+      "expect": "~/.npm-global/bin/codex"
+    },
+    {
+      "id": "world-writable-rejected",
+      "why": "trust boundary: anyone could have put that file there",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/.local/bin/codex": "exe:0777", "~/.npm-global/bin/codex": "exe"},
+      "expect": "~/.npm-global/bin/codex"
+    },
+    {
+      "id": "world-writable-dir-rejected",
+      "why": "a safe file in an unsafe directory can be swapped",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/loose/": "dir:0777", "~/loose/codex": "exe", "~/.npm-global/bin/codex": "exe"},
+      "extra_dirs": ["~/loose"],
+      "expect": "~/.npm-global/bin/codex"
+    },
+    {
+      "id": "group-writable-own-group-accepted",
+      "why": "npm creates its prefix dirs 0775, so a healthy install really is drwxrwxr-x. Rejecting that would break every healthy box",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/.npm-global/bin/": "dir:0775", "~/.npm-global/bin/codex": "exe"},
+      "expect": "~/.npm-global/bin/codex"
+    },
+    {
+      "id": "extra-dirs-last",
+      "why": "an operator extra dir must not shadow the standard locations",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/extra/codex": "exe", "~/.npm-global/bin/codex": "exe"},
+      "extra_dirs": ["~/extra"],
+      "expect": "~/.npm-global/bin/codex"
+    },
+    {
+      "id": "extra-dirs-used-when-nothing-else",
+      "why": "the extension point still has to work",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/extra/codex": "exe"},
+      "extra_dirs": ["~/extra"],
+      "expect": "~/extra/codex"
+    },
+    {
+      "id": "nothing-anywhere",
+      "why": "the failure mode this contract exists for: return null, never a path string",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {},
+      "expect": null
+    },
+    {
+      "id": "claude-versions-fallback",
+      "why": "claude-only candidate: the .local/bin symlink is dangling",
+      "cmd": "claude",
+      "path_dirs": [],
+      "tree": {"~/.local/bin/claude": "symlink:~/gone/claude", "~/.local/share/claude/versions/2.1.226": "exe"},
+      "expect": "~/.local/share/claude/versions/2.1.226"
+    },
+    {
+      "id": "claude-versions-not-for-codex",
+      "why": "only_for must be honoured",
+      "cmd": "codex",
+      "path_dirs": [],
+      "tree": {"~/.local/share/claude/versions/2.1.226": "exe"},
+      "expect": null
+    }
+  ]
+}

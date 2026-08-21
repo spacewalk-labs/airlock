@@ -1,0 +1,78 @@
+/* popup.css — the account/switch popup surface, shared by two pages.
+ *
+ * Why a file and not index.html's <style>: panel.html shows the very same account list
+ * (the Airlock return widget opens it in an iframe), and a second copy of these rules is
+ * how the panel and the popup slowly stop looking alike. index.html loads this after its
+ * own <style>, so nothing about the terminal layout moved.
+ *
+ * `.acct-panel` is the panel flavour: fills its container instead of floating.
+ */
+.tab-pop { position: fixed; z-index: 30; background: #202431; border: 1px solid #3a4254;
+           border-radius: 8px; padding: 8px; box-shadow: 0 16px 44px rgba(0,0,0,.42);
+           font: 12.5px system-ui; color: #dde1e8; width: 224px; max-height: 66vh; overflow-y: auto; }
+.tab-pop button { display: block; width: 100%; text-align: left; height: 30px; padding: 0 10px;
+                  border: 0; background: transparent; color: #dde1e8; border-radius: 6px; font: 12.5px system-ui;
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-pop button:hover, .tab-pop button:active { background: #333a49; }
+.tab-pop button.danger { color: #e06a5a; }
+.tab-pop button.danger:hover { background: #4a2a28; }
+.tab-pop .swatches { display: grid; grid-template-columns: repeat(4, 28px); gap: 8px 10px; padding: 8px 8px 6px; }
+.tab-pop .swatches span { width: 24px; height: 24px; border-radius: 6px; cursor: pointer;
+                          box-shadow: inset 0 0 0 1px rgba(255,255,255,.18), 0 0 0 1px rgba(0,0,0,.35); }
+.tab-pop .swatches span.sel { outline: 2px solid #e8edf8; outline-offset: 2px; }
+.tab-pop .sep { height: 1px; background: #333a49; margin: 5px 2px; }
+.tab-pop .hd { font-size: 11px; color: #8a92a6; padding: 3px 8px; }
+/* ---- account-switch popup (wide 2-column: account | 5h/7d usage) ---- */
+.tab-pop.acct { width: 320px; }
+.tab-pop.acct button.acctrow { display: flex; align-items: center; justify-content: space-between;
+                  gap: 10px; height: auto; min-height: 40px; padding: 6px 10px; white-space: normal; }
+.tab-pop.acct .acct-l { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
+.tab-pop.acct .acct-l .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* subtitle never wraps — a two-line wrap would overlap the usage column. Full text is in the hover tip. */
+.tab-pop.acct .acct-l .pl { font-size: 10.5px; color: #8a92a6; white-space: nowrap;
+                  overflow: hidden; text-overflow: ellipsis; }
+/* dead account (needs re-login) — kept with its reason. Clicking it re-logins, not switches. */
+.tab-pop.acct button.acctrow.dead .nm { color: #8a92a6; text-decoration: line-through; }
+.tab-pop.acct button.acctrow.dead .pl { color: #e6b34d; }
+.tab-pop.acct .acct-r { flex: 0 0 auto; text-align: right; font-size: 11px; line-height: 1.3; white-space: pre; font-variant-numeric: tabular-nums; }
+/* remove (x) only on non-active rows, but the gutter is on every row so the usage
+   column stays aligned (active rows indent by the x width too). */
+.tab-pop.acct button.acctrow { position: relative; }
+.tab-pop.acct .acct-r { margin-right: 20px; }
+.tab-pop.acct .acct-x { position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+                  width: 16px; height: 22px; line-height: 22px; text-align: center; border-radius: 5px;
+                  font-size: 11px; color: #6b7385; }
+.tab-pop.acct .acct-x:hover, .tab-pop.acct .acct-x:active { background: #4a2a28; color: #e06a5a; }
+.tab-pop.acct button.addacct { color: #7bd88f; font-weight: 600; }
+.tab-pop.acct .acct-link { display: block; margin: 2px 8px 4px; padding: 8px 10px; border-radius: 6px;
+                  background: #223a5e; border: 1px solid #3a5f9a; color: #9ec7ff; font: 600 12.5px system-ui;
+                  text-align: center; text-decoration: none; }
+.tab-pop.acct .acct-link:hover { background: #2a4a76; }
+.tab-pop.acct .addform { display: flex; gap: 6px; padding: 6px 8px 2px; }
+.tab-pop.acct .addform input { flex: 1; min-width: 0; background: #161a24; border: 1px solid #3a4254;
+                  color: #dde1e8; border-radius: 6px; padding: 6px 8px; font: 12px system-ui; }
+.tab-pop.acct .addform button { flex: 0 0 auto; width: auto; height: auto; padding: 6px 12px;
+                  background: #2f6fed; color: #fff; font-weight: 600; }
+/* ---- Codex (ChatGPT) section — single account: status + re-login + logout ---- */
+.tab-pop.acct .codex-box { padding: 4px 10px 8px; }
+.tab-pop.acct .codex-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.tab-pop.acct .codex-row .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-pop.acct .codex-row .pl { font-size: 10.5px; color: #8a92a6; flex: 0 0 auto; }
+.tab-pop.acct .codex-btns { display: flex; gap: 6px; margin-top: 7px; }
+.tab-pop.acct .codex-btn { flex: 0 0 auto; width: auto; height: auto; padding: 5px 11px; font-size: 12px; border-radius: 6px; }
+.tab-pop.acct .codex-btn.danger { color: #e06a5a; }
+.tab-pop.acct .codex-guide { font-size: 11.5px; color: #c3c9d4; line-height: 1.4; }
+.tab-pop.acct .cg-step { margin-top: 7px; }
+.tab-pop.acct .cg-cmd { display: block; margin-top: 3px; padding: 6px 8px; background: #11141b;
+                  border: 1px solid #3a4254; border-radius: 5px; font: 11px monospace; color: #9ec7ff;
+                  cursor: pointer; word-break: break-all; }
+/* account hover tip — reset times as two lines (5h / 7d). Next to the cursor, grey, slightly larger.
+   (native title has ~1s delay + tiny text) */
+.acct-tip { position: fixed; z-index: 40; background: #252a38; border: 1px solid #3a4254;
+            border-radius: 6px; padding: 6px 10px; box-shadow: 0 8px 20px rgba(0,0,0,.45);
+            pointer-events: none; font: 13.5px/1.5 system-ui; color: #aeb4c0;
+            white-space: pre; font-variant-numeric: tabular-nums; }
+
+/* panel flavour — no floating and no fixed width: fill the container we were given. */
+.tab-pop.acct.acct-panel { position: static; z-index: auto; width: auto; max-width: 100%;
+                           box-shadow: none; border: none; background: transparent; }

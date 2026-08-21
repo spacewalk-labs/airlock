@@ -1,0 +1,23 @@
+# gitleaks findings this project has judged and rejected, by fingerprint.
+#
+# Why a file and not a --no-verify: a bypass is a decision that leaves no record and
+# has to be re-made, by whoever is holding the keyboard, under time pressure, at the
+# one moment they least want to think about it. On 2026-08-21 the release of the
+# public tree hit these three and the choice was exactly that — bypass once, or write
+# down the judgement once. Each entry below names what the string actually is.
+#
+# Fingerprint = <path>:<rule>:<line>. Line numbers move, so an entry that stops
+# matching is not silently forgiving something new — it starts failing, and that is
+# the correct behaviour: re-judge it.
+
+# The literal example nonce from RFC 6455 §1.3 — base64("the sample nonce"). It is the
+# value the spec itself prints, used here to open a websocket in a smoke test. There is
+# nothing behind it to steal.
+apps/code-server/smoke.sh:generic-api-key:45
+
+# Claude Code's OAuth client ID. A public client's client_id is public by construction —
+# it ships inside every copy of the distributed client and identifies the application,
+# not the user; the secret in that flow is the PKCE verifier, which is generated per
+# exchange and never stored. Both scripts refresh a token the user already holds.
+apps/devterm/bin/claude-switch:generic-api-key:45
+apps/devterm/bin/claude-status:generic-api-key:41

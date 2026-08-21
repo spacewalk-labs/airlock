@@ -1,0 +1,135 @@
+contract = 1
+id = "dev-monitor"
+
+# Transcribed from the former APP_DEFAULTS["dev-monitor"] entry.
+[config]
+# Measured by the installer from the box's own FQDN (install.sh:64-83). Declaring
+# it as config would create a knob that does nothing, because the installer
+# overwrites whatever it was set to.
+runtime_env = [
+  "AIRLOCK_DEV_MONITOR_CORS_HOSTS",
+  "AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT",
+  "AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE",
+]
+
+[config.defaults]
+backend_port = 18804
+messages = false
+# Canonical per-lane webhook indirection. Values are environment-variable names,
+# never webhook URLs. The legacy slack_webhook_env remains an urgent-only alias
+# until 2026-09-07.
+slack_webhook_urgent_env = ""
+slack_webhook_routine_env = ""
+slack_webhook_env = ""
+exec_cwd_root = ""
+exec_session = "devmon-exec"
+# Untrusted spool producers run under this system identity. The installer resolves the
+# name to the box-assigned UID when loading nftables; no numeric UID is portable or safe
+# to pin in configuration.
+spool_writer_user = "airlock-dev-monitor-writer"
+spool_writer_group = "airlock-dev-monitor-writers"
+# Email, the second path for `page` (D3_EMAIL, 2026-08-08). Empty is a supported state and
+# not a broken one: with no host, sender or recipient the lane is off, the settings screen
+# says so, and `page` still reaches Slack and the console. Measured 2026-08-18 — the
+# Workspace SMTP relay refuses this box's address until an operator registers it, so "off"
+# is the state most boxes start in and it has to be a legible one.
+smtp_host = ""
+# 587, not "", because the config layer requires every *_port key to be a real port and
+# it is right to: a port is not this lane's on/off switch. host, from and to are.
+# 587 is the submission port for both transports an operator can open here — an
+# IP-registered relay and an authenticated account (measured 2026-08-18).
+smtp_port = 587
+smtp_from = ""
+smtp_to = ""
+smtp_user = ""
+# The name of an environment variable holding the password, never the password. Same
+# indirection as slack_webhook_urgent_env, for the same reason: a config file is read by
+# everything that renders it, and a secret in one is a secret in all of them.
+smtp_password_env = ""
+# The company roster snapshot (P4, docs/tasks/active/dev-monitor-roster.md), read from disk
+# at delivery time — a path, not a credential, so no indirection like the SMTP password
+# above. Empty is a supported state ("no roster on this box"), not a broken one, so this
+# does NOT join devmon_owner.py's _REQUIRED tuple: a fifth all-or-nothing key would take
+# every box without a roster file and turn the whole message feature off on its next
+# install. The recommended value is ~/.local/state/roster/roster.json, outside this app's
+# own state directory on purpose — it already has a consumer that is not this app.
+roster_path = ""
+# Optional migration bridge for producers and watchdogs that still read one legacy
+# EnvironmentFile. The path is deployment-specific and therefore belongs in config, never
+# in this public package. Empty means the installer does not own a compatibility file; to
+# retire an existing bridge, first keep this path while installing messages=false, then clear
+# the key only after that install removes the generated file.
+compat_env_path = ""
+# Credential freshness. Off by default: the check reads files under the operator's home
+# that belong to other tools, so looking at them at all is an opt-in. On, the dashboard
+# grows a card and /api/tokens answers; the periodic half is a separate explicit act
+# (apps/dev-monitor/install-token-timer.sh), because a standing timer is not something a
+# config default should switch on.
+token_freshness = false
+# Claude: warn once the refresh-token deadline is this close.
+token_freshness_warn_hours = 24
+# Codex: warn once tokens.last_refresh is this old. There is no expiry field to read, so
+# age is the only evidence the session is still alive.
+token_freshness_stale_hours = 24
+
+[config.deprecated.slack_webhook_env]
+replacement = "slack_webhook_urgent_env"
+remove_after = "2026-09-07"
+
+# Installer and smoke command prerequisites.
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Application runtime"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User service"
+
+[[prerequisites]]
+command = "journalctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "Log viewer"
+
+[[prerequisites]]
+command = "realpath"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y coreutils"
+note = "Compatibility path normalization"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Smoke check"
+
+# Appendix: one user unit, one hub-locations fragment, the dashboard webroot
+# page, and the env file the unit's EnvironmentFile= line reads. The spool
+# (~/.local/state/airlock/dev-monitor/) is retained operator data — never
+# declared. backend_port is proxied by the hub's own nginx, never
+# tailscale-served directly, so it is NOT a serve_ports entry.
+[artifacts]
+units = ["airlock-dev-monitor.service",
+         { name = "airlock-dev-monitor-spool-firewall.service", scope = "system" }]
+fragments = ["hub-locations.d/dev-monitor.conf"]
+webroot = ["monitor/index.html"]
+files = ["~/.config/airlock/dev-monitor.env"]
+rooted = ["/etc/airlock/dev-monitor-spool.nft",
+          "/opt/airlock/libexec/airlock-dev-monitor-spool-firewall"]
+
+# From hub/index.html's APPS table (dev-monitor row).
+[tile]
+label = "Dev Monitor"
+sub = "system status"
+cat = "system"
+path = "/monitor/"
+glyph = "app-monitor"

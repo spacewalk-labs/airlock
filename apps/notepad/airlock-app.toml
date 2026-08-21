@@ -1,0 +1,39 @@
+contract = 1
+id = "notepad"
+
+# notepad depends on publish's upload backend (apps/notepad/install.sh:27-28
+# also checks this itself at install time, and keeps doing so — the manifest
+# edge orders the install/removal, the app-side check is the last-resort
+# guard against a hand-edited/out-of-band config). The P2 migration kept this
+# check app-side ONLY, deliberately withholding [dependencies] here, per
+# docs/tasks/active/app-pkg-c4-builtin-migration.md "Approach" P2 per-app
+# notes ("notepad manifest without [dependencies] until P3") — P3 (child 4,
+# D3 demotion) is that declared point: the synthetic input-order chain that
+# used to carry this ordering for free is gone, so the real edge below is
+# what now guarantees publish installs before notepad (and, reversed, that
+# notepad is removed before publish).
+[dependencies]
+apps = ["publish"]
+
+# Transcribed from install/prerequisites.tsv's notepad row (F11); notepad has
+# no config keys (APP_DEFAULTS["notepad"] was {}).
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Smoke check"
+
+# apps/notepad/install.sh writes exactly this one file into the hub webroot
+# (Appendix: webroot = notepad/index.html; no units, no fragments, no data).
+[artifacts]
+webroot = ["notepad/index.html"]
+
+# From hub/index.html's APPS table (notepad row) — the hub's tile registry
+# entry this manifest replaces.
+[tile]
+label = "Clip Bridge"
+sub = "clipboard"
+cat = "docs"
+path = "/notepad/"
+glyph = "app-notepad"

@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Airlock</title>
+<link rel="icon" type="image/png" href="/assets/favicon.png">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<meta name="theme-color" content="#0a0f1e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Airlock">
+<style>
+  :root {
+    --bg: #f5f5f7; --surface: #fff; --text: #1d1d1f; --muted: #6e6e73;
+    --line: #d2d2d7; --accent: #0066cc;
+    --tile-fallback: linear-gradient(160deg, #ffffff, #eceff2);
+    --tile-glyph-fallback: #0f766e;
+    --ic-shadow: 0 3px 8px -2px rgba(0,0,0,.20), 0 1px 2px rgba(0,0,0,.10);
+    --ic-shadow-hover: 0 9px 18px -5px rgba(0,0,0,.28), 0 2px 5px rgba(0,0,0,.12);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      /* near-black navy (not pure #000) so the dark "coding" tiles stay visible */
+      --bg: #0a0c11; --surface: #16181d; --text: #f5f5f7; --muted: #98989d;
+      --line: #2a2d34; --accent: #2997ff;
+      --ic-shadow: 0 3px 10px -2px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
+      --ic-shadow-hover: 0 10px 20px -5px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.08);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 17px/1.5 -apple-system, "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding: max(env(safe-area-inset-top), 1.5rem) 1.25rem 3rem;
+  }
+  header { max-width: 880px; margin: 0 auto 2rem; display: flex; align-items: center; gap: 1rem;
+           padding-bottom: 0.9rem; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 1.25rem; margin: 0; letter-spacing: -0.02em; font-weight: 700; }
+  .who { margin-left: auto; color: var(--muted); font-size: 0.9rem; font-weight: 500;
+         padding: 4px 12px; border: 1px solid var(--line); border-radius: 999px; white-space: nowrap; }
+  .who:empty { display: none; }
+  main { max-width: 880px; margin: 0 auto; }
+  .sec-h { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+           color: var(--muted); margin: 0 0 1.25rem; display: flex; align-items: center; gap: 8px; }
+  .sec-h::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+
+  /* launcher grid — category-coloured tiles + shared glyph sprite */
+  .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+          gap: 26px 12px; justify-items: center; }
+  .app { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 82px;
+         text-decoration: none; color: var(--text); position: relative; }
+  .app .ic {
+    width: 60px; height: 60px; border-radius: 15px; display: grid; place-items: center;
+    overflow: hidden; position: relative;
+    color: var(--app-glyph, var(--tile-glyph-fallback));
+    background: var(--app-tile, var(--tile-fallback));
+    box-shadow: var(--ic-shadow);
+    transition: transform .16s cubic-bezier(.2,.8,.2,1), box-shadow .16s;
+  }
+  /* iOS-style glass edge: bright top-left / soft bottom-right corner rims */
+  .app .ic::after {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background:
+      radial-gradient(145% 145% at 0% 0%, rgba(255,255,255,.32), rgba(255,255,255,0) 20%),
+      radial-gradient(145% 145% at 100% 100%, rgba(255,255,255,.18), rgba(255,255,255,0) 22%),
+      linear-gradient(180deg, rgba(255,255,255,.05) 0%, rgba(255,255,255,0) 48%, rgba(0,0,0,.05) 100%);
+  }
+  .app:hover .ic { transform: translateY(-3px); box-shadow: var(--ic-shadow-hover); }
+  .app .ic svg { width: 36px; height: 36px; display: block; }
+  .app .ic svg, .app .ic svg * { color: var(--app-glyph, var(--tile-glyph-fallback)); }
+  /* real brand icon (orca, paseo): full-bleed image, no category tile behind it */
+  .app .ic img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .app.has-brand .ic { background: none; box-shadow: var(--ic-shadow); }
+  .app .lb { font-size: 0.85rem; font-weight: 500; text-align: center; line-height: 1.25; }
+
+  /* category palette — the tile bg + glyph colour per tool character.
+     coding=dark+green · docs=blue · files=teal · system=slate · comms=green */
+  .app[data-cat="coding"] { --app-tile: #16181f; --app-glyph: #6aac32; }
+  .app[data-cat="docs"]   { --app-tile: #2f5aa8; --app-glyph: #ffffff; }
+  .app[data-cat="files"]  { --app-tile: #128a86; --app-glyph: #ffffff; }
+  .app[data-cat="system"] { --app-tile: #46597e; --app-glyph: #ffffff; }
+  .app[data-cat="comms"]  { --app-tile: #3f9a5c; --app-glyph: #ffffff; }
+
+  .empty { color: var(--muted); }
+
+  /* message strip — dev-monitor's "needs a person" preview, above the tool grid.
+     Owner-only (matches the API's own gate); hidden entirely for anyone else, same as
+     the feedback box below is hidden when its backend is off. */
+  .msgstrip { max-width: 880px; margin: 0 auto 1.75rem; }
+  .msgstrip[hidden] { display: none; }
+  .ms-quiet { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; color: var(--muted); }
+  .ms-quiet .ok { color: var(--text); font-weight: 500; }
+  .ms-card { border: 1px solid var(--line); border-radius: 14px; background: var(--surface);
+             padding: 0.9rem 1.1rem 0.3rem; }
+  .ms-hd { display: flex; align-items: baseline; gap: 10px; margin-bottom: 0.4rem; }
+  .ms-hd .ms-ttl { font-weight: 700; font-size: 0.95rem; }
+  .ms-hd .ms-cnt { color: var(--muted); font-size: 0.85rem; }
+  .ms-hd .ms-cnt b { color: var(--text); }
+  .ms-hd a { margin-left: auto; color: var(--accent); font-size: 0.82rem; text-decoration: none; }
+  .ms-row { display: flex; align-items: baseline; gap: 8px; padding: 7px 0;
+            border-top: 1px solid var(--line); text-decoration: none; color: inherit; }
+  .ms-row:first-of-type { border-top: 0; }
+  .ms-row .ms-t { font-size: 0.88rem; font-weight: 500; flex: 1; min-width: 0;
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ms-row .ms-s { color: var(--muted); font-size: 0.76rem; white-space: nowrap; }
+
+  /* suggestion box — a same-origin feedback relay (see apps/feedback).
+     Collapsed by default: the launcher stays quiet and only a small trigger
+     shows. The panel below is revealed on click. */
+  .feedback { max-width: 880px; margin: 2.75rem auto 0; }
+  .fb-open {
+    border: 1px solid var(--line); border-radius: 999px; padding: 5px 14px; cursor: pointer;
+    background: transparent; color: var(--muted); font: inherit; font-size: 0.8rem; font-weight: 500;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  .fb-open:hover { color: var(--text); border-color: var(--muted); background: var(--surface); }
+  .fb-panel { position: relative; }        /* anchors the dismiss button */
+  .fb-panel[hidden] { display: none; }
+  .fb-panel .sec-h { margin-bottom: 0.75rem; padding-right: 2.75rem; }
+  .feedback textarea {
+    width: 100%; min-height: 84px; resize: vertical; box-sizing: border-box;
+    padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px;
+    background: var(--surface); color: var(--text); font: inherit;
+    -webkit-appearance: none;   /* iOS draws an inset shadow otherwise */
+  }
+  .feedback textarea:focus { outline: none; border-color: var(--accent); }
+  .fb-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  /* Sized against the section headers, not the 17px body text: this is a small
+     utility control at the foot of the page, not a page-level call to action. */
+  .fb-send {
+    border: 0; border-radius: 999px; padding: 5px 14px; cursor: pointer;
+    background: var(--accent); color: #fff; font: inherit; font-size: 0.8rem; font-weight: 600;
+  }
+  .fb-send:disabled { opacity: .55; cursor: default; }
+  /* Dismiss sits at the panel's top-right, away from Send: it is an escape
+     hatch, not a sibling of the primary action. Icon-only, but a 36px target. */
+  .fb-close {
+    position: absolute; top: -7px; right: 0; width: 36px; height: 36px; padding: 0;
+    display: grid; place-items: center; border: 0; border-radius: 999px;
+    background: none; color: var(--muted); cursor: pointer;
+    transition: color .15s, background .15s;
+  }
+  .fb-close:hover { color: var(--text); background: var(--surface); }
+  .fb-close svg { width: 15px; height: 15px; display: block;
+                  fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; }
+  .fb-status { min-width: 0; color: var(--muted); font-size: 0.8rem; }
+  .fb-status a { color: var(--accent); }
+
+  footer { max-width: 880px; margin: 2.5rem auto 0; color: var(--muted); font-size: 0.8rem; }
+</style>
+</head>
+<body>
+<!-- shared glyph sprite (same-document <use> refs are safe on every browser incl. iOS Safari).
+     All glyphs are Airlock's own drawings: viewBox 0 0 24 24, body fill="currentColor"
+     (themed via the tile).
+     An accent CUT OUT of that body is fill="var(--app-tile,#fff)" — it must show the tile
+     through, so it is painted in the tile colour, not in white. A literal #fff there is
+     white on a white glyph: the notepad tile drew its lines that way and they were
+     invisible on the launcher for as long as the tile existed. The two surfaces that
+     paint these glyphs both supply --app-tile (the .app[data-cat] rules below; the
+     standalone tile in bin/gen-app-icons.py), so one value drives both. -->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="app-devterm" viewBox="0 0 24 24"><rect x="2.6" y="4" width="18.8" height="16" rx="2.6" fill="currentColor"/><path d="M6.6 9.4l3.1 2.6-3.1 2.6" fill="none" stroke="var(--app-tile,#fff)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><rect x="11.6" y="14" width="6" height="1.7" rx=".85" fill="var(--app-tile,#fff)"/></symbol>
+  <symbol id="app-code-server" viewBox="0 0 24 24"><path d="M9 7.5 4 12l5 4.5M15 7.5 20 12l-5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="app-orca" viewBox="0 0 24 24"><path fill="currentColor" d="M8.5 15C9 9.4 10 5.8 11 4c1.2 2 2.4 5.4 4.5 11z"/><path d="M11.6 6.6c1 1.4 1.9 3.3 2.6 5.2" fill="none" stroke="#fff" stroke-width="1.3" stroke-linecap="round" opacity=".8"/><g fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round" opacity=".9"><path d="M2.6 17.6c1.9-1.5 3.4-1.5 5.3 0s3.4 1.5 5.3 0 3.4-1.5 5.3 0"/><path d="M4 20.4c1.7-1.2 3-1.2 4.7 0s3 1.2 4.7 0"/></g></symbol>
+  <symbol id="app-paseo" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.6 11.4 16 6.6M6.6 12.6 16 17.4"/></g><g fill="currentColor"><circle cx="5.6" cy="12" r="2.7"/><circle cx="17" cy="6.4" r="2.7"/><circle cx="17" cy="17.6" r="2.7"/></g><g fill="#fff" opacity=".92"><circle cx="5.6" cy="12" r=".95"/><circle cx="17" cy="6.4" r=".95"/><circle cx="17" cy="17.6" r=".95"/></g></symbol>
+  <symbol id="app-markwand" viewBox="0 0 24 24"><rect x="2.4" y="5.4" width="19.2" height="13.2" rx="2.6" fill="none" stroke="currentColor" stroke-width="1.7"/><path fill="currentColor" d="M5.7 15.4V8.6h1.9l2 2.4 2-2.4h1.9v6.8h-1.9v-4.1l-2 2.3-2-2.3v4.1z"/><path fill="currentColor" d="M17 8.6h1.9v3.5h1.7l-2.65 3.3-2.65-3.3h1.7z"/></symbol>
+  <symbol id="app-publish" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><ellipse cx="12" cy="12" rx="3.8" ry="8.5"/><path d="M5 8c4.4 2 10.6 2 14 0M5 16c4.4-2 10.6-2 14 0"/></g></symbol>
+  <symbol id="app-notepad" viewBox="0 0 24 24"><rect x="4.8" y="4.4" width="14.4" height="17.2" rx="2.8" fill="currentColor"/><rect x="8.4" y="2.4" width="7.2" height="4.4" rx="1.5" fill="currentColor"/><rect x="8.4" y="2.4" width="7.2" height="4.4" rx="1.5" fill="#000" opacity=".15"/><g fill="var(--app-tile,#fff)"><rect x="8.2" y="11" width="7.6" height="1.6" rx=".8"/><rect x="8.2" y="14.6" width="5.2" height="1.6" rx=".8"/></g></symbol>
+  <symbol id="app-monitor" viewBox="0 0 24 24"><path d="M2.4 13.2h4.2l2.2-6.4 3 11 2.4-7.8 1.8 3.2h5.6" fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</svg>
+
+<header>
+  <h1 id="product">Airlock</h1>
+  <span class="who" id="who"></span>
+</header>
+<main>
+  <div class="msgstrip" id="msgstrip" hidden></div>
+  <div class="sec-h">Tools</div>
+  <div class="apps" id="grid"></div>
+  <p class="empty" id="empty" hidden>No apps enabled. Add app tables to <code>airlock.toml</code>.</p>
+</main>
+
+<!-- suggestion box — same-origin; the owner identity is attached server-side by the
+     feedback backend (from the gate header), never sent by this page. Hidden until
+     the backend reports it's configured (GET /feedback/api/health -> enabled).
+     Collapsed: only the small trigger shows until it is clicked. -->
+<section class="feedback" id="feedback" hidden>
+  <button type="button" class="fb-open" id="fb-open"
+          aria-expanded="false" aria-controls="fb-panel">Feedback</button>
+  <div class="fb-panel" id="fb-panel" role="region" aria-labelledby="fb-title" hidden>
+    <div class="sec-h" id="fb-title">Feedback</div>
+    <button type="button" class="fb-close" id="fb-close" aria-label="Close feedback">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/></svg>
+    </button>
+    <textarea id="fb-text" aria-label="Feedback" placeholder="Share a suggestion"></textarea>
+    <div class="fb-row">
+      <button type="button" class="fb-send" id="fb-send">Send</button>
+      <span class="fb-status" id="fb-status" role="status" aria-live="polite"></span>
+    </div>
+  </div>
+</section>
+
+<footer>Airlock · self-hosted dev hub · open source (MIT) · © 2026 Sunghyeon Cho</footer>
+
+<script>
+async function j(url) { const r = await fetch(url, { cache: "no-store" }); return r.ok ? r.json() : null; }
+
+// D7/F14: may an app's tile render for this viewer? Pure and FAIL-CLOSED —
+// an owner-audience tile shows only to a verified owner; an unknown role
+// (whoami fetch failed, role field absent) hides it. Apps without a declared
+// audience are unaffected. Extracted so install/test-hub-filter.sh can
+// exercise it in node without a browser.
+function airlockTileVisible(audience, role) {
+  if (audience !== "owner") return true;
+  return role === "owner";
+}
+
+// F14: which tile model renders for an app — manifest webjson only (child
+// 4/P3 retires the built-in APPS presentation registry and its name-fallback:
+// every app reaching this function is a shipped package, so its tile data,
+// if any, always comes from its manifest). No [tile] in the manifest renders
+// NOTHING (null). Extracted so install/test-hub-filter.sh can exercise it in
+// node.
+function airlockTileMeta(entry) {
+  const t = entry.tile;
+  if (!t) return null;
+  return { label: t.label, sub: t.sub || "", cat: t.cat || null,
+           path: t.path, glyph: t.glyph || null, brand: t.icon || null };
+}
+
+(async () => {
+  const [cfg, me] = [await j("/__airlock.json"), await j("/whoami")];
+  if (cfg && cfg.product) {
+    document.getElementById("product").textContent = cfg.product;
+    document.title = cfg.product;
+  }
+  if (me && me.login) document.getElementById("who").textContent = me.login;
+
+  const grid = document.getElementById("grid");
+  const apps = (cfg && cfg.apps) || {};
+  // Canonical host for cross-port links (see the href below). Only accept a
+  // dotted name — a short hostname has no certificate.
+  const HOST = (cfg && cfg.fqdn && cfg.fqdn.indexOf(".") > 0) ? cfg.fqdn : location.hostname;
+  // "feedback" is not a launcher tile — it's the suggestion box below the grid.
+  const names = Object.keys(apps).filter(n => n !== "hub" && n !== "feedback");
+  if (!names.length) { document.getElementById("empty").hidden = false; return; }
+
+  for (const name of names) {
+    if (!airlockTileVisible(apps[name].audience, me && me.role)) continue;
+    const meta = airlockTileMeta(apps[name]);
+    if (!meta) continue;
+    const port = apps[name].port;
+    // Ported same-box tools navigate IN PLACE (one-app feel — the return widget
+    // brings you back). Only a genuinely third-party service (external=true in
+    // airlock.toml) opens a new tab. A separate-port tool is reached via the
+    // deployment FQDN so its URL matches the Tailscale cert — that cert covers
+    // the FQDN ONLY, so a short hostname or an IP would give the browser a link
+    // it cannot verify. Prefer the FQDN the installer measured (cfg.fqdn) over
+    // location.hostname: then the tiles are correct no matter which origin this
+    // page was opened from.
+    const external = !!(apps[name].external || meta.external);
+    const href = port ? `https://${HOST}:${port}/` : (meta.path || `/${name}/`);
+
+    const a = document.createElement("a");
+    a.className = "app";
+    a.href = href;
+    if (meta.cat) a.dataset.cat = meta.cat;
+    if (meta.sub) a.title = meta.sub;
+    if (external) { a.target = "_blank"; a.rel = "noopener"; }
+
+    const ic = document.createElement("span");
+    ic.className = "ic";
+    if (meta.brand) {                    // real brand icon (full-bleed image)
+      a.classList.add("has-brand");
+      const img = document.createElement("img");
+      img.src = meta.brand; img.alt = "";
+      ic.appendChild(img);
+    } else if (meta.glyph) {
+      ic.innerHTML = '<svg viewBox="0 0 24 24"><use href="#' + meta.glyph + '"/></svg>';
+    }
+    const lb = document.createElement("span");
+    lb.className = "lb";
+    lb.textContent = meta.label;
+
+    a.append(ic, lb);
+    grid.appendChild(a);
+  }
+})();
+
+// iOS home-screen standalone: a plain same-origin <a> can bounce out to Safari.
+// Force same-origin navigations through location.href so they stay in the app.
+// Cross-origin links (separate-port tools, external=true) are left alone.
+if (("standalone" in navigator) && navigator.standalone) {
+  document.addEventListener("click", function (e) {
+    const a = e.target.closest && e.target.closest("a[href]");
+    if (!a || a.target === "_blank") return;
+    let u; try { u = new URL(a.href, location.href); } catch (_) { return; }
+    if (u.origin === location.origin) { e.preventDefault(); location.href = u.href; }
+  });
+}
+</script>
+
+<script>
+// Message strip — dev-monitor's "needs a person" preview, above the tool grid: the
+// screen a person meets BEFORE choosing a tool. Owner-only (the API 403s everyone
+// else anyway; the role check just avoids a doomed fetch). Polls the same endpoint
+// the shared return-widget badge reads (hub/assets/airlock-return.js), same-origin
+// here so no CORS is involved.
+//
+// Failure discipline matches the widget's: 403/404 are real "nothing to show" and
+// hide the strip; any other failure (5xx, network, bad JSON) leaves the strip exactly
+// as it last rendered rather than flashing it away — see airlock-return.js's
+// pollUnread for why collapsing every failure to one state was the bug this campaign
+// exists to fix.
+(async () => {
+  const strip = document.getElementById("msgstrip");
+  if (!strip) return;
+  let me = null;
+  try { me = await j("/whoami"); } catch (_) {}
+  if (!me || me.role !== "owner") return;      // stays hidden — collaborators draw no fetch
+
+  function fmtClock(iso) {
+    try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+    catch (_) { return iso; }
+  }
+  // Same-day: a clock time ("마지막 수집 08:41") reads fine. Older than a day, a bare clock
+  // time silently relabels itself "today" every time this renders — that is exactly the
+  // quiet/dead confusion this strip exists to end, so it switches to a relative age instead.
+  function fmtCollected(iso, ageSeconds) {
+    if (!iso) return "-";
+    if (ageSeconds == null || ageSeconds < 86400) return fmtClock(iso);
+    const days = Math.floor(ageSeconds / 86400);
+    return days + "일 전 (" + fmtClock(iso) + ")";
+  }
+  function row(card) {
+    const a = document.createElement("a");
+    a.className = "ms-row"; a.href = "/monitor/";
+    const t = document.createElement("span");
+    t.className = "ms-t"; t.textContent = card.title || "";
+    const s = document.createElement("span");
+    s.className = "ms-s";
+    const bits = [card.source || ""];
+    if (card.occurrence_count > 1) bits.push("×" + card.occurrence_count);
+    s.textContent = bits.join(" · ");
+    a.append(t, s);
+    return a;
+  }
+
+  async function render() {
+    let r;
+    try { r = await fetch("/monitor/api/owner/messages/preview", { cache: "no-store" }); }
+    catch (_) { return; }                       // network failure — keep the last render
+    if (r.status === 403 || r.status === 404) { strip.hidden = true; strip.textContent = ""; return; }
+    if (!r.ok) return;                           // unexpected status — keep the last render
+    let d; try { d = await r.json(); } catch (_) { return; }
+
+    strip.textContent = "";
+    strip.hidden = false;
+    const n = d.needs_action_count || 0;
+    if (n === 0) {
+      const wrap = document.createElement("div");
+      wrap.className = "ms-quiet";
+      const ok = document.createElement("span");
+      ok.className = "ok"; ok.textContent = "지금 하실 일이 없습니다.";
+      const when = document.createElement("span");
+      when.textContent = "마지막 수집 " + fmtCollected(d.collected_at, d.collected_age_seconds);
+      wrap.append(ok, when);
+      strip.appendChild(wrap);
+      return;
+    }
+    const card = document.createElement("div");
+    card.className = "ms-card";
+    const hd = document.createElement("div");
+    hd.className = "ms-hd";
+    const ttl = document.createElement("span");
+    ttl.className = "ms-ttl"; ttl.textContent = "받은함";
+    const cnt = document.createElement("span");
+    cnt.className = "ms-cnt";
+    cnt.append("해야 할 일 ");
+    const b = document.createElement("b"); b.textContent = String(n);
+    cnt.appendChild(b);
+    const open = document.createElement("a");
+    open.href = "/monitor/"; open.textContent = "받은함 열기 →";
+    hd.append(ttl, cnt, open);
+    card.appendChild(hd);
+    const top = d.top || [];
+    top.forEach(c => card.appendChild(row(c)));
+    if (n > top.length) {
+      const more = document.createElement("a");
+      more.className = "ms-row"; more.href = "/monitor/";
+      const t = document.createElement("span");
+      t.className = "ms-t"; t.textContent = "그 밖에 " + (n - top.length) + "건";
+      more.appendChild(t);
+      card.appendChild(more);
+    }
+    strip.appendChild(card);
+  }
+  render();
+  setInterval(render, 30000);
+})();
+</script>
+
+<script>
+// Suggestion box: POST only {text} to the same-origin /feedback/api/ — the owner
+// is attached server-side by the backend from the gate header (never sent here).
+// The box stays hidden unless the backend reports it's configured, and even then
+// only the small "Feedback" trigger shows until it is clicked.
+(async () => {
+  const sec = document.getElementById("feedback");
+  const open = document.getElementById("fb-open");
+  const panel = document.getElementById("fb-panel");
+  const close = document.getElementById("fb-close");
+  const ta = document.getElementById("fb-text");
+  const btn = document.getElementById("fb-send");
+  const status = document.getElementById("fb-status");
+  if (!sec) return;
+
+  let health = null;
+  try {
+    const r = await fetch("/feedback/api/health", { cache: "no-store" });
+    if (r.ok) health = await r.json();
+  } catch (_) { /* backend down -> box stays hidden */ }
+  if (!health || !health.enabled) return;   // unconfigured -> no box (degrade cleanly)
+  sec.hidden = false;
+
+  // Disclosure: the trigger yields to the panel (one of the two is visible), so
+  // the collapsed launcher shows a single small pill and nothing else.
+  const setOpen = (on) => {
+    panel.hidden = !on;
+    open.hidden = on;
+    open.setAttribute("aria-expanded", String(on));
+    if (on) ta.focus();
+    else { status.textContent = ""; open.focus(); }
+  };
+  open.addEventListener("click", () => setOpen(true));
+  close.addEventListener("click", () => setOpen(false));
+  // Esc always closes: the textarea keeps its value, so a draft survives being
+  // collapsed and comes back on the next open.
+  panel.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); setOpen(false); }
+  });
+
+  btn.addEventListener("click", async () => {
+    const text = (ta.value || "").trim();
+    if (!text) { status.textContent = "Enter a message."; return; }
+    btn.disabled = true;
+    status.textContent = "Sending…";
+    try {
+      const r = await fetch("/feedback/api/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      let d = null; try { d = await r.json(); } catch (_) {}
+      if (r.ok && d && d.ok) {
+        ta.value = "";
+        status.textContent = "";
+        if (d.issue_url) {
+          status.append("Sent · ");
+          const a = document.createElement("a");
+          a.href = d.issue_url; a.target = "_blank"; a.rel = "noopener";
+          a.textContent = "open";
+          status.append(a);
+        } else {
+          status.textContent = "Sent, thanks!";
+        }
+      } else {
+        status.textContent = "Failed: " + ((d && d.error) || r.status);
+      }
+    } catch (e) {
+      status.textContent = "Failed: " + e;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

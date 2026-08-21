@@ -1,0 +1,53 @@
+# Airlock — EXPERIMENTAL systemd-in-Docker compose (alternative to the OrbStack
+# machine path in docker/orbstack-machine-setup.sh, which is recommended).
+# See docs/design/macos-container.md. STATUS: unverified on real hardware.
+#
+#   1. cp docker/airlock.env.example docker/airlock.env   # fill in TS_AUTHKEY
+#   2. cp airlock.toml.example airlock.toml               # fill in owner/apps
+#   3. docker compose -f docker/docker-compose.yml up -d --build
+#
+# amd64 platform => Rosetta on Apple Silicon runs orca, the one x86_64-only app.
+services:
+  airlock:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    platform: linux/amd64
+    container_name: airlock
+    hostname: airlock
+    # systemd as PID 1 needs these. cgroup ns + the cgroup mount let systemd
+    # manage units without full --privileged. NET_ADMIN: tailscaled + orca nft.
+    cgroup: host
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # The repo (edit-one-copy; installer runs from here).
+      - ..:/airlock
+      # First-boot env (TS_AUTHKEY etc.) — mapped to where the unit reads it.
+      - ./airlock.env:/etc/airlock/firstboot.env:ro
+      # Persistence: Tailscale identity + the owner's home (app state).
+      - airlock-tsstate:/var/lib/tailscale
+      - airlock-home:/home/airlock
+      # Your real code, edited live. Point [paths].code_root in airlock.toml at
+      # /code, and set the host side to the Mac dir you work in. Mount a project
+      # directory: everything under it is collaborator-readable AND writable, and
+      # the guest cannot warn you about a host home dir it cannot see.
+      - ${AIRLOCK_CODE_DIR:-./_code}:/code
+    devices:
+      # tailscaled TUN. Remove and set TS_USERSPACE=true in airlock.env if the
+      # host has no /dev/net/tun.
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN   # tailscaled + orca's nft loopback lock
+      - NET_RAW
+    env_file:
+      - ./airlock.env
+    restart: unless-stopped
+    # systemd stop signal.
+    stop_signal: SIGRTMIN+3
+
+volumes:
+  airlock-tsstate:
+  airlock-home:

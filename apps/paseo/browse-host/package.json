@@ -1,0 +1,22 @@
+{
+  "name": "airlock-paseo-browse-host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Server-side browser automation host for self-hosted Paseo (loopback WS sidecar, Playwright-backed).",
+  "license": "MIT",
+  "bin": {
+    "paseo-browse-host": "bin/paseo-browse-host.js"
+  },
+  "main": "src/host.js",
+  "scripts": {
+    "start": "node bin/paseo-browse-host.js",
+    "test": "node test/security.policy.cjs && node test/executor.roundtrip.cjs && node test/executor.ensuretab.cjs && node test/logs.unit.cjs && node test/roster.unit.cjs && node test/stream.roundtrip.cjs && node test/roster.integration.cjs && node test/broker.integration.mjs && node test/companion.unit.cjs && node test/companion.e2e.cjs"
+  },
+  "dependencies": {
+    "playwright": "1.61.1",
+    "ws": "8.21.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

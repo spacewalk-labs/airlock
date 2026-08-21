@@ -1,0 +1,11 @@
+contract = 1
+id = "hello-example"
+
+[config.defaults]
+backend_port = 18900
+
+# The service is a user unit. The nginx fragment is included inside Airlock's
+# already-gated hub server, so the backend only listens on loopback.
+[artifacts]
+units = ["airlock-hello-example.service"]
+fragments = ["hub-locations.d/hello-example.conf"]

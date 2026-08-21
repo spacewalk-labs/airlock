@@ -1,0 +1,20 @@
+[Unit]
+Description=airlock markserv — markdown viewer for TMP/code (127.0.0.1:18799)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=TMP/code
+# markserv runs through env node, so this PATH decides whether the unit starts at
+# all. It was hardcoded here until 2026-08-07 with no entry for wherever node
+# actually lives, and a box that followed this repo's own preflight fix (snap)
+# crash-looped: env: node: No such file or directory. The installer derives it now
+# — see airlock_cmd_dirs in install/lib.sh.
+Environment=PATH=WDIR/home/.local/bin:NODE_BIN:/usr/local/bin:/usr/bin:/bin
+# --livereloadport false: no chokidar watcher (avoids EACCES on symlinked trees)
+ExecStart=WDIR/home/.local/bin/markserv --address 127.0.0.1 --port 18799 --livereloadport false --browser false --silent TMP/code
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

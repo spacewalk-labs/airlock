@@ -1,0 +1,93 @@
+contract = 1
+id = "publish"
+
+# Transcribed from the former APP_DEFAULTS["publish"] entry. public_target's
+# nested keys keep NO central defaults, matching today's split exactly:
+# install.sh applies its own per-key defaults inline (mode -> "remote",
+# token_env -> "AIRLOCK_PUBLISH_TOKEN", gated_dir/htpasswd_dir/htpasswd_bin
+# -> their own fallbacks) — only the allowed key SET was ever centrally
+# declared (the former NESTED_APP_KEYS[("publish","public_target")]).
+[config]
+# Env-var names this installer WRITES rather than reads. Eleven of them are
+# `Environment=` lines the renderer puts on the unit (apps/publish/render.sh:27-40)
+# and the backend reads at runtime; the real operator-facing config for this app
+# goes through [config.tables.public_target] above. Declaring them as config keys
+# instead would merge them into resolved config and export them all — a knob-shaped
+# thing that does not behave like a knob. See [config].runtime_env in
+# docs/design/app-package-contract.md.
+runtime_env = [
+  "AIRLOCK_PUBLISH_BASE_URL",
+  "AIRLOCK_PUBLISH_GATED_DIR",
+  "AIRLOCK_PUBLISH_HTPASSWD_BIN",
+  "AIRLOCK_PUBLISH_HTPASSWD_DIR",
+  "AIRLOCK_PUBLISH_INGEST_URL",
+  "AIRLOCK_PUBLISH_PUBLIC_DIR",
+  "AIRLOCK_PUBLISH_PUBLIC_MODE",
+  "AIRLOCK_PUBLISH_STATE_DIR",
+  "AIRLOCK_PUBLISH_TOKEN",
+  "AIRLOCK_PUBLISH_TOKEN_ENV",
+  "AIRLOCK_PUBLISH_UPLOADS_DIR",
+]
+
+[config.defaults]
+backend_port = 18803
+share_dir = "/opt/airlock/share"
+
+[config.tables.public_target]
+allowed_keys = ["mode", "ingest_url", "base_url", "token_env", "public_dir",
+                 "gated_dir", "htpasswd_dir", "htpasswd_bin"]
+
+# Transcribed from install/prerequisites.tsv's four publish rows (F11).
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Application runtime"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User services"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Smoke check"
+
+[[prerequisites]]
+command = "sudo"
+predicate = "present"
+expected = "-"
+fix = "su -c 'apt-get update && apt-get install -y sudo'"
+note = "Shared directory setup"
+
+# Appendix: three user units, two hub/public-includes fragments (the gated
+# one is mode-gated — install.sh writes it only when public_target.mode =
+# "local" and removes it otherwise, but declaring it here is what lets the
+# ledger reclaim it if the app is removed while it exists), and the manager
+# webroot page. Deliberately NOT declared (platform-protected / retained
+# operator data, per the ADR appendix and revision-9 note — declaring any
+# of these removable would be fatal-in-spirit even where the schema
+# wouldn't catch it): ~/.local/state/airlock/publish-public.json (inside
+# AIRLOCK_STATE_DIR — platform state, not an app artifact), /opt/airlock/
+# share* (share_dir/public_dir/gated_dir), the htpasswd auth directory, and
+# ~/uploads. No serve_ports: backend_port is proxied by the hub's own
+# nginx, never tailscale-served directly.
+[artifacts]
+units = ["airlock-publish.service", "airlock-publish-cleanup.service",
+         "airlock-publish-cleanup.timer"]
+fragments = ["hub-locations.d/publish.conf", "public-includes.d/publish-gated.conf"]
+webroot = ["publish/index.html"]
+
+# From hub/index.html's APPS table (publish row).
+[tile]
+label = "Publish"
+sub = "static publish"
+cat = "docs"
+path = "/publish/"
+glyph = "app-publish"

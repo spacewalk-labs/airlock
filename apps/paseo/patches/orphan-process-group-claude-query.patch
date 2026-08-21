@@ -1,0 +1,15 @@
+--- a/dist/server/server/agent/providers/claude/query.js
++++ b/dist/server/server/agent/providers/claude/query.js
+@@ -57,6 +57,12 @@
+                     ? { env: selfNodeCommand.env, envMode: "internal" }
+                     : providerEnvSpec),
+                 signal: spawnOptions.signal,
++                // [paseo-process-group] Give the claude leader its own process group so its
++                // MCP children can still be reached after the leader itself exits (a ppid
++                // tree-kill cannot — they are reparented by then). cgroup membership is
++                // unaffected, so systemd KillMode=control-group still sweeps everything.
++                // codex already spawns its app-server this way upstream.
++                detached: process.platform !== "win32",
+                 stdio: ["pipe", "pipe", "pipe"],
+                 // Bypass cmd.exe on Windows: the SDK passes --mcp-config with inline JSON
+                 // containing double quotes, which cmd.exe mangles (strips quotes, breaks parsing).

@@ -1,0 +1,57 @@
+contract = 1
+id = "feedback"
+
+# Defaults transcribed from bin/airlock-config's former APP_DEFAULTS["feedback"]
+# entry (backend_port, intake_url, token_env) plus the four keys
+# apps/feedback/install.sh already reads but the registry never declared
+# (mail_to, mail_from, mail_api, mail_key_env — install.sh applies its own
+# "RESEND_API_KEY" fallback when mail_key_env is empty; declaring the same
+# value here as the default makes that fallback a no-op, byte-identical).
+[config]
+# The NAME of the env var holding the intake token, assigned as a default by the
+# installer (apps/feedback/install.sh:50). The token itself never appears here.
+runtime_env = [
+  "AIRLOCK_FEEDBACK_TOKEN",
+]
+
+[config.defaults]
+backend_port = 18805
+intake_url = "https://your-intake.example"
+token_env = "AIRLOCK_FEEDBACK_TOKEN"
+mail_to = ""
+mail_from = ""
+mail_api = ""
+mail_key_env = "RESEND_API_KEY"
+
+# Transcribed from install/prerequisites.tsv's three feedback rows (F11).
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Application runtime"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User service"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Smoke check"
+
+# Appendix: one user unit + one hub-locations fragment; no webroot, no
+# files/rooted, no retained data. backend_port is a loopback target the hub's
+# own nginx proxies to — never tailscale-served directly — so it is NOT a
+# serve_ports entry.
+[artifacts]
+units = ["airlock-feedback.service"]
+fragments = ["hub-locations.d/feedback.conf"]
+
+# No [tile]: feedback is the suggestion box shipped inside the hub launcher,
+# not a launcher tile (hub/index.html filters it out of the grid today).

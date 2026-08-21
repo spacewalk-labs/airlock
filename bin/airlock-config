@@ -1,0 +1,3902 @@
+#!/usr/bin/env python3
+"""airlock-config — the single reader of airlock.toml.
+
+Nothing else in Airlock parses the config; installers/nginx/backends consume it
+through this tool. Site-specific facts live only in airlock.toml.
+
+Usage:
+  airlock-config validate            # fail-closed sanity checks (run first)
+  airlock-config apps                # list enabled app names (one per line)
+  airlock-config get <dotted.key>    # e.g. auth.owner, apps.devterm.public_port
+  airlock-config env <app>           # KEY=VALUE lines for `eval` in bash
+  airlock-config json                # full resolved config (defaults merged)
+  airlock-config webjson             # frontend-safe subset (/__airlock.json)
+  airlock-config plaintext           # app<TAB>listen<TAB>target plaintext rows
+  airlock-config plaintext-known     # every plaintext port Airlock could own
+  airlock-config plaintext-retirement-drop <port>
+                                     # recovery: forget a manually verified intent
+  airlock-config package-info        # resolved [packages.*] as JSON (see D1/D6)
+  airlock-config lock-finalize       # ORCHESTRATOR-INTERNAL: record missing
+                                     #   explicit-package digests after success
+  airlock-config canonical-package-info <id> <repository-id> <full-40-hex-sha>
+                                     # stable six-field release boundary JSON
+  airlock-config known-builtins      # shipped ids (hub/core, shadowed excluded) (F15)
+  airlock-config adopt-scan          # F15 sweep: report pre-ledger artifacts, mutates nothing
+  airlock-config adopt-write <id>    # ORCHESTRATOR-INTERNAL: called only by
+                                     #   `bin/airlock-teardown --adopt`, under its
+                                     #   ledger lock — journals a synthetic intent
+                                     #   record for a known builtin with no config
+                                     #   entry and no ledger record (F15)
+  airlock-config prereqs             # assembled prerequisites TSV (F11)
+  airlock-config icon-src <app>      # staged tile icon source/destination (F4)
+  airlock-config icon-stage <app>    # ORCHESTRATOR-INTERNAL: the one writing
+                                     #   verb — stages a declared tile icon
+                                     #   into the webroot AFTER the ledger
+                                     #   intent names it (record before
+                                     #   mutate); refuses unless the tree
+                                     #   still matches that intent's digest
+
+Requires Python >= 3.11 (tomllib).
+"""
+from __future__ import annotations
+
+import copy
+import datetime as dt
+import fcntl
+import hashlib
+import heapq
+import json
+import os
+import re
+import shlex
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    sys.stderr.write(
+        "airlock-config: Python >= 3.11 required (tomllib missing). "
+        "Current: %s\n" % sys.version.split()[0]
+    )
+    sys.exit(2)
+
+# v1: Tailscale is the only supported auth provider, and its identity header is
+# fixed — an operator-chosen header name would be spoofable and insecure.
+# See SECURITY.md.
+PROVIDER_HEADER = {"tailscale": "Tailscale-User-Login"}
+
+# Set only by the exact process argv parsed in main().  This is deliberately
+# not read from the environment: an exported switch would remain active for
+# later commands and turn an exceptional, package-scoped act into ambient
+# process state.
+_DANGEROUS_ADMIT_UNVERIFIED: str | None = None
+
+# App names cross a line-oriented shell boundary (`airlock-config apps`). Keep
+# custom/local app names available, but reject control characters and shell/path
+# punctuation that could turn one TOML table name into multiple installer names.
+# `\Z`, not `$`: Python's `$` also matches immediately before a trailing newline, so
+# `$` here would have admitted exactly the "one name becomes two lines" value the comment
+# above exists to reject. Only the fullmatch at the call site was preventing it.
+APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+# Default ports/flags per app. A table's mere presence in [apps.*] enables it;
+# omitted keys fall back to these. hub is the only survivor of this table
+# (child 4/P3): the nine other built-ins are shipped packages now, and their
+# defaults live in their own manifest's [config.defaults] (D2) — see
+# airlock.toml.example for the operator-facing documentation of hub's ports.
+APP_DEFAULTS: dict[str, dict] = {
+    # *_port pairs: http_port/public_port are PLAINTEXT tailnet ports that only
+    # 301 to https (served by the loopback redirect_port) — no content, ever.
+    "hub":         {"https_port": 443, "http_port": 9999, "nginx_port": 18802,
+                    "redirect_port": 18806},
+}
+
+# Accepted in ANY app table (not a default: they carry no value when absent).
+COMMON_APP_KEYS = frozenset({"external"})
+
+# The non-app sections are closed vocabularies: v1 reads exactly these keys and
+# nothing else, so anything else in them is a typo. `[auth]` earns the check on its
+# own — a mistyped `collaborators` leaves the operator believing they granted (or
+# revoked) access that was never read. Only [apps.*] is open, and only at the table
+# level (a local/custom app), never at the key level.
+CLOSED_SECTIONS: dict[str, frozenset] = {
+    "airlock":  frozenset({"config_version"}),
+    "site":     frozenset({"name"}),
+    "auth":     frozenset({"provider", "owner", "collaborators"}),
+    "paths":    frozenset({"code_root", "wiki"}),
+    "branding": frozenset({"product", "icon_ring"}),
+}
+
+CONFIG_ABI_VERSION = 2
+
+# Config keys that were shipped but never implemented. They are NOT errors (that
+# would break every box installed from an example that carried them); they get a
+# targeted message that says what to do, because a generic "unknown key" warning
+# cannot correct what the operator believes the key was doing.
+RETIRED_KEYS: dict[str, str] = {
+    "apps.dev-monitor.skill_allow":
+        "was removed (owner, 2026-08-10). Remove it — but know what it was doing "
+        "first: it filtered the `skill` field of an action and nothing else, so the "
+        "same card sent as a `prompt` naming the same skill ran anyway. It was never "
+        "the lock it reads as. What bounds a run is the approval: the owner reads the "
+        "derived plan and clicks, and that plan runs or nothing does (see SECURITY.md).",
+    "paths.mount_exclude":
+        "was never implemented — nothing was ever excluded. Remove it. Everything "
+        "under code_root is served read+write to the owner and every "
+        "collaborator (see SECURITY.md).",
+    "auth.read_open":
+        "was never implemented — no read-only tier exists. Remove it. Access is "
+        "owner + collaborators; nothing else is admitted.",
+    "auth.read_open_suffix":
+        "was never implemented (see auth.read_open). Remove it — a domain suffix "
+        "grants nothing.",
+    "site.domain_override":
+        "was never implemented — the FQDN is always measured from `tailscale "
+        "status`, or taken from AIRLOCK_TS_FQDN. Remove it.",
+    "branding.logo":
+        "was never implemented — the hub serves hub/assets/ as shipped. Replace "
+        "the file in the repo instead, and remove this key.",
+}
+
+
+# ---- packaged apps (docs/design/app-package-contract.md, D1/D2/D6) ----------
+
+# Packaged ids are stricter than APP_NAME_RE on purpose: env export flattens `-`
+# and `_` to the same character (_envkey below), so `a-b` and `a_b` would collide.
+# The looser APP_NAME_RE grammar stays for [apps.*] table names and
+# [dependencies].apps entries PERMANENTLY (child 4/P3: this is not a
+# migration-window artifact) — a manifest may declare a dependency on a
+# plain, unpackaged app id that predates package ids' stricter charset (an
+# id that will never resolve to a package/manifest of its own, only ever
+# exist as a same-box [apps.X] table another package's [dependencies] names);
+# narrowing that grammar would wedge a validate-green box's ledger plan (see
+# install/test-manifest.sh's C36b fixture and ledger's own _DEP_RE, which is
+# never narrowed for the identical reason).
+PACKAGE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
+
+MANIFEST_NAME = "airlock-app.toml"
+
+# The five artifact classes the ledger can record and tear down. Everything an
+# app's scripts create OUTSIDE its package dir must be declared in one of them
+# (app *data* is deliberately never declared and never torn down).
+ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "rooted", "serve_ports")
+
+# A unit name may glob in the stem but must end in a real unit suffix — a bare
+# `..` or `*` would otherwise resolve outside (or to all of) the unit dirs.
+UNIT_SUFFIXES = (".service", ".socket", ".timer", ".path", ".target")
+
+_SERVE_KEY_RE = re.compile(r"^[a-z0-9_]+\Z")
+_WILDCARD_RE = re.compile(r"[*?\[]")
+
+# Full manifest schema (D2). Unknown fields anywhere in the manifest are fatal —
+# fail-closed applies to the manifest too (F10).
+_MANIFEST_KEYS = ("contract", "id", "dependencies", "config", "prerequisites",
+                  "artifacts", "tile", "audience", "serve", "plaintext_redirect")
+_SERVE_KEYS = ("https",)
+_CONFIG_SCHEMA_KEYS = ("required", "defaults", "tables", "port_spans",
+                       "runtime_env", "deprecated")
+_TILE_KEYS = ("label", "sub", "cat", "path", "icon", "glyph")
+_TILE_CATS = ("coding", "docs", "files", "system", "comms")
+_PREREQ_FIELDS = ("command", "predicate", "expected", "fix", "note")
+_TYPE_NAMES = {"string": str, "integer": int, "boolean": bool}
+# Manifest config keys become env vars through _envkey: keep them shell-safe
+# and collision-free (`-` would flatten onto `_`). Also the F12 scan grammar.
+_MANIFEST_KEY_RE = re.compile(r"^[a-z0-9_]+\Z")
+# Prereq fields become TSV row cells: a tab or newline would inject rows (F11).
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# `core` is the prerequisites pseudo-owner; a package named core would let a
+# manifest masquerade as the immutable platform rows (F11).
+RESERVED_PACKAGE_IDS = {"hub": "reserved platform core and cannot be shadowed",
+                        "core": "the prerequisites pseudo-owner (F11)"}
+
+# Trust/capability contract v1.  This is repository policy, not operator
+# configuration: config shape stays closed and there is deliberately no env or
+# file override.  Empty entries are load-bearing — adding a tenth bundled app
+# without an explicit review must fail parity instead of inheriting privilege.
+CAPABILITY_SCHEMA_VERSION = 1
+LEDGER_CAPABILITIES = frozenset({"rooted-artifact", "system-unit"})
+GRANTABLE_CAPABILITIES = LEDGER_CAPABILITIES
+ELEVATED_CAPABILITIES = GRANTABLE_CAPABILITIES | {"plaintext-redirect"}
+BUNDLE_CERTIFICATIONS = ("dry-run-exec", "strict-config-scan")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BUNDLE_ROOT = REPO_ROOT / "apps"
+PACKAGE_LOCK_PATH = REPO_ROOT / "airlock.lock"
+BUNDLE_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
+    "code-server": (),
+    "dev-monitor": ("rooted-artifact", "system-unit"),
+    "devterm": (),
+    "feedback": (),
+    "markwand": (),
+    "notepad": (),
+    "orca": ("rooted-artifact", "system-unit"),
+    "paseo": (),
+    "publish": (),
+}
+SURFACE_CLASSIFICATIONS = {
+    "rooted-artifact": "elevated-capability",
+    "system-unit": "elevated-capability",
+    "serve-port": "baseline-mediated-mapping",
+    "serve-https": "baseline-mediated-mapping",
+    "plaintext-redirect": "shipped-only-restricted",
+}
+
+
+def _state_dir() -> Path:
+    env = os.environ.get("AIRLOCK_STATE_DIR", "")
+    if env:
+        # Verbatim, like the orchestrator's shell. Even abspath() would
+        # diverge: it collapses `..` lexically, while the shell's open()
+        # resolves any symlink first — same string, two directories.
+        return Path(env)
+    return Path.home() / ".local/state/airlock"
+
+
+def _ledger_path() -> Path:
+    return _state_dir() / "app-ledger.json"
+
+
+PLAINTEXT_RETIREMENT_VERSION = 1
+PLAINTEXT_RETIREMENT_FILENAME = "plaintext-retirement.json"
+
+
+def _plaintext_retirement_path() -> Path:
+    return _state_dir() / PLAINTEXT_RETIREMENT_FILENAME
+
+
+def _load_plaintext_retirement(path: Path) -> dict:
+    """Strict reader for the ledger-independent plaintext cleanup record."""
+    if not os.path.lexists(path):
+        return {"version": PLAINTEXT_RETIREMENT_VERSION, "entries": []}
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("must be a regular non-symlink file")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot parse record: {exc}") from exc
+    if not isinstance(raw, dict) or set(raw) != {"version", "entries"}:
+        raise ValueError("invalid record shape")
+    if raw["version"] != PLAINTEXT_RETIREMENT_VERSION:
+        raise ValueError(f"unsupported record version {raw['version']!r}")
+    entries = raw["entries"]
+    if not isinstance(entries, list):
+        raise ValueError("entries must be a list")
+    normalised = []
+    keys = []
+    for index, entry in enumerate(entries):
+        where = f"entries[{index}]"
+        if (not isinstance(entry, dict)
+                or set(entry) != {"package", "listen", "target", "state"}):
+            raise ValueError(f"{where} has invalid shape")
+        package = entry["package"]
+        listen, target = entry["listen"], entry["target"]
+        state = entry["state"]
+        if not isinstance(package, str) or PACKAGE_ID_RE.fullmatch(package) is None:
+            raise ValueError(f"{where}.package is invalid")
+        if state not in ("intent", "committed"):
+            raise ValueError(f"{where}.state must be intent or committed")
+        for field, value in (("listen", listen), ("target", target)):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+                raise ValueError(f"{where}.{field} is not a port number 1-65535")
+        keys.append((package, listen))
+        normalised.append({"package": package, "listen": listen, "target": target,
+                           "state": state})
+    if keys != sorted(keys) or len(keys) != len(set(keys)):
+        raise ValueError("entries must be sorted and unique by package/listen")
+    return {"version": PLAINTEXT_RETIREMENT_VERSION, "entries": normalised}
+
+
+def _read_plaintext_retirement() -> dict:
+    path = _plaintext_retirement_path()
+    try:
+        return _load_plaintext_retirement(path)
+    except ValueError as exc:
+        die(f"plaintext retirement record is unreadable: {path} ({exc}).\n"
+            "  A corrupt retirement record is NOT treated as empty — it may be "
+            "the only fact naming a persistent plaintext listener. Repair or "
+            "restore the file before continuing.")
+
+
+def _plaintext_retirement_ledger_note() -> str:
+    """Best-effort appendix for a ledger error; never hides the ledger failure."""
+    path = _plaintext_retirement_path()
+    try:
+        record = _load_plaintext_retirement(path)
+    except ValueError as exc:
+        return (f"\n  The independent plaintext retirement record is also "
+                f"unreadable: {path} ({exc}).")
+    entries = record["entries"]
+    if not entries:
+        return ""
+    facts = ", ".join(
+        f"{entry['package']} :{entry['listen']} -> :{entry['target']} ({entry['state']})"
+        for entry in entries)
+    return ("\n  Independent plaintext retirement record still names: " + facts
+            + ". Restore the ledger before continuing; if recovery is impossible, "
+              "these are the plaintext listeners a human must verify and retire.")
+
+
+def _write_plaintext_retirement(record: dict) -> "None":
+    """Atomically replace the cleanup record in the installed-state directory."""
+    path = _plaintext_retirement_path()
+    directory = path.parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        die(f"cannot prepare plaintext retirement record directory {directory}: {exc}", code=2)
+    temp_name = None
+    data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    try:
+        try:
+            os.fsync(directory_fd)
+            with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=directory, prefix=".plaintext-retirement.",
+                    delete=False) as handle:
+                temp_name = handle.name
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+            temp_name = None
+        except OSError as exc:
+            die(f"cannot atomically write plaintext retirement record {path}: {exc}", code=2)
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            # Replacement is the commit point. As with airlock.lock, a failed
+            # rollback would be worse than a loud committed result.
+            log("WARNING: plaintext retirement record was atomically replaced, "
+                f"but directory sync could not be confirmed ({exc}); treating "
+                "the replacement as committed")
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        os.close(directory_fd)
+
+
+def _with_plaintext_retirement_lock(action) -> "None":
+    """Serialize every sidecar mutation with the orchestrator's run lock."""
+    if os.environ.get("AIRLOCK_LEDGER_LOCK_HELD") == "1":
+        action()
+        return
+    ledger_mod = _ledger_module()
+    try:
+        lock_dir = ledger_mod._ensure_state_dir()
+    except ledger_mod.LedgerError as exc:
+        die(f"cannot prepare plaintext retirement lock: {exc}", code=2)
+    lock_path = lock_dir / "app-ledger.lock"
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        die(f"cannot open ledger lock file {lock_path}: {exc}", code=2)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            die(f"another airlock run holds the ledger lock ({lock_path}) — "
+                "re-run when it finishes", code=2)
+        action()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _read_ledger() -> dict:
+    """Fail-closed ledger read: a missing file is the empty ledger, a corrupt
+    one is fatal. Treating garbage as empty would orphan every recorded
+    artifact and re-install over live state (F9a)."""
+    p = _ledger_path()
+    if not p.exists():
+        if p.is_symlink():
+            die(f"installed-state ledger is a dangling symlink: {p}. "
+                "A ledger that cannot be read is NOT treated as empty (F9a) — "
+                "repair or remove the link first."
+                + _plaintext_retirement_ledger_note())
+        # The store version has ONE definition (bin/airlock-ledger's
+        # LEDGER_VERSION); a literal here would go stale at the next bump and
+        # hand callers an empty store the ledger itself would refuse. This
+        # makes even the missing-file fast path depend on the loader, which is
+        # deliberate: an airlock-config that cannot find bin/airlock-ledger
+        # beside it is a broken install, and saying so beats inventing a
+        # version number.
+        return {"version": _ledger_module().LEDGER_VERSION, "entries": {},
+                "events": []}
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError) as e:
+        die(f"installed-state ledger is unreadable: {p} ({e}).\n"
+            "  A corrupt ledger is NOT treated as empty — every recorded artifact "
+            "would be orphaned. Repair or restore the file; `bin/airlock-ledger list` "
+            "shows what a readable one records."
+            + _plaintext_retirement_ledger_note())
+    ledger = _ledger_module()
+    try:
+        # The validator's RETURN VALUE is the store: a file older than the
+        # current LEDGER_VERSION comes back normalised in memory (stamped to
+        # that version, with the fields each step added derived) — consuming
+        # `data` instead would hand callers records whose shape the current
+        # schema no longer has.
+        data = ledger._validate_store(data, p)
+    except ledger.LedgerError as e:
+        die(f"installed-state ledger is malformed: {e}\n"
+            "  A malformed ledger is NOT treated as empty — every recorded artifact "
+            "would be orphaned. Repair or restore the file; `bin/airlock-ledger list` "
+            "shows what a readable one records."
+            + _plaintext_retirement_ledger_note())
+    return data
+
+
+_LEDGER_MODULE = None
+
+
+def _ledger_module():
+    """bin/airlock-ledger loaded as a module: validate must reject exactly
+    what the ledger tools would, and read the store version from where it is
+    defined (one store schema and one version, no drifting copy).
+
+    Loaded once per process. It has nine call sites, one of them inside a
+    per-artifact loop (_rooted_contains) and one now on the missing-ledger
+    fast path, and re-executing a 1900-line module at each of them is pure
+    cost — visible when tens of these run concurrently, which the adopt-write
+    race test does on purpose."""
+    global _LEDGER_MODULE
+    if _LEDGER_MODULE is not None:
+        return _LEDGER_MODULE
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    path = Path(__file__).resolve().parent / "airlock-ledger"
+    loader = SourceFileLoader("_airlock_ledger", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    prior = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True   # a validator must not write __pycache__
+    try:
+        loader.exec_module(mod)
+    except OSError as e:
+        die(f"cannot load the ledger module beside this tool: {path} ({e}).\n"
+            "  airlock-config takes both the store SCHEMA and the store VERSION "
+            "from that file, so a missing or unreadable one is a broken install "
+            "— not an empty ledger. Restore bin/airlock-ledger next to "
+            "bin/airlock-config.")
+    finally:
+        sys.dont_write_bytecode = prior
+    _LEDGER_MODULE = mod
+    return mod
+
+
+def die(msg: str, code: int = 1) -> "None":
+    sys.stderr.write(f"airlock-config: {msg}\n")
+    sys.exit(code)
+
+
+def log(msg: str) -> "None":
+    sys.stderr.write(f"airlock-config: {msg}\n")
+
+
+def find_config() -> Path:
+    # The path is resolved (symlinks included) so a symlinked config and its
+    # target agree on the base directory that relative [packages.*] paths
+    # resolve against (D1).
+    env = os.environ.get("AIRLOCK_CONFIG")
+    if env:
+        p = Path(env).expanduser()
+        if not p.exists():
+            die(f"AIRLOCK_CONFIG points to a missing file: {p}")
+        return p.resolve()
+    # search upward from CWD, then fall back to repo root (parent of bin/)
+    for base in [Path.cwd(), *Path.cwd().parents]:
+        cand = base / "airlock.toml"
+        if cand.exists():
+            return cand.resolve()
+    fallback = Path(__file__).resolve().parent.parent / "airlock.toml"
+    if fallback.exists():
+        return fallback.resolve()
+    die("no airlock.toml found (copy airlock.toml.example and fill it in)")
+
+
+def load() -> dict:
+    path = find_config()
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except ValueError as e:
+        # ValueError, not just tomllib.TOMLDecodeError (a ValueError
+        # subclass): tomllib decodes the bytes as UTF-8 before parsing, so
+        # one invalid byte raises a plain UnicodeDecodeError first — missing
+        # that turned a clean die() into a raw traceback.
+        die(f"{path}: invalid TOML: {e}")
+
+
+def _preflight_config_abi(cfg: dict) -> int:
+    """Validate the operator-file ABI before any command parses packages."""
+    airlock = cfg.get("airlock")
+    if airlock is None:
+        return 1
+    if not isinstance(airlock, dict):
+        die(f"[airlock] must be a table; got {airlock!r}")
+    unknown = sorted(set(airlock) - CLOSED_SECTIONS["airlock"])
+    if unknown:
+        die("unknown key(s) in [airlock]: " + ", ".join(unknown))
+    version = airlock.get("config_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        die(f"[airlock].config_version must be the integer 2; got {version!r}")
+    if version > CONFIG_ABI_VERSION:
+        die(f"config version {version} is newer than this Airlock core supports "
+            f"(maximum {CONFIG_ABI_VERSION}); upgrade the Airlock core before "
+            "using this config")
+    if version != CONFIG_ABI_VERSION:
+        die(f"[airlock].config_version must be the integer 2; got {version!r}")
+    return version
+
+
+def resolved(cfg: dict) -> dict:
+    """Merge defaults into each enabled app table; expand paths.
+
+    A packaged app's defaults come from its manifest's [config.defaults] — a
+    shadowing package REPLACES the built-in schema and defaults, no
+    inheritance (D2). Its [audience] default joins the same merge so env
+    export and webjson see the effective value (D7)."""
+    out = json.loads(json.dumps(cfg))  # deep copy
+    apps = out.setdefault("apps", {})
+    specs = package_specs(cfg)
+    for name, table in list(apps.items()):
+        spec = specs.get(name)
+        if spec is not None:
+            merged = dict(spec["schema"]["defaults"])
+            if spec["audience"] is not None:
+                merged["audience"] = spec["audience"]["default"]
+            merged.update(table or {})
+            apps[name] = merged
+            continue
+        if name not in APP_DEFAULTS:
+            sys.stderr.write(f"airlock-config: warning: unknown app [apps.{name}] "
+                             f"(no defaults; typo?)\n")
+        merged = dict(APP_DEFAULTS.get(name, {}))
+        merged.update(table or {})
+        apps[name] = merged
+    paths = out.setdefault("paths", {})
+    for k in ("code_root", "wiki"):
+        if paths.get(k):
+            paths[k] = str(_expanduser(str(paths[k]), f"paths.{k}"))
+    return out
+
+
+def identity_header(cfg: dict) -> str:
+    provider = cfg.get("auth", {}).get("provider")
+    if provider not in PROVIDER_HEADER:
+        die(f"auth.provider must be one of {sorted(PROVIDER_HEADER)} in v1 "
+            f"(got {provider!r}). An arbitrary header is spoofable — see SECURITY.md.")
+    return PROVIDER_HEADER[provider]
+
+
+def cmd_validate(cfg: dict) -> "None":
+    _validate_shape(cfg)   # first: everything below assumes tables are tables
+    auth = cfg.get("auth", {})
+    if not auth:
+        die("missing [auth] section")
+    identity_header(cfg)  # enforces provider == tailscale (fail-closed)
+    owner = auth.get("owner", "")
+    if not isinstance(owner, str) or "@" not in owner:
+        die(f"auth.owner must be a login (email-like); got {owner!r}")
+    apps = cfg.get("apps", {})
+    if "hub" not in apps:
+        die("[apps.hub] is required (the entrance)")
+    # Validator order, fixed (D2): manifest parse -> PackageSpec -> effective
+    # schema per app id -> resolved config -> key/type/port/artifact checks.
+    specs = package_specs(cfg)
+    for name in apps:
+        if name not in APP_DEFAULTS and name not in specs:
+            # Child 4/P3: all nine built-ins are shipped packages now, so an
+            # [apps.X] table that resolves to neither hub nor a package
+            # (shipped or explicit) is never a not-yet-migrated built-in —
+            # it can only be a typo or a genuinely missing manifest/package
+            # line. Both used to be a warning during the migration window
+            # (an unmigrated built-in legitimately had no package yet); that
+            # window is over, so this is now fatal.
+            die(f"unknown app [apps.{name}]: no built-in, no shipped manifest "
+                f"at apps/{name}/airlock-app.toml, and no [packages.{name}] "
+                f"— configure [packages.{name}].path to point at its "
+                f"manifest, or remove [apps.{name}] if this was a typo.")
+    _validate_keys(cfg)
+    _warn_deprecated_config(cfg, specs)
+    _validate_code_root(cfg)
+    _validate_ports(cfg)
+    _validate_plaintext_retirement_intents(cfg)
+    _read_ledger()          # F9a: a corrupt ledger fails validate, loudly
+    packages_resolved(cfg)  # D1/D2: serve values, port spans, disjointness
+    app_order(cfg)          # D3/F5: missing dep and cycles surface at validate
+    # AIRLOCK_STRICT_CONFIG_SCAN=1 promotes the scan's LITERAL findings to fatal,
+    # for shipped packages only. It is off by default and on in CI: an operator
+    # validating their own config should not be blocked by a lint about a package
+    # they did not write, and an external package author should not be blocked at
+    # all (see _scan_config_reads).
+    strict_scan = os.environ.get("AIRLOCK_STRICT_CONFIG_SCAN") == "1"
+    for pid, spec in specs.items():   # F12: declared vs actually-read keys
+        _scan_config_reads(pid, Path(spec["dir"]), spec["schema"],
+                           spec["audience"],
+                           strict=(strict_scan and
+                                   "strict-config-scan" in spec["certifications"]))
+    print("ok: config valid")
+
+
+def _validate_shape(cfg: dict) -> "None":
+    """Sections are tables, and there are no sections we do not read.
+
+    Runs before every other check: `auth = 1` used to reach `.get()` and surface a
+    traceback. An unknown SECTION is a typo just like an unknown key — `[brandng]`
+    would otherwise validate and leave the product name silently at its default.
+    """
+    for section, val in cfg.items():
+        if not isinstance(val, dict):
+            die(f"[{section}] must be a table; got {val!r}")
+    known = set(CLOSED_SECTIONS) | {"apps", "packages"}
+    unknown = sorted(s for s in cfg if s not in known)
+    if unknown:
+        die("unknown config section(s): " + ", ".join(f"[{s}]" for s in unknown)
+            + f"\n  Airlock reads only {sorted(known)}. A section it does not read "
+              "is a typo, and its contents are silently ignored.")
+    for name, table in (cfg.get("apps") or {}).items():
+        _validate_app_name(name)
+        if not isinstance(table, dict):
+            die(f"[apps.{name}] must be a table; got {table!r}")
+
+
+def _validate_app_name(name: str) -> "None":
+    if not isinstance(name, str) or APP_NAME_RE.fullmatch(name) is None:
+        die(f"invalid app table name {name!r}; use letters, digits, '.', '_', or '-'")
+
+
+def _validate_keys(cfg: dict) -> "None":
+    """Unknown key = typo = die. Retired key = loud warning + how to fix.
+
+    A typo must not survive: an unknown key falls back to a default silently, so
+    `messages` mistyped disables a feature and `https_port` mistyped moves a port
+    while the config still reads as if it had been set. An unknown APP TABLE is
+    fatal too (child 4/P3: cmd_validate's own loop dies on it before this function
+    is even reached — there is no local/custom-app escape hatch anymore; every
+    [apps.X] must resolve to hub or a package, shipped or explicit).
+    """
+    retired = []
+    for dotted, why in RETIRED_KEYS.items():
+        section, _, rest = dotted.partition(".")
+        if section == "apps":
+            # apps.<app>.<key> — an app key lives one level deeper, and the loops below
+            # would otherwise call it a typo and die. Retiring an app key has to reach
+            # the same operator the two-token form does.
+            app, _, key = rest.partition(".")
+            if key in ((cfg.get("apps") or {}).get(app) or {}):
+                retired.append(f"  {dotted} {why}")
+            continue
+        if rest in (cfg.get(section) or {}):
+            retired.append(f"  {dotted} {why}")
+    if retired:
+        sys.stderr.write("airlock-config: warning: retired config key(s):\n"
+                         + "\n".join(retired) + "\n")
+
+    unknown = []
+    for section, known in CLOSED_SECTIONS.items():
+        for key in cfg.get(section) or {}:
+            if key not in known and f"{section}.{key}" not in RETIRED_KEYS:
+                unknown.append(f"{section}.{key}")
+    specs = package_specs(cfg)
+    for name, table in (cfg.get("apps") or {}).items():
+        spec = specs.get(name)
+        if spec is not None:
+            # Packaged app: the manifest's [config] IS the schema — same
+            # fail-closed rules as built-ins, fed by the effective schema
+            # (a shadowing package REPLACES the built-in row, D2).
+            schema = spec["schema"]
+            allowed = set(schema["defaults"]) | set(schema["required"]) | COMMON_APP_KEYS
+            if spec["audience"] is not None:
+                allowed.add("audience")
+            for key, val in (table or {}).items():
+                if isinstance(val, dict):
+                    if key not in schema["tables"]:
+                        unknown.append(f"apps.{name}.{key} (table)")
+                    else:
+                        for nk in val:
+                            if nk not in schema["tables"][key]:
+                                unknown.append(f"apps.{name}.{key}.{nk}")
+                    continue
+                if key in schema["tables"]:
+                    die(f"apps.{name}.{key} must be a table ([apps.{name}.{key}] "
+                        "per the manifest schema), not a scalar — a scalar here "
+                        "would shadow the table the installer reads")
+                if key not in allowed and f"apps.{name}.{key}" not in RETIRED_KEYS:
+                    unknown.append(f"apps.{name}.{key}")
+            continue
+        if name not in APP_DEFAULTS:
+            # Unreachable for a genuinely unknown app: cmd_validate's own loop
+            # already died on it (fatal, child 4/P3) before calling this
+            # function. Kept as defense-in-depth, not a live escape hatch.
+            continue
+        allowed = set(APP_DEFAULTS[name]) | COMMON_APP_KEYS
+        for key, val in table.items():
+            if isinstance(val, dict):
+                # hub — the only APP_DEFAULTS survivor (child 4/P3: every
+                # nested-table app, e.g. publish's public_target, is a shipped
+                # package now and validated through its manifest schema
+                # above) — has no nested tables of its own, so a table value
+                # here is always a typo.
+                unknown.append(f"apps.{name}.{key} (table)")
+                continue
+            if key not in allowed and f"apps.{name}.{key}" not in RETIRED_KEYS:
+                unknown.append(f"apps.{name}.{key}")
+    if unknown:
+        die("unknown config key(s): " + ", ".join(sorted(unknown))
+            + "\n  A key Airlock does not read is a typo, and a typo silently keeps "
+              "the default. Fix or remove it; see airlock.toml.example.")
+    _validate_packaged_types(cfg, specs)
+
+
+def _warn_deprecated_config(cfg: dict, specs: dict, only_app: str | None = None) -> "None":
+    """Emit manifest-owned migration warnings once per CLI invocation."""
+    configured_apps = cfg.get("apps") or {}
+    for pid, spec in sorted(specs.items()):
+        if only_app is not None and pid != only_app:
+            continue
+        table = configured_apps.get(pid) or {}
+        for key, metadata in sorted(spec["schema"]["deprecated"].items()):
+            value = table.get(key)
+            configured = bool(value.strip()) if isinstance(value, str) else bool(value)
+            if not configured:
+                continue
+            replacement = metadata["replacement"]
+            remove_after = metadata["remove_after"]
+            sys.stderr.write(
+                f"airlock-config: warning: apps.{pid}.{key} is deprecated; "
+                f"use apps.{pid}.{replacement}; remove the legacy key by "
+                f"{remove_after}\n")
+
+
+def _validate_packaged_types(cfg: dict, specs: dict) -> "None":
+    """Required-key presence and per-key TOML type for packaged apps (D2).
+
+    The manifest declares each key's type (required keys explicitly, defaulted
+    keys by the default value's own type). A mistyped value would flow into
+    env export and the installer as the wrong shape — fail at validate, like
+    every other schema violation."""
+    for name, spec in specs.items():
+        table = (cfg.get("apps") or {}).get(name) or {}
+        schema = spec["schema"]
+        for key, typ in schema["required"].items():
+            if key not in table:
+                die(f"apps.{name}.{key} is required by the package manifest "
+                    f"(type {typ}) and has no default — set it in [apps.{name}]")
+        for key, val in table.items():
+            if isinstance(val, dict):
+                continue   # nested tables: membership checked above
+            if key in schema["required"]:
+                want = schema["required"][key]
+            elif key in schema["defaults"]:
+                d = schema["defaults"][key]
+                want = ("boolean" if isinstance(d, bool)
+                        else "integer" if isinstance(d, int) else "string")
+            elif key == "audience" and spec["audience"] is not None:
+                if val not in spec["audience"]["supported"]:
+                    die(f"apps.{name}.audience must be one of "
+                        f"{spec['audience']['supported']} (the manifest's "
+                        f"supported audiences, D7); got {val!r}")
+                continue
+            else:
+                continue   # COMMON_APP_KEYS — membership already enforced
+            expect = _TYPE_NAMES[want]
+            if expect is bool:
+                ok = isinstance(val, bool)
+            elif expect is int:
+                ok = isinstance(val, int) and not isinstance(val, bool)
+            else:
+                ok = isinstance(val, str)
+            if not ok:
+                die(f"apps.{name}.{key} must be a {want} (declared by the "
+                    f"package manifest); got {val!r}")
+
+
+def _validate_code_root(cfg: dict) -> "None":
+    """[apps.markwand] serves code_root — so it must be stated, never guessed.
+
+    Markwand hands markserv (read) and filebrowser (write) this directory. It is
+    the file surface the owner AND every collaborator get, so it is not something
+    an installer may pick on the operator's behalf.
+    """
+    if "markwand" not in (cfg.get("apps", {}) or {}):
+        return
+    raw = (cfg.get("paths", {}) or {}).get("code_root")
+    hint = ("\n  [apps.markwand] serves this directory to the owner and every "
+            "collaborator, read AND write — it must be stated, not guessed.\n"
+            "  Older versions silently defaulted to ~/code: set "
+            'code_root = "~/code" to keep that. See SECURITY.md.')
+    if raw is None:
+        die("[apps.markwand] is enabled but [paths].code_root is not set." + hint)
+    if not isinstance(raw, str) or not raw.strip():
+        die(f"[paths].code_root must be a non-empty path string; got {raw!r}." + hint)
+    root = _expanduser(raw.strip(), "paths.code_root")
+    if not root.is_absolute():
+        die(f"[paths].code_root must be absolute (or ~-relative); got {raw!r}."
+            "\n  A relative path resolves against whatever directory the service "
+            "happens to start in.")
+    _warn_wide_code_root(cfg, root)
+
+
+def _expanduser(raw: str, where: str) -> Path:
+    """`~` expansion that reports a bad path instead of raising.
+
+    `~nosuchuser/code` — an easy typo — makes pathlib raise RuntimeError, which
+    would surface as a traceback: the opposite of what this validator is for.
+    """
+    try:
+        return Path(raw).expanduser()
+    except (RuntimeError, OSError) as e:
+        die(f"{where}: cannot expand {raw!r} ({e}). "
+            "Use an absolute path, or a `~` that names a real user.")
+        raise  # unreachable; die() exits
+
+
+def _warn_wide_code_root(cfg: dict, root: Path) -> "None":
+    """Best-effort nudge, not a boundary check.
+
+    If collaborators are configured and code_root is the home directory (or an
+    ancestor of it), every dotfile and credential under it is theirs to read and
+    edit. This is a lexical/realpath heuristic — it cannot see through a bind
+    mount (the Docker path mounts an arbitrary host dir at /code), so a clean
+    result proves nothing.
+    """
+    if not (cfg.get("auth", {}) or {}).get("collaborators"):
+        return
+    try:
+        root_r = root.resolve()
+        home_r = Path.home().resolve()   # RuntimeError when HOME is unset
+    except (RuntimeError, OSError, ValueError):   # ValueError: NUL in the path
+        return
+    if root_r == home_r or root_r in home_r.parents:
+        sys.stderr.write(
+            f"airlock-config: warning: [paths].code_root = {root} covers the home "
+            f"directory, and [auth].collaborators is not empty.\n"
+            "  Collaborators get read+write on everything under it (~/.ssh, ~/.config, "
+            "tokens), and the viewer reads through symlinks that leave it.\n"
+            "  Point it at a project directory instead. See SECURITY.md.\n")
+
+
+def _validate_ports(cfg: dict) -> "None":
+    """Every *_port across enabled apps must be a distinct, valid port.
+
+    Not cosmetic: two nginx `server`s on one loopback port both match
+    `server_name _`, so nginx silently keeps the FIRST and drops the second. If a
+    redirect_port collided with a gate_port, the plaintext tailnet port would land
+    back on the gate and serve content — and the trusted identity header — in the
+    clear, which is exactly the hole this config is supposed to close. Fail loudly
+    at validate time instead.
+    """
+    seen: dict = {}
+    for app, table in sorted(resolved(cfg).get("apps", {}).items()):
+        for key, val in sorted((table or {}).items()):
+            if not key.endswith("_port"):
+                continue
+            if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 65535:
+                die(f"apps.{app}.{key} must be a port number 1-65535 (got {val!r})")
+            if val in seen:
+                other = seen[val]
+                die(f"port {val} is used twice: apps.{other} and apps.{app}.{key}. "
+                    f"Ports must be unique — a collision makes nginx drop one server "
+                    f"block silently. See SECURITY.md.")
+            seen[val] = f"{app}.{key}"
+    # Packaged serve values join the same pool: a serve key not ending in
+    # _port (the grammar allows any [a-z0-9_]+ name) must not dodge the
+    # sweep, and 443 is the platform's TLS entrypoint, never an app's.
+    for pid, pkg in sorted(packages_resolved(cfg).items()):
+        for key, val in sorted(pkg["serve_port_values"].items()):
+            if val == 443:
+                die(f"packages.{pid} serve key {key!r} claims port 443 — the "
+                    "platform's TLS entrypoint is never an app's serve port.")
+            if key.endswith("_port"):
+                continue   # already swept above as apps.{pid}.{key}
+            if val in seen:
+                die(f"port {val} is used twice: apps.{seen[val]} and "
+                    f"packages.{pid} serve key {key!r}. Ports must be unique.")
+            seen[val] = f"{pid}.{key} (serve)"
+        # Declared port spans: ports base..base+count-1 ALL enter the global
+        # uniqueness pool, not just the declared scalar (D2). The base scalar
+        # itself may already be in the pool under this app's own key — that
+        # one self-claim is the span's anchor, not a collision.
+        for base_key, base, count in pkg["port_span_values"]:
+            for v in range(base, base + count):
+                if v == 443:
+                    die(f"packages.{pid} port span {base_key}[{count}] covers "
+                        "port 443 — the platform's TLS entrypoint is never an "
+                        "app's port.")
+                prev = seen.get(v)
+                # The exemption names the SCALAR anchor forms only — a port
+                # already owned by another span ("(span)") is never exempt,
+                # so span-vs-span overlap dies even inside one package
+                # (duplicate bases are also rejected at the schema).
+                anchors = (f"{pid}.{base_key}", f"{pid}.{base_key} (serve)")
+                if prev is not None and prev not in anchors:
+                    die(f"port {v} is used twice: apps.{prev} and "
+                        f"packages.{pid} port span {base_key}[{count}] "
+                        f"(base {base}). Ports must be unique.")
+                seen[v] = f"{pid}.{base_key} (span)"
+
+
+def _artifact_roots() -> dict:
+    """Absolute roots each artifact class expands under, canonicalised with
+    realpath: two roots that alias the same directory through a symlink must
+    collide in claim space, or disjointness would let two apps own one real
+    path. Env-overridable the same way the test suites already override
+    WEBROOT/CONFD, so fixtures never touch the real system."""
+    def real(raw) -> Path:
+        # expanduser() before realpath(), matching bin/airlock-ledger's
+        # _real_root exactly — otherwise AIRLOCK_WEBROOT=~/hub resolves to
+        # two DIFFERENT anchors depending on which file computed it (config
+        # would treat the literal "~" as a directory name component;
+        # realpath does not understand shell tilde expansion on its own).
+        return Path(os.path.realpath(os.path.expanduser(str(raw))))
+    return {
+        "unit_user": real(os.environ.get("AIRLOCK_UNIT_DIR_USER", "").strip()
+                          or (Path.home() / ".config/systemd/user")),
+        "unit_system": real(os.environ.get("AIRLOCK_UNIT_DIR_SYSTEM", "").strip()
+                            or "/etc/systemd/system"),
+        "confd": real(os.environ.get("AIRLOCK_CONFD", "").strip()
+                      or "/etc/airlock/nginx"),
+        "webroot": real(os.environ.get("AIRLOCK_WEBROOT", "").strip()
+                        or "/opt/airlock/hub"),
+        "home": real(Path.home()),
+    }
+
+
+def _validate_artifacts(pid: str, raw) -> tuple[dict, dict]:
+    """[artifacts] grammar, fail-closed per class. Returns all five classes
+    (missing ones as empty lists)."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        die(f"package '{pid}': [artifacts] must be a table; got {raw!r}")
+    unknown = sorted(k for k in raw if k not in ARTIFACT_CLASSES)
+    if unknown:
+        die(f"package '{pid}': unknown [artifacts] key(s): {', '.join(unknown)}. "
+            f"Classes are {list(ARTIFACT_CLASSES)} — we validate what we read.")
+    out = {}
+    unit_scopes = {}
+    for cls in ARTIFACT_CLASSES:
+        vals = raw.get(cls, [])
+        if not isinstance(vals, list):
+            die(f"package '{pid}': artifacts.{cls} must be a list of non-empty strings")
+        if cls == "units":
+            names = []
+            for v in vals:
+                if isinstance(v, str) and v.strip():
+                    name, scope = v.strip(), "user"
+                elif (isinstance(v, dict) and set(v) == {"name", "scope"}
+                      and isinstance(v.get("name"), str) and v["name"].strip()
+                      and v.get("scope") in ("user", "system")):
+                    name, scope = v["name"].strip(), v["scope"]
+                else:
+                    die(f"package '{pid}': artifacts.units entries must be bare names or {{name, scope}} (user|system)")
+                if name in unit_scopes:
+                    die(f"package '{pid}': artifacts.units declares {name!r} more than once (including across scopes)")
+                names.append(name); unit_scopes[name] = scope
+            out[cls] = names
+        else:
+            if any(not isinstance(v, str) or not v.strip() for v in vals):
+                die(f"package '{pid}': artifacts.{cls} must be a list of non-empty strings")
+            out[cls] = [v.strip() for v in vals]
+    for name in out["units"]:
+        if ("/" in name or name in (".", "..")
+                or name.startswith("-") or "**" in name
+                or not name.endswith(UNIT_SUFFIXES)
+                or _WILDCARD_RE.search(name)):
+            # Literal names only (contract decision, child 4 round 5): every
+            # unit the nine built-ins create is a literal (including the
+            # @-template forms, e.g. airlock-code-server@.service — the "@"
+            # is not a glob character), so nothing in P2 needs a pattern.
+            # Allowing one is actively dangerous, not just unneeded: a
+            # glob-shaped name wedges commit permanently (unit_scopes is
+            # keyed by expanded basenames, which a pattern never equals),
+            # and a name like "*.service" globs the ENTIRE system unit dir
+            # at teardown — reproduced disabling and removing nginx.service
+            # and sshd.service on a scratch box.
+            die(f"package '{pid}': artifacts.units entry {name!r} must be a bare "
+                f"unit file name ending in one of {list(UNIT_SUFFIXES)} (and not "
+                "option-like, and not a glob — '*', '?', '[' are fatal here) — "
+                "anything else could resolve outside the unit directories or "
+                "confuse systemctl")
+    for cls in ("fragments", "webroot"):
+        for p in out[cls]:
+            segs = [s for s in p.split("/") if s]
+            if p.startswith("/") or any(s in (".", "..") for s in segs) or not segs:
+                die(f"package '{pid}': artifacts.{cls} entry {p!r} must be a "
+                    "relative path with no '.' or '..' segments (it expands under "
+                    "the platform-owned root; escapes are exactly what the "
+                    "declaration exists to prevent)")
+            if cls == "webroot" and segs[0] == "assets":
+                die(f"package '{pid}': artifacts.webroot entry {p!r} — "
+                    "'assets' is platform-managed (hub assets, and the staged "
+                    "icon directories under assets/apps/<id>) and is never "
+                    "manifest-claimable directly (F4)")
+            if any(c in seg for seg in segs[:-1] for c in "*?["):
+                die(f"package '{pid}': artifacts.{cls} entry {p!r} — glob "
+                    "characters are only allowed in the final segment (a "
+                    "wildcard directory cannot be checked for ownership "
+                    "before it exists)")
+            if "**" in p:
+                die(f"package '{pid}': artifacts.{cls} entry {p!r} — recursive "
+                    "globs are not part of the artifact grammar (they descend "
+                    "through symlinked directories, escaping the claim space)")
+    for p in out["files"]:
+        if not (p.startswith("/") or p.startswith("~")):
+            die(f"package '{pid}': artifacts.files entry {p!r} must be absolute "
+                "or ~-prefixed")
+        if any(s in (".", "..") for s in p.split("/")):
+            die(f"package '{pid}': artifacts.files entry {p!r} must not contain "
+                "'.' or '..' segments ('.' aliases the parent — ~/. is the "
+                "whole home)")
+        if any(c in seg for seg in p.split("/")[:-1] for c in "*?["):
+            die(f"package '{pid}': artifacts.files entry {p!r} — glob characters "
+                "are only allowed in the final segment (a wildcard directory "
+                "cannot be checked for ownership before it exists)")
+        if "**" in p:
+            die(f"package '{pid}': artifacts.files entry {p!r} — recursive globs "
+                "are not part of the artifact grammar")
+        if p.startswith("~") and (not p.startswith("~/") or not p[2:].strip("/")):
+            die(f"package '{pid}': artifacts.files entry {p!r} — only ~/<path> "
+                "is supported (a named user's home is not ours to claim, and "
+                "the whole home is not an artifact)")
+    roots = _artifact_roots()
+    webroot_parent = str(Path(roots["webroot"]).parent)
+    # The dynamic anchor is validated before it can authorize anything: a
+    # webroot that collapses webroot_parent to "/" (or one level narrower,
+    # e.g. "/opt") must not silently authorize a whole top-level directory.
+    # The rule (and its denylist floor) is bin/airlock-ledger's
+    # _rooted_dynamic_anchor_forbidden — used here only to build the hint
+    # text below; the actual admission decision never re-derives it.
+    webroot_parent_forbidden = _ledger_module()._rooted_dynamic_anchor_forbidden(webroot_parent)
+    for p in out["rooted"]:
+        expanded = p.replace("${webroot_parent}", webroot_parent)
+        if not os.path.isabs(expanded) or any(s in (".", "..") for s in expanded.split("/")):
+            die(f"package '{pid}': artifacts.rooted entry {p!r} must be absolute after ${'{'}webroot_parent{'}'} substitution with no '.' or '..' segments")
+        if any(c in seg for seg in expanded.split("/")[:-1] for c in "*?[") or "**" in expanded:
+            die(f"package '{pid}': artifacts.rooted entry {p!r} permits globs only in the final segment (no **)")
+        # Containment is checked through bin/airlock-ledger's OWN
+        # _rooted_contains, loaded through the same _ledger_module() loader
+        # _read_ledger already uses for the store schema — not a hand-copied
+        # reimplementation of its anchor/prefix logic. A prior copy here
+        # (matching _rooted_contains line for line, including the trailing
+        # `+ os.sep` that refuses a sibling like "/opt/airlock-backup") had
+        # drifted invisibly from the ledger's version: a mutation-testing
+        # pass could delete the ledger's boundary and this file's own copy
+        # would still refuse the near-miss for the wrong reason, masking
+        # the regression (round-5 addendum, DEFECT 3).
+        if not _ledger_module()._rooted_contains(expanded):
+            hint = ("" if not webroot_parent_forbidden else
+                    " — the current webroot's parent is a protected system directory, "
+                    "so ${webroot_parent} grants no authority here; move the webroot to "
+                    "a deeper path, or manage this artifact by hand")
+            die(f"package '{pid}': artifacts.rooted entry {p!r} is outside the rooted allowlist{hint}")
+    for k in out["serve_ports"]:
+        if _SERVE_KEY_RE.fullmatch(k) is None:
+            die(f"package '{pid}': artifacts.serve_ports entry {k!r} is not a "
+                "config key name ([a-z0-9_]+)")
+    return out, unit_scopes
+
+
+def _validate_mappings(pid: str, raw, declared: set[str], arts: dict) -> dict:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict) or set(raw) - set(_SERVE_KEYS):
+        _mf_die(pid, f"[serve] may contain only {list(_SERVE_KEYS)}")
+    https = raw.get("https", {})
+    if not isinstance(https, dict):
+        _mf_die(pid, "[serve.https] must be a table")
+    mappings = {}
+    for key, target in https.items():
+        if key not in declared or not isinstance(target, str) or target not in declared:
+            _mf_die(pid, "serve.https keys and targets must name declared config keys")
+        if key not in arts["serve_ports"]:
+            _mf_die(pid, f"serve.https key '{key}' must be declared in artifacts.serve_ports")
+        mappings[key] = {"mode": "https", "target_key": target}
+    return mappings
+
+
+def _validate_plaintext_redirect(pid: str, raw, declared: set[str]) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        _mf_die(pid, "[plaintext_redirect] must be a table")
+    if any(k not in declared or not isinstance(v, str) or v not in declared for k, v in raw.items()):
+        _mf_die(pid, "plaintext_redirect keys and targets must name declared config keys")
+    self_redirect = sorted(k for k, v in raw.items() if k == v)
+    if self_redirect:
+        # The SAME declared key on both sides means listen == target always
+        # (Minor N2) — a redirect loop (`tailscale serve --http=X
+        # http://127.0.0.1:X`), fatal regardless of what value the key
+        # resolves to (no config values are needed to see this: it is the
+        # same key).
+        _mf_die(pid, f"plaintext_redirect key(s) {self_redirect} redirect to "
+                     "themselves (public == redirect) — that pairs one listen "
+                     "with itself as its own target")
+    return dict(raw)
+
+
+def _walk_special_files(pid: str, pdir: Path) -> "None":
+    """D6: any file that is not a regular file, directory, or symlink is fatal
+    at validate — the digest serialization cannot represent it, and finding
+    that out immediately before install would be the late failure this early
+    gate exists to prevent. (The digest step re-checks; validate is the early
+    gate, not the only one.)"""
+    for base, dirs, files in os.walk(pdir):
+        for name in dirs + files:
+            p = Path(base) / name
+            st = p.lstat()
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)
+                    or stat.S_ISLNK(st.st_mode)):
+                die(f"package '{pid}': {p} is a special file (FIFO/socket/device); "
+                    "packages may contain only regular files, directories, and "
+                    "symlinks (D6 digest serialization)")
+
+
+def _may_overlap(a: str, b: str) -> bool:
+    """Conservative glob-overlap test on absolute patterns, segment-wise.
+
+    Two patterns are DISJOINT only when some segment position holds two
+    wildcard-free literals that differ. Everything else — wildcard vs
+    anything, equal prefixes with one pattern shorter (containment) — is
+    treated as overlapping. Sound but over-approximate on purpose: exact glob
+    intersection is expensive, bidirectional fnmatch is unsound
+    (`foo/a*` vs `foo/*b` both match `foo/ab` yet fnmatch each other false),
+    and fail-closed over-rejection just asks for distinct literal prefixes.
+    """
+    sa = [s for s in a.split("/") if s]
+    sb = [s for s in b.split("/") if s]
+    for x, y in zip(sa, sb):
+        if not _WILDCARD_RE.search(x) and not _WILDCARD_RE.search(y) and x != y:
+            return False
+    return True
+
+
+def _pattern_claims(arts: dict, roots: dict, unit_scopes: dict | None = None) -> list:
+    """Map declared patterns into resolved-root space so classes cannot alias
+    each other (a `fragments` entry and a `files` entry naming the same real
+    path collide here, not at commit time).
+
+    Units are scope-aware (child 4): a name declared `scope: user` claims
+    only the user unit path, not both — the ledger's own expansion is
+    already scope-aware (it resolves only the declared scope), so claiming
+    both paths here would make two apps that legitimately declare the same
+    basename under DIFFERENT scopes collide at validate even though nothing
+    would ever actually collide on disk. `unit_scopes` absent, or a name
+    missing from it, defaults to "both" (today's dual-probe, matching a
+    legacy record with no scope information at all)."""
+    claims = []
+    for name in arts.get("units", []):
+        scope = (unit_scopes or {}).get(name, "both")
+        if scope in ("user", "both"):
+            claims.append(_canon_claim(str(roots["unit_user"] / name)))
+        if scope in ("system", "both"):
+            claims.append(_canon_claim(str(roots["unit_system"] / name)))
+    for p in arts.get("fragments", []):
+        claims.append(_canon_claim(str(roots["confd"] / p)))
+    for p in arts.get("webroot", []):
+        claims.append(_canon_claim(str(roots["webroot"] / p)))
+    home = str(roots.get("home") or Path.home())
+    for p in arts.get("files", []):
+        q = str(p)
+        if q.startswith("~/"):
+            # ~ means the home these roots describe (an intent's recorded
+            # home during repair), not whoever runs validate today. The
+            # grammar guarantees a non-empty remainder.
+            q = os.path.join(home, q[2:].lstrip("/"))
+        claims.append(_canon_claim(q))
+    for p in arts.get("rooted", []):
+        q = str(p).replace("${webroot_parent}", str(Path(roots["webroot"]).parent))
+        claims.append(_canon_claim(q))
+    return claims
+
+
+def _may_contain(container: str, path: str) -> bool:
+    """Could `container` (a claim, possibly with final-segment wildcards)
+    equal or be an ancestor of `path` (a literal)? Conservative: a wildcard
+    segment may match anything."""
+    c_segs = [s for s in container.split("/") if s]
+    p_segs = [s for s in path.split("/") if s]
+    if len(c_segs) > len(p_segs):
+        return False
+    return all(_WILDCARD_RE.search(c) or c == p
+               for c, p in zip(c_segs, p_segs))
+
+
+def _canon_claim(p: str) -> str:
+    """One claim space (mirrors airlock-ledger's canonical records): the real
+    parent directory plus the entry's own name — a symlink alias collides
+    with the real path, but a claimed symlink is never resolved to its
+    target. Trailing slashes are stripped first (mirrors the ledger), or
+    `/x/link/` would resolve the leaf while `/x/link` keeps it."""
+    p = p.rstrip("/") or "/"
+    parent = os.path.dirname(p) or "/"
+    return os.path.join(os.path.realpath(parent), os.path.basename(p))
+
+
+def _recorded_claims(ledger: dict, skip_id: str, roots: dict):
+    """(path_claims, serve_ports) recorded under every id except skip_id —
+    committed expansions are literal paths, intent declarations are patterns;
+    both compare under the same conservative rule."""
+    paths, ports = [], set()
+    for rid, ent in (ledger.get("entries") or {}).items():
+        if rid == skip_id or not isinstance(ent, dict):
+            continue
+        rec = ent.get("committed")
+        if isinstance(rec, dict):
+            arts = rec.get("artifacts") or {}
+            for cls in ("units", "fragments", "webroot", "files", "rooted"):
+                # Canonicalised for comparison so a record written through an
+                # alias still collides with a claim on the real path.
+                paths.extend((rid, _canon_claim(str(p))) for p in arts.get(cls, []))
+            ports.update((rid, int(p)) for p in arts.get("serve_ports", []))
+        rec = ent.get("intent")
+        if isinstance(rec, dict):
+            decl = rec.get("artifacts_declared") or {}
+            rroots = rec.get("roots") or {}
+            # The intent's declaration meant the roots recorded AT INTENT
+            # TIME — claims must live where the crashed install wrote.
+            iroots = ({k: Path(rroots[k]) for k in
+                       ("unit_user", "unit_system", "confd", "webroot", "home")
+                       if k in rroots}
+                      if rroots else roots)
+            paths.extend((rid, c) for c in _pattern_claims(decl, iroots, rec.get("unit_scopes")))
+            ports.update((rid, int(v))
+                         for v in (rec.get("serve_port_values") or {}).values())
+    return paths, ports
+
+
+def _builtin_plaintext_ports(cfg: dict, pkgs: dict) -> set:
+    """Listen ports the built-in plaintext sweep will map (hub's 9999 and any
+    configured http_port/public_port on a non-packaged app)."""
+    ports = set()
+    for name, table in resolved(cfg).get("apps", {}).items():
+        if name in pkgs or not (table or {}).get("redirect_port"):
+            continue
+        for k in _PLAINTEXT_PORT_KEYS:
+            v = (table or {}).get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                ports.add(v)
+                break
+    return ports
+
+
+def _platform_state_claims(roots: dict) -> list:
+    """The platform's own always-owned claims — the ledger's state directory
+    and the hub's fixed webroot entries — that no app artifact may ever
+    overlap. Factored out of _validate_disjoint (child 4/P4) so the
+    known-builtin adoption admission predicate (_known_builtin_admission)
+    compares against the EXACT same set, not a hand-copied one that could
+    drift from it."""
+    claims = [(os.path.realpath(str(_state_dir())),
+              "state directory (the ledger and its lock)")]
+    for sub in ("assets", "index.html", "wrong-owner.html", "__airlock.json"):
+        claims.append((_canon_claim(str(roots["webroot"] / sub)),
+                       f"hub-owned webroot entry {sub}"))
+    return claims
+
+
+def _validate_disjoint(pkgs: dict, cfg: dict) -> "None":
+    """D2: declared ownership must be exclusive — against every other
+    configured package AND every ledger/journal record under a different id
+    (same id exempt: that is the upgrade path), and never the platform's own
+    state directory or plaintext listen ports."""
+    if not pkgs:
+        return
+    roots = _artifact_roots()
+    ledger = _read_ledger()
+    mine = {pid: _pattern_claims(p["artifacts"], roots, p.get("unit_scopes")) for pid, p in pkgs.items()}
+    # plaintext_redirect ports (public AND redirect) join the SAME ownership
+    # pool as serve ports (Major N1): the intra-app check in
+    # packages_resolved stops at this package's own boundary, so without
+    # this, a distinct package's redirect public port — or the built-in
+    # registry's (hub's 9999, e.g.) — was invisible to every check below.
+    serve = {pid: set(p["serve_port_values"].values()) | set(p.get("plaintext_redirect_ports") or [])
+            for pid, p in pkgs.items()}
+    ids = sorted(pkgs)
+    # (The $CONFD include dirs are deliberately NOT claimed: app fragments
+    # live inside them by contract — ownership there is per file.)
+    platform_claims = _platform_state_claims(roots)
+    builtin_ports = _builtin_plaintext_ports(cfg, pkgs)
+    root_paths = sorted({os.path.realpath(str(r)) for r in roots.values()})
+    # F4 carve-out: assets/apps/<id> is platform-managed PER APP — the one
+    # synthetic claim the platform itself stages an icon into. Everything
+    # else under assets stays hub-owned and never manifest-claimable.
+    icon_exempt = {pid: _canon_claim(str(roots["webroot"] / f"assets/apps/{pid}"))
+                   for pid, p in pkgs.items() if p.get("icon") is not None}
+    assets_claim = _canon_claim(str(roots["webroot"] / "assets"))
+    for pid in ids:
+        for ca in mine[pid]:
+            for claim, what in platform_claims:
+                if claim == assets_claim and ca == icon_exempt.get(pid):
+                    continue
+                if _may_overlap(ca, claim):
+                    die(f"package '{pid}' claims {ca!r}, which overlaps the "
+                        f"platform's own {what} ({claim}) — platform state is "
+                        "never an app artifact.")
+            for r in root_paths:
+                if _may_contain(ca, r):
+                    die(f"package '{pid}' claims {ca!r}, which contains the "
+                        f"platform root {r} — a root (or its ancestor) is "
+                        "never an app artifact; claim paths inside it.")
+        collide = serve[pid] & builtin_ports
+        if collide:
+            die(f"package '{pid}' claims serve port {sorted(collide)[0]}, which a "
+                "built-in app's plaintext mapping already owns — the later direct "
+                "mapping would silently replace it.")
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            for ca in mine[a]:
+                for cb in mine[b]:
+                    if _may_overlap(ca, cb):
+                        die(f"packages '{a}' and '{b}' claim overlapping artifacts: "
+                            f"{ca!r} vs {cb!r}. Ownership must be exclusive — give "
+                            "them distinct literal path prefixes (D2).")
+            both = serve[a] & serve[b]
+            if both:
+                die(f"packages '{a}' and '{b}' both claim serve port "
+                    f"{sorted(both)[0]} — serve-port ownership must be exclusive.")
+    for pid in ids:
+        rec_paths, rec_ports = _recorded_claims(ledger, pid, roots)
+        for ca in mine[pid]:
+            for rid, cb in rec_paths:
+                if _may_overlap(ca, cb):
+                    die(f"package '{pid}' claims {ca!r}, which overlaps an artifact "
+                        f"recorded under id '{rid}' in the installed-state ledger. "
+                        "The record owns it until removed — tear that app down "
+                        f"first (bin/airlock-teardown {rid}).")
+        # Declared port spans join the SAME recorded-ownership comparison as
+        # serve values: every port in base..base+count-1 is exclusive against
+        # every other id's records until those are removed (same-id exempt —
+        # the upgrade path).
+        span_ports = {v for _key, base, count in pkgs[pid]["port_span_values"]
+                      for v in range(base, base + count)}
+        for rid, port in rec_ports:
+            if port in serve[pid]:
+                die(f"package '{pid}' claims serve port {port}, which is recorded "
+                    f"under id '{rid}' in the installed-state ledger.")
+            if port in span_ports:
+                die(f"package '{pid}' declares a port span covering {port}, "
+                    f"which is recorded under id '{rid}' in the installed-state "
+                    "ledger. The record owns it until removed — tear that app "
+                    f"down first (bin/airlock-teardown {rid}).")
+
+
+def _regular_file(p: Path) -> bool:
+    """lstat, not stat: a symlinked manifest or lifecycle script is rejected.
+    The D6 digest records only a symlink's TARGET STRING, so a symlinked
+    script could change behind an unchanged digest."""
+    try:
+        return stat.S_ISREG(os.lstat(p).st_mode)
+    except OSError:
+        return False
+
+
+def _mf_die(pid: str, msg: str) -> "None":
+    die(f"package '{pid}' manifest: {msg}")
+
+
+def _validate_deps(pid: str, raw) -> list:
+    """[dependencies] apps = [...] — same-box app ids, id-level (D3)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        _mf_die(pid, f"[dependencies] must be a table; got {raw!r}")
+    unknown = sorted(k for k in raw if k != "apps")
+    if unknown:
+        _mf_die(pid, f"unknown [dependencies] key(s): {', '.join(unknown)} — "
+                     "'apps' is the only key (D3)")
+    apps = raw.get("apps", [])
+    if not isinstance(apps, list) or any(not isinstance(d, str) for d in apps):
+        _mf_die(pid, "dependencies.apps must be a list of app-id strings")
+    seen = set()
+    for dep in apps:
+        if APP_NAME_RE.fullmatch(dep) is None:
+            _mf_die(pid, f"dependencies.apps entry {dep!r} is not a valid app id")
+        if dep == pid:
+            _mf_die(pid, "dependencies.apps names the package itself — "
+                         "a self-dependency is a cycle")
+        if dep in seen:
+            _mf_die(pid, f"dependencies.apps lists {dep!r} twice")
+        seen.add(dep)
+    return list(apps)
+
+
+def _validate_config_schema(pid: str, raw) -> dict:
+    """[config] — the app's declared key space: required (explicit type),
+    defaults (value doubles as type), nested tables' allowed_keys, port spans.
+    This replaces APP_DEFAULTS's two roles for packaged apps (D2)."""
+    out = {"required": {}, "defaults": {}, "tables": {}, "port_spans": [],
+           "runtime_env": [], "deprecated": {}}
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        _mf_die(pid, f"[config] must be a table; got {raw!r}")
+    unknown = sorted(k for k in raw if k not in _CONFIG_SCHEMA_KEYS)
+    if unknown:
+        _mf_die(pid, f"unknown [config] key(s): {', '.join(unknown)}. "
+                     f"Schema fields are {list(_CONFIG_SCHEMA_KEYS)}.")
+    req = raw.get("required", [])
+    if not isinstance(req, list) or any(not isinstance(r, dict) for r in req):
+        _mf_die(pid, "[[config.required]] must be an array of tables")
+    for row in req:
+        bad = sorted(k for k in row if k not in ("name", "type"))
+        if bad:
+            _mf_die(pid, f"unknown [[config.required]] key(s): {', '.join(bad)}")
+        name, typ = row.get("name"), row.get("type")
+        if not isinstance(name, str) or _MANIFEST_KEY_RE.fullmatch(name) is None:
+            _mf_die(pid, f"config.required name {name!r} must match [a-z0-9_]+ "
+                         "(keys become env variables and scan tokens, F12)")
+        if typ not in _TYPE_NAMES:
+            _mf_die(pid, f"config.required '{name}' type must be one of "
+                         f"{sorted(_TYPE_NAMES)}; got {typ!r}")
+        if name in out["required"]:
+            _mf_die(pid, f"config.required lists '{name}' twice")
+        out["required"][name] = typ
+    dfl = raw.get("defaults", {})
+    if not isinstance(dfl, dict):
+        _mf_die(pid, f"[config.defaults] must be a table; got {dfl!r}")
+    for key, val in dfl.items():
+        if not isinstance(key, str) or _MANIFEST_KEY_RE.fullmatch(key) is None:
+            _mf_die(pid, f"config.defaults key {key!r} must match [a-z0-9_]+")
+        if not isinstance(val, (str, int, bool)):
+            _mf_die(pid, f"config.defaults.{key} must be a string, integer, or "
+                         f"boolean (the value doubles as the type declaration); "
+                         f"got {val!r}")
+        if key in out["required"]:
+            _mf_die(pid, f"config key '{key}' is both required and defaulted — "
+                         "the default would always satisfy the requirement")
+        out["defaults"][key] = val
+    # Platform-owned keys have exactly one owner. A manifest declaring
+    # 'audience' in [config] would make the defaults branch of the type
+    # checker match FIRST and skip the supported-membership check — an
+    # unvalidated audience string would then drive the gates and the hub
+    # filter (fail-open). Same rule for 'external' (COMMON_APP_KEYS).
+    for reserved in ("audience", "external"):
+        if reserved in out["required"] or reserved in out["defaults"]:
+            _mf_die(pid, f"'{reserved}' is a platform-owned config key — "
+                         "declare audience in [audience]; 'external' needs no "
+                         "declaration (it is common to every app table)")
+    deprecated = raw.get("deprecated", {})
+    if not isinstance(deprecated, dict):
+        _mf_die(pid, f"[config.deprecated] must be a table; got {deprecated!r}")
+    declared_scalars = set(out["required"]) | set(out["defaults"])
+    for key, metadata in deprecated.items():
+        if key not in declared_scalars:
+            _mf_die(pid, f"config.deprecated.{key} is not a declared scalar config "
+                         "key — deprecation cannot make an unknown key valid")
+        if not isinstance(metadata, dict):
+            _mf_die(pid, f"[config.deprecated.{key}] must be a table")
+        bad = sorted(k for k in metadata if k not in ("replacement", "remove_after"))
+        if bad:
+            _mf_die(pid, f"unknown [config.deprecated.{key}] key(s): {', '.join(bad)}")
+        replacement = metadata.get("replacement")
+        remove_after = metadata.get("remove_after")
+        if replacement not in declared_scalars or replacement == key:
+            _mf_die(pid, f"config.deprecated.{key}.replacement must name a different "
+                         f"declared scalar config key; got {replacement!r}")
+        if not isinstance(remove_after, str):
+            _mf_die(pid, f"config.deprecated.{key}.remove_after must be an ISO date")
+        try:
+            dt.date.fromisoformat(remove_after)
+        except ValueError:
+            _mf_die(pid, f"config.deprecated.{key}.remove_after must be an ISO date; "
+                         f"got {remove_after!r}")
+        out["deprecated"][key] = {
+            "replacement": replacement,
+            "remove_after": remove_after,
+        }
+    tables = raw.get("tables", {})
+    if not isinstance(tables, dict):
+        _mf_die(pid, f"[config.tables] must be a table; got {tables!r}")
+    for tname, t in tables.items():
+        if not isinstance(tname, str) or _MANIFEST_KEY_RE.fullmatch(tname) is None:
+            _mf_die(pid, f"config.tables name {tname!r} must match [a-z0-9_]+")
+        if not isinstance(t, dict):
+            _mf_die(pid, f"[config.tables.{tname}] must be a table; got {t!r}")
+        bad = sorted(k for k in t if k != "allowed_keys")
+        if bad:
+            _mf_die(pid, f"unknown [config.tables.{tname}] key(s): "
+                         f"{', '.join(bad)} — 'allowed_keys' is the only field")
+        ak = t.get("allowed_keys")
+        if (not isinstance(ak, list) or not ak
+                or any(not isinstance(k, str)
+                       or _MANIFEST_KEY_RE.fullmatch(k) is None for k in ak)
+                or len(set(ak)) != len(ak)):
+            _mf_die(pid, f"config.tables.{tname}.allowed_keys must be a "
+                         "non-empty list of distinct [a-z0-9_]+ key names")
+        if tname in out["required"] or tname in out["defaults"]:
+            _mf_die(pid, f"config declares '{tname}' as both a scalar and a "
+                         "table — a scalar key cannot also be a nested table")
+        out["tables"][tname] = list(ak)
+    spans = raw.get("port_spans", [])
+    if not isinstance(spans, list) or any(not isinstance(s, dict) for s in spans):
+        _mf_die(pid, "[[config.port_spans]] must be an array of tables")
+    declared = set(out["required"]) | set(out["defaults"])
+    span_bases = set()
+    for row in spans:
+        bad = sorted(k for k in row if k not in ("base", "count"))
+        if bad:
+            _mf_die(pid, f"unknown [[config.port_spans]] key(s): {', '.join(bad)}")
+        for field in ("base", "count"):
+            v = row.get(field)
+            if not isinstance(v, str) or _MANIFEST_KEY_RE.fullmatch(v) is None:
+                _mf_die(pid, f"config.port_spans {field} must name a config key "
+                             f"([a-z0-9_]+); got {v!r}")
+            if v not in declared:
+                _mf_die(pid, f"config.port_spans {field} '{v}' is not a declared "
+                             "config key — add it to [config.defaults] or "
+                             "[[config.required]]")
+        if row["base"] in span_bases:
+            _mf_die(pid, f"config.port_spans declares base '{row['base']}' "
+                         "twice — one span per base key, or the uniqueness "
+                         "sweep's own-anchor exemption could mask a real "
+                         "overlap between the two spans")
+        span_bases.add(row["base"])
+        out["port_spans"].append({"base": row["base"], "count": row["count"]})
+    # runtime_env — env-var NAMES the installer WRITES into units, secrets or test
+    # seams. Not config: no values, no defaults, not merged into resolved config,
+    # never exported. It exists so the F12 scan can tell "the installer writes this
+    # into a unit" apart from "somebody read a key that does not exist".
+    #
+    # A field of [config] rather than a new top-level key, deliberately. It inherits
+    # the fail-closed unknown-key handling above, and resolved() merges only
+    # `defaults`, so a sibling field cannot leak into resolved config. A top-level
+    # key would mean touching the manifest grammar and PackageSpec for nothing.
+    #
+    # The three rules below exist because without them this is an opt-out from the
+    # scan: declare the variable here, never declare the config key, and the warning
+    # that says "the export will not exist" goes away while the export still does
+    # not exist.
+    renv = raw.get("runtime_env", [])
+    if not isinstance(renv, list) or any(not isinstance(n, str) for n in renv):
+        _mf_die(pid, "[config].runtime_env must be an array of env-var name strings")
+    envid = pid.replace("-", "_").upper()
+    want_prefix = f"AIRLOCK_{envid}_"
+    seen_env = set()
+    for name in renv:
+        if not name.startswith(want_prefix):
+            _mf_die(pid, f"[config].runtime_env entry {name!r} does not carry this "
+                         f"package's own prefix ({want_prefix}). A package may only "
+                         "declare its own runtime variables.")
+        suffix = name[len(want_prefix):]
+        if not re.fullmatch(r"[A-Z0-9_]+", suffix):
+            _mf_die(pid, f"[config].runtime_env entry {name!r} is not a valid env "
+                         "var name ([A-Z0-9_]+ after the prefix)")
+        if name in seen_env:
+            _mf_die(pid, f"[config].runtime_env lists {name!r} twice")
+        seen_env.add(name)
+        # The collision rule. A key that is BOTH declared config and declared
+        # runtime_env is ambiguous — one of the two is a lie about where the value
+        # comes from, and the scan would stop being able to tell which.
+        if suffix.lower() in out["required"] or suffix.lower() in out["defaults"]:
+            _mf_die(pid, f"[config].runtime_env entry {name!r} collides with the "
+                         f"declared config key '{suffix.lower()}'. A name is either "
+                         "config (resolved and exported) or a runtime variable the "
+                         "installer writes — it cannot be both.")
+    out["runtime_env"] = sorted(seen_env)
+
+    return out
+
+
+def _validate_prereqs(pid: str, raw) -> list:
+    """[[prerequisites]] — replaces this app's rows in prerequisites.tsv (F11).
+    Owner is always the package id; the five fields are the remaining TSV
+    columns, so control characters (row/cell injection) are fatal here."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(r, dict) for r in raw):
+        _mf_die(pid, "[[prerequisites]] must be an array of tables")
+    out = []
+    for i, row in enumerate(raw):
+        bad = sorted(k for k in row if k not in _PREREQ_FIELDS)
+        if bad:
+            _mf_die(pid, f"unknown prerequisites[{i}] key(s): {', '.join(bad)}. "
+                         f"Fields are {list(_PREREQ_FIELDS)} (owner is always "
+                         "the package id).")
+        rec = {}
+        for field in _PREREQ_FIELDS:
+            v = row.get(field)
+            if not isinstance(v, str) or not v.strip():
+                _mf_die(pid, f"prerequisites[{i}].{field} must be a non-empty "
+                             f"string; got {v!r}")
+            if _CTRL_RE.search(v):
+                _mf_die(pid, f"prerequisites[{i}].{field} contains a control "
+                             "character — prereq fields become TSV cells, and a "
+                             "tab or newline would inject rows (F11)")
+            rec[field] = v.strip()
+        out.append(rec)
+    return out
+
+
+def _validate_tile(pid: str, raw):
+    """[tile] — the hub's real tile model (label, sub, cat, optional path,
+    icon XOR glyph). Omitting the whole table means a no-tile app."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        _mf_die(pid, f"[tile] must be a table; got {raw!r}")
+    unknown = sorted(k for k in raw if k not in _TILE_KEYS)
+    if unknown:
+        _mf_die(pid, f"unknown [tile] key(s): {', '.join(unknown)}. "
+                     f"Tile fields are {list(_TILE_KEYS)}.")
+    label = raw.get("label")
+    if not isinstance(label, str) or not label.strip():
+        _mf_die(pid, "[tile] label must be a non-empty string")
+    sub = raw.get("sub", "")
+    if not isinstance(sub, str):
+        _mf_die(pid, f"[tile] sub must be a string; got {sub!r}")
+    cat = raw.get("cat")
+    if cat not in _TILE_CATS:
+        _mf_die(pid, f"[tile] cat must be one of {list(_TILE_CATS)} "
+                     f"(the hub's palette); got {cat!r}")
+    path = raw.get("path")
+    if path is not None and (not isinstance(path, str)
+                             or not path.startswith("/")):
+        _mf_die(pid, f"[tile] path must be a hub subpath starting with '/' "
+                     f"(public-port apps omit it); got {path!r}")
+    icon, glyph = raw.get("icon"), raw.get("glyph")
+    if (icon is None) == (glyph is None):
+        _mf_die(pid, "[tile] needs exactly one of 'icon' (an image staged from "
+                     "the package) or 'glyph' (a built-in symbol id)")
+    if glyph is not None and (not isinstance(glyph, str) or not glyph.strip()):
+        _mf_die(pid, f"[tile] glyph must be a non-empty string; got {glyph!r}")
+    if icon is not None:
+        if not isinstance(icon, str) or not icon.strip():
+            _mf_die(pid, f"[tile] icon must be a non-empty string; got {icon!r}")
+        icon = icon.strip()
+        segs = icon.split("/")
+        if (icon.startswith("/") or any(s in ("", ".", "..") for s in segs)
+                or _WILDCARD_RE.search(icon)):
+            _mf_die(pid, f"[tile] icon {icon!r} must be a relative path inside "
+                         "the package: no leading '/', no '.'/'..' segments, no "
+                         "glob characters (F4 — the file is staged out of the "
+                         "package, so the path must not be able to point "
+                         "anywhere else)")
+    return {"label": label.strip(), "sub": sub, "cat": cat, "path": path,
+            "icon": icon, "glyph": glyph}
+
+
+def _validate_icon_source(pid: str, pdir: Path, rel: str) -> dict:
+    """F4 containment, run at validate AND again at staging (TOCTOU): the
+    declared icon must strict-resolve to a regular readable file INSIDE the
+    canonical package root. The package root itself being reached through a
+    symlink is fine (pdir is already resolved); an internal symlink that
+    escapes the root is exactly what this check refuses. Returns the resolved
+    source and the id-scoped staging destination (relative to the webroot)."""
+    root = Path(os.path.realpath(str(pdir)))
+    try:
+        real = (root / rel).resolve(strict=True)
+    except OSError as e:
+        _mf_die(pid, f"[tile] icon {rel!r} does not resolve to a file inside "
+                     f"the package: {e}")
+    if not (real != root and real.is_relative_to(root)):
+        _mf_die(pid, f"[tile] icon {rel!r} resolves to {real}, outside the "
+                     "canonical package root — the platform stages the icon "
+                     "out of the package, so the source must live in it (F4)")
+    if not stat.S_ISREG(os.stat(real).st_mode):
+        _mf_die(pid, f"[tile] icon {rel!r} must resolve to a regular file")
+    if not os.access(real, os.R_OK):
+        _mf_die(pid, f"[tile] icon {rel!r} is not readable")
+    return {"src": str(real), "dest": f"assets/apps/{pid}/{Path(rel).name}"}
+
+
+def _validate_audience(pid: str, raw):
+    """[audience] — who this app can serve (D7)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        _mf_die(pid, f"[audience] must be a table; got {raw!r}")
+    unknown = sorted(k for k in raw if k not in ("supported", "default"))
+    if unknown:
+        _mf_die(pid, f"unknown [audience] key(s): {', '.join(unknown)}")
+    sup = raw.get("supported")
+    if (not isinstance(sup, list) or not sup
+            or any(s not in ("shared", "owner") for s in sup)
+            or len(set(sup)) != len(sup)):
+        _mf_die(pid, "[audience] supported must be a non-empty list of distinct "
+                     f"values from ['shared', 'owner'] (D7); got {sup!r}")
+    default = raw.get("default")
+    if default not in sup:
+        _mf_die(pid, f"[audience] default must be one of supported {sup}; "
+                     f"got {default!r}")
+    return {"supported": list(sup), "default": default}
+
+
+def _shell_word(text: str, i: int) -> tuple:
+    """Read ONE shell word starting at `text[i]` the way bash would, and say
+    whether it is a literal.
+
+    Pattern-matching the argument's visible characters is not good enough in
+    either direction: `get "apps.x.port"` is the same key as the unquoted
+    form (a regex sees a stray quote), and `get a\\pps.x.port` reads
+    `apps.x.port` (a regex sees no call at all). So expand exactly what the
+    shell expands for free — quotes and backslashes — and flag anything that
+    needs runtime expansion ($, `) as dynamic, which the caller refuses.
+
+    Returns (literal_value, end_index, dynamic)."""
+    out, n, dynamic = [], len(text), False
+    while i < n:
+        c = text[i]
+        if c == "\x00":
+            # The placeholder marks a removed backslash-newline: bash SPLICES
+            # there, so `port\<newline>evil` is the single word `portevil`.
+            # Skipping (not breaking) is what keeps that a scanned read.
+            i += 1
+            continue
+        if c in " \t\n" or c in ");|&<>":
+            break
+        if c == "\\":
+            if i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            if j == -1:            # unterminated: not analysable
+                return "".join(out), n, True
+            out.append(text[i + 1:j])
+            i = j + 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            # ANSI-C quoting: $'…' yields a literal. An escape inside it
+            # ($'po\162t' is `port`) is a C decoding this reader does not
+            # do — mark the word dynamic so it is WARNED about rather than
+            # judged on the raw bytes.
+            j = text.find("'", i + 2)
+            if j == -1:
+                return "".join(out), n, True
+            body = text[i + 2:j]
+            if "\\" in body:
+                dynamic = True
+            out.append(body)
+            i = j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            buf = []
+            while j < n and text[j] != '"':
+                # Inside double quotes bash treats backslash as an escape ONLY
+                # before $ ` " \ and newline; anywhere else the backslash is a
+                # literal character of the word ("po\rt" is po\rt, not port).
+                if text[j] == "\\" and j + 1 < n and text[j + 1] in '$`"\\\n':
+                    if text[j + 1] != "\n":
+                        buf.append(text[j + 1])
+                    j += 2
+                    continue
+                if text[j] in "$`":
+                    dynamic = True
+                buf.append(text[j])
+                j += 1
+            if j >= n:
+                return "".join(out), n, True
+            out.append("".join(buf))
+            i = j + 1
+            continue
+        if c in "$`":
+            dynamic = True
+            out.append(c)
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), i, dynamic
+
+
+def _warn(pid: str, msg: str) -> "None":
+    sys.stderr.write(f"airlock-config: warning: package '{pid}': {msg}\n")
+
+
+def _in_comment_line(text: str, pos: int) -> bool:
+    """Is `pos` after an unquoted `#` on its own line?
+
+    This is the ONLY source-structure heuristic left in the scan, and it can
+    afford to be approximate: every F12 diagnostic is advisory (see
+    _scan_config_reads), so a comment the check misreads costs one warning
+    line, never a blocked install. Earlier revisions grew a whole shell
+    reader here — quote stacks, here-doc masking, arithmetic spans — and each
+    round of review traded one edge case for another. The runtime, not the
+    scan, is what fails closed."""
+    line_start = text.rfind("\n", 0, pos) + 1
+    prefix = text[line_start:pos]
+    quote = None
+    for i, ch in enumerate(prefix):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or prefix[i - 1] in " \t\x00;&|()"):
+            return True
+    return False
+
+
+def _line_of(text: str, pos: int) -> int:
+    """1-based line number, counting the NUL placeholders that stand in for
+    normalised shell line continuations (see the scanner below)."""
+    return text.count("\n", 0, pos) + text.count("\x00", 0, pos) + 1
+
+
+def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
+                       strict: bool = False) -> "None":
+    """F12: compare the manifest's declared key space with the reads the
+    package's own files actually contain, and REPORT — every finding here is
+    a warning.
+
+    That is a deliberate narrowing (ADR F12 amendment). Making it fatal
+    requires the scan to decide, reliably, which text in a package is a call
+    site — to be a shell parser. Eleven review rounds of exactly that grew a
+    quote stack, here-doc masking and arithmetic-span logic that traded one
+    edge case for another every round, in both directions: a real call site
+    missed one round, a correct installer blocked by a usage message the next.
+
+    The honest scope of what remains: this is an ADVISORY LINT for the package
+    AUTHOR, not an enforcement of the declaration contract. An undeclared read
+    usually surfaces by itself — `airlock-config get apps.x.undeclared` exits
+    non-zero with "key not found" — but a package that suppresses the failure
+    (`… 2>/dev/null || true`, a pattern this repo's own feedback and publish
+    installers use) will simply see an empty value, and the platform cannot
+    tell that from a legitimately empty one. What IS enforced elsewhere: the
+    operator's own typos, since an unknown key in `[apps.X]` is fatal against
+    the manifest schema. Gating the package side is deferred to child 4, when
+    the built-ins carry manifests and every call site is in-tree. Pinned
+    call-site grammar:
+
+      airlock_config get apps.<id>.<key>       (nested: apps.<id>.<table>.<leaf>)
+      AIRLOCK_<ID>_<KEY>                       (the real _envkey shape)
+
+    both matched as whole tokens — dynamically-constructed names are a stated
+    limitation of the lint. Scope:
+    the package root only; regular files <= 1 MiB that decode as UTF-8
+    (decode failure = binary = skipped); symlinks (file or dir) not followed;
+    README*, docs/, and *.md are excluded (examples are not reads). The
+    mechanical whole-table env export never counts as a read."""
+    # Findings that are FULLY LITERAL: a name written out in the file, with nothing
+    # assembled at runtime. Only these can be made fatal — the dynamic ones stay
+    # warnings forever, because deciding them needs the shell parser this scan gave
+    # up on after eleven rounds (see the docstring).
+    hard: list = []
+
+    def _hard(msg: str) -> None:
+        hard.append(msg)
+        _warn(pid, msg)
+
+    scalar_declared = set(schema["required"]) | set(schema["defaults"])
+    # Names the installer WRITES rather than reads. Declared, so the scan can tell
+    # them from a read of a key that does not exist. Deliberately NOT applied to the
+    # `airlock_config get` path below: a literal `get apps.<id>.<key>` really is a
+    # config read and really will fail at runtime, whatever this list says.
+    runtime_env = set(schema.get("runtime_env") or [])
+    common_ok = {"external"} | ({"audience"} if audience is not None else set())
+    table_declared = {(t, leaf) for t, leaves in schema["tables"].items()
+                      for leaf in leaves}
+    envid = pid.replace("-", "_").upper()
+    # Env names the PLATFORM exports to every lifecycle script (cmd_env's
+    # common block + the orchestrator's per-app vars). For an unlucky package
+    # id these collide with the AIRLOCK_<ID>_<KEY> shape — a package named
+    # `app` reads AIRLOCK_APP_DIR in every install.sh — and are neither
+    # config-key reads nor errors.
+    # Exactly the names the platform GUARANTEES: cmd_env's common block (which
+    # every lifecycle script evals) plus the variables the orchestrator
+    # exports. Nothing else — exempting a name that is merely sometimes set
+    # would turn a real undeclared read into a runtime-unset surprise.
+    platform_env = {
+        "AIRLOCK_SITE_NAME", "AIRLOCK_PRODUCT", "AIRLOCK_ICON_RING",
+        "AIRLOCK_AUTH_PROVIDER", "AIRLOCK_IDENTITY_HEADER", "AIRLOCK_OWNER",
+        "AIRLOCK_COLLABORATORS", "AIRLOCK_CODE_ROOT", "AIRLOCK_WIKI",
+        "AIRLOCK_APP_DIR", "AIRLOCK_APP_ID", "AIRLOCK_ROOT", "AIRLOCK_CONFIG",
+        # STATE_DIR is exported only when the operator sets it; a package
+        # reading it is still reading a PLATFORM name (with its own fallback),
+        # never a config key called `dir` — so exempt it in both cases.
+        "AIRLOCK_STATE_DIR", "AIRLOCK_WEBROOT", "AIRLOCK_CONFD",
+        "AIRLOCK_TS_FQDN", "AIRLOCK_PKG_INFO",
+    }
+    # Built at runtime around the package id; both are SEARCH patterns
+    # (finditer over file text), not validators — matches are compared
+    # against the declared set, so no end anchor applies. The get capture
+    # spans the WHOLE shell argument token (everything up to whitespace,
+    # quotes, or a shell metacharacter): stopping at the key grammar would
+    # silently truncate `apps.<id>.port-bad` or `apps.<id>.port/evil` to a
+    # declared `port` and pass validate for a read that fails at runtime —
+    # the invalid tail must reach the segment checks below and die.
+    # \x00 is the line-continuation placeholder (see below). The capture runs
+    # to the first character that could END a shell word; anything that could
+    # CONTINUE it (quote, backtick, backslash-continuation, $) is handled by
+    # the terminator check at the call site, which fails closed — a regex
+    # cannot expand shell quoting, so an argument it cannot read literally is
+    # refused rather than analysed as its visible prefix.
+    # Locate the CALL; the key argument itself is read with _shell_word, not
+    # matched as text — see that function for why.
+    get_re = re.compile(r"(?<![A-Za-z0-9_.-])airlock[-_]config\b[^\n]*?\bget([\s\x00]+)")  # noqa: regex-anchor
+    prefix = f"apps.{pid}."
+    env_re = re.compile(r"\bAIRLOCK_" + re.escape(envid) + r"_([A-Z0-9_]+)\b")  # noqa: regex-anchor
+    read_scalars, read_tables = set(), set()
+    for dirpath, dirnames, filenames in os.walk(pdir, followlinks=False):
+        if Path(dirpath) == pdir:
+            # docs/ is excluded at the PACKAGE ROOT only — a nested docs
+            # directory is ordinary package content and stays scanned (the
+            # exclusion list is part of the spec, not a heuristic).
+            dirnames[:] = [d for d in dirnames if d != "docs"]
+        # Determinism, not a validation rule: os.walk's readdir order is
+        # filesystem-dependent, and warnings are emitted in scan order, so an
+        # unsorted walk makes F12's diagnostic ORDER (never its content —
+        # which files/keys are flagged is unchanged by sorting) depend on
+        # directory-entry order rather than the package's own bytes. Sorting
+        # dirnames in place also steers os.walk's descent order, so nested
+        # directories are visited in a fixed order too.
+        dirnames.sort()
+        for fname in sorted(filenames):
+            if fname.startswith("README") or fname.endswith(".md"):
+                continue
+            if fname == MANIFEST_NAME and Path(dirpath) == pdir:
+                continue   # the declaration itself is not a read site
+            fp = Path(dirpath) / fname
+            try:
+                st = os.lstat(fp)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 1024 * 1024:
+                continue
+            try:
+                text = fp.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue   # binary (or vanished): skipped by spec
+            # A shell line continuation would split a call site across the
+            # single-line get pattern — normalise it away first, keeping a
+            # NUL placeholder so the line counter below stays accurate
+            # (a plain removal would shift every later diagnostic up by one
+            # per preceding continuation).
+            text = text.replace("\\\n", "\x00")
+            where = str(fp.relative_to(pdir))
+            for m in get_re.finditer(text):
+                if not any(ch in " \t\n" for ch in m.group(1)):
+                    continue   # only a splice: `get\<newline>apps…` is one word
+                line = _line_of(text, m.start())
+                if _in_comment_line(text, m.start()):
+                    continue   # a commented-out example is not a call site
+                word, _end, dynamic = _shell_word(text, m.end())
+                if not word.startswith(prefix):
+                    if dynamic and word.startswith("apps."):
+                        _warn(pid, f"{where}:{line} builds an app-config key "
+                                   "at runtime; F12 cannot tell whether it "
+                                   "reads this package")
+                    continue   # another app's key, or an unresolvable name
+                if dynamic:
+                    _warn(pid, f"{where}:{line} builds the key for "
+                               f"apps.{pid}.… at runtime; F12 cannot check it")
+                    continue
+                chain = word[len(prefix):].split(".")
+                if any(_MANIFEST_KEY_RE.fullmatch(seg) is None for seg in chain):
+                    _warn(pid, f"{where}:{line} reads apps.{pid}."
+                               f"{'.'.join(chain)}, which is not a valid key "
+                               "chain ([a-z0-9_]+ per segment)")
+                elif len(chain) == 1:
+                    if chain[0] in scalar_declared | common_ok:
+                        read_scalars.add(chain[0])
+                    else:
+                        _hard(f"{where}:{line} reads apps.{pid}."
+                              f"{chain[0]}, which the manifest does not "
+                              "declare (it will fail at runtime; declare "
+                              "it in [config])")
+                elif len(chain) == 2 and tuple(chain) in table_declared:
+                    read_tables.add(tuple(chain))
+                else:
+                    _hard(f"{where}:{line} reads apps.{pid}."
+                          f"{'.'.join(chain)}, which the manifest does "
+                          "not declare (declare the table and key in "
+                          "[config.tables])")
+            for m in env_re.finditer(text):
+                if _in_comment_line(text, m.start()):
+                    continue
+                full = f"AIRLOCK_{envid}_{m.group(1)}"
+                if full in platform_env:
+                    continue   # a platform export, not a config-key read
+                if full in runtime_env:
+                    continue   # declared as a name the installer writes, not reads
+                key = m.group(1).lower()
+                if key in scalar_declared | common_ok:
+                    read_scalars.add(key)
+                else:
+                    line = _line_of(text, m.start())
+                    _hard(f"{where}:{line} references AIRLOCK_{envid}_"
+                          f"{m.group(1)}, but '{key}' is neither a declared config "
+                          "key nor a declared [config].runtime_env name (the export "
+                          "will not exist)")
+    # Strict mode covers SHIPPED packages only, and only these literal findings.
+    # An external package keeps today's advisory behaviour: this must never block
+    # somebody else's install over a lint whose own docstring records eleven rounds
+    # of trying to become a shell parser. Declared-but-unread keys stay a warning
+    # too — a dead declaration is untidy, not broken.
+    if strict and hard:
+        die(f"package '{pid}': {len(hard)} literal reference(s) to names this "
+            "manifest does not declare (strict scan). Each is listed above. "
+            "Declare the config key in [config], or — if the installer WRITES the "
+            "variable rather than reading it — list the full env-var name in "
+            "[config].runtime_env.")
+
+    unread = sorted(scalar_declared - read_scalars)
+    unread += sorted(f"{t}.{leaf}" for (t, leaf) in table_declared - read_tables)
+    if unread:
+        sys.stderr.write(f"airlock-config: warning: package '{pid}' declares "
+                         "config key(s) its files never read: "
+                         + ", ".join(unread)
+                         + " (dead declarations rot; drop them or use them)\n")
+
+
+# One PackageSpec per (config object, package): manifests are parsed ONCE per
+# process and every command projects from the same descriptor. The value
+# RETAINS the cfg object: keying on id() alone would let a freed dict's
+# address be reused by a different config and silently serve its specs.
+_SPEC_CACHE: dict = {}
+
+
+def _physical_bundle_ids(root: Path) -> set[str]:
+    """Direct app directories carrying a regular manifest under `root`.
+
+    This intentionally does not parse manifests.  Policy/table parity is an
+    assembly invariant and must fail outside known-builtins' best-effort parse
+    handling, including when the newly added manifest itself is malformed.
+    """
+    if not root.is_dir():
+        return set()
+    return {
+        entry.name for entry in root.iterdir()
+        if entry.is_dir() and not entry.is_symlink()
+        and _regular_file(entry / MANIFEST_NAME)
+        and PACKAGE_ID_RE.fullmatch(entry.name) is not None
+        and entry.name not in RESERVED_PACKAGE_IDS
+    }
+
+
+def _assert_bundle_policy_parity() -> "None":
+    physical = _physical_bundle_ids(BUNDLE_ROOT)
+    policy = set(BUNDLE_ENTITLEMENTS)
+    if physical != policy:
+        missing = sorted(physical - policy)
+        stale = sorted(policy - physical)
+        detail = []
+        if missing:
+            detail.append(f"missing policy entries: {missing}")
+        if stale:
+            detail.append(f"policy entries without bundled apps: {stale}")
+        die("bundled entitlement table does not exactly match apps/: "
+            + "; ".join(detail))
+    for pid, values in BUNDLE_ENTITLEMENTS.items():
+        if (not isinstance(values, tuple)
+                or values != tuple(sorted(set(values)))
+                or not set(values) <= ELEVATED_CAPABILITIES):
+            die(f"bundled entitlement entry '{pid}' must be a sorted, unique "
+                f"tuple from {sorted(ELEVATED_CAPABILITIES)}; got {values!r}")
+
+
+def _read_package_lock() -> dict[str, str]:
+    """Read the closed, machine-written explicit-package digest lock."""
+    path = PACKAGE_LOCK_PATH
+    if path.is_symlink():
+        die(f"package lock must be a regular non-symlink file: {path}")
+    if not path.exists():
+        return {}
+    if not path.is_file():
+        die(f"package lock must be a regular non-symlink file: {path}")
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, ValueError) as exc:
+        die(f"cannot parse package lock {path} as TOML: {exc}")
+    out = {}
+    for pid, entry in raw.items():
+        if not isinstance(pid, str) or PACKAGE_ID_RE.fullmatch(pid) is None:
+            die(f"package lock has invalid package id {pid!r}")
+        if not isinstance(entry, dict):
+            die(f"package lock entry [{pid}] must be a table")
+        unknown = sorted(set(entry) - {"digest"})
+        if unknown:
+            die(f"package lock entry [{pid}] has unknown key(s): "
+                + ", ".join(unknown))
+        digest = entry.get("digest")
+        if not _ledger_module()._is_hex_digest(digest):
+            die(f"package lock entry [{pid}].digest must be a bare lowercase "
+                "64-hex string")
+        out[pid] = digest
+    return out
+
+
+def _package_tree_digest(pid: str, pdir: Path) -> str:
+    """Use the ledger's one tree-digest implementation, preserving failures."""
+    lock_real = os.path.realpath(PACKAGE_LOCK_PATH)
+    package_real = os.path.realpath(pdir)
+    try:
+        contains_lock = os.path.commonpath((lock_real, package_real)) == package_real
+    except ValueError:
+        contains_lock = False
+    if contains_lock:
+        die(f"package '{pid}': explicit package path contains {PACKAGE_LOCK_PATH}; "
+            "stage the package outside the Airlock repository root so its digest "
+            "does not contain the lock that records it")
+    ledger = _ledger_module()
+    try:
+        return ledger.digest_tree(str(pdir))
+    except ledger.LedgerError as exc:
+        die(f"package '{pid}': cannot compute package lock digest: {exc}")
+
+
+def _check_package_lock(pid: str, pdir: Path, lock: dict[str, str]) -> tuple[str, dict | None]:
+    computed = _package_tree_digest(pid, pdir)
+    recorded = lock.get(pid)
+    if recorded is not None and recorded != computed:
+        if _DANGEROUS_ADMIT_UNVERIFIED == pid:
+            return computed, {
+                "argument": f"--dangerously-admit-unverified={pid}",
+                "recorded_digest": recorded,
+                "admitted_digest": computed,
+            }
+        die(f"package '{pid}': package lock digest mismatch\n"
+            f"  recorded digest: {recorded}\n"
+            f"  computed digest: {computed}\n"
+            f"  re-approval means deliberately updating {PACKAGE_LOCK_PATH}; "
+            "the package grant is a separate decision")
+    return computed, None
+
+
+def _render_package_lock(entries: dict[str, str]) -> bytes:
+    blocks = [f'[{pid}]\ndigest = "{entries[pid]}"\n'
+              for pid in sorted(entries)]
+    return ("\n".join(blocks)).encode("utf-8")
+
+
+def _bundle_admission(pid: str, pdir: Path, bundle_principal: bool,
+                      granted_capabilities=(),
+                      requested_capabilities=()) -> tuple[set[str], list[str]]:
+    """Return the admitted elevated names and immutable certifications.
+
+    A package id is not a principal.  Bundle policy applies only to the
+    canonical direct child under this checkout's immutable bundle root; an explicit
+    package reusing `orca` or `devterm` therefore receives nothing. Explicit
+    package grants enter only here. Only the two ledger-verifiable capability
+    names are grantable; plaintext redirect remains bundle-only.
+    """
+    grants = set(granted_capabilities)
+    requested = set(requested_capabilities)
+    # Capability names are narrower than surface classifications: serve-port
+    # and serve-https describe mediated baseline surfaces, not grant tokens.
+    unknown_grants = grants - ELEVATED_CAPABILITIES
+    if unknown_grants:
+        die(f"package '{pid}': unknown capability grant(s): "
+            f"{sorted(unknown_grants)}")
+    non_grantable = grants - GRANTABLE_CAPABILITIES
+    if non_grantable:
+        die(f"package '{pid}': non-grantable capability grant(s): "
+            f"{sorted(non_grantable)}")
+    canonical = (bundle_principal and os.path.realpath(pdir)
+                 == os.path.join(os.path.realpath(BUNDLE_ROOT), pid))
+    if not canonical:
+        undeclared = grants - requested
+        if undeclared:
+            die(f"package '{pid}': capability grant(s) not requested by "
+                f"manifest: {sorted(undeclared)}")
+        missing = (requested & GRANTABLE_CAPABILITIES) - grants
+        if missing:
+            die(f"package '{pid}': missing capability grant(s): {sorted(missing)}")
+        return grants, []
+    if pid not in BUNDLE_ENTITLEMENTS:
+        die(f"bundled package '{pid}' has no immutable entitlement-table entry")
+    return set(BUNDLE_ENTITLEMENTS[pid]) | grants, list(BUNDLE_CERTIFICATIONS)
+
+
+def _capability_projection(spec: dict) -> dict:
+    """The stable effective-policy subset shared by both JSON producers."""
+    return {
+        "requested_capabilities": list(spec["requested_capabilities"]),
+        "effective_capabilities": list(spec["effective_capabilities"]),
+        "capabilities": list(spec["capabilities"]),
+        "certifications": list(spec["certifications"]),
+        "surfaces": list(spec["surfaces"]),
+        "surface_classifications": dict(spec["surface_classifications"]),
+    }
+
+
+def package_specs(cfg: dict) -> dict:
+    """Validate [packages.*] (D1) and parse each manifest ONCE into an
+    immutable PackageSpec: {id, contract, deps, schema, prerequisites,
+    artifacts, tile, audience, lifecycle, dir}. Every consumer — validate,
+    apps, package-info, env, webjson, prereqs — is a projection of this
+    structure; no command re-reads the manifest. Fatal on any manifest
+    violation (F10: unknown fields anywhere are fatal); {} when no packages
+    are configured. Config cross-checks (serve values, spans, disjointness)
+    live in packages_resolved."""
+    cached = _SPEC_CACHE.get(id(cfg))
+    if cached is not None:
+        return cached[1]
+    config_abi = _preflight_config_abi(cfg)
+    if (_DANGEROUS_ADMIT_UNVERIFIED is not None
+            and config_abi != CONFIG_ABI_VERSION):
+        die("--dangerously-admit-unverified requires [airlock] "
+            f"config_version = {CONFIG_ABI_VERSION}", code=2)
+    package_lock = _read_package_lock() if config_abi == CONFIG_ABI_VERSION else {}
+    shipped_root = _shipped_root()
+    _assert_bundle_policy_parity()
+    pkgs_cfg = cfg.get("packages") or {}
+    if not isinstance(pkgs_cfg, dict):
+        die(f"[packages] must be a table; got {pkgs_cfg!r}")
+    cfg_dir = find_config().parent
+    sources = {pid: (table, "explicit", False) for pid, table in pkgs_cfg.items()}
+    shipped_root_real = os.path.realpath(shipped_root)
+    for pid in (cfg.get("apps") or {}):
+        if pid in sources or pid in RESERVED_PACKAGE_IDS:
+            continue
+        if isinstance(pid, str) and PACKAGE_ID_RE.fullmatch(pid):
+            app_dir = shipped_root / pid
+            manifest = app_dir / MANIFEST_NAME
+            # Canonical containment (matching the known-builtins contract's
+            # symlinked-manifest exclusion): `os.path.exists` follows
+            # symlinks, so a `$ROOT/apps/<id>` that is itself a symlink to an
+            # outside directory would otherwise resolve as shipped and gain
+            # the rooted artifact class's trust. Require the real path to
+            # sit directly under the real shipped root; a symlinked entry is
+            # excluded, not shipped.
+            if (os.path.exists(manifest) and not app_dir.is_symlink()
+                    and os.path.realpath(app_dir) == os.path.join(shipped_root_real, pid)):
+                sources[pid] = ({"path": str(manifest.parent)}, "shipped", True)
+    if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+        selected_source = sources.get(_DANGEROUS_ADMIT_UNVERIFIED)
+        if selected_source is None or selected_source[1] != "explicit":
+            die(f"--dangerously-admit-unverified target "
+                f"'{_DANGEROUS_ADMIT_UNVERIFIED}' does not name a configured "
+                "explicit package", code=2)
+    out = {}
+    for pid in sorted(sources):
+        table, source_class, bundle_principal = sources[pid]
+        if not isinstance(table, dict):
+            die(f"[packages.{pid}] must be a table; got {table!r}")
+        if not isinstance(pid, str) or PACKAGE_ID_RE.fullmatch(pid) is None:
+            die(f"invalid package id {pid!r}: package ids match "
+                "^[a-z0-9][a-z0-9-]{0,31}$ (env export flattens '-' and '_' to "
+                "the same character, so the tighter grammar prevents collisions)")
+        if pid in RESERVED_PACKAGE_IDS:
+            die(f"[packages.{pid}] is not allowed: {pid} is "
+                f"{RESERVED_PACKAGE_IDS[pid]}")
+        unknown = sorted(k for k in table if k not in {"path", "grant"})
+        if unknown:
+            die(f"unknown key(s) in [packages.{pid}]: {', '.join(unknown)}.\n"
+                "  Airlock reads only 'path' and ABI-2 'grant'. It is not a "
+                "package manager: no "
+                "git sources, no fetching — stage the tree locally and point "
+                "path at it (D1).")
+        if "grant" in table and _preflight_config_abi(cfg) != 2:
+            die(f"[packages.{pid}].grant requires [airlock] config_version = 2")
+        granted = table.get("grant", [])
+        if (not isinstance(granted, list)
+                or any(not isinstance(value, str) for value in granted)
+                or len(granted) != len(set(granted))):
+            die(f"[packages.{pid}].grant must be a list of unique strings")
+        raw = table.get("path")
+        if not isinstance(raw, str) or not raw.strip():
+            die(f"[packages.{pid}].path must be a non-empty path string; got {raw!r}")
+        if pid not in (cfg.get("apps") or {}):
+            die(f"[packages.{pid}] has no [apps.{pid}] table. A package line that "
+                f"configures nothing is a typo — add [apps.{pid}] to enable the "
+                "app, or remove the package line (F2).")
+        p = _expanduser(raw.strip(), f"packages.{pid}.path")
+        if not p.is_absolute():
+            p = cfg_dir / p
+        pdir = p.resolve()
+        if not pdir.is_dir():
+            die(f"[packages.{pid}].path does not resolve to a directory: {pdir}")
+        spec = _parse_manifest_spec(pid, pdir, source_class,
+                                    bundle_principal=bundle_principal,
+                                    granted_capabilities=granted)
+        if source_class == "explicit" and config_abi == CONFIG_ABI_VERSION:
+            _, lock_override = _check_package_lock(pid, pdir, package_lock)
+            if lock_override is not None:
+                spec["lock_override"] = lock_override
+        out[pid] = spec
+    if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+        selected = out.get(_DANGEROUS_ADMIT_UNVERIFIED)
+        if selected is None or selected.get("source_class") != "explicit":
+            raise AssertionError("selected explicit package disappeared during parsing")
+        if "lock_override" not in selected:
+            state = ("has no recorded lock digest" if _DANGEROUS_ADMIT_UNVERIFIED
+                     not in package_lock else "already matches its recorded lock digest")
+            die(f"--dangerously-admit-unverified target "
+                f"'{_DANGEROUS_ADMIT_UNVERIFIED}' {state}; the escape hatch is "
+                "accepted only for a real digest mismatch", code=2)
+    _SPEC_CACHE[id(cfg)] = (cfg, out)
+    return out
+
+
+def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
+                         bundle_principal=False,
+                         granted_capabilities=()) -> dict:
+    """Parse + validate ONE manifest at `pdir` into the PackageSpec shape
+    `package_specs` stores (child 4/P4: extracted so the known-builtins scan
+    can parse a SHIPPED manifest the exact same way for an id that has no
+    `[packages.pid]`/`[apps.pid]` table at all — one parser, no drifting
+    copy). Fatal (die/`_mf_die`, i.e. `SystemExit`) on any manifest
+    violation, exactly as before the extraction: `package_specs` lets that
+    propagate (a CONFIGURED package's manifest must fail loudly), while the
+    known-builtins scan wraps this call in `try/except SystemExit` (an
+    UNCONFIGURED shipped id with a malformed manifest is simply excluded,
+    best-effort, never a reason to crash the whole scan)."""
+    manifest = pdir / MANIFEST_NAME
+    if not _regular_file(manifest):
+        if os.path.lexists(manifest):
+            die(f"package '{pid}': {MANIFEST_NAME} at {pdir} must be a "
+                "regular non-symlink file — the D6 digest records only a "
+                "symlink's target string, so a symlinked manifest could "
+                "change behind an unchanged digest.")
+        die(f"package '{pid}' has no {MANIFEST_NAME} at {pdir} — the "
+            "manifest is required; the ledger cannot record ownership "
+            "without it (D2).")
+    try:
+        with manifest.open("rb") as fh:
+            m = tomllib.load(fh)
+    except ValueError as e:
+        # ValueError (see load()'s identical fix): tomllib's UTF-8
+        # decode happens before TOMLDecodeError's own error class does.
+        die(f"{manifest}: invalid TOML: {e}")
+    unknown = sorted(k for k in m if k not in _MANIFEST_KEYS)
+    if unknown:
+        _mf_die(pid, f"unknown key(s): {', '.join(unknown)}. The manifest "
+                     f"schema is {list(_MANIFEST_KEYS)} — a field Airlock "
+                     "does not read is a typo, and fail-closed applies to "
+                     "the manifest too (F10).")
+    if "contract" not in m:
+        _mf_die(pid, "missing 'contract' — every manifest states the "
+                     "contract version it was written against (contract = 1)")
+    contract = m["contract"]
+    if isinstance(contract, bool) or not isinstance(contract, int):
+        _mf_die(pid, f"'contract' must be an integer; got {contract!r}")
+    if contract != 1:
+        _mf_die(pid, f"unsupported contract version {contract} — this "
+                     "platform supports contract = 1 only")
+    if "id" not in m:
+        _mf_die(pid, "missing 'id'")
+    if m["id"] != pid:
+        _mf_die(pid, f"manifest id {m['id']!r} does not match the package "
+                     f"id '{pid}' — package id, manifest id, [apps.{pid}] "
+                     f"and [packages.{pid}] must agree exactly (F2)")
+    deps = _validate_deps(pid, m.get("dependencies"))
+    schema = _validate_config_schema(pid, m.get("config"))
+    prereqs = _validate_prereqs(pid, m.get("prerequisites"))
+    arts, unit_scopes = _validate_artifacts(pid, m.get("artifacts"))
+    tile = _validate_tile(pid, m.get("tile"))
+    icon = (None if tile is None or tile["icon"] is None
+            else _validate_icon_source(pid, pdir, tile["icon"]))
+    audience = _validate_audience(pid, m.get("audience"))
+    declared = set(schema["required"]) | set(schema["defaults"])
+    serve = _validate_mappings(pid, m.get("serve"), declared, arts)
+    plaintext_redirect = _validate_plaintext_redirect(pid, m.get("plaintext_redirect"), declared)
+    for key in arts["serve_ports"]:
+        if key not in declared:
+            _mf_die(pid, f"artifacts.serve_ports names '{key}', which is "
+                         "not a declared config key — add it to "
+                         "[config.defaults] or [[config.required]] (the "
+                         f"platform reads the value from apps.{pid}.{key})")
+    requested = set()
+    if arts["rooted"]:
+        requested.add("rooted-artifact")
+    if any(scope == "system" for scope in unit_scopes.values()):
+        requested.add("system-unit")
+    if plaintext_redirect:
+        requested.add("plaintext-redirect")
+    admitted, certifications = _bundle_admission(
+        pid, pdir, bundle_principal, granted_capabilities, requested)
+    refused = requested - admitted
+    if refused:
+        if "rooted-artifact" in refused:
+            _mf_die(pid, "artifacts.rooted is available only to shipped packages "
+                         "or an explicit package with a rooted-artifact grant")
+        if "system-unit" in refused:
+            _mf_die(pid, "a system-scope unit requires the system-unit bundle "
+                         "entitlement or an explicit grant")
+        # Retirement is no longer the missing substrate: the independent
+        # intent/committed sidecar below survives config, payload and ledger
+        # loss. Admission deliberately remains bundle-only in this change;
+        # defining an explicit grant is a separate policy/implementation step.
+        _mf_die(pid, "plaintext_redirect is available only to shipped packages "
+                     "with the plaintext-redirect entitlement")
+
+    effective_capabilities = sorted(requested & admitted)
+    capabilities = sorted(set(effective_capabilities) & LEDGER_CAPABILITIES)
+    surfaces = set(requested)
+    if arts["serve_ports"]:
+        surfaces.add("serve-port")
+    if serve:
+        surfaces.add("serve-https")
+    surfaces = sorted(surfaces)
+    surface_classifications = {
+        surface: SURFACE_CLASSIFICATIONS[surface] for surface in surfaces
+    }
+    # Serve surfaces must be pairwise disjoint per app (structural half):
+    # a config key may serve exactly one of {serve_ports (bare or
+    # serve.https-mapped)} or {plaintext_redirect public/redirect}. The
+    # orchestrator applies cmd_plaintext's rows in config order
+    # (install/airlock-install.sh) and a ledger serve mapping
+    # separately — a key declared in both surfaces gets two competing
+    # rows for the same listen, and whichever runs last silently wins
+    # (a 301 redirect replaced by a proxy to a dead port, in the
+    # reported repro). The resolved-VALUE half (two DIFFERENT keys that
+    # happen to share one config value) is checked in packages_resolved,
+    # once actual port numbers are known.
+    redirect_keys = set(plaintext_redirect) | set(plaintext_redirect.values())
+    surface_overlap = set(arts["serve_ports"]) & redirect_keys
+    if surface_overlap:
+        _mf_die(pid, f"config key(s) {sorted(surface_overlap)} are declared in both "
+                     "artifacts.serve_ports and plaintext_redirect — a key must serve "
+                     "exactly one surface")
+    # F6, validate-time half: install.sh and smoke.sh are required for a
+    # manifest-bearing package; deactivate.sh optional = install/upgrade-
+    # only recorded. All three, when present, must be regular non-symlink
+    # files (same digest rationale as the manifest).
+    lifecycle = {}
+    for script, required in (("install.sh", True), ("smoke.sh", True),
+                             ("deactivate.sh", False)):
+        sp = pdir / script
+        present = os.path.lexists(sp)
+        if present and not _regular_file(sp):
+            die(f"package '{pid}': {script} must be a regular non-symlink "
+                "file — the D6 digest records a symlink's target string, so "
+                "a symlinked script could change behind an unchanged digest")
+        if required and not present:
+            die(f"package '{pid}' has no {script} at {pdir} — install.sh "
+                "and smoke.sh are required for a manifest-bearing package "
+                "(F6); deactivate.sh is the only optional lifecycle script")
+        lifecycle[script.removesuffix(".sh")] = present
+    _walk_special_files(pid, pdir)
+    return {
+        "dir": str(pdir),
+        "contract": contract,
+        "deps": deps,
+        "schema": schema,
+        "prerequisites": prereqs,
+        "artifacts": arts,
+        "unit_scopes": unit_scopes,
+        "serve": serve,
+        "plaintext_redirect": plaintext_redirect,
+        "source_class": source_class,
+        "requested_capabilities": sorted(requested),
+        "effective_capabilities": effective_capabilities,
+        "capabilities": capabilities,
+        "certifications": sorted(certifications),
+        "surfaces": surfaces,
+        "surface_classifications": surface_classifications,
+        "tile": tile,
+        "icon": icon,
+        "audience": audience,
+        "lifecycle": lifecycle,
+    }
+
+
+def packages_resolved(cfg: dict) -> dict:
+    """PackageSpecs cross-checked against the resolved config: serve-port
+    values, port-span values, and disjoint ownership (D1/D2). Fatal on any
+    violation; {} when no packages are configured."""
+    specs = package_specs(cfg)
+    if not specs:
+        return {}
+    r_apps = resolved(cfg).get("apps", {})
+    out = {}
+    for pid, spec in specs.items():
+        app_table = r_apps.get(pid) or {}
+        spv = {}
+        for key in spec["artifacts"]["serve_ports"]:
+            val = app_table.get(key)
+            if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 65535:
+                die(f"package '{pid}' declares serve_ports key '{key}' but "
+                    f"apps.{pid}.{key} is {val!r}, not a port number 1-65535 — "
+                    "the platform must be able to record the number it maps.")
+            spv[key] = val
+        serve_mappings = {key: {"listen": val, "mode": "http", "target": val}
+                          for key, val in spv.items()}
+        for key, mapping in spec["serve"].items():
+            target = app_table.get(mapping["target_key"])
+            if not isinstance(target, int) or isinstance(target, bool) or not 1 <= target <= 65535:
+                die(f"package '{pid}' serve target apps.{pid}.{mapping['target_key']} is not a port")
+            serve_mappings[key] = {"listen": spv[key], "mode": mapping["mode"],
+                                   "target": target}
+        # Two 301 pairs whose PUBLIC keys resolve to the same port (Minor
+        # N2): only one could ever be the live listener — the other's row
+        # is silently dropped by cmd_plaintext's per-app dedup table, so
+        # this is fatal here instead of a quiet no-op.
+        public_ports_seen: dict[int, str] = {}
+        for public_key in spec["plaintext_redirect"]:
+            v = app_table.get(public_key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                if v in public_ports_seen:
+                    die(f"package '{pid}': plaintext_redirect public keys "
+                        f"'{public_ports_seen[v]}' and '{public_key}' both resolve to "
+                        f"port {v} — two 301 pairs cannot share one public listen")
+                public_ports_seen[v] = public_key
+        # Serve surfaces must be pairwise disjoint per app (resolved-value
+        # half): package_specs already refused the same KEY in both
+        # surfaces, but two DIFFERENT keys can still resolve to the same
+        # port number once the operator's actual config values are known —
+        # the reported repro used exactly this (a plaintext_redirect public
+        # key and an unrelated serve_ports key sharing one default port).
+        redirect_ports: dict[int, str] = {}
+        for public_key, redirect_key in spec["plaintext_redirect"].items():
+            for k in (public_key, redirect_key):
+                v = app_table.get(k)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    redirect_ports[v] = k
+        port_collide = set(redirect_ports) & {m["listen"] for m in serve_mappings.values()}
+        if port_collide:
+            port = sorted(port_collide)[0]
+            die(f"package '{pid}': plaintext_redirect key '{redirect_ports[port]}' "
+                f"and a serve_ports/serve.https key both resolve to port {port} — "
+                "a config key (and its resolved listen port) may serve exactly "
+                "one surface")
+        spans = []
+        for span in spec["schema"]["port_spans"]:
+            base = app_table.get(span["base"])
+            count = app_table.get(span["count"])
+            if not isinstance(base, int) or isinstance(base, bool) or not 1 <= base <= 65535:
+                die(f"package '{pid}' port span base apps.{pid}.{span['base']} "
+                    f"must be a port number 1-65535; got {base!r}")
+            if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 1024:
+                die(f"package '{pid}' port span count apps.{pid}.{span['count']} "
+                    f"must be an integer 1-1024; got {count!r}")
+            if base + count - 1 > 65535:
+                die(f"package '{pid}' port span {span['base']}..+{count} runs "
+                    f"past port 65535 (base {base})")
+            spans.append([span["base"], base, count])
+        arts_out = {c: list(spec["artifacts"][c]) for c in ARTIFACT_CLASSES}
+        if spec["icon"] is not None:
+            # F4: the staged icon directory is synthesized into the DECLARED
+            # artifacts before anything is journaled — the intent names the
+            # destination, so a crash after the copy leaves an artifact the
+            # child-2 repair paths already know how to reclaim. Id-scoped, so
+            # cross-app collisions are impossible by construction.
+            arts_out["webroot"] = arts_out["webroot"] + [f"assets/apps/{pid}"]
+        out[pid] = dict(spec, artifacts=arts_out,
+                        serve_port_values=spv, serve_mappings=serve_mappings,
+                        port_span_values=spans,
+                        # The resolved plaintext_redirect ports (public AND
+                        # redirect — a redirect target is a real bound
+                        # socket too), for _validate_disjoint's cross-app
+                        # and built-in ownership checks (Major N1): the
+                        # intra-app check above stops at this package's own
+                        # boundary, so a distinct package (or the built-in
+                        # registry) declaring the identical port was
+                        # invisible to ownership until this rides along.
+                        # A sorted list, not a set: this dict is JSON-dumped
+                        # whole by cmd_package_info for bin/airlock-ledger to
+                        # consume, and a set is not JSON-serializable.
+                        plaintext_redirect_ports=sorted(redirect_ports))
+    _validate_disjoint(out, cfg)
+    return out
+
+
+def app_order(cfg: dict) -> list:
+    """Stable install order (F5, D3 stage 4 — the D3 demotion), consumed
+    identically by validate, `apps`, and package-info.
+
+    No [packages.*] configured -> TOML input order, byte-identical (the
+    built-in fast path). With packages -> Kahn over REAL manifest
+    [dependencies] edges ONLY (dep -> pid: the dep runs first) — no synthetic
+    input-order chain (child 4/P3 demotes it; r3 review showed the edge-drop
+    rule it replaced could create transitive cycles). The ready queue is
+    prioritized by config INPUT ORDER (then C-collation name order for two
+    ids at equal input position, which cannot occur — each name appears once
+    in one file). Properties that fall out of this: with no real edges the
+    order IS input order, so this is byte-identical to the no-packages fast
+    path above; real-edge cycles remain fatal; a config that used to be
+    contradiction-fatal under the synthetic chain (a manifest edge disagreeing
+    with [apps.*] position) is now simply ordered by the real edge — a
+    deliberate relaxation, previously-invalid boxes only."""
+    names = list(cfg.get("apps") or {})
+    specs = package_specs(cfg)
+    if not specs:
+        return names
+    configured = set(names)
+    pos = {n: i for i, n in enumerate(names)}   # config input order, for ties
+    edges: dict = {n: set() for n in names}   # X -> {Y}: X runs before Y
+    indeg = {n: 0 for n in names}
+
+    def add(x, y):
+        if y not in edges[x]:
+            edges[x].add(y)
+            indeg[y] += 1
+
+    for pid, spec in specs.items():
+        for dep in spec["deps"]:
+            if dep not in configured:
+                die(f"package '{pid}' depends on app '{dep}', but there is no "
+                    f"[apps.{dep}] table. A dependency must be configured on "
+                    "this box — a ledger record alone does not satisfy it (D3).")
+            add(dep, pid)
+    ready = sorted((pos[n], n) for n in names if indeg[n] == 0)
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        _, n = heapq.heappop(ready)
+        order.append(n)
+        for m in sorted(edges[n]):
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                heapq.heappush(ready, (pos[m], m))
+    if len(order) != len(names):
+        stuck = sorted(n for n in names if indeg[n] > 0)
+        die("dependency cycle among apps: " + ", ".join(stuck) + ".\n"
+            "  The manifests' [dependencies] edges form a cycle — fix the "
+            "manifests.")
+    return order
+
+
+# ---- known-builtins / --adopt (F15 amendment, child 4/P4) -------------------
+#
+# A box upgraded from before the ledger existed may carry artifacts of a
+# shipped app that is no longer configured and was never journaled. This
+# section gives an operator a loud, non-destructive path to notice those
+# artifacts (the "sweep", cmd_adopt_scan) and either reclaim them under the
+# ledger (`bin/airlock-teardown --adopt <id>`, cmd_adopt_write) or remove
+# them by hand. See docs/design/app-package-contract.md's D6/F15 amendments
+# and docs/tasks/active/app-pkg-c4-builtin-migration.md's P0 F15 amendment
+# for the contract this section implements.
+
+
+def _shipped_root() -> Path:
+    return Path(os.environ.get("AIRLOCK_SHIPPED_APPS_ROOT")
+                or Path(__file__).resolve().parent.parent / "apps")
+
+
+def _shadowed_ids(cfg: dict) -> set:
+    """Ids with an explicit [packages.pid] table. The shipped manifest at
+    apps/pid, if any, is SHADOWED by it (package_specs's own `sources`
+    precedence) and must never surface as a known builtin — its identity as
+    a 'known builtin' depends on being resolved implicitly, and an explicit
+    override is validated and adopted as an ordinary explicit package
+    instead (F15 amendment: 'shadowed excluded')."""
+    pkgs_cfg = cfg.get("packages") or {}
+    return set(pkgs_cfg) if isinstance(pkgs_cfg, dict) else set()
+
+
+def _shipped_dirs(cfg: dict) -> dict:
+    """{id: pdir} for every entry under the shipped root that could resolve
+    as an implicit shipped package — same canonical-containment and
+    regular-non-symlink-manifest rules package_specs applies at its shipped-
+    detection step (`bin/airlock-config` sources-building loop), but scanning
+    the WHOLE shipped root instead of only ids already named in
+    `[apps.*]` — regardless of whether the id is currently configured (F15
+    amendment: the listing is config-independent; only hub/core and shadowed
+    ids are excluded here)."""
+    root = _shipped_root()
+    root_real = os.path.realpath(root)
+    shadowed = _shadowed_ids(cfg)
+    out = {}
+    if not os.path.isdir(root):
+        return out
+    for app_dir in sorted(root.iterdir()):
+        pid = app_dir.name
+        if pid in RESERVED_PACKAGE_IDS or pid in shadowed:
+            continue
+        if PACKAGE_ID_RE.fullmatch(pid) is None:
+            continue
+        if not app_dir.is_dir() or app_dir.is_symlink():
+            continue
+        if os.path.realpath(app_dir) != os.path.join(root_real, pid):
+            continue
+        manifest = app_dir / MANIFEST_NAME
+        if not _regular_file(manifest):
+            continue
+        out[pid] = app_dir
+    return out
+
+
+def known_builtin_specs(cfg: dict) -> dict:
+    """{id: PackageSpec} for every shipped id whose manifest actually
+    parses. Best-effort (F15 amendment: 'shipped ids with PARSEABLE regular
+    non-symlink manifests') — reuses `_parse_manifest_spec`, the identical
+    parser `package_specs` uses for a configured package (one manifest
+    reader; no drifting hand-rolled second copy), but here a manifest
+    violation excludes the id instead of aborting the whole scan: this
+    command must stay usable to DIAGNOSE a box, including one where some
+    OTHER shipped app's manifest happens to be broken, not join the set of
+    things that can wedge every install."""
+    _assert_bundle_policy_parity()
+    out = {}
+    for pid, pdir in _shipped_dirs(cfg).items():
+        try:
+            out[pid] = _parse_manifest_spec(pid, pdir, "shipped",
+                                            bundle_principal=True)
+        except SystemExit:
+            continue
+    return out
+
+
+def cmd_known_builtins(cfg: dict) -> "None":
+    for pid in sorted(known_builtin_specs(cfg)):
+        print(pid)
+
+
+def _shipped_default_serve_mappings(spec: dict) -> dict:
+    """The serve_mappings a fresh install of this shipped app would create
+    from its manifest's OWN [config.defaults] — the only values knowable
+    with no operator config at all for an unconfigured id (the same
+    'recovers only the default' limitation `_shipped_plaintext_redirect_defaults`
+    already documents for plaintext ports — F15's 'customized-port
+    limitation'). A serve key whose default is missing (declared only in
+    [[config.required]], no [config.defaults] entry — never true of any of
+    the nine shipped manifests today, but not grammar-forbidden) simply
+    contributes no mapping: that key's port stays outside anything
+    detection or --adopt can construct."""
+    defaults = spec["schema"]["defaults"]
+    mappings = {}
+    for key in spec["artifacts"]["serve_ports"]:
+        val = defaults.get(key)
+        if isinstance(val, int) and not isinstance(val, bool):
+            mappings[key] = {"listen": val, "mode": "http", "target": val}
+    for key, mapping in spec["serve"].items():
+        listen = defaults.get(key)
+        target = defaults.get(mapping["target_key"])
+        if (isinstance(listen, int) and not isinstance(listen, bool)
+                and isinstance(target, int) and not isinstance(target, bool)):
+            # Overrides the bare entry above when `key` is ALSO
+            # serve.https-mapped — matches packages_resolved's own
+            # construction exactly (bare pass first, serve.https second).
+            mappings[key] = {"listen": listen, "mode": mapping["mode"], "target": target}
+    return mappings
+
+
+def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
+    """THE exclusion/admission predicate (F15 amendment: 'the exclusion
+    predicate IS the admission predicate — one predicate, two call sites').
+
+    Called by cmd_adopt_scan (detection: report-only) and by
+    cmd_adopt_write (enforcement: `bin/airlock-teardown --adopt` re-runs it
+    under the ledger lock before writing anything). Both call sites invoke
+    this SAME function for BOTH halves of the decision — the on-disk
+    existence probe AND the overlap checks — not two independently written
+    checks (round-2 review defect: the probe used to live only in
+    cmd_adopt_scan, so a symlink-escaping glob the scan's own
+    `expand_declared` call would refuse was invisible to a forced
+    adopt-write, which built and journaled a record anyway). Unified here:
+    a printed `--adopt <id>` line can never be refused, and a forced one
+    can never be admitted, for a reason the OTHER call site would have
+    decided differently.
+
+    Builds the prospective claims a fresh adoption would make (ALL declared
+    patterns — not just the ones found on disk — projected onto the CURRENT
+    environment roots, plus serve mappings synthesized from the manifest's
+    own defaults) and checks them against the FULL disjoint model: every
+    other id's recorded (committed union intent) claims and (mode, listen)
+    mappings, the platform's own fixed claims and roots, and every
+    CURRENTLY CONFIGURED package's declared claims and mappings — record or
+    not (D6 amendment: an app installed earlier in this very run has claims
+    before its own record lands).
+
+    Returns (found, ok, reason, prospective):
+      found=False — nothing on disk matches any declared pattern (or the
+        probe itself never got the chance): the id is not reportable at
+        all (F15: a clean box is silent).
+      found=True, ok=False — reportable as an EXCLUDE diagnostic; `reason`
+        explains why (including the probe ITSELF failing, e.g. a
+        redirected-symlink escape `expand_declared` refuses to walk
+        through — treated as reportable, not silent, since something
+        concerning was found even though it could not be safely expanded).
+      found=True, ok=True — reportable as an ADOPT candidate; `prospective`
+        carries the manifest-shaped `package` dict
+        `airlock-ledger._intent_record` expects, PLUS `found` (the on-disk
+        path list, for the printed candidate line)."""
+    roots = _artifact_roots()
+    claims = _pattern_claims(spec["artifacts"], roots, spec["unit_scopes"])
+    serve_mappings = _shipped_default_serve_mappings(spec)
+
+    ledger_mod = _ledger_module()
+    # expand_declared is airlock-ledger's own function and expects its own
+    # STRING-valued root set (`_current_roots()`), not airlock-config's
+    # Path-valued `_artifact_roots()` (used everywhere else here for
+    # claim-space computation) — the two resolve identically but are
+    # differently typed, and airlock-ledger's internal iteration over a
+    # single root assumes a str.
+    live_roots = ledger_mod._current_roots()
+    try:
+        expanded = ledger_mod.expand_declared(
+            spec["artifacts"], {}, live_roots,
+            unit_scopes=spec["unit_scopes"], capabilities=spec["capabilities"])
+    except ledger_mod.LedgerError as e:
+        return True, False, f"artifact expansion failed: {e}", None
+    found = sorted({p for cls in ("units", "fragments", "webroot", "files", "rooted")
+                    for p in expanded.get(cls, [])})
+    if not found:
+        return False, False, None, None
+
+    # Every declared serve_ports key MUST resolve to a mapping: a v3 intent
+    # record requires serve_port_values' keys to equal
+    # artifacts_declared.serve_ports exactly (bin/airlock-ledger's
+    # _validate_record), and _shipped_default_serve_mappings silently omits
+    # a key with no [config.defaults] value (the customized-port
+    # limitation — never true of the nine shipped manifests today, but not
+    # grammar-forbidden). Catching that HERE, before any overlap check,
+    # keeps the invariant exact: a printed --adopt line must never be
+    # refused for a reason detection could not already see, and an
+    # unconstructable record is exactly such a reason.
+    missing_defaults = set(spec["artifacts"]["serve_ports"]) - set(serve_mappings)
+    if missing_defaults:
+        return True, False, (f"serve key(s) {sorted(missing_defaults)} have no "
+                        "[config.defaults] value to assume — --adopt can only "
+                        "recover a default-valued port (customized-port "
+                        "limitation)"), None
+    cand_ports = {(m["mode"], m["listen"]) for m in serve_mappings.values()}
+
+    ledger = _read_ledger()
+
+    # 1) vs every OTHER id's recorded (committed ∪ intent) claims/mappings.
+    rec_paths, _legacy_ports = _recorded_claims(ledger, pid, roots)
+    for ca in claims:
+        for rid, cb in rec_paths:
+            if _may_overlap(ca, cb):
+                return True, False, (f"artifact {ca!r} overlaps one recorded under "
+                                f"id '{rid}' ({cb!r}) in the installed-state ledger"), None
+    active_ports = ledger_mod._recorded_active_ports(ledger, pid)
+    collide = cand_ports & active_ports
+    if collide:
+        mode, listen = sorted(collide)[0]
+        return True, False, (f"serve mapping ({mode}, {listen}) is recorded under "
+                        "another id in the installed-state ledger"), None
+
+    # 2) vs the platform's own fixed claims, and vs the roots themselves.
+    platform_claims = _platform_state_claims(roots)
+    root_paths = sorted({os.path.realpath(str(r)) for r in roots.values()})
+    for ca in claims:
+        for claim, what in platform_claims:
+            if _may_overlap(ca, claim):
+                return True, False, f"artifact {ca!r} overlaps the platform's own {what} ({claim})", None
+        for r in root_paths:
+            if _may_contain(ca, r):
+                return True, False, f"artifact {ca!r} contains the platform root {r}", None
+
+    # 3) vs every CURRENTLY CONFIGURED package's declared claims/mappings —
+    # record or not (D6 amendment).
+    pkgs = packages_resolved(cfg)
+    for other_pid, p in pkgs.items():
+        other_claims = _pattern_claims(p["artifacts"], roots, p.get("unit_scopes"))
+        for ca in claims:
+            for cb in other_claims:
+                if _may_overlap(ca, cb):
+                    return True, False, (f"artifact {ca!r} overlaps configured app "
+                                    f"'{other_pid}' declared artifact ({cb!r})"), None
+        other_ports = {(m["mode"], m["listen"]) for m in p["serve_mappings"].values()}
+        overlap_ports = cand_ports & other_ports
+        if overlap_ports:
+            mode, listen = sorted(overlap_ports)[0]
+            return True, False, (f"serve mapping ({mode}, {listen}) is declared by "
+                            f"configured app '{other_pid}'"), None
+
+    # 4) vs the built-in plaintext-registry ports (hub's own).
+    builtin_ports = _builtin_plaintext_ports(cfg, pkgs)
+    http_collide = {port for (mode, port) in cand_ports if mode == "http"} & builtin_ports
+    if http_collide:
+        return True, False, (f"serve mapping port {sorted(http_collide)[0]} is a "
+                        "built-in app's plaintext mapping"), None
+
+    package = {
+        "dir": str(_shipped_root() / pid),
+        "artifacts": spec["artifacts"],
+        "serve_port_values": {k: v["listen"] for k, v in serve_mappings.items()},
+        "serve_mappings": serve_mappings,
+        "unit_scopes": spec["unit_scopes"],
+        "source_class": "shipped",
+        # Copied from the spec, not derived again: _parse_manifest_spec is the
+        # one place admission is computed, and a second derivation here would
+        # agree with it only by accident.
+        "requested_capabilities": spec["requested_capabilities"],
+        "effective_capabilities": spec["effective_capabilities"],
+        "capabilities": spec["capabilities"],
+        "certifications": spec["certifications"],
+        "surfaces": spec["surfaces"],
+        "surface_classifications": spec["surface_classifications"],
+        "lifecycle": spec["lifecycle"],
+        "deps": spec["deps"],
+    }
+    return True, True, None, {"claims": claims, "serve_mappings": serve_mappings,
+                               "package": package, "found": found}
+
+
+def cmd_adopt_scan(cfg: dict) -> "None":
+    """The F15 sweep. For every known-builtin id with no config entry and no
+    ledger record, run `_known_builtin_admission` — the SAME predicate
+    `bin/airlock-teardown --adopt` re-runs under the lock, probe and all —
+    and print one line per reportable id, tab-separated:
+
+      ADOPT\\t<id>\\t<path>[\\t<path> ...]
+      EXCLUDE\\t<id>\\t<reason>
+
+    Read-only end to end (the probe inside `_known_builtin_admission` is
+    `expand_declared`'s glob/lstat, never a write). An id with nothing on
+    disk is silent — F15: 'does not delete anything on its own', and a
+    silent id needs no line at all."""
+    ledger = _read_ledger()
+    configured = set(cfg.get("apps") or {})
+    entries = ledger.get("entries") or {}
+    for pid, spec in sorted(known_builtin_specs(cfg).items()):
+        if pid in configured or isinstance(entries.get(pid), dict):
+            continue
+        found, ok, reason, prospective = _known_builtin_admission(pid, spec, cfg)
+        if not found:
+            continue
+        if ok:
+            print("ADOPT\t" + pid + "\t" + "\t".join(prospective["found"]))
+        else:
+            print(f"EXCLUDE\t{pid}\t{reason}")
+
+
+def cmd_adopt_write(cfg: dict, pid: str) -> "None":
+    """ORCHESTRATOR-INTERNAL entry point for adoption, but not lock-bare:
+    `bin/airlock-teardown --adopt <id>` is the intended caller (it already
+    holds the ledger lock via its own flock(2) before invoking this, and
+    sets AIRLOCK_LEDGER_LOCK_HELD=1 to say so) — but this command is also
+    directly dispatchable from the CLI (`main`'s dispatch table has no
+    caller-identity check, and never should: a doc comment is not an
+    execution boundary). A direct invocation with no lock signal takes the
+    SAME lock file itself (round-2 review: two concurrent bare
+    `adopt-write` calls used to both read-modify-write the store with no
+    serialisation at all — `write_store`'s atomic replace prevents a
+    corrupt file, but not a LOST UPDATE, and 60 concurrent runs reproduced
+    exactly that, deterministically). Two writers can never proceed
+    unserialised: whichever one is NOT already inside the wrapper's lock
+    takes it here; the wrapper's own call skips this (it would deadlock on
+    its own already-held flock) because AIRLOCK_LEDGER_LOCK_HELD says the
+    caller has it covered."""
+    if os.environ.get("AIRLOCK_LEDGER_LOCK_HELD") == "1":
+        _cmd_adopt_write_locked(cfg, pid)
+        return
+    ledger_mod = _ledger_module()
+    lock_dir = ledger_mod._ensure_state_dir()
+    lock_path = lock_dir / "app-ledger.lock"
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        die(f"cannot open ledger lock file {lock_path}: {e}")
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            die(f"another airlock run holds the ledger lock ({lock_path}) — "
+                "re-run when it finishes")
+        _cmd_adopt_write_locked(cfg, pid)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _cmd_adopt_write_locked(cfg: dict, pid: str) -> "None":
+    """The actual adoption logic, run under the ledger lock — either the
+    caller's own (bin/airlock-teardown --adopt, AIRLOCK_LEDGER_LOCK_HELD=1)
+    or one cmd_adopt_write just took itself. Re-verifies from a clean read
+    (id validity, no config entry, no existing record, manifest
+    regular/non-symlink/contract=1 — re-parsed here, not trusted from an
+    earlier unlocked scan) and re-runs `_known_builtin_admission` — the
+    SAME predicate `known-builtins` detection used, probe and all — so a
+    candidate line printed a moment ago cannot be refused, and a forced one
+    cannot be admitted, for a reason detection would have decided
+    differently. On success: journals a synthetic INTENT record (D-order:
+    written UNRANKED, order=None — an adopted record must never silently
+    outrank a real install's true sequence) and prints its digest.
+    AIRLOCK_DRY_RUN=1 computes and validates the would-be record but never
+    writes it. The caller then runs the ordinary `airlock-ledger teardown
+    <id>` machinery unchanged (D6's record-less-teardown amendment)."""
+    if not isinstance(pid, str) or PACKAGE_ID_RE.fullmatch(pid) is None:
+        die(f"'{pid}' is not a valid package id (^[a-z0-9][a-z0-9-]{{0,31}}$) — nothing to adopt")
+    if pid in RESERVED_PACKAGE_IDS:
+        die(f"'{pid}' is {RESERVED_PACKAGE_IDS[pid]} — not adoptable")
+    if pid in (cfg.get("apps") or {}):
+        die(f"'{pid}' is configured in airlock.toml — the ordinary packaged "
+            "install path applies (D5's idempotent re-run rule), not --adopt; "
+            "run the orchestrator instead")
+    ledger_mod = _ledger_module()
+    store = ledger_mod.load_store()
+    if isinstance((store.get("entries") or {}).get(pid), dict):
+        die(f"record exists — run bin/airlock-teardown {pid} "
+            "(or let the next install run reconcile it)")
+    pdirs = _shipped_dirs(cfg)
+    if pid not in pdirs:
+        die(f"'{pid}' is not a known built-in (unknown id, hub/core, shadowed, "
+            "or has no regular non-symlink manifest at its shipped path) — "
+            "nothing to adopt")
+    # Re-parsed fresh, under the lock — not the cached scan result: a
+    # TOCTOU-safe re-verification, and it dies LOUDLY (unlike
+    # known_builtin_specs's best-effort skip) because this IS the
+    # enforcement path.
+    spec = _parse_manifest_spec(pid, pdirs[pid], "shipped",
+                                bundle_principal=True)
+    found, ok, reason, prospective = _known_builtin_admission(pid, spec, cfg)
+    if not found:
+        die(f"'{pid}' has no on-disk artifacts matching any declared pattern "
+            "— nothing to adopt")
+    if not ok:
+        die(f"'{pid}' cannot be adopted: {reason} — resolve by hand")
+    # Belt-and-braces (defense in depth, not the primary gate — the
+    # admission predicate above is): construction/validation failing here
+    # despite a passing admission check would be a genuine bug, not an
+    # operator-facing refusal reason, so it is caught and reported cleanly
+    # rather than as a raw traceback — "no silent failure" applies to how
+    # it fails, not whether it can.
+    try:
+        record = ledger_mod._intent_record(pid, prospective["package"], store)
+        record["order"] = None
+        result = copy.deepcopy(store)
+        result.setdefault("entries", {})[pid] = {"intent": record}
+        result = ledger_mod._validate_store(result, ledger_mod.ledger_path())
+    except ledger_mod.LedgerError as e:
+        die(f"'{pid}' passed admission but its synthetic intent record failed "
+            f"to validate ({e}) — this is a bug, not an ordinary refusal; "
+            "nothing was written")
+    if os.environ.get("AIRLOCK_DRY_RUN") == "1":
+        log(f"[dry] would adopt '{pid}': synthetic intent recorded (unranked), "
+            f"digest {record['digest']}")
+        print(record["digest"])
+        return
+    ledger_mod.write_store(result)
+    print(record["digest"])
+    log(f"adopted '{pid}': synthetic intent recorded (unranked) — run "
+        f"'bin/airlock-teardown {pid}' to remove it, or add [apps.{pid}] to "
+        "install it fresh over the adopted record")
+
+
+def cmd_icon_src(cfg: dict, app: str) -> "None":
+    """F4 staging re-check: re-run the strict-resolve/regular/readable/
+    contained validation at the moment the orchestrator is about to copy
+    (validate-to-stage TOCTOU), then print two lines — the resolved source
+    path and the webroot-relative destination. No output = no icon to stage."""
+    specs = package_specs(cfg)
+    spec = specs.get(app)
+    if spec is None:
+        die(f"not a packaged app: {app}")
+    if spec["icon"] is None:
+        return
+    icon = _validate_icon_source(app, Path(spec["dir"]), spec["tile"]["icon"])
+    print(icon["src"])
+    print(icon["dest"])
+
+
+def cmd_icon_stage(cfg: dict, app: str) -> "None":
+    """F4 staging, ONE process (review round 1): re-validate the source, prove
+    the package is exactly the tree the journaled intent named, then create
+    the id-scoped destination refusing symlinks at every component, and write
+    the file atomically. Prints the staged webroot-relative path; no output =
+    no icon to stage.
+
+    Why each guard exists:
+    - intent match (synthetic claim present + digest equal): a manifest edited
+      AFTER the intent was journaled could otherwise stage an artifact no
+      record names — permanently unreclaimable (record before mutate, D6).
+    - per-component symlink refusal: `mkdir -p` + `cp` FOLLOW a pre-planted
+      symlink (assets/apps -> elsewhere, or apps/<id> -> <other-id>), which
+      breaks id-scoped ownership and could hand teardown an outside path.
+    - O_NOFOLLOW open of the source: the validate-time containment check and
+      the copy happen in the same process, so nothing can be swapped between
+      them.
+
+    What this is NOT: an attestation of the bytes install.sh will run. The
+    digest is a snapshot, and the lock serialises Airlock's own writers only
+    — see the D6 amendment on that bounded limitation (D4)."""
+    specs = package_specs(cfg)
+    spec = specs.get(app)
+    if spec is None:
+        die(f"not a packaged app: {app}")
+    # The intent and digest checks run for EVERY packaged app, icon or not:
+    # this is the last platform step before install.sh, so a tree that no
+    # longer matches its journaled record stops here. Returning early for a
+    # no-icon manifest would let a tree replaced post-intent install under
+    # the OLD record's digest and artifact list, orphaning everything the new
+    # installer creates. (A tree rewritten in the instant AFTER this check is
+    # the documented D4 window — see the D6 amendment.)
+    entry = _read_ledger()["entries"].get(app) or {}
+    intent = entry.get("intent")
+    if not isinstance(intent, dict):
+        die(f"package '{app}': no journaled intent — nothing may be staged or "
+            "installed before a record names it (D6)")
+    mod = _ledger_module()
+    try:
+        digest = mod.digest_tree(spec["dir"])
+    except mod.LedgerError as e:
+        die(f"package '{app}': cannot digest the package for staging: {e}")
+    if digest != intent.get("digest"):
+        die(f"package '{app}' changed between the journaled intent and "
+            "staging (digest mismatch) — re-run the installer so the record "
+            "matches the tree")
+    declared = (intent.get("artifacts_declared") or {}).get("webroot") or []
+    claimed = f"assets/apps/{app}" in declared
+    if claimed != (spec["icon"] is not None):
+        die(f"package '{app}': the journaled intent and the manifest disagree "
+            f"about the tile icon (intent claims assets/apps/{app}: {claimed}) "
+            "— re-run the installer so the record matches the tree")
+    if spec["icon"] is None:
+        return
+    icon = _validate_icon_source(app, Path(spec["dir"]), spec["tile"]["icon"])
+    base = Path(os.path.realpath(str(_artifact_roots()["webroot"])))
+    d = base
+    for comp in ("assets", "apps", app):
+        d = d / comp
+        if os.path.islink(d):
+            die(f"package '{app}': {d} is a symlink — the staging path must be "
+                "real directories inside the webroot (id-scoped ownership)")
+        if os.path.lexists(d):
+            if not d.is_dir():
+                die(f"package '{app}': {d} exists and is not a directory")
+        else:
+            try:
+                os.mkdir(d)
+            except OSError as e:
+                die(f"package '{app}': cannot create {d}: {e}")
+    name = Path(icon["dest"]).name
+    target = d / name
+    if os.path.islink(target):
+        die(f"package '{app}': {target} is a symlink — refusing to write "
+            "through it")
+    try:
+        src_fd = os.open(icon["src"], os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        die(f"package '{app}': icon source changed under staging: {e}")
+    with os.fdopen(src_fd, "rb") as fh:
+        data = fh.read()
+    tmp = d / f".{name}.staging"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                     0o644)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, target)
+    except OSError as e:
+        die(f"package '{app}': staging write failed: {e}")
+    print(icon["dest"])
+
+
+def _prereq_tsv_path() -> Path:
+    env = os.environ.get("AIRLOCK_PREREQUISITES", "").strip()
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parent.parent / "install" / "prerequisites.tsv"
+
+
+def cmd_prereqs(cfg: dict) -> "None":
+    """F11 assembly of the prerequisites inventory: six-column TSV rows
+    (owner, command, predicate, expected, fix, note) on stdout.
+
+    Assembly steps only — ALL cross-row rules (duplicate owner+command,
+    conflicting fix, stricter-wins) stay in preflight, step 5, so the
+    built-in path is byte-identical and every cross-row rule has exactly
+    one owner:
+      1. existing TSV data rows pass through verbatim, in file order
+         (core rows immutable — 'core' is a reserved package id);
+      2. rows whose owner is a manifest-bearing package id are dropped
+         (a shadowing package replaces the built-in's rows);
+      3. each configured package appends its manifest rows, owner = the
+         package id (a zero-prereq manifest contributes no rows);
+      4. per-row validity: a TSV row that does not split into exactly six
+         non-empty fields is fatal (rc 2) — it could not be passed through
+         faithfully. Manifest rows were validated at manifest parse.
+    Cardinality is preserved: multiple rows per command stay as-is."""
+    try:
+        specs = package_specs(cfg)
+    except SystemExit as e:
+        # Assembly surface: rc 2 is preflight's contract-error vocabulary
+        # (F11), and a manifest whose prereq rows cannot be assembled is an
+        # assembly violation when reached THROUGH this command. validate
+        # keeps its own rc for the same errors.
+        raise SystemExit(2) from e
+    path = _prereq_tsv_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as e:
+        die(f"prerequisites declaration file not readable: {path} ({e})", code=2)
+    rows = []
+    for ln, rawline in enumerate(text.splitlines(), 1):
+        # Same skip rule as preflight's reader (empty, or '#' in COLUMN ONE):
+        # an indented '#' is a malformed data row THERE, so silently dropping
+        # it HERE would make the two paths disagree about the same file.
+        if not rawline or rawline.startswith("#"):
+            continue
+        fields = rawline.split("\t")
+        if len(fields) != 6 or any(not f.strip() for f in fields):
+            die(f"invalid declaration at {path}:{ln} — a row is six non-empty "
+                "tab-separated fields", code=2)
+        if fields[0] in specs:
+            continue   # replaced by the manifest's rows below
+        rows.append(rawline)
+    for pid in sorted(specs):
+        for row in specs[pid]["prerequisites"]:
+            rows.append("\t".join([pid, row["command"], row["predicate"],
+                                   row["expected"], row["fix"], row["note"]]))
+    for row in rows:
+        print(row)
+
+
+def cmd_package_info(cfg: dict) -> "None":
+    """Everything bash needs about [packages.*], as one JSON object. Consumed
+    by the orchestrator and bin/airlock-ledger (which parses no TOML)."""
+    print(json.dumps({
+        "config_path": str(find_config()),
+        "order": app_order(cfg),
+        "packages": packages_resolved(cfg),
+    }, indent=2, sort_keys=True))
+
+
+def cmd_lock_finalize(cfg: dict, override_receipt: str | None = None) -> "None":
+    """Record missing ABI-2 explicit-package digests after a successful run.
+
+    The repository directory inode is the mutex shared by runs even when their
+    HOME and installed-state directories differ. Existing entries are reread
+    under that mutex and never rewritten when nothing is missing.
+    """
+    if _preflight_config_abi(cfg) != CONFIG_ABI_VERSION:
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(REPO_ROOT, flags)
+    except OSError as exc:
+        die(f"cannot open repository directory for package lock: {exc}", code=2)
+    temp_name = None
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        specs = package_specs(cfg)
+        current = _read_package_lock()
+        checked = {
+            pid: _check_package_lock(pid, Path(spec["dir"]), current)
+            for pid, spec in sorted(specs.items())
+            if spec["source_class"] == "explicit"
+        }
+        computed = {pid: result[0] for pid, result in checked.items()}
+        missing = {pid: digest for pid, digest in computed.items()
+                   if pid not in current}
+        replacement = None
+        if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+            pid = _DANGEROUS_ADMIT_UNVERIFIED
+            if (override_receipt is None
+                    or re.fullmatch(r"[0-9a-f]{64}", override_receipt) is None):
+                die(f"package '{pid}': current-run break-glass receipt is required; "
+                    "refusing to reuse ledger audit history", code=2)
+            receipt_sha256 = hashlib.sha256(override_receipt.encode()).hexdigest()
+            events = _read_ledger().get("events") or []
+            expected_argument = f"--dangerously-admit-unverified={pid}"
+            event = next((item for item in reversed(events)
+                          if item.get("type") == "package-lock-override"
+                          and item.get("package_id") == pid
+                          and item.get("argument") == expected_argument
+                          and item.get("receipt_sha256") == receipt_sha256), None)
+            if event is None:
+                die(f"package '{pid}': no ledger audit event records this "
+                    "break-glass admission; refusing to update the package lock",
+                    code=2)
+            recorded = event["recorded_digest"]
+            admitted = event["admitted_digest"]
+            if current.get(pid) != recorded:
+                die(f"package '{pid}': package lock changed after break-glass "
+                    f"admission (expected recorded digest {recorded}, now "
+                    f"{current.get(pid)!r}); preserving current lock bytes",
+                    code=2)
+            if computed.get(pid) != admitted:
+                die(f"package '{pid}': package tree changed after break-glass "
+                    f"admission (admitted digest {admitted}, now "
+                    f"{computed.get(pid)!r}); preserving current lock bytes",
+                    code=2)
+            replacement = (pid, admitted)
+        if not missing and replacement is None:
+            return
+        merged = dict(current)
+        merged.update(missing)
+        if replacement is not None:
+            merged[replacement[0]] = replacement[1]
+        data = _render_package_lock(merged)
+        try:
+            # Establish that this filesystem accepts a directory durability
+            # barrier before crossing the irreversible replace commit point.
+            # Every failure through this call leaves the old lock untouched.
+            os.fsync(directory_fd)
+            with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=REPO_ROOT, prefix=".airlock.lock.",
+                    delete=False) as handle:
+                temp_name = handle.name
+                os.fchmod(handle.fileno(), 0o644)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, PACKAGE_LOCK_PATH)
+            temp_name = None
+        except OSError as exc:
+            die(f"cannot atomically write package lock {PACKAGE_LOCK_PATH}: {exc}",
+                code=2)
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            # os.replace is the commit point. Reporting failure after it would
+            # violate the stronger contract that every failed run preserves
+            # the prior bytes, while rollback would itself need another
+            # fallible replace. Keep the committed result and say durability
+            # could not be confirmed; the next run rechecks the digest.
+            log(f"WARNING: package lock was atomically replaced, but repository "
+                f"directory sync could not be confirmed ({exc}); treating the "
+                "replacement as committed")
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        os.close(directory_fd)
+
+
+def cmd_canonical_package_info(cfg: dict, package_id: str,
+                               source_repository_id: str,
+                               source_sha: str) -> "None":
+    """Emit the stable release-boundary projection for one admitted package.
+
+    Repository identity and commit are caller assertions because this tool's
+    config may point outside its own checkout.  The release layer already owns
+    that pinned source boundary; guessing it here would create false provenance.
+    """
+    packages = packages_resolved(cfg)
+    if package_id not in packages:
+        die(f"'{package_id}' is not a configured package")
+    if (not isinstance(source_repository_id, str)
+            or not source_repository_id.strip()
+            or source_repository_id != source_repository_id.strip()
+            or _CTRL_RE.search(source_repository_id)):
+        die("source repository id must be a non-empty, trimmed string without "
+            "control characters")
+    if re.fullmatch(r"[0-9a-f]{40}\Z", source_sha) is None:
+        die("source SHA must be a full lowercase 40-hex commit id")
+    spec = packages[package_id]
+    out = {
+        "package_id": package_id,
+        "schema_version": CAPABILITY_SCHEMA_VERSION,
+        "source_repository_id": source_repository_id,
+        "source_sha": source_sha,
+        "surfaces": list(spec["surfaces"]),
+        "surface_classifications": dict(spec["surface_classifications"]),
+    }
+    sys.stdout.write(json.dumps(out, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def cmd_apps(cfg: dict) -> "None":
+    for name in app_order(cfg):
+        _validate_app_name(name)
+        print(name)
+
+
+# Tailnet-facing PLAINTEXT ports, by app. These never carry content: each is
+# wired to the app's redirect_port, whose only response is a 301 to https.
+_PLAINTEXT_PORT_KEYS = ("http_port", "public_port")
+
+
+def cmd_plaintext(cfg: dict) -> "None":
+    """`<app> <listen_port> <redirect_port>` per enabled app with a plaintext port.
+
+    The orchestrator owns this wiring (it must happen AFTER nginx is reloaded, or
+    the plaintext port would point at a redirect server nginx is not serving yet)
+    and uses the same list to retire mappings that config no longer asks for.
+    """
+    packaged = packages_resolved(cfg)
+    for name, table in sorted(resolved(cfg).get("apps", {}).items()):
+        if name in packaged:
+            # A packaged app's plaintext surface is its DECLARED serve ports
+            # only — a generic sweep row would create a mapping no ledger
+            # record names, unreclaimable after removal.
+            continue
+        redirect = (table or {}).get("redirect_port")
+        if not redirect:
+            continue
+        for k in _PLAINTEXT_PORT_KEYS:
+            if k in table:
+                print(f"{name}\t{table[k]}\t{redirect}")
+                break
+    # Manifest-bearing apps: a row is MODE-derived, never class/key-derived —
+    # printing straight from serve_port_values (raw ints, mode-blind) gave a
+    # package that declares BOTH serve.https and a plaintext_redirect-less
+    # bare serve_ports key an http row for its HTTPS listen port too, which
+    # the orchestrator then created as a real (wrong) http listener that
+    # plaintext-known's mode filter correctly excluded — an unsweepable
+    # mistake. A row exists iff (a) an explicit 301 pairs two declared keys
+    # (plaintext_redirect), or (b) a serve_mappings entry is ITSELF mode
+    # "http" (a bare declared serve_ports key with no [serve.https]
+    # override) — for both source classes; nothing else ever emits a row.
+    for pid, pkg in sorted(packaged.items()):
+        table = resolved(cfg).get("apps", {}).get(pid) or {}
+        # Built from ONE (listen -> row) table, not printed as each surface
+        # is walked: package_specs/packages_resolved already refuse a
+        # manifest that lets two surfaces name the same listen, but this is
+        # the internal backstop — even if that validation were bypassed (a
+        # hand-built package-info, a future bug), one listen can still only
+        # ever emit ONE row here, never two competing ones for the
+        # orchestrator to apply in an order-dependent, silently-last-wins
+        # sequence.
+        rows: dict[int, tuple[int, int]] = {}
+        for public, redirect in sorted(pkg["plaintext_redirect"].items()):
+            rows[table[public]] = (table[public], table[redirect])
+        for _key, mapping in sorted(pkg["serve_mappings"].items()):
+            if mapping["mode"] == "http":
+                rows[mapping["listen"]] = (mapping["listen"], mapping["target"])
+        for listen, target in (rows[k] for k in sorted(rows)):
+            print(f"{pid}\t{listen}\t{target}")
+
+
+def _current_plaintext_retirement_entries(cfg: dict) -> list[dict]:
+    """Resolved package plaintext rows that must exist before a mapping does."""
+    packaged = packages_resolved(cfg)
+    app_tables = resolved(cfg).get("apps", {})
+    entries = []
+    for pid, package in sorted(packaged.items()):
+        table = app_tables.get(pid) or {}
+        for public_key, redirect_key in sorted(package["plaintext_redirect"].items()):
+            entries.append({"package": pid, "listen": table[public_key],
+                            "target": table[redirect_key], "state": "intent"})
+    return sorted(entries, key=lambda entry: (entry["package"], entry["listen"]))
+
+
+def cmd_plaintext_retirement_record(cfg: dict) -> "None":
+    """Durably journal intents before the orchestrator opens mappings."""
+    current = _current_plaintext_retirement_entries(cfg)
+    if not current:
+        return
+    _with_plaintext_retirement_lock(
+        lambda: _cmd_plaintext_retirement_record_locked(current))
+
+
+def _cmd_plaintext_retirement_record_locked(current: list[dict]) -> "None":
+    record = _read_plaintext_retirement()
+    merged = {(entry["package"], entry["listen"]): entry
+              for entry in record["entries"]}
+    for entry in current:
+        key = (entry["package"], entry["listen"])
+        old = merged.get(key)
+        # A matching committed row stays committed across an idempotent rerun.
+        # A target change is a new ownership attempt and returns to intent until
+        # the corresponding tailscale command succeeds.
+        if old is None or old["target"] != entry["target"]:
+            merged[key] = entry
+    result = {"version": PLAINTEXT_RETIREMENT_VERSION,
+              "entries": sorted(merged.values(),
+                                key=lambda entry: (entry["package"], entry["listen"]))}
+    if result != record:
+        _write_plaintext_retirement(result)
+
+
+def cmd_plaintext_retirement_commit(cfg: dict, package: str,
+                                    listen: int, target: int) -> "None":
+    """Promote one exact intent after the persistent mapping command succeeds."""
+    expected = {(entry["package"], entry["listen"], entry["target"])
+                for entry in _current_plaintext_retirement_entries(cfg)}
+    if (package, listen, target) not in expected:
+        # `cmd_plaintext` also emits ordinary mode=http serve_mappings. They
+        # are already ledgered and are not this sidecar's plaintext_redirect
+        # contract, so there is deliberately no intent to promote.
+        return
+    _with_plaintext_retirement_lock(
+        lambda: _cmd_plaintext_retirement_commit_locked(
+            package, listen, target))
+
+
+def _cmd_plaintext_retirement_commit_locked(package: str, listen: int,
+                                            target: int) -> "None":
+    record = _read_plaintext_retirement()
+    found = False
+    entries = []
+    for entry in record["entries"]:
+        if entry["package"] == package and entry["listen"] == listen:
+            if entry["target"] != target:
+                die(f"plaintext retirement intent for {package} :{listen} names "
+                    f":{entry['target']}, not successful target :{target}", code=2)
+            entry = dict(entry, state="committed")
+            found = True
+        entries.append(entry)
+    if not found:
+        die(f"no plaintext retirement intent for {package} :{listen} -> :{target}", code=2)
+    result = {"version": PLAINTEXT_RETIREMENT_VERSION, "entries": entries}
+    if result != record:
+        _write_plaintext_retirement(result)
+
+
+def cmd_plaintext_retirement_drop(port: int) -> "None":
+    """Drop responsibility only after the orchestrator proved the mapping absent."""
+    _with_plaintext_retirement_lock(
+        lambda: _cmd_plaintext_retirement_drop_locked(port))
+
+
+def _cmd_plaintext_retirement_drop_locked(port: int) -> "None":
+    record = _read_plaintext_retirement()
+    entries = [entry for entry in record["entries"] if entry["listen"] != port]
+    if len(entries) != len(record["entries"]):
+        _write_plaintext_retirement(
+            {"version": PLAINTEXT_RETIREMENT_VERSION, "entries": entries})
+
+
+def cmd_plaintext_retirement_known() -> "None":
+    for port in sorted({entry["listen"] for entry in
+                        _read_plaintext_retirement()["entries"]
+                        if entry["state"] == "committed"}):
+        print(port)
+
+
+def _validate_plaintext_retirement_intents(cfg: dict) -> "None":
+    """An abandoned pre-map intent is diagnostic, never removal authority."""
+    record = _read_plaintext_retirement()
+    current = {(entry["package"], entry["listen"], entry["target"])
+               for entry in _current_plaintext_retirement_entries(cfg)}
+    abandoned = [entry for entry in record["entries"]
+                 if entry["state"] == "intent"
+                 and (entry["package"], entry["listen"], entry["target"])
+                 not in current]
+    if abandoned:
+        facts = ", ".join(f"{entry['package']} :{entry['listen']} -> :{entry['target']}"
+                          for entry in abandoned)
+        die("uncommitted plaintext mapping intent(s) remain after their package "
+            f"configuration disappeared: {facts}.\n"
+            "  Airlock will NOT turn these ports off automatically because the "
+            "mapping command never reached its ownership commit point. Inspect "
+            "`tailscale serve status`; retire an Airlock mapping by hand if present, "
+            "then drop only the verified record with "
+            "`bin/airlock-config plaintext-retirement-drop <port>`.")
+
+
+def _shipped_plaintext_redirect_defaults() -> set:
+    """DEFAULT public-port values of every SHIPPED manifest's
+    plaintext_redirect, obtained from the common manifest parser's
+    shadow-agnostic shipped view — REGARDLESS of current config.
+
+    This fallback predates the independent plaintext retirement sidecar. A
+    shipped manifest persists in-tree even when the app is fully removed
+    from airlock.toml, so its DEFAULT value remains knowable — the same
+    backstop APP_DEFAULTS gives a removed built-in. A committed sidecar row
+    is now the authoritative recovery path for an operator-picked custom
+    plaintext_redirect port; this scan still covers old/pre-sidecar boxes.
+
+    Best-effort and read-only: a missing/malformed manifest contributes
+    nothing rather than failing the whole sweep (nothing here grants
+    removal authority — it only ever feeds a conservative stale-port list).
+    """
+    ports = set()
+    # Empty cfg is deliberate: stale-default retirement is shadow-agnostic.
+    # `known_builtin_specs` walks every canonical bundle entry and uses the
+    # same complete manifest parser/admission result as configured packages;
+    # this function never opens TOML itself.
+    for spec in known_builtin_specs({}).values():
+        defaults = spec["schema"]["defaults"]
+        for public_key in spec["plaintext_redirect"]:
+            v = defaults.get(public_key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                ports.add(v)
+    return ports
+
+
+def cmd_plaintext_known(cfg: dict) -> "None":
+    """Every plaintext port Airlock could own — defaults AND configured values.
+
+    Used to retire `tailscale serve` mappings for apps that were removed from
+    airlock.toml. Committed plaintext-retirement rows preserve exact package
+    custom ports; built-in/shipped defaults retain compatibility for mappings
+    created before that sidecar existed. The installer turns off only ports in
+    this conservative union and never an unrecognised live listener.
+
+    Mode-aware (child 4): the consumer, `ts_stale_plaintext_ports`, only ever
+    retires a PLAIN http listener (it skips any live TCP entry tailscale
+    marks HTTPS) — so this list must carry http-mode ports only. A packaged
+    app's `serve.https` mapping shares the SAME config key/port space as a
+    plain declared `serve_ports` value; mixing an https-mode port into this
+    set would misname it as "ours to sweep as plaintext" even though it was
+    never a plaintext mapping.
+    """
+    _validate_plaintext_retirement_intents(cfg)
+    ports = {entry["listen"] for entry in
+             _read_plaintext_retirement()["entries"]
+             if entry["state"] == "committed"}
+    packaged = packages_resolved(cfg)
+    for table in APP_DEFAULTS.values():
+        for k in _PLAINTEXT_PORT_KEYS:
+            v = (table or {}).get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                ports.add(v)
+    for name, table in (cfg.get("apps") or {}).items():
+        if name in packaged:
+            # A packaged app owns only its DECLARED/recorded serve values; an
+            # undeclared config port was never mapped by us and must not be
+            # sweepable as stale (it could be someone else's live mapping).
+            continue
+        for k in _PLAINTEXT_PORT_KEYS:
+            v = (table or {}).get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                ports.add(v)
+    # Packaged serve ports are ours too — both the currently declared values and
+    # every value recorded in the ledger/journal, so the stale sweep can retire a
+    # REMOVED package's custom port (the D6 closure of the forgotten-port gap:
+    # the config lines are gone, but the record still names the number) — but
+    # only the http-mode half of that mapping set (mode-aware, above).
+    for pkg in packaged.values():
+        ports.update(m["listen"] for m in pkg["serve_mappings"].values()
+                     if m["mode"] == "http")
+    # A packaged app's plaintext_redirect public port is a genuine plaintext
+    # http listener the ORCHESTRATOR maps (D2's plaintext_redirect stays
+    # orchestrator-owned, not ledgered) — cmd_plaintext already emits a row
+    # for it, so this list must carry it too, or removing the app leaves a
+    # public port `plaintext` no longer wants but `plaintext-known` never
+    # named, and the stale sweep has nothing to retire it by.
+    for pid, pkg in packaged.items():
+        table = resolved(cfg).get("apps", {}).get(pid) or {}
+        for public_key in pkg["plaintext_redirect"]:
+            v = table.get(public_key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                ports.add(v)
+    # A shipped app removed from config entirely (no [apps.X] table, no
+    # packages entry) drops out of `packaged` above too — its manifest is
+    # still in-tree, so its DEFAULT plaintext_redirect port is still swept.
+    ports.update(_shipped_plaintext_redirect_defaults())
+    for ent in _read_ledger()["entries"].values():
+        if not isinstance(ent, dict):
+            continue
+        for kind in ("committed", "intent"):
+            rec = ent.get(kind)
+            if isinstance(rec, dict):
+                ports.update(m["listen"] for m in (rec.get("serve_mappings") or {}).values()
+                             if isinstance(m, dict) and m.get("mode") == "http")
+    for p in sorted(ports):
+        print(p)
+
+
+def _dig(cfg: dict, dotted: str):
+    cur = cfg
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            die(f"key not found: {dotted}")
+        cur = cur[part]
+    return cur
+
+
+def cmd_get(cfg: dict, dotted: str) -> "None":
+    val = _dig(resolved(cfg), dotted)
+    if isinstance(val, bool):
+        print("true" if val else "false")
+    elif isinstance(val, (list, dict)):
+        print(json.dumps(val))
+    else:
+        print(val)
+
+
+def _envkey(app: str, key: str) -> str:
+    return f"AIRLOCK_{app.replace('-', '_').upper()}_{key.upper()}"
+
+
+def cmd_env(cfg: dict, app: str) -> "None":
+    _warn_deprecated_config(cfg, package_specs(cfg), only_app=app)
+    r = resolved(cfg)
+    if app not in r.get("apps", {}):
+        die(f"app not enabled (no [apps.{app}] table): {app}")
+    site = r.get("site", {})
+    auth = r.get("auth", {})
+    paths = r.get("paths", {})
+    brand = r.get("branding", {})
+    collaborators = auth.get("collaborators", []) or []
+    common = {
+        "AIRLOCK_SITE_NAME": site.get("name", "Airlock"),
+        "AIRLOCK_PRODUCT": brand.get("product", "Airlock"),
+        # Empty = app favicons ship as-is. Set on a box to ring its app icons so a
+        # browser tab says WHICH Airlock it is (see install/lib.sh ring_icon_svg).
+        "AIRLOCK_ICON_RING": brand.get("icon_ring", ""),
+        "AIRLOCK_AUTH_PROVIDER": auth.get("provider", ""),
+        "AIRLOCK_IDENTITY_HEADER": identity_header(cfg),
+        "AIRLOCK_OWNER": auth.get("owner", ""),
+        "AIRLOCK_COLLABORATORS": ",".join(collaborators),
+        "AIRLOCK_CODE_ROOT": paths.get("code_root", ""),
+        "AIRLOCK_WIKI": paths.get("wiki", ""),
+    }
+    lines = [f"{k}={shlex.quote(str(v))}" for k, v in common.items()]
+    for key, val in r["apps"][app].items():
+        # Nested tables (e.g. [apps.publish.public_target]) are not flattened into
+        # env — installers read them explicitly via `airlock-config get a.b.c`.
+        if isinstance(val, dict):
+            continue
+        v = ("true" if val else "false") if isinstance(val, bool) else str(val)
+        lines.append(f"{_envkey(app, key)}={shlex.quote(v)}")
+    print("\n".join(lines))
+
+
+def cmd_json(cfg: dict) -> "None":
+    out = resolved(cfg)
+    specs = package_specs(cfg)
+    out["capability_contract"] = {
+        "schema_version": CAPABILITY_SCHEMA_VERSION,
+        "bundle_entitlements": {
+            pid: list(BUNDLE_ENTITLEMENTS[pid]) for pid in sorted(BUNDLE_ENTITLEMENTS)
+        },
+        "packages": {
+            pid: _capability_projection(spec) for pid, spec in sorted(specs.items())
+        },
+    }
+    print(json.dumps(out, indent=2, sort_keys=True))
+
+
+# Public ports the frontend may link to (external tabs). Everything else
+# (gate/backend/loopback ports, owner, identity header) is deliberately omitted.
+_PUBLIC_PORT_KEYS = ("https_port", "public_port")
+
+
+def cmd_webjson(cfg: dict) -> "None":
+    """Frontend-safe config for the hub launcher (served as /__airlock.json).
+
+    Contains ONLY what the browser needs: product name and the enabled apps with
+    their public port (if any). No owner, no identity header, no internal ports.
+    """
+    r = resolved(cfg)
+    specs = package_specs(cfg)
+    apps = {}
+    for name, table in r.get("apps", {}).items():
+        entry = {}
+        for k in _PUBLIC_PORT_KEYS:
+            if k in table:
+                entry["port"] = table[k]
+                break
+        # Ported same-box tools navigate in-place; only a genuinely third-party
+        # service marked external=true opens a new tab (see hub/index.html).
+        if table.get("external"):
+            entry["external"] = True
+        # F14 (packaged ids only — the built-in payload is byte-identical):
+        # the effective audience (so the launcher can hide owner-only tiles
+        # fail-closed) and the manifest tile (data for the launcher; the
+        # built-in APPS table retired in child 4/P3 — hub/index.html's
+        # airlockTileMeta now reads manifest webjson tile data alone).
+        spec = specs.get(name)
+        if spec is not None:
+            # The launcher must distinguish "packaged, declares no tile"
+            # (render nothing) from hub — the only id that ever reaches
+            # webjson with spec is None now (it has no apps/hub tree and
+            # [packages.hub] is reserved) — which carries no "packaged" key
+            # at all and is filtered out of the tile grid by name anyway.
+            entry["packaged"] = True
+            entry["source_class"] = spec["source_class"]
+            if spec["audience"] is not None:
+                entry["audience"] = table.get("audience")
+            if spec["tile"] is not None:
+                tile = {"label": spec["tile"]["label"],
+                        "sub": spec["tile"]["sub"],
+                        "cat": spec["tile"]["cat"]}
+                if spec["tile"]["path"] is not None:
+                    tile["path"] = spec["tile"]["path"]
+                if spec["tile"]["glyph"] is not None:
+                    tile["glyph"] = spec["tile"]["glyph"]
+                if spec["icon"] is not None:
+                    tile["icon"] = "/" + spec["icon"]["dest"]
+                entry["tile"] = tile
+        apps[name] = entry
+    out = {
+        "product": r.get("branding", {}).get("product", "Airlock"),
+        "site": r.get("site", {}).get("name", "Airlock"),
+        "apps": apps,
+    }
+    # The deployment FQDN, so the launcher can build separate-port links that
+    # match the TLS cert no matter which origin the page was loaded from. Not a
+    # secret: it is the address the browser is already talking to. Measured by
+    # the installer (AIRLOCK_TS_FQDN); absent = the launcher falls back to
+    # location.hostname.
+    fqdn = os.environ.get("AIRLOCK_TS_FQDN", "").strip()
+    if fqdn:
+        out["fqdn"] = fqdn
+    print(json.dumps(out, indent=2, sort_keys=True))
+
+
+def _parse_global_args(argv: list[str]) -> list[str]:
+    global _DANGEROUS_ADMIT_UNVERIFIED
+    # main() is normally one process per call, but keep the parser honest for
+    # embedded/test callers too: an earlier exceptional invocation must never
+    # become ambient state for a later normal invocation in the same process.
+    _DANGEROUS_ADMIT_UNVERIFIED = None
+    rest = []
+    seen = False
+    for argument in argv:
+        if argument == "--dangerously-admit-unverified":
+            die("--dangerously-admit-unverified requires =<package-id>", code=2)
+        if argument.startswith("--dangerously-admit-unverified="):
+            if seen:
+                die("--dangerously-admit-unverified is accepted only once", code=2)
+            seen = True
+            value = argument.split("=", 1)[1]
+            if not value or PACKAGE_ID_RE.fullmatch(value) is None:
+                die("--dangerously-admit-unverified requires a valid package id "
+                    "after '='", code=2)
+            _DANGEROUS_ADMIT_UNVERIFIED = value
+            continue
+        rest.append(argument)
+    return rest
+
+
+def main(argv: list[str]) -> int:
+    argv = _parse_global_args(argv)
+    if not argv:
+        die("usage: airlock-config <validate|apps|plaintext|get|env|json> [arg]", code=2)
+    cmd, rest = argv[0], argv[1:]
+    cfg = load()
+    _preflight_config_abi(cfg)
+    if cmd == "validate":
+        cmd_validate(cfg)
+    elif cmd == "apps":
+        cmd_apps(cfg)
+    elif cmd == "plaintext":
+        cmd_plaintext(cfg)
+    elif cmd == "plaintext-known":
+        cmd_plaintext_known(cfg)
+    elif cmd == "plaintext-retirement-record":
+        if rest:
+            die("plaintext-retirement-record takes no arguments", code=2)
+        cmd_plaintext_retirement_record(cfg)
+    elif cmd == "plaintext-retirement-known":
+        if rest:
+            die("plaintext-retirement-known takes no arguments", code=2)
+        cmd_plaintext_retirement_known()
+    elif cmd == "plaintext-retirement-commit":
+        if (len(rest) != 3 or PACKAGE_ID_RE.fullmatch(rest[0]) is None
+                or not rest[1].isdigit() or not 1 <= int(rest[1]) <= 65535
+                or not rest[2].isdigit() or not 1 <= int(rest[2]) <= 65535):
+            die("plaintext-retirement-commit requires <package> <listen> <target>", code=2)
+        cmd_plaintext_retirement_commit(cfg, rest[0], int(rest[1]), int(rest[2]))
+    elif cmd == "plaintext-retirement-drop":
+        if len(rest) != 1 or not rest[0].isdigit() or not 1 <= int(rest[0]) <= 65535:
+            die("plaintext-retirement-drop requires one port number 1-65535", code=2)
+        cmd_plaintext_retirement_drop(int(rest[0]))
+    elif cmd == "get":
+        if not rest:
+            die("get requires a dotted.key", code=2)
+        cmd_get(cfg, rest[0])
+    elif cmd == "env":
+        if not rest:
+            die("env requires an app name", code=2)
+        cmd_env(cfg, rest[0])
+    elif cmd == "json":
+        cmd_json(cfg)
+    elif cmd == "webjson":
+        cmd_webjson(cfg)
+    elif cmd == "package-info":
+        cmd_package_info(cfg)
+    elif cmd == "lock-finalize":
+        if _DANGEROUS_ADMIT_UNVERIFIED is None:
+            if rest:
+                die("lock-finalize takes no arguments", code=2)
+            cmd_lock_finalize(cfg)
+        else:
+            if len(rest) != 1:
+                die("break-glass lock-finalize requires its current-run receipt", code=2)
+            cmd_lock_finalize(cfg, rest[0])
+    elif cmd == "canonical-package-info":
+        if len(rest) != 3:
+            die("canonical-package-info requires <package-id> "
+                "<source-repository-id> <full-40-hex-sha>", code=2)
+        cmd_canonical_package_info(cfg, rest[0], rest[1], rest[2])
+    elif cmd == "known-builtins":
+        cmd_known_builtins(cfg)
+    elif cmd == "adopt-scan":
+        cmd_adopt_scan(cfg)
+    elif cmd == "adopt-write":
+        if not rest:
+            die("adopt-write requires an app id", code=2)
+        cmd_adopt_write(cfg, rest[0])
+    elif cmd == "prereqs":
+        cmd_prereqs(cfg)
+    elif cmd == "icon-src":
+        if not rest:
+            die("icon-src requires an app name", code=2)
+        cmd_icon_src(cfg, rest[0])
+    elif cmd == "icon-stage":
+        if not rest:
+            die("icon-stage requires an app name", code=2)
+        cmd_icon_stage(cfg, rest[0])
+    else:
+        die(f"unknown command: {cmd}", code=2)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

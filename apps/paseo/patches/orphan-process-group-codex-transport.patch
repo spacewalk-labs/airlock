@@ -1,0 +1,41 @@
+--- a/dist/server/server/agent/providers/codex/app-server-transport.js
++++ b/dist/server/server/agent/providers/codex/app-server-transport.js
+@@ -181,6 +181,38 @@
+         if (result === "kill-timeout") {
+             this.logger.warn({ timeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS }, "Codex app-server did not report exit after SIGKILL");
+         }
++        // [paseo-process-group] The app-server is already spawned detached upstream, but
++        // nothing ever killed its group — so when it exited first, its children survived.
++        this.sweepProcessGroup(this.child ? this.child.pid : undefined, "dispose");
++    }
++    // [paseo-process-group] Kill the leader's PROCESS GROUP, not just its tree.
++    // A tree-kill walks ppid links, which are already gone once the leader exits —
++    // its MCP children get reparented and survive. The process group outlives the
++    // leader, so this reaches them. Safe when the spawn is NOT detached: a group id
++    // equals its leader's pid, so kill(-pid) can only ever hit the group led by that
++    // same process; if it leads none, the call fails with ESRCH and touches nothing.
++    //
++    // Why there is no "is this my own group?" check: a process group id IS the pid of
++    // its leader, and pids are unique among live processes — so a group we spawned can
++    // never share an id with the group this daemon sits in. (An earlier draft guarded
++    // with process.getpgrp(); that function does not exist in Node 22, so the branch was
++    // dead code pretending to be a safety net. Removed rather than left lying.)
++    // Residual, accepted: if the leader died and its pid were recycled by an unrelated
++    // group leader between the tree-kill and this call (sub-millisecond), we would signal
++    // that group. Closing it would need a liveness handle we no longer have by then.
++    sweepProcessGroup(pid, reason) {
++        if (!pid || pid <= 1 || pid === process.pid) {
++            return;
++        }
++        try {
++            process.kill(-pid, "SIGKILL");
++            this.logger.warn({ pgid: pid, reason, provider: "codex" }, "[paseo-process-group] swept the leader's process group — descendants had outlived the tree-kill");
++        }
++        catch (err) {
++            if (err && err.code !== "ESRCH") {   // ESRCH = 그룹 없음(정상: 이미 전멸했거나 비-detached)
++                this.logger.warn({ err, pgid: pid, reason, provider: "codex" }, "[paseo-process-group] process-group sweep failed");
++            }
++        }
+     }
+     writeJsonRpcResponse(response) {
+         if (this.disposed || this.child.stdin.destroyed || !this.child.stdin.writable) {

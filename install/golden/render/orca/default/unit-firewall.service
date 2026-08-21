@@ -1,0 +1,13 @@
+[Unit]
+Description=airlock-orca firewall — drop non-loopback traffic to :19600 (orca binds 0.0.0.0)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Idempotent re-apply: drop only our own table, then reload it (docker untouched).
+ExecStart=/bin/sh -c '/usr/sbin/nft delete table inet airlock_orca 2>/dev/null; /usr/sbin/nft -f /etc/airlock/orca-loopback.nft'
+ExecStop=/usr/sbin/nft delete table inet airlock_orca
+
+[Install]
+WantedBy=multi-user.target

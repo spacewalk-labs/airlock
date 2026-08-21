@@ -1,0 +1,82 @@
+# @getpaseo/server dist/server/server/agent/providers/claude/agent.js — toSdkUserMessage()
+#
+# Persist a pasted/uploaded image under the session cwd (<cwd>/.paseo-attachments/) so the
+# agent's Read tool can open it by absolute path. The inline base64 vision block is left
+# untouched (the model still sees the image); a text block naming the absolute path is
+# appended beside it. install.sh applies this idempotently and all-or-nothing via
+# patches/image-attachments-persist.mjs — THAT is the applier; this file is the
+# human-readable reference / re-derivation copy.
+#
+# Why: a web-UI image upload reaches the daemon only as inline base64 in
+# send_agent_message.images[] — there is no file on disk — and the claude provider merely
+# puts it into stream-json as {type:image, source:{base64}}. Nothing exists in the
+# filesystem, so Read fails and "look at this screenshot, then edit the file" dead-ends.
+# All three materialize paths converge on toSdkUserMessage, so this one function is the
+# single edit point.
+#
+# Three anchors; applied only if all three are present, otherwise skipped whole:
+
+## (1) import — add createHash
+ import { randomUUID } from "node:crypto";
++import { randomUUID, createHash } from "node:crypto";
+
+## (2) insert the helper right after the isImageMimeType definition
+ function isImageMimeType(value) {
+     return (value === "image/jpeg" ||
+         value === "image/png" ||
+         value === "image/gif" ||
+         value === "image/webp");
+ }
++// [paseo-attachments-persist] Persist a pasted/uploaded image inside the session cwd
++// so the agent Read tool can open it by absolute path. The inline base64 vision block is
++// left alone (the model still sees it); a text block naming the path is appended beside it.
++// Files land in <cwd>/.paseo-attachments/, which self-ignores via its own .gitignore (*),
++// so git status stays clean. The name is content-addressed (sha256[:12]), which dedups a
++// re-paste or a replay. A failure is not swallowed: warn, and keep the inline block.
++const PASEO_IMG_EXT = { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp" };
++function persistPastedImage(cwd, chunk, logger) {
++    if (typeof cwd !== "string" || cwd.length === 0) {
++        return null;
++    }
++    try {
++        const buf = Buffer.from(chunk.data, "base64");
++        const ext = PASEO_IMG_EXT[chunk.mimeType] ?? "img";
++        const dir = path.join(cwd, ".paseo-attachments");
++        fs.mkdirSync(dir, { recursive: true });
++        const gitignore = path.join(dir, ".gitignore");
++        if (!fs.existsSync(gitignore)) {
++            fs.writeFileSync(gitignore, "*\n");
++        }
++        const name = `paste-${createHash("sha256").update(buf).digest("hex").slice(0, 12)}.${ext}`;
++        const abs = path.join(dir, name);
++        if (!fs.existsSync(abs)) {
++            fs.writeFileSync(abs, buf, { mode: 0o600 });
++        }
++        return abs;
++    }
++    catch (err) {
++        logger?.warn?.({ err: String(err) }, "paseo-attachments: could not persist pasted image");
++        return null;
++    }
++}
+
+## (3) in the image branch, persist and announce the path alongside the vision block
+                 else if (chunk.type === "image") {
+                     if (isImageMimeType(chunk.mimeType)) {
+                         content.push({
+                             type: "image",
+                             source: {
+                                 type: "base64",
+                                 media_type: chunk.mimeType,
+                                 data: chunk.data,
+                             },
+                         });
++                        const savedPath = persistPastedImage(this.config.cwd, chunk, this.logger);
++                        if (savedPath) {
++                            content.push({
++                                type: "text",
++                                text: `[Pasted image also saved to ${savedPath}]`,
++                            });
++                        }
+                     }
+                 }

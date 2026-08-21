@@ -1,0 +1,95 @@
+diff --git a/node_modules/@getpaseo/server/dist/server/server/session.js b/node_modules/@getpaseo/server/dist/server/server/session.js
+--- a/node_modules/@getpaseo/server/dist/server/server/session.js
++++ b/node_modules/@getpaseo/server/dist/server/server/session.js
+@@
+     supportsForSource(capability, source) {
+         return (this.clientCapabilitiesBySource.get(source)?.has(capability) ?? this.supports(capability));
+     }
++    // [paseo-provider-subagent-stream-filter] Keep provider-owned child streams
++    // inside the same source-local viewed-parent boundary as normal agent streams.
++    forwardProviderSubagentUpdate(update) {
++        const parentAgentId = update.type === "upsert"
++            ? update.subagent.parentAgentId
++            : update.parentAgentId;
++        const payload = update.type === "upsert"
++            ? { kind: "upsert", subagent: update.subagent }
++            : update.type === "timeline"
++                ? {
++                    kind: "timeline",
++                    parentAgentId: update.parentAgentId,
++                    subagentId: update.subagentId,
++                    provider: update.provider,
++                    item: update.row.item,
++                    timestamp: update.row.timestamp,
++                    seq: update.row.seq,
++                    epoch: update.epoch,
++                }
++                : {
++                    kind: "remove",
++                    parentAgentId: update.parentAgentId,
++                    subagentId: update.subagentId,
++                };
++        const message = { type: "agent.provider_subagents.update", payload };
++        if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
++            if (!this.supports(CLIENT_CAPS.providerSubagents)) {
++                return;
++            }
++            if (this.usesSelectiveTimelineDelivery() &&
++                !this.viewedTimelineAgentIds.has(parentAgentId)) {
++                return;
++            }
++            this.emit(message);
++            return;
++        }
++        for (const [source, capabilities] of this.clientCapabilitiesBySource) {
++            if (!capabilities.has(CLIENT_CAPS.providerSubagents)) {
++                continue;
++            }
++            if (capabilities.has(CLIENT_CAPS.selectiveAgentTimeline) &&
++                !this.viewedTimelineAgentIdsBySource.get(source)?.has(parentAgentId)) {
++                continue;
++            }
++            this.onMessageToSource(source, message);
++        }
++    }
+     emitProjectUpdate(update) {
+@@
+             if (event.type === "provider_subagent") {
+-                if (!this.supports(CLIENT_CAPS.providerSubagents)) {
+-                    return;
+-                }
+-                const update = event.event;
+-                if (update.type === "upsert") {
+-                    this.emit({
+-                        type: "agent.provider_subagents.update",
+-                        payload: { kind: "upsert", subagent: update.subagent },
+-                    });
+-                }
+-                else if (update.type === "timeline") {
+-                    this.emit({
+-                        type: "agent.provider_subagents.update",
+-                        payload: {
+-                            kind: "timeline",
+-                            parentAgentId: update.parentAgentId,
+-                            subagentId: update.subagentId,
+-                            provider: update.provider,
+-                            item: update.row.item,
+-                            timestamp: update.row.timestamp,
+-                            seq: update.row.seq,
+-                            epoch: update.epoch,
+-                        },
+-                    });
+-                }
+-                else {
+-                    this.emit({
+-                        type: "agent.provider_subagents.update",
+-                        payload: {
+-                            kind: "remove",
+-                            parentAgentId: update.parentAgentId,
+-                            subagentId: update.subagentId,
+-                        },
+-                    });
+-                }
++                this.forwardProviderSubagentUpdate(event.event);
+                 return;
+             }

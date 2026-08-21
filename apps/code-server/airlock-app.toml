@@ -1,0 +1,131 @@
+contract = 1
+id = "code-server"
+
+# Transcribed from the former APP_DEFAULTS["code-server"] entry.
+[config]
+# Written by the renderer into the manager unit, derived from a loopback constant
+# and the owner (apps/code-server/render.sh:51-55) — not values an operator sets.
+runtime_env = [
+  "AIRLOCK_CODE_SERVER_ALLOW",
+  "AIRLOCK_CODE_SERVER_MANAGER_HOST",
+]
+
+[config.defaults]
+https_port = 8444
+gate_port = 18808
+backend_port = 18811
+manager_port = 18810
+slots = 4
+
+# D8: code-server actually binds backend_port .. backend_port+slots-1 (one
+# loopback port per slot, apps/code-server/manager/manager.py:37) — the
+# whole derived range joins the global port-uniqueness pool, not just the
+# declared scalar.
+[[config.port_spans]]
+base = "backend_port"
+count = "slots"
+
+# Transcribed from install/prerequisites.tsv's seven code-server rows (F11).
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Release download"
+
+[[prerequisites]]
+command = "sha256sum"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y coreutils"
+note = "Release verification"
+
+[[prerequisites]]
+command = "tar"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y tar"
+note = "Release extraction"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User services"
+
+[[prerequisites]]
+command = "tailscale"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get install -y curl && curl -fsSL https://tailscale.com/install.sh | sh"
+note = "Private ingress"
+
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Slot manager"
+
+[[prerequisites]]
+command = "sudo"
+predicate = "present"
+expected = "-"
+fix = "su -c 'apt-get update && apt-get install -y sudo'"
+note = "Privileged ingress setup"
+
+# Appendix: two user units (the slot template's "@" is a literal char in the
+# unit-name grammar, not a glob — D2 amendment), one servers.d fragment plus
+# the tab-bar shell's own fragments-class dir claim (code-server/ — the
+# $CONFD projection IS the fragments contract), the versioned+arch-named
+# code-server tree, the code-server symlink + our own slot launcher/manager
+# binaries, and the one installer-generated config file. Deliberately NOT
+# declared (retained operator/user state, per the Appendix "data (retained)"
+# column): ~/.local/share/airlock-code-server/ (extensions/, slots/ —
+# declaring extensions/ removable would delete user-installed extensions),
+# ~/.config/airlock-code-server/tabs.json (manager.py:52), and the rest of
+# ~/.config/code-server/ beyond config.yaml itself.
+#
+# The versioned tree's directory name bakes in VER + ARCH_TAG
+# (install.sh: code-server-${VER}-linux-${ARCH_TAG}). A wildcard there
+# (e.g. code-server-*-linux-*) validated in isolation but DIED at validate
+# once markwand was also configured: the D2 disjointness check
+# (_may_overlap in bin/airlock-config) compares claims segment-by-segment
+# and can only PROVE two claims disjoint at a segment where both sides are
+# wildcard-free literals that differ; the wildcard here sits exactly at the
+# segment position where this path and markwand's
+# ~/.local/lib/node_modules/markserv/ diverge (this pattern is also one
+# segment SHORTER, so the comparison never reaches a later literal
+# position) — so the conservative check could not rule out an overlap and
+# refused. VER is already hardcoded in install.sh (a version bump edits
+# both together, same as orca's/paseo's own version pins), and ARCH_TAG has
+# exactly two values, so declaring both literal directories — never a
+# glob — is both more precise and free of the collision, and teardown
+# no-ops on whichever one this box never had.
+[artifacts]
+units = ["airlock-code-server@.service", "airlock-code-server-manager.service"]
+fragments = ["servers.d/code-server.conf", "code-server/"]
+files = ["~/.local/lib/code-server-4.128.0-linux-amd64",
+         "~/.local/lib/code-server-4.128.0-linux-arm64",
+         "~/.local/bin/code-server",
+         "~/.local/bin/airlock-code-server-slot",
+         "~/.local/bin/airlock-code-server-manager",
+         "~/.config/code-server/config.yaml"]
+serve_ports = ["https_port"]
+
+[serve.https]
+https_port = "gate_port"
+
+# From hub/index.html's APPS table (code-server row). code-server has no
+# public_port/redirect_port at all (https only), so unlike devterm there is
+# no [plaintext_redirect] here.
+[tile]
+label = "code-server"
+sub = "browser IDE"
+cat = "coding"
+glyph = "app-code-server"
+
+[audience]
+supported = ["owner"]
+default = "owner"

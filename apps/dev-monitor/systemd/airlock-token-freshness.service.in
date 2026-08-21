@@ -1,0 +1,29 @@
+[Unit]
+Description=airlock — check how long the provider credentials on this box have left
+Documentation=file:@REPO@/apps/dev-monitor/README.md
+# A separate unit rather than a line in this one, for the reason live/systemd's weekly
+# verification records: a run that dies takes this ExecStart with it, and anything that
+# had to run inside it would die too. OnFailure= is started by systemd AFTER this unit
+# has failed, which is the only version of "raise an alarm" that survives the failure.
+# The watchdog going quiet is the failure nobody would otherwise see — an expired token
+# is only a card.
+OnFailure=airlock-token-freshness-failed.service
+
+[Service]
+Type=oneshot
+# Stated, not inherited. A timer-driven unit gets a reduced PATH, and a fleet's worth of
+# jobs that "worked by hand and did nothing on schedule" is why this line is here.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DEV_MONITOR_TOKEN_SNAPSHOT=@SNAPSHOT@
+WorkingDirectory=@REPO@
+# @SPOOLFLAG@ is either `--spool <dir>` or `--no-spool`, decided once at install time.
+# It is a FLAG rather than an environment variable because "this box has no message
+# console" has to be a statement the unit makes, not an empty value the script has to
+# interpret — an empty spool path would otherwise produce one journal complaint per tick.
+ExecStart=@PYTHON@ @REPO@/apps/dev-monitor/token-freshness.py --warn-hours @WARNHOURS@ --stale-hours @STALEHOURS@ @SPOOLFLAG@
+# Reading two small files and linking one into a spool. A minute is not an estimate of
+# how long it takes, it is the point past which something is wrong.
+TimeoutStartSec=60
+
+[Install]
+WantedBy=default.target

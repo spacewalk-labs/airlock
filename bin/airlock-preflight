@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=/dev/null
+. "$ROOT/install/lib.sh"
+
+case "$#" in
+  0) quiet="" ;;
+  1) [ "$1" = "--quiet" ] || { log "usage: airlock-preflight [--quiet]"; exit 2; }; quiet="$1" ;;
+  *) log "usage: airlock-preflight [--quiet]"; exit 2 ;;
+esac
+
+airlock_preflight_bootstrap
+airlock_config validate >/dev/null || exit 2
+# F11: the standalone report must evaluate the SAME assembled inventory the
+# installer does — without package-info, packaged prerequisites are silently
+# never evaluated and the paseo nvm gate acts on the wrong contract.
+AIRLOCK_PKG_INFO="$(airlock_config package-info)" || exit 2
+export AIRLOCK_PKG_INFO
+if [ -n "$quiet" ]; then airlock_preflight "$quiet"; else airlock_preflight; fi

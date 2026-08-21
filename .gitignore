@@ -1,0 +1,43 @@
+# The filled config — holds site-specific facts. Only the .example is tracked.
+airlock.toml
+# The external-package example must be tracked so a clean clone can copy it.
+!examples/app-package/airlock.toml
+
+# Secrets — never commit
+*.env
+.env
+*.token
+*.key
+*.pem
+
+# The orca web-bundle dist IS vendored (committed) — it is the patched web client
+# Airlock serves at /orca-web/. Provenance + refresh: apps/orca/web-bundle/README.md.
+# (The orca AppImage runtime is still fetched + sha-pinned at install, never committed.)
+node_modules/
+# Playwright downloads its own browsers at install
+.cache/ms-playwright/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# macOS/OrbStack: default local code-mount placeholder for the experimental
+# docker-compose (docs/design/macos-container.md). Real code lives on the Mac.
+docker/_code/
+
+# Worktrees created inside the clone. Four of them live under `wt/` on the box that
+# runs the weekly verification, and an untracked directory makes the clone dirty
+# forever — which `live/verify.sh:78` refuses to run against, correctly: a result
+# recorded against a SHA whose tree has extra files is a claim about something that
+# did not run. On 2026-08-17 that refusal is what turned the freshness watchdog red,
+# the first time it ever reported anything (it had failed 11 times for its own
+# reasons before that). The convention is fine; leaving it visible to git was not.
+wt/
+
+# 선택 스킬 배선 산출물 — 이름만 skills.conf 에 커밋한다
+.claude/skills/

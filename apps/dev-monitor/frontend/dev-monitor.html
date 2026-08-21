@@ -1,0 +1,1726 @@
+<!doctype html>
+<html lang="en" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Dev Monitor</title>
+  <meta name="apple-mobile-web-app-title" content="Dev Monitor">
+  <!-- Icons are generated from the launcher tile — bin/gen-app-icons.py, SoT hub/index.html.
+       Same-origin subpath app: /assets/ is the hub's, copied there by the installer. -->
+  <link rel="icon" type="image/svg+xml" href="/assets/app-icons/dev-monitor.svg">
+  <link rel="apple-touch-icon" href="/assets/app-icons/dev-monitor.png">
+  <style>
+    :root {
+      --bg: #f5f5f7; --surface: #fff; --text: #1d1d1f; --muted: #6e6e73;
+      --line: #d2d2d7; --accent: #0066cc; --accent-contrast: #fff;
+      --success: #1a8f3c; --warning: #b8860b; --danger: #c0392b;
+      --hover: #ececf0; --code-bg: #f0f0f3;
+      --font-sans: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --r: 14px; --r-sm: 8px; --r-pill: 999px;
+      --shadow: 0 1px 2px rgba(0,0,0,.05), 0 1px 3px rgba(0,0,0,.04);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #000; --surface: #1c1c1e; --text: #f5f5f7; --muted: #98989d;
+        --line: #38383a; --accent: #2997ff; --accent-contrast: #001528;
+        --success: #30d158; --warning: #ffd60a; --danger: #ff453a;
+        --hover: #2c2c2e; --code-bg: #0e0e10; --shadow: none;
+      }
+    }
+    :root[data-theme="light"] {
+      --bg: #f5f5f7; --surface: #fff; --text: #1d1d1f; --muted: #6e6e73;
+      --line: #d2d2d7; --accent: #0066cc; --accent-contrast: #fff;
+      --success: #1a8f3c; --warning: #b8860b; --danger: #c0392b;
+      --hover: #ececf0; --code-bg: #f0f0f3; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 1px 3px rgba(0,0,0,.04);
+    }
+    :root[data-theme="dark"] {
+      --bg: #000; --surface: #1c1c1e; --text: #f5f5f7; --muted: #98989d;
+      --line: #38383a; --accent: #2997ff; --accent-contrast: #001528;
+      --success: #30d158; --warning: #ffd60a; --danger: #ff453a;
+      --hover: #2c2c2e; --code-bg: #0e0e10; --shadow: none;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; min-height: 100vh; }
+    body {
+      background: var(--bg); color: var(--text); font-family: var(--font-sans);
+      font-size: 14px; line-height: 1.55; -webkit-font-smoothing: antialiased;
+    }
+    .shell { max-width: 1100px; margin: 0 auto; padding: max(env(safe-area-inset-top), 20px) 18px 48px; }
+
+    .ic { width: 1em; height: 1em; display: inline-block; vertical-align: -0.14em; flex: none; }
+
+    /* topbar */
+    .topbar {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 12px 16px; margin-bottom: 20px;
+      background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+      box-shadow: var(--shadow);
+    }
+    .topbar .title { font-size: 1.25rem; font-weight: 600; color: var(--text); flex: 1; letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px; }
+    .topbar .title .ic { width: 1.1em; height: 1.1em; color: var(--accent); }
+    .topbar .meta { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+    .theme-group { display: flex; gap: 4px; }
+    .theme-group button {
+      background: transparent; border: 1px solid var(--line); color: var(--text);
+      padding: 4px 10px; border-radius: var(--r-pill); cursor: pointer; font-size: 13px; line-height: 1;
+    }
+    .theme-group button:hover { background: var(--hover); }
+    .theme-group button[aria-pressed="true"] { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
+
+    /* sections */
+    .section { margin-bottom: 24px; }
+    .section h2 {
+      font-size: 1.05rem; margin: 0 0 12px; color: var(--text);
+      display: flex; align-items: center; gap: 8px; font-weight: 600;
+    }
+    .section h2 .ic { color: var(--accent); width: 1.05em; height: 1.05em; }
+    .section h2 .hint { font-size: 12px; color: var(--muted); font-weight: 400; font-family: var(--font-mono); }
+
+    /* cards */
+    .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    @media (max-width: 820px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 460px) { .cards { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: var(--r); padding: 16px; box-shadow: var(--shadow);
+    }
+    .card .h { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+    .card .h .ic { color: var(--accent); }
+    .card .v { font-size: 1.5rem; font-weight: 600; color: var(--text); line-height: 1.1; }
+    .card .sub { font-size: 12px; color: var(--muted); margin-top: 4px; font-family: var(--font-mono); }
+    .card.warn { border-left: 3px solid var(--warning); }
+    .card.warn .v { color: var(--warning); }
+    .card.danger { border-left: 3px solid var(--danger); }
+    .card.danger .v { color: var(--danger); }
+    .card .bar { height: 6px; background: var(--hover); border-radius: var(--r-pill); overflow: hidden; margin-top: 10px; }
+    .card .bar > span { display: block; height: 100%; background: var(--accent); transition: width 250ms; }
+    .card.warn .bar > span { background: var(--warning); }
+    .card.danger .bar > span { background: var(--danger); }
+
+    /* process tables */
+    .proc-list { margin-top: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow-x: auto; box-shadow: var(--shadow); }
+    .proc-list table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 420px; }
+    .proc-list th { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-weight: 500; }
+    .proc-list th.num, .proc-list td.num { text-align: right; white-space: nowrap; }
+    .proc-list td { padding: 8px 14px; border-bottom: 1px solid var(--line); }
+    .proc-list tr:last-child td { border-bottom: 0; }
+    .proc-list code { font-family: var(--font-mono); font-size: 12px; }
+    .proc-list .u { color: var(--muted); font-family: var(--font-mono); font-size: 12px; }
+    .proc-list .dim { color: var(--muted); font-size: 12px; }
+    .proc-list .xn { color: var(--accent); font-size: 12px; }
+
+    /* services */
+    .svc-list { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; box-shadow: var(--shadow); }
+    .svc-row {
+      display: grid; grid-template-columns: 16px 1fr auto auto; gap: 12px; align-items: center;
+      padding: 12px 16px; border-bottom: 1px solid var(--line); font-size: 13px;
+    }
+    .svc-row:last-child { border-bottom: 0; }
+    .svc-row .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
+    .svc-row.inactive .dot { background: var(--muted); }
+    .svc-row.failed .dot { background: var(--danger); }
+    .svc-row .name { font-family: var(--font-mono); }
+    .svc-row .scope { font-size: 12px; color: var(--muted); }
+    .svc-row .uptime { color: var(--muted); font-family: var(--font-mono); font-size: 12px; }
+    .svc-row .svc-restart { justify-self: end; }
+
+    /* network */
+    .net-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 820px) { .net-grid { grid-template-columns: 1fr; } }
+    .net-block { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; box-shadow: var(--shadow); }
+    .net-block h3 { font-size: 12px; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+    .net-block h3 + h3 { margin-top: 14px; }
+    .net-block .row { display: flex; gap: 12px; padding: 4px 0; font-size: 13px; }
+    .net-block .row .label { color: var(--muted); min-width: 96px; font-family: var(--font-mono); font-size: 12px; }
+    .net-block .row code { background: var(--code-bg); padding: 1px 6px; border-radius: var(--r-sm); font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
+    .net-block .peer { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+    .net-block .peer .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); flex: none; }
+    .net-block .peer.off .dot { background: var(--muted); }
+    .net-block .peer .ip { color: var(--muted); font-family: var(--font-mono); font-size: 12px; margin-left: auto; }
+
+    /* storage */
+    .stg-list { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 16px; box-shadow: var(--shadow); }
+    .stg-row { display: grid; grid-template-columns: 1fr 140px 90px; gap: 12px; align-items: center; padding: 7px 0; font-size: 13px; }
+    @media (max-width: 560px) { .stg-row { grid-template-columns: 1fr 80px; } .stg-row .bar { display: none; } }
+    .stg-row .path { font-family: var(--font-mono); font-size: 12px; color: var(--text); }
+    .stg-row .size { font-family: var(--font-mono); font-size: 12px; color: var(--muted); text-align: right; }
+    .stg-row .bar { height: 6px; background: var(--hover); border-radius: var(--r-pill); overflow: hidden; }
+    .stg-row .bar > span { display: block; height: 100%; background: var(--accent); }
+    .stg-row.warn .bar > span { background: var(--warning); }
+    .stg-row.warn .size { color: var(--warning); }
+
+    /* logs */
+    .log-head select { background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 2px 6px; font-family: var(--font-mono); font-size: 12px; }
+    .log-block { background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 16px; font-family: var(--font-mono); font-size: 12px; max-height: 260px; overflow: auto; }
+    .log-row { display: grid; grid-template-columns: 150px 56px 1fr; gap: 12px; padding: 2px 0; color: var(--text); }
+    @media (max-width: 560px) { .log-row { grid-template-columns: 1fr; gap: 0; } }
+    .log-row .ts { color: var(--muted); }
+    .log-row .lv { text-transform: uppercase; font-weight: 600; }
+    .log-row .lv.info { color: var(--accent); }
+    .log-row .lv.warn { color: var(--warning); }
+    .log-row .lv.err  { color: var(--danger); }
+
+    details.section > summary {
+      cursor: pointer; font-size: 1.05rem; font-weight: 600; color: var(--text);
+      padding: 6px 0; display: flex; align-items: center; gap: 8px; list-style: none;
+    }
+    details.section > summary::-webkit-details-marker { display: none; }
+    details.section > summary .ic { color: var(--accent); width: 1.05em; height: 1.05em; }
+    details.section > summary .hint { font-size: 12px; color: var(--muted); font-weight: 400; font-family: var(--font-mono); }
+    details.section[open] > summary { margin-bottom: 12px; }
+
+    /* Message console */
+    .msg-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .msg-head h2 { margin: 0; }
+    .msg-unread { font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: var(--r-pill); background: var(--hover); color: var(--accent); }
+    .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+    .chip, .mbtn, .micon {
+      background: transparent; border: 1px solid var(--line); color: var(--text); cursor: pointer;
+      font-family: var(--font-sans); font-size: 13px;
+    }
+    .chip { color: var(--muted); padding: 3px 11px; border-radius: var(--r-pill); }
+    .chip:hover, .mbtn:hover, .micon:hover { background: var(--hover); }
+    .chip[aria-pressed="true"], .mbtn.primary { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
+    .chip .n { opacity: .7; margin-left: 3px; font-variant-numeric: tabular-nums; }
+    /* `hidden` is display:none from the user-agent sheet, and any author `display` beats it.
+       .chips and .strip both set one, so disableMessages() hid neither and a console that is
+       off or not ours still drew a filter bar and a row of numbers — a screen that looks like
+       it is reporting something. Named per selector rather than as a global !important. */
+    .chips[hidden], .strip[hidden] { display: none; }
+    .msg-feed { display: flex; flex-direction: column; gap: 8px; }
+    .bulkbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: -4px 0 12px; color: var(--muted); font-size: 12px; }
+    .bulkbar[hidden] { display: none; }
+    .bulkbar .mbtn[hidden] { display: none; }
+    .bulkbar .bulk-count { min-width: 72px; }
+    .mcard { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 16px; display: flex; gap: 12px; align-items: flex-start; box-shadow: var(--shadow); }
+    .mcard .mselect { margin: 3px 0 0; flex: none; accent-color: var(--accent); }
+    .mcard.urgent { border-left: 3px solid var(--danger); }
+    .mcard .mdot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); margin-top: 5px; flex: none; }
+    .mcard.unread .mdot { background: var(--accent); }
+    .mcard.urgent .mdot { background: var(--danger); }
+    .mcard .mmain { flex: 1; min-width: 0; }
+    .mcard .mtop { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .mcard .mtop.mtoggle { cursor: pointer; }
+    .mcard .mtitle { font-size: 14px; font-weight: 500; }
+    .mcard.unread .mtitle { font-weight: 600; }
+    .mkind, .murg { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 1px 6px; border-radius: var(--r-sm); border: 1px solid var(--line); color: var(--muted); }
+    .mkind.action { color: var(--accent); border-color: var(--accent); }
+    .murg { color: var(--danger); border-color: var(--danger); }
+    .mowner-fallback { font-size: 10px; padding: 1px 6px; border-radius: var(--r-sm); border: 1px solid var(--warning); color: var(--warning); }
+    .mcard .mbody { font-size: 13px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
+    .mcard .mmeta { font-size: 12px; color: var(--muted); font-family: var(--font-mono); margin-top: 5px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .mcard.unread .mstatus { color: var(--accent); font-weight: 600; }
+    .mcard.urgent .mstatus { color: var(--danger); }
+    .mcard .mactions { display: flex; gap: 6px; align-items: center; flex: none; }
+    .mcard .mchev { margin-left: auto; font-size: 10px; color: var(--muted); flex: none; }
+    .mcard .mdetail[hidden] { display: none; }
+    .mcard .murl { font-family: var(--font-mono); }
+    .mbtn { padding: 4px 12px; border-radius: var(--r-pill); white-space: nowrap; text-decoration: none; display: inline-block; }
+    .mbtn:disabled, .micon:disabled { opacity: .4; cursor: not-allowed; }
+    .micon { padding: 4px 7px; border-radius: var(--r-sm); line-height: 1; }
+    .micon.pinned { color: var(--accent); }
+    .mrun { font-size: 12px; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; font-family: inherit; margin-top: 5px; }
+    .mrun:hover { text-decoration: underline; }
+    .msg-empty { text-align: center; color: var(--muted); padding: 24px; font-size: 13px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); }
+    .msg-empty.err { color: var(--danger); }
+    .sheet-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.42); display: none; align-items: flex-end; justify-content: center; z-index: 1100; }
+    .sheet-backdrop.show { display: flex; }
+    .sheet { background: var(--surface); border: 1px solid var(--line); border-radius: 16px 16px 0 0; width: 100%; max-width: 560px; padding: 20px; box-shadow: var(--shadow); max-height: 85vh; overflow-y: auto; }
+    .sheet h3 { margin: 0 0 8px; font-size: 1.05rem; }
+    .sheet .sheet-sub, .sheet-warn { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+    .sheet-preview { background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--r); padding: 8px 16px; }
+    .pv-line { display: flex; gap: 8px; padding: 6px 0; }
+    .pv-line + .pv-line { border-top: 1px solid var(--line); }
+    .pv-label { color: var(--muted); min-width: 92px; font-family: var(--font-mono); font-size: 12px; flex: none; }
+    .pv-value { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; }
+    .sheet-err { color: var(--danger); font-size: 13px; margin-top: 12px; }
+    .sheet-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+    .runview-terminal { height: min(55vh, 560px); margin-top: 12px; position: relative; background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+    .runview-terminal:empty { display: none; }
+    .runview-terminal iframe { display: block; width: 100%; height: 100%; border: 0; }
+    .runview-note { height: 100%; display: flex; align-items: center; justify-content: center; padding: 20px; text-align: center; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+    #undo-toast, #msg-toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: var(--r-pill); padding: 8px 12px 8px 20px; font-size: 13px; box-shadow: var(--shadow); display: none; align-items: center; gap: 12px; z-index: 1050; }
+    #undo-toast.show, #msg-toast.show { display: inline-flex; }
+    #undo-btn { background: var(--accent); color: var(--accent-contrast); border: 0; border-radius: var(--r-pill); padding: 4px 12px; cursor: pointer; font-size: 13px; }
+    #msg-toast { z-index: 1060; padding: 8px 20px; }
+    @media (min-width: 640px) { .sheet-backdrop { align-items: center; } .sheet { border-radius: var(--r); } }
+    /* The task actions made this row longer than a phone. It wraps rather than clipping:
+       a button that is off-screen is a transition the person cannot reach. */
+    @media (max-width: 560px) { .mcard { flex-wrap: wrap; } .mcard .mactions { flex-basis: 100%; flex-wrap: wrap; justify-content: flex-end; margin-top: 6px; } }
+
+    /* Tabs. The inbox is a destination rather than the top section of one long page:
+       everything else on this box is observation, and observation is not a task. */
+    .nav { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .nav button {
+      background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+      font: inherit; font-size: 14px; padding: 8px 14px; cursor: pointer; display: flex; align-items: center; gap: 6px;
+    }
+    .nav button:hover { color: var(--text); }
+    .nav button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+    .nav .nbadge, .tabbar .nbadge {
+      background: var(--danger); color: #fff; border-radius: var(--r-pill); font-size: 11px;
+      font-weight: 700; padding: 0 6px; min-width: 18px; text-align: center; font-variant-numeric: tabular-nums;
+    }
+    .view[hidden] { display: none; }
+
+    /* The strip. "To do" is the number; unread survives beside it as a smaller stat, because
+       on the day needs_action ships nothing has declared yet and a screen that simply lost its
+       number would read as a broken console rather than as an honest zero. */
+    .strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .stat { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 10px 14px; box-shadow: var(--shadow); }
+    .stat .k { font-size: 12px; color: var(--muted); }
+    .stat .v { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .stat.alarm .v { color: var(--danger); }
+    .stat.warn .v { color: var(--warning); }
+    .stat.zero .v { color: var(--success); }
+
+    .mstate {
+      font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 1px 6px;
+      border-radius: var(--r-sm); border: 1px solid var(--line); color: var(--muted);
+    }
+    .mstate.todo { color: var(--text); border-color: var(--text); font-weight: 600; }
+    .mstate.doing { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+    .mstate.done { color: var(--success); border-color: var(--success); }
+    .mstate.aging { color: var(--warning); border-color: var(--warning); font-weight: 600; }
+    .mcard.closed { opacity: .62; }
+
+    /* Notification settings: read-only. Editing the policy per severity is out of scope by
+       decision, so this screen shows the policy and the health of each path and nothing else. */
+    .lane-list { display: flex; flex-direction: column; gap: 8px; }
+    .lane { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 16px; box-shadow: var(--shadow); }
+    .lane h3 { margin: 0 0 4px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+    .lane .ldot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+    .lane.ok .ldot { background: var(--success); }
+    .lane.bad .ldot { background: var(--danger); }
+    .lane.unknown .ldot { background: var(--warning); }
+    .lane .lmeta { font-size: 12px; color: var(--muted); font-family: var(--font-mono); display: flex; gap: 10px; flex-wrap: wrap; }
+    .policy { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; box-shadow: var(--shadow); }
+    .policy th, .policy td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); }
+    .policy th { color: var(--muted); font-weight: 500; }
+    .policy tr:last-child td { border-bottom: 0; }
+    .note { font-size: 12.5px; color: var(--muted); margin: 10px 2px 0; }
+
+    /* Phone: the tabs move to the thumb. */
+    .tabbar {
+      position: fixed; left: 0; right: 0; bottom: 0; display: none; z-index: 1040;
+      background: var(--surface); border-top: 1px solid var(--line);
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .tabbar button {
+      flex: 1; background: transparent; border: 0; color: var(--muted); font: inherit; font-size: 11px;
+      padding: 8px 2px 6px; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 3px;
+    }
+    .tabbar button[aria-selected="true"] { color: var(--accent); font-weight: 600; }
+    .tabbar .glyph { font-size: 16px; line-height: 1; position: relative; }
+    .tabbar .nbadge { position: absolute; top: -5px; left: 11px; }
+    @media (max-width: 620px) {
+      .nav { display: none; }
+      .tabbar { display: flex; }
+      .shell { padding-bottom: 78px; }
+      #undo-toast, #msg-toast { bottom: 74px; }
+    }
+
+    .empty { color: var(--muted); padding: 12px; }
+    .err { color: var(--danger); }
+  </style>
+</head>
+<body>
+
+<!-- inline icon sprite (self-contained, same-document <use> refs) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="ic-monitor" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 20.5h8"/><path d="M6 11l3-2.5 3 3 4-4"/>
+  </symbol>
+  <symbol id="ic-host" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>
+  </symbol>
+  <symbol id="ic-disk" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.66 3.58 3 8 3s8-1.34 8-3V6"/><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/>
+  </symbol>
+  <symbol id="ic-cpu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="6" y="6" width="12" height="12" rx="1.5"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>
+  </symbol>
+  <symbol id="ic-memory" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="2" y="7" width="20" height="10" rx="1.5"/><path d="M6 7v-2M10 7v-2M14 7v-2M18 7v-2M7 12h2M11 12h2M15 12h2"/>
+  </symbol>
+  <symbol id="ic-services" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>
+  </symbol>
+  <symbol id="ic-network" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 3.5 6 3.5 9s-1 6.5-3.5 9c-2.5-2.5-3.5-6-3.5-9s1-6.5 3.5-9z"/>
+  </symbol>
+  <symbol id="ic-storage" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6"/>
+  </symbol>
+  <symbol id="ic-logs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>
+  </symbol>
+</svg>
+
+<div class="shell">
+
+  <div class="topbar">
+    <span class="title"><svg class="ic"><use href="#ic-monitor"/></svg> Dev Monitor</span>
+    <span class="meta" id="ms-meta">loading…</span>
+    <div class="theme-group" role="group" aria-label="Theme">
+      <button data-theme-btn="system" aria-pressed="true" title="System">Auto</button>
+      <button data-theme-btn="light"  aria-pressed="false" title="Light">Light</button>
+      <button data-theme-btn="dark"   aria-pressed="false" title="Dark">Dark</button>
+    </div>
+  </div>
+
+  <nav class="nav" role="tablist" aria-label="Screens">
+    <button role="tab" data-tab="inbox" aria-selected="true">Inbox <span class="nbadge" id="nav-todo" hidden></span></button>
+    <button role="tab" data-tab="system" aria-selected="false">System</button>
+    <button role="tab" data-tab="routing" aria-selected="false">Notifications</button>
+  </nav>
+
+  <!-- Messages are independent from the observation feed and may be unavailable on read-only installations. -->
+  <section class="view" id="view-inbox" role="tabpanel">
+   <section class="section" id="messages">
+    <div class="strip" id="msg-strip">
+      <div class="stat" id="st-todo"><div class="k">To do</div><div class="v">–</div><div class="k" id="st-todo-sub">&nbsp;</div></div>
+      <div class="stat" id="st-doing"><div class="k">In progress</div><div class="v">–</div><div class="k" id="st-doing-sub">&nbsp;</div></div>
+      <div class="stat" id="st-unread"><div class="k">Unread</div><div class="v">–</div><div class="k">&nbsp;</div></div>
+      <div class="stat" id="st-aging"><div class="k">Waiting 3+ days</div><div class="v">–</div><div class="k">&nbsp;</div></div>
+    </div>
+    <div class="msg-head">
+      <h2>Inbox <span class="msg-unread" id="msg-unread" aria-live="polite" hidden></span></h2>
+      <div class="chips" id="msg-chips" role="group" aria-label="Message filter">
+        <button class="chip" data-key="needs_me" aria-pressed="true">To do <span class="n" data-count="needs_me"></span></button>
+        <button class="chip" data-key="doing" aria-pressed="false">In progress <span class="n" data-count="doing"></span></button>
+        <button class="chip" data-key="active" aria-pressed="false">All <span class="n" data-count="active"></span></button>
+        <button class="chip" data-key="unread" aria-pressed="false">Unread <span class="n" data-count="unread"></span></button>
+        <button class="chip" data-key="urgent" aria-pressed="false">Urgent <span class="n" data-count="urgent"></span></button>
+        <button class="chip" data-key="closed" aria-pressed="false">Done &amp; records <span class="n" data-count="closed"></span></button>
+        <button class="chip" data-key="archived" aria-pressed="false">Archived <span class="n" data-count="archived"></span></button>
+      </div>
+    </div>
+    <div class="bulkbar" id="msg-bulk" hidden>
+      <span class="bulk-count" id="bulk-count">0 selected</span>
+      <button class="mbtn" id="bulk-all" type="button">Select all visible</button>
+      <button class="mbtn" data-bulk-action="unpin" type="button">Unpin</button>
+      <button class="mbtn" data-bulk-action="archive" type="button">Archive</button>
+      <button class="mbtn" data-bulk-action="dismiss" type="button">Dismiss</button>
+    </div>
+    <div class="msg-feed" id="msg-feed"><div class="msg-empty">Loading messages…</div></div>
+   </section>
+  </section>
+
+  <div class="view" id="view-system" role="tabpanel" hidden>
+
+  <!-- Host + Disk (snapshot) -->
+  <div class="section">
+    <h2><svg class="ic"><use href="#ic-host"/></svg> Host <span class="hint">— hostname · OS · uptime · disk snapshot</span></h2>
+    <div class="cards" id="cards">
+      <div class="card"><div class="h"><svg class="ic"><use href="#ic-host"/></svg><span>Host</span></div><div class="v">…</div></div>
+      <div class="card"><div class="h"><svg class="ic"><use href="#ic-disk"/></svg><span>Disk /</span></div><div class="v">…</div></div>
+    </div>
+  </div>
+
+  <!-- Credential freshness — hidden entirely until /api/tokens answers, because the
+       feature is off by default and an empty panel reads as "nothing to report". -->
+  <div class="section" id="tokens-section" hidden>
+    <h2><svg class="ic"><use href="#ic-host"/></svg> Credentials <span class="hint" id="tokens-hint">— provider token expiry · last checked</span></h2>
+    <div class="cards" id="token-cards">
+      <div class="card"><div class="h"><span>Providers</span></div><div class="v">…</div></div>
+    </div>
+  </div>
+
+  <!-- CPU -->
+  <div class="section">
+    <h2><svg class="ic"><use href="#ic-cpu"/></svg> CPU <span class="hint">— now · 1h/1d average · top consumers</span></h2>
+    <div class="cards" id="cpu-cards">
+      <div class="card"><div class="h"><span>Now</span></div><div class="v">…</div></div>
+      <div class="card"><div class="h"><span>1h avg</span></div><div class="v">…</div></div>
+      <div class="card"><div class="h"><span>1d avg</span></div><div class="v">…</div></div>
+    </div>
+    <div class="proc-list" id="cpu-top"><div class="empty">loading…</div></div>
+  </div>
+
+  <!-- Memory -->
+  <div class="section">
+    <h2><svg class="ic"><use href="#ic-memory"/></svg> Memory <span class="hint">— now · 1h/1d average · top consumers</span></h2>
+    <div class="cards" id="mem-cards">
+      <div class="card"><div class="h"><span>Now</span></div><div class="v">…</div></div>
+      <div class="card"><div class="h"><span>1h avg</span></div><div class="v">…</div></div>
+      <div class="card"><div class="h"><span>1d avg</span></div><div class="v">…</div></div>
+    </div>
+    <div class="proc-list" id="mem-top"><div class="empty">loading…</div></div>
+  </div>
+
+  <!-- Services -->
+  <details class="section">
+    <summary><svg class="ic"><use href="#ic-services"/></svg> Services <span class="hint">— systemd user/system units · expand</span></summary>
+    <div class="svc-list" id="svc-list"><div class="empty">loading…</div></div>
+  </details>
+
+  <!-- Network -->
+  <details class="section">
+    <summary><svg class="ic"><use href="#ic-network"/></svg> Network <span class="hint">— tailscale peers + listen ports · expand</span></summary>
+    <div class="net-grid" id="net-grid">
+      <div class="net-block"><h3>Tailscale (self)</h3><div class="empty">loading…</div></div>
+      <div class="net-block"><h3>Listen ports</h3><div class="empty">loading…</div></div>
+    </div>
+  </details>
+
+  <!-- Storage -->
+  <div class="section">
+    <h2><svg class="ic"><use href="#ic-storage"/></svg> Storage <span class="hint">— mount + directory sizes (measured on first fetch, may take seconds)</span></h2>
+    <div class="stg-list" id="stg-list"><div class="empty">loading…</div></div>
+  </div>
+
+  <!-- Recent logs -->
+  <div class="section log-head">
+    <h2><svg class="ic"><use href="#ic-logs"/></svg> Recent logs <span class="hint">— <select id="log-unit"><option value="airlock-dev-monitor">airlock-dev-monitor</option></select></span></h2>
+    <div class="log-block" id="log-block"><div class="empty">loading…</div></div>
+  </div>
+
+  </div><!-- /view-system -->
+
+  <!-- Notifications: read-only on purpose. Editing the policy per severity is out of scope
+       (owner, 2026-08-08), so this screen states the policy and shows whether each path is
+       actually delivering. There is deliberately no per-severity checkbox grid: the policy is
+       decided, nobody has yet needed to change it, and the day somebody does is the day to
+       build one. The table is drawn from POLICY below, which a contract test compares against
+       the backend's ROUTING — the rule now exists twice, and two rules disagree eventually. -->
+  <section class="view" id="view-routing" role="tabpanel" hidden>
+    <div class="section">
+      <h2>Where a card goes</h2>
+      <table class="policy">
+        <thead><tr><th>Severity</th><th>Means</th><th>Inbox</th><th>Slack</th><th>Email</th></tr></thead>
+        <tbody id="policy-rows"></tbody>
+      </table>
+      <p class="note">The inbox column cannot be turned off — whatever goes out, the card stays,
+        so something seen in Slack and moved past is still here as a task.</p>
+      <p class="note">A producer declares a severity and never a channel. Older jobs need no
+        change: <code>urgent</code> is read as <code>page</code> and <code>normal</code> as
+        <code>record</code>.</p>
+    </div>
+    <div class="section">
+      <h2>Delivery paths</h2>
+      <div class="lane-list" id="lane-list"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+
+</div>
+
+<nav class="tabbar" role="tablist" aria-label="Screens">
+  <button role="tab" data-tab="inbox" aria-selected="true"><span class="glyph">✉<span class="nbadge" id="tb-todo" hidden></span></span>Inbox</button>
+  <button role="tab" data-tab="system" aria-selected="false"><span class="glyph">▤</span>System</button>
+  <button role="tab" data-tab="routing" aria-selected="false"><span class="glyph">⚙</span>Notifications</button>
+</nav>
+
+<div class="sheet-backdrop" id="exec-backdrop" role="dialog" aria-modal="true" aria-labelledby="exec-title">
+  <div class="sheet">
+    <h3 id="exec-title">Confirm action</h3>
+    <p class="sheet-sub">Approve this plan to start the action. Nothing runs automatically.</p>
+    <div class="sheet-preview" id="exec-body"></div>
+    <p class="sheet-warn">The approved plan is checked again before it starts. If it changed, approval is required again.</p>
+    <div class="sheet-err" id="exec-err"></div>
+    <div class="sheet-actions">
+      <button class="mbtn" id="exec-cancel" type="button">Cancel</button>
+      <button class="mbtn primary" id="exec-confirm" type="button" disabled>Run</button>
+    </div>
+  </div>
+</div>
+
+<div class="sheet-backdrop" id="runview-backdrop" role="dialog" aria-modal="true" aria-labelledby="runview-title">
+  <div class="sheet">
+    <h3 id="runview-title">Action status</h3>
+    <p class="sheet-sub" id="runview-state">Connecting…</p>
+    <div class="sheet-preview" id="runview-body"></div>
+    <div class="runview-terminal" id="runview-terminal"></div>
+    <div class="sheet-actions">
+      <button class="mbtn" id="runview-pop" type="button" disabled>Open terminal ↗</button>
+      <button class="mbtn" id="runview-keep" type="button" disabled>Keep window</button>
+      <button class="mbtn" id="runview-stop" type="button">Stop</button>
+      <button class="mbtn" id="runview-close" type="button">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="undo-toast"><span id="undo-msg"></span><button id="undo-btn" type="button">Undo</button></div>
+<div id="msg-toast" role="status" aria-live="polite"></div>
+
+<script>
+  // ---- theme ----
+  var THEME_KEY = 'airlock-monitor-theme';
+  var theme = localStorage.getItem(THEME_KEY) || 'system';
+  function setTheme(t) {
+    theme = t;
+    document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem(THEME_KEY, t); } catch (_) {}
+    document.querySelectorAll('.theme-group [data-theme-btn]').forEach(function (b) {
+      b.setAttribute('aria-pressed', b.dataset.themeBtn === t ? 'true' : 'false');
+    });
+  }
+  document.querySelectorAll('.theme-group [data-theme-btn]').forEach(function (b) {
+    b.addEventListener('click', function () { setTheme(b.dataset.themeBtn); });
+  });
+  setTheme(theme);
+
+  // ---- api ----
+  var API = '/monitor/api';
+  function escHTML(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c];
+    });
+  }
+  function humanSize(bytes) {
+    if (!bytes) return '0 B';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(0) + ' KB';
+    if (bytes < 1024*1024*1024) return (bytes/(1024*1024)).toFixed(1) + ' MB';
+    return (bytes/(1024*1024*1024)).toFixed(1) + ' GB';
+  }
+  function pctClass(p) { return p >= 90 ? 'danger' : p >= 75 ? 'warn' : ''; }
+  function j(url) { return fetch(url, { cache: 'no-store' }).then(function (r) { return r.json(); }); }
+
+  function loadOverview() {
+    return Promise.all([j(API + '/overview'), j(API + '/history')]).then(function (vals) {
+      var d = vals[0], hist = vals[1];
+      var h = d.host, c = d.cpu, m = d.memory, ds = d.disk;
+      document.getElementById('cards').innerHTML =
+        '<div class="card"><div class="h"><svg class="ic"><use href="#ic-host"/></svg><span>Host</span></div>' +
+          '<div class="v" style="font-size:1.2rem">' + escHTML(h.hostname) + '</div>' +
+          '<div class="sub">' + escHTML(h.os) + ' · kernel ' + escHTML(h.kernel.slice(0,12)) + ' · up ' + escHTML(h.uptime_human) + '</div></div>' +
+        '<div class="card ' + pctClass(ds.percent) + '"><div class="h"><svg class="ic"><use href="#ic-disk"/></svg><span>Disk /</span></div>' +
+          '<div class="v">' + humanSize(ds.used_bytes) + ' <span style="color:var(--muted);font-size:0.6em">(' + ds.percent + '%)</span></div>' +
+          '<div class="sub">capacity ' + humanSize(ds.total_bytes) + (ds.total_bytes - ds.used_bytes > 0 ? ' · ' + humanSize(ds.total_bytes - ds.used_bytes) + ' free' : '') + '</div>' +
+          '<div class="bar"><span style="width:' + ds.percent + '%"></span></div></div>';
+
+      var h1 = hist['1h'] || {}, hd = hist['1d'] || {};
+      var cpuCoresNow = (c.percent * c.cores / 100).toFixed(2);
+      var memTotalGB = (m.total_bytes / 1073741824).toFixed(0);
+      document.getElementById('cpu-cards').innerHTML =
+        '<div class="card ' + pctClass(c.percent) + '"><div class="h"><span>Now</span></div>' +
+          '<div class="v" style="font-weight:500">' + cpuCoresNow + ' <span style="font-size:0.6em;color:var(--muted)">core</span></div>' +
+          '<div class="sub"><strong>' + c.percent + '%</strong> of ' + c.cores + ' cores · load ' + c.loadavg.join(' / ') + '</div>' +
+          '<div class="bar"><span style="width:' + Math.min(100, c.percent) + '%"></span></div></div>' +
+        cpuAvgCard('1h avg', h1, c.cores) + cpuAvgCard('1d avg', hd, c.cores);
+
+      var memUsedGB = (m.used_bytes / 1073741824).toFixed(1);
+      document.getElementById('mem-cards').innerHTML =
+        '<div class="card ' + pctClass(m.percent) + '"><div class="h"><span>Now</span></div>' +
+          '<div class="v" style="font-weight:500">' + memUsedGB + ' <span style="font-size:0.6em;color:var(--muted)">GB</span></div>' +
+          '<div class="sub"><strong>' + m.percent + '%</strong> of ' + memTotalGB + ' GB · cache ' + humanSize(m.cache_bytes) + ' · swap ' + humanSize(m.swap_used_bytes) + '/' + humanSize(m.swap_total_bytes) + '</div>' +
+          '<div class="bar"><span style="width:' + m.percent + '%"></span></div></div>' +
+        memAvgCard('1h avg', h1, m.total_bytes, memTotalGB) + memAvgCard('1d avg', hd, m.total_bytes, memTotalGB);
+
+      document.getElementById('ms-meta').textContent = h.hostname + ' · refreshed ' + new Date().toLocaleTimeString();
+    }).catch(function (e) {
+      document.getElementById('cards').innerHTML = '<div class="card danger"><div class="v" style="font-size:14px">backend unreachable</div><div class="sub">' + escHTML(e.message) + '</div></div>';
+    });
+  }
+  function cpuAvgCard(label, hs, cores) {
+    var avg = hs.cpu_avg != null ? (hs.cpu_avg * cores / 100).toFixed(2) + ' <span style="font-size:0.6em;color:var(--muted)">core</span>' : '—';
+    return '<div class="card"><div class="h"><span>' + label + '</span></div>' +
+      '<div class="v" style="font-weight:500">' + avg + '</div>' +
+      '<div class="sub">' + (hs.cpu_avg != null ? hs.cpu_avg + '%' : '—') + ' of ' + cores + ' cores · <span style="color:var(--warning)">peak ' + (hs.cpu_max != null ? hs.cpu_max + '%' : '—') + '</span> · ' + (hs.samples || 0) + ' samples</div></div>';
+  }
+  function memAvgCard(label, hs, totalBytes, totalGB) {
+    var avg = hs.mem_avg != null ? (hs.mem_avg * totalBytes / 100 / 1073741824).toFixed(1) + ' <span style="font-size:0.6em;color:var(--muted)">GB</span>' : '—';
+    return '<div class="card"><div class="h"><span>' + label + '</span></div>' +
+      '<div class="v" style="font-weight:500">' + avg + '</div>' +
+      '<div class="sub">' + (hs.mem_avg != null ? hs.mem_avg + '%' : '—') + ' of ' + totalGB + ' GB · <span style="color:var(--warning)">peak ' + (hs.mem_max != null ? hs.mem_max + '%' : '—') + '</span> · ' + (hs.samples || 0) + ' samples</div></div>';
+  }
+
+  function renderProcs(elId, procs) {
+    if (!procs || procs.length === 0) {
+      document.getElementById(elId).innerHTML = '<div class="empty">waiting for 5s sample…</div>';
+      return;
+    }
+    var html = '<table><thead><tr><th>command</th><th>user</th><th class="num">CPU</th><th class="num">MEM</th></tr></thead><tbody>';
+    procs.forEach(function (p) {
+      var commLabel = '<code>' + escHTML(p.comm) + '</code>';
+      if (p.count > 1) commLabel += ' <span class="xn">×' + p.count + '</span>';
+      var memDisplay = p.mem_bytes >= 1024*1024*1024
+        ? (p.mem_bytes/1024/1024/1024).toFixed(1) + ' GB'
+        : (p.mem_bytes/1024/1024).toFixed(0) + ' MB';
+      html += '<tr>' +
+        '<td>' + commLabel + '</td>' +
+        '<td class="u">' + escHTML(p.user) + '</td>' +
+        '<td class="num"><strong>' + p.cpu_cores.toFixed(2) + '</strong><span class="dim"> core (' + p.cpu_pct.toFixed(1) + '%)</span></td>' +
+        '<td class="num"><strong>' + memDisplay + '</strong><span class="dim"> (' + p.mem_pct.toFixed(1) + '%)</span></td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById(elId).innerHTML = html;
+  }
+
+  function loadTop() {
+    return Promise.all([
+      j(API + '/top?sort=cpu&n=5'),
+      j(API + '/top?sort=mem&n=5'),
+    ]).then(function (vals) {
+      renderProcs('cpu-top', vals[0].processes || []);
+      renderProcs('mem-top', vals[1].processes || []);
+    }).catch(function (e) {
+      document.getElementById('cpu-top').innerHTML = '<div class="empty err">' + escHTML(e.message) + '</div>';
+    });
+  }
+
+  var logUnitInit = false;
+  function populateLogUnits(services) {
+    if (logUnitInit) return;
+    var userSvcs = services.filter(function (s) { return s.scope === 'user'; });
+    if (!userSvcs.length) return;
+    var sel = document.getElementById('log-unit');
+    sel.innerHTML = '';
+    userSvcs.forEach(function (s) {
+      var o = document.createElement('option'); o.value = s.name; o.textContent = s.name; sel.appendChild(o);
+    });
+    var def = userSvcs.filter(function (s) { return s.name.indexOf('dev-monitor') >= 0; })[0];
+    sel.value = def ? def.name : userSvcs[0].name;
+    logUnitInit = true;
+    loadLogs(sel.value);
+  }
+
+  function loadServices() {
+    return j(API + '/services').then(function (d) {
+      var svcs = d.services || [];
+      var html = '';
+      svcs.forEach(function (s) {
+        var stateClass = s.state === 'active' ? '' : (s.state === 'failed' ? 'failed' : 'inactive');
+        html += '<div class="svc-row ' + stateClass + '">' +
+          '<div class="dot" title="' + escHTML(s.state) + '"></div>' +
+          '<div><div class="name">' + escHTML(s.name) + '</div><div class="scope">' + escHTML(s.scope) + ' · ' + escHTML(s.state) + '</div></div>' +
+          '<div class="uptime">' + escHTML(s.uptime || '') + '</div>' +
+          '<div>' + (s.action_allowed ? '<button class="mbtn svc-restart" type="button" data-service="' + escHTML(s.name) + '">Restart</button>' : '') + '</div>' +
+          '</div>';
+      });
+      var list = document.getElementById('svc-list');
+      list.innerHTML = html || '<div class="empty">no services found</div>';
+      list.querySelectorAll('.svc-restart').forEach(function (button) {
+        button.addEventListener('click', function () {
+          var name = button.dataset.service;
+          if (!window.confirm('Restart ' + name + '?')) return;
+          button.disabled = true; button.textContent = 'Restarting…';
+          ownerFetch('/service/restart', { method: 'POST', body: JSON.stringify({ name: name }) })
+            .then(ownerResponse).then(function (res) {
+              if (!res.ok || !res.data.ok) throw new Error(res.data.message || 'restart refused');
+              msgToast(res.data.message || ('Restarted ' + name + '.'));
+              return loadServices();
+            }).catch(function (error) {
+              button.disabled = false; button.textContent = 'Restart';
+              msgToast('Could not restart ' + name + ': ' + error.message);
+            });
+        });
+      });
+      populateLogUnits(svcs);
+    }).catch(function (e) {
+      document.getElementById('svc-list').innerHTML = '<div class="empty err">' + escHTML(e.message) + '</div>';
+    });
+  }
+
+  function loadNetwork() {
+    return j(API + '/network').then(function (d) {
+      var ts = d.tailscale, ports = d.listen_ports;
+      var tsHtml = '<h3>Tailscale (self)</h3>' +
+        '<div class="row"><span class="label">ip</span><code>' + escHTML(ts.ip || '?') + '</code></div>' +
+        '<div class="row"><span class="label">magicDNS</span><code>' + escHTML(ts.dns || '?') + '</code></div>' +
+        '<h3>Peers (' + ts.peer_count + ')</h3>';
+      ts.peers.forEach(function (p) {
+        tsHtml += '<div class="peer ' + (p.online ? '' : 'off') + '"><span class="dot"></span><span>' + escHTML(p.name) + '</span><span class="ip">' + escHTML(p.ip) + '</span></div>';
+      });
+      var portHtml = '<h3>Listen ports</h3>';
+      ports.forEach(function (pt) {
+        portHtml += '<div class="row"><span class="label">' + pt.port + '/tcp</span><code>' + escHTML(pt.ip) + ':' + pt.port + '</code></div>';
+      });
+      document.getElementById('net-grid').innerHTML =
+        '<div class="net-block">' + tsHtml + '</div>' +
+        '<div class="net-block">' + portHtml + '</div>';
+    }).catch(function (e) {
+      document.getElementById('net-grid').innerHTML = '<div class="net-block"><div class="empty err">' + escHTML(e.message) + '</div></div>';
+    });
+  }
+
+  function loadStorage() {
+    return j(API + '/storage').then(function (d) {
+      var html = '';
+      d.items.forEach(function (it) {
+        var pct = it.total_bytes ? Math.min(100, (it.used_bytes / it.total_bytes) * 100).toFixed(0) : null;
+        var bar = pct != null ? '<div class="bar"><span style="width:' + pct + '%"></span></div>' : '<div class="bar"></div>';
+        var size = it.human || (it.used_bytes != null ? humanSize(it.used_bytes) + ' / ' + humanSize(it.total_bytes) : '?');
+        html += '<div class="stg-row"><div class="path">' + escHTML(it.path) + '</div>' + bar + '<div class="size">' + escHTML(size) + '</div></div>';
+      });
+      document.getElementById('stg-list').innerHTML = html || '<div class="empty">no data</div>';
+    }).catch(function (e) {
+      document.getElementById('stg-list').innerHTML = '<div class="empty err">' + escHTML(e.message) + '</div>';
+    });
+  }
+
+  function loadLogs(unit) {
+    return j(API + '/logs?unit=' + encodeURIComponent(unit) + '&n=15').then(function (d) {
+      var html = '';
+      d.lines.forEach(function (line) {
+        var lv = /err|fail|trace/i.test(line) ? 'err' : (/warn/i.test(line) ? 'warn' : 'info');
+        var m = line.match(/^([0-9T:+\-]+) /);
+        var ts = m ? m[1] : '';
+        var rest = m ? line.slice(m[0].length) : line;
+        html += '<div class="log-row"><span class="ts">' + escHTML(ts) + '</span><span class="lv ' + lv + '">' + lv + '</span><span>' + escHTML(rest) + '</span></div>';
+      });
+      document.getElementById('log-block').innerHTML = html || '<div class="empty">(no recent logs)</div>';
+    }).catch(function (e) {
+      document.getElementById('log-block').innerHTML = '<div class="empty err">' + escHTML(e.message) + '</div>';
+    });
+  }
+
+  document.getElementById('log-unit').addEventListener('change', function (ev) { loadLogs(ev.target.value); });
+
+  // ---- credential freshness ----
+  // Severity, not tidiness: `unknown` is styled as a warning, never as a neutral card.
+  // A missing credentials file rendering as calm grey is the exact failure the backend
+  // refuses to produce, and the UI must not reintroduce it.
+  function tokenClass(status) {
+    return status === 'expired' ? 'danger' : (status === 'ok' ? '' : 'warn');
+  }
+  function humanDur(seconds) {
+    if (seconds == null) return '—';
+    var past = seconds < 0, s = Math.abs(Math.round(seconds));
+    var d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    var t = d ? (d + 'd ' + h + 'h') : (h ? (h + 'h ' + m + 'm') : (m + 'm'));
+    return past ? (t + ' ago') : ('in ' + t);
+  }
+  function loadTokens() {
+    return fetch(API + '/tokens', { cache: 'no-store' }).then(function (r) {
+      if (r.status === 404) { document.getElementById('tokens-section').hidden = true; return null; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
+      if (!d) return;
+      document.getElementById('tokens-section').hidden = false;
+      var html = '';
+      (d.providers || []).forEach(function (p) {
+        html += '<div class="card ' + tokenClass(p.status) + '">' +
+          '<div class="h"><span>' + escHTML(p.provider) + '</span></div>' +
+          '<div class="v" style="font-size:1.05rem">' + escHTML(p.status) + '</div>' +
+          '<div class="sub">' + escHTML(p.detail || '') + '</div></div>';
+      });
+      // The last-check card is part of the panel, not a footnote: a checker that stopped
+      // running is the failure mode, and it has to be as visible as an expiry.
+      var lc = d.last_check || {};
+      // Three states, not two. A snapshot that exists but whose timestamp cannot be
+      // parsed has age_seconds === null, and treating that as `|| 0` would print
+      // "in 0m" in a neutral card — an unknown state shown as the healthiest possible
+      // one, which is the single thing this panel must never do.
+      var age = lc.ever ? lc.age_seconds : undefined;
+      var unreadable = lc.ever && age == null;
+      var stale = !lc.ever || unreadable || age > 48 * 3600;
+      html += '<div class="card ' + (stale ? 'warn' : '') + '">' +
+        '<div class="h"><span>Last check</span></div>' +
+        '<div class="v" style="font-size:1.05rem">' +
+          (!lc.ever ? 'never' : (unreadable ? 'unknown' : escHTML(humanDur(-age)))) + '</div>' +
+        '<div class="sub">' + (!lc.ever
+          ? 'no scheduled check has run — install-token-timer.sh'
+          : (unreadable ? 'the snapshot carries no readable timestamp'
+                        : escHTML(lc.checked_at || ''))) + '</div></div>';
+      document.getElementById('token-cards').innerHTML = html;
+      document.getElementById('tokens-hint').textContent =
+        '— warn at ' + d.warn_hours + 'h · codex stale at ' + d.stale_hours + 'h';
+    }).catch(function (e) {
+      // Reachable-but-broken is its own state. Hiding the panel here would turn a
+      // backend error into "no credentials to worry about".
+      document.getElementById('tokens-section').hidden = false;
+      document.getElementById('token-cards').innerHTML =
+        '<div class="card danger"><div class="h"><span>Credentials</span></div>' +
+        '<div class="v" style="font-size:14px">check unavailable</div>' +
+        '<div class="sub">' + escHTML(e.message) + '</div></div>';
+    });
+  }
+
+  // ---- initial load + auto-refresh ----
+  loadTokens();
+  setInterval(loadTokens, 60000);
+  loadOverview();
+  loadTop();
+  loadServices();
+  loadNetwork();
+  loadStorage();
+  // storage/network are heavier (du, tailscale) — refresh the live panels only.
+  setInterval(function () { loadOverview(); loadTop(); loadServices(); }, 5000);
+  setInterval(loadNetwork, 30000);
+
+  // ---- message console ----
+  // Message producers are not trusted dashboard data, so every card is assembled with textContent.
+  // Keeping response status available also lets this optional feature explain access and setup issues.
+  var OWNER_API = API + '/owner';
+  var msgState = { key: 'needs_me', cards: [], counts: {}, enabled: null, expanded: {}, selected: {} };
+  var execNonce = null, execCardId = null;
+  var undoTimer = null, undoCards = [], msgToastTimer = null, msgPoll = null;
+  var runView = { runId: null, poll: null, retry: null, terminalUrl: null, finished: null };
+  var terminalConfigPromise = null;
+
+  function ownerFetch(path, opts) {
+    opts = opts || {};
+    opts.cache = 'no-store';
+    if (opts.method === 'POST') {
+      opts.headers = Object.assign({ 'content-type': 'application/json' }, opts.headers || {});
+      if (opts.body == null) opts.body = '{}';
+    }
+    return fetch(OWNER_API + path, opts);
+  }
+  function ownerResponse(r) {
+    return r.json().catch(function () { return {}; }).then(function (data) {
+      return { status: r.status, ok: r.ok, data: data };
+    });
+  }
+  function getTerminalUrl(session) {
+    // The public hub config is the source for this optional cross-origin app. It avoids
+    // baking a host or port into the dashboard while still using the deployment's TLS name.
+    if (!terminalConfigPromise) {
+      terminalConfigPromise = j('/__airlock.json').then(function (config) {
+        if (!config) throw new Error('Terminal configuration is unavailable.');
+        return config;
+      }).catch(function (error) {
+        // Drop the cache on failure. Caching a REJECTED promise turned one transient
+        // network blip into "the terminal is unavailable" for the rest of the page's life.
+        terminalConfigPromise = null;
+        throw error;
+      });
+    }
+    return terminalConfigPromise.then(function (config) {
+      var port = config && config.apps && config.apps.devterm && config.apps.devterm.port;
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('The terminal is not enabled for this installation.');
+      var host = config.fqdn && config.fqdn.indexOf('.') > 0 ? config.fqdn : location.hostname;
+      var url = new URL(location.href);
+      url.hostname = host;
+      url.port = String(port);
+      url.pathname = '/';
+      url.search = '?arg=' + encodeURIComponent(session);
+      return url.href;
+    });
+  }
+  function isHttpUrl(url) { return typeof url === 'string' && /^https?:\/\//i.test(url); }
+  function timeAgo(value) {
+    var time = Date.parse(value);
+    if (isNaN(time)) return '';
+    var seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+    if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
+    return Math.floor(seconds / 86400) + 'd ago';
+  }
+  function msgEl(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+  function msgToast(text) {
+    var node = document.getElementById('msg-toast');
+    node.textContent = text;
+    node.classList.add('show');
+    clearTimeout(msgToastTimer);
+    msgToastTimer = setTimeout(function () { node.classList.remove('show'); }, 3000);
+  }
+  function disableMessages(status) {
+    msgState.enabled = false;
+    if (msgPoll) { clearInterval(msgPoll); msgPoll = null; }
+    var message = status === 403
+      ? 'This message console is available only to the dashboard owner.'
+      : 'Message console is disabled for this installation.';
+    var feed = document.getElementById('msg-feed');
+    feed.textContent = '';
+    feed.appendChild(msgEl('div', 'msg-empty', message));
+    document.getElementById('msg-chips').hidden = true;
+    document.getElementById('msg-unread').hidden = true;
+    document.getElementById('msg-strip').hidden = true;
+    document.getElementById('msg-bulk').hidden = true;
+    ['nav-todo', 'tb-todo'].forEach(function (id) { document.getElementById(id).hidden = true; });
+  }
+  function scopeForMessageKey(key) { return key === 'archived' ? 'archived' : 'active'; }
+  /* TESTABLE:inbox-state — extracted and run by apps/dev-monitor/test-inbox-state.mjs.
+     These three are pure on purpose. The needs-me rule now exists twice, here and as
+     NEEDS_ME_SQL in the backend, and the day they disagree the screen and the badge tell a
+     person two different things about the same card. Rendering stays outside the markers so
+     the rule can be tested without a DOM. */
+  // The same rule as the server's NEEDS_ME_SQL, and for the same three reasons: `doing` is
+  // not "to do", a snooze returns when its deadline passes rather than when something sweeps,
+  // and a card that never declared is a record. This decides which cards to DRAW; every
+  // number on screen still comes from the server, so the two cannot drift into two answers.
+  function needsMe(card) {
+    if (card.needs_action !== true) return false;
+    var state = card.task_state;
+    if (state == null || state === 'todo') return true;
+    if (state !== 'snoozed') return false;
+    return !card.snoozed_until || Date.parse(card.snoozed_until) <= Date.now();
+  }
+  function isClosed(card) { return card.needs_action !== true || card.task_state === 'done'; }
+  // What this returns for a record is the point of the phase: nothing. A button a person
+  // feels they ought to press is how a "still to do" number stops meaning that. The other
+  // half is "Not a task" — without it a person completes something they never had to do,
+  // and the count fills with false completions instead of false tasks.
+  function taskActionsFor(card) {
+    if (card.needs_action !== true) return [];
+    if (card.task_state === 'done') return [{ label: 'Reopen', action: 'reopen' }];
+    if (card.task_state === 'doing') return [{ label: 'Complete', action: 'complete' }];
+    return [
+      { label: 'Complete', action: 'complete', primary: card.kind === 'info' },
+      card.task_state === 'snoozed' && !needsMe(card)
+        ? { label: 'Now', action: 'unsnooze' } : { label: 'Tomorrow', action: 'snooze' },
+      { label: 'Not a task', action: 'not_task' }
+    ];
+  }
+  /* :TESTABLE */
+  /* TESTABLE:monitor-bulk — extracted by install/test-monitor-bulk.mjs. */
+  function runLimited(items, limit, worker) {
+    var next = 0, results = new Array(items.length);
+    var width = Math.max(1, Math.min(Number(limit) || 1, items.length || 1));
+    function lane() {
+      var index = next++;
+      if (index >= items.length) return Promise.resolve();
+      return Promise.resolve().then(function () { return worker(items[index]); })
+        .then(function (value) { results[index] = { id: items[index], ok: true, value: value }; },
+              function (error) { results[index] = { id: items[index], ok: false, error: error }; })
+        .then(lane);
+    }
+    return Promise.all(Array.from({ length: width }, lane)).then(function () { return results; });
+  }
+  function bulkCardActions(cardIds, action, request, limit) {
+    return runLimited(cardIds.slice(), limit || 4, function (cardId) {
+      return request(cardId, action);
+    });
+  }
+  function failedBulkIds(results) {
+    return results.filter(function (result) { return !result.ok; })
+      .map(function (result) { return result.id; });
+  }
+  function nextBulkSelection(selected, results) {
+    var next = Object.assign({}, selected);
+    results.forEach(function (result) { if (result.ok) delete next[result.id]; });
+    return next;
+  }
+  function retryBulkItems(items, results) {
+    var failed = failedBulkIds(results);
+    return items.filter(function (item) { return failed.indexOf(item.card_id) >= 0; });
+  }
+  function bulkActionsForScope(scope) {
+    return scope === 'archived' ? ['unpin', 'dismiss'] : ['unpin', 'archive', 'dismiss'];
+  }
+  /* :TESTABLE */
+  function filteredMessages() {
+    var key = msgState.key, cards = msgState.cards;
+    if (key === 'active' || key === 'archived') return cards;
+    return cards.filter(function (card) {
+      if (key === 'needs_me') return needsMe(card);
+      if (key === 'doing') return card.needs_action === true && card.task_state === 'doing';
+      if (key === 'closed') return isClosed(card);
+      if (key === 'unread') return !card.read_at;
+      if (key === 'urgent') return card.urgency === 'urgent';
+      return card.kind === key;
+    });
+  }
+  function loadMessages() {
+    if (msgState.enabled === false) return Promise.resolve();
+    return ownerFetch('/messages?scope=' + scopeForMessageKey(msgState.key)).then(ownerResponse)
+      .then(function (res) {
+        if (res.status === 403 || res.status === 404) { disableMessages(res.status); return; }
+        if (!res.ok) throw new Error('Message feed returned ' + res.status + '.');
+        msgState.enabled = true;
+        msgState.cards = res.data.messages || [];
+        msgState.counts = res.data.counts || {};
+        renderMessages();
+      }).catch(function (error) {
+        if (msgState.enabled === null) {
+          var feed = document.getElementById('msg-feed');
+          feed.textContent = '';
+          feed.appendChild(msgEl('div', 'msg-empty err', 'Message console is unavailable: ' + error.message));
+          return;
+        }
+        // The feed has loaded before, so the cards on screen are real — but they are now
+        // stale and we are still polling. Saying nothing would leave a console that looks
+        // current and is not, which is the failure mode this whole app exists to avoid.
+        msgToast('Message feed did not refresh (' + error.message + '); showing the last known state.');
+      });
+  }
+  var EMPTY_TEXT = {
+    needs_me: 'Nothing needs you right now.',
+    doing: 'Nothing is in progress.',
+    closed: 'Nothing completed and no records yet.',
+    unread: 'Everything has been read.',
+    urgent: 'Nothing urgent.',
+    archived: 'No archived messages.'
+  };
+  function setStat(id, value, sub, tone) {
+    var stat = document.getElementById(id);
+    stat.className = 'stat' + (tone ? ' ' + tone : '');
+    stat.querySelector('.v').textContent = value;
+    if (sub) document.getElementById(id + '-sub').textContent = sub;
+  }
+  function renderMessages() {
+    var counts = msgState.counts;
+    document.querySelectorAll('#msg-chips .n').forEach(function (node) {
+      var count = counts[node.dataset.count];
+      node.textContent = count > 0 ? count : '';
+    });
+    var todo = counts.needs_me || 0;
+    // The badge counts what is untouched, not what is unread: something read and not done
+    // must not disappear from it. That is the whole point of this screen.
+    var urgentTodo = msgState.cards.filter(function (c) {
+      return needsMe(c) && c.urgency === 'urgent';
+    }).length;
+    setStat('st-todo', todo, todo ? urgentTodo + ' urgent' : 'nothing waiting',
+            todo ? 'alarm' : 'zero');
+    setStat('st-doing', counts.doing || 0, (counts.snoozed || 0) + ' snoozed');
+    setStat('st-unread', counts.unread || 0);
+    setStat('st-aging', counts.aging || 0, null, counts.aging ? 'warn' : null);
+    ['nav-todo', 'tb-todo'].forEach(function (id) {
+      var badge = document.getElementById(id);
+      badge.textContent = todo > 99 ? '99+' : todo;
+      badge.hidden = !todo;
+    });
+    var unread = document.getElementById('msg-unread');
+    if (todo > 0) { unread.textContent = todo + ' to do'; unread.hidden = false; }
+    else unread.hidden = true;
+    var feed = document.getElementById('msg-feed');
+    feed.textContent = '';
+    var cards = filteredMessages();
+    renderBulkBar(cards);
+    if (!cards.length) {
+      feed.appendChild(msgEl('div', 'msg-empty', EMPTY_TEXT[msgState.key] || 'No messages.'));
+      return;
+    }
+    cards.forEach(function (card) { feed.appendChild(buildMessageCard(card)); });
+  }
+  function buildMessageCard(message) {
+    var card = msgEl('div', 'mcard' + (message.read_at ? '' : ' unread')
+                     + (message.urgency === 'urgent' ? ' urgent' : '')
+                     + (isClosed(message) ? ' closed' : ''));
+    card.dataset.cardId = message.card_id;
+    var select = msgEl('input', 'mselect');
+    select.type = 'checkbox'; select.checked = !!msgState.selected[message.card_id];
+    select.setAttribute('aria-label', 'Select ' + message.title);
+    select.addEventListener('click', function (event) { event.stopPropagation(); });
+    select.addEventListener('change', function () {
+      if (select.checked) msgState.selected[message.card_id] = true;
+      else delete msgState.selected[message.card_id];
+      renderBulkBar(filteredMessages());
+    });
+    card.appendChild(select);
+    card.appendChild(msgEl('span', 'mdot'));
+    var main = msgEl('div', 'mmain');
+    var top = msgEl('div', 'mtop mtoggle');
+    top.appendChild(msgEl('span', 'mtitle', message.title));
+    var kindLabel = message.kind === 'action' ? 'Action' : (message.kind === 'link' ? 'Link' : 'Info');
+    top.appendChild(msgEl('span', 'mkind ' + message.kind, kindLabel));
+    if (message.urgency === 'urgent') top.appendChild(msgEl('span', 'murg', 'Urgent'));
+    top.appendChild(taskPill(message));
+    var ownerFallback = ownerFallbackPill(message);
+    if (ownerFallback) top.appendChild(ownerFallback);
+    main.appendChild(top);
+    var detailNodes = [];
+    if (message.body) detailNodes.push(msgEl('div', 'mbody', message.body));
+    if (message.kind === 'action' && message.action && message.action.explain) detailNodes.push(msgEl('div', 'mbody', message.action.explain));
+    if (message.kind === 'link' && message.link && isHttpUrl(message.link.url)) detailNodes.push(msgEl('div', 'mbody murl', message.link.url));
+    if (detailNodes.length) {
+      var detail = msgEl('div', 'mdetail');
+      detailNodes.forEach(function (node) { detail.appendChild(node); });
+      if (!msgState.expanded[message.card_id]) detail.hidden = true;
+      main.appendChild(detail);
+      top.appendChild(msgEl('span', 'mchev', msgState.expanded[message.card_id] ? 'v' : '>'));
+    }
+    top.addEventListener('click', function () { toggleMessageCard(message); });
+    var meta = msgEl('div', 'mmeta');
+    meta.appendChild(msgEl('span', null, message.source));
+    meta.appendChild(msgEl('span', null, timeAgo(message.received_at)));
+    if (message.occurrence_count > 1) meta.appendChild(msgEl('span', null, 'x' + message.occurrence_count));
+    meta.appendChild(msgEl('span', 'mstatus', message.read_at ? 'Read' : 'Unread'));
+    main.appendChild(meta);
+    var statusRunId = message.run_id || message.result_run_id;
+    if (statusRunId) {
+      var status = msgEl('button', 'mrun', message.run_id ? 'Action running — view status' : 'Action completed — view status');
+      status.type = 'button';
+      status.addEventListener('click', function () { openRunView(statusRunId, message.title); });
+      main.appendChild(status);
+    }
+    card.appendChild(main);
+    var actions = msgEl('div', 'mactions');
+    if (message.run_id) {
+      var stop = msgEl('button', 'mbtn', 'Stop'); stop.type = 'button';
+      stop.addEventListener('click', function () {
+        stop.disabled = true;
+        stopRun(message.run_id, function (text, ok) { msgToast(text); if (!ok) stop.disabled = false; });
+      });
+      actions.appendChild(stop);
+    } else if (message.result_run_id) {
+      var keep = msgEl('button', 'mbtn', 'Keep window'); keep.type = 'button';
+      keep.addEventListener('click', function () {
+        keep.disabled = true;
+        keepRun(message.result_run_id, function (text, ok) {
+          keep.textContent = ok ? 'Kept' : 'Keep window';
+          if (!ok) keep.disabled = false;
+          msgToast(text);
+        });
+      });
+      actions.appendChild(keep);
+    } else if (message.kind === 'action') {
+      var run = msgEl('button', 'mbtn primary', 'Run'); run.type = 'button';
+      run.addEventListener('click', function () { openExecSheet(message); });
+      actions.appendChild(run);
+    } else if (message.kind === 'link' && message.link && isHttpUrl(message.link.url)) {
+      var open = msgEl('a', 'mbtn primary', (message.link.label || 'Open') + ' ↗');
+      open.href = message.link.url; open.target = '_blank'; open.rel = 'noopener noreferrer';
+      open.addEventListener('click', function () {
+        if (!message.read_at) cardAction(message.card_id, 'read').then(loadMessages)
+          .catch(function (error) { msgToast('Could not mark message as read: ' + error.message); });
+      });
+      actions.appendChild(open);
+    }
+    taskButtons(message).forEach(function (button) { actions.appendChild(button); });
+    var pin = msgEl('button', 'micon' + (message.pinned ? ' pinned' : ''), message.pinned ? 'Unpin' : 'Pin');
+    pin.type = 'button'; pin.title = message.pinned ? 'Unpin' : 'Pin';
+    pin.addEventListener('click', function () {
+      cardAction(message.card_id, message.pinned ? 'unpin' : 'pin').then(loadMessages)
+        .catch(function (error) { msgToast('Could not update pin: ' + error.message); });
+    });
+    actions.appendChild(pin);
+    if (msgState.key !== 'archived') {
+      var archive = msgEl('button', 'micon', 'Archive'); archive.type = 'button'; archive.title = 'Archive';
+      archive.addEventListener('click', function () {
+        cardAction(message.card_id, 'archive').then(loadMessages)
+          .catch(function (error) { msgToast('Could not archive message: ' + error.message); });
+      });
+      actions.appendChild(archive);
+    }
+    var dismiss = msgEl('button', 'micon', 'Dismiss'); dismiss.type = 'button'; dismiss.title = 'Dismiss';
+    dismiss.addEventListener('click', function () { dismissMessageCard(message); });
+    actions.appendChild(dismiss);
+    card.appendChild(actions);
+    return card;
+  }
+  function daysWaiting(message) {
+    var created = Date.parse(message.created_at);
+    return isNaN(created) ? 0 : Math.floor((Date.now() - created) / 86400000);
+  }
+  function taskPill(message) {
+    if (message.needs_action !== true) return msgEl('span', 'mstate', 'Record');
+    if (message.task_state === 'done') return msgEl('span', 'mstate done', 'Done');
+    if (message.task_state === 'doing') return msgEl('span', 'mstate doing', 'In progress');
+    if (message.task_state === 'snoozed' && !needsMe(message)) return msgEl('span', 'mstate', 'Snoozed');
+    var days = daysWaiting(message);
+    if (days >= 3) return msgEl('span', 'mstate aging', 'To do · ' + days + 'd');
+    return msgEl('span', 'mstate todo', 'To do');
+  }
+  // P4: a fallback that only changed a value nobody looks at is the quiet version this
+  // axis exists to rule out — so it earns a pill of its own, not folded into taskPill.
+  // 'no-owner-declared' is not shown: that is a card that never claimed an owner, and the
+  // roster was fine when it was asked, so there is nothing here for a person to act on.
+  var OWNER_FALLBACK_REASON = {
+    'not-configured': 'roster not configured',
+    'missing': 'roster file missing',
+    'unreadable': 'roster unreadable',
+    'invalid-json': 'roster invalid',
+    'missing-generated-at': 'roster invalid',
+    'stale': 'roster stale',
+    'unknown-owner': 'not in roster',
+  };
+  function ownerFallbackPill(message) {
+    var info = message.owner_resolved;
+    if (!info || !info.fallback || info.fallback_reason === 'no-owner-declared') return null;
+    var reason = OWNER_FALLBACK_REASON[info.fallback_reason] || info.fallback_reason;
+    if (info.fallback_reason === 'stale' && typeof message.roster_age_seconds === 'number') {
+      reason += ' ' + Math.round(message.roster_age_seconds / 3600) + 'h old';
+    }
+    var text = (message.owner ? message.owner + ' ' : '') + 'unresolved: ' + reason;
+    return msgEl('span', 'mowner-fallback', text);
+  }
+  function taskButtons(message) {
+    return taskActionsFor(message).map(function (spec) {
+      var node = msgEl('button', 'mbtn' + (spec.primary ? ' primary' : ''), spec.label);
+      node.type = 'button';
+      node.addEventListener('click', function () {
+        node.disabled = true;
+        cardAction(message.card_id, spec.action).then(loadMessages).catch(function (error) {
+          node.disabled = false;
+          msgToast('Could not update this card: ' + error.message);
+        });
+      });
+      return node;
+    });
+  }
+  function toggleMessageCard(message) {
+    var hasDetail = !!(message.body || (message.action && message.action.explain) || (message.link && message.link.url));
+    if (hasDetail) msgState.expanded[message.card_id] = !msgState.expanded[message.card_id];
+    if (!message.read_at) {
+      message.read_at = new Date().toISOString();
+      if (msgState.counts.unread > 0) msgState.counts.unread--;
+      cardAction(message.card_id, 'read').then(loadMessages)
+        .catch(function (error) { msgToast('Could not mark message as read: ' + error.message); });
+    }
+    renderMessages();
+  }
+  function cardAction(cardId, action) {
+    return ownerFetch('/messages/' + encodeURIComponent(cardId) + '/' + action, { method: 'POST' }).then(ownerResponse)
+      .then(function (res) {
+        if (res.status === 403) disableMessages(403);
+        else if (!res.ok || !res.data.ok) throw new Error(res.data.error || ('Action returned ' + res.status + '.'));
+        return res.data;
+      });
+  }
+  function renderBulkBar(cards) {
+    var bar = document.getElementById('msg-bulk');
+    bar.hidden = !cards.length;
+    if (!cards.length) return;
+    var selected = cards.filter(function (card) { return !!msgState.selected[card.card_id]; });
+    document.getElementById('bulk-count').textContent = selected.length + ' selected';
+    document.getElementById('bulk-all').textContent = selected.length === cards.length
+      ? 'Clear visible' : 'Select all visible';
+    var allowed = bulkActionsForScope(msgState.key);
+    bar.querySelectorAll('[data-bulk-action]').forEach(function (button) {
+      button.hidden = allowed.indexOf(button.dataset.bulkAction) < 0;
+      button.disabled = !selected.length;
+    });
+  }
+  function applyBulkAction(action) {
+    var cards = filteredMessages().filter(function (card) { return !!msgState.selected[card.card_id]; });
+    if (!cards.length) return Promise.resolve([]);
+    var bar = document.getElementById('msg-bulk');
+    bar.querySelectorAll('button').forEach(function (button) { button.disabled = true; });
+    return bulkCardActions(cards.map(function (card) { return card.card_id; }), action, cardAction, 4)
+      .then(function (results) {
+        msgState.selected = nextBulkSelection(msgState.selected, results);
+        var failed = failedBulkIds(results);
+        if (action === 'dismiss') {
+          var succeeded = cards.filter(function (card) { return failed.indexOf(card.card_id) < 0; });
+          if (succeeded.length) showUndo(succeeded, 'Dismissed ' + succeeded.length + ' message' +
+            (succeeded.length === 1 ? '' : 's') + (failed.length ? '; ' + failed.length + ' failed' : ''));
+        }
+        if (action !== 'dismiss' || !succeeded.length) {
+          msgToast((results.length - failed.length) + ' updated' + (failed.length ? '; ' + failed.length + ' failed.' : '.'));
+        }
+        return loadMessages().then(function () { return results; });
+      }).catch(function (error) {
+        msgToast('Bulk action failed: ' + error.message);
+        renderBulkBar(filteredMessages());
+        return [];
+      });
+  }
+  function dismissMessageCard(message) {
+    cardAction(message.card_id, 'dismiss').then(function () { showUndo([message]); return loadMessages(); })
+      .catch(function (error) { msgToast('Could not dismiss message: ' + error.message); });
+  }
+  function showUndo(messages, label) {
+    undoCards = messages.slice();
+    document.getElementById('undo-msg').textContent = label || (messages.length === 1
+      ? 'Dismissed: ' + messages[0].title : 'Dismissed ' + messages.length + ' messages');
+    var toast = document.getElementById('undo-toast'); toast.classList.add('show');
+    clearTimeout(undoTimer);
+    undoTimer = setTimeout(function () { toast.classList.remove('show'); undoCards = []; }, 6000);
+  }
+  document.getElementById('undo-btn').addEventListener('click', function () {
+    if (!undoCards.length) return;
+    var restoring = undoCards.slice(); undoCards = [];
+    document.getElementById('undo-toast').classList.remove('show');
+    bulkCardActions(restoring.map(function (card) { return card.card_id; }), 'undismiss', cardAction, 4)
+      .then(function (results) {
+        var failed = failedBulkIds(results);
+        if (failed.length) {
+          showUndo(retryBulkItems(restoring, results),
+            'Could not restore ' + failed.length + ' message' + (failed.length === 1 ? '; retry Undo' : 's; retry Undo'));
+        }
+        return loadMessages();
+      });
+  });
+  document.getElementById('bulk-all').addEventListener('click', function () {
+    var cards = filteredMessages();
+    var all = cards.length && cards.every(function (card) { return !!msgState.selected[card.card_id]; });
+    cards.forEach(function (card) {
+      if (all) delete msgState.selected[card.card_id];
+      else msgState.selected[card.card_id] = true;
+    });
+    renderMessages();
+  });
+  document.getElementById('msg-bulk').addEventListener('click', function (event) {
+    var button = event.target.closest('[data-bulk-action]');
+    if (button) applyBulkAction(button.dataset.bulkAction);
+  });
+  document.getElementById('msg-chips').addEventListener('click', function (event) {
+    var chip = event.target.closest('.chip'); if (!chip) return;
+    msgState.key = chip.dataset.key;
+    document.querySelectorAll('#msg-chips .chip').forEach(function (button) {
+      button.setAttribute('aria-pressed', button === chip ? 'true' : 'false');
+    });
+    loadMessages();
+  });
+
+  function planLine(label, value) {
+    var line = msgEl('div', 'pv-line');
+    line.appendChild(msgEl('span', 'pv-label', label));
+    line.appendChild(msgEl('span', 'pv-value', value == null ? '' : value));
+    return line;
+  }
+  var execGen = 0;
+  function showArgv(argv) {
+    // One quoted element per argument. join(' ') would render ["sh","-c","a b"] and
+    // ["sh","-c","a","b"] identically, and this dialog exists to be unambiguous about
+    // exactly what is going to run.
+    return (argv || []).map(function (part) { return JSON.stringify(String(part)); }).join(' ');
+  }
+  function openExecSheet(message) {
+    var body = document.getElementById('exec-body');
+    document.getElementById('exec-title').textContent = message.title;
+    document.getElementById('exec-err').textContent = '';
+    var confirmButton = document.getElementById('exec-confirm');
+    confirmButton.disabled = true; confirmButton.textContent = 'Run';
+    execNonce = null; execCardId = null;
+    // Every open gets a generation. A plan request is slow enough that the sheet can be
+    // cancelled and reopened on a different card before it lands; without this, the old
+    // response repopulated the sheet — resurrecting a cancelled approval and leaving a
+    // plan that disagreed with the title above it.
+    var gen = ++execGen;
+    body.textContent = ''; body.appendChild(msgEl('div', 'msg-empty', 'Creating plan…'));
+    document.getElementById('exec-backdrop').classList.add('show');
+    ownerFetch('/messages/' + encodeURIComponent(message.card_id) + '/plan', { method: 'POST' }).then(ownerResponse)
+      .then(function (res) {
+        if (gen !== execGen) return;
+        body.textContent = '';
+        if (res.status === 403) { disableMessages(403); closeExecSheet(); return; }
+        if (!res.ok || !res.data.ok) { document.getElementById('exec-err').textContent = 'Could not create plan: ' + (res.data.error || res.status); return; }
+        var plan = res.data.plan || {};
+        execNonce = res.data.nonce; execCardId = message.card_id;
+        body.appendChild(planLine('Working directory:', plan.cwd));
+        if (plan.exec) body.appendChild(planLine('Command:', showArgv(plan.exec)));
+        else if (plan.skill) body.appendChild(planLine('Skill:', '/' + plan.skill));
+        else body.appendChild(planLine('Prompt:', plan.prompt));
+        if (plan.explain) body.appendChild(planLine('Reason:', plan.explain));
+        confirmButton.disabled = false;
+      }).catch(function (error) {
+        if (gen !== execGen) return;
+        body.textContent = ''; document.getElementById('exec-err').textContent = 'Plan error: ' + error.message;
+      });
+  }
+  function closeExecSheet() {
+    execGen++;
+    document.getElementById('exec-backdrop').classList.remove('show');
+    execNonce = null; execCardId = null;
+  }
+  document.getElementById('exec-cancel').addEventListener('click', closeExecSheet);
+  document.getElementById('exec-backdrop').addEventListener('click', function (event) { if (event.target === this) closeExecSheet(); });
+  document.getElementById('exec-confirm').addEventListener('click', function () {
+    if (!execNonce || !execCardId) return;
+    var button = this, cardId = execCardId;
+    button.disabled = true; button.textContent = 'Starting…';
+    ownerFetch('/messages/' + encodeURIComponent(cardId) + '/execute', { method: 'POST', body: JSON.stringify({ nonce: execNonce }) }).then(ownerResponse)
+      .then(function (res) {
+        button.textContent = 'Run';
+        if (res.status === 403) { disableMessages(403); closeExecSheet(); return; }
+        if (res.status === 409) { document.getElementById('exec-err').textContent = 'The plan changed. Review and approve it again.'; button.disabled = false; return; }
+        if (!res.ok || !res.data.ok) { document.getElementById('exec-err').textContent = 'Could not start action: ' + (res.data.error || res.status); button.disabled = false; return; }
+        var title = document.getElementById('exec-title').textContent;
+        closeExecSheet();
+        cardAction(cardId, 'read').catch(function () {}).then(loadMessages);
+        if (res.data.run_id) openRunView(res.data.run_id, title);
+        else msgToast('Action started.');
+      }).catch(function (error) { document.getElementById('exec-err').textContent = 'Run error: ' + error.message; button.disabled = false; });
+  });
+
+  var RUN_STATE_LABEL = { starting: 'Starting', running: 'Running', done: 'Completed', failed: 'Failed', stopped: 'Stopped', interrupted: 'Interrupted' };
+  function closeRunView() {
+    document.getElementById('runview-backdrop').classList.remove('show');
+    clearInterval(runView.poll);
+    clearTimeout(runView.retry);
+    document.getElementById('runview-terminal').textContent = '';
+    document.getElementById('runview-pop').disabled = true;
+    document.getElementById('runview-keep').disabled = true;
+    document.getElementById('runview-keep').textContent = 'Keep window';
+    runView = { runId: null, poll: null, retry: null, terminalUrl: null, finished: null };
+  }
+  function renderRunStatus(run) {
+    document.getElementById('runview-state').textContent = RUN_STATE_LABEL[run.status] || run.status;
+    var body = document.getElementById('runview-body'); body.textContent = '';
+    body.appendChild(planLine('Status:', RUN_STATE_LABEL[run.status] || run.status));
+    if (run.exit_code != null) body.appendChild(planLine('Exit code:', run.exit_code));
+    if (run.error) body.appendChild(planLine('Error:', run.error));
+    if (run.reclaimed_at) body.appendChild(planLine('Reclaimed:', run.reclaimed_at + ' (24-hour retention expired)'));
+    else if (run.keep) body.appendChild(planLine('Retention:', 'Kept indefinitely by owner'));
+    if (run.plan) {
+      if (run.plan.cwd) body.appendChild(planLine('Working directory:', run.plan.cwd));
+      if (run.plan.exec) body.appendChild(planLine('Command:', showArgv(run.plan.exec)));
+      else if (run.plan.skill) body.appendChild(planLine('Skill:', '/' + run.plan.skill));
+      else if (run.plan.prompt) body.appendChild(planLine('Prompt:', run.plan.prompt));
+    }
+    var active = run.status === 'starting' || run.status === 'running';
+    document.getElementById('runview-stop').disabled = !active;
+    var keepButton = document.getElementById('runview-keep');
+    keepButton.disabled = !!run.keep || !!run.reclaimed_at;
+    keepButton.textContent = run.keep ? 'Kept' : 'Keep window';
+  }
+  function pollRunStatus(runId) {
+    return ownerFetch('/runs/' + encodeURIComponent(runId)).then(ownerResponse).then(function (res) {
+      if (res.status === 403 || res.status === 404) {
+        if (res.status === 403) disableMessages(403);
+        else document.getElementById('runview-state').textContent = 'Run record not found.';
+        return;
+      }
+      if (!res.ok || !res.data.status) throw new Error(res.data.error || ('Run status returned ' + res.status + '.'));
+      renderRunStatus(res.data);
+      if (res.data.status !== 'starting' && res.data.status !== 'running') {
+        clearInterval(runView.poll); runView.poll = null;
+        if (res.data.status === 'done') scheduleRunViewAutoClose(runId);
+        if (res.data.status === 'stopped' || res.data.status === 'interrupted') {
+          document.getElementById('runview-terminal').textContent = '';
+          runView.terminalUrl = null;
+          document.getElementById('runview-pop').disabled = true;
+          showTerminalNote((RUN_STATE_LABEL[res.data.status] || res.data.status) + ': the action terminal has closed.');
+        }
+        loadMessages();
+      }
+    }).catch(function (error) {
+      if (runView.runId === runId) document.getElementById('runview-state').textContent = 'Status unavailable: ' + error.message;
+    });
+  }
+  var VIEW_ERROR_MESSAGE = {
+    launching: 'Preparing the action terminal…',
+    stale_generation: 'This terminal can no longer be identified safely.',
+    stale_target_format: 'This action was recorded in an unsupported terminal format.',
+    not_active: 'This action is no longer active.',
+    not_found: 'Run record not found.',
+    tmux_unavailable: 'Terminal status is temporarily unavailable.',
+    view_create_failed: 'Could not create an action terminal view.',
+    kill_failed: 'Could not stop the action terminal.',
+  };
+  function scheduleRunViewAutoClose(runId) {
+    // Deliberately does not close the modal. The window belongs to the run and the run is
+    // still there to read: the terminal is a cross-origin iframe, so the parent cannot tell
+    // whether someone is reading or typing in it, and closing on a timer took the output
+    // away mid-sentence. Announce the result, refresh the feed behind it, let the owner close.
+    if (runView.runId !== runId || runView.finished === runId) return;
+    runView.finished = runId;
+    msgToast('Action completed. The result is in Messages; this window stays open.');
+    loadMessages();
+  }
+  function showTerminalNote(text) {
+    var terminal = document.getElementById('runview-terminal');
+    terminal.textContent = '';
+    terminal.appendChild(msgEl('div', 'runview-note', text));
+  }
+  function mountRunFrame(runId, session) {
+    getTerminalUrl(session).then(function (url) {
+      if (runView.runId !== runId) return;
+      runView.terminalUrl = url;
+      document.getElementById('runview-pop').disabled = false;
+      var terminal = document.getElementById('runview-terminal');
+      terminal.textContent = '';
+      var frame = document.createElement('iframe');
+      frame.title = 'Action terminal';
+      frame.src = url;
+      terminal.appendChild(frame);
+    }).catch(function (error) {
+      if (runView.runId === runId) showTerminalNote('Terminal view unavailable: ' + error.message);
+    });
+  }
+  function ensureRunView(runId, attempts) {
+    ownerFetch('/runs/' + encodeURIComponent(runId) + '/view', { method: 'POST' }).then(ownerResponse)
+      .then(function (res) {
+        if (runView.runId !== runId) return;
+        if (res.ok && res.data.ok) { mountRunFrame(runId, res.data.arg); return; }
+        var code = res.data.error || ('http_' + res.status);
+        if (code === 'launching' && attempts > 1) {
+          document.getElementById('runview-state').textContent = VIEW_ERROR_MESSAGE.launching;
+          runView.retry = setTimeout(function () { ensureRunView(runId, attempts - 1); }, 1000);
+          return;
+        }
+        showTerminalNote(VIEW_ERROR_MESSAGE[code] || ('Could not open action terminal: ' + code));
+      }).catch(function (error) {
+        if (runView.runId === runId) showTerminalNote('Terminal view error: ' + error.message);
+      });
+  }
+  function openRunView(runId, title) {
+    closeRunView();
+    runView.runId = runId;
+    document.getElementById('runview-title').textContent = title || 'Action status';
+    document.getElementById('runview-body').textContent = '';
+    document.getElementById('runview-terminal').textContent = '';
+    document.getElementById('runview-state').textContent = 'Connecting…';
+    document.getElementById('runview-backdrop').classList.add('show');
+    showTerminalNote('Connecting to the action terminal…');
+    ensureRunView(runId, 5);
+    pollRunStatus(runId);
+    runView.poll = setInterval(function () { pollRunStatus(runId); }, 1500);
+  }
+  function stopRun(runId, report) {
+    return ownerFetch('/runs/' + encodeURIComponent(runId) + '/stop', { method: 'POST' }).then(ownerResponse)
+      .then(function (res) {
+        if (res.status === 403) { disableMessages(403); report('Could not stop the action.', false); return; }
+        if (!res.ok || !res.data.ok) { report('Could not stop the action: ' + (res.data.error || res.status), false); return; }
+        report('Action stopped.', true);
+        pollRunStatus(runId); loadMessages();
+      }).catch(function (error) { report('Stop error: ' + error.message, false); });
+  }
+  function keepRun(runId, report) {
+    return ownerFetch('/runs/' + encodeURIComponent(runId) + '/keep', { method: 'POST' }).then(ownerResponse)
+      .then(function (res) {
+        if (res.status === 403) { disableMessages(403); report('Could not keep the action window.', false); return; }
+        if (!res.ok || !res.data.ok) { report('Could not keep the action window: ' + (res.data.error || res.status), false); return; }
+        report('Action window kept indefinitely.', true);
+        pollRunStatus(runId); loadMessages();
+      }).catch(function (error) { report('Keep error: ' + error.message, false); });
+  }
+  document.getElementById('runview-close').addEventListener('click', closeRunView);
+  document.getElementById('runview-pop').addEventListener('click', function () {
+    if (!runView.terminalUrl) return;
+    var opened = window.open(runView.terminalUrl, '_blank');
+    if (!opened) { showTerminalNote('The browser blocked the terminal tab. Open this address directly: ' + runView.terminalUrl); return; }
+    closeRunView();
+  });
+  document.getElementById('runview-backdrop').addEventListener('click', function (event) { if (event.target === this) closeRunView(); });
+  document.getElementById('runview-stop').addEventListener('click', function () {
+    if (!runView.runId) return;
+    var button = this; button.disabled = true;
+    stopRun(runView.runId, function (text, ok) { if (!ok) button.disabled = false; msgToast(text); });
+  });
+  document.getElementById('runview-keep').addEventListener('click', function () {
+    if (!runView.runId) return;
+    var button = this; button.disabled = true;
+    keepRun(runView.runId, function (text, ok) {
+      if (!ok) button.disabled = false;
+      msgToast(text);
+    });
+  });
+  document.addEventListener('keydown', function (event) { if (event.key === 'Escape' && runView.runId) closeRunView(); });
+
+  // ---- tabs ----
+  // Both bars drive the same function: the phone bar is not a second implementation, it is
+  // the same three buttons in the thumb's reach.
+  var TABS = ['inbox', 'system', 'routing'];
+  function showTab(name) {
+    if (TABS.indexOf(name) < 0) name = 'inbox';
+    TABS.forEach(function (tab) {
+      document.getElementById('view-' + tab).hidden = (tab !== name);
+    });
+    document.querySelectorAll('[role="tab"][data-tab]').forEach(function (button) {
+      button.setAttribute('aria-selected', button.dataset.tab === name ? 'true' : 'false');
+    });
+    if (name === 'routing') loadLanes();
+    if (location.hash.replace('#', '') !== name) history.replaceState(null, '', '#' + name);
+  }
+  document.querySelectorAll('[role="tab"][data-tab]').forEach(function (button) {
+    button.addEventListener('click', function () { showTab(button.dataset.tab); });
+  });
+  window.addEventListener('hashchange', function () { showTab(location.hash.replace('#', '')); });
+  // ---- notification paths ----
+  // /api/health, not an owner route: this says whether each path can deliver, which is the
+  // question the 2026-07-30 outage could not answer while the console looked healthy.
+  var LANE_LABEL = {
+    'slack-urgent': 'Slack — urgent', 'slack-routine': 'Slack — routine', email: 'Email',
+  };
+  var LANE_ORDER = ['slack-urgent', 'email', 'slack-routine'];
+
+  /* TESTABLE:routing-policy — extracted and run by install/test-routing-policy.mjs.
+     The routing table is written twice now: as ROUTING in backend/devmon_messages.py, which
+     decides what is enqueued, and as POLICY here, which is what a person reads. The test
+     compares them, because a screen that states a rule the box does not follow is worse than
+     no screen — it is the one place somebody would go to check. */
+  var POLICY = [
+    { severity: 'page', means: 'a person is needed now',
+      channels: ['console', 'slack-urgent', 'email'] },
+    { severity: 'attention', means: 'today, not this minute',
+      channels: ['console', 'slack-routine'] },
+    { severity: 'record', means: 'kept, nobody called',
+      channels: ['console'] },
+    { severity: 'digest', means: 'gathered up, once a day',
+      channels: ['console'] },
+  ];
+  function laneTone(lane) {
+    // Unconfigured is not broken. A lane nobody set up should read as unknown rather than as
+    // a failure, and the prefix is matched rather than the exact wording because each lane
+    // names its own remedy — a webhook for Slack, a transport for email.
+    if (lane.worker_state && lane.worker_state.indexOf('off:') === 0) return 'unknown';
+    if (lane.worker_state !== 'on') return 'bad';
+    if (lane.delivery_state === 'failed') return 'bad';
+    // `pending` on its own is a queue with a retry in it, which is normal. `pending` WITH a
+    // last error is the 2026-07-30 shape, and it must not be green: a channel that is off
+    // does not go quiet, it fills up.
+    if (lane.last_error && lane.pending_count > 0) return 'bad';
+    if (lane.delivery_state === 'rate-limited' || lane.delivery_state === 'unknown') return 'unknown';
+    return 'ok';
+  }
+  function laneAge(seconds) {
+    if (seconds == null) return null;
+    if (seconds < 60) return seconds + 's';
+    if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+    return Math.floor(seconds / 3600) + 'h';
+  }
+  /* :TESTABLE */
+
+  function renderPolicy() {
+    var body = document.getElementById('policy-rows');
+    if (!body || body.childNodes.length) return;
+    POLICY.forEach(function (row) {
+      var tr = msgEl('tr');
+      var name = msgEl('td');
+      name.appendChild(msgEl('code', null, row.severity));
+      tr.appendChild(name);
+      tr.appendChild(msgEl('td', null, row.means));
+      // The inbox cell says "always" rather than a tick, because it is not a setting.
+      tr.appendChild(msgEl('td', null, 'always'));
+      tr.appendChild(msgEl('td', null,
+        row.channels.indexOf('slack-urgent') >= 0 ? 'urgent lane'
+          : row.channels.indexOf('slack-routine') >= 0 ? 'routine lane' : '—'));
+      tr.appendChild(msgEl('td', null, row.channels.indexOf('email') >= 0 ? 'yes' : '—'));
+      body.appendChild(tr);
+    });
+  }
+
+  function loadLanes() {
+    renderPolicy();
+    var list = document.getElementById('lane-list');
+    return j(API + '/health').then(function (data) {
+      var lanes = data.message_lanes || {};
+      list.textContent = '';
+      var names = Object.keys(lanes);
+      if (!names.length) { list.appendChild(msgEl('div', 'empty', 'No delivery paths are configured.')); return; }
+      // Sorted by the policy's own order, so the lane a `page` needs is the first one read.
+      names.sort(function (a, b) { return LANE_ORDER.indexOf(a) - LANE_ORDER.indexOf(b); });
+      names.forEach(function (name) {
+        var lane = lanes[name];
+        var block = msgEl('div', 'lane ' + laneTone(lane));
+        var head = msgEl('h3');
+        head.appendChild(msgEl('span', 'ldot'));
+        head.appendChild(msgEl('span', null, LANE_LABEL[name] || name));
+        block.appendChild(head);
+        var meta = msgEl('div', 'lmeta');
+        meta.appendChild(msgEl('span', null, 'worker ' + lane.worker_state));
+        meta.appendChild(msgEl('span', null, 'delivery ' + lane.delivery_state));
+        meta.appendChild(msgEl('span', null, lane.last_success_at
+          ? 'last sent ' + timeAgo(lane.last_success_at) : 'never sent'));
+        var waiting = lane.pending_count + ' waiting';
+        var oldest = laneAge(lane.oldest_pending_age_seconds);
+        // The age of the oldest waiting row is the number that grew for nine days while the
+        // console said the channel was fine. The count alone does not show that.
+        if (lane.pending_count > 0 && oldest) waiting += ' (oldest ' + oldest + ')';
+        meta.appendChild(msgEl('span', null, waiting));
+        block.appendChild(meta);
+        // A channel that is off does not go quiet — it fills up. Saying so is the difference
+        // between this screen and the console that looked healthy for nine days.
+        if (lane.last_error) block.appendChild(msgEl('div', 'lmeta err', lane.last_error));
+        list.appendChild(block);
+      });
+    }).catch(function (error) {
+      list.textContent = '';
+      list.appendChild(msgEl('div', 'empty err', 'Delivery health is unavailable: ' + error.message));
+    });
+  }
+
+  // #messages was the anchor the hub and older links used when the inbox was a section of
+  // this page. It still has to land on the inbox rather than on a tab that does not exist.
+  //
+  // Bootstrapped here, at the end, and not next to showTab's definition: opening straight
+  // onto #routing calls renderPolicy synchronously, and `var POLICY` is assigned further
+  // down this script. Declared-but-unassigned is what hoisting gives you, so the table came
+  // up with headers and no rows — and because the throw happened before loadLanes reached
+  // its promise, it took the delivery health down with it and left "loading…" forever. Both
+  // halves of this tab went blank over a line ordering, which a live open found and no unit
+  // test could have.
+  showTab(location.hash === '#messages' ? 'inbox' : location.hash.replace('#', '') || 'inbox');
+
+  loadMessages();
+  msgPoll = setInterval(function () { if (msgState.enabled !== false && !document.getElementById('exec-backdrop').classList.contains('show')) loadMessages(); }, 8000);
+</script>
+<script src="/airlock-return.js" data-mode="corner" defer></script>
+</body>
+</html>

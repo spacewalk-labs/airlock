@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# airlock-teardown [--adopt] <app-id> — the ONE exit for a recorded app the
+# platform refuses to drop implicitly (D6 priority 1: its package shipped no
+# deactivator, so silent config removal would strand its artifacts). Removes
+# every artifact the installed-state ledger records for <app-id>, logs that
+# the removal was platform-performed, and drops the record.
+#
+#   bash bin/airlock-teardown <app-id>
+#
+# --adopt <app-id> (F15/D6 amendment, child 4/P4): for a KNOWN BUILTIN with
+# no config entry and no ledger record — artifacts left behind by an install
+# that predates the ledger — journals a synthetic intent record (under the
+# ledger lock, re-verified from scratch) and then runs the SAME ordinary
+# teardown machinery below to remove them. `airlock-config known-builtins`/
+# `adopt-scan` name the exact `--adopt <id>` line to run; see
+# docs/design/app-package-contract.md's D6 amendment.
+#
+# Honours AIRLOCK_DRY_RUN=1 (prints the plan, changes nothing).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=/dev/null
+. "$ROOT/install/lib.sh"
+
+adopt=0
+if [ "${1:-}" = --adopt ]; then
+  adopt=1
+  shift
+fi
+[ $# -eq 1 ] || die "usage: airlock-teardown [--adopt] <app-id>"
+app="$1"
+
+require_cmd python3
+
+# Same single-writer lock as the orchestrator (F9c): teardown mutates the
+# ledger and the box, so it must never interleave with a running install.
+# Taken FIRST — the desired-app guard and the config probe below must read
+# state nothing concurrent can change after they ran. --adopt ALWAYS locks,
+# dry run or not: unlike the ordinary path (where a dry run reads a record
+# that already exists and changes nothing), --adopt reasons about whether
+# ANOTHER id's claims collide RIGHT NOW — that reasoning is only valid taken
+# under the same lock a real adoption would hold, even for a preview.
+_state_dir="${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}"
+if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ "$adopt" = 1 ]; then
+  require_cmd flock
+  install -d -m 0700 "$_state_dir"
+  airlock_pin_state_dir
+  _state_dir="${AIRLOCK_STATE_DIR:-$_state_dir}"
+  exec 9>>"$_state_dir/app-ledger.lock"
+  flock -n 9 || die "another airlock run holds the ledger lock ($_state_dir/app-ledger.lock) — re-run when it finishes"
+fi
+
+# A desired app is not torn down (or adopted) behind the config's back:
+# reconcile owns the desired state for a configured app; --adopt is the exit
+# for one that is NOT configured. Remove its [packages.X]/[apps.X] lines
+# first, then re-run.
+if airlock_config apps | grep -qx -- "$app"; then
+  if [ "$adopt" = 1 ]; then
+    die "'$app' is enabled in airlock.toml — the ordinary packaged install \
+path applies (D5's idempotent re-run rule), not --adopt; run the \
+orchestrator instead."
+  fi
+  die "'$app' is still enabled in airlock.toml — teardown is the exit for a \
+RECORDED app, not an enabled one. Remove its [packages.$app] and [apps.$app] \
+lines first, then re-run this command."
+fi
+
+if [ "$adopt" = 1 ]; then
+  # Re-verifies everything from scratch under the lock just taken (id
+  # validity, no config entry — already checked above too, defense in depth
+  # — no existing record, manifest regular/non-symlink/contract=1, and the
+  # full-disjoint admission predicate) and journals a synthetic intent
+  # record on success; AIRLOCK_DRY_RUN=1 computes and validates it but never
+  # writes. See cmd_adopt_write in bin/airlock-config.
+  # AIRLOCK_LEDGER_LOCK_HELD=1 tells adopt-write this process already holds
+  # the ledger lock (fd 9, taken above) — without it, adopt-write takes its
+  # OWN lock on the SAME file for a bare/direct invocation (round-2 review:
+  # a lost-update race between two concurrent bare `adopt-write` calls),
+  # which would deadlock here since this process already holds it.
+  AIRLOCK_LEDGER_LOCK_HELD=1 airlock_config adopt-write "$app" >/dev/null
+  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+    log "[dry] --adopt preview only: nothing was recorded, so there is no intent for the ordinary teardown machinery below to remove yet"
+    exit 0
+  fi
+  log "adopted '$app': proceeding to the ordinary teardown of its newly-recorded artifacts"
+fi
+
+# Fail-closed before consuming any projection (child 4/P3): package-info and
+# plaintext below do not themselves validate — an unknown/manifestless
+# [apps.X] elsewhere in the config would otherwise sail through unnoticed
+# here, the one place the flip to fatal at `validate` didn't reach. <app>
+# itself is already gone from config by construction (the enabled-check
+# above), so this never rejects a genuine removed-app teardown — only a
+# typo/manifestless app STILL sitting in airlock.toml.
+airlock_config validate >/dev/null \
+  || die "airlock.toml does not validate — fix it before tearing down '$app' \
+(teardown reads package-info/plaintext, which do not themselves fail closed \
+on an unrelated unknown app; see the validate output above)."
+
+AIRLOCK_PKG_INFO="$(airlock_config package-info)"
+export AIRLOCK_PKG_INFO
+
+# Ports still claimed by desired apps are never turned off, even if a stale
+# record names them (the guard in airlock-ledger).
+_active_ports="$(airlock_config plaintext | awk '{print $2}' | tr '\n' ' ')"
+printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" teardown "$app" --active-ports "$_active_ports"
+log "teardown complete: '$app' (platform-performed; the package's own deactivator did not run)"

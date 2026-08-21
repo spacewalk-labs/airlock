@@ -1,0 +1,11 @@
+# Airlock — restrict a backend that must bind 0.0.0.0 to loopback callers only.
+# Some upstreams (e.g. orca) cannot bind 127.0.0.1; this nft table drops any
+# non-loopback traffic to their port so only the local nginx gate can reach them.
+# Rendered by install/lib.sh render_loopback_nft <table> <port> (fills TABLE, PORT).
+# See SECURITY.md (loopback binding is part of the trust boundary).
+table inet @@TABLE@@ {
+    chain input {
+        type filter hook input priority -10; policy accept;
+        iif != "lo" tcp dport @@PORT@@ drop
+    }
+}

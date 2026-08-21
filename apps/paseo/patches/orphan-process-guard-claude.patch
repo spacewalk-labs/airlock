@@ -1,0 +1,149 @@
+--- a/dist/server/server/agent/providers/claude/agent.js
++++ b/dist/server/server/agent/providers/claude/agent.js
+@@ -1495,6 +1495,7 @@
+         this.capabilities = CLAUDE_CAPABILITIES;
+         this.query = null;
+         this.childProcess = null;
++        this.liveChildProcesses = new Set(); // [paseo-orphan-guard]
+         this.input = null;
+         this.planResumeMode = null;
+         this.availableModes = DEFAULT_MODES;
+@@ -1993,19 +1994,9 @@
+         await this.awaitWithTimeout(this.query?.return?.(), "close query return");
+         this.query = null;
+         this.input = null;
+-        // Terminate the entire process tree (claude + MCP children) to prevent
+-        // orphan accumulation. The SDK's internal cleanup may only kill the
+-        // direct child process.
+-        if (this.childProcess) {
+-            const result = await terminateWithTreeKill(this.childProcess, {
+-                gracefulTimeoutMs: 2000,
+-                forceTimeoutMs: 2000,
+-            });
+-            if (result === "kill-timeout") {
+-                this.logger.warn({ pid: this.childProcess.pid, agentId: this.agentId }, "Claude process tree did not report exit after SIGKILL");
+-            }
+-            this.childProcess = null;
+-        }
++        // [paseo-orphan-guard] Terminate every live process tree (claude + MCP children).
++        // Was: kill the one tracked handle, silently do nothing when it was absent.
++        await this.terminateLiveChildren("session_close");
+         if (this.persistSession === false && this.claudeSessionId) {
+             // Claude Code currently ignores --no-session-persistence outside --print mode
+             // (see `claude --help`), so the SDK's persistSession=false is silently dropped
+@@ -2325,7 +2316,83 @@
+         }
+         return { kind: "fork", messageId: previousTurn.assistantMessageId };
+     }
++    // [paseo-orphan-guard] Ownership of the processes this session spawned.
++    // A Set, not a single slot: the SDK can spawn a replacement while the previous
++    // process is still alive, and the upstream single handle silently dropped the
++    // older one. Every branch that used to be silent now warns at level 40.
++    adoptSpawnedChild(child) {
++        const pid = child ? child.pid : undefined;
++        if (this.closed) {
++            this.logger.warn({ agentId: this.agentId, provider: "claude", pid }, "[paseo-orphan-guard] child process arrived after close — terminating it instead of adopting");
++            void terminateWithTreeKill(child, { gracefulTimeoutMs: 2000, forceTimeoutMs: 2000 }).catch(() => { });
++            return;
++        }
++        if (!this.liveChildProcesses) {
++            this.liveChildProcesses = new Set();
++        }
++        if (this.childProcess && this.childProcess !== child) {
++            this.logger.warn({ agentId: this.agentId, provider: "claude", pid, previousPid: this.childProcess.pid }, "[paseo-orphan-guard] a live child was replaced — the previous one stays tracked so close() still terminates it");
++        }
++        this.liveChildProcesses.add(child);
++        this.childProcess = child;
++        const forget = () => {
++            if (this.liveChildProcesses) {
++                this.liveChildProcesses.delete(child);
++            }
++            if (this.childProcess === child) {
++                this.childProcess = null;
++            }
++        };
++        if (child && typeof child.once === "function") {
++            child.once("exit", forget);
++        }
++    }
++    async terminateLiveChildren(reason) {
++        const targets = new Set(this.liveChildProcesses || []);
++        if (this.childProcess) {
++            targets.add(this.childProcess);
++        }
++        this.liveChildProcesses = new Set();
++        this.childProcess = null;
++        if (targets.size === 0) {
++            // Not a warning: close() ends stdin first, so the claude process usually
++            // exits on its own and the exit listener has already emptied the set. The
++            // leak this patch is after shows up at adopt/ensureQuery time, not here.
++            return;
++        }
++        if (targets.size > 1) {
++            this.logger.warn({ agentId: this.agentId, provider: "claude", reason, count: targets.size }, "[paseo-orphan-guard] more than one live child at termination");
++        }
++        for (const child of targets) {
++            const pid = child ? child.pid : undefined;
++            let result;
++            try {
++                result = await terminateWithTreeKill(child, {
++                    gracefulTimeoutMs: 2000,
++                    forceTimeoutMs: 2000,
++                });
++            }
++            catch (err) {
++                this.logger.warn({ err, agentId: this.agentId, provider: "claude", pid, reason }, "[paseo-orphan-guard] tree-kill threw — the process tree may survive");
++                continue;
++            }
++            if (result === "kill-timeout") {
++                this.logger.warn({ pid, agentId: this.agentId, reason }, "Claude process tree did not report exit after SIGKILL");
++            }
++            else if (result === "already-exited") {
++                this.logger.warn({ pid, agentId: this.agentId, provider: "claude", reason }, "[paseo-orphan-guard] leader had already exited — its MCP children were reparented to init and cannot be tree-killed from here");
++            }
++        }
++    }
+     async ensureQuery() {
++        // [paseo-orphan-guard] A closed session must not spawn. close() sets this flag
++        // but upstream only honoured it in startTurn()/startQueryPump(); setMode,
++        // setModel, listCommands, revertFiles and ensureFreshQuery all reach here and
++        // would resurrect a process that nothing owns.
++        if (this.closed) {
++            this.logger.warn({ agentId: this.agentId, provider: "claude" }, "[paseo-orphan-guard] ensureQuery() on a closed session — refusing to spawn a replacement");
++            throw new Error("Claude session is closed");
++        }
+         if (this.query && !this.queryRestartNeeded) {
+             return this.query;
+         }
+@@ -2346,18 +2413,10 @@
+             catch {
+                 /* ignore */
+             }
+-            // Tree-kill the old process tree now that the SDK has cleaned up.
+-            // If we skip this, MCP children of the previous claude process can
+-            // survive as orphans when the session spawns a replacement query.
+-            if (this.childProcess) {
+-                await terminateWithTreeKill(this.childProcess, {
+-                    gracefulTimeoutMs: 2000,
+-                    forceTimeoutMs: 2000,
+-                }).catch(() => {
+-                    /* process may already be dead */
+-                });
+-                this.childProcess = null;
+-            }
++            // [paseo-orphan-guard] Same termination path as close(): every live handle,
++            // not just the newest one. MCP children of a previous claude process used to
++            // survive here whenever the handle had been overwritten.
++            await this.terminateLiveChildren("query_restart");
+         }
+         // Preserve claudeSessionId across query recreation so buildOptions() passes
+         // resume: sessionId and the new query continues the existing conversation.
+@@ -2371,7 +2430,7 @@
+             launchEnv: this.launchEnv,
+             queryFactory: this.queryFactory,
+             onChildProcess: (child) => {
+-                this.childProcess = child;
++                this.adoptSpawnedChild(child); // [paseo-orphan-guard]
+             },
+         });
+         const fastMode = this.resolveFastModeSetting();

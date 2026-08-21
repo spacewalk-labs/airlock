@@ -1,0 +1,27 @@
+[Unit]
+Description=airlock code-server slot manager API (127.0.0.1:19199)
+# NOT After=default.target — same WantedBy=default.target ordering-cycle
+# anti-pattern fixed in apps/paseo/render.sh; see that comment for the exact
+# boot-log signature this produces. network.target matches
+# airlock-code-server@.service just below and every other app unit here.
+After=network.target
+
+[Service]
+Type=simple
+Environment=AIRLOCK_CODE_SERVER_MANAGER_HOST=127.0.0.1
+Environment=AIRLOCK_CODE_SERVER_MANAGER_PORT=19199
+Environment=AIRLOCK_CODE_SERVER_SLOTS=1
+Environment=AIRLOCK_CODE_SERVER_BACKEND_PORT=19100
+Environment=AIRLOCK_CODE_SERVER_ALLOW=owner@example.com
+Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+ExecStart=%h/.local/bin/airlock-code-server-manager
+Restart=on-failure
+RestartSec=2
+MemoryHigh=128M
+MemoryMax=256M
+TasksMax=128
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

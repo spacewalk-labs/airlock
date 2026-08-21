@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# devterm-shell — the command ttyd runs for each browser client.
+# Attach (or create) the tmux session named by ttyd's url-arg ($1).
+#   URL `/?arg=main`   -> tmux session "main"; reopening the URL resumes that screen.
+#   no arg (`/`)       -> session "main".
+#   `?arg=RMT__<host>__<name>` -> ssh to <host> and attach its tmux session, but only
+#                                 if <host> is in DEVTERM_REMOTE_HOSTS (else safe local
+#                                 fallback). Inert unless remote hosts are configured.
+#   optional 2nd arg (`&arg=<dir>`) -> starting folder for a NEW session (~ expanded,
+#                                 applied only when the session is first created).
+# Session names are normalized to tmux-safe chars (defense against injected input).
+set -euo pipefail
+raw="${1:-main}"
+
+# remote session — arg is RMT__<host>__<session>. host validated against the
+# DEVTERM_REMOTE_HOSTS allow-list (blocks pointing ssh at an arbitrary target).
+if [[ "$raw" == RMT__* ]]; then
+  rest="${raw#RMT__}"
+  rhost="${rest%%__*}"
+  rname="${rest#*__}"
+  rhost="${rhost//[^A-Za-z0-9_.-]/}"
+  rname="${rname//[^A-Za-z0-9_-]/_}"
+  [ -z "$rname" ] && rname="main"
+  ok=0
+  IFS=',' read -ra _allowed <<< "${DEVTERM_REMOTE_HOSTS:-}"
+  for h in "${_allowed[@]}"; do [ "$h" = "$rhost" ] && ok=1; done
+  if [ "$ok" = 1 ] && [ -n "$rhost" ]; then
+    exec ssh -tt -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=20 "$rhost" "tmux new -A -s '$rname'"
+  fi
+  raw="$rname"   # not allowed -> local session with that name (safe fallback, no stray ssh)
+fi
+
+name="${raw//[^A-Za-z0-9_-]/_}"
+[ -z "$name" ] && name="main"
+# optional 2nd arg = starting folder. ~ expanded; applied only when the session is
+# first created (`tmux new -A` attaches and ignores -c if the session already exists).
+dir="${2:-}"
+dir="${dir/#\~/$HOME}"
+if [ -n "$dir" ] && [ -d "$dir" ]; then
+  exec tmux new -A -s "$name" -c "$dir"
+fi
+exec tmux new -A -s "$name"

@@ -1,0 +1,13 @@
+[Unit]
+Description=airlock filebrowser — zero-login editor for TMP/code (127.0.0.1:18801)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.config/filebrowser
+ExecStart=WDIR/home/.local/bin/filebrowser --database WDIR/home/.config/filebrowser/fb.db --root TMP/code --address 127.0.0.1 --port 18801 --followExternalSymlinks=false
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

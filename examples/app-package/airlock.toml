@@ -1,0 +1,14 @@
+# Copy this directory, then change only the owner value below before installing.
+[airlock]
+config_version = 2
+
+[auth]
+provider = "tailscale"
+owner = "you@example.com"
+
+[apps.hub]
+
+[apps.hello-example]
+
+[packages.hello-example]
+path = "package"

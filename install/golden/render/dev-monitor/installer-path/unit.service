@@ -1,0 +1,22 @@
+[Unit]
+Description=airlock dev-monitor — system observability (127.0.0.1:18804)
+After=network.target
+
+[Service]
+Type=simple
+Environment=AIRLOCK_DEV_MONITOR_BACKEND_PORT=18804
+Environment=AIRLOCK_DEV_MONITOR_MESSAGES=false
+Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
+Environment=AIRLOCK_DEV_MONITOR_CORS_HOSTS=box.example.ts.net,box
+Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS=false
+Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS=24
+Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS=24
+# '-' = optional: with messages off the file is absent by design, and the backend
+# then serves observability only. Secrets stay in this 0600 file, out of the unit.
+EnvironmentFile=-WDIR/home/.config/airlock/dev-monitor.env
+ExecStart=/usr/bin/python3 ROOT/apps/dev-monitor/backend/airlock-dev-monitor.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

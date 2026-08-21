@@ -1,0 +1,186 @@
+# Airlock configuration — copy to airlock.toml and fill in.
+# This is the SINGLE source of site-specific facts. Airlock code reads only from
+# here (via `bin/airlock-config`); nothing is hardcoded. Do NOT commit airlock.toml.
+
+[airlock]
+config_version = 2
+# ABI 2 enables per-package grants. A local package that requests elevated
+# capabilities in its manifest must acknowledge exactly those capabilities:
+# [packages.hello]
+# path = "./packages/hello"
+# grant = ["rooted-artifact", "system-unit"]
+
+[site]
+name = "My Dev Hub"
+# The box's public FQDN is always measured at install time from `tailscale status`.
+# To render offline (CI, a box whose tailscaled is down), set AIRLOCK_TS_FQDN in
+# the environment — there is no config key for it.
+
+[auth]
+provider = "tailscale"        # v1: the only supported provider (fail-closed).
+owner    = "me@example.com"   # full access
+# Collaborators get the WHOLE hub tier, not a read-only view: markwand (browse and
+# EDIT everything under code_root below), publish (delete shared items), notepad,
+# dev-monitor, feedback. Only the shell-grade apps — devterm, code-server, orca,
+# paseo — stay owner-only. Add someone here only if that is what you mean.
+collaborators = []
+
+[paths]
+# The root markwand serves: markserv renders it, filebrowser edits it. Everything
+# UNDER here is readable and writable by the owner and every collaborator, dotfiles
+# included, and the viewer also reads THROUGH symlinks that point outside it.
+# There is no exclusion mechanism (see SECURITY.md).
+code_root = "~"
+# Exported as AIRLOCK_WIKI for your own skills/tooling. Airlock itself does not
+# read it. Empty = wiki-less.
+wiki = ""
+
+[branding]
+product = "Airlock"
+# The hub serves hub/assets/ as it ships (logo, favicon, app icons). To rebrand,
+# replace those files in the repo — there is no path key for them.
+# icon_ring = "#22c55e"               # run more than one Airlock? Set a colour on ONE
+#                                     # box and its APP favicons get a thick ring in
+#                                     # that colour, so a browser TAB says which box it
+#                                     # is. The hub keeps the untouched brand mark.
+#                                     # Tabs only: iOS home-screen icons take a PNG and
+#                                     # the ring is drawn as SVG (install/lib.sh
+#                                     # ring_icon_svg). Unset = ship as-is.
+
+# --- Apps: a table's presence = install it. Omit a port to use the default. ---
+# hub is the platform core; every other app below is a shipped package
+# (apps/<id>/airlock-app.toml) — its defaults, prerequisites, and tile all
+# live in that manifest, not in this repo's code. A table listed below with
+# no manifest and no [packages.<id>] is a typo: unknown [apps.X] is fatal at
+# `airlock-config validate` (child 4/P3 — there is no local/custom-app
+# fallback; use [packages.<id>].path for a third-party or local package).
+
+# Airlock serves content over https ONLY. The plaintext tailnet ports below
+# (http_port / public_port) answer with a 301 to the https FQDN and nothing else.
+
+[apps.hub]        # required — the entrance
+https_port    = 443
+http_port     = 9999    # plaintext: 301 -> https entrance (serves no content)
+nginx_port    = 18802
+redirect_port = 18806   # loopback server that emits that 301
+
+[apps.devterm]
+public_port   = 9900  # plaintext: 301 -> https (serves no content)
+https_port    = 8443  # secure-context https (clipboard, OSC52, full PWA)
+redirect_port = 9913  # loopback server that emits that 301
+gate_port    = 9910   # loopback nginx owner-gate
+backend_port = 9912   # loopback devterm-gate (serves the custom client + API, proxies to ttyd)
+ttyd_port    = 9911   # loopback ttyd (pure PTY backend)
+font_size    = 15
+# secret_ttl_sec = 1800   # secret drop lifetime (default 30 min). The drop stores a typed
+#                         # value in ~/.devterm-secrets (0700 dir, 0600 files) and hands
+#                         # out only the PATH, so a key never enters scrollback or history.
+#                         # It is safe because it expires — see SECURITY.md.
+# lang = "C.UTF-8"    # locale for the ttyd/tmux environment (LANG/LC_CTYPE)
+# --- Optional features (all default off; degrade cleanly when their deps are absent) ---
+# accounts   = true                          # Claude Code login + account pool, and Codex login UI.
+#                                            # Ships with airlock (apps/devterm/bin/claude-switch,
+#                                            # claude-status); the Codex half needs the `codex` CLI.
+# xai        = true                          # OpenCode xAI credential status + login/logout UI.
+#                                            # Uses `opencode`; this is separate from Orca's Grok login.
+# claude_switch = ""                          # override: path to your own claude-switch CLI
+# claude_status = ""                          # override: path to your own claude-status probe
+# fleet_store     = ""                        # path to a shared usage-store file (optional, annotates usage)
+# fleet_store_url = ""                        # URL of a shared usage store (optional; no host is hardcoded)
+# remote_hosts = "hostA,hostB"               # comma-separated ssh hosts whose tmux sessions also appear as tabs
+# orca_shim  = "~/.config/orca/linux-orca-cli-shim/orca"  # Orca CLI shim -> enables the worktree sidebar
+# The terminal file-path -> markwand link turns on automatically when [apps.markwand]
+# is enabled and [paths].code_root is set.
+
+[apps.markwand]
+markserv_port    = 18799
+filebrowser_port = 18801
+
+[apps.publish]
+backend_port = 18803
+# share_dir  = "~/public_html"   # the static-share directory this manages/serves
+# Optional external publishing. Omit this table = share manager only (the
+# external-publish buttons stay hidden). Two modes:
+#
+#   mode = "local"  — this box serves the public links itself. Snapshots go to
+#     public_dir, which YOUR nginx serves at base_url. Expiry (24h/7d/14d/30d in
+#     the UI) is enforced here: the hourly cleanup timer deletes expired pages.
+#     public_dir MUST NOT be share_dir — share_dir is your tailnet-internal
+#     share and publishing it would expose everything in it.
+# [apps.publish.public_target]
+# mode       = "local"
+# base_url   = "https://doc.example.com"       # public URLs are <base_url>/<slug>/
+# public_dir = "/opt/airlock/share-public"     # default; nginx serves THIS
+# gated_dir  = "/opt/airlock/share-gated"      # nginx serves this only at /g/ with auth_basic
+# htpasswd_dir  = "/opt/airlock/publish-gated-auth" # nginx reads one file per slug
+# htpasswd_bin  = "htpasswd"                    # required only for gated publishes
+#
+#   mode = "remote" (default) — POST snapshots to an ingest service you host.
+#     The token is NOT stored here — put it in the env var named by token_env
+#     (the installer reads an EnvironmentFile ~/.config/airlock-publish.env).
+#     See apps/publish/README.md for the protocol you must implement.
+# [apps.publish.public_target]
+# ingest_url = "https://your-ingest.example"   # implements /ingest /list /revoke /set-expiry
+# base_url   = "https://docs.example"          # public URLs are <base_url>/<slug>/
+# token_env  = "AIRLOCK_PUBLISH_TOKEN"         # name of the env var holding the token
+
+[apps.notepad]        # shares the publish backend (needs [apps.publish]); table = show the card
+
+[apps.dev-monitor]
+backend_port = 18804
+messages     = false  # owner-only message/action console; default off
+# With messages = true the installer creates ~/.local/state/airlock/dev-monitor/
+# (spool + SQLite, 0700) and mints a fresh nginx->backend proxy secret on every real install.
+# Anything that can write the spool can post a card, including an `action` card — but
+# an action still has to be approved by the owner and runs against a hash-pinned plan.
+# slack_webhook_urgent_env = "DEVMON_SLACK_WEBHOOK_URGENT"   # env var NAME, not URL
+# slack_webhook_routine_env = "DEVMON_SLACK_WEBHOOK_ROUTINE" # either lane may be empty
+# slack_webhook_env = "DEVMON_SLACK_WEBHOOK" # legacy urgent alias; remove by 2026-09-07
+#                                                feed and cards work with both lanes empty
+# exec_cwd_root      = ""            # approved actions may only run STRICTLY below this
+#                                    # directory; empty = $HOME (the root itself is refused)
+# exec_session       = "devmon-exec" # tmux session the approved runs get their window in
+#                                    # valid name. It filters the `skill` field ONLY — not a
+#                                    # `prompt` (free text) and not an `exec` argv. See SECURITY.md.
+
+# [apps.feedback]        # a suggestion box at the bottom of the hub launcher
+# backend_port = 18805
+# Two independent delivery targets — configure either, both, or neither.
+# 1. intake: an endpoint you host that records the suggestion (e.g. opens an issue)
+# intake_url = "https://your-intake.example"  # POST /submit {owner, text} -> {ok, issue_url}
+# token_env  = "AIRLOCK_FEEDBACK_TOKEN"        # name of the env var holding the intake token
+# 2. mail: the suggestion is mailed to you via a transactional mail API
+# mail_to      = "you@example.com"
+# mail_from    = "Airlock <feedback@your-verified-domain.example>"  # sender the API accepts
+# mail_key_env = "RESEND_API_KEY"              # name of the env var holding the API key
+# mail_api     = "https://api.resend.com/emails"   # default; change for another provider
+# Secrets are NOT stored here — put them in the env vars named by token_env/mail_key_env,
+# delivered via an EnvironmentFile the installer wires (~/.config/airlock-feedback.env,
+# chmod 600). Neither target configured = the box degrades cleanly (it stays hidden).
+# See apps/feedback/README.md for the intake protocol you must implement.
+
+[apps.code-server]
+https_port   = 8444
+gate_port    = 18808
+backend_port = 18811
+# manager_port / slots are for the multi-tab manager (a later enhancement);
+# v1 runs a single code-server instance on backend_port.
+manager_port = 18810
+slots        = 4
+
+[apps.orca]
+https_port   = 8446
+gate_port    = 18820
+backend_port = 18821
+
+[apps.paseo]
+https_port     = 8447
+gate_port      = 18822
+backend_port   = 6767
+# browse-host: server-side browser panels for agents (headless Chromium via
+# Playwright). Off by default — turning it on downloads ~150MB of chromium and
+# patches the paseo web-ui for the live "New browser" panel. When true, the
+# installer adds the owner-gated /browse-view/ stream route and runs
+# browse-host/install.sh (warn-only). See apps/paseo/browse-host/README.md.
+browse         = false
+browse_ws_port = 6768

@@ -1,0 +1,18 @@
+# Provenance pin for the vendored Orca web client in dist/.
+#
+# dist/ is a BUILD, not source: it is the upstream Orca web client (MIT, github.com/
+# stablyai/orca) plus the local patches described in README.md, PII-scrubbed. Because a
+# build has no version string inside it, this file is what says which one it is — without
+# it, "is the vendored client stale?" and "did something corrupt it?" are both unanswerable.
+#
+# bin/verify-web-bundle.sh checks dist/ against these values. apps/orca/install.sh runs it
+# before serving, so a truncated or half-copied bundle fails the install instead of
+# serving a client that loads to a blank page.
+#
+# When you re-derive dist/ from a newer upstream, update every field here in the same
+# commit — a stale pin is worse than no pin.
+
+orca-appimage-version: 1.4.139
+web-index-asset: assets/web-index-7YTHIMhi.js
+dist-file-count: 385
+dist-tree-sha256: 14f5c2087f1996b5d9d6397387e323c8bccedf242406bd26d3c547688112f052

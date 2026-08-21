@@ -1,0 +1,9 @@
+# @getpaseo/server dist/server/server/session.js - handleDirectorySuggestionsRequest
+# Limits the add-project name search (root=$HOME) to depth 4. install.sh applies
+#   this via an idempotent sed; this file is the reference / re-derivation copy.
+# Anchor: insert on the line immediately after
+#   'confidentResultScanThreshold: searchesWorkspace ? undefined : 5000,'.
+@@ handleDirectorySuggestionsRequest: searchDirectoryEntries({ ... }) @@
+                 confidentResultScanThreshold: searchesWorkspace ? undefined : 5000,
++                maxDepth: searchesWorkspace ? undefined : 4,
+                 includeFiles,

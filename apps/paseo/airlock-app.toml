@@ -1,0 +1,126 @@
+contract = 1
+id = "paseo"
+
+# Transcribed from the former APP_DEFAULTS["paseo"] entry.
+[config]
+# Env-var names this installer READS from the environment but which are not
+# operator config. TASKS_MAX is a genuine knob, deliberately left here rather than
+# promoted: it is read as a raw string with its own default, and declaring it as a
+# config key would export it and change what the installer sees. MEM_CAP_BYTES is a
+# test seam the source marks as not a supported knob (install.sh:99-104).
+# ALLOW_UNBACKED_MEM is compared against the literal `1` (install.sh:126), so
+# declaring it as a bool would export "true" and silently stop matching.
+runtime_env = [
+  "AIRLOCK_PASEO_ALLOW_UNBACKED_MEM",
+  "AIRLOCK_PASEO_MEM_CAP_BYTES",
+  "AIRLOCK_PASEO_TASKS_MAX",
+]
+
+[config.defaults]
+https_port = 8447
+gate_port = 18822
+backend_port = 6767
+browse = false
+browse_ws_port = 6768
+# empty = the installer's own pinned version wins. A value here OVERRIDES
+# that pin, so it must default to "" — a real version string would silently
+# freeze every box on this release.
+version = ""
+
+# Transcribed from install/prerequisites.tsv's eight paseo rows (F11).
+[[prerequisites]]
+command = "node"
+predicate = "major-gte"
+expected = "20"
+fix = "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+note = "Paseo runtime - NOT snap: snap re-execs through setuid snap-confine, which the unit's NoNewPrivileges neuters"
+
+[[prerequisites]]
+command = "npm"
+predicate = "present"
+expected = "-"
+fix = "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+note = "Package manager - ships with the same non-snap node"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User service"
+
+[[prerequisites]]
+command = "tailscale"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get install -y curl && curl -fsSL https://tailscale.com/install.sh | sh"
+note = "Private ingress"
+
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Patch helpers"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Smoke check"
+
+[[prerequisites]]
+command = "ss"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y iproute2"
+note = "Backend readiness check"
+
+[[prerequisites]]
+command = "sudo"
+predicate = "present"
+expected = "-"
+fix = "su -c 'apt-get update && apt-get install -y sudo'"
+note = "Privileged ingress setup"
+
+# Appendix: one user unit (+ the browse-host unit, browse=true — declared
+# unconditionally, same "so the ledger can reclaim it if it exists"
+# reasoning as publish's mode-gated fragment), one servers.d fragment plus
+# the icon location's own fragments-class dir claim (paseo/ —
+# favicon-ring.svg + icons/, [branding] icon_ring), the pinned npm-global
+# tree (prefix hardcoded $HOME/.npm-global, apps/paseo/install.sh:87 — the
+# depth4/model-prune/image-persist patches all land inside this tree) + its
+# bin symlink, and the browse-host sidecar's own install dir (browse=true).
+# Deliberately NOT declared (retained data, per the Appendix): ~/.paseo/
+# (config.json, patched in place, never removed) and
+# ~/.cache/ms-playwright/ (a SHARED Playwright cache other tools may use —
+# never Airlock's alone to remove). ~/.nvm/ is never touched or claimed
+# either — install/preflight.sh's airlock_load_nvm only SOURCES nvm.sh
+# (if present) to put an nvm-managed node/npm on PATH; it is not something
+# this app installs or owns.
+[artifacts]
+units = ["airlock-paseo.service", "airlock-paseo-browse-host.service"]
+fragments = ["servers.d/paseo.conf", "paseo/"]
+files = ["~/.npm-global/lib/node_modules/@getpaseo/cli/",
+         "~/.npm-global/bin/paseo",
+         "~/.local/share/paseo-browse-host/"]
+serve_ports = ["https_port"]
+
+[serve.https]
+https_port = "gate_port"
+
+# From hub/index.html's APPS table (paseo row), image moved in-app (was
+# hub/assets/paseo.png — repo-root NOTICE updated to the new path) and
+# staged by the platform like every other declared tile icon (F4). paseo
+# has no public_port at all (https only), so unlike devterm there is no
+# [plaintext_redirect] here.
+[tile]
+label = "Paseo"
+sub = "agent orchestration"
+cat = "coding"
+icon = "paseo.png"
+
+[audience]
+supported = ["owner"]
+default = "owner"

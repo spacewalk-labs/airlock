@@ -1,0 +1,74 @@
+Airlock — third-party components and licenses
+=============================================
+
+Airlock is an installer/composer. It does NOT bundle the upstream tools below;
+each is fetched at install time from its own source. Airlock ships only its own
+glue (identity gate, config layer, custom UIs) plus, where noted, patches.
+
+Component         Upstream                          License       How obtained
+----------------  --------------------------------  ------------  ----------------------------
+ttyd (devterm)    github.com/tsl0922/ttyd           MIT           binary downloaded at install (sha-pinned)
+xterm.js (devterm) github.com/xtermjs/xterm.js      MIT           vendored in apps/devterm/web/vendor/ (xterm 5.x + fit/unicode11/web-links addons)
+code-server       github.com/coder/code-server      MIT           tarball downloaded at install (sha-pinned)
+markserv          npm: markserv                     MIT           npm at install
+filebrowser       github.com/filebrowser/filebrowser Apache-2.0   binary downloaded at install (sha-pinned)
+markwand assets   github.com/givepro91/markwand     MIT           vendored in apps/markwand/static/ (tokens/enhance/editor/edit-button)
+highlight.js      github.com/highlightjs/highlight.js BSD-3-Clause vendored in apps/markwand/static/vendor/highlight.min.js (v11.11.1)
+marked            github.com/markedjs/marked        MIT           vendored in apps/markwand/static/vendor/marked.min.js (v15.0.12)
+DOMPurify         github.com/cure53/DOMPurify       Apache-2.0 OR MPL-2.0  vendored in apps/markwand/static/vendor/purify.min.js (v3.4.8)
+orca (ADE)        github.com/stablyai/orca          MIT           AppImage downloaded at install (sha-pinned)
+orca web client   github.com/stablyai/orca          MIT           vendored BUILT dist in apps/orca/web-bundle/dist/ (patched; redistributed)
+paseo (CLI)       github.com/getpaseo/paseo         AGPL-3.0      npm i @getpaseo/cli at install (not redistributed)
+paseo patches     apps/paseo/patches/               AGPL-3.0      our patches — derivative of paseo, see that dir
+paseo web-ui patcher apps/paseo/browse-host/bin/patch-web-ui.js  AGPL-3.0  encodes derivative edits of paseo's web-ui
+paseo browse-host apps/paseo/browse-host/ (ours)    MIT           loopback-WS sidecar; needs Playwright (follow-up, not wired in v1)
+Playwright/Chromium (only if browse-host used)      Apache-2.0 / (Chromium BSD)  downloaded at install
+
+Everything else under apps/ (hub, publish, notepad, dev-monitor backends/UIs, the
+gate, config layer, installers) is Airlock's own code under MIT (repo root LICENSE).
+
+Orca web client (apps/orca/web-bundle/dist/) — derived from stablyai/orca, MIT,
+Copyright (c) 2026 Lovecast Inc.; local patches under this repo's MIT license. Unlike
+the other upstream tools, this is a BUILT derivative we REDISTRIBUTE (it ships in the
+repo and is served at /orca-web/), which the upstream MIT license permits with this
+attribution. Provenance + patch summary: apps/orca/web-bundle/README.md.
+
+Deferred to a follow-up (NOT shipped in v1, so not a distribution concern yet):
+the paseo browse-host live panels, and the orca local-render / grab sidecars (the
+client code for those is in the vendored web-bundle but stays inert without the
+services, which this repo does not install).
+
+Notes
+-----
+- Downloaded binaries (orca AppImage, ttyd, code-server, filebrowser, Chromium)
+  are NOT redistributed by Airlock; the installer fetches them from upstream and
+  verifies sha256 where applicable. Operators accept the upstream terms of those
+  binaries.
+- Mixed-license: the Airlock core is MIT. Paseo (@getpaseo/cli) is AGPL-3.0 and
+  runs as a SEPARATE PROCESS — the core talks to it over loopback IPC/WS, so the
+  core is not a derivative of paseo (mere aggregation). The paseo *patches* and the
+  *web-ui patcher* ARE derivatives of paseo and carry AGPL-3.0; the browse-host
+  sidecar is an independent program (no paseo imports) and is MIT. The full
+  AGPL-3.0 text is vendored at apps/paseo/patches/LICENSE. This is NOT legal advice.
+- Vendored (redistributed) libraries: unlike the downloaded binaries above, the
+  markwand viewer's client-side libraries — highlight.js (BSD-3-Clause), marked
+  (MIT), and DOMPurify (Apache-2.0 OR MPL-2.0) — ARE redistributed in this repo
+  under apps/markwand/static/vendor/. Each minified file retains its own upstream
+  license header. They are self-hosted so the viewer loads no external CDN.
+- Brand icons: apps/orca/orca.png and apps/paseo/paseo.png (both moved
+  in-app with their app-package-contract migrations — child 4 P2b — and
+  staged by the platform from there now) are the upstream projects' own
+  logos, vendored for the launcher tiles (nominative use — identifying the
+  tool each tile opens), and are their respective trademarks, not
+  MIT-licensed Airlock code. The Airlock porthole mark
+  (hub/assets/apple-touch-icon.png, favicon.png;
+  artwork bin/airlock-mark.png; generator bin/gen-hub-icons.py) is the author's
+  own under the repo-root MIT license. So is the per-app icon set — the glyph
+  sprite in hub/index.html, the favicons and iOS home-screen icons it produces
+  (hub/assets/app-icons/*.svg and *.png, apps/devterm/web/favicon.svg and
+  apple-touch-icon.png, and the inline mark in apps/code-server/web/shell.html),
+  and their generator bin/gen-app-icons.py. Those glyphs are drawn for this
+  repo — generic marks for the kind of tool each tile opens, not any upstream
+  project's logo.
+- TODO(before public release): complete a hash/provenance inventory of all
+  downloads and re-confirm each upstream's current license.

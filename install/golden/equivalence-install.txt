@@ -1,0 +1,51 @@
+[airlock] validating airlock.toml
+ok: config valid
+[airlock] prerequisite preflight passed
+[airlock] installing hub -> TMP/web
+[dry] sudo mkdir -p TMP/web/assets TMP/confd/hub-locations.d TMP/confd/servers.d
+[dry] sudo chown -R USER:GROUP TMP/web TMP/confd
+[dry] cp ROOT/hub/index.html ROOT/hub/wrong-owner.html TMP/web/
+[dry] cp -r ROOT/hub/assets/. TMP/web/assets/
+[airlock] [dry] airlock-config webjson > TMP/web/__airlock.json
+[airlock] [dry] installing packaged app: publish (ROOT/apps/publish) (shipped app — dry run executes)
+[dry] sudo mkdir -p /opt/airlock/share
+[dry] sudo chmod 755 /opt/airlock/share
+[dry] sudo chmod o+x /opt/airlock
+[dry] sudo chown USER:GROUP /opt/airlock/share
+[dry] mkdir -p TMP/home/uploads
+[airlock] [dry] write TMP/home/.config/systemd/user/airlock-publish.service (127.0.0.1:18803, share=/opt/airlock/share)
+[dry] systemctl --user daemon-reload
+[dry] systemctl --user enable airlock-publish.service airlock-publish-cleanup.timer
+[dry] systemctl --user restart airlock-publish.service
+[dry] systemctl --user restart airlock-publish-cleanup.timer
+[airlock] [dry] install publish.html -> TMP/web/publish/index.html
+[airlock] wrote nginx fragment: TMP/confd/hub-locations.d/publish.conf
+[airlock] [dry] remove disabled nginx gated fragments
+[airlock] publish installed (owner: me@example.com; external target: <none, share-manager only>)
+[airlock] [dry] installing packaged app: notepad (ROOT/apps/notepad) (shipped app — dry run executes)
+[airlock] [dry] install notepad.html -> TMP/web/notepad/index.html
+[airlock] notepad installed (owner: me@example.com)
+[airlock] [dry] installing packaged app: devterm (ROOT/apps/devterm) (shipped app — dry run executes)
+[airlock] [dry] download+verify ttyd 1.7.7 -> TMP/home/.local/bin/ttyd
+[dry] install -D -m755 ROOT/apps/devterm/bin/devterm-shell TMP/home/.local/bin/devterm-shell
+[airlock] [dry] install web/ -> TMP/home/.local/share/airlock-devterm/web (index.html config={"accounts":false,"xai":false,"markwand":false,"orca":false}, + ui.js/popup.css/panel.html)
+[airlock] [dry] write TMP/home/.config/systemd/user/airlock-devterm.service (ttyd -i 127.0.0.1 -p 9911)
+[airlock] [dry] write TMP/home/.config/systemd/user/airlock-devterm-gate.service (127.0.0.1:9912; accounts=false xai=false markwand=false orca=false)
+[dry] systemctl --user daemon-reload
+[dry] systemctl --user enable airlock-devterm.service airlock-devterm-gate.service
+[airlock] [dry] restart ttyd/gate units if changed
+[airlock] wrote nginx fragment: TMP/confd/servers.d/devterm.conf
+[airlock] devterm installed (owner: me@example.com; accounts=false, xai=false, markwand=false, orca=false)
+[dry] sudo tailscale serve --bg --https=8443 http://127.0.0.1:9910
+[airlock] rendering nginx site -> /etc/nginx/conf.d/airlock.conf
+[airlock] [dry] render-nginx.sh > /etc/nginx/conf.d/airlock.conf
+[dry] sudo nginx -t
+[dry] sudo systemctl reload nginx
+[dry] loginctl enable-linger USER
+[dry] sudo systemctl enable nginx
+[dry] sudo systemctl enable tailscaled
+[dry] sudo tailscale serve --bg --https=443 http://127.0.0.1:18802
+[airlock] plaintext ingress: :9999 -> 301 https (hub)
+[dry] sudo tailscale serve --bg --http=9999 http://127.0.0.1:18806
+[airlock] serve check skipped: AIRLOCK_DRY_RUN=1 (nothing is serving)
+[airlock] done (dry run — nothing was changed). Entrance would be: https://<your-box>.<tailnet>.ts.net/

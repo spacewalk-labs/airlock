@@ -1,0 +1,2317 @@
+#!/usr/bin/env python3
+"""airlock-ledger — the installed-state journal for packaged apps.
+
+The caller owns the process-wide lock.  This tool deliberately does not take
+one, and it never reads TOML: package-info JSON is its only configuration
+input.
+
+Usage:
+  airlock-ledger plan
+  airlock-ledger intent <id>
+  airlock-ledger commit <id> [--active-ports "18900 18901"]
+  airlock-ledger remove <id> [--for-upgrade] [--active-ports "..."]
+  airlock-ledger teardown <id> [--active-ports "..."]
+  airlock-ledger list
+  airlock-ledger audit-lock-override <id>
+"""
+from __future__ import annotations
+
+import copy
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import secrets
+import stat
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn
+
+
+LEDGER_VERSION = 5
+LEDGER_FILENAME = "app-ledger.json"
+# What an install was AUTHORIZED to do, recorded on the record itself so a
+# later load checks the decision admission already made instead of re-deriving
+# policy against a config that may have changed since. Closed: an unknown name
+# is fatal, because a reader that tolerated one would carry a claim it cannot
+# check and silently drop it on the next write. Every member must be provable
+# from the record's own contents — `plaintext-redirect` is deliberately absent
+# because no path writes it and `_intent_record` stores nothing to check such a
+# claim against, which would turn "checked" into "trusted" without saying so.
+CAPABILITIES = ("rooted-artifact", "system-unit")
+ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "rooted", "serve_ports")
+LEGACY_ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "serve_ports")
+PATH_CLASSES = ("units", "fragments", "webroot", "files", "rooted")
+LIFECYCLE_KEYS = ("install", "smoke", "deactivate")
+DESTRUCTIVE_ACTIONS = frozenset(("remove", "teardown-intent", "upgrade-deactivate"))
+UNIT_SUFFIXES = (".service", ".socket", ".timer", ".path", ".target")
+AUDIT_EVENT_FIELDS = ("type", "package_id", "argument", "recorded_digest",
+                      "admitted_digest", "recorded_at", "receipt_sha256")
+INTENT_RECORD_FIELDS_V5 = (
+    "path", "digest", "artifacts_declared", "serve_port_values", "lifecycle",
+    "roots", "deps", "anchors", "serve_mappings", "unit_scopes", "order",
+    "source_class", "capabilities",
+)
+COMMITTED_RECORD_FIELDS_V5 = (
+    "path", "digest", "lifecycle", "artifacts", "deps", "serve_mappings",
+    "unit_scopes", "order", "roots", "source_class", "capabilities",
+)
+STORE_FIELDS_V5 = ("version", "entries", "events")
+# Mirrors PACKAGE_ID_RE in bin/airlock-config (the config owns the grammar;
+# the store re-checks it so a hand-made entry cannot smuggle an id the CLI
+# cannot address, e.g. one starting with '-').
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
+# Deps name CONFIGURED APP ids, not package ids: in stage 3 a dependency may
+# legitimately target a legacy-grammar app ([apps.My_App]), and rejecting it
+# here would wedge plan/remove — including the documented per-app teardown
+# escape hatch — on a config validate had already accepted. Mirrors
+# APP_NAME_RE in bin/airlock-config.
+_DEP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# Mirrors _WILDCARD_RE in bin/airlock-config: unit claims are literal names
+# ONLY (contract decision, child 4 round 5) — a glob-shaped unit name wedges
+# commit permanently (unit_scopes is keyed by expanded basenames, which a
+# pattern never equals) and "*.service" globs the entire system unit dir at
+# teardown. The manifest reader already refuses this at validate; the store
+# re-checks it here so a hand-edited record cannot smuggle one past to
+# expansion/removal.
+_UNIT_WILDCARD_RE = re.compile(r"[*?\[]")
+
+
+class LedgerError(Exception):
+    """An expected, user-facing ledger failure."""
+
+
+def die(message: str, code: int = 1) -> NoReturn:
+    """Print one consistently-prefixed diagnostic and exit."""
+    sys.stderr.write(f"airlock-ledger: {message}\n")
+    raise SystemExit(code)
+
+
+def fail(message: str) -> NoReturn:
+    raise LedgerError(message)
+
+
+def log(message: str) -> None:
+    sys.stderr.write(f"airlock-ledger: {message}\n")
+
+
+def is_dry_run() -> bool:
+    return os.environ.get("AIRLOCK_DRY_RUN") == "1"
+
+
+def _expand_path(raw: str) -> str:
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def state_dir() -> Path:
+    env = os.environ.get("AIRLOCK_STATE_DIR")
+    if env:
+        # The orchestrator's shell builds the lock path from this value
+        # verbatim, so the store must too. Even abspath() would diverge: it
+        # collapses `..` lexically, while the shell's open() resolves any
+        # symlink first — same string, two directories.
+        return Path(env)
+    return Path(_expand_path("~/.local/state/airlock"))
+
+
+def ledger_path() -> Path:
+    return state_dir() / LEDGER_FILENAME
+
+
+def _real_root(raw: str) -> str:
+    """Roots are canonicalised with realpath (matching airlock-config's claim
+    space): a record must name the real directory, or an alias root would
+    record paths a later run classifies differently."""
+    return os.path.realpath(os.path.expanduser(raw))
+
+
+def _canonical_artifact(path: str) -> str:
+    """One path space for records and ownership comparison: the real parent
+    directory plus the entry's own name. The leaf is never resolved — a
+    recorded symlink is owned (and removed) as a link, not as its target.
+    Trailing slashes are stripped first, or `/x/link/` would resolve the
+    leaf while `/x/link` keeps it — two objects for one declaration."""
+    path = os.path.expanduser(str(path))
+    path = path.rstrip("/") or "/"
+    parent = os.path.dirname(path) or "/"
+    return os.path.join(os.path.realpath(parent), os.path.basename(path))
+
+
+def _unit_dir(which: str) -> str:
+    if which == "user":
+        raw = os.environ.get("AIRLOCK_UNIT_DIR_USER") or "~/.config/systemd/user"
+    else:
+        raw = os.environ.get("AIRLOCK_UNIT_DIR_SYSTEM") or "/etc/systemd/system"
+    return _real_root(raw)
+
+
+def _conf_dir() -> str:
+    return _real_root(os.environ.get("AIRLOCK_CONFD") or "/etc/airlock/nginx")
+
+
+def _webroot() -> str:
+    return _real_root(os.environ.get("AIRLOCK_WEBROOT") or "/opt/airlock/hub")
+
+
+ROOT_KEYS = ("unit_user", "unit_system", "confd", "webroot", "home")
+
+
+def _current_roots() -> dict[str, str]:
+    return {"unit_user": _unit_dir("user"), "unit_system": _unit_dir("system"),
+            "confd": _conf_dir(), "webroot": _webroot(),
+            "home": os.path.realpath(os.path.expanduser("~"))}
+
+
+def _rooted_webroot_parent(roots: dict[str, str]) -> str:
+    """RESOLUTION only: where a record's ${webroot_parent} token expands to —
+    the record's OWN roots snapshot, since that is where the artifact was
+    actually written on disk. This confers no authority by itself; see
+    _rooted_authorization_allowlist for the (deliberately different)
+    authorization boundary."""
+    return str(Path(roots["webroot"]).parent)
+
+
+# A denylist enumeration of FHS system roots is a losing game — round 3
+# closed webroot_parent="/" (AIRLOCK_WEBROOT=/hub), but the same collapse one
+# level narrower (AIRLOCK_WEBROOT=/opt/hub -> webroot_parent="/opt") was not
+# on the list, and re-admitted /opt (authorizing sudo rm -rf of any top-level
+# /opt entry) while /var/hub was refused only because /var happened to be
+# enumerated. A RULE instead: the anchor must have at least two path
+# components (/opt/airlock qualifies; /opt does not — no single top-level
+# directory is ever a legitimate dynamic anchor, named or not). The old
+# enumeration stays too, as a floor: belt-and-braces if the length rule is
+# ever refactored wrong, though every entry in it is already <2 components
+# and so already covered by the rule alone.
+_ROOTED_FORBIDDEN_DYNAMIC_ANCHORS = frozenset((
+    "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot",
+    "/sys", "/proc", "/dev", "/run", "/root", "/home", "/var",
+))
+
+
+def _rooted_dynamic_anchor_forbidden(anchor: str) -> bool:
+    real = os.path.realpath(anchor)
+    depth = len([part for part in real.split("/") if part])
+    return depth < 2 or real in _ROOTED_FORBIDDEN_DYNAMIC_ANCHORS
+
+
+def _rooted_refusal_hint() -> str:
+    """An extra sentence for a rooted refusal message when the CURRENT
+    dynamic anchor is itself the reason — distinguishes "your webroot is too
+    shallow" from "this pattern genuinely names somewhere else"."""
+    if _rooted_dynamic_anchor_forbidden(_rooted_webroot_parent(_current_roots())):
+        return (" — the current webroot's parent is a protected system "
+                "directory, so ${webroot_parent} grants no authority here; "
+                "move the webroot to a deeper path, or manage this artifact "
+                "by hand")
+    return ""
+
+
+def _rooted_authorization_allowlist() -> tuple[str, ...]:
+    """The anchors a rooted path must sit under to be TOUCHED at all — the
+    two static platform dirs, plus the CURRENT LIVE environment's webroot
+    parent, ITSELF validated before it joins the set. Deliberately NEVER
+    derived from a record's own roots snapshot (D6 child-4 amendment, round
+    2 fix): a hand-written record can claim any roots.webroot it likes
+    (roots.webroot=/etc/attacker-hub makes /etc/passwd's parent "/etc" pass
+    a record-derived allowlist), so trusting record data here would let a
+    fabricated record authorize removing anything its author names. A
+    legitimate record whose webroot genuinely changed since it was recorded
+    is refused here too, loudly — fail-closed over trusting record-supplied
+    roots is the accepted trade. The dynamic anchor gets the SAME scrutiny
+    (round 3 fix): a webroot that collapses to "/" or an FHS system root
+    must not silently authorize the whole filesystem — the anchor is simply
+    excluded, so any rooted pattern that needed it is refused, same as if
+    the artifact genuinely lived somewhere else."""
+    dynamic = _rooted_webroot_parent(_current_roots())
+    anchors = ["/etc/airlock", "/opt/airlock"]
+    if not _rooted_dynamic_anchor_forbidden(dynamic):
+        anchors.append(dynamic)
+    return tuple(anchors)
+
+
+def _rooted_contains(path: str) -> bool:
+    """Does `path`'s parent sit under one of the rooted AUTHORIZATION
+    anchors, canonically? Used both to validate a declared pattern (after
+    ${webroot_parent} substitution) and to gate an actual removal — always
+    against the live-environment allowlist, never a record's own roots."""
+    parent = os.path.realpath(os.path.dirname(path.rstrip("/")) or "/")
+    return any(parent == os.path.realpath(root)
+               or parent.startswith(os.path.realpath(root).rstrip("/") + os.sep)
+               for root in _rooted_authorization_allowlist())
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_lifecycle(value: Any, where: str) -> None:
+    if not isinstance(value, dict) or set(value) != set(LIFECYCLE_KEYS):
+        fail(f"{where}: lifecycle must contain install, smoke, and deactivate")
+    if any(not isinstance(value[key], bool) for key in LIFECYCLE_KEYS):
+        fail(f"{where}: lifecycle values must be boolean")
+
+
+def _validate_artifact_map(value: Any, where: str, declared: bool, *, version: int = LEDGER_VERSION,
+                           roots: dict[str, str] | None = None) -> None:
+    classes = ARTIFACT_CLASSES if version >= 3 else LEGACY_ARTIFACT_CLASSES
+    if not isinstance(value, dict) or set(value) != set(classes):
+        fail(f"{where}: artifacts must contain {', '.join(classes)}")
+    for name in classes:
+        items = value[name]
+        if not isinstance(items, list):
+            fail(f"{where}.{name}: expected a list")
+        if name == "serve_ports" and not declared:
+            if any(not _is_int(item) or not 1 <= item <= 65535 for item in items):
+                fail(f"{where}.serve_ports: expected integer ports")
+        elif any(not isinstance(item, str) for item in items):
+            fail(f"{where}.{name}: expected string paths/patterns")
+        elif (name != "serve_ports" and not declared
+                and any(not os.path.isabs(item) for item in items)):
+            # Committed artifacts are recorded fully expanded; a relative
+            # entry would teardown whatever the future cwd makes of it.
+            fail(f"{where}.{name}: recorded paths must be absolute")
+        if name == "units":
+            for item in items:
+                base = os.path.basename(str(item))
+                if base.startswith("-") or not base.endswith(UNIT_SUFFIXES):
+                    # A leading '-' would parse as a systemctl option; a
+                    # non-unit suffix is not a unit file at all.
+                    fail(f"{where}.units: {item!r} is not a safe unit file name")
+                if declared and ("/" in str(item) or "**" in str(item)
+                                 or _UNIT_WILDCARD_RE.search(str(item))):
+                    fail(f"{where}.units: {item!r} must be a bare unit file name "
+                         "without globs ('*', '?', '[') or recursive globs")
+                if not declared and ("**" in str(item)
+                                     or _UNIT_WILDCARD_RE.search(str(item))):
+                    # A committed unit is an expanded literal path — glob
+                    # characters can only arrive in a hand-written record,
+                    # and teardown basenames the entry straight into
+                    # `systemctl disable --now`, where '*.service' is a
+                    # pattern over every system unit (round 6: the intent
+                    # branch above did not cover committed records).
+                    fail(f"{where}.units: {item!r} must be a literal unit path "
+                         "without globs ('*', '?', '[')")
+        # Declared patterns re-checked against the manifest grammar: a
+        # hand-made intent must not smuggle what validate would refuse
+        # (a relative files pattern deletes whatever the future cwd holds).
+        if declared and name in ("fragments", "webroot"):
+            for item in items:
+                s = str(item)
+                segs = [x for x in s.split("/") if x]
+                if s.startswith("/") or not segs or any(x in (".", "..") for x in segs):
+                    fail(f"{where}.{name}: {item!r} must be a relative pattern "
+                         "with no '.' or '..' segments")
+                if any(c in seg for seg in segs[:-1] for c in "*?["):
+                    fail(f"{where}.{name}: {item!r} — glob characters are only "
+                         "allowed in the final segment")
+                if "**" in s:
+                    fail(f"{where}.{name}: {item!r} — recursive globs are not "
+                         "part of the artifact grammar")
+        if declared and name == "files":
+            for item in items:
+                s = str(item)
+                if not (s.startswith("/") or s.startswith("~")):
+                    fail(f"{where}.files: {item!r} must be absolute or ~-prefixed")
+                if any(x in (".", "..") for x in s.split("/")):
+                    # '.' would alias the parent (~/. is the whole home).
+                    fail(f"{where}.files: {item!r} must not contain '.' or '..' segments")
+                if any(c in seg for seg in s.split("/")[:-1] for c in "*?["):
+                    fail(f"{where}.files: {item!r} — glob characters are only "
+                         "allowed in the final segment")
+                if "**" in s:
+                    fail(f"{where}.files: {item!r} — recursive globs are not "
+                         "part of the artifact grammar")
+                if s.startswith("~") and (not s.startswith("~/") or not s[2:].strip("/")):
+                    fail(f"{where}.files: {item!r} — only ~/<path> is supported "
+                         "(a named user's home is not ours to claim, and the "
+                         "whole home is not an artifact)")
+        if declared and name == "serve_ports":
+            for item in items:
+                if not isinstance(item, str) or not re.fullmatch(r"[a-z0-9_]+", item):
+                    fail(f"{where}.serve_ports: {item!r} is not a config key name")
+        if declared and name == "rooted":
+            # A hand-made (or malicious) intent must not smuggle a rooted
+            # pattern validate would refuse: re-run the same grammar check
+            # bin/airlock-config applies at manifest validate-time.
+            # ${webroot_parent} SUBSTITUTES against the record's own roots
+            # snapshot (that is where the pattern resolves on disk), but the
+            # ALLOWLIST check is always against the live environment — never
+            # the record's roots — or a record claiming roots.webroot under
+            # an attacker-chosen directory could smuggle an arbitrary path
+            # (e.g. /etc/passwd) past validate by making its own fabricated
+            # webroot_parent equal that path's parent.
+            if roots is None:
+                fail(f"{where}.rooted: cannot validate without a roots snapshot")
+            for item in items:
+                s = str(item)
+                substituted = s.replace("${webroot_parent}", _rooted_webroot_parent(roots))
+                if not os.path.isabs(substituted) or any(
+                        x in (".", "..") for x in substituted.split("/")):
+                    fail(f"{where}.rooted: {item!r} must be absolute after "
+                         "${webroot_parent} substitution with no '.' or '..' segments")
+                if any(c in seg for seg in substituted.split("/")[:-1] for c in "*?[") \
+                        or "**" in substituted:
+                    fail(f"{where}.rooted: {item!r} permits glob characters only in "
+                         "the final segment (no **)")
+                if not _rooted_contains(substituted):
+                    fail(f"{where}.rooted: {item!r} is outside the rooted allowlist "
+                         "(checked against the current environment)" + _rooted_refusal_hint())
+
+
+def _validate_port_values(value: Any, where: str) -> None:
+    if not isinstance(value, dict):
+        fail(f"{where}: expected an object")
+    for key, port in value.items():
+        if not isinstance(key, str) or not _is_int(port) or not 1 <= port <= 65535:
+            fail(f"{where}: invalid port value for {key!r}")
+
+
+def _validate_serve_mappings(value: Any, where: str) -> None:
+    if not isinstance(value, dict):
+        fail(f"{where}: expected an object")
+    for key, mapping in value.items():
+        if (not isinstance(key, str) or not isinstance(mapping, dict)
+                or set(mapping) != {"listen", "mode", "target"}
+                or mapping.get("mode") not in ("http", "https")
+                or not _is_int(mapping.get("listen")) or not _is_int(mapping.get("target"))
+                or not 1 <= mapping["listen"] <= 65535 or not 1 <= mapping["target"] <= 65535):
+            fail(f"{where}: mappings must be {{key: {{listen, mode, target}}}}")
+
+
+def _validate_unit_scopes(value: Any, units: list[Any], where: str) -> None:
+    names = {os.path.basename(str(x)) for x in units}
+    if not isinstance(value, dict) or set(value) != names:
+        fail(f"{where}: must map exactly the unit names")
+    if any(v not in ("user", "system", "both") for v in value.values()):
+        fail(f"{where}: values must be user, system, or both")
+
+
+def _validate_order(value: Any, where: str) -> None:
+    if value is not None and (not _is_int(value) or value < 1):
+        fail(f"{where}: order must be a positive integer or null")
+
+
+def _validate_source_class(value: Any, where: str) -> None:
+    if value not in ("shipped", "explicit"):
+        fail(f"{where}: source_class must be 'shipped' or 'explicit'")
+
+
+def _validate_capabilities(value: Any, where: str) -> None:
+    """A record's claim about what it was authorized to do. Canonical form is
+    part of the contract: `write_store` dumps with sort_keys=True, so a record
+    that came back unsorted or with a repeat was hand-edited, and accepting it
+    would give one claim two spellings that compare unequal (the stale-intent
+    guard at command_intent diffs recorded surfaces literally)."""
+    if not isinstance(value, list):
+        fail(f"{where}: capabilities must be a list")
+    if any(not isinstance(item, str) for item in value):
+        fail(f"{where}: capabilities must be a list of strings")
+    for item in value:
+        if item not in CAPABILITIES:
+            fail(f"{where}: unknown capability {item!r} "
+                 f"(known: {', '.join(CAPABILITIES)})")
+    if len(set(value)) != len(value):
+        fail(f"{where}: capabilities must not repeat a name")
+    if value != sorted(value):
+        fail(f"{where}: capabilities must be sorted")
+
+
+def _unit_scopes_include_system(unit_scopes: dict[str, str]) -> bool:
+    return any(scope in ("system", "both") for scope in unit_scopes.values())
+
+
+def _require_system_unit_scope_claim(unit_scopes: dict[str, str],
+                                     capabilities: list[str] | None,
+                                     where: str, *, symmetric: bool) -> None:
+    """Check agreement between requested unit scope and the recorded claim.
+
+    Package facts and intents describe the complete declaration, so they can
+    prove both directions.  A committed record describes only artifacts that
+    were found; its claim may legitimately survive a conditional system unit
+    that was absent at commit time, so callers use the one-way form there.
+    """
+    has_system_scope = _unit_scopes_include_system(unit_scopes)
+    claims_system = "system-unit" in (capabilities or ())
+    if has_system_scope and not claims_system:
+        fail(f"{where}: unit_scopes has system/both but capabilities does not "
+             "claim 'system-unit'")
+    if symmetric and claims_system and not has_system_scope:
+        fail(f"{where}: capabilities claims 'system-unit' but unit_scopes has "
+             "no system/both")
+
+
+def _recorded_system_unit_paths(artifacts: dict[str, list[Any]],
+                                roots: dict[str, str]) -> list[str]:
+    """Recorded unit paths whose exact parent is the record's system root."""
+    system_root = os.path.normpath(roots["unit_system"])
+    return [str(unit) for unit in artifacts["units"]
+            if os.path.normpath(os.path.dirname(str(unit))) == system_root]
+
+
+def _record_capabilities(record: dict[str, Any], kind: str) -> list[str]:
+    """What a stored record can prove about ITSELF, for the read normalisation
+    that has to give a pre-v4 record a capability list.
+
+    Derived from the record alone — no config (the box being read may have none
+    to hand: teardown of a deleted app is exactly the case) and no live
+    environment (the box's AIRLOCK_UNIT_DIR_* may have moved since, and the
+    question here is where this install PUT its units, not where a unit would
+    go today). Fresh records never come through here; they carry the list
+    bin/airlock-config derived at admission."""
+    claimed: set[str] = set()
+    artifacts = record["artifacts_declared"] if kind == "intent" else record["artifacts"]
+    if artifacts["rooted"]:
+        claimed.add("rooted-artifact")
+    # "both" counts. It does not mean "user"; it means scope unknown, search
+    # BOTH roots (expand_declared), so such a record can own a system unit —
+    # and recording no claim would strand that unit the moment the capability
+    # is gated. Every pre-v3 record normalises to "both", which is why this
+    # is not a hypothetical.
+    if _unit_scopes_include_system(record["unit_scopes"]):
+        claimed.add("system-unit")
+    if kind == "committed" and "system-unit" not in claimed:
+        # A committed record's units are RECORDED absolute paths — the ground
+        # truth its scope map only summarises — so a record whose scopes say
+        # "user" but whose paths sit in the system unit dir still owns one.
+        # Against the record's own roots snapshot, per the docstring.
+        if _recorded_system_unit_paths(artifacts, record["roots"]):
+            claimed.add("system-unit")
+    return sorted(claimed)
+
+
+def _is_hex_digest(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value))
+
+
+def _validate_events(value: Any, where: str) -> None:
+    if not isinstance(value, list):
+        fail(f"{where}: events must be a list")
+    required = set(AUDIT_EVENT_FIELDS)
+    for index, event in enumerate(value):
+        label = f"{where}.events[{index}]"
+        if not isinstance(event, dict) or set(event) != required:
+            fail(f"{label}: invalid audit event shape")
+        if event["type"] != "package-lock-override":
+            fail(f"{label}: unknown event type {event['type']!r}")
+        package_id = event["package_id"]
+        if not isinstance(package_id, str) or not _ID_RE.fullmatch(package_id):
+            fail(f"{label}: invalid package id {package_id!r}")
+        if event["argument"] != f"--dangerously-admit-unverified={package_id}":
+            fail(f"{label}: argument does not exactly name its package")
+        if not _is_hex_digest(event["recorded_digest"]):
+            fail(f"{label}: recorded_digest must be a bare lowercase 64-hex string")
+        if not _is_hex_digest(event["admitted_digest"]):
+            fail(f"{label}: admitted_digest must be a bare lowercase 64-hex string")
+        recorded_at = event["recorded_at"]
+        if not isinstance(recorded_at, str) or not recorded_at.endswith("Z"):
+            fail(f"{label}: recorded_at must be a UTC timestamp ending in Z")
+        try:
+            parsed_at = datetime.fromisoformat(recorded_at[:-1] + "+00:00")
+        except ValueError:
+            fail(f"{label}: recorded_at must be a valid UTC timestamp")
+        if parsed_at.utcoffset() != timezone.utc.utcoffset(parsed_at):
+            fail(f"{label}: recorded_at must be a UTC timestamp")
+        if not _is_hex_digest(event["receipt_sha256"]):
+            fail(f"{label}: receipt_sha256 must be a bare lowercase 64-hex string")
+
+
+def _validate_provenance(record: dict[str, Any], kind: str, where: str) -> None:
+    if not isinstance(record["path"], str) or not os.path.isabs(record["path"]):
+        fail(f"{where}: {kind} path must be an absolute string")
+    if not _is_hex_digest(record["digest"]):
+        fail(f"{where}: {kind} digest must be a 64-hex sha256")
+
+
+def _validate_deps(value: Any, app_id: str, where: str) -> None:
+    if not isinstance(value, list):
+        fail(f"{where}: deps must be a list of id strings")
+    if any(not isinstance(dep, str) or not _DEP_RE.fullmatch(dep) for dep in value):
+        fail(f"{where}: deps must be a list of valid id strings")
+    if len(value) != len(set(value)):
+        fail(f"{where}: deps must not contain duplicates")
+    if app_id in value:
+        fail(f"{where}: deps must not contain a self-reference to {app_id!r}")
+
+
+def _validate_record(record: Any, kind: str, where: str, *,
+                     app_id: str = "", version: int = LEDGER_VERSION) -> None:
+    if not isinstance(record, dict):
+        fail(f"{where}: {kind} record must be an object")
+    if kind == "intent":
+        required = {"path", "digest", "artifacts_declared", "serve_port_values",
+                    "lifecycle", "roots"}
+        if version >= 2:
+            required.add("deps")
+            required.add("anchors")
+        if version >= 3:
+            required.update(("serve_mappings", "unit_scopes", "order", "source_class"))
+        if version >= 4:
+            required.add("capabilities")
+        if version >= LEDGER_VERSION:
+            required = set(INTENT_RECORD_FIELDS_V5)
+        if set(record) != required:
+            fail(f"{where}: invalid intent record shape")
+        _validate_provenance(record, kind, where)
+        if version >= 2:
+            _validate_deps(record["deps"], app_id, f"{where}.deps")
+            anchors = record["anchors"]
+            if (not isinstance(anchors, dict)
+                    or any(not isinstance(k, str) or not isinstance(v, str)
+                           or not os.path.isabs(v) for k, v in anchors.items())):
+                fail(f"{where}.anchors: expected a map of pattern keys to "
+                     "absolute resolved directories")
+        roots = record["roots"]
+        if (not isinstance(roots, dict) or set(roots) != set(ROOT_KEYS)
+                or any(not isinstance(v, str) or not os.path.isabs(v)
+                       for v in roots.values())):
+            fail(f"{where}: roots must record the five absolute expansion bases")
+        _validate_artifact_map(record["artifacts_declared"], f"{where}.artifacts_declared", True,
+                               version=version, roots=roots)
+        _validate_port_values(record["serve_port_values"], f"{where}.serve_port_values")
+        # The value map must be exactly the declared key set — an undeclared
+        # value would make its port a teardown target nothing declared.
+        if set(record["serve_port_values"]) != set(record["artifacts_declared"]["serve_ports"]):
+            fail(f"{where}: serve_port_values keys must equal artifacts_declared.serve_ports")
+        _validate_lifecycle(record["lifecycle"], f"{where}.lifecycle")
+        if version >= 3:
+            _validate_serve_mappings(record["serve_mappings"], f"{where}.serve_mappings")
+            _validate_unit_scopes(record["unit_scopes"], record["artifacts_declared"]["units"], f"{where}.unit_scopes")
+            _validate_order(record["order"], f"{where}.order")
+            _validate_source_class(record["source_class"], f"{where}.source_class")
+            if version == 3 and record["artifacts_declared"]["rooted"] and record["source_class"] != "shipped":
+                # v3 ONLY, and it stays. In v3 `source_class` was the
+                # authorisation record itself, so no legitimate writer of that
+                # version could produce a rooted explicit-class record — one on
+                # disk was hand-written, and refusing it is the ledger's own
+                # defence (Blocker C) rather than a policy re-decision. Nothing
+                # is lost by keeping it: a grant cannot exist in a v3 record.
+                # It is deliberately not carried into v4, where a grant may
+                # legitimately authorise an explicit package and the claim is
+                # recorded on the record instead.
+                fail(f"{where}: artifacts_declared.rooted is shipped-only "
+                     f"(source_class={record['source_class']!r})")
+        if version >= 4:
+            _validate_capabilities(record["capabilities"], f"{where}.capabilities")
+            # Successor to the shipped-only assertion (Blocker C), which
+            # re-decided POLICY at load time: it read source_class, a fact the
+            # record cannot prove and whose meaning lives in a config that may
+            # have granted the capability since — so the first granted rooted
+            # install wrote a record the next run refused to READ, dying before
+            # it could tear anything down. This reads the record instead.
+            #
+            # Biconditional, and only on the intent record: what an intent
+            # proves is its DECLARATION, and both directions are wrong records.
+            # A declaration with no claim is an install nothing authorized; a
+            # claim with no declaration is a claim with no evidence behind it.
+            claims_rooted = "rooted-artifact" in record["capabilities"]
+            if record["artifacts_declared"]["rooted"] and not claims_rooted:
+                fail(f"{where}: artifacts_declared.rooted is non-empty but "
+                     "capabilities does not claim 'rooted-artifact'")
+            if claims_rooted and not record["artifacts_declared"]["rooted"]:
+                fail(f"{where}: capabilities claims 'rooted-artifact' but "
+                     "artifacts_declared.rooted is empty")
+            _require_system_unit_scope_claim(record["unit_scopes"],
+                                             record["capabilities"], where,
+                                             symmetric=True)
+    else:
+        required = {"path", "digest", "lifecycle", "artifacts"}
+        if version >= 2:
+            required.add("deps")
+        if version >= 3:
+            required.update(("serve_mappings", "unit_scopes", "order", "roots", "source_class"))
+        if version >= 4:
+            required.add("capabilities")
+        if version >= LEDGER_VERSION:
+            required = set(COMMITTED_RECORD_FIELDS_V5)
+        if set(record) != required:
+            fail(f"{where}: invalid committed record shape")
+        _validate_provenance(record, kind, where)
+        if version >= 2:
+            _validate_deps(record["deps"], app_id, f"{where}.deps")
+        _validate_lifecycle(record["lifecycle"], f"{where}.lifecycle")
+        _validate_artifact_map(record["artifacts"], f"{where}.artifacts", False, version=version)
+        if version >= 3:
+            _validate_serve_mappings(record["serve_mappings"], f"{where}.serve_mappings")
+            _validate_unit_scopes(record["unit_scopes"], record["artifacts"]["units"], f"{where}.unit_scopes")
+            _validate_order(record["order"], f"{where}.order")
+            _validate_source_class(record["source_class"], f"{where}.source_class")
+            if version == 3 and record["artifacts"]["rooted"] and record["source_class"] != "shipped":
+                # v3 only — the intent branch above says why.
+                fail(f"{where}: artifacts.rooted is shipped-only "
+                     f"(source_class={record['source_class']!r})")
+            # The roots snapshot AT COMMIT TIME (child-4 fix): used ONLY to
+            # resolve ${webroot_parent} for a rooted pattern back to where it
+            # was written — it confers no removal authority (Blocker C,
+            # round 2): execution-time allowlist checks always use the live
+            # environment instead, never this snapshot.
+            croots = record["roots"]
+            if (not isinstance(croots, dict) or set(croots) != set(ROOT_KEYS)
+                    or any(not isinstance(v, str) or not os.path.isabs(v)
+                           for v in croots.values())):
+                fail(f"{where}: roots must record the five absolute expansion bases")
+        if version >= 4:
+            _validate_capabilities(record["capabilities"], f"{where}.capabilities")
+            # ONE WAY here, unlike the intent record above. A committed
+            # record holds the FOUND artifacts, not the declared ones (see
+            # command_commit's unit_scopes comment), so a package whose
+            # rooted path was conditional on something the installer decided
+            # commits with rooted: [] while still legitimately claiming the
+            # capability — a biconditional would refuse that healthy commit.
+            # What stays provable is the direction teardown acts on: a
+            # recorded rooted path with no claim standing behind it.
+            if record["artifacts"]["rooted"] and "rooted-artifact" not in record["capabilities"]:
+                fail(f"{where}: artifacts.rooted is non-empty but capabilities "
+                     "does not claim 'rooted-artifact'")
+            _require_system_unit_scope_claim(record["unit_scopes"],
+                                             record["capabilities"], where,
+                                             symmetric=False)
+            if (_recorded_system_unit_paths(record["artifacts"], record["roots"])
+                    and "system-unit" not in record["capabilities"]):
+                fail(f"{where}: artifacts.units contains a system unit but "
+                     "capabilities does not claim 'system-unit'")
+
+
+def _validate_store(store: Any, path: Path) -> dict[str, Any]:
+    if not isinstance(store, dict) or "version" not in store:
+        fail(f"{path}: invalid ledger shape")
+    version = store.get("version")
+    # 3 is spelled out, not written as LEDGER_VERSION: every previous store
+    # version must stay in this set by NAME, or raising the constant silently
+    # evicts the one version most boxes are actually on and kills them here —
+    # before the normalisation below, which exists to upgrade them, ever runs.
+    if not _is_int(version) or version not in (1, 2, 3, 4, LEDGER_VERSION):
+        hint = ""
+        if _is_int(version) and version > LEDGER_VERSION:
+            hint = ("; this state was written by a newer airlock, so the tree is "
+                    "older than the state it is reading — upgrade (or restore) the "
+                    "airlock checkout rather than editing the ledger")
+        fail(f"{path}: unsupported ledger version {store.get('version')!r}; "
+             f"this airlock reads up to version {LEDGER_VERSION}{hint}")
+    expected_top = (set(STORE_FIELDS_V5)
+                    if version >= 5 else {"version", "entries"})
+    if set(store) != expected_top:
+        fail(f"{path}: invalid ledger shape")
+    if version >= 5:
+        _validate_events(store["events"], str(path))
+    entries = store.get("entries")
+    if not isinstance(entries, dict):
+        fail(f"{path}: invalid ledger shape: entries must be an object")
+    for app_id, entry in entries.items():
+        if not isinstance(app_id, str) or not _ID_RE.fullmatch(app_id):
+            fail(f"{path}: invalid ledger entry id {app_id!r}")
+        if not isinstance(entry, dict):
+            fail(f"{path}: invalid ledger entry for {app_id!r}")
+        if set(entry) - {"committed", "intent"}:
+            fail(f"{path}: invalid ledger entry for {app_id!r}")
+        present = False
+        for kind in ("committed", "intent"):
+            record = entry.get(kind)
+            if record is None:
+                continue
+            present = True
+            _validate_record(record, kind, f"{path}: entry {app_id!r}.{kind}",
+                             app_id=app_id, version=version)
+        if not present:
+            fail(f"{path}: empty ledger entry for {app_id!r}")
+    if version >= LEDGER_VERSION:
+        return store
+    # One read-normalisation staircase, not a set of sibling branches: an older
+    # store is deep-copied ONCE (the caller's dict is never mutated under it),
+    # walked up through every step it is behind, and returned as the store the
+    # rest of the tool sees. A step written as a sibling of the v1/v2 branch
+    # would be skipped by exactly the stores that need it most — a v1 file would
+    # come back stamped LEDGER_VERSION with the newest fields missing, and
+    # write_store would then refuse its own output.
+    normalised = copy.deepcopy(store)
+    normalised["version"] = LEDGER_VERSION
+    normalised["events"] = []
+    if version in (1, 2):
+        for entry in normalised["entries"].values():
+            for kind in ("committed", "intent"):
+                record = entry.get(kind)
+                if record is not None:
+                    record.setdefault("deps", [])
+                    if kind == "intent":
+                        record.setdefault("anchors", {})
+                        record["serve_mappings"] = {
+                            k: {"listen": p, "mode": "http", "target": p}
+                            for k, p in record["serve_port_values"].items()}
+                        record["artifacts_declared"]["rooted"] = []
+                        record["unit_scopes"] = {n: "both" for n in record["artifacts_declared"]["units"]}
+                    else:
+                        record["serve_mappings"] = {
+                            str(p): {"listen": p, "mode": "http", "target": p}
+                            for p in record["artifacts"]["serve_ports"]}
+                        record["artifacts"]["rooted"] = []
+                        record["unit_scopes"] = {os.path.basename(n): "both" for n in record["artifacts"]["units"]}
+                        # A legacy committed record never had a roots
+                        # snapshot (rooted didn't exist yet) — its rooted
+                        # list is always [] just above, so the live
+                        # environment is a safe stand-in (nothing will ever
+                        # resolve ${webroot_parent} against it).
+                        record["roots"] = _current_roots()
+                    record["order"] = None
+                    # Conservative default (Blocker C, round 2): a legacy
+                    # record never carried source_class, and its rooted list
+                    # is always [] (rooted did not exist pre-v3), so
+                    # "explicit" costs nothing. Since store v4 no rooted GATE
+                    # reads it either (they read capabilities, which the
+                    # v3 -> v4 step below derives from the record itself); it
+                    # remains a compared surface in the stale-intent sweep.
+                    record["source_class"] = "explicit"
+    # v3 -> v4. Runs AFTER the block above because that block writes this
+    # step's inputs: pre-v3 records have no `rooted` list and no `unit_scopes`
+    # at all until the fixups synthesise them.
+    for entry in normalised["entries"].values():
+        for kind in ("committed", "intent"):
+            record = entry.get(kind)
+            if record is not None and "capabilities" not in record:
+                record["capabilities"] = _record_capabilities(record, kind)
+    return normalised
+
+
+def load_store() -> dict[str, Any]:
+    """Read the ledger fail-closed; a missing file is the only empty case."""
+    path = ledger_path()
+    if not os.path.lexists(path):
+        return {"version": LEDGER_VERSION, "entries": {}, "events": []}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{path}: cannot parse ledger: {exc}")
+    return _validate_store(raw, path)
+
+
+def _ensure_state_dir() -> Path:
+    directory = state_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+    except OSError as exc:
+        fail(f"cannot create state directory {directory}: {exc}")
+    return directory
+
+
+def write_store(store: dict[str, Any], *, require_directory_sync: bool = False) -> None:
+    """Replace the ledger in one same-directory atomic operation. Validated
+    first: this tool must never persist a store it would refuse to re-read."""
+    path = ledger_path()
+    # The validator RETURNS the normalised store — an older candidate comes
+    # back stamped LEDGER_VERSION with the fields that version added already
+    # derived — so every persisted mutation is current by construction.
+    # Persisting the caller's own dict instead would write back the shape the
+    # file was read in and leave the upgrade permanently pending.
+    store = _validate_store(store, path)
+    directory = _ensure_state_dir()
+    temp_name: str | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=".app-ledger.", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_name, path)
+        temp_name = None
+        if require_directory_sync:
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except (OSError, TypeError, ValueError) as exc:
+        fail(f"cannot atomically write ledger {path}: {exc}")
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+
+def read_package_info() -> dict[str, Any]:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"stdin: invalid package-info JSON: {exc}")
+    if not isinstance(info, dict):
+        fail("stdin: package-info must be a JSON object")
+    packages = info.get("packages", {})
+    if not isinstance(packages, dict):
+        fail("stdin: package-info packages must be an object")
+    return info
+
+
+def _normalise_package(app_id: str, raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        fail(f"package-info: packages.{app_id} must be an object")
+    directory = raw.get("dir")
+    if not isinstance(directory, str) or not directory:
+        fail(f"package-info: packages.{app_id}.dir must be a non-empty string")
+    raw_artifacts = raw.get("artifacts", {})
+    if not isinstance(raw_artifacts, dict) or set(raw_artifacts) - set(ARTIFACT_CLASSES):
+        fail(f"package-info: packages.{app_id}.artifacts has unknown keys")
+    artifacts: dict[str, list[str]] = {}
+    for name in ARTIFACT_CLASSES:
+        values = raw_artifacts.get(name, [])
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            fail(f"package-info: packages.{app_id}.artifacts.{name} must be a string list")
+        artifacts[name] = list(values)
+
+    raw_ports = raw.get("serve_port_values", {})
+    _validate_port_values(raw_ports, f"package-info: packages.{app_id}.serve_port_values")
+    port_values = {str(key): int(value) for key, value in raw_ports.items()}
+    raw_mappings = raw.get("serve_mappings")
+    if raw_mappings is None:
+        raw_mappings = {k: {"listen": p, "mode": "http", "target": p}
+                        for k, p in port_values.items()}
+    _validate_serve_mappings(raw_mappings, f"package-info: packages.{app_id}.serve_mappings")
+    mappings = copy.deepcopy(raw_mappings)
+    raw_scopes = raw.get("unit_scopes", {n: "user" for n in artifacts["units"]})
+    _validate_unit_scopes(raw_scopes, artifacts["units"], f"package-info: packages.{app_id}.unit_scopes")
+    if any(v == "both" for v in raw_scopes.values()):
+        fail(f"package-info: packages.{app_id}.unit_scopes may not declare both")
+    source_class = raw.get("source_class", "explicit")
+    if source_class not in ("explicit", "shipped"):
+        fail(f"package-info: packages.{app_id}.source_class must be explicit or shipped")
+    # The ledger is a pure CONSUMER of this list: bin/airlock-config derives it
+    # from the manifest request, where the policy that decides it lives. No
+    # default here — a package-info without it is a producer that never learned
+    # to derive one, and defaulting would write a record claiming nothing while
+    # its artifacts say otherwise.
+    if "capabilities" not in raw:
+        fail(f"package-info: packages.{app_id}.capabilities is required at "
+             f"ledger store v{LEDGER_VERSION} (derived by bin/airlock-config "
+             "from the package's declared artifacts)")
+    _validate_capabilities(raw["capabilities"], f"package-info: packages.{app_id}.capabilities")
+    # Consistency, not policy. WHETHER a package may use rooted artifacts is
+    # decided at admission and stays there (bin/airlock-config's manifest gate
+    # still refuses explicit + rooted); re-deciding it here would refuse the
+    # granted install this store version exists to be able to record — the
+    # same bug as the load-time shipped-only assertion, one layer down. What
+    # the ledger checks is that the two facts it was handed agree, both ways,
+    # so a producer that derives a list its own artifacts contradict is loud.
+    if bool(artifacts["rooted"]) != ("rooted-artifact" in raw["capabilities"]):
+        fail(f"package-info: packages.{app_id}: artifacts.rooted and the "
+             f"'rooted-artifact' capability disagree (rooted={artifacts['rooted']!r}, "
+             f"capabilities={raw['capabilities']!r})")
+    _require_system_unit_scope_claim(raw_scopes, raw["capabilities"],
+                                     f"package-info: packages.{app_id}",
+                                     symmetric=True)
+
+    raw_lifecycle = raw.get("lifecycle", {})
+    if not isinstance(raw_lifecycle, dict) or set(raw_lifecycle) - set(LIFECYCLE_KEYS):
+        fail(f"package-info: packages.{app_id}.lifecycle has unknown keys")
+    lifecycle = {}
+    for key in LIFECYCLE_KEYS:
+        value = raw_lifecycle.get(key, False)
+        if not isinstance(value, bool):
+            fail(f"package-info: packages.{app_id}.lifecycle.{key} must be boolean")
+        lifecycle[key] = value
+    deps = raw.get("deps", [])
+    _validate_deps(deps, app_id, f"package-info: packages.{app_id}")
+    return {
+        "dir": directory,
+        "artifacts": artifacts,
+        "serve_port_values": port_values,
+        "serve_mappings": mappings,
+        "unit_scopes": dict(raw_scopes),
+        "source_class": source_class,
+        "capabilities": list(raw["capabilities"]),
+        "lifecycle": lifecycle,
+        "deps": list(deps),
+    }
+
+
+def packages_from_info(info: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    packages = info.get("packages", {})
+    result: dict[str, dict[str, Any]] = {}
+    for app_id, raw in packages.items():
+        if not isinstance(app_id, str):
+            fail("package-info: package ids must be strings")
+        result[app_id] = _normalise_package(app_id, raw)
+    return result
+
+
+def canonical_package_path(package: dict[str, Any]) -> str:
+    return os.path.realpath(os.path.expanduser(package["dir"]))
+
+
+def _length_prefixed(hasher: "hashlib._Hash", field: bytes) -> None:
+    hasher.update(len(field).to_bytes(8, "big"))
+    hasher.update(field)
+
+
+def digest_tree(root: str) -> str:
+    """Hash every package entry in byte-sorted relative-path order."""
+    try:
+        root_stat = os.stat(root)
+    except OSError as exc:
+        fail(f"cannot digest package tree {root}: {exc}")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        fail(f"cannot digest package tree {root}: package path is not a directory")
+
+    entries: list[tuple[bytes, bytes, int, bytes]] = []
+
+    def visit(directory: str, prefix: str) -> None:
+        try:
+            children = list(os.scandir(directory))
+        except OSError as exc:
+            fail(f"cannot read package tree {root}: {exc}")
+        for child in children:
+            relative = child.name if not prefix else f"{prefix}/{child.name}"
+            relative_bytes = os.fsencode(relative)
+            try:
+                child_stat = child.stat(follow_symlinks=False)
+            except OSError as exc:
+                fail(f"cannot stat package entry {os.path.join(root, relative)}: {exc}")
+            mode = stat.S_IMODE(child_stat.st_mode)
+            if stat.S_ISREG(child_stat.st_mode):
+                try:
+                    with open(child.path, "rb") as fh:
+                        content = fh.read()
+                except OSError as exc:
+                    fail(f"cannot read package entry {os.path.join(root, relative)}: {exc}")
+                entries.append((relative_bytes, b"f", mode, content))
+            elif stat.S_ISDIR(child_stat.st_mode):
+                entries.append((relative_bytes, b"d", mode, b""))
+                visit(child.path, relative)
+            elif stat.S_ISLNK(child_stat.st_mode):
+                try:
+                    target = os.fsencode(os.readlink(child.path))
+                except OSError as exc:
+                    fail(f"cannot read package symlink {os.path.join(root, relative)}: {exc}")
+                entries.append((relative_bytes, b"l", mode, target))
+            else:
+                fail(f"special file is not allowed in package tree: {os.path.join(root, relative)}")
+
+    visit(root, "")
+    entries.sort(key=lambda item: item[0])
+    hasher = hashlib.sha256()
+    for relative, kind, mode, content in entries:
+        _length_prefixed(hasher, relative)
+        _length_prefixed(hasher, kind)
+        _length_prefixed(hasher, str(mode).encode("ascii"))
+        _length_prefixed(hasher, content)
+    return hasher.hexdigest()
+
+
+def _intent_record(app_id: str, package: dict[str, Any], store: dict[str, Any]) -> dict[str, Any]:
+    path = canonical_package_path(package)
+    if "capabilities" not in package:
+        # There is more than one producer of package facts (package-info via
+        # _normalise_package, and bin/airlock-config's hand-built adopt dict),
+        # so a third one arriving without a derivation is a real possibility.
+        # LedgerError, never a bare KeyError: _cmd_adopt_write_locked catches
+        # only LedgerError, and the operator gets a diagnosis, not a traceback.
+        fail(f"package facts for {app_id} carry no capabilities — every producer "
+             "must derive them (bin/airlock-config's manifest spec, or a copy of "
+             "that spec's list on the adopt path)")
+    return {
+        "path": path,
+        "digest": digest_tree(path),
+        "artifacts_declared": copy.deepcopy(package["artifacts"]),
+        "serve_port_values": copy.deepcopy(package["serve_port_values"]),
+        "serve_mappings": copy.deepcopy(package["serve_mappings"]),
+        "unit_scopes": copy.deepcopy(package["unit_scopes"]),
+        "order": max((r.get("order") or 0 for e in store["entries"].values()
+                      for r in (e.get("intent"), e.get("committed")) if isinstance(r, dict)), default=0) + 1,
+        # Provenance only, as of store v4: the gates that used to read it
+        # (load, expansion, rooted removal) read `capabilities` below. Kept
+        # because it is what admission was looking at, and the stale-intent
+        # sweep still discriminates on it.
+        "source_class": package["source_class"],
+        # What admission authorized, recorded as history: the record is read
+        # long after the config that produced it may be gone, so this is
+        # carried from the resolver's determination and never re-derived here.
+        "capabilities": sorted(package["capabilities"]),
+        "lifecycle": copy.deepcopy(package["lifecycle"]),
+        "deps": copy.deepcopy(package["deps"]),
+        # The roots the declaration meant AT INTENT TIME: repair after a
+        # crash must expand against these, or a changed root env would make
+        # the expansion empty and orphan what the installer already created.
+        "roots": _current_roots(),
+        # Where each declared pattern's fixed prefix RESOLVED at intent time,
+        # so teardown can tell a post-record redirect from a box that was
+        # always laid out that way.
+        "anchors": _record_anchors(package["artifacts"], _current_roots()),
+    }
+
+
+def _sort_paths(paths: list[str] | set[str]) -> list[str]:
+    return sorted(set(paths), key=os.fsencode)
+
+
+def _pattern_roots(roots: dict[str, str]) -> dict[str, tuple[str, ...]]:
+    return {"fragments": (roots["confd"],), "webroot": (roots["webroot"],),
+            "units": (roots["unit_user"], roots["unit_system"]),
+            "files": ("",), "rooted": ("",)}
+
+
+def _pattern_anchor(cls: str, pattern: str, root: str, roots: dict[str, str]) -> str:
+    """Where a declared pattern's fixed directory prefix RESOLVES TO right now.
+
+    Recorded at intent time and compared at teardown. This is what tells a
+    tree that was redirected AFTER the record (the hazard) from one that was
+    always laid out that way (~/.local pointing into a dotfiles checkout is
+    an ordinary box, and its artifacts must stay removable): the first
+    changes the anchor, the second does not."""
+    if cls in ("files", "rooted"):
+        raw = pattern
+        if cls == "rooted":
+            raw = raw.replace("${webroot_parent}", str(Path(roots["webroot"]).parent))
+        if raw.startswith("~/"):
+            raw = os.path.join(roots["home"], raw[2:].lstrip("/"))
+        rooted = os.path.abspath(raw)
+    else:
+        rooted = os.path.join(root, os.path.expanduser(pattern))
+    # `webroot = ["mydir/"]` and `["mydir"]` name ONE object (the same rule
+    # _canonical_artifact states): without this the trailing-slash form would
+    # anchor on the claimed directory itself, so the app's own symlink there
+    # would look like a redirect and wedge its teardown.
+    rooted = rooted.rstrip("/") or "/"
+    head = rooted
+    while head and any(ch in os.path.basename(head) for ch in "*?["):
+        head = os.path.dirname(head)
+    head = os.path.dirname(head) if head == rooted else head
+    return os.path.realpath(head or "/")
+
+
+def _record_anchors(declared: dict[str, Any], roots: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for cls, cls_roots in _pattern_roots(roots).items():
+        for pattern in declared.get(cls, []):
+            for root in cls_roots:
+                out[f"{cls}|{root}|{pattern}"] = _pattern_anchor(cls, str(pattern), root, roots)
+    return out
+
+
+def _rooted_artifact(path: str, root: str | tuple[str, ...], where: str) -> str:
+    """Canonicalise a match that is supposed to live under a platform root,
+    and REFUSE it if the canonical form escapes.
+
+    glob() walks a symlinked intermediate directory ($WEBROOT/assets/apps ->
+    /elsewhere), so a match can canonicalise outside the root it was expanded
+    under. Recording that path would put an external directory in the ledger,
+    and teardown removes recorded directories — the record itself becomes the
+    weapon. Fail closed instead: the operator repairs the redirected tree,
+    and nothing outside a root is ever recorded or removed."""
+    canonical = _canonical_artifact(path)
+    roots = (root,) if isinstance(root, str) else root
+    for candidate in roots:
+        real = os.path.realpath(candidate)
+        if canonical == real or canonical.startswith(real.rstrip("/") + os.sep):
+            return canonical
+    fail(f"{where}: {path} resolves to {canonical}, outside the platform root"
+         f"{'s' if len(roots) > 1 else ''} it was expanded under "
+         f"({', '.join(os.path.realpath(r) for r in roots)}) — a symlinked "
+         "directory inside the root redirects the claim space; repair the "
+         "tree (the ledger never records or removes a path outside a root)")
+
+
+def _redirected_ancestor(path: str) -> str | None:
+    """The first ANCESTOR component of `path` that is a symlink today, or None.
+
+    Every recorded path was canonicalised with a real parent chain, so a
+    symlinked ancestor now means the tree was redirected after the record was
+    written. Removing through it would delete whatever the link points at —
+    the record becoming a weapon (the leaf itself may be a symlink: that is
+    owned as a link and removed as one)."""
+    parent = os.path.dirname(os.path.normpath(path))
+    seen = set()
+    while parent and parent not in ("/", ".") and parent not in seen:
+        seen.add(parent)
+        if os.path.islink(parent):
+            return parent
+        parent = os.path.dirname(parent)
+    return None
+
+
+def _check_anchor(anchors: dict[str, str] | None, cls: str, root: str,
+                  patterns: list[Any], roots: dict[str, str], where: str) -> None:
+    """Refuse to expand a declaration whose fixed prefix no longer resolves
+    where it did when the record was written.
+
+    That is the precise statement of the hazard: not "an ancestor is a
+    symlink" (a box whose ~/.local points into a dotfiles checkout is
+    ordinary, and its artifacts must stay removable), but "this declaration
+    now names somewhere else than it did". Only teardown passes anchors;
+    recording is permissive by design (D2 canonicalises an aliased claim into
+    the one claim space). Records written before anchors existed carry an
+    empty map and are simply not compared."""
+    if not anchors:
+        return
+    for pattern in patterns:
+        key = f"{cls}|{root}|{pattern}"
+        recorded = anchors.get(key)
+        if recorded is None:
+            continue
+        current = _pattern_anchor(cls, str(pattern), root, roots)
+        if current != recorded and str(pattern).endswith("/"):
+            # An intermediate build of this child anchored a trailing-slash
+            # claim one level deeper (on the claimed directory itself). Accept
+            # that older shape too, or a record written by it could never be
+            # torn down — the wedge this whole mechanism exists to prevent.
+            legacy = os.path.join(current, os.path.basename(
+                str(pattern).rstrip("/")))
+            if legacy == recorded:
+                continue
+        if current != recorded:
+            fail(f"{where}: {pattern!r} resolved under {recorded} when the "
+                 f"record was written and now resolves under {current} — the "
+                 "declaration no longer names what it claimed, so nothing is "
+                 "removed through it. Move the artifacts back to the recorded "
+                 "location — re-creating an empty directory would drop the "
+                 "record while the files it named live on elsewhere — or tear "
+                 "the app down before moving them. The record is kept until "
+                 "then.")
+
+
+def _glob_matches(pattern: str) -> list[str]:
+    # recursive=False: `**` is rejected by the declared grammar — a recursive
+    # glob descends through symlinked directories, escaping the claim space.
+    # include_hidden: a dotfile an installer writes under a `*` claim must be
+    # recorded, or teardown would leave it orphaned (a stray .env is exactly
+    # what must never survive with no record naming it).
+    return _sort_paths([os.path.abspath(match)
+                        for match in glob.glob(pattern, recursive=False, include_hidden=True)])
+
+
+def _relative_pattern(root: str, pattern: str, where: str) -> str:
+    expanded = os.path.expanduser(pattern)
+    if os.path.isabs(expanded):
+        fail(f"{where}: absolute artifact pattern is not allowed: {pattern!r}")
+    parts = expanded.replace(os.sep, "/").split("/")
+    if ".." in parts:
+        fail(f"{where}: artifact pattern escapes its root: {pattern!r}")
+    # Only the declared pattern globs; a root that happens to contain glob
+    # characters is a literal directory name.
+    return os.path.join(glob.escape(root), expanded)
+
+
+def expand_declared(declared: dict[str, Any], port_values: dict[str, Any],
+                    roots: dict[str, str] | None = None, *,
+                    anchors: dict[str, str] | None = None,
+                    unit_scopes: dict[str, str] | None = None,
+                    capabilities: list[str] | None = None) -> dict[str, list[Any]]:
+    """Expand each class against its root (the record's own roots snapshot
+    when repairing an intent; the live env otherwise) without following
+    matches."""
+    if roots is None:
+        roots = _current_roots()
+    _validate_artifact_map(declared, "artifacts_declared", True, roots=roots)
+    if declared["rooted"] and "rooted-artifact" not in (capabilities or ()):
+        # Belt-and-braces: _validate_record already ties a non-empty rooted
+        # declaration to the claim at load time, so this should be
+        # unreachable in practice — but expansion must never depend on
+        # every caller having gone through full record validation first.
+        fail("artifacts_declared.rooted: the record does not claim the "
+             f"'rooted-artifact' capability (capabilities={capabilities!r})")
+    scopes = unit_scopes or {name: "both" for name in declared["units"]}
+    _require_system_unit_scope_claim(scopes, capabilities,
+                                     "artifacts_declared.units", symmetric=False)
+    expanded: dict[str, list[Any]] = {}
+    for name, root in (("fragments", roots["confd"]), ("webroot", roots["webroot"])):
+        matches: list[str] = []
+        for pattern in declared[name]:
+            rooted = _relative_pattern(root, pattern, f"artifacts_declared.{name}")
+            matches.extend(_glob_matches(rooted))
+        _check_anchor(anchors, name, root, declared[name], roots,
+                      f"artifacts_declared.{name}")
+        expanded[name] = _sort_paths(
+            _rooted_artifact(m, root, f"artifacts_declared.{name}")
+            for m in matches)
+    matches = []
+    for pattern in declared["files"]:
+        if pattern.startswith("~/"):
+            # ~ means the HOME recorded in the roots snapshot, escaped so a
+            # home path containing glob characters stays literal. The grammar
+            # guarantees a non-empty remainder.
+            rooted = os.path.join(glob.escape(roots["home"]), pattern[2:].lstrip("/"))
+        else:
+            rooted = os.path.abspath(pattern)
+        matches.extend(_glob_matches(rooted))
+    _check_anchor(anchors, "files", "", declared["files"], roots,
+                  "artifacts_declared.files")
+    expanded["files"] = _sort_paths(_canonical_artifact(m) for m in matches)
+    matches = []
+    for pattern in declared["rooted"]:
+        rooted = pattern.replace("${webroot_parent}", _rooted_webroot_parent(roots))
+        matches.extend(_glob_matches(rooted))
+    _check_anchor(anchors, "rooted", "", declared["rooted"], roots,
+                  "artifacts_declared.rooted")
+    rooted_canon = [_canonical_artifact(m) for m in matches]
+    # Containment applies to the EXPANSION too, not just the declared
+    # pattern: a glob's non-final segment can walk through a symlinked
+    # directory the pattern-level check never sees (the same hazard
+    # `_check_anchor` exists for on other classes).
+    for m in rooted_canon:
+        if not _rooted_contains(m):
+            fail(f"artifacts_declared.rooted: {m} resolved outside the rooted "
+                 "allowlist (checked against the current environment) — "
+                 "the declaration or the environment changed since it was "
+                 "recorded" + _rooted_refusal_hint())
+    expanded["rooted"] = _sort_paths(rooted_canon)
+    ports: list[int] = []
+    for value in port_values.values():
+        if not _is_int(value) or not 1 <= value <= 65535:
+            fail(f"serve_port_values contains invalid port {value!r}")
+        ports.append(int(value))
+    expanded["serve_ports"] = sorted(set(ports))
+
+    matches = []
+    unit_roots = (roots["unit_user"], roots["unit_system"])
+    for pattern in declared["units"]:
+        selected = unit_roots if scopes.get(pattern, "both") == "both" else (roots[f"unit_{scopes[pattern]}"],)
+        for root in selected:
+            rooted = _relative_pattern(root, pattern, "artifacts_declared.units")
+            matches.extend(_glob_matches(rooted))
+        for _uroot in selected:
+            _check_anchor(anchors, "units", _uroot, [pattern], roots,
+                          "artifacts_declared.units")
+    expanded["units"] = _sort_paths(
+        _rooted_artifact(m, unit_roots, "artifacts_declared.units")
+        for m in matches)
+    return expanded
+
+
+def _committed_artifacts(record: dict[str, Any]) -> dict[str, list[Any]]:
+    artifacts = record.get("artifacts", {})
+    _validate_artifact_map(artifacts, "committed.artifacts", False)
+    if artifacts.get("rooted") and "rooted-artifact" not in (record.get("capabilities") or ()):
+        # Belt-and-braces, matching expand_declared's own gate: a committed
+        # record's rooted list is only ever teardown-reachable through this
+        # function.
+        fail("committed.artifacts.rooted: the record does not claim the "
+             f"'rooted-artifact' capability (capabilities={record.get('capabilities')!r})")
+    _require_system_unit_scope_claim(record.get("unit_scopes") or {},
+                                     record.get("capabilities"),
+                                     "committed.artifacts.units", symmetric=False)
+    roots = record.get("roots") or {}
+    if (set(roots) == set(ROOT_KEYS)
+            and _recorded_system_unit_paths(artifacts, roots)
+            and "system-unit" not in (record.get("capabilities") or ())):
+        fail("committed.artifacts.units contains a system unit but the record "
+             "does not claim 'system-unit' "
+             f"(capabilities={record.get('capabilities')!r})")
+    result: dict[str, list[Any]] = {}
+    for name in PATH_CLASSES:
+        result[name] = _sort_paths([_expand_path(path) for path in artifacts[name]])
+    result["serve_ports"] = sorted(set(int(port) for port in artifacts["serve_ports"]))
+    return result
+
+
+def _intent_artifacts(record: dict[str, Any], *,
+                      for_teardown: bool = False) -> dict[str, list[Any]]:
+    return expand_declared(record["artifacts_declared"], record["serve_port_values"],
+                           record.get("roots"),
+                           anchors=record.get("anchors") if for_teardown else None,
+                           unit_scopes=record.get("unit_scopes"),
+                           capabilities=record.get("capabilities"))
+
+
+def _record_artifact_sets(artifacts: dict[str, list[Any]]) -> tuple[set[str], set[int]]:
+    paths: set[str] = set()
+    for name in PATH_CLASSES:
+        paths.update(_canonical_artifact(str(path)) for path in artifacts[name])
+    return paths, set(int(port) for port in artifacts["serve_ports"])
+
+
+def _check_commit_conflicts(store: dict[str, Any], app_id: str, new_artifacts: dict[str, list[Any]]) -> None:
+    new_paths, new_ports = _record_artifact_sets(new_artifacts)
+    for other_id in sorted(store["entries"]):
+        if other_id == app_id:
+            continue
+        entry = store["entries"][other_id]
+        for kind in ("committed", "intent"):
+            record = entry.get(kind)
+            if record is None:
+                continue
+            artifacts = _committed_artifacts(record) if kind == "committed" else _intent_artifacts(record)
+            old_paths, old_ports = _record_artifact_sets(artifacts)
+            path_overlap = sorted((p for p in new_paths
+                                   if any(_paths_related(p, q) for q in old_paths)),
+                                  key=os.fsencode)
+            if path_overlap:
+                fail(f"commit for {app_id} claims artifact {path_overlap[0]} already owned by {other_id}")
+            port_overlap = sorted(new_ports & old_ports)
+            if port_overlap:
+                fail(f"commit for {app_id} claims serve port :{port_overlap[0]} already owned by {other_id}")
+
+
+def _copy_artifacts(artifacts: dict[str, list[Any]]) -> dict[str, list[Any]]:
+    return {name: list(artifacts[name]) for name in ARTIFACT_CLASSES}
+
+
+def _paths_related(a: str, b: str) -> bool:
+    """Equal, ancestor, or descendant — one object or one containing the
+    other. A directory claim and a claim on its contents own the same tree."""
+    return a == b or _is_under(a, b) or _is_under(b, a)
+
+
+def _artifact_difference(old: dict[str, list[Any]], new: dict[str, list[Any]]) -> dict[str, list[Any]]:
+    # Path classes diff against the union of the new expansion's paths, not
+    # class-by-class: a path that merely moved class (webroot -> files) is
+    # still owned and must not be torn down as old-only. Containment counts
+    # as ownership too — an upgrade that turns a directory claim into a
+    # claim on its contents (or back) must not rmtree what it just claimed.
+    new_paths: set[str] = set()
+    for name in PATH_CLASSES:
+        new_paths.update(_canonical_artifact(str(p)) for p in new[name])
+
+    def _still_owned(path: str) -> bool:
+        canon = _canonical_artifact(path)
+        return any(_paths_related(canon, q) for q in new_paths)
+
+    result: dict[str, list[Any]] = {}
+    for name in PATH_CLASSES:
+        result[name] = _sort_paths(p for p in (str(x) for x in old[name])
+                                   if not _still_owned(p))
+    result["serve_ports"] = sorted(set(old["serve_ports"]) - set(new["serve_ports"]))
+    return result
+
+
+def parse_active_ports(raw: str | None, info: dict[str, Any]) -> set[tuple[str, int]]:
+    ports: set[tuple[str, int]] = set()
+    if raw:
+        for token in raw.replace(",", " ").split():
+            try:
+                port = int(token)
+            except ValueError:
+                fail(f"--active-ports contains a non-integer value: {token!r}")
+            if not 1 <= port <= 65535:
+                fail(f"--active-ports contains an invalid port: {port}")
+            ports.add(("http", port))
+    for package in packages_from_info(info).values():
+        ports.update((m["mode"], m["listen"]) for m in package["serve_mappings"].values())
+    return ports
+
+
+def _recorded_active_ports(store: dict[str, Any], exclude_id: str) -> set[tuple[str, int]]:
+    """(mode, listen) pairs occupied by every OTHER live ledger record.
+
+    BOTH the committed and intent record of each other id are considered —
+    not just one or the other — since during an in-progress upgrade the two
+    can name different mappings and either could be the one still actually
+    live. `off` clears the whole listen address (D2's child-4 amendment), so
+    a record we are not currently touching must guard that address exactly
+    like a currently-configured mapping does — two ledger entries can
+    legitimately share a (mode, listen) pair mid-run (an upgrade in
+    progress, or a config edit that hands a port from one id to another
+    within the same reconcile batch)."""
+    ports: set[tuple[str, int]] = set()
+    for other_id, entry in store.get("entries", {}).items():
+        if other_id == exclude_id or not isinstance(entry, dict):
+            continue
+        for kind in ("committed", "intent"):
+            record = entry.get(kind)
+            if not isinstance(record, dict):
+                continue
+            mappings = record.get("serve_mappings") or {}
+            ports.update((m["mode"], m["listen"]) for m in mappings.values()
+                         if isinstance(m, dict) and "mode" in m and "listen" in m)
+    return ports
+
+
+def _dedupe_mappings(already_covered: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """`candidate`'s entries whose (mode, listen) is NOT already present in
+    `already_covered` (Minor E): committed and intent are torn down as two
+    independent teardown_artifacts calls, and when both map the same
+    address the second call must not reissue the off the first already
+    covered — a second off that itself errors would otherwise keep the
+    whole entry and repeat the (harmless but noisy, and retry-blocking)
+    duplicate on every re-run. Committed wins (matches _removal_order's own
+    committed-over-intent precedence) — the caller passes committed's
+    mappings as `already_covered` and dedupes intent's against them.
+
+    Returns an empty dict, never omits the argument, when everything was
+    already covered — `_teardown_ports` must see an explicit empty mapping
+    (not None) or its no-mappings fallback would resweep every raw port as
+    http and reintroduce the very duplicate this function exists to avoid."""
+    covered = {(m["mode"], m["listen"]) for m in already_covered.values()}
+    return {k: m for k, m in candidate.items() if (m["mode"], m["listen"]) not in covered}
+
+
+def _dropped_serve_mappings(old_mappings: dict[str, Any], new_mappings: dict[str, Any]) -> dict[str, Any]:
+    """Mappings a diff drops, computed on (mode, listen) IDENTITY — never on
+    bare port numbers.
+
+    A diff-based teardown must never reuse the NEW record's mappings: by
+    definition those no longer cover anything the diff is dropping at all
+    (the port's key disappeared, or the same key's listen number changed) —
+    `_teardown_ports` ignores its `ports` argument whenever `mappings` is
+    given, so handing it the new mappings silently swept nothing for the
+    dropped entry and left the old TLS/http listener live forever (no other
+    path ever reclaims it). And a NUMBER-only diff misses a same-listen MODE
+    flip entirely (http -> https on the SAME port): the number survives in
+    both the old and new sets, so a diff keyed on port numbers alone sees no
+    change at all (Major: same-listen mode flip invisible to the diff) —
+    this compares the full (mode, listen) pair instead."""
+    new_keys = {(m["mode"], m["listen"]) for m in new_mappings.values()}
+    result: dict[tuple[str, int], dict[str, Any]] = {}
+    for mapping in old_mappings.values():
+        key = (mapping["mode"], mapping["listen"])
+        if key not in new_keys:
+            result[key] = mapping
+    return {f"{mode}:{listen}": mapping for (mode, listen), mapping in result.items()}
+
+
+def _run_command(args: list[str], description: str) -> int | None:
+    try:
+        result = subprocess.run(args, check=False)
+    except OSError as exc:
+        log(f"{description} failed: {exc}")
+        return None
+    if result.returncode != 0:
+        log(f"{description} failed with exit {result.returncode}")
+    return result.returncode
+
+
+def _is_under(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath((path, root)) == root
+    except ValueError:
+        return False
+
+
+def _remove_plain_path(path: str, recursive: bool) -> bool:
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+        return True
+    if recursive:
+        shutil.rmtree(path)
+    else:
+        os.rmdir(path)
+    return True
+
+
+def _protected_state_path(path: str) -> bool:
+    """The ledger, its lock, and the state directory are never app artifacts;
+    removing them through a record would erase the record of the removal.
+    Compared canonically so a symlinked alias cannot slip past."""
+    return _is_under(_canonical_artifact(path),
+                     os.path.realpath(str(state_dir())))
+
+
+def _plain_artifact_refusal(path: str) -> str | None:
+    if _protected_state_path(path):
+        return f"refusing to remove {path}: inside the platform state directory"
+    redirected = _redirected_ancestor(path)
+    if redirected is not None:
+        return (f"refusing to remove {path}: {redirected} is now a symlink, so the "
+                "recorded path no longer names what it named when it was recorded "
+                "(repair the tree, then re-run)")
+    return None
+
+
+def _remove_artifact_path(path: str, dry: bool) -> bool:
+    path = _expand_path(path)
+    refusal = _plain_artifact_refusal(path)
+    if refusal is not None:
+        log(refusal)
+        return False
+    if not os.path.lexists(path):
+        return True
+    if dry:
+        log(f"[dry] would remove {path}")
+        return True
+    try:
+        _remove_plain_path(path, recursive=True)
+    except OSError as exc:
+        log(f"remove {path} failed: {exc}")
+        return False
+    log(f"removed {path}")
+    return True
+
+
+def _rooted_artifact_refusal(path: str,
+                             capabilities: list[str] | None) -> str | None:
+    """Return a pure execution-time refusal, without touching the path.
+
+    The claim comes from the record that outlives its original config.  The
+    allowlist comes from the live environment, never the record's roots
+    snapshot: a hand-written record cannot authorize its own removal target.
+    This same predicate is used by aggregate preflight and the final removal
+    recheck so the two boundaries cannot drift.
+    """
+    if "rooted-artifact" not in (capabilities or ()):
+        return (f"refusing to remove rooted artifact {path}: the record does not "
+                "claim the 'rooted-artifact' capability "
+                f"(capabilities={capabilities!r})")
+    if not _rooted_contains(path):
+        return (f"refusing to remove rooted artifact {path}: outside the rooted "
+                "allowlist (checked against the current environment, not the "
+                "record) — restore the webroot this record was created under, "
+                "or remove the artifact by hand" + _rooted_refusal_hint())
+    if _protected_state_path(path) or _redirected_ancestor(path) is not None:
+        return f"refusing to remove rooted artifact {path}: redirected or protected path"
+    return None
+
+
+def _remove_rooted_artifact_path(path: str, dry: bool, capabilities: list[str] | None) -> bool:
+    path = _expand_path(path)
+    refusal = _rooted_artifact_refusal(path, capabilities)
+    if refusal is not None:
+        log(refusal)
+        return False
+    if not os.path.lexists(path):
+        return True
+    if dry:
+        log(f"[dry] would run sudo rm -rf -- {path}")
+        return True
+    return _run_command(["sudo", "rm", "-rf", "--", path], f"sudo rm -rf -- {path}") == 0
+
+
+def _unit_scope(path: str) -> tuple[str, str]:
+    """Return the expanded unit path and its current exact-parent scope."""
+    path = _expand_path(path)
+    parent = os.path.dirname(path)
+    if parent == _unit_dir("user"):
+        return path, "user"
+    if parent == _unit_dir("system"):
+        return path, "system"
+    fail(f"recorded unit {path} is outside the configured unit directories; "
+         "refusing to touch it blind — the record is kept")
+
+
+def _preflight_teardown_artifacts(artifacts: dict[str, list[Any]],
+                                  capabilities: list[str] | None) -> list[tuple[str, str]]:
+    """Resolve and authorize the complete artifact set before any mutation.
+
+    This is deliberately repeated at the execution boundary even though a
+    normal command loaded a validated record.  Internal callers and future
+    refactors must not be able to remove an earlier artifact before a later
+    protected, redirected, unauthorized, or out-of-policy artifact is
+    discovered. Predictable policy/shape refusals belong here; runtime I/O
+    failures remain retryable results of the individual removal operations.
+    """
+    units = [_unit_scope(str(path)) for path in artifacts["units"]]
+    if (any(scope == "system" for _, scope in units)
+            and "system-unit" not in (capabilities or ())):
+        fail("artifacts.units contains a system unit but capabilities does not "
+             f"claim 'system-unit' (capabilities={capabilities!r})")
+    for name in ("fragments", "webroot", "files"):
+        for raw_path in artifacts[name]:
+            path = _expand_path(str(raw_path))
+            refusal = _plain_artifact_refusal(path)
+            if refusal is not None:
+                fail(refusal)
+    for raw_path in artifacts["rooted"]:
+        path = _expand_path(str(raw_path))
+        refusal = _rooted_artifact_refusal(path, capabilities)
+        if refusal is not None:
+            fail(refusal)
+    return units
+
+
+def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
+                   *, preflight_scope: str | None = None) -> tuple[bool, str]:
+    """Returns (ok, scope): scope is 'user'/'system' whenever the recorded
+    path lies under that root (even if already absent — the batch reload in
+    teardown_artifacts must still be retryable)."""
+    path, scope = _unit_scope(path)
+    if preflight_scope is not None and scope != preflight_scope:
+        fail(f"recorded unit {path} changed scope after teardown preflight; "
+             "refusing to touch it")
+    if scope == "system" and "system-unit" not in (capabilities or ()):
+        fail("artifacts.units contains a system unit but capabilities does not "
+             f"claim 'system-unit' (capabilities={capabilities!r})")
+    if not os.path.lexists(path):
+        return True, scope
+    unit_name = os.path.basename(path)
+    if dry:
+        log(f"[dry] would disable and remove unit {path}")
+        return True, scope
+    # A unit file removed while its service still runs can never be stopped
+    # through the record again, so a failed disable keeps the file (and the
+    # record) in place for the retry.
+    if scope == "user":
+        if _run_command(["systemctl", "--user", "disable", "--now", unit_name],
+                        f"systemctl --user disable --now {unit_name}") != 0:
+            log(f"kept {path} so a re-run can retry the disable")
+            return False, scope
+        try:
+            _remove_plain_path(path, recursive=False)
+        except OSError as exc:
+            log(f"remove {path} failed: {exc}")
+            return False, scope
+    else:
+        if _run_command(["sudo", "systemctl", "disable", "--now", unit_name],
+                        f"sudo systemctl disable --now {unit_name}") != 0:
+            log(f"kept {path} so a re-run can retry the disable")
+            return False, scope
+        if _run_command(["sudo", "rm", "-f", path], f"sudo rm {path}") != 0:
+            return False, scope
+    log(f"removed {path}")
+    return True, scope
+
+
+def _reload_units(scopes: set[str], dry: bool) -> bool:
+    """One daemon-reload per touched scope, after the unit batch. Run (and
+    retried) whenever units are recorded in the scope, even already-absent
+    ones — a reload that failed after the file was removed would otherwise
+    never run again."""
+    ok = True
+    if "user" in scopes:
+        if dry:
+            log("[dry] would run systemctl --user daemon-reload")
+        elif _run_command(["systemctl", "--user", "daemon-reload"],
+                          "systemctl --user daemon-reload") != 0:
+            ok = False
+    if "system" in scopes:
+        if dry:
+            log("[dry] would run sudo systemctl daemon-reload")
+        elif _run_command(["sudo", "systemctl", "daemon-reload"],
+                          "sudo systemctl daemon-reload") != 0:
+            ok = False
+    return ok
+
+
+def _teardown_ports(ports: list[int], active_ports: set[tuple[str, int]], dry: bool,
+                    mappings: dict[str, Any] | None = None) -> bool:
+    ok = True
+    # `mappings is not None`, not `mappings or ...`: a caller that dedupes
+    # mappings across two records (command_teardown, command_remove) can
+    # legitimately end up with an EMPTY dict for one of them (every port it
+    # would have covered was already claimed by the other) — `or` would
+    # treat that the same as "no mappings given" and fall back to sweeping
+    # every raw port as http, reissuing exactly the duplicate off the caller
+    # deduped away.
+    candidate = (mappings if mappings is not None
+                else {str(p): {"mode": "http", "listen": p} for p in ports}).values()
+    for mapping in sorted(candidate, key=lambda m: (m["mode"], m["listen"])):
+        mode, port = mapping["mode"], mapping["listen"]
+        if (mode, port) in active_ports:
+            if dry:
+                log(f"[dry] skipped serve off --{mode}={port} (active)")
+            else:
+                log(f"skipped serve off --{mode}={port} (active)")
+            continue
+        if dry:
+            log(f"[dry] would run sudo tailscale serve --{mode}={port} off")
+            continue
+        result = _run_command(["sudo", "tailscale", "serve", f"--{mode}={port}", "off"],
+                              f"sudo tailscale serve --{mode}={port} off")
+        if result == 0:
+            log(f"removed serve --{mode}={port}")
+        else:
+            ok = False
+    return ok
+
+
+def teardown_artifacts(artifacts: dict[str, list[Any]], active_ports: set[tuple[str, int]], dry: bool,
+                       mappings: dict[str, Any] | None = None, *,
+                       capabilities: list[str] | None) -> bool:
+    # Attempt every artifact (they are independent) and report the aggregate:
+    # any failure means the caller must keep the record, or what is left on
+    # the box would have no record naming it (D6's orphan rule).
+    units = _preflight_teardown_artifacts(artifacts, capabilities)
+    ok = True
+    scopes: set[str] = set()
+    for path, scope in units:
+        unit_ok, scope = _teardown_unit(path, dry, capabilities,
+                                        preflight_scope=scope)
+        ok = unit_ok and ok
+        scopes.add(scope)
+    ok = _reload_units(scopes, dry) and ok
+    for name in ("fragments", "webroot", "files"):
+        for path in artifacts[name]:
+            ok = _remove_artifact_path(str(path), dry) and ok
+    for path in artifacts["rooted"]:
+        ok = _remove_rooted_artifact_path(str(path), dry, capabilities) and ok
+    ok = _teardown_ports([int(port) for port in artifacts["serve_ports"]], active_ports, dry, mappings) and ok
+    return ok
+
+
+def _drop_committed(store: dict[str, Any], app_id: str) -> dict[str, Any]:
+    result = copy.deepcopy(store)
+    entry = result["entries"].get(app_id)
+    if entry is None:
+        return result
+    entry.pop("committed", None)
+    if not entry:
+        result["entries"].pop(app_id, None)
+    return result
+
+
+def _drop_entry(store: dict[str, Any], app_id: str) -> dict[str, Any]:
+    result = copy.deepcopy(store)
+    result["entries"].pop(app_id, None)
+    return result
+
+
+def _removal_order(store: dict[str, Any], destructive_ids: list[str]) -> list[str]:
+    """Return destructive ids in the one reverse-topological removal order.
+
+    A selected entry contributes exactly one dependency snapshot: committed
+    wins over intent, and intent is used only when committed is absent. Any
+    referenced id is retained as a virtual graph node so it can affect the
+    deterministic order even when it has no ledger entry.
+    """
+    graph: dict[str, set[str]] = {app_id: set() for app_id in destructive_ids}
+    indegree: dict[str, int] = {app_id: 0 for app_id in destructive_ids}
+    for app_id in destructive_ids:
+        entry = store["entries"][app_id]
+        record = entry.get("committed") or entry.get("intent")
+        if record is None:
+            fail(f"removal plan has no dependency snapshot for {app_id}")
+        for dependency in record["deps"]:
+            graph.setdefault(dependency, set()).add(app_id)
+            indegree.setdefault(dependency, 0)
+            indegree[app_id] += 1
+
+    selected = set(destructive_ids)
+    ranks = {app_id: (store["entries"][app_id].get("committed") or store["entries"][app_id].get("intent"))["order"]
+             for app_id in destructive_ids}
+    ranked = all(v is not None for v in ranks.values()) and len(set(ranks.values())) == len(ranks)
+    def sort_key(node: str):
+        if not ranked:
+            return os.fsencode(node)
+        return (0, os.fsencode(node)) if node not in selected else (1, ranks[node], os.fsencode(node))
+    ready = sorted((node for node, degree in indegree.items() if degree == 0), key=sort_key)
+    order: list[str] = []
+    while ready:
+        node = ready.pop(0)
+        order.append(node)
+        for dependent in sorted(graph[node], key=os.fsencode):
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                ready.append(dependent)
+        ready.sort(key=sort_key)
+
+    if len(order) != len(graph):
+        unresolved = sorted((node for node, degree in indegree.items() if degree > 0),
+                            key=os.fsencode)
+        names = ", ".join(unresolved)
+        fail("cyclic dependency in removal plan involving "
+             f"{names}; use bin/airlock-teardown <id> for each affected app")
+
+    return [app_id for app_id in reversed(order) if app_id in selected]
+
+
+def _desired_package_map(info: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return packages_from_info(info)
+
+
+def command_plan(store: dict[str, Any], info: dict[str, Any]) -> int:
+    packages = _desired_package_map(info)
+    ids = sorted(set(packages) | set(store["entries"]))
+    refusals: list[str] = []
+    lines: list[tuple[str, str]] = []
+    action_by_id: dict[str, str] = {}
+    for app_id in ids:
+        desired = packages.get(app_id)
+        entry = store["entries"].get(app_id, {})
+        committed = entry.get("committed")
+        intent = entry.get("intent")
+        if desired is not None:
+            if committed is None:
+                action = "fresh"
+            else:
+                path = canonical_package_path(desired)
+                digest = digest_tree(path)
+                if path == committed["path"] and digest == committed["digest"]:
+                    action = "reinstall"
+                elif committed["lifecycle"]["deactivate"]:
+                    action = "upgrade-deactivate"
+                else:
+                    action = "upgrade-diff"
+        elif committed is not None:
+            if committed["lifecycle"]["deactivate"]:
+                action = "remove"
+            else:
+                action = "refuse"
+                refusals.append(app_id)
+        elif intent is not None:
+            action = "teardown-intent"
+        else:
+            continue
+        lines.append((action, app_id))
+
+        action_by_id[app_id] = action
+
+    destructive_ids = [app_id for action, app_id in lines
+                       if action in DESTRUCTIVE_ACTIONS]
+    if destructive_ids:
+        removal_ids = iter(_removal_order(store, destructive_ids))
+        ordered_lines: list[tuple[str, str]] = []
+        for action, app_id in lines:
+            if action in DESTRUCTIVE_ACTIONS:
+                replacement = next(removal_ids)
+                ordered_lines.append((action_by_id[replacement], replacement))
+            else:
+                ordered_lines.append((action, app_id))
+        lines = ordered_lines
+
+    for action, app_id in lines:
+        print(f"{action}\t{app_id}")
+    sys.stdout.flush()
+    for app_id in refusals:
+        log(f"cannot remove {app_id}: no deactivator was recorded; the only exit is bin/airlock-teardown {app_id}")
+    return 3 if refusals else 0
+
+
+def command_intent(store: dict[str, Any], info: dict[str, Any], app_id: str,
+                   active_ports_raw: str | None = None) -> int:
+    packages = _desired_package_map(info)
+    package = packages.get(app_id)
+    if package is None:
+        fail(f"package-info has no configured package {app_id}")
+    record = _intent_record(app_id, package, store)
+    entry_now = store["entries"].get(app_id) or {}
+    old_intent = entry_now.get("intent")
+    result = copy.deepcopy(store)
+    entry = result["entries"].setdefault(app_id, {})
+    entry["intent"] = record
+    # Gate before any destruction: a candidate the write gate would refuse
+    # must fail before the stale cleanup below touches anything.
+    _validate_store(result, ledger_path())
+    if old_intent is not None and (
+            old_intent.get("roots") != record["roots"]
+            or old_intent.get("artifacts_declared") != record["artifacts_declared"]
+            or old_intent.get("serve_port_values") != record["serve_port_values"]
+            # The guard must compare the FULL recorded surface, not just the
+            # P1-era fields (Major C): unit_scopes and serve_mappings carry
+            # information artifacts_declared/serve_port_values do not (which
+            # scope a unit resolves under; which mode/target a port maps
+            # to), so a scope or mode change between two crashed-install
+            # intents used to replace the old record with zero teardown
+            # calls — orphaning an enabled unit (D6's orphan rule broken by
+            # the exact mechanism meant to enforce it) or leaving a stale
+            # off-address with nothing to reclaim it. source_class rides
+            # along as recorded provenance, and capabilities gets its own row
+            # for the same Major C reason: since store v4 it is what the
+            # teardown BELOW is authorized by (teardown_artifacts takes the
+            # OLD intent's list), so two intents that disagree on it are two
+            # different records — deriving it from artifacts_declared would
+            # only cover 'rooted-artifact', never 'system-unit'.
+            or old_intent.get("unit_scopes") != record["unit_scopes"]
+            or old_intent.get("serve_mappings") != record["serve_mappings"]
+            or old_intent.get("source_class") != record["source_class"]
+            or old_intent.get("capabilities") != record["capabilities"]):
+        # The stale intent may have expanded under different roots or
+        # declarations; replacing it would drop the only record naming what
+        # its crashed install already created. Tear down ONLY what neither
+        # the new declaration nor this id's committed record still owns —
+        # the caller's active-ports list keeps live mappings up.
+        protected = {name: list(_intent_artifacts(record)[name])
+                     for name in ARTIFACT_CLASSES}
+        committed_now = entry_now.get("committed")
+        if committed_now is not None:
+            committed_arts = _committed_artifacts(committed_now)
+            for name in ARTIFACT_CLASSES:
+                protected[name] = list(protected[name]) + list(committed_arts[name])
+        # strict_links: this expansion feeds a teardown, so it must refuse a
+        # declaration whose parent chain was redirected after the record.
+        stale = _artifact_difference(_intent_artifacts(old_intent, for_teardown=True),
+                                     protected)
+        stale_active = (parse_active_ports(active_ports_raw, info)
+                        | _recorded_active_ports(store, app_id))
+        # The OLD intent's mappings that the NEW one no longer names, on
+        # (mode, listen) identity — never the NEW record's mappings, which
+        # by construction never cover an entry this sweep is retiring.
+        stale_mappings = _dropped_serve_mappings(old_intent["serve_mappings"], record["serve_mappings"])
+        if not teardown_artifacts(stale, stale_active, is_dry_run(), stale_mappings,
+                                  capabilities=old_intent["capabilities"]):
+            fail(f"stale intent for {app_id} could not be torn down (see above); "
+                 "record kept so a re-run can retry")
+    if is_dry_run():
+        log(f"[dry] would record intent {app_id}")
+    else:
+        write_store(result)
+        log(f"recorded intent {app_id}")
+    print(record["digest"])
+    return 0
+
+
+def command_commit(store: dict[str, Any], info: dict[str, Any], app_id: str,
+                   active_ports_raw: str | None) -> int:
+    packages = _desired_package_map(info)
+    if app_id not in packages:
+        fail(f"package-info has no configured package {app_id}")
+    entry = store["entries"].get(app_id)
+    if not entry or entry.get("intent") is None:
+        fail(f"no intent record for {app_id}")
+    intent = entry["intent"]
+    active_ports = (parse_active_ports(active_ports_raw, info)
+                    | _recorded_active_ports(store, app_id))
+    new_artifacts = _intent_artifacts(intent)
+    _check_commit_conflicts(store, app_id, new_artifacts)
+    # A committed record's unit_scopes maps exactly the RECORDED units (the
+    # D6 "expanded artifact list"), not every declared name — a declared
+    # unit an installer never created (a conditional unit gated on a config
+    # flag, e.g.) is simply absent from artifacts.units, and unit_scopes
+    # must shrink with it or the exact-shape validator would refuse an
+    # otherwise-healthy commit.
+    found_unit_names = {os.path.basename(str(p)) for p in new_artifacts["units"]}
+    committed_unit_scopes = {name: scope for name, scope in intent["unit_scopes"].items()
+                             if name in found_unit_names}
+    committed = {
+        "path": intent["path"],
+        "digest": intent["digest"],
+        "lifecycle": copy.deepcopy(intent["lifecycle"]),
+        "deps": copy.deepcopy(intent["deps"]),
+        "serve_mappings": copy.deepcopy(intent["serve_mappings"]),
+        "unit_scopes": committed_unit_scopes,
+        "order": intent["order"],
+        # The roots snapshot rides into the committed record too (it used to
+        # be dropped here): resolution only (${webroot_parent} for a rooted
+        # pattern, at removal-EXPANSION time) — it confers no removal
+        # authority (Blocker C: execution-time allowlist checks always use
+        # the live environment, never this).
+        "roots": copy.deepcopy(intent["roots"]),
+        "source_class": intent["source_class"],
+        # Carried forward from the intent, NOT re-derived from the artifacts
+        # just above: those are the FOUND set (see the unit_scopes comment),
+        # so a capability whose artifact turned out to be conditional would
+        # vanish from the record teardown later reads.
+        "capabilities": list(intent["capabilities"]),
+        "artifacts": _copy_artifacts(new_artifacts),
+    }
+    result = copy.deepcopy(store)
+    result["entries"][app_id] = {"committed": committed}
+    # Validate the candidate BEFORE the destructive record diff: a store the
+    # write gate would refuse must fail before anything is torn down.
+    _validate_store(result, ledger_path())
+    old_committed = entry.get("committed")
+    if old_committed is not None and not old_committed["lifecycle"]["deactivate"]:
+        old_artifacts = _committed_artifacts(old_committed)
+        diff = _artifact_difference(old_artifacts, new_artifacts)
+        # The OLD committed record's mappings the NEW one no longer names,
+        # on (mode, listen) identity (Major D: a numeric-only port diff
+        # misses a same-listen mode flip entirely) — never the NEW record's
+        # mappings, which by construction never cover an entry the diff is
+        # retiring.
+        diff_mappings = _dropped_serve_mappings(old_committed["serve_mappings"], committed["serve_mappings"])
+        if not teardown_artifacts(diff, active_ports, is_dry_run(), diff_mappings,
+                                  capabilities=old_committed["capabilities"]):
+            # Committing now would drop the only record naming the artifact
+            # that refused to go (D6) — keep old committed + intent; the next
+            # run re-installs and retries this diff.
+            fail(f"record-diff teardown for {app_id} is incomplete (see above); "
+                 "old committed record kept so a re-run can retry")
+    if is_dry_run():
+        log(f"[dry] would commit {app_id}")
+    else:
+        write_store(result)
+        log(f"committed {app_id}")
+    return 0
+
+
+def _refuse_remove(app_id: str) -> int:
+    log(f"refusing to remove {app_id}: no deactivator was recorded; the only exit is bin/airlock-teardown {app_id}")
+    return 3
+
+
+def _deactivator_matches(record: dict[str, Any], app_id: str) -> bool:
+    path = record["path"]
+    if not os.path.isdir(path):
+        return False
+    try:
+        return digest_tree(path) == record["digest"]
+    except LedgerError:
+        return False
+
+
+def _run_deactivator(record: dict[str, Any], app_id: str, dry: bool) -> None:
+    path = record["path"]
+    script = os.path.join(path, "deactivate.sh")
+    if dry:
+        log(f"[dry] would run {script}")
+        return
+    # lstat at the moment of execution: the digest records only a symlink's
+    # TARGET STRING, so a script swapped to a symlink after the digest check
+    # would run unverified external content behind an unchanged digest (D6).
+    try:
+        mode = os.lstat(script).st_mode
+    except OSError as exc:
+        fail(f"deactivator for {app_id} is unreadable: {exc}; ledger retained")
+    if not stat.S_ISREG(mode):
+        fail(f"deactivator for {app_id} is not a regular non-symlink file; "
+             "ledger retained")
+    environment = os.environ.copy()
+    environment["AIRLOCK_ROOT"] = environment.get("AIRLOCK_ROOT") or str(Path(__file__).resolve().parent.parent)
+    environment["AIRLOCK_APP_DIR"] = path
+    environment["AIRLOCK_APP_ID"] = app_id
+    try:
+        result = subprocess.run(["bash", script], cwd=path, env=environment, check=False)
+    except OSError as exc:
+        fail(f"deactivator for {app_id} failed to start: {exc}; ledger retained")
+    if result.returncode != 0:
+        fail(f"deactivator for {app_id} failed with exit {result.returncode}; ledger retained")
+    log(f"deactivator ran for {app_id}")
+
+
+def command_remove(store: dict[str, Any], info: dict[str, Any], app_id: str,
+                   for_upgrade: bool, active_ports_raw: str | None) -> int:
+    entry = store["entries"].get(app_id)
+    if entry is None:
+        fail(f"no ledger entry for {app_id}")
+    committed = entry.get("committed")
+    intent = entry.get("intent")
+    dry = is_dry_run()
+    active_ports = (parse_active_ports(active_ports_raw, info)
+                    | _recorded_active_ports(store, app_id))
+
+    if committed is None:
+        if intent is None:
+            fail(f"no ledger entry for {app_id}")
+        if for_upgrade:
+            log(f"[dry] would keep intent {app_id} for upgrade" if dry else f"kept intent {app_id} for upgrade")
+            return 0
+        intent_artifacts = _intent_artifacts(intent, for_teardown=True)
+        _preflight_teardown_artifacts(intent_artifacts, intent["capabilities"])
+        if not teardown_artifacts(intent_artifacts, active_ports, dry,
+                                  intent["serve_mappings"], capabilities=intent["capabilities"]):
+            fail(f"teardown of intent {app_id} is incomplete (see above); "
+                 "record kept so a re-run can retry")
+        if dry:
+            log(f"[dry] would drop intent {app_id}")
+        else:
+            write_store(_drop_entry(store, app_id))
+            log(f"dropped intent {app_id}")
+        return 0
+
+    if not committed["lifecycle"]["deactivate"] and not for_upgrade:
+        return _refuse_remove(app_id)
+
+    if for_upgrade and not committed["lifecycle"]["deactivate"]:
+        if dry:
+            log(f"[dry] would remove committed record {app_id} for upgrade")
+        else:
+            write_store(_drop_committed(store, app_id))
+            log(f"removed committed record {app_id} for upgrade")
+        return 0
+
+    # Resolve and authorize every record this command may act on before the
+    # deactivator (or any individual teardown) runs.  In-progress upgrades can
+    # leave committed and intent records side by side; a bad second record may
+    # not be discovered after the first record has already mutated the box.
+    committed_artifacts = _committed_artifacts(committed)
+    _preflight_teardown_artifacts(committed_artifacts, committed["capabilities"])
+    intent_artifacts = None
+    if intent is not None and not for_upgrade:
+        intent_artifacts = _intent_artifacts(intent, for_teardown=True)
+        _preflight_teardown_artifacts(intent_artifacts, intent["capabilities"])
+
+    if committed["lifecycle"]["deactivate"] and _deactivator_matches(committed, app_id):
+        _run_deactivator(committed, app_id, dry)
+        ok = teardown_artifacts(committed_artifacts, active_ports, dry,
+                                committed["serve_mappings"], capabilities=committed["capabilities"])
+    else:
+        prefix = "[dry] " if dry else ""
+        log(f"{prefix}deactivator did not run for {app_id}; tearing down recorded artifacts")
+        ok = teardown_artifacts(committed_artifacts, active_ports, dry,
+                                committed["serve_mappings"], capabilities=committed["capabilities"])
+
+    if intent is not None and not for_upgrade:
+        # Dedupe against committed (Minor E): the same (mode, listen) an
+        # intent alongside a committed record both name must get exactly
+        # one off, not two independent attempts from two separate calls.
+        intent_mappings = _dedupe_mappings(committed["serve_mappings"], intent["serve_mappings"])
+        assert intent_artifacts is not None
+        ok = teardown_artifacts(intent_artifacts, active_ports, dry,
+                                intent_mappings, capabilities=intent["capabilities"]) and ok
+    if not ok:
+        fail(f"removal of {app_id} is incomplete (see above); "
+             "ledger record kept so a re-run can retry")
+    if dry:
+        log(f"[dry] would drop committed record {app_id}")
+    else:
+        result = _drop_committed(store, app_id) if for_upgrade else _drop_entry(store, app_id)
+        write_store(result)
+        log(f"dropped committed record {app_id}" if for_upgrade else f"dropped ledger entry {app_id}")
+    return 0
+
+
+def command_teardown(store: dict[str, Any], info: dict[str, Any], app_id: str,
+                     active_ports_raw: str | None) -> int:
+    entry = store["entries"].get(app_id)
+    if entry is None:
+        fail(f"no ledger entry for {app_id}")
+    committed = entry.get("committed")
+    intent = entry.get("intent")
+    if committed is None and intent is None:
+        fail(f"no ledger entry for {app_id}")
+    dry = is_dry_run()
+    active_ports = (parse_active_ports(active_ports_raw, info)
+                    | _recorded_active_ports(store, app_id))
+    # Committed and intent are torn down as two SEPARATE calls, each with its
+    # own record's artifacts and capability list (a committed and an intent
+    # record for the same id could in principle disagree on what was
+    # authorized, if the config changed between them) — but the (mode, listen) mapping set is
+    # deduped ACROSS the two calls first (Minor E), or a port both records
+    # name would get offed twice from two independent calls.
+    committed_artifacts = _committed_artifacts(committed) if committed is not None else None
+    intent_artifacts = (_intent_artifacts(intent, for_teardown=True)
+                        if intent is not None else None)
+    if committed_artifacts is not None:
+        _preflight_teardown_artifacts(committed_artifacts, committed["capabilities"])
+    if intent_artifacts is not None:
+        _preflight_teardown_artifacts(intent_artifacts, intent["capabilities"])
+
+    log(f"{'[dry] ' if dry else ''}platform-performed, no deactivator ran for {app_id}")
+    ok = True
+    intent_mappings = (_dedupe_mappings(committed["serve_mappings"], intent["serve_mappings"])
+                       if committed is not None and intent is not None
+                       else (intent["serve_mappings"] if intent is not None else {}))
+    if committed is not None:
+        assert committed_artifacts is not None
+        ok = teardown_artifacts(committed_artifacts, active_ports, dry,
+                                committed["serve_mappings"], capabilities=committed["capabilities"]) and ok
+    if intent is not None:
+        assert intent_artifacts is not None
+        ok = teardown_artifacts(intent_artifacts, active_ports, dry,
+                                intent_mappings, capabilities=intent["capabilities"]) and ok
+    if not ok:
+        fail(f"teardown of {app_id} is incomplete (see above); "
+             "ledger entry kept so a re-run can retry")
+    if dry:
+        log(f"[dry] would drop ledger entry {app_id}")
+    else:
+        write_store(_drop_entry(store, app_id))
+        log(f"dropped ledger entry {app_id}")
+    return 0
+
+
+def command_list(store: dict[str, Any]) -> int:
+    for app_id in sorted(store["entries"]):
+        entry = store["entries"][app_id]
+        committed = entry.get("committed")
+        intent = entry.get("intent")
+        states = []
+        if committed is not None:
+            states.append("committed")
+        if intent is not None:
+            states.append("intent")
+        record = committed or intent
+        if committed is not None:
+            artifact_count = sum(len(committed["artifacts"][name]) for name in ARTIFACT_CLASSES)
+        else:
+            artifact_count = sum(len(intent["artifacts_declared"][name]) for name in PATH_CLASSES)
+            artifact_count += len(intent["serve_port_values"])
+        print(f"{app_id}\tstate={'+'.join(states)}\tpath={record['path']}"
+              f"\tdigest={record['digest'][:12]}\tartifacts={artifact_count}")
+    return 0
+
+
+def command_audit_lock_override(store: dict[str, Any], info: dict[str, Any],
+                                app_id: str) -> int:
+    """Persist the exceptional admission fact before any package mutation.
+
+    The caller already holds the ledger writer lock. The event records the
+    canonical package-info mismatch fact, but it is not tamper-proof: an actor
+    who can write this owner-controlled ledger can also rewrite its history.
+    A one-way receipt binds finalization to this invocation without pretending
+    the ledger is a security boundary.
+    """
+    if is_dry_run():
+        fail("audit-lock-override is not available during a dry run")
+    packages = info.get("packages") or {}
+    raw = packages.get(app_id)
+    if not isinstance(raw, dict) or raw.get("source_class") != "explicit":
+        fail(f"package-info has no configured explicit package {app_id}")
+    override = raw.get("lock_override")
+    required = {"argument", "recorded_digest", "admitted_digest"}
+    if not isinstance(override, dict) or set(override) != required:
+        fail(f"package-info carries no break-glass lock mismatch for {app_id}")
+    receipt = secrets.token_hex(32)
+    event = {
+        "type": "package-lock-override",
+        "package_id": app_id,
+        "argument": override["argument"],
+        "recorded_digest": override["recorded_digest"],
+        "admitted_digest": override["admitted_digest"],
+        "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "receipt_sha256": hashlib.sha256(receipt.encode()).hexdigest(),
+    }
+    result = copy.deepcopy(store)
+    result["events"].append(event)
+    # Audit must survive a crash before lifecycle mutation begins. Existing
+    # ledger mutations retain their historical atomic-replace contract; this
+    # exceptional pre-mutation barrier additionally requires directory
+    # durability before returning the one-run receipt.
+    write_store(result, require_directory_sync=True)
+    log("DANGEROUS: admitting unverified package lock mismatch: "
+        f"{event['argument']}\n"
+        f"  recorded digest: {event['recorded_digest']}\n"
+        f"  admitted digest: {event['admitted_digest']}")
+    print(receipt)
+    return 0
+
+
+def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
+    if not argv:
+        fail("usage: airlock-ledger "
+             "{plan|intent|commit|remove|teardown|list|audit-lock-override} ...")
+    command = argv[0]
+    if command not in {"plan", "intent", "commit", "remove", "teardown", "list",
+                       "audit-lock-override"}:
+        fail(f"unknown subcommand: {command}")
+    positional: list[str] = []
+    for_upgrade = False
+    active_ports: str | None = None
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--for-upgrade":
+            if command != "remove" or for_upgrade:
+                fail("--for-upgrade is only accepted once by remove")
+            for_upgrade = True
+        elif argument == "--active-ports":
+            if active_ports is not None or index + 1 >= len(argv):
+                fail("--active-ports requires one value")
+            index += 1
+            active_ports = argv[index]
+        elif argument.startswith("--active-ports="):
+            if active_ports is not None:
+                fail("--active-ports is accepted only once")
+            active_ports = argument.split("=", 1)[1]
+        elif argument.startswith("-"):
+            fail(f"unknown option: {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+
+    expected = {"plan": 0, "list": 0, "intent": 1, "commit": 1, "remove": 1,
+                "teardown": 1, "audit-lock-override": 1}[command]
+    if len(positional) != expected:
+        fail(f"usage: airlock-ledger {command}"
+             + (" <id>" if expected else ""))
+    return command, positional[0] if positional else None, for_upgrade, active_ports
+
+
+def main(argv: list[str] | None = None) -> int:
+    command, app_id, for_upgrade, active_ports = parse_cli(list(sys.argv[1:] if argv is None else argv))
+    store = load_store()
+    info = read_package_info()
+    if command == "plan":
+        return command_plan(store, info)
+    if command == "intent":
+        return command_intent(store, info, app_id or "", active_ports)
+    if command == "commit":
+        return command_commit(store, info, app_id or "", active_ports)
+    if command == "remove":
+        return command_remove(store, info, app_id or "", for_upgrade, active_ports)
+    if command == "teardown":
+        return command_teardown(store, info, app_id or "", active_ports)
+    if command == "audit-lock-override":
+        return command_audit_lock_override(store, info, app_id or "")
+    return command_list(store)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except LedgerError as exc:
+        die(str(exc))

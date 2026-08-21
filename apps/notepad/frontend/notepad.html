@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Clip Bridge</title>
+<meta name="apple-mobile-web-app-title" content="Clip Bridge">
+<!-- Icons are generated from the launcher tile — bin/gen-app-icons.py, SoT hub/index.html.
+     Same-origin subpath app: /assets/ is the hub's, copied there by the installer. -->
+<link rel="icon" type="image/svg+xml" href="/assets/app-icons/notepad.svg">
+<link rel="apple-touch-icon" href="/assets/app-icons/notepad.png">
+<style>
+  :root {
+    --bg: #f5f5f7; --surface: #fff; --text: #1d1d1f; --muted: #6e6e73;
+    --line: #d2d2d7; --accent: #0066cc; --warn: #c0392b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #000; --surface: #1c1c1e; --text: #f5f5f7; --muted: #98989d;
+            --line: #38383a; --accent: #2997ff; --warn: #ff6961; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 17px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding: max(env(safe-area-inset-top), 1.5rem) 1.25rem 3rem;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 0.35rem; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 0.95rem; margin: 0 0 1.25rem; }
+  .sub code {
+    font-family: var(--mono); font-size: 0.85em;
+    background: rgba(127, 127, 127, 0.16); padding: 0.05em 0.35em; border-radius: 5px;
+  }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.75rem; }
+  button {
+    font: inherit; font-size: 0.95rem; padding: 0.6rem 0.95rem;
+    min-height: 44px; border: 1px solid var(--line); border-radius: 12px;
+    background: var(--surface); color: var(--text); cursor: pointer;
+    transition: border-color .08s ease, transform .08s ease;
+  }
+  button:hover { border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover { filter: brightness(1.08); }
+  #editor {
+    width: 100%; min-height: 40vh; resize: vertical; padding: 0.9rem;
+    border: 1px solid var(--line); border-radius: 14px;
+    background: var(--surface); color: var(--text);
+    font-family: var(--mono); font-size: 0.95rem; line-height: 1.55;
+  }
+  #editor:focus { outline: none; border-color: var(--accent); }
+  .strip { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
+  .strip .hint { color: var(--muted); font-size: 0.85rem; padding: 0.5rem 0; }
+  .thumb {
+    position: relative; width: 108px; overflow: hidden;
+    border: 1px solid var(--line); border-radius: 12px; background: var(--surface);
+  }
+  .thumb img { display: block; width: 108px; height: 80px; object-fit: cover; }
+  .thumb .lbl {
+    display: block; font-family: var(--mono); font-size: 0.72rem; color: var(--muted);
+    padding: 4px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .thumb .rm {
+    position: absolute; top: 4px; right: 4px; width: 26px; height: 26px; min-height: 0;
+    padding: 0; line-height: 1; border: none; border-radius: 50%;
+    background: rgba(0, 0, 0, 0.55); color: #fff; font-size: 14px;
+  }
+  .thumb.file {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-height: 80px; gap: 4px; padding: 8px 4px;
+  }
+  .thumb.file .ico { font-size: 24px; line-height: 1; }
+  .thumb.file .lbl { width: 100%; text-align: center; }
+  body.drag .wrap { outline: 2px dashed var(--accent); outline-offset: 8px; border-radius: 14px; }
+  .warn { font-size: 0.8rem; color: var(--muted); margin-top: 1.25rem; }
+  .warn b { color: var(--warn); }
+  .warn code { font-family: var(--mono); font-size: 0.9em; }
+  #toast {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); max-width: 90vw;
+    background: var(--text); color: var(--bg); padding: 0.6rem 1rem; border-radius: 12px;
+    font-size: 0.88rem; opacity: 0; pointer-events: none; transition: opacity .2s ease; z-index: 10;
+  }
+  #toast.show { opacity: 0.96; }
+  #toast.err { background: var(--warn); color: #fff; }
+  /* ---- lightbox (zoom) + drawing annotation ---- */
+  .thumb img { cursor: zoom-in; }
+  #lb-overlay { position:fixed; inset:0; z-index:50; display:flex; flex-direction:column;
+    background:rgba(0,0,0,.86); overscroll-behavior:contain; -webkit-touch-callout:none; }
+  .lb-bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px 12px;
+    background:rgba(0,0,0,.35); }
+  .lb-bar .spacer { flex:1 1 auto; }
+  .lb-btn { font:inherit; font-size:.9em; min-height:40px; padding:8px 12px;
+    border-radius:8px; border:1px solid rgba(255,255,255,.35);
+    background:rgba(255,255,255,.08); color:#fff; cursor:pointer; }
+  .lb-btn:hover { border-color:#fff; }
+  .lb-btn.on { background:#fff; color:#111; border-color:#fff; }
+  .lb-btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .lb-btn:disabled { opacity:.45; cursor:not-allowed; }
+  .lb-tools { display:none; }                          /* shown only in draw mode */
+  #lb-overlay.draw .lb-tools { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+  .lb-swatch { width:30px; height:30px; min-height:0; padding:0; border-radius:50%;
+    border:2px solid rgba(255,255,255,.5); cursor:pointer; }
+  .lb-swatch.on { border-color:#fff; box-shadow:0 0 0 2px #111, 0 0 0 4px #fff; }
+  .lb-stage { flex:1 1 auto; min-height:0; display:flex; align-items:center; justify-content:center;
+    overflow:hidden; padding:6px; box-sizing:border-box; }
+  .lb-frame { position:relative; display:inline-flex; max-width:100%; max-height:100%; line-height:0; }
+  .lb-img { display:block; max-width:100%; max-height:100%; object-fit:contain;
+    user-select:none; -webkit-user-select:none; -webkit-user-drag:none; }
+  .lb-canvas { position:absolute; inset:0; width:100%; height:100%; touch-action:none;
+    user-select:none; -webkit-user-select:none; cursor:crosshair; display:none; }
+  #lb-overlay.draw .lb-canvas { display:block; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Clip Bridge</h1>
+  <p class="sub">
+    Write here, then <b>paste</b> a clipboard image (or pick a photo) &mdash; it is saved to
+    <code>~/uploads/</code> and an <code>[imageN]</code> token is inserted. Attach any file
+    (PPTX, PDF, zip, &hellip;) to insert a <code>[fileN]</code> token. Hit <b>Copy</b> and paste into
+    your terminal so an agent can read the files by path.
+  </p>
+  <div class="toolbar">
+    <button id="pasteBtn" class="primary" style="display:none" type="button">Paste from clipboard</button>
+    <button id="pickBtn" type="button">Add photo</button>
+    <button id="filePickBtn" type="button">Attach file</button>
+    <button id="copyBtn" class="primary" type="button">Copy</button>
+    <button id="clearBtn" type="button">Clear</button>
+    <input id="imgInput" type="file" accept="image/*" multiple hidden>
+    <input id="fileInput" type="file" multiple hidden>
+  </div>
+  <textarea id="editor" spellcheck="false" autocorrect="off" autocapitalize="off" autocomplete="off"
+    placeholder="Write here and paste images&#10;e.g. Take a look at this error [image1] — what is causing it?"></textarea>
+  <div class="strip" id="strip">
+    <span class="hint" id="emptyHint">No uploads yet &mdash; paste an image or attach a file and thumbnails appear here.</span>
+  </div>
+  <p class="warn">
+    <b>All uploads (images and files) in <code>~/uploads/</code> are automatically deleted after 24 hours &mdash; no exceptions.</b>
+    This is not permanent storage. Never upload secrets or sensitive data.
+  </p>
+</div>
+<div id="toast"></div>
+<script>
+(function () {
+  var editor = document.getElementById('editor');
+  var strip = document.getElementById('strip');
+  var emptyHint = document.getElementById('emptyHint');
+  var imgInput = document.getElementById('imgInput');
+  var fileInput = document.getElementById('fileInput');
+  var toastEl = document.getElementById('toast');
+
+  var imgMap = new Map();   // "N" -> "~/uploads/imageNNN-....jpg"  (for copy-time token expansion)
+  var fileMap = new Map();  // "N" -> "~/uploads/<name>"
+  var fileSeq = 0;          // client-side [fileN] counter (upload-file returns no n)
+
+  var STORE_KEY = 'airlock.notepad.text';
+  var MAX_SIDE = 2400, MAX_PX = 16777216, QUALITY = 0.9, THUMB_SIDE = 220; // iOS 16Mpx canvas guard + JPEG 90%
+  var MAX_ENCODED = 12 * 1024 * 1024;  // ~12MB guard on the base64 payload
+  var FILE_MAX = 50 * 1024 * 1024;     // matches backend FILE_MAX_BYTES
+
+  var viewMap = new Map();             // "N" -> full-size view dataURL (zoom + drawing source)
+  var DRAW_COLORS = ['#e5484d', '#f5d90a', '#3b82f6', '#ffffff'];
+  var MAX_CANVAS_PX = 16000000, MAX_CANVAS_SIDE = 4096;  // iOS canvas guards
+  var MIN_DIST = 1.4, EXPORT_Q = 0.85;                   // point thinning (px) + annotated JPEG quality
+
+  function toast(msg, isErr) {
+    toastEl.textContent = msg;
+    toastEl.className = 'show' + (isErr ? ' err' : '');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { toastEl.className = ''; }, 2600);
+  }
+
+  // ---- persistence (text only) ----
+  function save() { try { localStorage.setItem(STORE_KEY, editor.value); } catch (e) {} }
+  try { var saved = localStorage.getItem(STORE_KEY); if (saved) editor.value = saved; } catch (e) {}
+  editor.addEventListener('input', save);
+
+  // ---- helpers ----
+  function stripPrefix(dataUrl) {           // "data:...;base64,XXXX" -> "XXXX"
+    var i = dataUrl.indexOf(',');
+    return i >= 0 ? dataUrl.slice(i + 1) : dataUrl;
+  }
+
+  function insertToken(tok) {
+    var s = editor.selectionStart, e = editor.selectionEnd, v = editor.value;
+    var before = v.slice(0, s), after = v.slice(e);
+    var sep = (before && !/\s$/.test(before)) ? ' ' : '';
+    var ins = sep + tok + ' ';
+    editor.value = before + ins + after;
+    var pos = (before + ins).length;
+    editor.selectionStart = editor.selectionEnd = pos;
+    editor.focus();
+    save();
+  }
+
+  // ---- image: decode once, produce upload JPEG + small thumbnail ----
+  function downscaleToJpeg(blob) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      var url = URL.createObjectURL(blob);
+      img.onload = function () {
+        URL.revokeObjectURL(url);
+        var w = img.naturalWidth, h = img.naturalHeight;
+        if (!w || !h) { reject(new Error('empty image')); return; }
+        function render(maxSide, q) {
+          var scale = Math.min(1, maxSide / Math.max(w, h));
+          if (w * h * scale * scale > MAX_PX) scale = Math.min(scale, Math.sqrt(MAX_PX / (w * h)));
+          var cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+          var c = document.createElement('canvas'); c.width = cw; c.height = ch;
+          c.getContext('2d').drawImage(img, 0, 0, cw, ch);
+          return c.toDataURL('image/jpeg', q);
+        }
+        try {
+          resolve({ upload: render(MAX_SIDE, QUALITY), thumb: render(THUMB_SIDE, 0.6) });
+        } catch (e) { reject(new Error('canvas encoding failed')); }
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('image decode failed')); };
+      img.src = url;
+    });
+  }
+
+  function addImgThumb(n, path, thumbUrl) {
+    var d = document.createElement('div'); d.className = 'thumb'; d.dataset.n = n;
+    var im = document.createElement('img'); im.src = thumbUrl; im.alt = 'image ' + n;
+    im.title = 'Click to zoom / annotate';
+    im.addEventListener('click', function () { openViewer(String(n)); });
+    var lb = document.createElement('span'); lb.className = 'lbl'; lb.textContent = '[image' + n + ']'; lb.title = path;
+    var rm = document.createElement('button'); rm.className = 'rm'; rm.type = 'button'; rm.textContent = '×'; rm.title = 'Remove';
+    rm.addEventListener('click', function () { removeImg(n, d); });
+    d.appendChild(im); d.appendChild(lb); d.appendChild(rm);
+    strip.appendChild(d); emptyHint.style.display = 'none';
+  }
+
+  function removeImg(n, d) {
+    imgMap.delete(String(n)); viewMap.delete(String(n)); d.remove();
+    editor.value = editor.value.replace(new RegExp('\\[image' + n + '\\]\\s?', 'g'), '');
+    save();
+    if (!strip.querySelector('.thumb')) emptyHint.style.display = '';
+  }
+
+  // ---- blob -> compress -> upload -> [imageN] token + thumbnail (no token on failure) ----
+  function processImage(blob) {
+    downscaleToJpeg(blob).then(function (out) {
+      var b64 = stripPrefix(out.upload);
+      if (b64.length > MAX_ENCODED) {
+        toast('Image is too large after encoding — try a smaller screenshot or crop it.', true);
+        return;
+      }
+      return fetch('/publish/api/upload-image', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: b64 })
+      }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (res) {
+          if (!res || !res.ok || !res.j.ok) {
+            toast('Upload failed: ' + ((res && res.j && res.j.error) || 'HTTP'), true); return;
+          }
+          var j = res.j;
+          insertToken('[image' + j.n + ']');
+          addImgThumb(j.n, j.path, out.thumb);
+          imgMap.set(String(j.n), j.path);
+          viewMap.set(String(j.n), out.upload);   // full-size source for zoom/annotate
+          toast('[image' + j.n + '] saved -> ' + j.path);
+        });
+    }).catch(function (e) { toast('Error: ' + e.message, true); });
+  }
+
+  // ---- arbitrary file (PPTX/PDF/zip/...) -> ~/uploads, [fileN] token ----
+  function readAsDataURL(blob) {
+    return new Promise(function (resolve, reject) {
+      var r = new FileReader();
+      r.onload = function () { resolve(r.result); };
+      r.onerror = function () { reject(new Error('file read failed')); };
+      r.readAsDataURL(blob);
+    });
+  }
+
+  function addFileChip(n, name, path) {
+    var d = document.createElement('div'); d.className = 'thumb file'; d.dataset.fn = n;
+    var ico = document.createElement('span'); ico.className = 'ico'; ico.textContent = '📎'; // paperclip
+    var lb = document.createElement('span'); lb.className = 'lbl'; lb.textContent = '[file' + n + '] ' + name; lb.title = path;
+    var rm = document.createElement('button'); rm.className = 'rm'; rm.type = 'button'; rm.textContent = '×'; rm.title = 'Remove';
+    rm.addEventListener('click', function () { removeFile(n, d); });
+    d.appendChild(ico); d.appendChild(lb); d.appendChild(rm);
+    strip.appendChild(d); emptyHint.style.display = 'none';
+  }
+
+  function removeFile(n, d) {
+    fileMap.delete(String(n)); d.remove();
+    editor.value = editor.value.replace(new RegExp('\\[file' + n + '\\]\\s?', 'g'), '');
+    save();
+    if (!strip.querySelector('.thumb')) emptyHint.style.display = '';
+  }
+
+  function processFile(file) {
+    if (file.size > FILE_MAX) {
+      toast(file.name + ' is too large (> ' + (FILE_MAX / 1048576 | 0) + 'MB)', true); return;
+    }
+    toast('Uploading ' + file.name + '...');
+    readAsDataURL(file).then(function (dataUrl) {
+      return fetch('/publish/api/upload-file', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: file.name, data: stripPrefix(dataUrl) })
+      }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (res) {
+          if (!res.ok || !res.j.ok) { toast('Upload failed: ' + (res.j.error || 'HTTP'), true); return; }
+          var j = res.j, n = ++fileSeq;
+          insertToken('[file' + n + ']');
+          addFileChip(n, j.name, j.path);
+          fileMap.set(String(n), j.path);
+          toast('[file' + n + '] saved -> ' + j.path);
+        });
+    }).catch(function (e) { toast('Error: ' + e.message, true); });
+  }
+
+  // ---- pick photo (always works — iPad photo library / screenshots) ----
+  document.getElementById('pickBtn').addEventListener('click', function () { imgInput.click(); });
+  imgInput.addEventListener('change', function () {
+    for (var i = 0; i < imgInput.files.length; i++) {
+      if (imgInput.files[i].type.indexOf('image/') === 0) processImage(imgInput.files[i]);
+    }
+    imgInput.value = '';
+  });
+
+  // ---- attach file ----
+  document.getElementById('filePickBtn').addEventListener('click', function () { fileInput.click(); });
+  fileInput.addEventListener('change', function () {
+    for (var i = 0; i < fileInput.files.length; i++) processFile(fileInput.files[i]);
+    fileInput.value = '';
+  });
+
+  // ---- drag & drop (image -> compress path, else file upload) ----
+  ['dragenter', 'dragover'].forEach(function (ev) {
+    document.addEventListener(ev, function (e) { e.preventDefault(); document.body.classList.add('drag'); });
+  });
+  ['dragleave', 'drop'].forEach(function (ev) {
+    document.addEventListener(ev, function (e) {
+      if (ev === 'dragleave' && e.relatedTarget) return;
+      document.body.classList.remove('drag');
+    });
+  });
+  document.addEventListener('drop', function (e) {
+    if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+    e.preventDefault();
+    for (var i = 0; i < e.dataTransfer.files.length; i++) {
+      var f = e.dataTransfer.files[i];
+      if (f.type && f.type.indexOf('image/') === 0) processImage(f); else processFile(f);
+    }
+  });
+
+  // ---- paste event (works on plain HTTP too — primary path) ----
+  editor.addEventListener('paste', function (ev) {
+    var dt = ev.clipboardData || window.clipboardData;
+    if (!dt || !dt.items) return;
+    var handled = false;
+    for (var i = 0; i < dt.items.length; i++) {
+      var it = dt.items[i];
+      if (it.type && it.type.indexOf('image') === 0) {
+        var blob = it.getAsFile();
+        if (blob) { processImage(blob); handled = true; }
+      }
+    }
+    if (handled) ev.preventDefault();   // swallow image paste; plain text pastes through
+  });
+
+  // ---- clipboard button (secure context = HTTPS only) ----
+  var pasteBtn = document.getElementById('pasteBtn');
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.read) {
+    pasteBtn.style.display = '';
+    pasteBtn.addEventListener('click', function () {
+      navigator.clipboard.read().then(function (items) {
+        var found = false, chain = Promise.resolve();
+        items.forEach(function (it) {
+          var type = it.types.find(function (t) { return t.indexOf('image/') === 0; });
+          if (type) { found = true; chain = chain.then(function () { return it.getType(type).then(processImage); }); }
+        });
+        return chain.then(function () { if (!found) toast('No image in clipboard', true); });
+      }).catch(function (e) { toast('Clipboard read failed: ' + e.message, true); });
+    });
+  }
+
+  // ---- copy: expand every [imageN]/[fileN] token to its server path, then copy ----
+  // navigator.clipboard.writeText fails on plain HTTP (non-secure context) — fall back to
+  // a hidden textarea + execCommand('copy'). This fallback is required, not optional.
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea'); ta.value = text;
+    ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.left = '0'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    var ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta); return ok;
+  }
+  function copyText(text) {
+    if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text)
+        .then(function () { return true; })
+        .catch(function () { return fallbackCopy(text); });
+    }
+    return Promise.resolve(fallbackCopy(text));
+  }
+  document.getElementById('copyBtn').addEventListener('click', function () {
+    var text = editor.value
+      .replace(/\[image(\d+)\]/g, function (m, n) { return imgMap.get(n) || m; })
+      .replace(/\[file(\d+)\]/g, function (m, n) { return fileMap.get(n) || m; })
+      .trim();
+    if (!text) { toast('Nothing to copy', true); return; }
+    copyText(text).then(function (ok) {
+      toast(ok ? 'Copied — paste into your terminal' : 'Copy failed — select the text and copy manually', !ok);
+    });
+  });
+
+  // ---- clear (uploaded files stay on the server) ----
+  document.getElementById('clearBtn').addEventListener('click', function () {
+    if (editor.value && !confirm('Clear the note and thumbnails? Uploaded files stay on the server.')) return;
+    closeViewer();
+    editor.value = ''; imgMap.clear(); fileMap.clear(); viewMap.clear(); fileSeq = 0;
+    strip.querySelectorAll('.thumb').forEach(function (el) { el.remove(); });
+    emptyHint.style.display = '';
+    save();
+    editor.focus();
+  });
+
+  // ================= lightbox (zoom) + drawing annotation =================
+  // Single modal instance. lbox != null means the modal is open.
+  var lbox = null;
+
+  function lbBtn(label, aria) {
+    var b = document.createElement('button'); b.type = 'button'; b.className = 'lb-btn';
+    b.textContent = label; if (aria) b.setAttribute('aria-label', aria);
+    return b;
+  }
+
+  function openViewer(n) {
+    var src = viewMap.get(String(n));
+    if (!src) return;
+    closeViewer();                                   // prevent double-open
+    var prevFocus = document.activeElement;
+
+    var overlay = document.createElement('div');
+    overlay.id = 'lb-overlay';
+    overlay.setAttribute('role', 'dialog'); overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', 'View / annotate image ' + n);
+
+    var bar = document.createElement('div'); bar.className = 'lb-bar';
+    var drawToggle = lbBtn('✏️ Draw', 'Start draw mode');
+    var tools = document.createElement('span'); tools.className = 'lb-tools';
+    var penBtn = lbBtn('✏️ Pen', 'Pen'); penBtn.classList.add('on');
+    var eraBtn = lbBtn('🧽 Eraser', 'Eraser');
+    var swatches = DRAW_COLORS.map(function (c, i) {
+      var b = document.createElement('button'); b.type = 'button';
+      b.className = 'lb-swatch' + (i === 0 ? ' on' : '');
+      b.style.background = c; b.setAttribute('aria-label', 'Color ' + (i + 1)); b.title = c;
+      b.addEventListener('click', function () { pickColor(c, b); });
+      return b;
+    });
+    var undoBtn = lbBtn('↶ Undo', 'Undo');
+    var clearDraw = lbBtn('Clear', 'Clear all annotations');
+    var saveBtn = lbBtn('Replace with annotated', 'Replace with annotated'); saveBtn.classList.add('primary');
+    tools.appendChild(penBtn); tools.appendChild(eraBtn);
+    swatches.forEach(function (s) { tools.appendChild(s); });
+    tools.appendChild(undoBtn); tools.appendChild(clearDraw); tools.appendChild(saveBtn);
+    var spacer = document.createElement('span'); spacer.className = 'spacer';
+    var closeBtn = lbBtn('✕', 'Close');
+    bar.appendChild(drawToggle); bar.appendChild(tools); bar.appendChild(spacer); bar.appendChild(closeBtn);
+
+    var stage = document.createElement('div'); stage.className = 'lb-stage';
+    var frame = document.createElement('div'); frame.className = 'lb-frame';
+    var img = document.createElement('img'); img.className = 'lb-img'; img.alt = 'image ' + n; img.src = src;
+    var canvas = document.createElement('canvas'); canvas.className = 'lb-canvas';
+    frame.appendChild(img); frame.appendChild(canvas); stage.appendChild(frame);
+    overlay.appendChild(bar); overlay.appendChild(stage);
+    document.body.appendChild(overlay);
+
+    // body scroll-lock (iOS: position fixed + preserve scrollY)
+    var scrollY = window.scrollY || window.pageYOffset || 0;
+    document.body.style.position = 'fixed'; document.body.style.top = (-scrollY) + 'px';
+    document.body.style.left = '0'; document.body.style.right = '0'; document.body.style.width = '100%';
+
+    lbox = {
+      n: String(n), overlay: overlay, img: img, canvas: canvas, ctx: null,
+      strokes: [], cur: null, mode: 'pen', color: DRAW_COLORS[0], width: 4,
+      scrollY: scrollY, prevFocus: prevFocus, pointerId: null, prev: null, prevMid: null,
+      saving: false, imgReady: !!(img.complete && img.naturalWidth),
+      penBtn: penBtn, eraBtn: eraBtn, saveBtn: saveBtn, undoBtn: undoBtn,
+      clearDraw: clearDraw, swatches: swatches, drawToggle: drawToggle, onKey: null
+    };
+    img.addEventListener('load', function () { if (lbox) lbox.imgReady = true; });
+
+    drawToggle.addEventListener('click', enterDraw);
+    penBtn.addEventListener('click', function () { setMode('pen'); });
+    eraBtn.addEventListener('click', function () { setMode('eraser'); });
+    undoBtn.addEventListener('click', function () { if (lbox) { lbox.strokes.pop(); redrawAll(); } });
+    clearDraw.addEventListener('click', function () { if (lbox) { lbox.strokes = []; redrawAll(); } });
+    saveBtn.addEventListener('click', saveAnnotated);
+    closeBtn.addEventListener('click', closeViewer);
+    // click empty stage to close — view mode only (avoids misfire while drawing)
+    stage.addEventListener('click', function (e) {
+      if (e.target === stage && !overlay.classList.contains('draw')) closeViewer();
+    });
+
+    lbox.onKey = function (e) {
+      if (e.key === 'Escape') { e.preventDefault(); closeViewer(); return; }
+      if (e.key === 'Tab') {                                  // minimal focus trap
+        var f = overlay.querySelectorAll('button:not(:disabled)');
+        if (!f.length) return;
+        var first = f[0], last = f[f.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    };
+    document.addEventListener('keydown', lbox.onKey);
+
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('lostpointercapture', onUp);
+
+    drawToggle.focus();
+  }
+
+  function enterDraw() {
+    if (!lbox || lbox.overlay.classList.contains('draw')) return;
+    if (!lbox.imgReady || !setupCanvas()) { toast('Image still loading — try again in a moment', true); return; }
+    lbox.overlay.classList.add('draw'); lbox.drawToggle.classList.add('on');
+  }
+
+  function setMode(m) {
+    if (!lbox) return;
+    lbox.mode = m;
+    lbox.penBtn.classList.toggle('on', m === 'pen');
+    lbox.eraBtn.classList.toggle('on', m === 'eraser');
+  }
+
+  function pickColor(c, btn) {
+    if (!lbox) return;
+    lbox.color = c; setMode('pen');
+    lbox.swatches.forEach(function (s) { s.classList.remove('on'); });
+    btn.classList.add('on');
+  }
+
+  function setupCanvas() {
+    var nw = lbox.img.naturalWidth, nh = lbox.img.naturalHeight;
+    if (!nw || !nh) return false;
+    var cap = Math.min(1, MAX_CANVAS_SIDE / nw, MAX_CANVAS_SIDE / nh, Math.sqrt(MAX_CANVAS_PX / (nw * nh)));
+    var cw = Math.max(1, Math.round(nw * cap)), ch = Math.max(1, Math.round(nh * cap));
+    lbox.canvas.width = cw; lbox.canvas.height = ch;
+    var ctx = lbox.canvas.getContext('2d', { desynchronized: true });
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    lbox.ctx = ctx; lbox.width = Math.max(3, Math.round(cw / 250));
+    redrawAll();
+    return true;
+  }
+
+  function canvasPoint(e) {                                    // CSS px -> canvas px (no extra DPR mult)
+    var r = lbox.canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * (lbox.canvas.width / (r.width || 1)),
+             y: (e.clientY - r.top) * (lbox.canvas.height / (r.height || 1)) };
+  }
+
+  function applyStyle(ctx, st) {
+    ctx.globalCompositeOperation = st.mode === 'eraser' ? 'destination-out' : 'source-over';
+    ctx.strokeStyle = st.color; ctx.fillStyle = st.color; ctx.lineWidth = st.width;
+  }
+
+  function onDown(e) {
+    if (!lbox || !lbox.ctx || lbox.pointerId !== null || e.isPrimary === false) return;
+    e.preventDefault();
+    lbox.pointerId = e.pointerId;
+    try { lbox.canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    var p = canvasPoint(e);
+    var w = lbox.mode === 'eraser' ? lbox.width * 3 : lbox.width;
+    lbox.cur = { mode: lbox.mode, color: lbox.color, width: w, pts: [p] };
+    lbox.prev = p; lbox.prevMid = p;
+    applyStyle(lbox.ctx, lbox.cur);                           // a single tap shows as a dot
+    lbox.ctx.beginPath(); lbox.ctx.arc(p.x, p.y, w / 2, 0, Math.PI * 2); lbox.ctx.fill();
+  }
+
+  function onMove(e) {
+    if (!lbox || !lbox.ctx || lbox.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    var p = canvasPoint(e), prev = lbox.prev;
+    var dx = p.x - prev.x, dy = p.y - prev.y;
+    if (dx * dx + dy * dy < MIN_DIST * MIN_DIST) return;       // point thinning
+    var mid = { x: (prev.x + p.x) / 2, y: (prev.y + p.y) / 2 };
+    applyStyle(lbox.ctx, lbox.cur);
+    lbox.ctx.beginPath(); lbox.ctx.moveTo(lbox.prevMid.x, lbox.prevMid.y);
+    lbox.ctx.quadraticCurveTo(prev.x, prev.y, mid.x, mid.y); lbox.ctx.stroke();
+    lbox.cur.pts.push(p); lbox.prev = p; lbox.prevMid = mid;
+  }
+
+  function onUp(e) {
+    if (!lbox || lbox.pointerId === null || (e && e.pointerId !== lbox.pointerId)) return;
+    try { lbox.canvas.releasePointerCapture(lbox.pointerId); } catch (err) {}
+    lbox.pointerId = null;
+    if (lbox.cur && lbox.cur.pts.length) lbox.strokes.push(lbox.cur);
+    lbox.cur = null;
+    if (lbox.ctx) lbox.ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function redrawAll() {
+    if (!lbox || !lbox.ctx) return;
+    var ctx = lbox.ctx, cv = lbox.canvas;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    lbox.strokes.forEach(function (st) {
+      applyStyle(ctx, st);
+      var pts = st.pts;
+      if (pts.length === 1) {
+        ctx.beginPath(); ctx.arc(pts[0].x, pts[0].y, st.width / 2, 0, Math.PI * 2); ctx.fill(); return;
+      }
+      var prevMid = pts[0];
+      for (var i = 1; i < pts.length; i++) {                  // same midpoint segments as live
+        var mid = { x: (pts[i - 1].x + pts[i].x) / 2, y: (pts[i - 1].y + pts[i].y) / 2 };
+        ctx.beginPath(); ctx.moveTo(prevMid.x, prevMid.y);
+        ctx.quadraticCurveTo(pts[i - 1].x, pts[i - 1].y, mid.x, mid.y); ctx.stroke();
+        prevMid = mid;
+      }
+      ctx.beginPath(); ctx.moveTo(prevMid.x, prevMid.y);
+      ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y); ctx.stroke();
+    });
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function setBusy(b) {
+    if (!lbox) return;
+    [lbox.saveBtn, lbox.undoBtn, lbox.clearDraw, lbox.penBtn, lbox.eraBtn].forEach(function (el) { if (el) el.disabled = b; });
+    if (lbox.saveBtn) lbox.saveBtn.textContent = b ? 'Replacing…' : 'Replace with annotated';
+  }
+
+  function makeThumb(srcCanvas) {
+    var s = Math.min(1, THUMB_SIDE / Math.max(srcCanvas.width, srcCanvas.height));
+    var tw = Math.max(1, Math.round(srcCanvas.width * s)), th = Math.max(1, Math.round(srcCanvas.height * s));
+    var t = document.createElement('canvas'); t.width = tw; t.height = th;
+    t.getContext('2d').drawImage(srcCanvas, 0, 0, tw, th);
+    return t.toDataURL('image/jpeg', 0.6);
+  }
+
+  function saveAnnotated() {
+    if (!lbox || lbox.saving) return;
+    if (!lbox.ctx) { toast('Tap ✏️ Draw first to add annotations', true); return; }
+    var cv = lbox.canvas;
+    var ex = document.createElement('canvas'); ex.width = cv.width; ex.height = cv.height;
+    var ectx = ex.getContext('2d');
+    var dataUrl = '';
+    try {
+      ectx.drawImage(lbox.img, 0, 0, cv.width, cv.height);     // base + annotations composite
+      ectx.drawImage(cv, 0, 0);
+      dataUrl = ex.toDataURL('image/jpeg', EXPORT_Q);
+    } catch (err) { toast('Compositing failed: ' + err.message, true); return; }
+    if (!dataUrl || dataUrl.length < 32 || dataUrl.indexOf('data:image/jpeg') !== 0) {
+      toast('Export failed (image too large?) — try again', true); return;   // toDataURL "data:," / empty guard
+    }
+    var n = lbox.n;
+    lbox.saving = true; setBusy(true);
+    fetch('/publish/api/upload-image', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: dataUrl })
+    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!lbox) return;
+        lbox.saving = false; setBusy(false);
+        if (!res.ok || !res.j.ok) { toast('Replace failed: ' + (res.j.error || 'HTTP') + ' — your drawing is kept', true); return; }
+        // === swap only after a successful upload (atomic). Keep token N; res.j.n is just the server file number ===
+        imgMap.set(n, res.j.path); viewMap.set(n, dataUrl);
+        var thumbImg = strip.querySelector('.thumb[data-n="' + n + '"] img');
+        if (thumbImg) thumbImg.src = makeThumb(ex);
+        toast('[image' + n + '] replaced with annotated -> ' + res.j.path);
+        closeViewer();
+      }).catch(function (e) {
+        if (!lbox) return;
+        lbox.saving = false; setBusy(false);
+        toast('Replace error: ' + e.message + ' — your drawing is kept', true);
+      });
+  }
+
+  function closeViewer() {
+    if (!lbox) return;
+    var o = lbox.overlay, scrollY = lbox.scrollY || 0, pf = lbox.prevFocus;
+    document.removeEventListener('keydown', lbox.onKey);
+    try { lbox.canvas.width = 0; lbox.canvas.height = 0; } catch (e) {}   // free canvas memory
+    if (o && o.parentNode) o.parentNode.removeChild(o);
+    document.body.style.position = ''; document.body.style.top = '';
+    document.body.style.left = ''; document.body.style.right = ''; document.body.style.width = '';
+    window.scrollTo(0, scrollY);
+    lbox = null;
+    if (pf && pf.focus) { try { pf.focus(); } catch (e) {} }
+  }
+
+  // ---- trigger the 24h cleanup on load (ignore failures) ----
+  fetch('/publish/api/uploads-cleanup').then(function (r) { return r.json(); })
+    .then(function (j) { if (j && j.removed) toast('Cleaned up ' + j.removed + ' old upload(s)'); })
+    .catch(function () {});
+})();
+</script>
+<script src="/airlock-return.js" data-mode="corner" defer></script>
+</body>
+</html>

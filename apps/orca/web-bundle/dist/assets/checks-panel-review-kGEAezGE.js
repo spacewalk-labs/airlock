@@ -1,0 +1,1 @@
+import{v as r}from"./web-index-7YTHIMhi.js";function s(e){return r(e)}function f({hostedReview:e,pr:n,linkedGitLabMR:l,linkedBitbucketPR:t,linkedAzureDevOpsPR:u,linkedGiteaPR:o}){const i=e?.provider==="gitlab"?e:null;return i||(l!==null||t!==null||u!==null||o!==null?null:n?s(n):null)}export{s as g,f as s};

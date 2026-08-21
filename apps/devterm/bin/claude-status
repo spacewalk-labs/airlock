@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""claude-status — report this box's Claude, Codex and xAI login state, read-only.
+
+Runs as the box's user and answers: which account is logged in here, and is it alive?
+
+Secrets never leave: no token values, no hashes — only identity (email/org), expiry
+and health. Identity is not inferred, it is asked of the authoritative source
+(GET /api/oauth/profile, read-only, costs no quota); ~/.claude.json's oauthAccount is
+not refreshed on a swap and is stale.
+
+Output is a single JSON line on stdout (what devterm's gate consumes):
+  claude-status              -> {host, user, ts, live, pool[], codex, xai}
+  claude-status --usage <slot>  -> that one account's state incl. 5h/7d utilization
+                                   (slot = "live" or a pool account name)
+  claude-status --codex-usage   -> the Codex (ChatGPT) subscription's 5h/7d utilization
+  claude-status --xai           -> OpenCode's xAI credential state (never token values)
+"""
+import base64
+import binascii
+import datetime
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+LIVE = os.path.join(HOME, ".claude", ".credentials.json")
+POOL = os.path.join(HOME, ".claude-accounts")
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+CODEX_AUTH = os.path.join(CODEX_HOME, "auth.json")       # Codex (ChatGPT) single account
+XAI_AUTH = os.path.join(HOME, ".local", "share", "opencode", "auth.json")
+CODEX_REAP_GRACE = 0.5                                   # SIGTERM -> SIGKILL grace, seconds
+PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
+USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+
+# Shared binary discovery. This tool is installed to ~/.local/bin as a standalone
+# file, so bin_discovery cannot be a plain sibling import: it is looked for in the
+# repo checkout first (running straight from apps/devterm/bin) and then where the
+# installer stages it. Absence is a broken install, not a condition to degrade
+# around — the whole point of the module is that "not found" gets a reason.
+LIB_DIRS = (os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"),
+            os.path.join(HOME, ".local", "share", "airlock-devterm", "lib"))
+for _d in LIB_DIRS:
+    if os.path.isfile(os.path.join(_d, "bin_discovery.py")):
+        sys.path.insert(0, _d)
+        break
+else:
+    raise SystemExit("claude-status: bin_discovery.py not found (looked in %s) — "
+                     "reinstall the devterm app" % ", ".join(LIB_DIRS))
+import bin_discovery  # noqa: E402
+
+
+def _get(url, token, timeout=8):
+    """Read-only GET (costs no quota). Returns (json|None, err); err='auth' means the
+    token was rejected — a verdict, not a hiccup."""
+    if not token:
+        return None, "no-token"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r), None
+    except urllib.error.HTTPError as e:
+        # 401 = token rejected (dead) / 429 = query throttle (transient, NOT exhausted)
+        # / anything else = transient. Collapsing them kills healthy accounts on a blip.
+        return None, "auth" if e.code == 401 else f"http-{e.code}"
+    except Exception as e:
+        return None, type(e).__name__
+
+
+def _usage(token):
+    """5h/7d utilization %. Exhaustion is judged by utilization only — a 429 is a query
+    throttle, not an exhausted account."""
+    j, err = _get(USAGE_ENDPOINT, token)
+    if err:
+        return {"err": err}
+
+    def pct(o):
+        return round(o["utilization"]) if isinstance(o, dict) and o.get("utilization") is not None else None
+    fh, sd = j.get("five_hour") or {}, j.get("seven_day") or {}
+    return {"use5h": pct(fh), "use7d": pct(sd),
+            "reset5h": fh.get("resets_at"), "reset7d": sd.get("resets_at")}
+
+
+def _oauth(d):
+    return d.get("claudeAiOauth") or d
+
+
+def _profile(token):
+    """Who the token really belongs to. Returns (info|None, err); err='auth' = dead."""
+    j, err = _get(PROFILE_ENDPOINT, token)
+    if err:
+        return None, err
+    acct, org = j.get("account") or {}, j.get("organization") or {}
+    ot = org.get("organization_type", "")
+    return {"email": acct.get("email"), "org": ot,
+            "kind": "team" if ot == "claude_team" else "personal",
+            "tier": org.get("rate_limit_tier")}, None
+
+
+def _describe(path, with_usage=False, is_live=True):
+    """One credential file -> identity + health (never the token itself).
+
+    with_usage is off by default on purpose: it costs one extra usage call per account,
+    and querying live + every pool slot on each status call turns several boxes polling
+    at once into a burst that earns a 429. Usage is asked for one account at a time."""
+    try:
+        creds = json.load(open(path))
+    except Exception as e:
+        return {"state": "unreadable", "reason": f"{type(e).__name__}"}
+    o = _oauth(creds)
+    now = time.time()
+    at_ok = o.get("expiresAt", 0) / 1000 > now
+    rt_left = o.get("refreshTokenExpiresAt", 0) / 1000 - now
+    out = {"atValid": at_ok, "rtDaysLeft": round(rt_left / 86400, 1),
+           "sub": o.get("subscriptionType")}
+    if rt_left <= 0:
+        # refreshToken expired: decidable without asking anyone. Only a re-login helps.
+        out.update(state="dead", reason="refreshToken expired — re-login required")
+        return out
+    if not at_ok:
+        if is_live:
+            # live is Claude Code's to refresh. Refreshing it here would hijack and
+            # break that lineage.
+            out.update(state="stale",
+                       reason="accessToken expired (refreshToken alive — Claude Code renews it)")
+            return out
+        # pool slots have no other refresher, so this box is it. Without this the
+        # accessToken dies after 8h and identity/usage can never be queried again.
+        if not _refresh_pool(path, creds):
+            out.update(state="unknown",
+                       reason="accessToken expired and refresh failed — may be transient")
+            return out
+        out["atValid"] = at_ok = True
+        out["rtDaysLeft"] = round((o.get("refreshTokenExpiresAt", 0) / 1000 - now) / 86400, 1)
+    tok = o.get("accessToken", "")
+    ident, err = _profile(tok)
+    if err == "auth":
+        out.update(state="dead", reason="token rejected (401) — session ended or subscription cancelled")
+        return out
+    if err:
+        out.update(state="unknown", reason=f"lookup failed ({err}) — may be transient")
+        return out
+    out.update(state="ok", **ident)
+    if with_usage:
+        # queried with this box's own token: only numbers leave, never the token.
+        out["usage"] = _usage(tok)
+    return out
+
+
+def _refresh_pool(path, creds):
+    """Revive an expired *pool* slot (True on success).
+
+    Why only pool: refreshTokens rotate, so a lineage may have exactly one refresher.
+      - live: Claude Code refreshes it. Touching it here breaks that lineage. Never.
+      - pool: nobody else refreshes it, so this box is the sole refresher.
+    A rotated token must be saved back immediately, or the next refresh kills the
+    lineage."""
+    o = _oauth(creds)
+    rt = o.get("refreshToken")
+    if not rt:
+        return False
+    body = json.dumps({"grant_type": "refresh_token", "refresh_token": rt,
+                       "client_id": CLIENT_ID}).encode()
+    req = urllib.request.Request(TOKEN_ENDPOINT, data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json",
+                                          "User-Agent": "claude-cli/2.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+    except Exception:
+        return False      # 400/401 = dead, anything else transient; _describe reports state
+    o["accessToken"] = resp["access_token"]
+    if resp.get("refresh_token"):
+        o["refreshToken"] = resp["refresh_token"]
+    if resp.get("expires_in"):
+        o["expiresAt"] = int((time.time() + resp["expires_in"]) * 1000)
+    if resp.get("refresh_token_expires_in"):
+        o["refreshTokenExpiresAt"] = int((time.time() + resp["refresh_token_expires_in"]) * 1000)
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(creds, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)     # persist the rotation — mandatory
+    except OSError:
+        return False
+    return True
+
+
+def _slot_path(slot):
+    """slot='live' -> the live file, otherwise a pool slot. Blocks path escape."""
+    if slot == "live":
+        return LIVE
+    if not slot or "/" in slot or slot.startswith("."):
+        return None
+    p = os.path.join(POOL, slot + ".json")
+    return p if os.path.isfile(p) else None
+
+
+def _jwt_claims(tok):
+    """Decode only the JWT payload segment (no signature check — we read identity
+    claims, we do not trust them for authz). Returns claims only, never the token."""
+    seg = tok.split(".")[1]
+    seg += "=" * (-len(seg) % 4)
+    return json.loads(base64.urlsafe_b64decode(seg))
+
+
+def _codex_status():
+    """This box's Codex (ChatGPT) login, read from auth.json's id_token — no API call.
+    Emits email/plan/account id/last refresh only; never the token or a hash of it.
+    Codex is single-account (no pool, no swap). Health is present/absent — a silently
+    dropped session is not cheaply detectable; the re-login button is the remedy."""
+    if not os.path.isfile(CODEX_AUTH):
+        return {"state": "none", "reason": "not logged in to codex (no auth.json)"}
+    try:
+        d = json.load(open(CODEX_AUTH))
+    except Exception as e:
+        return {"state": "unreadable", "reason": type(e).__name__}
+    mode = d.get("auth_mode")
+    idt = (d.get("tokens") or {}).get("id_token")
+    if not idt:
+        # No id_token = API-key mode or similar: logged in, but no ChatGPT identity.
+        return {"state": "apikey" if d.get("OPENAI_API_KEY") else "unknown", "mode": mode,
+                "reason": "no id_token (API key mode?)"}
+    try:
+        p = _jwt_claims(idt)
+    except Exception:
+        return {"state": "unknown", "mode": mode, "reason": "could not parse id_token"}
+    auth = p.get("https://api.openai.com/auth") or {}
+    return {"state": "ok", "mode": mode, "email": p.get("email"),
+            "plan": auth.get("chatgpt_plan_type"),
+            "accountId": auth.get("chatgpt_account_id"),
+            "lastRefresh": d.get("last_refresh")}
+
+
+def _xai_status():
+    """OpenCode's xAI OAuth credential, reduced to non-secret display metadata.
+
+    ``expires`` is the access-token expiry, not the sign-in lifetime: OpenCode uses
+    the refresh token on demand. We still expose the mechanical past/future state so
+    the UI can explain that a refresh is needed without calling the login dead.
+    """
+    try:
+        with open(XAI_AUTH, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        # A clean OpenCode install has no auth.json yet. That is the normal state in
+        # which Airlock must offer the first Log in action, not an unreadable-store error.
+        return {"state": "none", "reason": "no OpenCode xAI credential"}
+    except Exception as e:
+        return {"state": "err", "reason": type(e).__name__}
+    if not isinstance(data, dict):
+        return {"state": "err", "reason": "auth file is not an object"}
+    if "xai" not in data:
+        return {"state": "none", "reason": "no OpenCode xAI credential"}
+    entry = data.get("xai")
+    valid_expires = (isinstance(entry, dict)
+                     and isinstance(entry.get("expires"), int)
+                     and not isinstance(entry.get("expires"), bool)
+                     and entry.get("expires") >= 0)
+    if (not isinstance(entry, dict) or entry.get("type") != "oauth"
+            or not isinstance(entry.get("access"), str) or not entry.get("access")
+            or not isinstance(entry.get("refresh"), str) or not entry.get("refresh")
+            or not valid_expires):
+        return {"state": "malformed",
+                "reason": "expected OAuth access, refresh and non-negative expires fields"}
+    expires = entry["expires"]
+    return {"state": "expired" if expires <= int(time.time() * 1000) else "ok",
+            "expires": expires}
+
+
+# ---- Codex (ChatGPT) subscription utilization -------------------------------
+# Unlike Claude, there is no usage HTTP endpoint we can call with a token. The numbers
+# live behind the `codex app-server` JSON-RPC interface, so this spawns a short-lived
+# app-server, asks `account/rateLimits/read`, and reaps it. Every failure mode returns
+# the same JSON shape with `err` set — a missing key would make consumers KeyError.
+
+_CODEX_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+_codex_signal_requested = False
+_codex_signal_signo = None
+
+
+def _codex_bin():
+    """Path to the codex executable, or None.
+
+    `which` alone is not enough: a systemd --user unit's PATH usually has neither
+    ~/.local/bin nor ~/.npm-global/bin, so usage collection worked from a login shell
+    and reported "no-bin" as a service. Install location also differs per box (npm
+    global prefix, a local bin, or a node version manager's own tree), and probing
+    only one of them fails *silently* with a perfectly valid auth.json — which reads
+    as "not logged in" instead of "cannot find the binary".
+
+    The three candidates this used to carry missed every version-manager layout, so
+    the candidate list now comes from the shared module rather than from here: one
+    contract, three repos, one corpus (bin-discovery-cases.json)."""
+    return bin_discovery.find_bin("codex")[0]
+
+
+def _codex_empty(err=None):
+    """The error/empty payload. Keeps every key the success payload has (including
+    accountId) — the contract is that failures do not change the shape."""
+    return {"use5h": None, "use7d": None, "reset5h": None, "reset7d": None,
+            "plan": None, "resetCredits": None, "observedAt": None,
+            "err": err, "accountId": None}
+
+
+def _codex_observed_at():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# The one Codex failure that looks like a healthy login: auth.json is present and its
+# id_token still parses, so _codex_status() reports "ok" with an email and a plan — but
+# the refresh token behind it has been revoked (the ChatGPT session that approved the
+# device code logged out, or signed in to another account). Nothing local can see that;
+# only a call that actually spends the credential gets told, and it arrives as an
+# app-server error. So it is classified here, and reported as its own `err` value:
+# "auth" means re-login, every other error means retry.
+_CODEX_AUTH_ERR_RE = re.compile(
+    r"could not be refreshed|sign ?in again|log ?in again|logged out"
+    r"|invalid_grant|unauthenticated|unauthorized", re.I)
+
+
+def _codex_auth_revoked(error):
+    """True when an app-server error means the stored credential is dead."""
+    if not isinstance(error, dict):
+        return False
+    if error.get("code") == 401:
+        return True
+    text = " ".join(str(error.get(k) or "") for k in ("message", "data"))
+    return bool(_CODEX_AUTH_ERR_RE.search(text))
+
+
+def _codex_norm(rate_limits, reset_credits=None):
+    """Normalize app-server rate limits by window length (no IO).
+
+    Windows are identified by duration, not by the "primary"/"secondary" key: which
+    slot holds the 5h vs the 7d window is not guaranteed. An unrecognized duration is
+    reported as such rather than silently mapped to the wrong window."""
+    out = {"use5h": None, "use7d": None, "reset5h": None, "reset7d": None,
+           "plan": (rate_limits.get("planType") if isinstance(rate_limits, dict) else None),
+           "resetCredits": reset_credits, "err": None}
+    if not isinstance(rate_limits, dict):
+        out["err"] = "unsupported"
+        return out
+
+    unknown_window = None
+    recognized_window = False
+    has_value = False
+    for window in (rate_limits.get("primary"), rate_limits.get("secondary")):
+        if not isinstance(window, dict):
+            continue
+        duration = window.get("windowDurationMins")
+        if duration is None:
+            continue
+        if duration == 300:
+            use_key, reset_key = "use5h", "reset5h"
+            recognized_window = True
+        elif duration == 10080:
+            use_key, reset_key = "use7d", "reset7d"
+            recognized_window = True
+        else:
+            if unknown_window is None:
+                unknown_window = duration
+            continue
+
+        used, reset = window.get("usedPercent"), window.get("resetsAt")
+        if used is not None or reset is not None:
+            has_value = True
+        if used is not None:
+            try:
+                out[use_key] = int(round(used))
+            except (TypeError, ValueError, OverflowError):
+                out["err"] = out["err"] or "parse"
+        if reset is not None:
+            try:
+                out[reset_key] = datetime.datetime.fromtimestamp(
+                    reset, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (TypeError, ValueError, OverflowError, OSError):
+                out["err"] = out["err"] or "parse"
+
+    if unknown_window is not None:
+        out["err"] = f"unknown-window-{unknown_window}"
+    elif not recognized_window or not has_value:
+        out["err"] = out["err"] or "unsupported"
+    return out
+
+
+def _codex_select_rate_limits(result):
+    """Pick the codex limit out of the response, tolerating both response shapes
+    (`rateLimits` flat, or `rateLimitsByLimitId` as a dict or a list)."""
+    if "rateLimitsByLimitId" not in result:
+        return result.get("rateLimits")
+    by_limit_id = result["rateLimitsByLimitId"]
+    if isinstance(by_limit_id, dict):
+        if by_limit_id.get("limitId") == "codex":
+            return by_limit_id
+        for limit_id, value in by_limit_id.items():
+            if limit_id == "codex" and isinstance(value, dict):
+                return value
+            if isinstance(value, dict) and value.get("limitId") == "codex":
+                return value
+    elif isinstance(by_limit_id, list):
+        for value in by_limit_id:
+            if isinstance(value, dict) and value.get("limitId") == "codex":
+                return value
+    return None
+
+
+def _codex_reap(proc, pgid):
+    """Terminate the dedicated app-server process group and reap the parent. The child
+    is started in its own session, so killing the group takes its children with it —
+    otherwise a hung app-server survives this process and leaks."""
+    if proc is None or pgid is None:
+        return
+    for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+        try:
+            if stream is not None:
+                stream.close()
+        except (OSError, ValueError):
+            pass
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=CODEX_REAP_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ChildProcessError):
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait()
+    except (OSError, ChildProcessError):
+        pass
+
+
+def _codex_signal_handler(signum, _frame):
+    """Record the intent to exit only; the actual reap happens in one place (finally),
+    so a signal arriving mid-spawn cannot leave an orphaned process group behind."""
+    global _codex_signal_requested, _codex_signal_signo
+    _codex_signal_requested = True
+    if _codex_signal_signo is None:
+        _codex_signal_signo = signum
+
+
+def _codex_usage():
+    """Read the Codex subscription's utilization. Every failure returns JSON with err."""
+    binary = _codex_bin()
+    if not binary:
+        return _codex_empty("no-bin")
+    if not os.path.isfile(CODEX_AUTH):
+        return _codex_empty("no-auth")
+    try:
+        with open(CODEX_AUTH, encoding="utf-8") as f:
+            auth = json.load(f)
+    except FileNotFoundError:
+        return _codex_empty("no-auth")
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return _codex_empty("parse")
+
+    tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    id_token = tokens.get("id_token") if isinstance(tokens, dict) else None
+    if not id_token:
+        return _codex_empty("apikey")
+
+    account_id = None
+    identity_err = None
+    try:
+        claims = _jwt_claims(id_token)
+        auth_claims = claims.get("https://api.openai.com/auth") or {}
+        if not isinstance(claims, dict) or not isinstance(auth_claims, dict):
+            raise TypeError("invalid id token claims")
+        account_id = auth_claims.get("chatgpt_account_id")
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError,
+            UnicodeError, binascii.Error):
+        identity_err = "parse"
+
+    out = _codex_empty(identity_err)
+    out["accountId"] = account_id
+    child_env = os.environ.copy()
+    child_env.pop("OPENAI_API_KEY", None)   # force the ChatGPT subscription path
+    proc = pgid = response = rpc_err = None
+    parse_err = timed_out = reap_done = False
+    protocol = (
+        '{"id":1,"method":"initialize","params":{"clientInfo":'
+        '{"name":"airlock-devterm","version":"1.0"}}}\n'
+        '{"method":"initialized"}\n'
+        '{"id":2,"method":"account/rateLimits/read","params":null}\n'
+    )
+    previous_handlers = {}
+    signal_mask = None
+    global _codex_signal_requested, _codex_signal_signo
+    _codex_signal_requested = False
+    _codex_signal_signo = None
+    try:
+        for signum in _CODEX_SIGNALS:
+            previous_handlers[signum] = signal.signal(signum, _codex_signal_handler)
+        # Block the signals across the spawn: a signal landing between Popen and the
+        # pgid assignment would leave a group nobody can reap.
+        signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _CODEX_SIGNALS)
+        try:
+            proc = subprocess.Popen(
+                [binary, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, env=child_env, cwd="/tmp",
+                start_new_session=True)
+            pgid = proc.pid
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, signal_mask)
+            signal_mask = None
+        if proc.stdin is None or proc.stdout is None:
+            parse_err = True
+        else:
+            proc.stdin.write(protocol)
+            proc.stdin.flush()
+            fd = proc.stdout.fileno()
+            deadline = time.monotonic() + 12
+            buffer = b""
+            while response is None and rpc_err is None:
+                if _codex_signal_requested:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                readable, _, _ = select.select([fd], [], [], min(remaining, 0.2))
+                if _codex_signal_requested:
+                    break
+                if not readable:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    parse_err = True
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw_line, buffer = buffer.split(b"\n", 1)
+                    try:
+                        message = json.loads(raw_line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        parse_err = True
+                        continue
+                    if not isinstance(message, dict):
+                        parse_err = True
+                        continue
+                    if message.get("id") != 2:
+                        continue          # notifications and the initialize reply
+                    error = message.get("error")
+                    if error is not None:
+                        code = error.get("code") if isinstance(error, dict) else None
+                        rpc_err = "auth" if _codex_auth_revoked(error) else "rpc-" + str(code)
+                    else:
+                        response = message
+                    break
+    except (FileNotFoundError, PermissionError, OSError):
+        out["err"] = "no-bin" if proc is None else "parse"
+    except (AttributeError, BrokenPipeError, TypeError, UnicodeError, ValueError):
+        parse_err = True
+    finally:
+        reap_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _CODEX_SIGNALS)
+        try:
+            if not reap_done:
+                _codex_reap(proc, pgid)
+                reap_done = True
+            pending = signal.sigpending()
+            requested_signo = _codex_signal_signo if _codex_signal_requested else None
+            if requested_signo is None:
+                requested_signo = next((s for s in _CODEX_SIGNALS if s in pending), None)
+            if requested_signo is not None:
+                # Restore the default disposition only after the reap, then re-raise the
+                # signal while it is still blocked: no re-entry, no faked exit code.
+                signal.signal(requested_signo, signal.SIG_DFL)
+            for signum, previous in previous_handlers.items():
+                if signum != requested_signo:
+                    signal.signal(signum, previous)
+            if requested_signo is not None:
+                os.kill(os.getpid(), requested_signo)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, reap_mask)
+
+    if out["err"] == "no-bin":
+        return out
+    if timed_out:
+        out["err"] = "timeout"
+        return out
+    if rpc_err is not None:
+        out["err"] = rpc_err
+        return out
+    if response is None:
+        out["err"] = "parse"
+        return out
+    result = response.get("result")
+    if not isinstance(result, dict):
+        out["err"] = "parse"
+        return out
+    reset_credits = None
+    credit_info = result.get("rateLimitResetCredits")
+    if isinstance(credit_info, dict):
+        reset_credits = credit_info.get("availableCount")
+    normalized = _codex_norm(_codex_select_rate_limits(result), reset_credits)
+    # If the update overwrote identity_err, a null accountId would look like a success.
+    # Only restore the prior err when normalization did not report one of its own.
+    prior_err = out["err"]
+    out.update(normalized)
+    if out["use5h"] is not None or out["use7d"] is not None:
+        out["observedAt"] = _codex_observed_at()
+    if out["err"] is None:
+        out["err"] = prior_err
+    if out["err"] is None and parse_err:
+        out["err"] = "parse"
+    return out
+
+
+def main():
+    # `--usage <slot>` asks for *one* account's usage, at the moment it is requested.
+    # Without it no usage call is made at all.
+    args = sys.argv[1:]
+    if "--codex-usage" in args:
+        json.dump(_codex_usage(), sys.stdout, ensure_ascii=False)
+        print(); return
+    if "--xai" in args:
+        json.dump(_xai_status(), sys.stdout, ensure_ascii=False)
+        print(); return
+    if "--usage" in args:
+        i = args.index("--usage")
+        slot = args[i + 1] if len(args) > i + 1 else "live"
+        p = _slot_path(slot)
+        if not p:
+            json.dump({"error": f"no such account: {slot}"}, sys.stdout, ensure_ascii=False)
+            print(); return
+        json.dump(dict(slot=slot, **_describe(p, with_usage=True, is_live=(slot == "live"))),
+                  sys.stdout, ensure_ascii=False)
+        print(); return
+
+    r = {"host": os.uname().nodename, "user": os.environ.get("USER") or "?",
+         "ts": int(time.time()),
+         "hasClaudeSwitch": bool(shutil.which("claude-switch"))}
+    r["live"] = _describe(LIVE) if os.path.isfile(LIVE) else {
+        "state": "none", "reason": "never logged in (no live credential)"}
+    # The .active slot is the same account as live, but its pool copy is a snapshot from
+    # swap time: once Claude Code refreshed live, that copy's refreshToken is already
+    # rotated away. Refreshing with it would fail and show a healthy account as
+    # "unknown" — so for the active slot we report live as-is.
+    try:
+        active = open(os.path.join(POOL, ".active")).read().strip()
+    except OSError:
+        active = None
+    pool = []
+    if os.path.isdir(POOL):
+        for f in sorted(os.listdir(POOL)):
+            if not f.endswith(".json") or f.startswith("."):
+                continue
+            slot = f[:-5]
+            if slot == active and r["live"].get("state") in ("ok", "stale"):
+                pool.append(dict(r["live"], slot=slot, isActive=True))
+            else:
+                pool.append(dict(slot=slot,
+                                 **_describe(os.path.join(POOL, f), is_live=False)))
+    r["pool"] = pool
+    r["codex"] = _codex_status()
+    r["xai"] = _xai_status()
+    json.dump(r, sys.stdout, ensure_ascii=False)
+    print()
+
+
+if __name__ == "__main__":
+    main()

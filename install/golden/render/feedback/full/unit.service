@@ -1,0 +1,24 @@
+[Unit]
+Description=airlock feedback — suggestion-box relay (127.0.0.1:19400)
+After=network.target
+
+[Service]
+Type=simple
+# Optional secret (the intake token) — safe if the file is absent.
+EnvironmentFile=-%h/.config/airlock-feedback.env
+Environment=AIRLOCK_FEEDBACK_BACKEND_PORT=19400
+Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
+Environment=AIRLOCK_FEEDBACK_INTAKE_URL=https://intake.example.com/hook
+Environment=AIRLOCK_FEEDBACK_TOKEN_ENV=AIRLOCK_FEEDBACK_TOKEN
+Environment=AIRLOCK_FEEDBACK_MAIL_TO=ops@example.com
+# Quoted: a display-name from-address ("Name <a@b>") contains spaces, and systemd
+# would otherwise split it into two assignments.
+Environment="AIRLOCK_FEEDBACK_MAIL_FROM=Airlock <noreply@example.com>"
+Environment=AIRLOCK_FEEDBACK_MAIL_API=https://api.resend.com/emails
+Environment=AIRLOCK_FEEDBACK_MAIL_KEY_ENV=RESEND_API_KEY
+ExecStart=/usr/bin/python3 ROOT/apps/feedback/backend/airlock-feedback.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

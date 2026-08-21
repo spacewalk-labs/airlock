@@ -1,0 +1,16 @@
+[Unit]
+Description=airlock — periodic provider credential freshness check
+
+[Timer]
+OnCalendar=@ONCALENDAR@
+# Persistent=true is the difference between "runs every few hours" and "runs every few
+# hours on a machine that is never suspended". Without it a box that was asleep at the
+# scheduled moment simply skips, silently — and a skipped expiry check is indistinguish-
+# able from a passing one, which is the exact failure this timer exists to end.
+Persistent=true
+# The check is cheap, but a fleet-wide simultaneous wake is still a herd. Small, because
+# the warning threshold is measured in hours and a few minutes of spread costs nothing.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

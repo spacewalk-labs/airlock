@@ -1,0 +1,50 @@
+/* markwand highlight.js theme — aligned with the design tokens (markwand-tokens.css),
+   auto light/dark/system. The parent page colours code with hljs.highlight() and
+   injects the static markup into a sandboxed srcdoc; this CSS paints the colours.
+   Colours map span classes -> --syn-* variables; only the variables swap per theme. */
+
+:root, :root[data-theme="light"] {
+  --syn-kw:   #b5006b;  /* keyword / literal — magenta */
+  --syn-str:  #0a7a4a;  /* string — green (readable on the beige surface) */
+  --syn-num:  #a15c00;  /* number / bullet — amber */
+  --syn-key:  #1560b0;  /* attr (key) / title / tag — blue */
+  --syn-var:  #7a3fb0;  /* variable / symbol / regexp — purple */
+  --syn-cmt:  #8a8f98;  /* comment — grey */
+  --syn-pun:  #6b7280;  /* punctuation — muted grey */
+}
+:root[data-theme="dark"] {
+  --syn-kw:   #ff7ab2;
+  --syn-str:  #5fd7a0;
+  --syn-num:  #e0a458;
+  --syn-key:  #79b8ff;
+  --syn-var:  #c9a9ff;
+  --syn-cmt:  #8b949e;
+  --syn-pun:  #8b949e;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --syn-kw:   #ff7ab2;
+    --syn-str:  #5fd7a0;
+    --syn-num:  #e0a458;
+    --syn-key:  #79b8ff;
+    --syn-var:  #c9a9ff;
+    --syn-cmt:  #8b949e;
+    --syn-pun:  #8b949e;
+  }
+}
+
+.hljs { color: var(--text); background: transparent; }
+
+.hljs-comment, .hljs-quote { color: var(--syn-cmt); font-style: italic; }
+.hljs-keyword, .hljs-literal, .hljs-selector-tag, .hljs-section, .hljs-doctag,
+.hljs-type, .hljs-built_in { color: var(--syn-kw); }
+.hljs-string, .hljs-addition, .hljs-meta-string, .hljs-template-tag { color: var(--syn-str); }
+.hljs-number, .hljs-bullet { color: var(--syn-num); }
+.hljs-attr, .hljs-attribute, .hljs-title, .hljs-name, .hljs-tag,
+.hljs-selector-id, .hljs-selector-class, .hljs-title.function_ { color: var(--syn-key); }
+.hljs-variable, .hljs-template-variable, .hljs-symbol, .hljs-regexp, .hljs-link,
+.hljs-meta { color: var(--syn-var); }
+.hljs-punctuation { color: var(--syn-pun); }
+.hljs-deletion { color: var(--color-danger, #d33); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }

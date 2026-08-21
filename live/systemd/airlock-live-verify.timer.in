@@ -1,0 +1,16 @@
+[Unit]
+Description=airlock — weekly full-tree install on a disposable container
+
+[Timer]
+OnCalendar=@ONCALENDAR@
+# Persistent=true is the difference between "runs weekly" and "runs weekly on a
+# machine that is never off". Without it a box that was down at the scheduled
+# moment simply skips the week, silently, and the first sign is a stale heartbeat
+# somebody notices later.
+Persistent=true
+# The runs are not free — each one creates a container on a shared host. Spreading
+# them keeps a fleet-wide Monday morning from becoming a thundering herd.
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

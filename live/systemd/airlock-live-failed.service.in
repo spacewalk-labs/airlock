@@ -1,0 +1,14 @@
+[Unit]
+Description=airlock — the weekly verification failed, say so
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=@ENVFILE@
+# `gh issue comment` resolves which repository it means from the working
+# directory. Without this the unit runs from / and every alarm silently failed to
+# post — found by firing the alarm on purpose, which is the entire argument for
+# firing it on purpose. The local marker was written either way, which is why the
+# two jobs are ordered the way they are in alarm.sh.
+WorkingDirectory=@REPO@
+ExecStart=/bin/bash @REPO@/live/alarm.sh

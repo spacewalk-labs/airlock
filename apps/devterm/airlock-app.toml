@@ -1,0 +1,106 @@
+contract = 1
+id = "devterm"
+
+# Transcribed from the former APP_DEFAULTS["devterm"] entry.
+# D-DEVTERM-9900 retired public_port/redirect_port. HTTPS only.
+[config.defaults]
+https_port = 8443
+gate_port = 9910
+ttyd_port = 9911
+backend_port = 9912
+font_size = 15
+lang = "C.UTF-8"
+accounts = false
+xai = false
+remote_hosts = ""
+secret_ttl_sec = 1800
+# empty = use the account tools bundled with the devterm app
+claude_switch = ""
+claude_status = ""
+fleet_store = ""
+fleet_store_url = ""
+orca_shim = ""
+
+# Transcribed from install/prerequisites.tsv's seven devterm rows (F11).
+[[prerequisites]]
+command = "tmux"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y tmux"
+note = "Session runtime"
+
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Gate runtime"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Release download"
+
+[[prerequisites]]
+command = "sha256sum"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y coreutils"
+note = "Release verification"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User services"
+
+[[prerequisites]]
+command = "tailscale"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get install -y curl && curl -fsSL https://tailscale.com/install.sh | sh"
+note = "Private ingress"
+
+[[prerequisites]]
+command = "sudo"
+predicate = "present"
+expected = "-"
+fix = "su -c 'apt-get update && apt-get install -y sudo'"
+note = "Privileged ingress setup"
+
+# Appendix: two user units, one servers.d fragment, ttyd + the devterm shell
+# wrapper + the account-switch tools (claude-switch when accounts=true;
+# claude-status when accounts=true or xai=true, same "declared unconditionally so
+# the ledger can reclaim it if it exists" reasoning as publish's mode-gated
+# fragment) + the web client's staged share dir. That share dir also holds
+# lib/bin_discovery.py, the shared binary-lookup module the two account tools
+# import — they are installed to ~/.local/bin as standalone files and cannot
+# reach the copy in the repo, so it is staged inside the directory the ledger
+# already owns rather than declared as a fourth entry. Deliberately NOT declared
+# (retained operator data): ~/.config/airlock-devterm/tabs.json (user tabs).
+# serve_ports/[serve.https]: HTTPS only. D-DEVTERM-9900 retired the
+# plaintext 9900 mapping (board 0ff93d05). Live close is a later step.
+[artifacts]
+units = ["airlock-devterm.service", "airlock-devterm-gate.service"]
+fragments = ["servers.d/devterm.conf"]
+files = ["~/.local/bin/ttyd", "~/.local/bin/devterm-shell",
+         "~/.local/bin/claude-switch", "~/.local/bin/claude-status",
+         "~/.local/share/airlock-devterm/"]
+serve_ports = ["https_port"]
+
+[serve.https]
+https_port = "gate_port"
+
+# From hub/index.html's APPS table (devterm row).
+[tile]
+label = "DevTerm"
+sub = "web shell"
+cat = "coding"
+glyph = "app-devterm"
+
+[audience]
+supported = ["owner"]
+default = "owner"

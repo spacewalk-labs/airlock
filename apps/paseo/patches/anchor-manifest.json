@@ -1,0 +1,91 @@
+{
+  "paseo_version": "0.2.5",
+  "web_ui": {
+    "version": "@getpaseo/cli@0.2.5 (index-55db56b9)",
+    "sha256": "435dff4ee752a352ee81ff1eae02338163455b2f7e9b605f1ef30967007ce28c",
+    "general_only_sha256": "6cc40f4d39f1bd9a65234c360b134ee6342afd2ac877586e3f61ee35d81a6eff",
+    "browse_only_sha256": "769e57f5fbdc31a9a8bbcf32ee8de6602c61f1705102f7e7ff5d9ebbd733117a",
+    "combined_sha256": "c74929516273d623698ab4646a5ffa826af35edfc714e0997e1ef4581eb5dfe2",
+    "three_anchor_browse_only_sha256": "8a31b87021fc2e0b70b8b2009fd7bf19bd9da89f4ae0c86af2353ae5e1bcb6b9",
+    "three_anchor_combined_sha256": "fa7c2470a1040b886125c5a58ed53b87e0c222b3b6a73f3a81588d502f75540f"
+  },
+  "patches": [
+    {
+      "id": "depth4-search",
+      "source": "apps/paseo/install.sh",
+      "anchors": [
+        "confidentResultScanThreshold: searchesWorkspace ? undefined : 5000,"
+      ]
+    },
+    {
+      "id": "claude-model-prune",
+      "source": "apps/paseo/patches/claude-model-prune.mjs",
+      "anchors": [
+        "export const CLAUDE_MODEL_MANIFEST = [",
+        "\\n];"
+      ]
+    },
+    {
+      "id": "provider-subagent-stream-filter",
+      "source": "apps/paseo/patches/provider-subagent-stream-filter.mjs",
+      "paired_with": "patch-web-ui:subagent-stream",
+      "anchors": [
+        "    supportsForSource(capability, source) {",
+        "const BRANCH_ANCHOR = lines("
+      ]
+    },
+    {
+      "id": "image-attachments-persist",
+      "source": "apps/paseo/patches/image-attachments-persist.mjs",
+      "anchors": [
+        "import { randomUUID } from \"node:crypto\";",
+        "function isImageMimeType(value) {",
+        "                else if (chunk.type === \"image\") {"
+      ]
+    },
+    {
+      "id": "orphan-process-guard",
+      "source": "apps/paseo/patches/orphan-process-guard.mjs",
+      "anchors": [
+        "this.query = null;",
+        "this.childProcess = null;",
+        "    async ensureQuery() {",
+        "        this.client = null;",
+        "    async connect() {"
+      ]
+    },
+    {
+      "id": "orphan-process-group",
+      "source": "apps/paseo/patches/orphan-process-group.mjs",
+      "requires": ["orphan-process-guard"],
+      "anchors": [
+        "    async terminateLiveChildren(reason) {",
+        "            else if (result === \"already-exited\") {",
+        "                signal: spawnOptions.signal,",
+        "                stdio: [\"pipe\", \"pipe\", \"pipe\"],",
+        "        if (result === \"kill-timeout\") {"
+      ]
+    },
+    {
+      "id": "credential-key-preservation",
+      "source": "apps/paseo/patches/credential-key-preservation.mjs",
+      "anchors": [
+        "    async saveClaudeCredentials(credPath, oauth) {",
+        "            const existing = ClaudeCredentialsSchema.parse(JSON.parse(await fs.readFile(credPath, \"utf8\")));",
+        "    async saveCodexAuth(authPath, original, refreshed) {",
+        "                    ...original.tokens,"
+      ]
+    },
+    {
+      "id": "patch-web-ui",
+      "source": "apps/paseo/browse-host/bin/patch-web-ui.js",
+      "anchors": [
+        "return\"agent\"===l?.kind?[l.agentId]:[]",
+        "if(!Ye||!(0,Be.getIsElectron)())return;e?.paneId&&at(Ye,e.paneId);const{browserId:t}=(0,le.createWorkspaceBrowser)()",
+        "if(!Ye||!(0,Be.getIsElectron)())return;const{browserId:t}=(0,le.createWorkspaceBrowser)({initialUrl:e})",
+        "{style:u.container,children:[S,_,I]})",
+      ",isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l,"
+      ]
+    }
+  ]
+}

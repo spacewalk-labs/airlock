@@ -1,0 +1,15 @@
+# First-boot installer oneshot for the EXPERIMENTAL Docker image.
+# Runs after the network is up; pulls TS_AUTHKEY etc. from the compose env file.
+[Unit]
+Description=Airlock first-boot installer
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/airlock/firstboot.env
+ExecStart=/usr/local/sbin/airlock-firstboot.sh
+
+[Install]
+WantedBy=multi-user.target

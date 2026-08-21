@@ -1,0 +1,33 @@
+[Unit]
+Description=airlock — weekly full-tree install on a disposable container
+Documentation=file:@REPO@/live/README.md
+# The failure handler is a separate unit rather than a line in this one: a run that
+# dies takes this service's ExecStart with it, and anything that had to run inside
+# it would die too. OnFailure= is started by systemd after this unit has already
+# failed, which is the only version of "raise an alarm" that survives the failure.
+OnFailure=airlock-live-failed.service
+
+[Service]
+Type=oneshot
+# A non-interactive SSH session gets a reduced PATH, and a timer-driven one gets
+# less than that. Absolute paths for anything the harness shells out to, and the
+# PATH stated here rather than inherited — a fleet lesson with its own entry, from
+# jobs that worked by hand and did nothing on schedule.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The unattended run verifies what ships, so it advances the checkout to the default
+# branch first (fast-forward only; verify.sh refuses rather than guessing). A person
+# running the same script against a branch before merging leaves this unset, because
+# there the tree under test is the point. Without it this timer spent its life
+# verifying whatever was last left in @REPO@ — 10 commits behind on 2026-08-17, two of
+# which had changed this system itself (#152).
+Environment=AIRLOCK_LIVE_UPDATE=1
+EnvironmentFile=@ENVFILE@
+WorkingDirectory=@REPO@
+ExecStart=/bin/bash @REPO@/live/verify.sh
+# One run measured at roughly six minutes end to end. An hour is not an estimate of
+# how long it should take, it is the point past which something is wrong and the
+# job should stop holding the slot.
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=default.target

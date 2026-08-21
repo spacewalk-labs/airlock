@@ -1,0 +1,18 @@
+[Unit]
+Description=airlock code-server slot %i — browser IDE engine
+After=network.target
+
+[Service]
+Environment=AIRLOCK_CS_BACKEND_BASE=19099
+# Only slots 1..1 are allowed — a rogue instance (out of range) is a clean skip.
+ExecCondition=/bin/sh -c 'case %i in 1) exit 0;; *) exit 1;; esac'
+ExecStart=%h/.local/bin/airlock-code-server-slot %i
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=2048
+LimitNOFILE=1048576
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

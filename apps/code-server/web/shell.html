@@ -1,0 +1,1045 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<title>code-server</title>
+<meta name="apple-mobile-web-app-title" content="code-server">
+<!-- Tab-bar shell favicon, generated from the launcher tile by bin/gen-app-icons.py
+     (SoT hub/index.html) — do not hand-edit the URI below; re-run the generator.
+     It stays an inline data URI because this gate serves shell.html as one static
+     file and 204s /favicon.ico: there is no second request to answer, which is also
+     why the shell has no apple-touch-icon (iOS needs a real PNG URL).
+     [branding] icon_ring re-wraps this exact URI at install time. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2024%2024%22%20style=%22--app-tile:%2316181f%22%3E%3Crect%20width=%2224%22%20height=%2224%22%20rx=%226%22%20fill=%22%2316181f%22/%3E%3Cg%20transform=%22translate%284.8%204.8%29%20scale%280.6%29%22%20style=%22color:%236aac32%22%3E%3Cpath%20d=%22M9%207.5%204%2012l5%204.5M15%207.5%2020%2012l-5%204.5%22%20fill=%22none%22%20stroke=%22currentColor%22%20stroke-width=%222%22%20stroke-linecap=%22round%22%20stroke-linejoin=%22round%22/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg0: #0f1220;
+    --bg1: #151a2a;
+    --bg2: #1b2133;
+    --line: #2d3448;
+    --line2: #3c4560;
+    --text: #e4e8f0;
+    --muted: #9ca7bf;
+    --accent: #8bb8ff;
+    --danger: #ef6b6f;
+    --warn: #e8bf6e;
+    --shadow: 0 14px 38px rgba(0,0,0,.35);
+  }
+  html, body { height: 100%; margin: 0; background:
+    radial-gradient(1200px 800px at 20% -10%, rgba(86,120,189,.18), transparent 42%),
+    radial-gradient(900px 600px at 100% 0%, rgba(66,175,161,.11), transparent 36%),
+    linear-gradient(180deg, #0d1020, #111727 34%, #0d111b);
+    overflow: hidden; color: var(--text); font: 13px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  #app { display: flex; flex-direction: column; height: 100dvh; min-height: 0; }
+  #tabbar {
+    flex: 0 0 auto; display: flex; align-items: stretch; gap: 8px;
+    /* left gutter reserves room for the fixed corner "return to Airlock" tile (/airlock-return.js). */
+    padding: calc(8px + env(safe-area-inset-top)) calc(10px + env(safe-area-inset-right)) 8px calc(60px + env(safe-area-inset-left));
+    background: linear-gradient(180deg, rgba(20,24,38,.98), rgba(17,20,31,.96));
+    border-bottom: 1px solid rgba(255,255,255,.06);
+    box-shadow: inset 0 -1px 0 rgba(255,255,255,.02);
+  }
+  #tabnames { flex: 1 1 auto; display: flex; align-items: center; gap: 6px; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+  #tabnames::-webkit-scrollbar { display: none; }
+  #tabctrls { flex: 0 0 auto; display: flex; gap: 6px; align-items: center; }
+  #tabbar button {
+    height: 32px; border: 1px solid rgba(255,255,255,.08); border-radius: 9px;
+    background: linear-gradient(180deg, #2a3143, #23293a); color: var(--text);
+    cursor: pointer; user-select: none; touch-action: manipulation;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+  }
+  #tabbar button:active { transform: translateY(1px); }
+  #tabbar button:disabled { opacity: .42; cursor: not-allowed; filter: grayscale(.2); transform: none; }
+  .sqbtn { width: 32px; min-width: 32px; display: inline-flex; align-items: center; justify-content: center; padding: 0; color: #bac3d7; }
+  .sqbtn svg { width: 18px; height: 18px; display: block; }
+  .tab {
+    position: relative; width: 144px; padding: 0 11px 0 19px; display: inline-flex; align-items: center; gap: 8px;
+    text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-size: 12.5px; font-weight: 600; letter-spacing: -.01em;
+    color: #e8ecf5; background: linear-gradient(180deg, #2b3142, #22283a);
+  }
+  .tab::before {
+    content: ""; position: absolute; left: 7px; top: 50%; transform: translateY(-50%);
+    width: 3px; height: 18px; border-radius: 999px; background: var(--tab-color, #73809d);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.15);
+  }
+  .tab .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .tab .state {
+    flex: 0 0 auto; display: none; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 700; color: #ced6ea; opacity: .95;
+  }
+  .tab.pending .state { display: inline-flex; }
+  .tab.pending .state::before {
+    content: ""; width: 9px; height: 9px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.28); border-top-color: #fff; animation: spin .8s linear infinite;
+  }
+  .tab.on {
+    background: linear-gradient(180deg, #3a4257, #2d3446);
+    border-color: rgba(255,255,255,.22);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.12), inset 0 -2px 0 rgba(255,255,255,.52), 0 6px 16px rgba(0,0,0,.28);
+  }
+  .tab.failed { background: linear-gradient(180deg, #4a3033, #362529); }
+  .tab.drag-src { opacity: .35; }
+  .tab.drop-before { box-shadow: -3px 0 0 var(--accent); }
+  .tab.drop-after { box-shadow: 3px 0 0 var(--accent); }
+  #banner {
+    display: none; align-items: center; gap: 10px; padding: 8px 12px;
+    color: #fff; background: linear-gradient(180deg, rgba(215,78,84,.98), rgba(171,55,60,.98));
+    border-bottom: 1px solid rgba(255,255,255,.12); box-shadow: 0 8px 24px rgba(0,0,0,.2);
+  }
+  #banner .pill {
+    flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 4px rgba(255,255,255,.16);
+  }
+  #banner .text { font-size: 13px; font-weight: 700; letter-spacing: -.01em; }
+  #frames { position: relative; flex: 1 1 auto; min-height: 0; background: #0f1220; }
+  .frame {
+    position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: none;
+    background: #111827;
+  }
+  #empty {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    pointer-events: none; text-align: center; color: #d9deea; padding: 24px;
+  }
+  #empty .card {
+    max-width: 420px; padding: 22px 20px; border: 1px solid rgba(255,255,255,.08); border-radius: 16px;
+    background: linear-gradient(180deg, rgba(25,30,44,.96), rgba(19,23,36,.92)); box-shadow: var(--shadow);
+  }
+  #empty h1 { margin: 0 0 8px; font-size: 18px; line-height: 1.2; }
+  #empty p { margin: 0; color: var(--muted); }
+  .tab-pop {
+    position: fixed; z-index: 50; width: 232px; max-height: 66vh; overflow: auto;
+    padding: 8px; border: 1px solid rgba(255,255,255,.1); border-radius: 12px;
+    background: linear-gradient(180deg, #202536, #181c29); box-shadow: 0 18px 52px rgba(0,0,0,.42);
+    color: var(--text); backdrop-filter: blur(10px);
+  }
+  .tab-pop button {
+    width: 100%; display: block; text-align: left; height: 32px; padding: 0 10px; margin: 0;
+    border: 0; border-radius: 8px; background: transparent; color: inherit; font: inherit;
+  }
+  .tab-pop button:hover { background: rgba(255,255,255,.08); }
+  .tab-pop button.danger { color: #ff8c8f; }
+  .tab-pop .sep { height: 1px; margin: 6px 2px; background: rgba(255,255,255,.08); }
+  .tab-pop .hd { padding: 3px 8px 7px; font-size: 11px; color: var(--muted); letter-spacing: .02em; }
+  .tab-pop .swatches { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 8px; }
+  .tab-pop .swatches span {
+    width: 100%; aspect-ratio: 1 / 1; border-radius: 8px; box-shadow: inset 0 0 0 1px rgba(255,255,255,.16), 0 0 0 1px rgba(0,0,0,.28);
+    cursor: pointer;
+  }
+  .tab-pop .swatches span.sel { outline: 2px solid #e9eef8; outline-offset: 2px; }
+  .tab-pop .small { font-size: 12px; color: var(--muted); padding: 4px 8px 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .degraded #tabbar button.action { opacity: .45; pointer-events: none; }
+  .degraded .tab { cursor: default; }
+  .no-paint { visibility: hidden; }
+</style>
+</head>
+<!-- data-max-slots is templated by apps/code-server/install.sh from the configured
+     slot count; the script reads it (and /api/list confirms it authoritatively). -->
+<body data-max-slots="@@MAX_SLOTS@@">
+<div id="app">
+  <div id="tabbar">
+    <div id="tabnames"></div>
+    <div id="tabctrls">
+      <button id="spawnBtn" class="sqbtn action" title="New slot" aria-label="New slot">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button id="refreshBtn" class="sqbtn action" title="Refresh" aria-label="Refresh">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-.8 4M20 4v5h-5"/></svg>
+      </button>
+    </div>
+  </div>
+  <div id="banner"><div class="pill"></div><div class="text">Slot manager unavailable</div></div>
+  <div id="frames">
+    <div id="empty"><div class="card"><h1>No running IDE slots</h1><p>Use <b>+</b> (top right) to start a new slot.</p></div></div>
+  </div>
+</div>
+<script>
+(function () {
+  'use strict';
+
+  // Slot count is config-driven: templated into <body data-max-slots> at install
+  // time and confirmed by /api/list (j.maxSlots). Everything slot-count-dependent
+  // derives from MAX_SLOTS — no hardcoded 1..4.
+  var _ms = parseInt((document.body && document.body.dataset && document.body.dataset.maxSlots), 10);
+  var MAX_SLOTS = Number.isInteger(_ms) && _ms >= 1 ? _ms : 4;
+  var MAX_SLOTS_HARD_CAP = 64;   // sanity clamp against a bad template value
+  if (MAX_SLOTS > MAX_SLOTS_HARD_CAP) MAX_SLOTS = MAX_SLOTS_HARD_CAP;
+
+  var TABS_KEY = 'codeserver-tabs-v1';
+  var LAST_LIST_KEY = 'codeserver-last-list-v1';
+  var ACTIVE_SLOT_KEY = 'codeserver-active-slot-v1';
+
+  function slotRangeStr() {
+    var a = [];
+    for (var i = 1; i <= MAX_SLOTS; i++) a.push(String(i));
+    return a;
+  }
+  function isValidSlotStr(x) {
+    var n = parseInt(x, 10);
+    return Number.isInteger(n) && n >= 1 && n <= MAX_SLOTS ? String(n) : null;
+  }
+
+  // Default tab accent colors, cycled by slot number so any slot count works.
+  var TAB_COLORS = [
+    { key: '#626a78', label: 'Slate' },
+    { key: '#8b403b', label: 'Brick' },
+    { key: '#84523a', label: 'Rust' },
+    { key: '#76562e', label: 'Amber' },
+    { key: '#66642e', label: 'Olive' },
+    { key: '#4c7145', label: 'Sage' },
+    { key: '#3f704d', label: 'Forest' },
+    { key: '#3a7070', label: 'Teal' },
+    { key: '#3e6f8e', label: 'Steel' },
+    { key: '#496ca3', label: 'Blue' },
+    { key: '#5d5aa0', label: 'Indigo' },
+    { key: '#824a63', label: 'Plum' },
+  ];
+  var DEFAULT_COLOR_CYCLE = ['#496ca3', '#4c7145', '#76562e', '#824a63', '#3a7070', '#5d5aa0'];
+  function slotDefaultColor(slot) {
+    var idx = (parseInt(slot, 10) - 1) % DEFAULT_COLOR_CYCLE.length;
+    if (idx < 0) idx = 0;
+    return DEFAULT_COLOR_CYCLE[idx];
+  }
+
+  var appEl = document.getElementById('app');
+  var tabbarEl = document.getElementById('tabbar');
+  var namesEl = document.getElementById('tabnames');
+  var ctrlsEl = document.getElementById('tabctrls');
+  var bannerEl = document.getElementById('banner');
+  var framesEl = document.getElementById('frames');
+  var emptyEl = document.getElementById('empty');
+  var emptyTitleEl = emptyEl.querySelector('h1');
+  var emptyTextEl = emptyEl.querySelector('p');
+  var spawnBtn = document.getElementById('spawnBtn');
+  var refreshBtn = document.getElementById('refreshBtn');
+
+  var JSON_HEADERS = { 'Content-Type': 'application/json' };
+  var state = {
+    tabs: loadTabs(),
+    lastList: loadLastList(),
+    activeSlot: loadActiveSlot(),
+    degraded: false,
+    seq: 0,
+    pollTimer: 0,
+    actionTimer: 0,
+    pending: new Map(),
+    frames: new Map(),
+    frameRetryCounts: new Map(),
+    frameRetryTimers: new Map(),
+    frameRetryFailed: new Set(),
+    frameReady: new Set(),
+    dragSlot: null,
+    popEl: null,
+    popAnchor: null,
+  };
+
+  function defaultTabs() {
+    return { slots: {}, order: [], hidden: [], rev: 0 };
+  }
+
+  function loadJSON(key, fallback) {
+    try {
+      var raw = localStorage.getItem(key);
+      if (!raw) return fallback;
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : fallback;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function saveJSON(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+  }
+
+  function normalizeTabs(raw) {
+    var out = defaultTabs();
+    if (!raw || typeof raw !== 'object') return out;
+    if (raw.slots && typeof raw.slots === 'object' && !Array.isArray(raw.slots)) {
+      for (var k in raw.slots) {
+        if (!Object.prototype.hasOwnProperty.call(raw.slots, k)) continue;
+        var v = raw.slots[k];
+        var slot = isValidSlotStr(k);
+        if (!slot || !v || typeof v !== 'object') continue;
+        var item = {};
+        if (typeof v.name === 'string') item.name = v.name;
+        if (typeof v.color === 'string' && /^#[0-9a-f]{6}$/i.test(v.color)) item.color = v.color.toLowerCase();
+        out.slots[slot] = item;
+      }
+    }
+    if (Array.isArray(raw.order)) {
+      out.order = raw.order.map(String).filter(isValidSlotStr);
+    }
+    if (Array.isArray(raw.hidden)) {
+      out.hidden = raw.hidden.map(String).filter(isValidSlotStr);
+    }
+    if (Number.isInteger(raw.rev) && raw.rev >= 0) out.rev = raw.rev;
+    return out;
+  }
+
+  function loadTabs() {
+    return normalizeTabs(loadJSON(TABS_KEY, defaultTabs()));
+  }
+
+  function loadLastList() {
+    var fallback = { slots: [], tabs: defaultTabs(), maxSlots: MAX_SLOTS, ts: 0 };
+    var raw = loadJSON(LAST_LIST_KEY, fallback);
+    if (!raw || typeof raw !== 'object') return fallback;
+    var slots = Array.isArray(raw.slots) ? raw.slots.map(normalizeSlot).filter(Boolean) : [];
+    var tabs = normalizeTabs(raw.tabs || defaultTabs());
+    var maxSlots = Number.isInteger(raw.maxSlots) ? raw.maxSlots : MAX_SLOTS;
+    var ts = Number.isInteger(raw.ts) ? raw.ts : 0;
+    return { slots: slots, tabs: tabs, maxSlots: maxSlots, ts: ts };
+  }
+
+  function loadActiveSlot() {
+    try {
+      var n = parseInt(localStorage.getItem(ACTIVE_SLOT_KEY), 10);
+      return Number.isInteger(n) && n >= 1 && n <= MAX_SLOTS ? n : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function setActiveSlot(slot) {
+    state.activeSlot = slot;
+    try {
+      if (slot == null) localStorage.removeItem(ACTIVE_SLOT_KEY);
+      else localStorage.setItem(ACTIVE_SLOT_KEY, String(slot));
+    } catch (e) {}
+  }
+
+  function normalizeSlot(s) {
+    if (!s || typeof s !== 'object') return null;
+    var slot = parseInt(s.slot, 10);
+    if (!Number.isInteger(slot) || slot < 1 || slot > MAX_SLOTS) return null;
+    var st = s.state === 'running' || s.state === 'activating' || s.state === 'failed' || s.state === 'stopped' || s.state === 'unknown' ? s.state : 'unknown';
+    return {
+      slot: slot,
+      url: typeof s.url === 'string' ? s.url : '/s/' + slot + '/',
+      state: st,
+      op: s.op === 'spawning' || s.op === 'stopping' ? s.op : null,
+      unit: typeof s.unit === 'string' ? s.unit : '',
+      port: Number.isInteger(s.port) ? s.port : null,
+      systemd: s.systemd && typeof s.systemd === 'object' ? s.systemd : {},
+    };
+  }
+
+  function storeTabs(tabs) {
+    state.tabs = normalizeTabs(tabs);
+    saveJSON(TABS_KEY, state.tabs);
+  }
+
+  function cloneTabs(tabs) {
+    return normalizeTabs(JSON.parse(JSON.stringify(tabs || defaultTabs())));
+  }
+
+  function storeLastList(list) {
+    var payload = {
+      slots: (list.slots || []).map(function (s) {
+        return { slot: s.slot, url: s.url, state: s.state, op: s.op || null };
+      }),
+      tabs: normalizeTabs(list.tabs || state.tabs),
+      maxSlots: list.maxSlots || MAX_SLOTS,
+      ts: Date.now(),
+    };
+    state.lastList = payload;
+    saveJSON(LAST_LIST_KEY, payload);
+  }
+
+  function slotName(slot, tabs) {
+    var prefs = (tabs || state.tabs).slots[String(slot)] || {};
+    return prefs.name && String(prefs.name).trim() ? String(prefs.name).trim() : 'slot ' + slot;
+  }
+
+  function slotColor(slot, tabs) {
+    var prefs = (tabs || state.tabs).slots[String(slot)] || {};
+    return prefs.color || slotDefaultColor(slot);
+  }
+
+  function classForState(model) {
+    var cls = [];
+    if (model.slot === state.activeSlot) cls.push('on');
+    if (model.state === 'failed') cls.push('failed');
+    if (model.state === 'activating' || model.op) cls.push('pending');
+    return cls.join(' ');
+  }
+
+  function currentSource() {
+    if (!state.degraded && state.lastList && Array.isArray(state.lastList.slots) && state.lastList.slots.length) return state.lastList;
+    return state.lastList || { slots: [], tabs: state.tabs, maxSlots: MAX_SLOTS, ts: 0 };
+  }
+
+  function mergeModel() {
+    var source = currentSource();
+    var bySlot = new Map();
+    (source.slots || []).forEach(function (raw) {
+      var s = normalizeSlot(raw);
+      if (s) bySlot.set(s.slot, s);
+    });
+    state.pending.forEach(function (temp, slot) {
+      bySlot.set(slot, Object.assign({}, bySlot.get(slot) || { slot: slot, url: '/s/' + slot + '/' }, temp));
+    });
+    var slots = [];
+    for (var slot = 1; slot <= MAX_SLOTS; slot++) {
+      var s = bySlot.get(slot) || { slot: slot, url: '/s/' + slot + '/', state: 'unknown', op: null };
+      slots.push(s);
+    }
+    return { slots: slots, tabs: state.tabs, maxSlots: source.maxSlots || MAX_SLOTS };
+  }
+
+  function visibleSlots(model) {
+    var order = (model.tabs.order && model.tabs.order.length ? model.tabs.order.slice() : slotRangeStr());
+    var hidden = new Set((model.tabs.hidden || []).map(String));
+    var slotMap = new Map(model.slots.map(function (s) { return [String(s.slot), s]; }));
+    var ordered = [];
+    order.forEach(function (key) {
+      var s = slotMap.get(String(key));
+      if (!s) return;
+      if (hidden.has(String(key))) return;
+      if (s.state === 'stopped' || s.state === 'unknown') return;
+      ordered.push(s);
+    });
+    model.slots.forEach(function (s) {
+      var key = String(s.slot);
+      if (ordered.some(function (x) { return x.slot === s.slot; })) return;
+      if (hidden.has(key)) return;
+      if (s.state === 'stopped' || s.state === 'unknown') return;
+      ordered.push(s);
+    });
+    return ordered;
+  }
+
+  function capacityCount(model) {
+    return model.slots.filter(function (s) { return s.state === 'running' || s.state === 'activating' || !!s.op; }).length;
+  }
+
+  function chooseActive(model, vis) {
+    var current = state.activeSlot;
+    if (current != null) {
+      var currentModel = model.slots.find(function (s) { return s.slot === current; });
+      if (currentModel && currentModel.state !== 'stopped' && currentModel.state !== 'failed' && !hiddenForSlot(model, current)) return current;
+    }
+    var running = vis.find(function (s) { return s.state === 'running'; });
+    if (running) return running.slot;
+    var pending = vis.find(function (s) { return s.state === 'activating' || s.op; });
+    if (pending) return pending.slot;
+    var fallback = vis.find(function (s) { return s.state !== 'failed'; });
+    return fallback ? fallback.slot : null;
+  }
+
+  function hiddenForSlot(model, slot) {
+    return (model.tabs.hidden || []).map(String).indexOf(String(slot)) !== -1;
+  }
+
+  function setFrameDisplay(slot, show) {
+    var fr = state.frames.get(slot);
+    if (fr) fr.style.display = show ? 'block' : 'none';
+  }
+
+  function clearFrameRetry(slot) {
+    var timer = state.frameRetryTimers.get(slot);
+    if (timer) clearTimeout(timer);
+    state.frameRetryTimers.delete(slot);
+    state.frameRetryCounts.delete(slot);
+    state.frameRetryFailed.delete(slot);
+  }
+
+  function clearFrameState(slot) {
+    clearFrameRetry(slot);
+    state.frameReady.delete(slot);
+  }
+
+  function resetFrameRetry(slot) {
+    clearFrameState(slot);
+  }
+
+  function markFrameFailed(slot) {
+    state.frameRetryFailed.add(slot);
+  }
+
+  function retryFrameNow(slot) {
+    var fr = state.frames.get(slot);
+    if (!fr) return false;
+    state.frameReady.delete(slot);
+    clearFrameRetry(slot);
+    fr.style.display = 'none';
+    fr.src = '/s/' + slot + '/';
+    return true;
+  }
+
+  // A freshly spawned slot may briefly proxy a 502/Bad Gateway before code-server
+  // finishes booting. Detect that inside the iframe and retry a few times so a cold
+  // spawn does not surface as a broken panel.
+  function frameLooksReady(fr) {
+    try {
+      var doc = fr.contentDocument;
+      if (!doc) return false;
+      var title = String(doc.title || '').trim();
+      var body = doc.body ? String(doc.body.textContent || '').trim() : '';
+      if (!title && !body) return false;
+      if (/^5\d\d\b/.test(title)) return false;
+      if (/Bad Gateway/i.test(title)) return false;
+      if (/Gateway Time-out/i.test(title)) return false;
+      if (/Bad Gateway/i.test(body)) return false;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function retrySlotFrame(slot, fr) {
+    var current = state.frameRetryCounts.get(slot) || 0;
+    if (current >= 8) {
+      clearFrameRetry(slot);
+      state.frameReady.delete(slot);
+      var model = mergeModel();
+      var active = model.slots.find(function (s) { return s.slot === slot; });
+      if (active && slot === state.activeSlot) {
+        markFrameFailed(slot);
+        emptyTitleEl.textContent = 'Connection failed — refresh';
+        emptyTextEl.textContent = 'Slot ' + slot + ' is not ready yet. Use refresh or tap the slot tab to retry.';
+        emptyEl.style.display = 'flex';
+      }
+      render();
+      return;
+    }
+    var next = current + 1;
+    state.frameRetryCounts.set(slot, next);
+    state.frameRetryFailed.delete(slot);
+    state.frameReady.delete(slot);
+    fr.style.display = 'none';
+    clearTimeout(state.frameRetryTimers.get(slot));
+    var timer = setTimeout(function () {
+      state.frameRetryTimers.delete(slot);
+      var live = state.frames.get(slot);
+      if (!live || live !== fr) return;
+      live.style.display = 'none';
+      live.src = '/s/' + slot + '/';
+    }, 1200);
+    state.frameRetryTimers.set(slot, timer);
+  }
+
+  function removeFrame(slot) {
+    clearFrameState(slot);
+    var fr = state.frames.get(slot);
+    if (fr) {
+      fr.remove();
+      state.frames.delete(slot);
+    }
+  }
+
+  function ensureFrame(slot, url) {
+    if (state.degraded) return null;
+    var fr = state.frames.get(slot);
+    if (fr) return fr;
+    fr = document.createElement('iframe');
+    fr.className = 'frame';
+    fr.title = 'code-server slot ' + slot;
+    fr.dataset.slot = String(slot);
+    fr.dataset.ready = '0';
+    fr.style.display = 'none';
+    fr.src = url || ('/s/' + slot + '/');
+    fr.addEventListener('load', function () {
+      fr.dataset.loaded = '1';
+      var ready = frameLooksReady(fr);
+      if (ready) {
+        state.frameReady.add(slot);
+        clearFrameRetry(slot);
+        render();
+        return;
+      }
+      state.frameReady.delete(slot);
+      retrySlotFrame(slot, fr);
+    });
+    framesEl.appendChild(fr);
+    state.frames.set(slot, fr);
+    return fr;
+  }
+
+  function render() {
+    var model = mergeModel();
+    var vis = visibleSlots(model);
+    var active = chooseActive(model, vis);
+    if (active !== state.activeSlot) setActiveSlot(active);
+
+    if (state.degraded && state.popEl) {
+      setPopDisabled(true);
+      closePop();
+    }
+    appEl.classList.toggle('degraded', state.degraded);
+    bannerEl.style.display = state.degraded ? 'flex' : 'none';
+    spawnBtn.disabled = state.degraded || capacityCount(model) >= MAX_SLOTS;
+    refreshBtn.disabled = state.degraded;
+
+    namesEl.textContent = '';
+    namesEl.classList.remove('no-paint');
+
+    var hasRunning = vis.some(function (s) { return s.state === 'running'; });
+    var activeModel = state.activeSlot == null ? null : model.slots.find(function (s) { return s.slot === state.activeSlot; }) || null;
+    var activePending = !!activeModel && (activeModel.state === 'activating' || !!activeModel.op);
+    var activeFrameReady = !!activeModel && state.frameReady.has(activeModel.slot);
+    var activeFailed = !!activeModel && state.frameRetryFailed.has(activeModel.slot);
+    var allPending = vis.length > 0 && !hasRunning && vis.every(function (s) { return s.state === 'activating' || !!s.op; });
+    if (!vis.length) {
+      emptyTitleEl.textContent = 'No running IDE slots';
+      emptyTextEl.innerHTML = 'Use <b>+</b> (top right) to start a new slot.';
+      emptyEl.style.display = 'flex';
+    } else if (activeFailed) {
+      emptyTitleEl.textContent = 'Connection failed — refresh';
+      emptyTextEl.textContent = 'Slot ' + activeModel.slot + ' is still unstable. Use the refresh button or tap the slot tab to retry.';
+      emptyEl.style.display = 'flex';
+    } else if (allPending || activePending || (activeModel && activeModel.state === 'running' && !activeFrameReady)) {
+      emptyTitleEl.textContent = 'Starting slot…';
+      emptyTextEl.textContent = 'The running slot will appear shortly.';
+      emptyEl.style.display = 'flex';
+    } else {
+      emptyEl.style.display = 'none';
+    }
+
+    vis.forEach(function (s) {
+      var b = document.createElement('button');
+      b.className = 'tab ' + classForState(s);
+      b.dataset.slot = String(s.slot);
+      b.style.setProperty('--tab-color', slotColor(s.slot, model.tabs));
+      b.title = 'slot ' + s.slot + ' · ' + (s.state || 'unknown');
+      b.innerHTML = '<span class="label">' + escapeHtml(slotName(s.slot, model.tabs)) + '</span><span class="state">' + escapeHtml(stateBadge(s)) + '</span>';
+      if (s.slot === state.activeSlot) b.classList.add('on');
+      if (s.state === 'failed') b.classList.add('failed');
+      if (s.state === 'activating' || s.op) b.classList.add('pending');
+      if (!state.degraded) {
+        b.addEventListener('click', function () { selectSlot(s.slot); });
+        b.addEventListener('contextmenu', function (e) {
+          e.preventDefault();
+          showTabMenu(s.slot, e.clientX, e.clientY, model);
+        });
+        b.draggable = s.state === 'running' || s.state === 'failed' || s.state === 'activating';
+        b.addEventListener('dragstart', function (e) {
+          if (!b.draggable || state.degraded) return;
+          state.dragSlot = s.slot;
+          b.classList.add('drag-src');
+          try {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', String(s.slot));
+          } catch (x) {}
+        });
+        b.addEventListener('dragend', function () {
+          state.dragSlot = null;
+          b.classList.remove('drag-src');
+          document.querySelectorAll('.drop-before,.drop-after').forEach(function (x) { x.classList.remove('drop-before', 'drop-after'); });
+        });
+        b.addEventListener('dragover', function (e) {
+          if (state.dragSlot == null || state.dragSlot === s.slot) return;
+          e.preventDefault();
+          var rect = b.getBoundingClientRect();
+          var after = (e.clientX - rect.left) > rect.width / 2;
+          b.classList.toggle('drop-after', after);
+          b.classList.toggle('drop-before', !after);
+        });
+        b.addEventListener('dragleave', function () { b.classList.remove('drop-before', 'drop-after'); });
+        b.addEventListener('drop', function (e) {
+          if (state.dragSlot == null) return;
+          e.preventDefault();
+          var after = b.classList.contains('drop-after');
+          b.classList.remove('drop-before', 'drop-after');
+          reorderSlots(state.dragSlot, s.slot, after);
+        });
+      } else {
+        b.style.cursor = 'default';
+      }
+      namesEl.appendChild(b);
+    });
+
+    if (!vis.length) {
+      namesEl.appendChild(document.createTextNode(''));
+    }
+
+    model.slots.forEach(function (s) {
+      if (s.state === 'stopped' || s.state === 'failed' || s.state === 'activating' || s.op) {
+        removeFrame(s.slot);
+      }
+    });
+
+    if (!state.degraded) {
+      model.slots.forEach(function (s) {
+        if (s.state !== 'running') return;
+        var fr = ensureFrame(s.slot, s.url);
+        if (fr) {
+          var show = s.slot === state.activeSlot && !state.frameRetryFailed.has(s.slot) && state.frameReady.has(s.slot);
+          fr.style.display = show ? 'block' : 'none';
+        }
+      });
+      if (state.activeSlot != null && activeModel && activeModel.state === 'running') {
+        var fr = ensureFrame(activeModel.slot, activeModel.url);
+        if (fr) {
+          var show = !state.frameRetryFailed.has(activeModel.slot) && state.frameReady.has(activeModel.slot);
+          fr.style.display = show ? 'block' : 'none';
+        }
+      }
+    } else {
+      model.slots.forEach(function (s) {
+        if (s.state === 'stopped') removeFrame(s.slot);
+      });
+      state.frames.forEach(function (fr, slot) {
+        fr.style.display = slot === state.activeSlot ? 'block' : 'none';
+      });
+    }
+
+    state.frames.forEach(function (fr, slot) {
+      var modelSlot = model.slots.find(function (x) { return x.slot === slot; });
+      if (!modelSlot) return;
+      if (slot === state.activeSlot && modelSlot.state === 'running' && !state.frameRetryFailed.has(slot) && state.frameReady.has(slot)) fr.style.display = 'block';
+      else if (modelSlot.state === 'running') fr.style.display = 'none';
+    });
+
+    if (!state.degraded) {
+      setPoll(determinePollDelay(model));
+    }
+  }
+
+  function determinePollDelay(model) {
+    if (state.actionTimer) return 500;
+    var busy = model.slots.some(function (s) { return s.state === 'activating' || !!s.op; });
+    return busy ? 1000 : 3000;
+  }
+
+  function stateBadge(s) {
+    if (s.op === 'spawning' || s.state === 'activating') return 'starting';
+    if (s.op === 'stopping') return 'stopping';
+    if (s.state === 'failed') return 'failed';
+    return '';
+  }
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, function (ch) {
+      return {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      }[ch];
+    });
+  }
+
+  function setPoll(ms) {
+    clearTimeout(state.pollTimer);
+    state.pollTimer = setTimeout(refreshList, ms);
+  }
+
+  function refreshList() {
+    var mySeq = ++state.seq;
+    fetch('/api/list', { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('status ' + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        if (mySeq !== state.seq) return;
+        if (!j || !j.ok) throw new Error((j && j.error) || 'bad response');
+        var tabs = normalizeTabs(j.tabs || defaultTabs());
+        var slots = Array.isArray(j.slots) ? j.slots.map(normalizeSlot).filter(Boolean) : [];
+        state.degraded = false;
+        state.pending.clear();
+        storeTabs(tabs);
+        storeLastList({ slots: slots, tabs: tabs, maxSlots: j.maxSlots || MAX_SLOTS, ts: Date.now() });
+        render();
+      })
+      .catch(function () {
+        if (mySeq !== state.seq) return;
+        enterDegraded();
+      });
+  }
+
+  function enterDegraded() {
+    state.degraded = true;
+    clearTimeout(state.actionTimer);
+    state.actionTimer = 0;
+    setPopDisabled(true);
+    closePop();
+    clearTimeout(state.pollTimer);
+    state.pollTimer = setTimeout(refreshList, 3000);
+    render();
+  }
+
+  function setPopDisabled(disabled) {
+    if (!state.popEl) return;
+    state.popEl.style.pointerEvents = disabled ? 'none' : '';
+    state.popEl.querySelectorAll('button').forEach(function (btn) {
+      btn.disabled = disabled;
+    });
+    state.popEl.querySelectorAll('.swatches span').forEach(function (swatch) {
+      swatch.style.pointerEvents = disabled ? 'none' : '';
+      swatch.style.opacity = disabled ? '.45' : '';
+    });
+  }
+
+  function startActionPolling() {
+    clearTimeout(state.actionTimer);
+    state.actionTimer = setTimeout(function () {
+      state.actionTimer = 0;
+      render();
+    }, 5000);
+  }
+
+  function refreshSoon(delay) {
+    clearTimeout(state.pollTimer);
+    state.pollTimer = setTimeout(refreshList, delay);
+  }
+
+  function selectSlot(slot) {
+    var model = mergeModel();
+    var s = model.slots.find(function (x) { return x.slot === slot; });
+    if (!s || s.state === 'stopped' || s.state === 'failed') return;
+    setActiveSlot(slot);
+    if (!state.degraded) {
+      if (s.state === 'running') {
+        ensureFrame(slot, s.url);
+        if (state.frameRetryFailed.has(slot)) retryFrameNow(slot);
+      }
+    }
+    render();
+  }
+
+  function apiPost(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: body == null ? undefined : JSON_HEADERS,
+      body: body == null ? null : JSON.stringify(body),
+    }).then(function (r) {
+      return r.text().then(function (text) {
+        var json = null;
+        try { json = text ? JSON.parse(text) : {}; } catch (e) {}
+        if (!r.ok) {
+          var err = (json && json.error) || ('status ' + r.status);
+          var ex = new Error(err);
+          ex.status = r.status;
+          ex.payload = json;
+          throw ex;
+        }
+        return json;
+      });
+    });
+  }
+
+  function spawnSlot() {
+    if (spawnBtn.disabled) return;
+    apiPost('/api/spawn', null)
+      .then(function (j) {
+        if (!j || !Number.isInteger(j.slot)) throw new Error('invalid spawn response');
+        state.pending.set(j.slot, { slot: j.slot, url: j.url || '/s/' + j.slot + '/', state: 'activating', op: 'spawning' });
+        setActiveSlot(j.slot);
+        resetFrameRetry(j.slot);
+        startActionPolling();
+        render();
+        refreshList();
+      })
+      .catch(function (e) {
+        if (e.status === 409) { refreshSoon(500); return; }
+        enterDegraded();
+      });
+  }
+
+  function killSlot(slot) {
+    apiPost('/api/kill', { slot: slot })
+      .then(function () {
+        state.pending.set(slot, { slot: slot, url: '/s/' + slot + '/', state: 'stopped', op: 'stopping' });
+        startActionPolling();
+        removeFrame(slot);
+        if (state.activeSlot === slot) setActiveSlot(null);
+        render();
+        refreshList();
+      })
+      .catch(function (e) {
+        if (e.status === 409) { refreshSoon(500); return; }
+        enterDegraded();
+      });
+  }
+
+  function setName(slot, name) {
+    var nextTabs = cloneTabs(state.tabs);
+    nextTabs.slots[String(slot)] = nextTabs.slots[String(slot)] || {};
+    nextTabs.slots[String(slot)].name = name;
+    storeTabs(nextTabs);
+    render();
+    apiPost('/api/prefs', { op: 'setName', slot: slot, name: name })
+      .then(function (j) {
+        if (j && j.ok && j.tabs) { storeTabs(j.tabs); render(); }
+      })
+      .catch(function () { refreshList(); });
+  }
+
+  function setColor(slot, color) {
+    var nextTabs = cloneTabs(state.tabs);
+    nextTabs.slots[String(slot)] = nextTabs.slots[String(slot)] || {};
+    nextTabs.slots[String(slot)].color = color;
+    storeTabs(nextTabs);
+    render();
+    apiPost('/api/prefs', { op: 'setColor', slot: slot, color: color })
+      .then(function (j) {
+        if (j && j.ok && j.tabs) { storeTabs(j.tabs); render(); }
+      })
+      .catch(function () { refreshList(); });
+  }
+
+  function reorderSlots(from, to, after) {
+    if (state.degraded || from == null || to == null || from === to) return;
+    var model = mergeModel();
+    var vis = visibleSlots(model);
+    var order = vis.map(function (s) { return s.slot; }).filter(function (n) { return n !== from; });
+    var idx = order.indexOf(to);
+    var insertAt = idx < 0 ? order.length : idx + (after ? 1 : 0);
+    order.splice(insertAt, 0, from);
+    var nextTabs = cloneTabs(state.tabs);
+    nextTabs.order = order.map(function (n) { return String(n); });
+    storeTabs(nextTabs);
+    render();
+    apiPost('/api/prefs', { op: 'reorder', order: order.map(function (n) { return Number(n); }) })
+      .then(function (j) {
+        if (j && j.ok && j.tabs) { storeTabs(j.tabs); render(); }
+      })
+      .catch(function () { refreshList(); });
+  }
+
+  function closePop() {
+    if (state.popEl) {
+      state.popEl.remove();
+      state.popEl = null;
+    }
+    state.popAnchor = null;
+  }
+
+  function placePop(pop, x, y) {
+    document.body.appendChild(pop);
+    var pad = 8;
+    var maxX = Math.max(pad, window.innerWidth - pop.offsetWidth - pad);
+    var maxY = Math.max(pad, window.innerHeight - pop.offsetHeight - pad);
+    pop.style.left = Math.max(pad, Math.min(x, maxX)) + 'px';
+    pop.style.top = Math.max(pad, Math.min(y, maxY)) + 'px';
+    state.popEl = pop;
+  }
+
+  function showTabMenu(slot, x, y, model) {
+    if (state.degraded) return;
+    closePop();
+    var pop = document.createElement('div');
+    pop.className = 'tab-pop';
+    var head = document.createElement('div');
+    head.className = 'small';
+    head.textContent = 'slot ' + slot;
+    pop.appendChild(head);
+
+    var rename = document.createElement('button');
+    rename.textContent = 'Rename';
+    rename.onclick = function () {
+      closePop();
+      var next = prompt('Slot ' + slot + ' name', slotName(slot, model.tabs));
+      if (next == null) return;
+      var name = next.trim();
+      if (!name) return;
+      setName(slot, name);
+    };
+    pop.appendChild(rename);
+
+    var colorTitle = document.createElement('div');
+    colorTitle.className = 'hd';
+    colorTitle.textContent = 'Color';
+    pop.appendChild(colorTitle);
+    var sw = document.createElement('div');
+    sw.className = 'swatches';
+    var current = (model.tabs.slots[String(slot)] || {}).color || '';
+    TAB_COLORS.forEach(function (c) {
+      var s = document.createElement('span');
+      s.style.background = c.key;
+      s.title = c.label;
+      if (current && current.toLowerCase() === c.key) s.className = 'sel';
+      s.onclick = function () {
+        closePop();
+        setColor(slot, c.key);
+      };
+      sw.appendChild(s);
+    });
+    pop.appendChild(sw);
+
+    var sep = document.createElement('div');
+    sep.className = 'sep';
+    pop.appendChild(sep);
+
+    var kill = document.createElement('button');
+    kill.className = 'danger';
+    kill.textContent = 'Close session';
+    kill.title = 'Close session';
+    kill.setAttribute('aria-label', 'Close session');
+    kill.onclick = function () {
+      closePop();
+      if (!confirm('Close slot ' + slot + '?')) return;
+      killSlot(slot);
+    };
+    pop.appendChild(kill);
+
+    placePop(pop, x, y);
+    setPopDisabled(false);
+  }
+
+  function renderWithLocalPaint() {
+    var model = mergeModel();
+    storeTabs(model.tabs);
+    storeLastList(state.lastList || { slots: model.slots, tabs: model.tabs, maxSlots: MAX_SLOTS, ts: Date.now() });
+    render();
+  }
+
+  function checkExternalActionsDisabled() {
+    var disabled = state.degraded;
+    spawnBtn.disabled = disabled || capacityCount(mergeModel()) >= MAX_SLOTS;
+    refreshBtn.disabled = disabled;
+  }
+
+  function hiddenPickCurrent() {
+    var model = mergeModel();
+    var vis = visibleSlots(model);
+    return chooseActive(model, vis);
+  }
+
+  function syncStateAfterRender() {
+    checkExternalActionsDisabled();
+    if (state.activeSlot == null) {
+      var next = hiddenPickCurrent();
+      if (next != null) setActiveSlot(next);
+    }
+  }
+
+  document.addEventListener('pointerdown', function (e) {
+    if (!state.popEl) return;
+    if (!e.target || !e.target.closest || e.target.closest('.tab-pop')) return;
+    closePop();
+  }, true);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closePop();
+  });
+
+  spawnBtn.addEventListener('click', spawnSlot);
+  refreshBtn.addEventListener('click', function () {
+    if (state.degraded) return;
+    if (state.activeSlot != null && state.frameRetryFailed.has(state.activeSlot)) retryFrameNow(state.activeSlot);
+    refreshSoon(0);
+  });
+
+  window.addEventListener('resize', function () {
+    if (state.popEl) closePop();
+  });
+
+  // initial paint from localStorage before server reconciliation
+  renderWithLocalPaint();
+  syncStateAfterRender();
+  refreshList();
+})();
+</script>
+<!-- Shared "return to Airlock" widget (corner tile + unread badge). Served by the
+     gate at /airlock-return.js; loaded here instead of embedding any brand asset. -->
+<script src="/airlock-return.js" data-mode="corner" defer></script>
+</body>
+</html>

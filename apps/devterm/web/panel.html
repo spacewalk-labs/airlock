@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>devterm panel</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="stylesheet" href="popup.css">
+<!--
+  panel.html — devterm's account UI on a page with NO terminal.
+
+  Who opens it: the Airlock return widget injected into tools that run on their own
+  ports (an agent runner, a browser IDE). Its menu opens this page in a modal iframe so
+  the user can switch subscription accounts without leaving the app they are in — on a
+  home-screen web app, opening devterm meant leaving it altogether.
+
+  Why an iframe and not a copy of the UI: every fetch here is a same-origin devterm path,
+  so there is no CORS to arrange, and accounts.js stays the only implementation of the
+  account list. Identity is the ingress header, not a cookie, so this authenticates the
+  same way inside a cross-origin iframe.
+
+  ?p=accounts | secret (default accounts). Closing is the parent's job — an iframe cannot
+  close the modal that contains it, so we postMessage and the widget removes it.
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1f29; color: #dde1e8;
+               font: 13px system-ui, -apple-system, sans-serif;
+               -webkit-text-size-adjust: 100%; }
+  body { display: flex; flex-direction: column; }
+  #top { flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+         padding: calc(10px + env(safe-area-inset-top)) 12px 10px; border-bottom: 1px solid #2c3240; }
+  /* display:flex beats [hidden]'s UA display:none — without this the header stayed
+     visible when embedded. */
+  #top[hidden] { display: none; }
+  #top .ttl { font: 600 14px system-ui; color: #f2f5fa; flex: 1; }
+  #top button { height: 32px; padding: 0 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,.12);
+                background: #2b303b; color: #dde1e8; font: 13px system-ui; cursor: pointer; }
+  #body { flex: 1 1 auto; min-height: 0; overflow: auto;
+          padding: 12px 12px calc(14px + env(safe-area-inset-bottom));
+          display: flex; flex-direction: column; gap: 10px; }
+  /* status toast — the panel's stand-in for app.js's #status, so flash() has somewhere to go */
+  #status { position: fixed; left: 50%; bottom: calc(14px + env(safe-area-inset-bottom));
+            transform: translateX(-50%); max-width: 92%; padding: 8px 14px; border-radius: 8px;
+            background: rgba(0,0,0,.78); color: #fff; font: 12.5px/1.45 system-ui; text-align: center;
+            box-shadow: 0 8px 24px rgba(0,0,0,.4); z-index: 60; }
+  #status.status-error { background: #6b2b2b; }
+</style>
+</head>
+<body>
+<div id="top">
+  <span class="ttl" id="ttl">Subscription accounts</span>
+  <button type="button" id="closeBtn">Close</button>
+</div>
+<div id="body"><div id="host"></div></div>
+
+<script src="ui.js"></script>
+<script src="accounts.js"></script>
+<script src="secretdrop.js"></script>
+<script>
+'use strict';
+(function () {
+  var params = new URLSearchParams(location.search);
+  var embedded = params.get('embed') === '1';
+  // Unknown ?p= falls back to accounts rather than rendering an empty page.
+  var page = params.get('p') === 'secret' ? 'secret' : 'accounts';
+  if (page === 'secret') document.getElementById('ttl').textContent = 'Secret drop';
+  // Embedded in the widget's modal, the modal owns the header (title + close), so ours
+  // would be a second one. Standalone (opened as a tab) we keep it.
+  if (embedded) document.getElementById('top').hidden = true;
+
+  var statusEl = null, statusTimer = null;
+  function flash(msg, ms, kind) {
+    if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+    if (!statusEl) { statusEl = document.createElement('div'); statusEl.id = 'status'; document.body.appendChild(statusEl); }
+    statusEl.textContent = msg;
+    statusEl.className = kind === 'error' ? 'status-error' : '';
+    statusTimer = setTimeout(function () { if (statusEl) { statusEl.remove(); statusEl = null; } }, ms || 2000);
+  }
+  function postJson(path, body) {
+    return fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                         body: JSON.stringify(body || {}) }).then(function (r) { return r.json(); });
+  }
+  function requestClose() {
+    // The parent owns the modal. Standalone (no parent) there is nothing to close.
+    if (!window.parent || window.parent === window) return;
+    // Both spellings until 2026-09-07 (2026-08-07 rename): the parent may be an
+    // out-of-tree frontend still listening for the old name, and our own listener
+    // ignores the second message once the modal is gone.
+    window.parent.postMessage('airlock-panel-close', '*');
+    window.parent.postMessage('swk-panel-close', '*');
+  }
+  document.getElementById('closeBtn').addEventListener('click', requestClose);
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') requestClose(); });
+
+  window.uiRefocus = function () {};   // nothing to focus back to here
+  var host = document.getElementById('host');
+
+  if (page === 'secret') {
+    // No sendInput here: without a terminal the secret drop runs in clipboard mode — it
+    // stores the value and copies the PATH TOKEN for the user to paste wherever they are.
+    var secret = window.initSecretDrop({ flash: flash, postJson: postJson });
+    // Embedded, the modal header already carries a close button, so passing one here
+    // would draw a second. Standalone, this is the only way out.
+    secret.renderSecretPanel(host, embedded ? requestClose : null);
+  } else {
+    // accounts.js expects the terminal core's helpers. On this page there is no terminal
+    // and no popup layer, so the ones that only make sense there are no-ops.
+    var acct = window.initAccounts({
+      flash: flash,
+      postJson: postJson,
+      mkFocus: function () {},
+      closeTabPops: function () { if (acct && acct.hideAcctTip) acct.hideAcctTip(); },
+      placePop: function () {},
+    });
+    acct.renderAcctPanel(host);
+    acct.startAcctIconWatch();         // keeps thresholds fresh; there is no icon to paint
+  }
+})();
+</script>
+</body>
+</html>

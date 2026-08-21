@@ -1,0 +1,15 @@
+[Unit]
+Description=airlock publish — uploads TTL sweep (24h) + public snapshot expiry
+
+[Service]
+Type=oneshot
+# MUST mirror the service's public env — the sweep and the writer have to agree
+# on which directory and state file they are talking about.
+Environment=AIRLOCK_PUBLISH_UPLOADS_DIR=/home/example/uploads
+Environment=AIRLOCK_PUBLISH_PUBLIC_MODE=remote
+Environment=AIRLOCK_PUBLISH_PUBLIC_DIR=
+Environment=AIRLOCK_PUBLISH_STATE_DIR=/home/example/.local/state/airlock
+Environment=AIRLOCK_PUBLISH_GATED_DIR=/opt/airlock/share-gated
+Environment=AIRLOCK_PUBLISH_HTPASSWD_DIR=/opt/airlock/publish-gated-auth
+Environment=AIRLOCK_PUBLISH_HTPASSWD_BIN=htpasswd
+ExecStart=/usr/bin/python3 ROOT/apps/publish/backend/airlock-publish.py --cleanup

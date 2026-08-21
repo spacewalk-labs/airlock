@@ -1,0 +1,85 @@
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+map $http_tailscale_user_login $hub_ok {
+    default 0;
+    "me@example.com" 1;
+}
+map $http_tailscale_user_login $owner_ok {
+    default 0;
+    "me@example.com" 1;
+}
+server {
+    listen 127.0.0.1:18806;
+    server_name _;
+    # 301, not 302: let browsers and home-screen shortcuts learn the https
+    # entrance for good. Nothing else is served here.
+    return 301 https://box.example.ts.net$request_uri;
+}
+map $owner_ok $airlock_role { 1 "owner"; default "collaborator"; }
+server {
+    listen 127.0.0.1:18802;
+    server_name _;
+    root TMP/web;
+    index index.html;
+
+    # ==== Identity gate — the single chokepoint ====
+    # Gate at the SERVER level, not per-location: a server-context `if ... return`
+    # runs in the server rewrite phase before any location is chosen, so it covers
+    # every location uniformly — including the subpath-app fragments included below
+    # (an app can never forget its guard). This deliberately does NOT use a
+    # per-location `if` + `try_files`, which do not gate reliably together.
+    # owner + collaborators pass ($hub_ok); everyone else gets the wrong-owner page.
+    if ($hub_ok = 0) { return 403; }
+    # No `=`: keep the honest 403 status AND serve the wrong-owner page body
+    # (browsers render an error_page body regardless of status). This matches the
+    # separate-port gates, which also 403 a denied identity.
+    error_page 403 @denied;
+    location @denied {
+        root TMP/web;
+        rewrite ^ /wrong-owner.html break;
+    }
+
+    # frontend reads its own (gate-verified) identity here
+    location = /whoami {
+        default_type application/json;
+        return 200 '{"login":"$http_tailscale_user_login","role":"$airlock_role"}';
+    }
+
+    # shared "return to Airlock" widget — served at a stable /airlock-return.js so
+    # same-origin subpath apps (markwand, notepad, publish, dev-monitor) can load
+    # it. Separate-port gates serve their own copy (see emit_owner_gate). The
+    # orchestrator copies hub/assets/ (incl. airlock-return.js) to <webroot>/assets.
+    location = /airlock-return.js {
+        alias TMP/web/assets/airlock-return.js;
+        default_type application/javascript;
+        add_header Cache-Control "no-cache" always;
+        access_log off;
+    }
+
+    # Browsers auto-probe /favicon.ico at the root regardless of the <link rel=icon>
+    # in index.html; without this it falls into the SPA fallback below and returns
+    # index.html as text/html, so the tab shows a generic/stale icon instead of the
+    # brand mark. Serve the PNG brand favicon here (browsers accept a PNG at .ico).
+    location = /favicon.ico {
+        alias TMP/web/assets/favicon.png;
+        default_type image/png;
+        add_header Cache-Control "no-cache" always;
+        access_log off;
+    }
+
+    # the entrance itself
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # same-origin subpath apps (markwand, publish, dev-monitor, notepad) drop
+    # location fragments here as they are installed. They inherit the server-level
+    # gate above — fragments are plain proxies, no per-location guard needed.
+    include TMP/confd/hub-locations.d/*.conf;
+}
+
+# separate-port owner gates (devterm, code-server, orca, paseo) drop server
+# fragments here as they are installed.
+include TMP/confd/servers.d/*.conf;

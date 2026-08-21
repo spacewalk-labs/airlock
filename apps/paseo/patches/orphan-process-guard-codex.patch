@@ -1,0 +1,100 @@
+--- a/dist/server/server/agent/providers/codex-app-server-agent.js
++++ b/dist/server/server/agent/providers/codex-app-server-agent.js
+@@ -2281,6 +2281,8 @@
+         this.currentThreadId = null;
+         this.currentTurnId = null;
+         this.client = null;
++        this.sessionClosed = false; // [paseo-orphan-guard]
++        this.liveAppServerClients = new Set(); // [paseo-orphan-guard]
+         this.subscribers = new Set();
+         this.nextTurnOrdinal = 0;
+         this.activeForegroundTurnId = null;
+@@ -2363,11 +2365,64 @@
+             planModeAvailable: this.hasPlanCollaborationMode(),
+         });
+     }
++    // [paseo-orphan-guard] Same defect as the claude provider: one `this.client` slot,
++    // an `if (this.client)` guard in close() with no else branch, and no closed-session
++    // gate on connect() — so an app-server spawned during or after close outlives the
++    // session with nobody holding its handle.
++    trackAppServerClient(client) {
++        if (!this.liveAppServerClients) {
++            this.liveAppServerClients = new Set();
++        }
++        this.liveAppServerClients.add(client);
++    }
++    async disposeLiveAppServerClients(reason) {
++        const targets = new Set(this.liveAppServerClients || []);
++        if (this.client) {
++            targets.add(this.client);
++        }
++        this.liveAppServerClients = new Set();
++        if (targets.size === 0) {
++            // Not a warning: a session that was created but never connected has nothing
++            // to dispose, and that is the common case (close() is idempotent too).
++            return;
++        }
++        if (targets.size > 1) {
++            this.logger.warn({ agentId: this.agentId, provider: "codex", reason, count: targets.size }, "[paseo-orphan-guard] more than one live app-server client at disposal");
++        }
++        for (const client of targets) {
++            try {
++                await client.dispose();
++            }
++            catch (err) {
++                this.logger.warn({ err, agentId: this.agentId, provider: "codex", reason }, "[paseo-orphan-guard] app-server dispose failed — the process tree may survive");
++            }
++        }
++    }
+     async connect() {
+         if (this.connected)
+             return;
++        // [paseo-orphan-guard] A closed session must not spawn an app-server.
++        if (this.sessionClosed) {
++            this.logger.warn({ agentId: this.agentId, provider: "codex" }, "[paseo-orphan-guard] connect() on a closed session — refusing to spawn an app-server");
++            throw new Error("Codex session is closed");
++        }
++        // A stale client here means a previous connect left a live app-server behind
++        // (connected === false but the handle is set). Dispose it before replacing it.
++        if (this.client || (this.liveAppServerClients && this.liveAppServerClients.size > 0)) {
++            this.logger.warn({ agentId: this.agentId, provider: "codex" }, "[paseo-orphan-guard] reconnecting over a live app-server client — disposing the previous one");
++            await this.disposeLiveAppServerClients("reconnect");
++            this.client = null;
++        }
+         const child = await this.spawnAppServer();
+         this.client = new CodexAppServerClient(child, this.logger, () => this.traceContext());
++        this.trackAppServerClient(this.client);
++        // The spawn above is awaited, so close() can have run in the meantime.
++        if (this.sessionClosed) {
++            this.logger.warn({ agentId: this.agentId, provider: "codex", pid: child ? child.pid : undefined }, "[paseo-orphan-guard] app-server arrived after close — disposing it immediately");
++            await this.disposeLiveAppServerClients("late_arrival");
++            this.client = null;
++            throw new Error("Codex session is closed");
++        }
+         this.client.setNotificationHandler((method, params) => this.handleNotification(method, params));
+         this.registerRequestHandlers();
+         try {
+@@ -2390,6 +2445,9 @@
+             catch (closeError) {
+                 this.logger.warn({ err: closeError, connectError: error }, "Failed to close Codex app-server after connection failure");
+             }
++            // [paseo-orphan-guard] The close() above is cleanup after a failed spawn, not
++            // a session close. Leaving the flag raised would refuse every later retry.
++            this.sessionClosed = false;
+             throw error;
+         }
+     }
+@@ -3236,9 +3294,10 @@
+         this.subscribers.clear();
+         this.activeForegroundTurnId = null;
+         this.activeClientMessageId = null;
+-        if (this.client) {
+-            await this.client.dispose();
+-        }
++        // [paseo-orphan-guard] Flag first (connect() may be mid-spawn), then dispose every
++        // live app-server client — not just the one currently in this.client.
++        this.sessionClosed = true;
++        await this.disposeLiveAppServerClients("session_close");
+         this.client = null;
+         this.connected = false;
+         this.currentThreadId = null;

@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>
+// Runtime config, templated in by the installer from airlock.toml (feature flags).
+// No scheme/port hopping lives here any more: the plaintext tailnet port serves
+// nothing but a 301 to the https FQDN (gate/nginx-lib.sh emit_https_redirect), so
+// this page is only ever reached in a secure context — clipboard, OSC52, PWA.
+window.__DEVTERM = %%DEVTERM_CONFIG%%;
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="DevTerm">
+<title>DevTerm</title>
+<!-- Icons are generated from the launcher tile — bin/gen-app-icons.py, SoT hub/index.html.
+     Relative, not /assets/: this page is served by the devterm gate on its own port,
+     where the hub's webroot is a different origin. The gate serves this web root, and
+     [branding] icon_ring rewrites favicon.svg in place at install time.
+     apple-touch-icon is a PNG because iOS ignores an SVG here. -->
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="popup.css"><!-- account popup surface, shared with panel.html -->
+<style>
+  html, body { height: 100%; margin: 0; background: #181b24; overflow: hidden;
+               -webkit-text-size-adjust: 100%; }
+  /* Browser default subpixel antialiasing renders glyphs heavier; grayscale keeps them thin. */
+  .xterm, .xterm .xterm-rows { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+  #app { display: flex; flex-direction: column; height: 100dvh; box-sizing: border-box;
+         padding-bottom: env(safe-area-inset-bottom); }   /* keep the tmux status line clear of the home indicator */
+  /* top bar: left = session tabs (scrollable) / right = controls */
+  #tabs { flex: 0 0 auto; display: flex; align-items: center; gap: 5px; overflow: hidden;
+          padding: calc(5px + env(safe-area-inset-top)) calc(6px + env(safe-area-inset-right)) 5px
+                   calc(6px + env(safe-area-inset-left));
+          background: #1e2230; border-bottom: 1px solid #2a3142; }
+  #tabnames { flex: 1 1 auto; display: flex; align-items: center; gap: 4px; min-height: 32px;
+              overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch;
+              padding-left: 8px; border-left: 1px solid #2f3542; }   /* left divider = Airlock rail vs session tabs */
+  #tabctrls { flex: 0 0 auto; display: flex; gap: 5px; padding-left: 8px; border-left: 1px solid #2f3542; }
+  /* pinned far-left: Airlock (return to the hub). Fixed regardless of #tabnames scroll. */
+  #airlock { flex: 0 0 auto; }
+  #tabs button { flex: 0 0 auto; height: 32px; padding: 0 10px;
+                 border: 1px solid rgba(255,255,255,.08); border-radius: 6px; background: #2b3140; color: #cfd3db;
+                 font: 14px/1 system-ui, sans-serif; touch-action: manipulation; user-select: none; }
+  #tabs button:active { background: #343c4c; }
+  #tabs .mini { min-width: 32px; padding: 0 8px; color: #9a9fac; font-size: 16px; }
+  /* square line-icon buttons — uniform size */
+  #tabs .sqbtn { width: 32px; min-width: 32px; padding: 0; display: inline-flex; align-items: center;
+                 justify-content: center; color: #aeb4c0; }
+  #tabs .sqbtn svg { width: 18px; height: 18px; display: block; }
+  #tabs .sqbtn .al-logo { display:block; width:18px; height:18px; background:currentColor; --al-mask:url(data:image/png;base64,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) center/contain no-repeat; -webkit-mask:var(--al-mask); mask:var(--al-mask); }
+  #tabs .sqbtn.on { color: #8bb8ff; background: #26304a; border-radius: 6px; }   /* pane-zoom active */
+  /* active-account usage warning surfaces on the account icon itself. amber = mild / red = critical (pulsing glow) */
+  #tabs .sqbtn.acct-warn, #mkeys .mk-icon.acct-warn { color: #e6b34d; }
+  #tabs .sqbtn.acct-crit, #mkeys .mk-icon.acct-crit { color: #ff6b6b; background: #3b2126;
+                    border-color: #8a4046; animation: acctCrit 1.8s ease-in-out infinite; }
+  @keyframes acctCrit {
+    0%, 100% { box-shadow: 0 0 0 1px rgba(255,107,107,.28), 0 0 6px rgba(255,107,107,.28); }
+    50%      { box-shadow: 0 0 0 1px rgba(255,107,107,.65), 0 0 15px rgba(255,107,107,.75); }
+  }
+  /* session tab: neutral bg, uniform width, centered label, ellipsis */
+  #tabs button.tab { position: relative; width: 120px; padding: 0 11px; display: inline-block; text-align: center;
+                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                     font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+                     font-size: 12.5px; font-weight: 500; letter-spacing: 0; color: #dfe4ec;
+                     box-shadow: inset 0 1px 0 rgba(255,255,255,.06); }
+  /* color = left accent bar (hint, not a full fill) */
+  #tabs button.tab.colored::before { content: ''; position: absolute; left: 6px; top: 50%; transform: translateY(-50%);
+                                     width: 3px; height: 17px; border-radius: 2px; background: var(--tab-color); }
+  /* selected (current) = slightly brighter bg + bottom accent + subtle elevation */
+  #tabs button.tab.on { color: #fff; background: #3a4150; border-color: #5b6475;
+                        box-shadow: inset 0 1px 0 rgba(255,255,255,.14),
+                                    inset 0 -2px 0 rgba(255,255,255,.55),
+                                    0 4px 12px rgba(0,0,0,.28); }
+  #tabs button.tab.drop-before { box-shadow: -3px 0 0 #6ea8ff; }   /* insert-before marker */
+  #tabs button.tab.drop-after { box-shadow: 3px 0 0 #6ea8ff; }     /* insert-after marker (drop at end) */
+  #tabs button.tab.drag-src { opacity: .4; }
+  /* right-click menu / overflow list popup */
+  /* the account popup surface moved to popup.css (shared with panel.html) */
+  #term { flex: 1 1 auto; min-height: 0; padding: 2px 4px; overflow: hidden; overscroll-behavior: contain; touch-action: none; }  /* clip last partial row; overscroll contain blocks Android pull-to-refresh; touch-action:none blocks iOS native scroll/bounce (touch scroll is JS-only) */
+  #term .xterm, #term .xterm-viewport, #term .xterm-screen { touch-action: none; }  /* keep native from scrolling/bouncing the xterm viewport — avoids clashing with the JS handler */
+  #term .xterm { height: 100%; }
+  #status { position: fixed; top: calc(46px + env(safe-area-inset-top)); left: 50%;
+            transform: translateX(-50%); background: rgba(0,0,0,.72); color: #fff;
+            padding: 5px 14px; border-radius: 13px; font: 13px system-ui; z-index: 9;
+            max-width: 86vw; white-space: normal; text-align: center; line-height: 1.4; }
+  /* error toast = bright red (pops on a dark terminal) + bold + glow. Tap to dismiss. */
+  #status.status-error { background: #e5484d; color: #fff; font-weight: 600; font-size: 13.5px;
+            border: 1px solid #ff9ba0; box-shadow: 0 6px 22px rgba(229,72,77,.55);
+            padding: 9px 16px; cursor: pointer; }
+  /* notice toast = blue (clipboard received / copy hint). Sized like error — color-led, not bulky. Tap to dismiss. */
+  #status.status-notice { background: #2f6fed; color: #fff; font-weight: 600; font-size: 13px;
+            border: 1px solid #9dc0ff; box-shadow: 0 5px 18px rgba(47,111,237,.5);
+            padding: 7px 14px; cursor: pointer; }
+  #status[hidden] { display: none; }
+
+  /* copy-modal textarea scrollbar — the default thumb blends into the dark bg, hiding
+     the scroll position. Light thumb + dark track so position/length are visible. */
+  .copy-overlay textarea { scrollbar-color: #6b7688 #12151d; }
+  .copy-overlay textarea::-webkit-scrollbar { width: 12px; height: 12px; }
+  .copy-overlay textarea::-webkit-scrollbar-track { background: #12151d; border-radius: 8px; }
+  .copy-overlay textarea::-webkit-scrollbar-thumb { background: #6b7688; border-radius: 8px; border: 2px solid #12151d; min-height: 28px; }
+  .copy-overlay textarea::-webkit-scrollbar-thumb:hover { background: #8b95a8; }
+  /* source button disabled (empty) = clearly greyed out */
+  .copy-overlay button:disabled { opacity: .38; cursor: not-allowed; }
+
+  /* When the copy hint (blue toast) appears, gently pulse the copy icon blue so it's
+     obvious which icon to press. Shared by the top toolbar and the bottom key bar. */
+  @keyframes copyPulse {
+    0%, 100% { color: #aeb4c0; box-shadow: 0 0 0 0 rgba(47,111,237,0); }
+    45%      { color: #8bb8ff; box-shadow: 0 0 8px 1px rgba(47,111,237,.42); }
+  }
+  .copy-pulse { animation: copyPulse 1.25s ease-in-out 3; border-radius: 6px; }
+  @media (prefers-reduced-motion: reduce) { .copy-pulse { animation: none; color: #8bb8ff; } }
+
+  /* ---- mobile accessory key bar (mobile-only, in-flow at the bottom of #app) ----
+     in-flow (not fixed): when the keyboard opens, fitResize shrinks #app to
+     visualViewport.height, so the bottom child sits above the soft keyboard. One
+     horizontally-scrolling row (zoom / more live here too). */
+  #mkeys { display: none; }
+  #app.mkeys-on { padding-bottom: 0; }                 /* safe-area ownership moves to #mkeys (avoid double-count) */
+  #app.mkeys-on #tabctrls { display: none; }           /* zoom / more move to the bottom bar -> top holds only tabs */
+  #app.mkeys-on #tabs button.tab { width: 92px; padding: 0 8px; }   /* compact mobile session tabs */
+  #app.mkeys-on #mkeys {
+    flex: 0 0 auto; display: block;                     /* one row, horizontal scroll */
+    background: #1b1f2b; border-top: 1px solid #2a3142;
+    padding: 3px 4px calc(3px + env(safe-area-inset-bottom));
+    overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap;
+    user-select: none; -webkit-user-select: none; }
+  #mkeys .mk-row { display: inline-flex; align-items: stretch; gap: 4px; }
+  #mkeys button {                                        /* square (uniform width), lowercase label */
+    flex: 0 0 auto; width: 34px; min-width: 34px; height: 34px; padding: 0;
+    border: 1px solid rgba(255,255,255,.10); border-radius: 7px;
+    background: #2b3140; color: #dfe4ec;
+    font: 600 11px/1 ui-sans-serif, -apple-system, system-ui, sans-serif; letter-spacing: -.02em;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent; overflow: hidden;
+    display: inline-flex; align-items: center; justify-content: center; }
+  #mkeys button:active { background: #3a4150; }
+  #mkeys button.mk-icon { color: #aeb4c0; }              /* zoom / more icon buttons (same square) */
+  #mkeys button.mk-icon svg { width: 17px; height: 17px; display: block; }
+  #mkeys button.mk-icon.on { color: #8bb8ff; background: #26304a; border-color: #3e5a86; }  /* zoom active */
+  #mkeys .mk-mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10.5px; }
+  #mkeys .mk-arm  { background: #3d6aa0; border-color: #7aa6de; color: #fff; }   /* armed (one-shot) */
+  #mkeys .mk-hold { background: #2f7a50; border-color: #5fbd8c; color: #fff; }   /* hold-chain */
+  /* ---- tablet (non-compact): dock the bar under the top tabs (toolbar position). Phones keep it at the bottom. ---- */
+  #app.mkeys-top { padding-bottom: env(safe-area-inset-bottom); }        /* term is at the bottom, so restore safe-area */
+  #app.mkeys-top #mkeys { order: 1; border-top: 0; border-bottom: 1px solid #2a3142;
+                          padding: 3px 4px; }                            /* top position = no bottom safe-area needed */
+  #app.mkeys-top #term  { order: 2; }
+  #app.mkeys-top #tabs button.tab { width: 120px; padding: 0 11px; }     /* wide screen = un-compact tabs */
+  /* collapse the key bar (tablet): keep only mk-toggle + mk-keep (esc, ^end), hide the rest. */
+  #app.mkeys-collapsed #mkeys .mk-row > button:not(.mk-toggle):not(.mk-keep) { display: none; }
+  #mkeys button.mk-toggle.on { color: #8bb8ff; background: #26304a; border-color: #3e5a86; }   /* expanded state */
+
+  /* ---- experimental layout: left sidebar (shell sessions) + top agent launcher.
+     JS tabPrefs.layout='sidebar' (default = tabs, auto-fallback on phones). ---- */
+  #sidebar { display: none; }
+  #app.sidebar-on { display: grid; grid-template-columns: 200px minmax(0, 1fr); grid-template-rows: auto 1fr auto;
+                    grid-template-areas: "side tabs" "side term" "side mkeys"; }
+  #app.sidebar-on > #sidebar { grid-area: side; display: flex; flex-direction: column; min-height: 0;
+                    overflow-y: auto; background: #171b26; border-right: 1px solid #2a3142;
+                    padding: calc(4px + env(safe-area-inset-top)) 6px 8px calc(6px + env(safe-area-inset-left)); }
+  #app.sidebar-on > #tabs  { grid-area: tabs; }
+  #app.sidebar-on > #term  { grid-area: term; }
+  #app.sidebar-on > #mkeys { grid-area: mkeys; }
+  /* section headers (projects / other sessions) = small dim chrome */
+  #sidebar .side-hd { font: 700 10px system-ui; letter-spacing: .06em; text-transform: uppercase; color: #6b7280; padding: 2px 4px; margin-top: 8px; }
+  #sidebar .side-row { display: flex; gap: 5px; margin: 8px 0 2px; }
+  /* shared sidebar button (other sessions, etc) */
+  #sidebar button { flex: 0 0 auto; height: 32px; border: 1px solid rgba(255,255,255,.08); border-radius: 6px;
+                    background: #2b3140; color: #cfd3db; font: 12.5px/1 system-ui, sans-serif;
+                    touch-action: manipulation; user-select: none; }
+  #sidebar button:active { background: #343c4c; }
+  #sidebar button.tab { position: relative; width: 100%; padding: 0 11px 0 12px; text-align: left; box-sizing: border-box; margin: 2px 0;
+                        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: #dfe4ec; }
+  #sidebar button.tab.colored::before { content: ''; position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+                        width: 3px; height: 17px; border-radius: 2px; background: var(--tab-color); }
+  #sidebar button.tab.on { color: #fff; background: #3a4150; border-color: #5b6475; }
+  #sidebar button.tab.drop-before { box-shadow: inset 0 3px 0 #6ea8ff; }
+  #sidebar button.tab.drop-after  { box-shadow: inset 0 -3px 0 #6ea8ff; }
+  #sidebar button.tab.drag-src { opacity: .4; }
+  #sidebar .mini.dots { color: #9a9fac; text-align: left; padding: 0 10px; margin: 2px 0; }
+  #sidebar .sqbtn { width: 32px; min-width: 32px; padding: 0; display: inline-flex; align-items: center;
+                    justify-content: center; color: #aeb4c0; }
+  #sidebar .sqbtn svg { width: 18px; height: 18px; display: block; }
+  /* project header (folder icon + repo name + plus) */
+  #sidebar .side-repo { display: flex; align-items: center; gap: 6px; margin: 16px 2px 6px 4px; }
+  #sidebar .side-repo.side-projects { margin: 2px 2px 6px 4px; padding-bottom: 8px; border-bottom: 1px solid #232838; }
+  #sidebar .side-repo:not(.side-projects) { border-top: 1px solid #232838; padding-top: 12px; }
+  #sidebar .side-repo-name { flex: 1; font: 700 13px system-ui; color: #f2f5fa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #sidebar .side-projects .side-repo-name { font: 700 10px system-ui; letter-spacing: .06em; text-transform: uppercase; color: #6b7280; }
+  #sidebar .side-repo-icon { width: 14px; height: 14px; flex: 0 0 auto; color: #6b7280; display: inline-flex; }
+  #sidebar .side-repo-icon svg { width: 14px; height: 14px; display: block; }
+  #sidebar .side-repo-add { width: 24px; min-width: 24px; height: 24px; }
+  #sidebar .side-repo-add svg { width: 15px; height: 15px; }
+  /* worktree card */
+  #sidebar button.wt { position: relative; display: block; width: 100%; height: auto; text-align: left; box-sizing: border-box;
+                       padding: 7px 10px; margin: 3px 0; background: #232936; border: 1px solid rgba(255,255,255,.05); border-radius: 7px;
+                       transition: background .12s ease, border-color .12s ease; }
+  #sidebar button.wt:hover { background: #333a49; border-color: rgba(255,255,255,.14); }
+  #sidebar button.wt:active { background: #3a4150; }
+  #sidebar button.wt.on { background: #243046; border-color: #3e5a86; }
+  #sidebar button.wt.on .wt-name { color: #fff; }
+  #sidebar button.wt.current::before { content: ''; position: absolute; left: 0; top: 6px; bottom: 6px; width: 3px; border-radius: 0 2px 2px 0; background: #8bb8ff; }
+  #sidebar .wt-name { display: flex; align-items: center; font: 600 13px system-ui; color: #e6eaf2; overflow: hidden; }
+  #sidebar .wt-name .wt-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #sidebar .wt-branch { font: 11px ui-monospace, Menlo, monospace; color: #6f7890; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+  #sidebar .wt-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; flex: 0 0 auto; box-shadow: 0 0 0 2px rgba(0,0,0,.3); }
+  /* worktree child sessions — left guide line + status */
+  #sidebar button.wt-agent { position: relative; display: block; width: 100%; height: 28px; text-align: left; box-sizing: border-box;
+                             margin: 1px 0 1px 13px; padding: 0 10px 0 14px; background: transparent;
+                             border: 1px solid transparent; border-left: 2px solid #2a3142; border-radius: 0 6px 6px 0;
+                             color: #aab1c0; font: 500 12px system-ui; transition: background .12s ease; }
+  #sidebar button.wt-agent:hover { background: #232936; }
+  #sidebar button.wt-agent:active { background: #2b3140; }
+  #sidebar button.wt-agent.on { color: #cfe0ff; background: #26304a; border-left-color: #6ea8ff; }
+  @keyframes dt-pulse { 0%,100% { opacity: .5; } 50% { opacity: 1; } }
+  #sidebar button.wt-agent.starting { animation: dt-pulse 1s ease-in-out infinite; color: #e2c37b; border-left-color: #e2c37b; }
+  /* top launcher bar (sidebar mode) — visually unified with the left tree */
+  #app.sidebar-on #tabs .agentbar-ctx { display: inline-flex; align-items: center; flex: 0 0 auto; align-self: center;
+                        font: 700 12px system-ui; color: #cfd3db; padding: 0 10px 0 2px; white-space: nowrap; }
+  #app.sidebar-on #tabs .agentbar-ctx .ctx-dot { width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; flex: 0 0 auto; box-shadow: 0 0 0 2px rgba(0,0,0,.3); }
+  #app.sidebar-on #tabs .agentbar-hint { align-self: center; color: #7b8296; font: 12.5px system-ui; padding-left: 4px; }
+  #app.sidebar-on #tabs button.tab.agent { position: relative; width: auto; min-width: 84px; height: 34px; border-radius: 7px; padding: 0 26px 0 18px; }
+  #app.sidebar-on #tabs button.tab.agent:not(.shell)::before { content: ''; position: absolute; left: 8px; top: 50%; transform: translateY(-50%);
+                        width: 3px; height: 15px; border-radius: 2px; background: #8bb8ff; }
+  #app.sidebar-on #tabs button.tab.agent.shell { min-width: 68px; padding: 0 14px; color: #cfd3db; }
+  #app.sidebar-on #tabs button.tab.agent:not(.live):not(.on) { opacity: .72; }
+  #app.sidebar-on #tabs button.tab.agent.live::after { content: ''; position: absolute; right: 9px; top: 50%;
+                        transform: translateY(-50%); width: 6px; height: 6px; border-radius: 50%;
+                        background: #7fd6a0; box-shadow: 0 0 6px rgba(127,214,160,.7); }
+  #app.sidebar-on #tabs button.tab.agent.starting::after { content: ''; position: absolute; right: 9px; top: 50%;
+                        transform: translateY(-50%); width: 6px; height: 6px; border-radius: 50%; background: #e2c37b; animation: dt-pulse 1s ease-in-out infinite; }
+  /* terminal-switch loading overlay — freezes the old screen during the reconnect/agent-boot gap */
+  #term { position: relative; }
+  #termdim { position: absolute; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center;
+             background: rgba(20,23,32,.5); pointer-events: none; }
+  #termdim[hidden] { display: none; }
+  #termdim .td-spin { width: 22px; height: 22px; border: 2.5px solid rgba(255,255,255,.2); border-top-color: #8bb8ff;
+             border-radius: 50%; animation: dt-spin .7s linear infinite; }
+  @keyframes dt-spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar"></div>
+  <div id="tabs">
+    <div id="tabnames"></div>
+    <div id="tabctrls"></div>
+  </div>
+  <div id="term"><div id="termdim" hidden><div class="td-spin"></div></div></div>
+  <div id="mkeys"></div>
+</div>
+<div id="status" hidden></div>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script src="vendor/addon-unicode11.js"></script>
+<script src="vendor/addon-web-links.js"></script>
+<script src="ui.js"></script><!-- shared modal/copy primitives — must load first -->
+<script src="accounts.js"></script><!-- account pool (initAccounts DI factory) -->
+<script src="secretdrop.js"></script><!-- secret drop (initSecretDrop DI factory) — shared with panel.html -->
+<script src="app.js"></script>
+</body>
+</html>

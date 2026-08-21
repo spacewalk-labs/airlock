@@ -1,0 +1,7 @@
+# Build context is the repo root (see docker-compose.yml `context: ..`).
+.git
+airlock.toml
+docker/airlock.env
+_code
+**/node_modules
+**/.DS_Store

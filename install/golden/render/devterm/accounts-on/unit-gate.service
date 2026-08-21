@@ -1,0 +1,38 @@
+[Unit]
+Description=airlock devterm-gate — custom client + API, proxies to ttyd (127.0.0.1:19301)
+After=network.target airlock-devterm.service
+Wants=airlock-devterm.service
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:NODE_BIN:/usr/local/bin:/usr/bin:/bin
+Environment=DEVTERM_REV=deadbeefcafe
+Environment=DEVTERM_LISTEN_HOST=127.0.0.1
+Environment=DEVTERM_LISTEN_PORT=19301
+Environment=DEVTERM_TTYD_HOST=127.0.0.1
+Environment=DEVTERM_TTYD_PORT=19300
+Environment=DEVTERM_WEB=/home/example/.local/share/airlock-devterm/web
+Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
+Environment=AIRLOCK_OWNER=owner@example.com
+Environment=AIRLOCK_CODE_ROOT=
+Environment=DEVTERM_MARKWAND=false
+Environment=DEVTERM_ACCOUNTS=true
+Environment=DEVTERM_XAI=false
+Environment=DEVTERM_REMOTE_HOSTS=
+Environment=DEVTERM_SECRET_TTL=1800
+Environment=DEVTERM_ORCA_SHIM=
+Environment=DEVTERM_CLAUDE_SWITCH=/home/example/.local/bin/claude-switch
+Environment=DEVTERM_CLAUDE_STATUS=/home/example/.local/bin/claude-status
+Environment=DEVTERM_FLEET_STORE=
+Environment=DEVTERM_FLEET_STORE_URL=
+ExecStart=/usr/bin/python3 ROOT/apps/devterm/backend/devterm-gate.py
+# KillMode=process, same reason as the ttyd unit: the gate starts a detached
+# `codex login --device-auth` that must outlive a redeploy. setsid does not leave the
+# cgroup, so the default (control-group) kills the pending login while the user is
+# entering the code on their phone — and the old credential is already backed out.
+KillMode=process
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

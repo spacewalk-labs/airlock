@@ -1,0 +1,31 @@
+[Unit]
+Description=airlock-orca — Orca ADE headless serve (behind the 127.0.0.1 owner gate)
+Requires=airlock-orca-xvfb.service
+# NOT After=default.target — same WantedBy=default.target ordering-cycle
+# anti-pattern as airlock-orca-xvfb.service above; see that comment.
+After=network.target airlock-orca-xvfb.service
+
+[Service]
+Type=simple
+Environment=LIBGL_ALWAYS_SOFTWARE=1
+Environment=APPDIR=/home/example/.local/share/airlock-orca/squashfs-root
+# DISPLAY is provided by the dedicated Xvfb unit; without it orca SIGSEGVs.
+Environment=DISPLAY=:59
+# Defensive: even with xvfb active the socket can lag a moment — wait for it.
+ExecStartPre=/bin/sh -c 'for _ in $(seq 1 100); do [ -S /tmp/.X11-unix/X59 ] && exit 0; sleep 0.1; done; echo "X59 socket not ready"; exit 1'
+# --pairing-code fixed (above) -> stable webClientUrl. --pairing-address rewrites
+# the endpoint the web client dials to the public gate (default ws://0.0.0.0:BACKEND
+# is not browser-reachable). The webClientUrl is only ever emitted to serve.log
+# (Electron stdout never reaches journald), so capture it there.
+ExecStart=/bin/sh -c 'exec /home/example/.local/share/airlock-orca/squashfs-root/AppRun serve --port 19600 --pairing-code deadbeefcafef00d1234567890abcdef --pairing-address wss://box.example.ts.net:19601 > /home/example/.local/share/airlock-orca/serve.log 2>&1'
+# The daemon self-detaches into app-orca-*.scope, so reclaim it on stop.
+ExecStopPost=/home/example/.local/bin/airlock-orca-reap
+Restart=on-failure
+RestartSec=3
+# Backstop only — app-orca-*.scope lives in app.slice, outside this cap.
+MemoryMax=8G
+TasksMax=1024
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

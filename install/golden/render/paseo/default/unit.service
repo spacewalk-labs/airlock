@@ -1,0 +1,98 @@
+[Unit]
+Description=airlock-paseo — Paseo daemon (coding-agent orchestration + web UI) behind the owner gate
+Documentation=https://github.com/getpaseo/paseo
+# NOT After=default.target: this unit is WantedBy=default.target below, and a
+# unit that is both Wanted by a target and ordered After that SAME target is a
+# guaranteed ordering cycle (the target gets an implicit After= on everything
+# it Wants — systemd.unit(5) "Default Dependencies" — so default.target ends
+# up After= this unit AND this unit After= default.target). Measured on a real
+# box: "Found ordering cycle on default.target/start ... Job
+# airlock-paseo-browse-host.service/start deleted to break ordering cycle" —
+# the unit never started on boot, only via a manual 'systemctl start'.
+# network.target matches every other app unit in this repo (dev-monitor,
+# devterm, feedback, publish, code-server) and carries no such back-edge.
+After=network.target
+
+[Service]
+Type=simple
+# Explicit PATH: npm global bin + provider CLI dirs + node + system. The daemon
+# spawns provider CLIs against this PATH — a mismatch is the #1 pilot gotcha.
+Environment=PATH=/home/example/.npm-global/bin:/home/example/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Provider CLI credential paths (claude=~/.claude, codex/gemini=~/.config).
+Environment=HOME=/home/example
+Environment=XDG_CONFIG_HOME=/home/example/.config
+Environment=PASEO_HOME=/home/example/.paseo
+# Trust the reverse proxy (nginx@127.0.0.1) X-Forwarded-Proto https so the web UI
+# uses wss:// (gate specific (1)/(2)). Without this the WebSocket fails behind TLS.
+Environment=PASEO_TRUSTED_PROXIES=127.0.0.1
+# DNS-rebinding host allowlist — must accept the Host the gate forwards (fqdn WITH
+# the https port, gate specific (3)) plus localhost.
+Environment=PASEO_HOSTNAMES=box.example.ts.net,box.example.ts.net:19700,localhost
+# Headless: no dictation/voice (avoids an unexpected ~600MB speech model download).
+Environment=PASEO_DICTATION_ENABLED=false
+Environment=PASEO_VOICE_MODE_ENABLED=false
+# Reap a stale singleton pidfile before every start (including on-boot and every
+# Restart=always retry): upstream (@getpaseo/cli) writes $PASEO_HOME/paseo.pid to
+# enforce "only one daemon" but never reaps it itself, so a record surviving a
+# reboot (stale pid, sometimes already reused by an unrelated process) makes the
+# daemon refuse to start FOREVER with "Another Paseo daemon is already running" —
+# measured on a real box, RestartSec=3 looping it (counter into double digits).
+# Leading '-': a guard-script problem must never block the real ExecStart; the
+# script itself only ever deletes the file when it can prove staleness (dead pid,
+# or a live pid whose uid/hostname/start-time contradict the record) and always
+# exits 0 either way. See apps/paseo/paseo-clear-stale-pid.py.
+ExecStartPre=-/usr/bin/python3 ROOT/apps/paseo/paseo-clear-stale-pid.py /home/example/.paseo/paseo.pid
+# --foreground: Type=simple. --no-relay: no upstream relay outbound. --web-ui: the
+# browser UI. --listen 127.0.0.1: loopback bind (the gate is the only ingress).
+ExecStart=/home/example/.npm-global/bin/paseo daemon start --foreground --no-relay --web-ui --listen 127.0.0.1:19701
+# always, not on-failure: the web UI's "restart daemon" is a websocket shutdown RPC
+# that exits the worker cleanly (status 0) and expects a supervisor to bring it back.
+# Under on-failure systemd reads that as an intended stop and leaves it dead — so the
+# button permanently kills the daemon (the gate stays up, so it just looks hung).
+# An explicit 'systemctl --user stop' still stops it: always only covers self-exit.
+# (Single quotes, not backticks: this heredoc is unquoted, so backticks here would
+# be command substitution — the comment would RUN at install time and vanish.)
+Restart=always
+RestartSec=3
+# Backstop, not a reservation (idle ~440M) — a ceiling this unit must never cross,
+# not memory set aside for it. Picked by the installer from a RAM tier table
+# (standard 5.5G/5G; >=16 GiB -> 14G/12G), so a runaway multi-session tree cannot take
+# the machine down with it. No box is refused over this: on a box smaller than the
+# tier the ceiling is inert and the installer says so.
+#
+# MemoryHigh, a little under max, is the part that matters in practice. MemoryMax alone
+# is a cliff: the cgroup runs flat out to the ceiling and then the allocation is
+# refused, and each runtime dies its own way there (node=SIGABRT, chrome=SIGTRAP,
+# python=SIGSEGV) with no warning first. MemoryHigh does not refuse — it forces
+# reclaim and throttles, so the result is a slowdown instead of a crash, and the
+# 'high' counter in memory.events becomes an early signal. Measured on a box that
+# had max but no high: high 1,886,403 / max 27,479 / oom_kill 0 — the kernel never
+# killed anything, the sessions just got strangled and timed out. Read the counters
+# with: cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/\
+#       app.slice/airlock-paseo.service/memory.events
+# 'high' climbing is by design; 'max' climbing means the box is too small.
+# Keep high < max — above max it is inert.
+MemoryMax=14G
+MemoryHigh=12G
+# Agent trees fork wide (a CLI plus its children per session, times N sessions).
+# 1024 was a real ceiling on a busy box: pids.events 'max' climbs, fork() starts
+# failing, and it surfaces as unrelated-looking tool errors rather than as a
+# resource limit. 24576 was the next guess, chosen on one box.
+#
+# Owner decision (2026-08-07): the default is the most this box can give, not a
+# number picked somewhere else. 'infinity' is not "unbounded" for a --user unit —
+# it is enclosed by user-<uid>.slice, whose pids.max is the real ceiling (339389
+# on the box this was measured on; systemd's DefaultTasksMax is 15% of
+# kernel.threads-max elsewhere). Deferring to that is the only spelling of
+# "maximum" that stays true when the box changes; a number derived here would
+# bake one kernel's limits into a golden, which is the mistake the memory block
+# above already had to unlearn.
+#
+# What it costs, stated plainly: this unit no longer carries a pids backstop of
+# its own, so 'pids.events' on the unit will never show 'max' climbing — the
+# slice's will instead. AIRLOCK_PASEO_TASKS_MAX puts a finite one back.
+TasksMax=infinity
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,78 @@
+contract = 1
+id = "markwand"
+
+# Transcribed from the former APP_DEFAULTS["markwand"] entry. markwand also
+# reads [paths].code_root (a platform-global key, not an app config key —
+# unaffected by this manifest) and requires it non-empty; that check stays
+# in install.sh (paths.code_root is not expressible in [config], the same
+# way notepad's publish dependency stays app-side per plan rev 3).
+[config.defaults]
+markserv_port = 18799
+filebrowser_port = 18801
+
+# Transcribed from install/prerequisites.tsv's six markwand rows (F11).
+[[prerequisites]]
+command = "node"
+predicate = "present"
+expected = "-"
+fix = "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+note = "Markserv runtime - same non-snap node as paseo (one command, one fix: preflight rejects conflicting fixes)"
+
+[[prerequisites]]
+command = "npm"
+predicate = "present"
+expected = "-"
+fix = "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+note = "Markserv package manager - ships with the same non-snap node"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Release download"
+
+[[prerequisites]]
+command = "sha256sum"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y coreutils"
+note = "Release verification"
+
+[[prerequisites]]
+command = "tar"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y tar"
+note = "Release extraction"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User services"
+
+# Appendix: two user units, one hub-locations fragment, the __mw/ static
+# asset directory (9 files, claimed as one directory the way every other
+# webroot dir claim works), and the markserv/filebrowser binaries + npm
+# tree + npm's own staging-leftover sibling pattern + filebrowser's
+# branding dir. Deliberately NOT declared (retained data): CODE_ROOT (the
+# served tree — [paths].code_root, not app-owned) and
+# ~/.config/filebrowser/fb.db. No serve_ports: both ports are proxied by
+# the hub's own nginx, never tailscale-served directly.
+[artifacts]
+units = ["airlock-markserv.service", "airlock-filebrowser.service"]
+fragments = ["hub-locations.d/markwand.conf"]
+webroot = ["__mw/"]
+files = ["~/.local/bin/markserv", "~/.local/lib/node_modules/markserv/",
+         "~/.local/lib/node_modules/.markserv-*", "~/.local/bin/filebrowser",
+         "~/.config/filebrowser/branding/"]
+
+# From hub/index.html's APPS table (markwand row).
+[tile]
+label = "Markwand"
+sub = "docs viewer + editor"
+cat = "docs"
+path = "/markwand/"
+glyph = "app-markwand"

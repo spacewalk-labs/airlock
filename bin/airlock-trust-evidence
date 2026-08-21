@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Emit digest-only Airlock trust evidence bound to the current clean commit."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import types
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True
+SCHEMAS = (
+    ("config_schema", 2, "schemas/trust/config-v2.json"),
+    ("capability_schema", 1, "schemas/trust/capability-v1.json"),
+    ("ledger_schema", 5, "schemas/trust/ledger-v5.json"),
+)
+SUITES = (
+    ("operator-trust-surface", "install/test-operator-surface.sh", 71),
+    ("builtin-capability-migration", "install/test-builtin-migration.sh", 181),
+    ("ledger-system-unit-boundary", "install/test-ledger-system-unit.sh", 7),
+    ("live-verdict-boundary", "install/test-live-verdict.sh", 39),
+)
+ALLOWED_SUITE_SKIPS = {
+    "builtin-capability-migration": (
+        "SKIP E: red-transcript check — base commit c647340 not present in this (shallow) "
+        "checkout and could not be fetched; the transcript is verified where the base is reachable",
+    ),
+}
+SUMMARY_RE = re.compile(r"passed=([0-9]+) failed=([0-9]+)\Z")
+FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+MAX_FILE_BYTES = 32 * 1024 * 1024
+RUNTIME_CONTRACTS = (
+    ("config_and_capability_runtime", "bin/airlock-config"),
+    ("ledger_runtime", "bin/airlock-ledger"),
+)
+
+
+class EvidenceError(Exception):
+    pass
+
+
+def fail(message: str) -> "NoReturn":
+    raise EvidenceError(message)
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+
+
+def digest(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def clean_env() -> dict[str, str]:
+    allowed = ("HOME", "LOGNAME", "PATH", "TMPDIR", "USER")
+    env = {key: os.environ[key] for key in allowed if key in os.environ}
+    env.update({"LC_ALL": "C", "LANG": "C", "TZ": "UTC"})
+    return env
+
+
+def load_json_bytes(raw: bytes, label: str) -> Any:
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, value in items:
+            if key in out:
+                fail(f"{label}: duplicate JSON key {key!r}")
+            out[key] = value
+        return out
+
+    try:
+        return json.loads(raw, object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"{label}: invalid JSON: {exc}")
+
+
+def read_regular(path: Path, label: str) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"{label}: cannot read {path}: {exc}")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{label}: must be a regular non-symlink file: {path}")
+        if info.st_size > MAX_FILE_BYTES:
+            fail(f"{label}: file exceeds {MAX_FILE_BYTES} bytes: {path}")
+        chunks: list[bytes] = []
+        remaining = MAX_FILE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_FILE_BYTES:
+            fail(f"{label}: file exceeds {MAX_FILE_BYTES} bytes: {path}")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def git(*args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", os.fspath(ROOT), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=clean_env(),
+    )
+    if result.returncode != 0:
+        fail(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def git_blob(sha: str, relative: str, label: str) -> bytes:
+    object_name = f"{sha}:{relative}"
+    try:
+        size = int(git("cat-file", "-s", object_name))
+    except ValueError:
+        fail(f"{label}: git reported a non-integer blob size")
+    if size > MAX_FILE_BYTES:
+        fail(f"{label}: committed blob exceeds {MAX_FILE_BYTES} bytes: {relative}")
+    result = subprocess.run(
+        ["git", "-C", os.fspath(ROOT), "cat-file", "blob", object_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=clean_env(),
+    )
+    if result.returncode != 0:
+        fail(f"{label}: cannot read committed blob {relative}: {result.stderr.decode(errors='replace').strip()}")
+    if len(result.stdout) != size:
+        fail(f"{label}: committed blob size changed while reading {relative}")
+    return result.stdout
+
+
+def candidate() -> str:
+    sha = git("rev-parse", "HEAD")
+    if not FULL_SHA_RE.fullmatch(sha):
+        fail("HEAD did not resolve to a full lowercase commit SHA")
+    if git("status", "--porcelain", "--untracked-files=all"):
+        fail("working tree is dirty; evidence must describe exactly the committed candidate")
+    return sha
+
+
+def schema_bundle(expected_candidate: str | None = None) -> dict[str, Any]:
+    sha = candidate()
+    if expected_candidate is not None and sha != expected_candidate:
+        fail("candidate changed while evidence was being produced")
+    schemas: dict[str, Any] = {}
+    for schema_id, version, relative in SCHEMAS:
+        raw = git_blob(sha, relative, schema_id)
+        parsed = load_json_bytes(raw, schema_id)
+        if not isinstance(parsed, dict):
+            fail(f"{schema_id}: schema root must be an object")
+        if parsed.get("version") != version:
+            fail(f"{schema_id}: version does not equal {version}")
+        if raw != canonical_bytes(parsed):
+            fail(f"{schema_id}: bytes are not canonical JSON")
+        schemas[schema_id] = {
+            "digest": digest(raw),
+            "path": relative,
+            "version": version,
+        }
+    runtime_pins = {
+        runtime_id: {"digest": digest(git_blob(sha, relative, runtime_id)), "path": relative}
+        for runtime_id, relative in RUNTIME_CONTRACTS
+    }
+    if candidate() != sha:
+        fail("candidate changed while schema evidence was being produced")
+    return {
+        "candidate_sha": sha,
+        "repository_id": "airlock-work",
+        "runtime_pins": runtime_pins,
+        "schema_version": 1,
+        "schemas": schemas,
+    }
+
+
+def optional_origin() -> str | None:
+    result = subprocess.run(
+        ["git", "-C", os.fspath(ROOT), "remote", "get-url", "origin"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=clean_env(),
+    )
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+
+
+def clone_candidate(sha: str, destination: Path, source_origin: str | None) -> None:
+    commands = (
+        ["git", "clone", "--quiet", "--no-checkout", os.fspath(ROOT), os.fspath(destination)],
+        ["git", "-C", os.fspath(destination), "fetch", "--quiet", os.fspath(ROOT), sha],
+        ["git", "-C", os.fspath(destination), "checkout", "--quiet", "--detach", sha],
+    )
+    for command in commands:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=False, env=clean_env())
+        if result.returncode != 0:
+            fail(f"cannot create detached candidate checkout: {result.stderr.decode(errors='replace').strip()}")
+    if source_origin is not None:
+        result = subprocess.run(
+            ["git", "-C", os.fspath(destination), "remote", "set-url", "origin", source_origin],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=clean_env(),
+        )
+        if result.returncode != 0:
+            fail(f"cannot preserve candidate origin: {result.stderr.decode(errors='replace').strip()}")
+
+
+def suite_summary(suite_id: str, expected_passed: int, returncode: int, output: str) -> tuple[int, int]:
+    lines = output.splitlines()
+    summaries = [match.groups() for line in lines if (match := SUMMARY_RE.fullmatch(line)) is not None]
+    if len(summaries) != 1:
+        fail(f"{suite_id}: expected one pass/fail summary, found {len(summaries)}")
+    passed, failed_count = (int(value) for value in summaries[0])
+    skip_lines = [line for line in lines if line.startswith("SKIP ")]
+    allowed_skips = set(ALLOWED_SUITE_SKIPS.get(suite_id, ()))
+    unexpected_skips = sorted(set(skip_lines) - allowed_skips)
+    if unexpected_skips:
+        fail(f"{suite_id}: unexpected SKIP: {unexpected_skips[0]}")
+    if len(skip_lines) != len(set(skip_lines)):
+        fail(f"{suite_id}: duplicate permitted SKIP")
+    expected_observed = expected_passed - len(skip_lines)
+    if returncode != 0 or failed_count != 0 or passed != expected_observed:
+        tail = "\n".join(lines[-20:])
+        fail(
+            f"{suite_id}: expected rc=0 passed={expected_observed} failed=0 "
+            f"with permitted_skips={len(skip_lines)}, got rc={returncode} "
+            f"passed={passed} failed={failed_count}\n{tail}"
+        )
+    return passed, len(skip_lines)
+
+
+def run_suite() -> dict[str, Any]:
+    sha = candidate()
+    results: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="airlock-trust-evidence-") as temporary:
+        temporary_root = Path(temporary)
+        source_origin = optional_origin()
+        for index, (suite_id, relative, expected_passed) in enumerate(SUITES):
+            snapshot = temporary_root / f"suite-{index}"
+            clone_candidate(sha, snapshot, source_origin)
+            path = snapshot / relative
+            if path.is_symlink() or not path.is_file():
+                fail(f"{suite_id}: committed suite path is not a regular file")
+            completed = subprocess.run(
+                ["bash", relative],
+                cwd=snapshot,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+                env=clean_env(),
+            )
+            passed, skipped = suite_summary(
+                suite_id, expected_passed, completed.returncode, completed.stdout
+            )
+            results.append(
+                {
+                    "command": ["bash", relative],
+                    "id": suite_id,
+                    "passed": passed,
+                    "script_digest": digest(git_blob(sha, relative, suite_id)),
+                    "skipped": skipped,
+                }
+            )
+    schemas = schema_bundle(sha)
+    return {
+        "candidate_sha": sha,
+        "repository_id": "airlock-work",
+        "result": "passed",
+        "runtime_pins": schemas["runtime_pins"],
+        "schema_pins": schemas["schemas"],
+        "schema_version": 1,
+        "suites": results,
+    }
+
+
+def load_verdict_module(sha: str) -> Any:
+    raw = git_blob(sha, "live/verdict.py", "live verdict")
+    module = types.ModuleType("airlock_live_verdict")
+    module.__file__ = "live/verdict.py"
+    try:
+        exec(compile(raw, module.__file__, "exec"), module.__dict__)
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        fail(f"cannot load committed live/verdict.py: {exc}")
+    return module
+
+
+def live_bundle(result_path: Path) -> dict[str, Any]:
+    sha = candidate()
+    raw = read_regular(result_path, "live result")
+    record = load_json_bytes(raw, "live result")
+    if not isinstance(record, dict):
+        fail("live result: root must be an object")
+    if record.get("commit") != sha:
+        fail(f"live result: commit must equal current candidate {sha}")
+    if record.get("schema") != 1:
+        fail("live result: schema must be the integer 1")
+    if record.get("stage") not in {"ran", "published", "publish_failed"}:
+        fail("live result: stage must show that the inner run finished")
+    run_id = record.get("run_id")
+    if not isinstance(run_id, str) or not run_id or run_id.strip() != run_id:
+        fail("live result: run_id must be a non-empty trimmed string")
+    if record.get("cleanup_ok") is not True:
+        fail("live result: cleanup_ok must be true")
+    value, reason = load_verdict_module(sha).verdict(record)
+    if value != 0:
+        fail(f"live result: verdict must be 0: {reason}")
+    inner = record.get("inner")
+    acceptance = inner.get("acceptance") if isinstance(inner, dict) else None
+    if not isinstance(acceptance, dict):
+        fail("live result: acceptance is missing")
+    schemas = schema_bundle(sha)
+    return {
+        "acceptance": {
+            "failed": acceptance.get("failed"),
+            "passed": acceptance.get("passed"),
+        },
+        "candidate_sha": sha,
+        "repository_id": "airlock-work",
+        "result": "passed",
+        "result_file": result_path.name,
+        "result_sha256": digest(raw),
+        "run_id": run_id,
+        "runtime_pins": schemas["runtime_pins"],
+        "schema_pins": schemas["schemas"],
+        "schema_version": 1,
+        "verdict": value,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("schemas", help="emit canonical contract-index and runtime digests")
+    sub.add_parser("suite", help="run the offline trust suites at the clean candidate")
+    live = sub.add_parser("live", help="bind a durable live result to the clean candidate")
+    live.add_argument("result", type=Path)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.command == "schemas":
+            value = schema_bundle()
+        elif args.command == "suite":
+            value = run_suite()
+        else:
+            value = live_bundle(args.result)
+        sys.stdout.buffer.write(canonical_bytes(value))
+        return 0
+    except EvidenceError as exc:
+        print(f"airlock-trust-evidence: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

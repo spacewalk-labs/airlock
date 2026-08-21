@@ -1,0 +1,142 @@
+# Known apps/ drift between airlock-work and spacewalk-labs/airlock-apps.
+# Measured 2026-08-17 against work origin/main 82aeaab and apps origin/main 407bd08.
+# kind is recorded for humans. The gate keys on the path: a new path that
+# splits is red even if the count stays the same.
+# Do not replace this list with a number.
+#
+# Two expected batches, both until D-APPS-DUP cutover:
+# 1) 2026-08-16 live drift: work-ahead installer files (dev-monitor/devterm).
+#    Work remains the live consumer of apps/. The public copy was behind.
+# 2) 2026-08-17 PUBLIC_APP_PARITY #1: public-repo-only tests, migrators,
+#    state helpers, fonts, and patches landed on airlock-apps. Work does not
+#    get a second copy of those files. Existing files PARITY edited on the
+#    apps side stay content-diff. Copying them into work would undo the split.
+only-work	apps/devterm/test-accounts-js.mjs
+# 3) 2026-08-18 P3 severity/routing: one work-ahead backend module. devmon_email.py is the
+#    email lane's transport — a real source file of a mirrored app, which the public copy
+#    gets on the next publish sync. That is batch 1's shape ("work remains the live consumer
+#    of apps/, the public copy was behind"), not a new exception.
+#    P3's other new file, the routing-policy contract test, is deliberately NOT here: it
+#    reads a page and a backend module by path and can never be mirrored, so it lives in
+#    install/ instead. Registering it would have widened this guard in the direction it
+#    exists to close — the same call P2 made for test-inbox-state.mjs.
+only-work	apps/dev-monitor/backend/devmon_email.py
+# 4) 2026-08-18 P4 owner/roster: one more work-ahead backend module, same shape as
+#    devmon_email.py above. devmon_roster.py resolves a card's owner against the roster
+#    snapshot for the Slack/email/console axes devmon_messages.py, devmon_slack.py and
+#    devmon_email.py already read — it belongs in the public mirror and will land there on
+#    the next publish sync. It is only-work today because that sync has not run since this
+#    file was added, not because it is work-only by design.
+only-work	apps/dev-monitor/backend/devmon_roster.py
+# 5) 2026-08-21 provider-subagent selective delivery: a new paseo patch GROUP, split the
+#    same way batch 1 describes — work is the live consumer and the public copy is behind.
+#    The server filter trio (.mjs/.patch/.test.mjs) mirrors the shape airlock-apps already
+#    uses for codex-strip-ambient-openai-key below, only on the other side: a patch that
+#    exists on one repo and lands on the other at the next publish sync. It is only-work
+#    today because that sync has not run, not because it is work-only by design.
+only-work	apps/paseo/patches/provider-subagent-stream-filter.mjs
+only-work	apps/paseo/patches/provider-subagent-stream-filter.patch
+only-work	apps/paseo/patches/provider-subagent-stream-filter.test.mjs
+only-work	apps/paseo/browse-host/bin/patch-web-ui.test.js
+# 6) 2026-08-21 P6 dev-monitor console replacement: hardening and migration helpers are
+#    work-ahead package files, while the three existing backend/test paths are expected
+#    content splits until the next public mirror synchronization.
+only-work	apps/dev-monitor/install-spool-hardening.sh
+only-work	apps/dev-monitor/test-migrate-legacy-state.py
+only-apps	apps/code-server/bin/migrate-legacy-state
+only-apps	apps/code-server/tests/lifecycle.sh
+only-apps	apps/code-server/tests/parity.sh
+only-apps	apps/dev-monitor/tests/lifecycle.sh
+only-apps	apps/dev-monitor/tests/parity.sh
+only-apps	apps/devterm/NOTICE
+only-apps	apps/devterm/tests/lifecycle.sh
+only-apps	apps/devterm/tests/parity.sh
+only-apps	apps/devterm/tests/parity_test.py
+only-apps	apps/devterm/web/keytest.html
+only-apps	apps/devterm/web/vendor/D2Coding-OFL.txt
+only-apps	apps/devterm/web/vendor/d2coding-400.woff2
+only-apps	apps/devterm/web/vendor/d2coding-700.woff2
+only-apps	apps/feedback/tests/lifecycle.sh
+only-apps	apps/feedback/tests/parity.sh
+only-apps	apps/markwand/state.sh
+only-apps	apps/markwand/static/markwand-manifest.json
+only-apps	apps/markwand/tests/lifecycle.sh
+only-apps	apps/markwand/tests/parity.sh
+only-apps	apps/notepad/render.sh
+only-apps	apps/notepad/tests/lifecycle.sh
+only-apps	apps/notepad/tests/parity.sh
+only-apps	apps/orca/bin/refresh-web-bundle.sh
+only-apps	apps/orca/release-pin.sh
+only-apps	apps/orca/state.sh
+only-apps	apps/orca/tests/lifecycle.sh
+only-apps	apps/orca/tests/parity.sh
+only-apps	apps/orca/web-bundle/public-scrub.json
+only-apps	apps/paseo/patches/codex-strip-ambient-openai-key.mjs
+only-apps	apps/paseo/patches/codex-strip-ambient-openai-key.patch
+only-apps	apps/paseo/patches/codex-strip-ambient-openai-key.test.mjs
+only-apps	apps/paseo/state.sh
+only-apps	apps/paseo/tests/lifecycle.sh
+only-apps	apps/paseo/tests/parity.sh
+only-apps	apps/publish/tests/lifecycle.sh
+only-apps	apps/publish/tests/parity.sh
+content	apps/code-server/README.md
+content	apps/code-server/airlock-app.toml
+content	apps/code-server/install.sh
+content	apps/dev-monitor/README.md
+content	apps/dev-monitor/airlock-app.toml
+content	apps/dev-monitor/backend/airlock-dev-monitor.py
+content	apps/dev-monitor/backend/devmon_messages.py
+content	apps/dev-monitor/backend/devmon_spool.py
+content	apps/dev-monitor/backend/devmon_owner.py
+content	apps/dev-monitor/backend/devmon_slack.py
+content	apps/dev-monitor/backend/test_devmon.py
+content	apps/dev-monitor/frontend/dev-monitor.html
+content	apps/dev-monitor/install.sh
+content	apps/dev-monitor/render.sh
+content	apps/dev-monitor/smoke.sh
+content	apps/dev-monitor/migrate-legacy-state.py
+content	apps/dev-monitor/test-backend.py
+content	apps/devterm/README.md
+content	apps/devterm/airlock-app.toml
+content	apps/devterm/backend/devterm-gate.py
+content	apps/devterm/bin/claude-status
+content	apps/devterm/deactivate.sh
+content	apps/devterm/install.sh
+content	apps/devterm/render.sh
+content	apps/devterm/smoke.sh
+content	apps/devterm/test-accounts.py
+content	apps/devterm/web/accounts.js
+content	apps/devterm/web/app.js
+content	apps/devterm/web/index.html
+content	apps/feedback/backend/airlock-feedback.py
+content	apps/markwand/airlock-app.toml
+content	apps/markwand/install.sh
+content	apps/markwand/render.sh
+content	apps/markwand/static/markwand-split.html
+content	apps/notepad/airlock-app.toml
+content	apps/notepad/deactivate.sh
+content	apps/notepad/frontend/notepad.html
+content	apps/notepad/install.sh
+content	apps/orca/airlock-app.toml
+content	apps/orca/bin/verify-web-bundle.sh
+content	apps/orca/install.sh
+content	apps/orca/render.sh
+content	apps/orca/web-bundle/README.md
+content	apps/orca/web-bundle/VERSION
+# batch 5 (above) also edits two files that exist on BOTH sides, so they are content drift,
+# not a new split: patch-web-ui.js gained named-mode dispatch and browse-host/install.sh
+# now requests --browse explicitly. Both heal on the next publish sync.
+content	apps/paseo/browse-host/bin/patch-web-ui.js
+content	apps/paseo/browse-host/install.sh
+content	apps/paseo/README.md
+content	apps/paseo/airlock-app.toml
+content	apps/paseo/install.sh
+content	apps/paseo/patches/README.md
+content	apps/paseo/patches/anchor-manifest.json
+content	apps/paseo/render.sh
+content	apps/publish/README.md
+content	apps/publish/backend/airlock-publish.py
+content	apps/publish/frontend/publish.html
+content	apps/publish/render.sh
+content	apps/publish/test-bundle-plan-state.mjs
+content	apps/publish/test-local-target.py

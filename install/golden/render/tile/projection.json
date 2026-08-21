@@ -1,0 +1,62 @@
+{
+  "code-server": {
+    "label": "code-server",
+    "sub": "browser IDE",
+    "cat": "coding",
+    "glyph": "app-code-server",
+    "brand": null
+  },
+  "dev-monitor": {
+    "label": "Dev Monitor",
+    "sub": "system status",
+    "cat": "system",
+    "path": "/monitor/",
+    "glyph": "app-monitor",
+    "brand": null
+  },
+  "devterm": {
+    "label": "DevTerm",
+    "sub": "web shell",
+    "cat": "coding",
+    "glyph": "app-devterm",
+    "brand": null
+  },
+  "markwand": {
+    "label": "Markwand",
+    "sub": "docs viewer + editor",
+    "cat": "docs",
+    "path": "/markwand/",
+    "glyph": "app-markwand",
+    "brand": null
+  },
+  "notepad": {
+    "label": "Clip Bridge",
+    "sub": "clipboard",
+    "cat": "docs",
+    "path": "/notepad/",
+    "glyph": "app-notepad",
+    "brand": null
+  },
+  "orca": {
+    "label": "Orca",
+    "sub": "agent IDE",
+    "cat": "coding",
+    "glyph": null,
+    "brand": "/assets/apps/orca/orca.png"
+  },
+  "paseo": {
+    "label": "Paseo",
+    "sub": "agent orchestration",
+    "cat": "coding",
+    "glyph": null,
+    "brand": "/assets/apps/paseo/paseo.png"
+  },
+  "publish": {
+    "label": "Publish",
+    "sub": "static publish",
+    "cat": "docs",
+    "path": "/publish/",
+    "glyph": "app-publish",
+    "brand": null
+  }
+}

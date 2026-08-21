@@ -1,0 +1,108 @@
+contract = 1
+id = "orca"
+
+# Transcribed from the former APP_DEFAULTS["orca"] entry.
+[config.defaults]
+https_port = 8446
+gate_port = 18820
+backend_port = 18821
+
+# Transcribed from install/prerequisites.tsv's nine orca rows (F11).
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Release download"
+
+[[prerequisites]]
+command = "sha256sum"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y coreutils"
+note = "Release verification"
+
+[[prerequisites]]
+command = "tar"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y tar"
+note = "Release extraction"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "Service management"
+
+[[prerequisites]]
+command = "tailscale"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get install -y curl && curl -fsSL https://tailscale.com/install.sh | sh"
+note = "Private ingress"
+
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Gate runtime"
+
+[[prerequisites]]
+command = "nft"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y nftables"
+note = "Loopback firewall"
+
+[[prerequisites]]
+command = "ss"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y iproute2"
+note = "Backend readiness check"
+
+[[prerequisites]]
+command = "sudo"
+predicate = "present"
+expected = "-"
+fix = "su -c 'apt-get update && apt-get install -y sudo'"
+note = "Runtime and firewall setup"
+
+# Appendix: two user units (xvfb, serve) + one SYSTEM-scope unit (the nft
+# firewall service — D2's typed-units surface; child 4), one servers.d
+# fragment, the AppImage/squashfs/serve.log staging dir + the reap helper +
+# the fixed pairing code file, and two rooted (shipped-only) claims: the
+# system nft ruleset file and the patched web client's world-readable serve
+# tree (a sibling of the hub webroot, not under it — the ${webroot_parent}
+# substitution token, resolved+authorized against the current environment
+# at record/execution time per D2's rooted amendment, not the record's own
+# snapshot). No data column in the Appendix — nothing is retained here.
+[artifacts]
+units = ["airlock-orca-xvfb.service", "airlock-orca.service",
+         { name = "airlock-orca-firewall.service", scope = "system" }]
+fragments = ["servers.d/orca.conf"]
+files = ["~/.local/share/airlock-orca/", "~/.local/bin/airlock-orca-reap",
+         "~/.config/orca/airlock-pairing-code"]
+rooted = ["/etc/airlock/orca-loopback.nft", "${webroot_parent}/orca-web/"]
+serve_ports = ["https_port"]
+
+[serve.https]
+https_port = "gate_port"
+
+# From hub/index.html's APPS table (orca row), image moved in-app (was
+# hub/assets/orca.png — repo-root NOTICE updated to the new path) and
+# staged by the platform like every other declared tile icon (F4). orca has
+# no public_port at all (https only), so unlike devterm there is no
+# [plaintext_redirect] here.
+[tile]
+label = "Orca"
+sub = "agent IDE"
+cat = "coding"
+icon = "orca.png"
+
+[audience]
+supported = ["owner"]
+default = "owner"
