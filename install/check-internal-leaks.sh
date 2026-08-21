@@ -48,7 +48,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # The separator is a class, not a hyphen: `swk:airlock-btn-pos-v1` was a
 # published localStorage key that the hyphen-only version of this pattern did
 # not see, so the prefix scan missed a name it existed to catch.
-PATTERN='spacewalk|sparrow-spectrum|\b[a-z0-9]+-(dev|mgmt)\b|TeamSPWK|swk[-:_.]|\bmacmini-[0-9]+\b|@spacewalk\.tech|doc\.spacewalk\.dev'
+PATTERN='spacewalk|sparrow-spectrum|\b[a-z0-9]+-(dev|mgmt)\b|TeamSPWK|swk[-:_.]|\bmacmini-[0-9]+\b|@spacewalk\.tech|doc\.spacewalk\.dev|\bairlock-work\b'
 
 # The allowlist holds two kinds of string, and they leave for different reasons.
 #
@@ -79,6 +79,26 @@ ALLOW_LIST=(swk-airlock-return swk-airlock-slot swk-panel-close swk:airlock-btn-
 # carve-out ci.yml used to need for holding them.
 SELF='install/check-internal-leaks.sh'
 
+# SCOPE: this scan reads what LEAVES, not what exists.
+#
+# It used to read the whole tree, and that was a category error with two costs. It could
+# not be taught the private repository's own name — `airlock-work` appears legitimately
+# in the cutline catalog, in task documents, in worklogs — so the one internal name most
+# likely to end up published was the one name the scan could never learn. And it forced
+# redaction of records that never publish: preserving the public repository's only pull
+# request under docs/tasks/evidence/ failed on the hostname in its body, in a file the
+# mirror has never seen.
+#
+# Measured 2026-08-21, after the scan was still whole-tree: `spacewalk-labs/airlock-work`
+# was published in six files, twelve times, four of them the full org-qualified name. The
+# allowlist entry for the public org slug stripped `spacewalk-labs` and left `/airlock-work`,
+# which matched nothing. The scan was working exactly as told, over the wrong domain.
+#
+# This is not the boundary gate in disguise. install/public-manifest.sh decides WHAT
+# leaves; this decides whether what leaves is CLEAN. They are a pipeline, and each still
+# fails closed on its own — an unclassified path stops the manifest before this ever runs.
+MANIFEST="$ROOT/install/public-manifest.sh"
+
 # The upstream bundle we do not write. Its minified strings coin tokens like
 # `1.104.0-dev` and `--save-dev`, which no shape can tell from a host name. An
 # ALLOW entry would be worse than an exclusion here: those strings are tied to a
@@ -88,8 +108,46 @@ SELF='install/check-internal-leaks.sh'
 # implementation.
 VENDOR='apps/orca/web-bundle/'
 
+# --dir never scans .git/. The tree mode cannot see it (git does not track its own
+# directory), so the two modes disagreed about what "the tree" means until this line —
+# and the disagreement only shows up where --dir is pointed at a clone rather than at an
+# extracted archive. On 2026-08-21 the post-release check did exactly that and reported
+# six leaks, all of them in .git/hooks/: this box's own policy-hook shims, which name the
+# company wiki because that is where the hook bodies live. Nothing published, nothing
+# wrong with the tree, six red lines on the one check that looks at what actually shipped.
+# A verification that cries wolf on its first real run is worse than no verification.
+
 mode=tree
 dir=""
+
+PUBLIC_SPEC=()
+PRIVATE_RE=""
+if [ -f "$MANIFEST" ]; then
+  while IFS= read -r e; do PUBLIC_SPEC+=(":(glob)${e%/}${e:+}"); done < <(bash "$MANIFEST" --print-public)
+  while IFS= read -r e; do
+    PUBLIC_SPEC+=(":(exclude)$e")
+    # The same list again as an anchored regex, because --dir has no pathspecs. Both
+    # modes must mean the same thing by "the tree": the .git/ fix earlier today came
+    # from exactly this pair drifting apart, and the pre-push hook found the second
+    # half of it minutes after the first was shipped.
+    # shellcheck disable=SC2016  # the sed script is literal on purpose
+    PRIVATE_RE="${PRIVATE_RE}${PRIVATE_RE:+|}^$(printf '%s' "$e" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+  done < <(bash "$MANIFEST" --print-private)
+else
+  # No manifest on this ref: scan everything rather than nothing. A missing boundary is
+  # a reason to look harder, not a reason to look at less.
+  PUBLIC_SPEC=(.)
+fi
+
+# Drop hits under a private path. Done on the output rather than with --exclude, which
+# matches basenames and would silently excuse a same-named public file elsewhere.
+drop_private() {
+  if [ -n "$PRIVATE_RE" ] && [ "$mode" = dir ]; then
+    sed "s|^${dir%/}/||" | grep -vE "$PRIVATE_RE"
+  else
+    cat
+  fi
+}
 case "${1:-}" in
   --print-pattern) printf '%s\n' "$PATTERN"; exit 0 ;;
   --print-allow)   printf '%s\n' "$ALLOW";   exit 0 ;;
@@ -100,16 +158,16 @@ esac
 
 scan() {   # emit matching "path:line:text" for the whole scanned tree
   if [ "$mode" = dir ]; then
-    grep -rnEI "$PATTERN" "$dir" 2>/dev/null | grep -vE "/($SELF:|$VENDOR)"
+    grep -rnEI --exclude-dir=.git "$PATTERN" "$dir" 2>/dev/null | drop_private | grep -vE "(^|/)($SELF:|$VENDOR)"
   else
-    git -C "$ROOT" grep --untracked -nEI "$PATTERN" -- . ":(exclude)$SELF" ":(exclude)$VENDOR*"
+    git -C "$ROOT" grep --untracked -nEI "$PATTERN" -- "${PUBLIC_SPEC[@]}" ":(exclude)$SELF" ":(exclude)$VENDOR*"
   fi
 }
 contains() {   # is this exact string present anywhere in the scanned tree?
   if [ "$mode" = dir ]; then
-    grep -rqF -- "$1" "$dir" 2>/dev/null
+    grep -rqF --exclude-dir=.git -- "$1" "$dir" 2>/dev/null
   else
-    git -C "$ROOT" grep --untracked -qF -- "$1" -- . ":(exclude)$SELF"
+    git -C "$ROOT" grep --untracked -qF -- "$1" -- "${PUBLIC_SPEC[@]}" ":(exclude)$SELF"
   fi
 }
 

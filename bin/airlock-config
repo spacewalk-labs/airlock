@@ -6,6 +6,10 @@ through this tool. Site-specific facts live only in airlock.toml.
 
 Usage:
   airlock-config validate            # fail-closed sanity checks (run first)
+  airlock-config catalog             # installable apps as JSON, with NO config
+                                     #   yet (the picker question; see cmd_catalog)
+  airlock-config init --owner <login> [--code-root <path>] [--site-name <name>]
+                      [--apps a,b,c] # the smallest config that validates -> stdout
   airlock-config apps                # list enabled app names (one per line)
   airlock-config get <dotted.key>    # e.g. auth.owner, apps.devterm.public_port
   airlock-config env <app>           # KEY=VALUE lines for `eval` in bash
@@ -209,6 +213,11 @@ BUNDLE_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
     "dev-monitor": ("rooted-artifact", "system-unit"),
     "devterm": (),
     "feedback": (),
+    # learning: two USER units, one hub-locations fragment, one share dir under
+    # ~/.local/share. No sudo, no system unit, nothing rooted — so it grants
+    # nothing elevated. The ingest worker spawns an agent CLI, which is a child
+    # of a user unit and needs no capability the platform mediates.
+    "learning": (),
     "markwand": (),
     "notepad": (),
     "orca": ("rooted-artifact", "system-unit"),
@@ -2723,6 +2732,278 @@ def cmd_known_builtins(cfg: dict) -> "None":
         print(pid)
 
 
+# Upstream build availability is not manifest grammar: airlock-app.toml has no
+# key for "this app has no arm64 build". `orca` is the only shipped app with the
+# limit, and it enforces it in its own installer (apps/orca/install.sh refuses
+# any arch but x86_64) rather than in its manifest. Recorded here instead of
+# adding a manifest key because a schema addition drags install/test-manifest.sh
+# and the render goldens along for an app the launcher task has already agreed
+# may be dropped (docs/tasks/active/macos-app-launcher.md, "Owner decisions").
+# install/test-catalog.sh asserts this table still matches that installer guard,
+# so the two cannot drift apart in silence.
+ARCH_LIMITS = {"orca": ["x86_64"]}
+
+
+def cmd_catalog() -> "None":
+    """Every shipped app a launcher could offer to install — answered with NO
+    airlock.toml in existence.
+
+    This is the one question that necessarily precedes a config: a picker has
+    to show what is installable before the operator has chosen anything, and
+    every other subcommand runs after `load()` (see main). It is a projection
+    of `known_builtin_specs`, so it reads manifests through the same parser an
+    actual install uses and cannot drift from what would really be installed.
+
+    Two absences are deliberate, not gaps:
+
+    - `hub` never appears. It is a RESERVED_PACKAGE_IDS platform core with no
+      apps/hub tree — always installed, never a choice, so a picker that
+      offered it would be offering to switch off the entrance.
+    - An app may carry `tile: null` (feedback today): a backend with no
+      launcher entry. It stays in the output because the catalog is a faithful
+      projection of the tree; rendering nothing for it is the caller's job,
+      exactly as hub/index.html already does for the same case in webjson.
+
+    `arch` is reported, not applied. Emitting the constraint instead of
+    filtering on the running host keeps this output a function of the tree
+    alone — testable, and identical whether it runs on the Mac or inside the
+    Linux machine. The caller compares it against its own architecture.
+    ("The tree" is the shipped root, which AIRLOCK_SHIPPED_APPS_ROOT selects;
+    the operator's airlock.toml never reaches this command.)
+
+    `unavailable` lists shipped ids that are present in the tree but produced no
+    installable app — a manifest that will not parse, one that cannot be read, or
+    a directory the shipped-root rules exclude. It is normally empty, and a caller
+    that ignores it silently loses apps.
+    """
+    root = _shipped_root()
+    try:
+        dirs = _shipped_dirs({})
+    except OSError as e:
+        # An unreadable root (wrong permissions, a broken mount) used to surface
+        # as a raw traceback. Guarded here rather than inside _shipped_dirs,
+        # which known-builtins and adopt-scan also call: this command is the one
+        # a GUI shells out to, and a traceback is not a message it can show.
+        die(f"cannot read the shipped app root {root}: {e}")
+    if not dirs:
+        # An empty catalog is never a real answer: this repository ships apps, so
+        # zero of them means the root is wrong (AIRLOCK_SHIPPED_APPS_ROOT points
+        # somewhere else, or this is not an Airlock checkout) — not that there is
+        # nothing to install. Returning `{"apps": []}` with exit 0 would render as
+        # an empty picker with no error, which is the failure looking like success.
+        die(f"no app manifests under {root} — this is not an Airlock checkout, or "
+            "AIRLOCK_SHIPPED_APPS_ROOT points at the wrong tree.")
+    specs = known_builtin_specs({})
+    # known_builtin_specs is best-effort by contract: a shipped id whose manifest
+    # does not parse is DROPPED so that one broken app cannot wedge a diagnostic
+    # scan. Right for that command, silent for this one — a picker would simply
+    # not show the app, and nobody would learn why.
+    #
+    # `dirs` is NOT the right set to subtract from. _shipped_dirs filters through
+    # _regular_file, which turns every OSError into False, so a manifest that
+    # cannot be stat'd is already gone before this line and would be missing from
+    # BOTH lists. Scan the root's own entries instead: anything that looks like a
+    # shipped app and did not produce a spec gets named, whatever the reason.
+    candidates = set()
+    for entry in root.iterdir():
+        pid = entry.name
+        if pid in RESERVED_PACKAGE_IDS or PACKAGE_ID_RE.fullmatch(pid) is None:
+            continue
+        # os.path.lexists is NOT usable here: like _regular_file it answers False
+        # for "no such entry" and for "cannot tell", which is the exact conflation
+        # this scan exists to undo. lstat separates them — FileNotFoundError means
+        # there is genuinely no manifest (not an app, skip it), any other OSError
+        # means we could not look, and something we cannot look at is precisely
+        # what must be reported rather than silently dropped.
+        try:
+            if not entry.is_dir():
+                continue
+            (entry / MANIFEST_NAME).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            candidates.add(pid)
+            continue
+        candidates.add(pid)
+    # Union with `dirs`, not just this scan's own findings. The tree is walked more
+    # than once (here, and inside known_builtin_specs); an entry that vanished
+    # between the walks would otherwise be absent from candidates AND from specs,
+    # which is the silent loss this field exists to prevent. Seen once is enough.
+    unavailable = sorted((candidates | set(dirs)) - set(specs))
+    apps = []
+    for pid in sorted(specs):
+        spec = specs[pid]
+        entry = {
+            "id": pid,
+            "tile": spec["tile"],
+            "requires": spec["deps"],
+            "audience": spec["audience"],
+            "prerequisites": spec["prerequisites"],
+        }
+        if pid in ARCH_LIMITS:
+            entry["arch"] = list(ARCH_LIMITS[pid])
+        apps.append(entry)
+    if not apps:
+        # The root held entries but none of them yielded an installable app. Same
+        # reasoning as the empty-root case above, one step later: exiting 0 with an
+        # empty list hands a picker "Airlock ships nothing" and no way to say why.
+        detail = (f"{len(unavailable)} entr(ies) yielded no manifest: "
+                  + ", ".join(unavailable)) if unavailable else "every entry was excluded"
+        die(f"no installable app under {root} — {detail}.")
+    print(json.dumps({"apps": apps, "unavailable": unavailable},
+                     indent=2, sort_keys=True))
+
+
+_TOML_ESCAPES = {"\\": "\\\\", '"': '\\"', "\b": "\\b", "\t": "\\t",
+                 "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+
+
+def _toml_str(value: str) -> str:
+    """Quote a value as a TOML basic string.
+
+    NOT json.dumps. JSON and TOML agree on most of this, and disagree on the one
+    case that matters: json.dumps defaults to ensure_ascii, which spells a non-BMP
+    character as a UTF-16 surrogate pair (`\\ud83d\\ude00`), and TOML forbids
+    escaped surrogates outright. So `--site-name '\N{GRINNING FACE} home'` produced a
+    file that no TOML parser would read, and the operator met that as a validate
+    error several screens after naming their box.
+
+    TOML files are UTF-8, so everything printable goes in literally; only the
+    quote, the backslash, and the C0 controls (plus DEL) need escaping.
+    """
+    out = []
+    for ch in value:
+        if ch in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[ch])
+        elif ch < " " or ch == "\x7f":
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def cmd_init(owner: str, code_root, site_name, selected: list) -> "None":
+    """Write the smallest airlock.toml that validates, to STDOUT.
+
+    The macOS launcher's picker (docs/tasks/active/macos-app-launcher.md,
+    Phase 1b) is mechanically this: two real inputs — a Tailscale login and a
+    code directory — plus one table per ticked app. airlock.toml.example is 186
+    lines and shows a port for nearly every app, which reads as "choose twenty
+    ports"; every one of them is defaulted by the manifests, so none of that
+    belongs in a generated file.
+
+    STDOUT, not a file. There is then no path to clobber and no --force to get
+    wrong, and the caller redirects. It also means this command can be tested
+    without a filesystem.
+
+    Three things it does NOT do:
+
+    - It does not guess `code_root`. Markwand serves that directory read AND
+      write to the owner and every collaborator (_validate_code_root), so an
+      installer may not pick it — which is why --code-root is required as soon
+      as markwand is selected, here rather than at validate time, so a GUI
+      fails at the picker instead of three screens later.
+    - It does not know about architecture. The apps run in the Linux
+      environment, whose arch is not this machine's; `catalog` reports each
+      app's constraint and the caller compares. Guessing here would refuse
+      orca on an amd64 machine driven from an arm64 Mac.
+    - It does not resolve paths. Whatever string is passed becomes the value:
+      inside an OrbStack machine the Mac's files live under /mnt/mac, and only
+      the caller knows which side of that boundary it is naming.
+    """
+    if not isinstance(owner, str) or "@" not in owner:
+        die(f"--owner must be a login (email-like); got {owner!r}", code=2)
+    catalog = known_builtin_specs({})
+    unknown = [a for a in selected if a not in catalog and a != "hub"]
+    if unknown:
+        die("unknown app(s): " + ", ".join(sorted(unknown))
+            + "\n  `airlock-config catalog` lists what this checkout ships.",
+            code=2)
+    # Close the dependency set rather than emitting a config that fails at
+    # validate (notepad without publish dies in app_order). Closing it silently
+    # would install an app nobody ticked, so the additions are reported — one
+    # place owns the rule, and the caller can still say why the box grew an app.
+    chosen, added = set(selected) - {"hub"}, set()
+    frontier = list(chosen)
+    while frontier:
+        pid = frontier.pop()
+        for dep in catalog[pid]["deps"]:
+            if dep not in catalog:
+                # Manifest grammar does not require a dependency to name another
+                # SHIPPED app, so this is reachable from a well-formed manifest.
+                # Left alone it was a KeyError traceback; validate would have said
+                # the same thing in prose, but only if a config got that far.
+                die(f"app '{pid}' depends on '{dep}', which this checkout does "
+                    "not ship — the dependency cannot be satisfied here.", code=2)
+            if dep not in chosen:
+                chosen.add(dep)
+                added.add(dep)
+                frontier.append(dep)
+    if "markwand" in chosen and not (code_root or "").strip():
+        die("--code-root is required when markwand is selected: it serves that "
+            "directory to the owner and every collaborator, read and write, so "
+            "it cannot be guessed (see SECURITY.md).", code=2)
+    if code_root is not None:
+        # The same rule _validate_code_root applies, applied now. Accepting
+        # `--code-root relative` here and rejecting it at validate is precisely
+        # the failure this command exists to move earlier: the GUI would report it
+        # on the install screen, in the validator's words, about a value the
+        # operator chose three screens back.
+        if not code_root.strip():
+            die("--code-root must be a non-empty path", code=2)
+        if not _expanduser(code_root.strip(), "--code-root").is_absolute():
+            die(f"--code-root must be absolute (or ~-relative); got "
+                f"{code_root!r}.\n  A relative path resolves against whatever "
+                "directory the service happens to start in.", code=2)
+    if added:
+        print("added as dependencies: " + ", ".join(sorted(added)), file=sys.stderr)
+    # Dependencies before dependents, ties alphabetical. app_order re-derives the
+    # real order from manifest edges anyway; this only makes the FILE readable and
+    # its byte layout a deterministic function of the inputs.
+    ordered, placed = [], set()
+    for pid in sorted(chosen):
+        stack, on_stack = [pid], {pid}
+        while stack:
+            cur = stack[-1]
+            # `d in chosen` matters: without it this loop closes the dependency
+            # set a SECOND time, quietly. Two owners of one rule, and the quiet
+            # one wins — delete the closure above and every dependency still
+            # lands in the file, just with no "added as dependencies" line to
+            # tell the operator. Ordering orders; closing is done, once, above.
+            pending = [d for d in sorted(catalog[cur]["deps"])
+                       if d in chosen and d not in placed]
+            if pending:
+                nxt = pending[0]
+                if nxt in on_stack:
+                    # a -> b -> a spun here forever: `placed` only stops an app
+                    # being EMITTED twice, never being VISITED again. validate has
+                    # a real cycle detector (app_order), but a config that hangs
+                    # its generator never reaches it — the GUI would just sit there.
+                    cycle = " -> ".join(stack[stack.index(nxt):] + [nxt])
+                    die(f"dependency cycle between shipped apps: {cycle}. "
+                        "This is a manifest defect, not a selection problem.",
+                        code=2)
+                stack.append(nxt)
+                on_stack.add(nxt)
+                continue
+            if cur not in placed:
+                placed.add(cur)
+                ordered.append(cur)
+            on_stack.discard(stack.pop())
+    lines = ["[airlock]", "config_version = 2"]
+    if site_name:
+        lines += ["", "[site]", f"name = {_toml_str(site_name)}"]
+    lines += ["", "[auth]", 'provider = "tailscale"', f"owner = {_toml_str(owner)}"]
+    if code_root:
+        lines += ["", "[paths]", f"code_root = {_toml_str(code_root)}"]
+    # [apps.hub] is not a choice: cmd_validate requires it ("the entrance") and
+    # it is a RESERVED_PACKAGE_ID with no apps/hub tree, so it never appears in
+    # `catalog` either. A picker cannot offer to switch off the front door.
+    lines += ["", "[apps.hub]"]
+    lines += [f"[apps.{pid}]" for pid in ordered]
+    print("\n".join(lines))
+
+
 def _shipped_default_serve_mappings(spec: dict) -> dict:
     """The serve_mappings a fresh install of this shipped app would create
     from its manifest's OWN [config.defaults] — the only values knowable
@@ -3817,8 +4098,57 @@ def _parse_global_args(argv: list[str]) -> list[str]:
 def main(argv: list[str]) -> int:
     argv = _parse_global_args(argv)
     if not argv:
-        die("usage: airlock-config <validate|apps|plaintext|get|env|json> [arg]", code=2)
+        die("usage: airlock-config "
+            "<validate|apps|catalog|init|plaintext|get|env|json> [arg]",
+            code=2)
     cmd, rest = argv[0], argv[1:]
+    # `catalog` runs BEFORE load(): it answers "what could I install?", which is
+    # asked when no airlock.toml exists yet. Every command below this line needs
+    # one, so the dispatch cannot wait for the shared `cfg`.
+    if cmd == "init":
+        # Same reason as catalog: this command exists to CREATE the config that
+        # every command below load() requires, so it cannot wait for one.
+        owner = code_root = site_name = None
+        apps: list = []
+        rest_iter = iter(rest)
+        for arg in rest_iter:
+            if arg in ("--owner", "--code-root", "--site-name", "--apps"):
+                value = next(rest_iter, None)
+                if value is None:
+                    die(f"{arg} requires a value", code=2)
+                if arg == "--owner":
+                    owner = value
+                elif arg == "--code-root":
+                    code_root = value
+                elif arg == "--site-name":
+                    site_name = value
+                else:
+                    # Accumulate, do not replace: a caller that builds the list in
+                    # pieces (`--apps a --apps b`) would otherwise lose the first
+                    # one silently, and end up with a box missing an app nobody
+                    # noticed was dropped. Whitespace is stripped because a list
+                    # typed by a person has spaces after the commas.
+                    apps += [a.strip() for a in value.split(",") if a.strip()]
+            else:
+                die(f"unknown argument for init: {arg}\n"
+                    "  usage: airlock-config init --owner <login> "
+                    "[--code-root <path>] [--site-name <name>] "
+                    "[--apps a,b,c]", code=2)
+        if owner is None:
+            die("init requires --owner <login>", code=2)
+        cmd_init(owner, code_root, site_name, apps)
+        return 0
+    if cmd == "catalog":
+        if rest:
+            die("catalog takes no arguments", code=2)
+        if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+            # The break-glass flag only means something to package admission,
+            # which catalog never performs. Accepting it silently would report
+            # success for a request that had no effect.
+            die("--dangerously-admit-unverified has no meaning for catalog: it "
+                "lists shipped manifests and admits nothing", code=2)
+        cmd_catalog()
+        return 0
     cfg = load()
     _preflight_config_abi(cfg)
     if cmd == "validate":

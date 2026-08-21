@@ -4,9 +4,9 @@
 Two jobs, and the second one is the reason this is not a `jq` one-liner.
 
 1. REDACT. The local record names the tailnet FQDN the container claimed and the
-   ssh destination of the LXD host. Neither may leave this machine: airlock-work
-   is mirrored to a public repository, `.github/workflows/ci.yml` refuses internal
-   names, and a comment is not covered by that scan. So the FQDN is removed from
+   ssh destination of the LXD host. Neither may leave this machine: this repository
+   is mirrored to a public one, CI refuses internal names, and a comment posted to
+   an issue is not a file, so no tree scan covers it. So the FQDN is removed from
    every string, not just from the field that holds it — it appears inside smoke
    lines too, which is exactly the kind of second copy a field-level redaction
    misses.

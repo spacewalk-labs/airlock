@@ -1,0 +1,16 @@
+[1;36m[airlock-mac][0m architecture: arm64 (detected from arm64)
+[1;36m[airlock-mac][0m machine 'airlock' already exists — reusing
+[1;36m[airlock-mac][0m pre-seeding nginx systemd drop-in (Type=simple) BEFORE install
+[1;36m[airlock-mac][0m installing base packages inside the machine
+[1;36m[airlock-mac][0m ensuring nginx is active
+[1;36m[airlock-mac][0m enabling systemd lingering for 'airlockuser' (persistent --user services)
+[1;36m[airlock-mac][0m starting tailscaled + tailscale up
+[1;36m[airlock-mac][0m no TS_AUTHKEY set — running interactive 'tailscale up' (approve the printed URL)
+To authenticate, visit:
+
+        https://login.tailscale.com/a/abc123def456
+
+[1;36m[airlock-mac][0m using repo at (in-machine path): /mnt/macTMP/repo
+[1;36m[airlock-mac][0m running install/airlock-install.sh inside the machine
+[1;36m[airlock-mac][0m done (arm64, detected from arm64). Open:  https://airlock.example.ts.net/  and add to home screen.
+[1;36m[airlock-mac][0m re-run this script anytime after editing airlock.toml to re-apply.

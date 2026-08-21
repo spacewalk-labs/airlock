@@ -301,7 +301,7 @@ contract = json.load(sys.stdin)["capability_contract"]
 assert contract["schema_version"] == 1
 assert contract["bundle_entitlements"] == {
     "code-server": [], "dev-monitor": ["rooted-artifact", "system-unit"],
-    "devterm": [], "feedback": [],
+    "devterm": [], "feedback": [], "learning": [],
     "markwand": [], "notepad": [],
     "orca": ["rooted-artifact", "system-unit"],
     "paseo": [], "publish": [],
@@ -336,11 +336,11 @@ else
 fi
 
 canonical_sha=0123456789abcdef0123456789abcdef01234567
-canonical_expected="{\"package_id\":\"dev-monitor\",\"schema_version\":1,\"source_repository_id\":\"spacewalk-labs/airlock-work\",\"source_sha\":\"$canonical_sha\",\"surface_classifications\":{\"rooted-artifact\":\"elevated-capability\",\"system-unit\":\"elevated-capability\"},\"surfaces\":[\"rooted-artifact\",\"system-unit\"]}"
+canonical_expected="{\"package_id\":\"dev-monitor\",\"schema_version\":1,\"source_repository_id\":\"example-org/example-work\",\"source_sha\":\"$canonical_sha\",\"surface_classifications\":{\"rooted-artifact\":\"elevated-capability\",\"system-unit\":\"elevated-capability\"},\"surfaces\":[\"rooted-artifact\",\"system-unit\"]}"
 canonical_one="$(AIRLOCK_SHIPPED_APPS_ROOT="$ROOT/apps" AIRLOCK_CONFIG="$cfg_capability_json" \
-  python3 "$CFG" canonical-package-info dev-monitor spacewalk-labs/airlock-work "$canonical_sha" 2>/dev/null)"
+  python3 "$CFG" canonical-package-info dev-monitor example-org/example-work "$canonical_sha" 2>/dev/null)"
 canonical_two="$(AIRLOCK_SHIPPED_APPS_ROOT="$ROOT/apps" AIRLOCK_CONFIG="$cfg_capability_json" \
-  python3 "$CFG" canonical-package-info dev-monitor spacewalk-labs/airlock-work "$canonical_sha" 2>/dev/null)"
+  python3 "$CFG" canonical-package-info dev-monitor example-org/example-work "$canonical_sha" 2>/dev/null)"
 if [ "$canonical_one" = "$canonical_expected" ] && [ "$canonical_two" = "$canonical_expected" ]; then
   ok "capability output: canonical package-info is exact, compact, deterministic, and carries dev-monitor hardening surfaces"
 else
@@ -350,11 +350,11 @@ fi
 expect_fail "capability output: canonical package-info requires a full lowercase 40-hex SHA" \
   "full lowercase 40-hex" env AIRLOCK_SHIPPED_APPS_ROOT="$ROOT/apps" \
   AIRLOCK_CONFIG="$cfg_capability_json" python3 "$CFG" canonical-package-info \
-  dev-monitor spacewalk-labs/airlock-work deadbeef
+  dev-monitor example-org/example-work deadbeef
 expect_fail "capability output: canonical package-info requires a configured package" \
   "is not a configured package" env AIRLOCK_SHIPPED_APPS_ROOT="$ROOT/apps" \
   AIRLOCK_CONFIG="$cfg_capability_json" python3 "$CFG" canonical-package-info \
-  notepad spacewalk-labs/airlock-work "$canonical_sha"
+  notepad example-org/example-work "$canonical_sha"
 
 # =============================================================================
 # Store v3 shape: required exact-shape, v1/v2 read-normalize.

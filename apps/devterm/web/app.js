@@ -1418,6 +1418,7 @@ const ICONS = {
   fontDown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18L8 6l5 12M4.9 14h6.2"/><path d="M16 12h5"/></svg>',
   fontUp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18L8 6l5 12M4.9 14h6.2"/><path d="M18.5 9.5v5M16 12h5"/></svg>',
   clip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.4l-8.6 8.6a5.2 5.2 0 0 1-7.4-7.4l8.6-8.6a3.4 3.4 0 0 1 4.9 4.9l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></svg>',
+  key: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="3.5"/><path d="m10.5 12.5 8-8M15 7l2 2M17 5l2 2"/></svg>',
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>',
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-.7 4M20 4v5h-5"/></svg>',
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
@@ -1609,6 +1610,7 @@ function buildControls() {   // right-side controls — square line icons
     [ICONS.fontSize, 'Font size (A- / A+)', (btn) => openFontPopover(btn)],
     [ICONS.theme, 'Theme', openThemePicker],
     [ICONS.clip, 'Upload file', pickAndUploadFile],
+    [ICONS.key, 'Secret drop (auto-deleted after 30 min)', openSecretDrop],
     [ICONS.pencil, 'Annotate image', openImageAnnotator],
     [ICONS.layoutH, 'Equal pane widths (even-horizontal)', equalizeLayout],
   ];

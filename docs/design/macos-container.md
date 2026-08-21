@@ -47,7 +47,8 @@ Two ways to run the Linux stack on macOS:
 > stack runs; it does not make setting it up easy. The terminal steps in
 > [`../../docker/README-macos.md`](../../docker/README-macos.md) are the remaining wall for a
 > non-terminal user, and the plan to put a macOS app in front of them — without porting
-> anything — is [`../tasks/active/macos-app-launcher.md`](../tasks/active/macos-app-launcher.md).
+> anything — is written down, but the plan lives with the project's internal task board
+> rather than here.
 
 We lead with **A** because it removes the entire systemd-in-container failure
 mode while reusing the real installer — the smallest change that fully solves

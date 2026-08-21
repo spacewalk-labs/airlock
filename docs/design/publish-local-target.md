@@ -1,6 +1,9 @@
 # publish — local public target (design v2)
 
-> Status: **plan, revised after adversarial review.** Adds a second backend for
+> Status: **built and shipping.** Written as a plan, revised after adversarial review,
+> and implemented since — the local mode lives in `apps/publish/backend/airlock-publish.py`
+> (`PUBLIC_MODE`) and `apps/publish/install.sh`. §10 records what changed on the way.
+> Adds a second backend for
 > the existing pluggable external-publish target so a single-box Airlock can
 > publish to its own domain, with a real TTL and a real expiry sweep, without
 > hosting a second ingest service.

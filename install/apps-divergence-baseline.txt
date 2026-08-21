@@ -1,4 +1,4 @@
-# Known apps/ drift between airlock-work and spacewalk-labs/airlock-apps.
+# Known apps/ drift between this repository and the published apps repository.
 # Measured 2026-08-17 against work origin/main 82aeaab and apps origin/main 407bd08.
 # kind is recorded for humans. The gate keys on the path: a new path that
 # splits is red even if the count stays the same.
@@ -11,6 +11,10 @@
 #    state helpers, fonts, and patches landed on airlock-apps. Work does not
 #    get a second copy of those files. Existing files PARITY edited on the
 #    apps side stay content-diff. Copying them into work would undo the split.
+# 3) 2026-08-22: apps/learning — a NEW app packaged here first. It is only-work
+#    because it does not exist on the apps side yet, not because it is split:
+#    this batch is expected to empty at the next publish-sync, unlike (1) and (2).
+#    docs/tasks/active/learning-app-package.md
 only-work	apps/devterm/test-accounts-js.mjs
 # 3) 2026-08-18 P3 severity/routing: one work-ahead backend module. devmon_email.py is the
 #    email lane's transport — a real source file of a mirrored app, which the public copy
@@ -140,3 +144,11 @@ content	apps/publish/frontend/publish.html
 content	apps/publish/render.sh
 content	apps/publish/test-bundle-plan-state.mjs
 content	apps/publish/test-local-target.py
+only-work	apps/learning/airlock-app.toml
+only-work	apps/learning/backend/airlock-learning.py
+only-work	apps/learning/backend/ingest_runner.py
+only-work	apps/learning/deactivate.sh
+only-work	apps/learning/frontend/learning.html
+only-work	apps/learning/install.sh
+only-work	apps/learning/render.sh
+only-work	apps/learning/smoke.sh

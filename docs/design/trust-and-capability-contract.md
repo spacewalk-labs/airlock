@@ -3,7 +3,7 @@
 Status: **accepted 2026-08-08 (owner); built 2026-08-13.** This records a decision and the
 reasoning behind it. The task documents that implemented it were retired from `active/` when
 the last card landed; what each one delivered, and what it deliberately left undone, is in
-[`../tasks/README.md`](../tasks/README.md) under "Already fixed, recorded so it is not re-filed".
+the project's internal task board, which is not part of this repository.
 
 Built through the RETIRE_RECORD stage (2026-08-13): the in-tree bundle entitlement table
 (`BUNDLE_ENTITLEMENTS`), one admission decision (`_bundle_admission`), the enumerated vocabulary

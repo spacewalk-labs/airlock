@@ -185,7 +185,7 @@ def schema_bundle(expected_candidate: str | None = None) -> dict[str, Any]:
         fail("candidate changed while schema evidence was being produced")
     return {
         "candidate_sha": sha,
-        "repository_id": "airlock-work",
+        "repository_id": "airlock",
         "runtime_pins": runtime_pins,
         "schema_version": 1,
         "schemas": schemas,
@@ -287,7 +287,7 @@ def run_suite() -> dict[str, Any]:
     schemas = schema_bundle(sha)
     return {
         "candidate_sha": sha,
-        "repository_id": "airlock-work",
+        "repository_id": "airlock",
         "result": "passed",
         "runtime_pins": schemas["runtime_pins"],
         "schema_pins": schemas["schemas"],
@@ -338,7 +338,7 @@ def live_bundle(result_path: Path) -> dict[str, Any]:
             "passed": acceptance.get("passed"),
         },
         "candidate_sha": sha,
-        "repository_id": "airlock-work",
+        "repository_id": "airlock",
         "result": "passed",
         "result_file": result_path.name,
         "result_sha256": digest(raw),
