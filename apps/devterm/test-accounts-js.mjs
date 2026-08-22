@@ -16,6 +16,18 @@ function makeElement(tagName) {
   const element = {
     tagName: tagName.toUpperCase(),
     className: '',
+    classList: {
+      add(name) {
+        const names = new Set(element.className.split(/\s+/).filter(Boolean));
+        names.add(name);
+        element.className = [...names].join(' ');
+      },
+      toggle(name, force) {
+        const names = new Set(element.className.split(/\s+/).filter(Boolean));
+        if (force) names.add(name); else names.delete(name);
+        element.className = [...names].join(' ');
+      },
+    },
     children: [],
     parentNode: null,
     style: {},
@@ -451,6 +463,72 @@ async function persistedClaudeUsageHasInlineMarker() {
         && !freshLabel.textContent.includes('(last value)'));
 }
 
+async function emptyLiveUsageCannotErasePersistedRows() {
+  const h = makeHarness({
+    statuses: [{ state: 'none' }],
+    usage: [{}],
+    postResponses: { '/acct-usage-now': { deferred: true } },
+    accountPayload: {
+      enabled: true,
+      thresholds: { warn5: 78, crit5: 88, warn7: 88, crit7: 93, rtWarnDays: 5 },
+      accounts: [
+        { active: true, email: 'a@example.com', kind: 'personal', sub: 'Claude',
+          usage: { use5h: 11, use7d: 21, stale: true } },
+        { active: false, email: 'b@example.com', kind: 'team', sub: 'Claude',
+          usage: { use5h: 31, use7d: 41, stale: true } },
+      ],
+    },
+  });
+  const panel = h.mountPanel();
+  await h.flush();
+  const cachedRows = panel.querySelectorAll('.acctrow');
+  const cachedVisible = cachedRows[0].textContent.includes('5h 11%')
+    && cachedRows[1].textContent.includes('5h 31%');
+  h.resolvePost('/acct-usage-now', {
+    usage: {}, email: 'a@example.com', kind: 'personal',
+  });
+  await h.flush();
+  const rows = panel.querySelectorAll('.acctrow');
+  check('P1 value-less fresh reading cannot erase persisted account rows',
+        cachedVisible
+        && rows[0].textContent.includes('5h 11%') && rows[0].textContent.includes('7d 21%')
+        && rows[1].textContent.includes('5h 31%') && rows[1].textContent.includes('7d 41%'));
+}
+
+async function valuedLiveUsageReplacesPersistedRow() {
+  const h = makeHarness({
+    statuses: [{ state: 'none' }],
+    usage: [{}],
+    postResponses: { '/acct-usage-now': { deferred: true } },
+    accountPayload: {
+      enabled: true,
+      thresholds: { warn5: 78, crit5: 88, warn7: 88, crit7: 93, rtWarnDays: 5 },
+      accounts: [
+        { active: true, email: 'a@example.com', kind: 'personal', sub: 'Claude',
+          usage: { use5h: 11, use7d: 21, stale: true } },
+        { active: false, email: 'b@example.com', kind: 'team', sub: 'Claude',
+          usage: { use5h: 31, use7d: 41, stale: true } },
+      ],
+    },
+  });
+  const panel = h.mountPanel();
+  await h.flush();
+  const before = panel.querySelectorAll('.acctrow');
+  const cachedVisible = before[0].textContent.includes('5h 11%')
+    && before[0].textContent.includes('(last value)');
+  h.resolvePost('/acct-usage-now', {
+    usage: { use5h: 55, use7d: 65, stale: false },
+    email: 'a@example.com', kind: 'personal',
+  });
+  await h.flush();
+  const rows = panel.querySelectorAll('.acctrow');
+  check('P1 valued fresh reading replaces only its persisted account row',
+        cachedVisible
+        && rows[0].textContent.includes('5h 55%') && rows[0].textContent.includes('7d 65%')
+        && !rows[0].textContent.includes('(last value)')
+        && rows[1].textContent.includes('5h 31%') && rows[1].textContent.includes('7d 41%'));
+}
+
 async function xaiFiveStatesRenderExactActions() {
   const cases = [
     {
@@ -547,6 +625,8 @@ await logoutInvalidatesScheduledReask();
 await liveUsageCannotErasePendingRelogin();
 await liveUsageCannotErasePendingLogout();
 await persistedClaudeUsageHasInlineMarker();
+await emptyLiveUsageCannotErasePersistedRows();
+await valuedLiveUsageReplacesPersistedRow();
 await xaiFiveStatesRenderExactActions();
 await xaiOldCredentialCannotCompletePendingLogin();
 await xaiRendersWithoutClaudeAccounts();

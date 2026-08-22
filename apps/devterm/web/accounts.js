@@ -728,7 +728,8 @@ function fillAcctList(list, opts) {
       if (list.querySelector('.addform') || _codexOperationPending || _xaiOperationPending) return;
       // Both login flows temporarily own the section. Re-rendering the whole list here
       // can erase a captured device code (or a pending logout) after auth already moved.
-      if (!fresh || !fresh.usage || fresh.usage.err) return;
+      if (!fresh || !fresh.usage || fresh.usage.err
+          || (fresh.usage.use5h == null && fresh.usage.use7d == null)) return;
       (j.accounts || []).forEach(function (a) {
         if (a.email === fresh.email && a.kind === fresh.kind) a.usage = fresh.usage;
       });

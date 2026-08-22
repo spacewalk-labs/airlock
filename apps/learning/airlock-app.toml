@@ -1,0 +1,122 @@
+contract = 1
+id = "learning"
+
+# Learning — a library of study material you build from links, keep in a plain
+# folder, and share through publish. Ported from the reference box's
+# learning-manager (docs/design/learning-app-redesign.md), which only ran there
+# because a third of it lived inside one person's content repository.
+
+[config.defaults]
+backend_port = 18832
+# A plain folder. It may happen to be a git repository — the app reads history
+# for sort order when it is one and stays silent when it is not — but nothing
+# requires that, and nothing here ever talks to a remote.
+library_dir = "~/learning"
+# auto  = use the library's own scripts/learn.py when it has one, else the
+#         built-in scanner. builtin/legacy pin it. A pinned legacy producer that
+#         fails is an error, never a silent fall back to builtin: the list would
+#         quietly change meaning.
+listing_provider = "auto"
+# Which agent CLI turns a link into a document. auto = probe what is installed and
+# prefer one with a credential file; claude/codex pin it. The model is never part of
+# this — owner decision 5: the app detects a logged-in CLI and the CLI picks.
+provider = "auto"
+
+# Env vars this installer WRITES onto the units and the backend reads at runtime.
+# Knobs live in [config] above — the same split publish documents. A name is one
+# or the other, never both: `listing_provider` is a knob, so the unit carries the
+# resolved value under the distinct runtime name AIRLOCK_LEARNING_LISTING.
+[config]
+runtime_env = [
+  # The resolved value of the `provider` knob. A distinct name because a name is a
+  # config key or a runtime var, never both — the same split `listing_provider`
+  # already carries as AIRLOCK_LEARNING_LISTING.
+  "AIRLOCK_LEARNING_AGENT",
+  # Escape hatches for a box where a CLI is somewhere unusual. The installer does not
+  # write them; the adapter reads them before falling back to PATH.
+  "AIRLOCK_LEARNING_CLAUDE_BIN",
+  "AIRLOCK_LEARNING_CODEX_BIN",
+  # The installer deliberately does NOT write these two — their defaults live in
+  # the code and they exist as escape hatches for a box whose ingest is unusually
+  # slow, or whose owner wants the raw failure log instead of a summary. They are
+  # declared because every AIRLOCK_LEARNING_* the app reads has to be declared:
+  # an undeclared one is indistinguishable from a typo that silently never fires.
+  "AIRLOCK_LEARNING_FAILURE_SUMMARY",
+  "AIRLOCK_LEARNING_INGEST_TIMEOUT_SECONDS",
+  "AIRLOCK_LEARNING_LIBRARY",
+  "AIRLOCK_LEARNING_LISTING",
+  "AIRLOCK_LEARNING_PORT",
+  # The two the ingest worker writes onto the agent CLI it spawns, so the skill
+  # does not have to guess where the app was installed: RECEIPT is where the save
+  # helper records what it wrote for this attempt, SAVE is the helper itself.
+  "AIRLOCK_LEARNING_RECEIPT",
+  "AIRLOCK_LEARNING_SAVE",
+  "AIRLOCK_LEARNING_SHARE_DIR",
+  "AIRLOCK_LEARNING_STATE_DIR",
+]
+
+# publish owns where a shared document lands. This app renders and places the
+# document in publish's share directory — read from publish's resolved config at
+# install time, never restated here — and publish owns listing, serving, and the
+# public/gated lifecycle from there. The share directory is a filesystem
+# contract, not an API: publish already expects things it did not create (its
+# repair-broken pass fixes symlinks in there).
+[dependencies]
+apps = ["publish"]
+
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Application runtime"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User services"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Smoke check"
+
+# 🔴 There is deliberately NO prerequisite row for an agent CLI, and the reason is
+# worth writing down. Ingest needs one; browsing, reading and sharing an existing
+# library do not. The predicate vocabulary is present/major-gte with no disjunction,
+# so the only expressible form is `command = "claude"` — and a failed prerequisite
+# BLOCKS the install (install/preflight.sh returns 1). That would mean a box with
+# codex logged in and no claude could not install an app whose non-ingest half works
+# perfectly there. An earlier version of this manifest did exactly that.
+#
+# So the check moved to where it can tell the truth: the app probes at enqueue time
+# and refuses the request with the reason, instead of failing forty minutes later or
+# refusing the whole install. apps/learning/backend/providers.py owns the probe.
+
+# Appendix: two user units (the loopback server and the single-slot ingest
+# worker), one hub-locations fragment, and the app's own share directory. The
+# library folder and ~/.local/state/airlock-learning/ are retained data — the documents
+# and the ingest history are the user's, so they are never declared and never
+# swept. No serve_ports: backend_port is proxied by the hub's own nginx.
+[artifacts]
+units = ["airlock-learning.service", "airlock-learning-ingest.service"]
+fragments = ["hub-locations.d/learning.conf"]
+files = ["~/.local/share/airlock-learning/"]
+# The ingest skill is symlinked into each agent CLI's skill directory from the share
+# dir above. Those two links live in the user's own directories rather than ours, so
+# deactivate.sh removes them explicitly — and only when they are still OUR links.
+
+[audience]
+supported = ["owner"]
+default = "owner"
+
+[tile]
+label = "Learning"
+sub = "study library"
+cat = "docs"
+path = "/learning/"
+glyph = "app-learning"

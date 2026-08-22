@@ -1,0 +1,3766 @@
+<!doctype html>
+<html lang="ko" data-learning-view="list">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Learning</title>
+<!-- 아이콘 SoT = hub/devhub-icons.js (`app-learning` 심볼 + registry). 런처 타일·파비콘 SVG·
+     iOS 홈아이콘 PNG 가 전부 거기서 나온다 — 손으로 사본을 두면 글리프를 바꿔도 안 따라온다.
+     🔴 iOS 는 apple-touch-icon 으로 **PNG 만** 받는다(SVG 불가) — 이게 없어서 아이폰 홈화면
+     바로가기에 아이콘이 안 나왔다. 경로 `/assets/app-icons/…` 은 허브 webroot 다 — 정본은 hub/index.html 의 타일
+     글리프이고, bin/gen-app-icons.py 가 거기서 favicon 과 홈화면 아이콘을 만든다. -->
+<link rel="icon" type="image/svg+xml" href="/assets/app-icons/learning.svg">
+<link rel="apple-touch-icon" href="/assets/app-icons/learning.png">
+<meta name="apple-mobile-web-app-title" content="Learning">
+<style>
+:root {
+  --ink: #1c1c1e;
+  --ink2: #8e8e93;
+  --ink3: #c7c7cc;
+  --bg: #f2f2f7;
+  --sf: #ffffff;
+  --sep: #e5e5ea;
+  --fill: #e9e9ec;
+  --tint: #0f766e;
+  --red: #d1332e;
+  --sys: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Pretendard", system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  min-height: 100%;
+  margin: 0;
+  background: var(--bg);
+}
+
+body {
+  color: var(--ink);
+  font-family: var(--sys);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button, input { font: inherit; }
+
+button, a { -webkit-tap-highlight-color: transparent; }
+
+button {
+  border: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+:focus-visible {
+  outline: 3px solid rgba(15, 118, 110, .35);
+  outline-offset: 2px;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: max(12px, env(safe-area-inset-top))
+           max(16px, env(safe-area-inset-right))
+           calc(28px + env(safe-area-inset-bottom))
+           max(16px, env(safe-area-inset-left));
+}
+
+.app-shell.is-editing {
+  padding-bottom: calc(96px + env(safe-area-inset-bottom));
+}
+
+.app-inner {
+  width: min(100%, 1160px);
+  margin: 0 auto;
+}
+
+.app-header {
+  padding: 0 0 12px;
+}
+
+.nav-row {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 4px;
+}
+
+.nav-spacer { flex: 1 1 auto; }
+
+.nav-button,
+.header-action,
+.refresh-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--tint);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.nav-button:hover,
+.header-action:hover,
+.refresh-button:hover { background: rgba(15, 118, 110, .08); }
+
+.nav-button.back { padding: 8px 6px; }
+
+.header-action.strong { font-weight: 650; }
+
+.header-action .count {
+  min-width: 20px;
+  margin-left: 4px;
+  color: var(--ink2);
+  font-size: 13px;
+  text-align: center;
+}
+
+.warning-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  margin-top: 7px;
+  padding: 3px 8px;
+  border-radius: 8px;
+  background: rgba(209, 51, 46, .08);
+  color: var(--red);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.header-action:disabled,
+.refresh-button:disabled {
+  color: var(--ink3);
+  background: transparent;
+}
+
+.page-title {
+  margin: 2px 0 0;
+  color: var(--ink);
+  font-size: 30px;
+  font-weight: 730;
+  letter-spacing: -.025em;
+  line-height: 1.15;
+}
+
+.page-subtitle {
+  min-height: 23px;
+  margin: 3px 0 0;
+  color: var(--ink2);
+  font-size: 14px;
+}
+
+.search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 44px;
+  margin-top: 10px;
+  padding: 0 11px;
+  border-radius: 11px;
+  background: var(--fill);
+  color: var(--ink2);
+}
+
+.search-wrap input {
+  width: 100%;
+  min-width: 0;
+  /* NOTE: 44px — 실제로 탭되는 것은 wrapper 가 아니라 input 이다. wrapper 만 44 로 두고
+     input 을 42 로 두면 터치타깃 기준이 실측에서 미달로 잡힌다(2026-07-30 Playwright).
+     wrapper 는 min-height:44 + 세로 padding 0 이라 44 가 그대로 들어간다. */
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  /* 🔴 16px 미만이면 iOS Safari 가 포커스 때 페이지를 강제 확대한다("미묘하게 줌인" 실측
+     2026-07-31). viewport 에 maximum-scale 을 박아 막는 길은 사용자가 확대 자체를 못 하게
+     만들어 접근성을 해치므로, 글자 크기로 푼다. */
+  font-size: 16px;
+}
+
+.search-wrap input::placeholder { color: var(--ink2); }
+
+.category-chips {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  margin-top: 8px;
+  overflow-x: auto;
+  padding: 1px 1px 3px;
+  scrollbar-width: none;
+}
+
+.category-chips::-webkit-scrollbar { display: none; }
+
+.filter-controls {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.filter-controls .category-chips { flex: 1 1 auto; }
+
+.category-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-height: 34px;
+  padding: 5px 11px;
+  border-radius: 17px;
+  background: var(--fill);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 560;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.category-chip:hover { background: rgba(15, 118, 110, .14); }
+
+.category-chip.is-selected {
+  background: var(--tint);
+  color: #fff;
+}
+
+.category-chip.is-zero {
+  color: var(--ink3);
+}
+
+.category-chip.is-selected.is-zero { color: rgba(255, 255, 255, .62); }
+
+.category-chip .count {
+  color: var(--ink2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.category-chip.is-selected .count { color: rgba(255, 255, 255, .72); }
+
+.star-filter {
+  flex: 0 0 auto;
+  margin-top: 9px;
+  color: var(--tint);
+}
+
+.star-filter.is-selected {
+  background: #8a6400;
+  color: #fff;
+}
+
+.ingest-composer {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 7px;
+  margin-top: 8px;
+  padding: 0 7px 0 11px;
+  border: 1px dashed var(--ink3);
+  border-radius: 11px;
+  background: var(--sf);
+}
+
+.ingest-composer:focus-within { border-color: var(--tint); }
+
+.ingest-composer input {
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 16px;   /* iOS 자동 확대 방지 — `.search-wrap input` 과 같은 이유 */
+}
+
+.ingest-composer input::placeholder { color: var(--ink2); }
+
+.ingest-submit {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tint);
+  font-size: 14px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.ingest-submit:hover { background: rgba(15, 118, 110, .08); }
+
+.ingest-submit:disabled { color: var(--ink3); }
+
+.ingest-queue {
+  margin-top: 14px;
+}
+
+.ingest-queue-heading {
+  margin: 0;
+  padding: 8px 4px 6px;
+  color: var(--ink2);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.ingest-row-sub {
+  margin: 2px 0 0;
+  color: var(--ink2);
+  font-size: 13px;
+}
+
+.ingest-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.ingest-row {
+  position: relative;
+  padding: 12px 13px;
+  border-radius: 12px;
+  border-left: 3px solid var(--tint);
+  background: var(--sf);
+}
+
+.ingest-row.is-waiting { border-left-color: var(--ink3); }
+.ingest-row.is-failed { border-left-color: var(--red); }
+.ingest-row.is-cancelled { border-left-color: var(--ink3); }
+
+.ingest-row-head {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.ingest-row-title {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 14.5px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ingest-row.is-waiting .ingest-row-title,
+.ingest-row.is-cancelled .ingest-row-title { color: var(--ink2); font-weight: 520; }
+
+.ingest-row-time {
+  flex: 0 0 auto;
+  color: var(--ink2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.queue-number {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 19px;
+  height: 19px;
+  border-radius: 50%;
+  background: var(--fill);
+  color: var(--ink2);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.ingest-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border: 2px solid var(--ink3);
+  border-top-color: var(--tint);
+  border-radius: 50%;
+}
+
+.ingest-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--red);
+}
+
+.ingest-row-detail {
+  margin-top: 6px;
+  color: var(--ink2);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.ingest-row-detail strong { color: var(--red); font-weight: 650; }
+/* 실패 카드에서 **사람이 읽을 문장**은 이것이다(§실패 카드 렌더). 기계 정보
+   (`.ingest-row-detail`)보다 먼저·크게 온다 — 요약이 있으면 그것만 읽어도 되게. */
+.ingest-row-summary {
+  margin: 6px 0 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+.ingest-row-summary.is-missing {
+  color: var(--ink3);
+  font-style: italic;
+  font-size: 13px;
+}
+
+.ingest-actions {
+  display: flex;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.ingest-action {
+  min-height: 36px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tint);
+  font-size: 13px;
+  font-weight: 620;
+}
+
+.ingest-action:hover { background: rgba(15, 118, 110, .08); }
+.ingest-action.danger { color: var(--red); }
+
+.ingest-log {
+  max-height: 320px;
+  overflow: auto;
+}
+
+.plan-details {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: var(--fill);
+  color: var(--ink2);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.header-notice,
+.stale-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 9px 11px;
+  border-radius: 10px;
+  background: rgba(15, 118, 110, .08);
+  color: var(--ink2);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.header-notice strong,
+.stale-notice strong { color: var(--tint); font-weight: 650; }
+
+.content { min-width: 0; }
+
+.desktop-list-head {
+  display: none;
+}
+
+.desktop-select-spacer { min-height: 1px; }
+
+.date-section { margin-top: 12px; }
+
+.date-heading {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  margin: 0;
+  padding: 8px 4px 6px;
+  background: linear-gradient(to bottom, rgba(242, 242, 247, .98) 72%, rgba(242, 242, 247, .78));
+  color: var(--ink2);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: .005em;
+}
+
+.list-group,
+.archive-group {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 12px;
+  background: var(--sf);
+  list-style: none;
+}
+
+.item-row {
+  position: relative;
+  content-visibility: auto;
+  contain-intrinsic-size: 0 66px;
+}
+
+.item-row:not(.is-editing) {
+  display: grid;
+  /* 링크 · 별표 · 공유. 칸을 안 늘리면 세 번째 자식이 암시적 다음 줄로 떨어져
+     행 높이가 두 배가 된다(실측 52 -> 96px). */
+  grid-template-columns: minmax(0, 1fr) 44px 44px;
+}
+
+.item-row + .item-row::before,
+.archive-row + .archive-row::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 13px;
+  height: 1px;
+  background: var(--sep);
+  content: "";
+}
+
+.item-row.is-editing + .item-row.is-editing::before { left: 56px; }
+
+.item-row.is-selected { background: rgba(15, 118, 110, .055); }
+
+/* 적재 중인 자료. 행은 이미 열리고 읽히므로 흐리게 하지 않는다 — 아직 안 온 것은
+   문서가 아니라 다듬기다. 표시는 날짜 칸 하나로 끝낸다. */
+.cell-added.is-ingesting {
+  color: var(--accent, #0f766e);
+  font-variant-numeric: tabular-nums;
+}
+
+.item-link {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  min-width: 0;
+  min-height: 66px;
+  padding: 10px 12px 10px 13px;
+  color: inherit;
+  text-align: left;
+  text-decoration: none;
+}
+
+.item-link:hover { background: rgba(15, 118, 110, .045); }
+
+.item-link.no-link { cursor: default; }
+
+.item-copy { min-width: 0; }
+
+.cell-title {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 15.5px;
+  font-weight: 540;
+  letter-spacing: -.015em;
+  line-height: 1.3;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.mobile-meta {
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--ink2);
+  font-size: 14px;
+  letter-spacing: -.005em;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-channel,
+.cell-duration,
+.cell-added { display: none; }
+
+.item-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 44px;
+  color: var(--ink3);
+}
+
+.star-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  align-self: center;
+  padding: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink3);
+  font-size: 25px;
+  line-height: 1;
+}
+
+.star-button:hover { background: rgba(138, 100, 0, .08); }
+.star-button.is-starred { color: #8a6400; }
+.star-button[aria-busy="true"] { opacity: .72; }
+
+.edit-check {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  min-height: 66px;
+}
+
+.edit-check input {
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: var(--tint);
+}
+
+.item-row.is-editing {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+}
+
+.item-row.is-editing .edit-check { display: flex; }
+
+.item-row.is-editing .item-link { padding-left: 0; }
+
+.item-row.is-editing .item-arrow { display: none; }
+
+.item-row.is-editing .item-link:hover { background: transparent; }
+
+.empty-panel,
+.error-card {
+  margin-top: 14px;
+  padding: 16px;
+  border-radius: 12px;
+  background: var(--sf);
+}
+
+.empty-panel {
+  color: var(--ink2);
+  text-align: center;
+}
+
+.empty-panel h2 {
+  margin: 0 0 4px;
+  color: var(--ink);
+  font-size: 17px;
+}
+
+.empty-panel p { margin: 0; }
+
+/* 걸러내는 상태를 되돌리는 두 번째 출구 (`.category-chip` 과 같은 결로 둔다 — 지역 이름을
+   새로 만들지 않고 공유 토큰만 쓴다). */
+.empty-reset {
+  margin-top: 12px;
+  min-height: 34px;
+  padding: 5px 13px;
+  border-radius: 17px;
+  background: var(--fill);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 560;
+}
+
+.error-dismiss {
+  margin-top: 10px;
+  min-height: 34px;
+  padding: 5px 13px;
+  border-radius: 17px;
+  background: var(--fill);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 560;
+}
+
+.error-card {
+  border-left: 3px solid var(--red);
+  color: var(--ink);
+  line-height: 1.55;
+}
+
+.error-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 8px;
+  color: var(--red);
+  font-size: 17px;
+  font-weight: 680;
+}
+
+.error-card p { margin: 7px 0; }
+
+.error-field {
+  margin-top: 9px;
+  color: var(--ink2);
+  font-size: 13px;
+}
+
+.error-field-label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--ink2);
+  font-weight: 650;
+}
+
+.error-value {
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 8px 9px;
+  border-radius: 7px;
+  background: var(--fill);
+  color: #3a3a3c;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.error-card code,
+.repo-foot code {
+  overflow-wrap: anywhere;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--fill);
+  color: #3a3a3c;
+  font-family: var(--mono);
+  font-size: .92em;
+}
+
+.warning-panel {
+  margin-top: 10px;
+  padding: 0 12px;
+  border-radius: 10px;
+  background: rgba(209, 51, 46, .06);
+  color: var(--ink2);
+}
+
+.warning-panel summary {
+  min-height: 44px;
+  padding: 11px 0;
+  color: var(--red);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.warning-list {
+  margin: 0;
+  padding: 0 0 11px 20px;
+  font-size: 13px;
+}
+
+.warning-list li + li { margin-top: 5px; }
+
+.repo-foot {
+  margin: 22px 3px 0;
+  color: var(--ink2);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.archive-intro {
+  margin: 8px 3px 4px;
+  color: var(--ink2);
+  font-size: 14px;
+}
+
+.archive-section { margin-top: 14px; }
+
+.archive-heading {
+  margin: 0;
+  padding: 8px 4px 6px;
+  color: var(--ink2);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.archive-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  padding: 10px 12px 10px 13px;
+}
+
+.archive-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.archive-title {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 15.5px;
+  font-weight: 540;
+  line-height: 1.3;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.archive-detail {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+  color: var(--ink2);
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.archive-detail.attention { color: var(--red); }
+
+.archive-path {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--ink3);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archive-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+}
+
+.share-button { color: var(--ink3); }
+.share-button:hover { background: rgba(15, 118, 110, .08); }
+.share-button.is-shared { color: var(--tint); }
+.share-button svg { display: block; }
+.row-action {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 7px 9px;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--tint);
+  white-space: nowrap;
+}
+
+.row-action:hover { background: rgba(15, 118, 110, .08); }
+
+.row-action.danger { color: var(--red); }
+
+.row-action:disabled {
+  color: var(--ink3);
+  background: transparent;
+}
+
+.selection-bar {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 20;
+  padding: 8px max(16px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  border-top: 1px solid var(--sep);
+  background: rgba(249, 249, 251, .94);
+  box-shadow: 0 -5px 18px rgba(28, 28, 30, .06);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+}
+
+.selection-bar-inner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(100%, 1160px);
+  min-height: 44px;
+  margin: 0 auto;
+}
+
+.selection-count {
+  color: var(--ink2);
+  font-size: 14px;
+}
+
+.selection-spacer { flex: 1; }
+
+.archive-action {
+  min-height: 44px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--red);
+  font-size: 15px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.archive-action:disabled { color: var(--ink3); }
+
+.toast {
+  position: fixed;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: calc(76px + env(safe-area-inset-bottom));
+  left: max(16px, env(safe-area-inset-left));
+  z-index: 60;
+  width: min(520px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 12px 14px;
+  border-radius: 11px;
+  background: var(--ink);
+  color: #fff;
+  box-shadow: 0 8px 26px rgba(28, 28, 30, .2);
+  font-size: 14px;
+  text-align: center;
+}
+
+.toast.error { background: var(--red); }
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 8px max(8px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  background: rgba(0, 0, 0, .32);
+}
+
+.action-sheet {
+  width: min(100%, 560px);
+}
+
+.sheet-group {
+  margin-bottom: 8px;
+  overflow: hidden;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .97);
+  box-shadow: 0 5px 22px rgba(0, 0, 0, .08);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+}
+
+.sheet-heading {
+  padding: 15px 16px 12px;
+  border-bottom: 1px solid var(--sep);
+  text-align: center;
+}
+
+.sheet-heading h2 {
+  margin: 0 0 5px;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 680;
+}
+
+.sheet-heading p {
+  margin: 0;
+  color: var(--ink2);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.sheet-items {
+  margin: 9px 0 0;
+  padding: 0 0 0 18px;
+  color: var(--ink2);
+  font-size: 13px;
+  text-align: left;
+}
+
+.sheet-items li + li { margin-top: 3px; }
+
+.sheet-button {
+  display: block;
+  width: 100%;
+  min-height: 52px;
+  padding: 12px 16px;
+  background: #fff;
+  color: var(--tint);
+  font-size: 18px;
+  text-align: center;
+}
+
+.sheet-button:hover { background: #f7f7f9; }
+
+.sheet-button.danger { color: var(--red); }
+
+.sheet-button.cancel { font-weight: 650; }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 단일 화면 전환 기준: 640px */
+@media (min-width: 640px) {
+  .app-shell {
+    padding-top: max(22px, env(safe-area-inset-top));
+    padding-right: max(28px, env(safe-area-inset-right));
+    padding-bottom: calc(38px + env(safe-area-inset-bottom));
+    padding-left: max(28px, env(safe-area-inset-left));
+  }
+
+  .app-header { padding-bottom: 16px; }
+
+  .page-title { font-size: 28px; }
+
+  .search-wrap {
+    width: min(360px, 100%);
+    min-height: 40px;
+    margin-top: 8px;
+  }
+
+  .search-wrap input { min-height: 38px; }
+
+  .category-chips {
+    overflow-x: visible;
+    padding-bottom: 1px;
+  }
+
+  .ingest-composer { max-width: 620px; }
+
+  .desktop-list-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(120px, 180px) 90px 90px 32px 44px;
+    align-items: center;
+    min-height: 44px;
+    margin-top: 8px;
+    padding: 0 12px;
+    border-top: 1px solid var(--sep);
+    border-bottom: 1px solid var(--sep);
+    background: rgba(255, 255, 255, .62);
+    color: var(--ink2);
+    font-size: 13px;
+    font-weight: 650;
+  }
+
+  .app-shell.is-editing .desktop-list-head {
+    grid-template-columns: 56px minmax(0, 1fr) minmax(120px, 180px) 90px 90px 32px 44px;
+    padding-left: 0;
+  }
+
+  .sort-button {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: 44px;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font-size: inherit;
+    font-weight: inherit;
+    text-align: left;
+  }
+
+  .sort-button:hover { color: var(--tint); }
+
+  .sort-indicator {
+    margin-left: 4px;
+    color: var(--tint);
+    font-size: 12px;
+  }
+
+  .date-section { margin-top: 12px; }
+
+  .date-heading {
+    padding-top: 9px;
+    padding-bottom: 7px;
+    font-size: 13px;
+  }
+
+  .item-row {
+    min-height: 52px;
+    contain-intrinsic-size: 0 52px;
+  }
+
+  .item-row + .item-row::before { left: 0; }
+
+  .item-row.is-editing + .item-row.is-editing::before { left: 56px; }
+
+  .item-row.is-editing {
+    grid-template-columns: 56px minmax(0, 1fr) 44px;
+  }
+
+  .item-link {
+    grid-template-columns: minmax(0, 1fr) minmax(120px, 180px) 90px 90px 32px;
+    min-height: 52px;
+    padding: 4px 12px;
+  }
+
+  .item-row.is-editing .item-link {
+    grid-template-columns: minmax(0, 1fr) minmax(120px, 180px) 90px 90px 32px;
+    padding-left: 0;
+  }
+
+  .cell-title {
+    display: block;
+    overflow: hidden;
+    font-size: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mobile-meta { display: none; }
+
+  .cell-channel,
+  .cell-duration,
+  .cell-added {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--ink2);
+    font-size: 14px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .cell-added { text-align: right; }
+
+  .item-arrow { min-height: 44px; }
+
+  .edit-check { min-height: 52px; }
+
+  .archive-row { min-height: 64px; }
+
+  .archive-group { border: 1px solid var(--sep); }
+
+  .archive-heading { padding-top: 8px; }
+
+  .selection-bar { padding-right: max(28px, env(safe-area-inset-right)); padding-left: max(28px, env(safe-area-inset-left)); }
+}
+
+/* 문서 뷰어 — 문서를 앱 밖으로 내보내지 않고 앱 껍데기(뒤로가기) 안에서 띄운다. */
+.viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg, #fff);
+}
+
+.viewer-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left));
+  padding-top: max(8px, env(safe-area-inset-top));
+  border-bottom: 1px solid var(--sep);
+  background: var(--surface, #fff);
+}
+
+.viewer-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 12px 0 8px;
+  border: 1px solid var(--sep);
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.viewer-back:hover { background: rgba(15, 118, 110, .06); }
+
+.viewer-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.viewer-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  border: 1px solid var(--sep);
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.viewer-copy:hover { background: rgba(15, 118, 110, .06); }
+
+.viewer-frame {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: var(--bg, #fff);
+}
+
+/* 이 문서의 subview에서만 공용 위젯을 숨긴다. 위젯은 app root 밖에 지연 주입되므로
+   `#learning-app` descendant selector를 쓰면 안 된다. */
+html[data-learning-view="archive"] #airlock-return,
+html[data-learning-view="viewer"] #airlock-return {
+  display: none !important;
+}
+</style>
+<script>
+/* The backend may replace null with a JSON value escaped for a script context. */
+window.__LEARNING_DATA__ = null;
+</script>
+<!-- LEARNING_MANAGER_DATA -->
+</head>
+<body>
+<div id="learning-app"></div>
+<script>
+(function () {
+  "use strict";
+
+  var root = document.getElementById("learning-app");
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  /* 에러 카드가 "무엇을 돌렸는지" 를 보여줄 때의 폴백. 서버가 실제 argv 를 함께 주므로
+     이건 그게 없을 때만 쓰이고, 내장 생산자에는 실행한 명령 자체가 없다. 특정 사람의
+     홈 경로를 박아 두면 남의 박스에서 없는 파일을 가리키게 된다. */
+  var DEFAULT_COMMAND = "scripts/learn.py manifest --json";
+  // 적재 폴링 주기. 1.2초에서 늘렸다 — 그 주기로 전체를 다시 그리면 손가락 밑에서 목록이
+  // 흔들린다. 테스트가 덮을 수 있게 열어둔다: 폴링이 도는지 보려고 프로덕션 케이던스를
+  // 그대로 기다리면 스위트가 주기에 결박되고, 주기를 바꾸는 순간 무관한 테스트가 깨진다.
+  var INGEST_POLL_MS = Number(window.__LEARNING_INGEST_POLL_MS__) || 10000;
+  var state = {
+    items: [],
+    archive: { archived: [], needs_attention: [] },
+    warnings: [],
+    warningsOpen: false,
+    repoHead: {},
+    stale: false,
+    error: null,
+    actionError: null,
+    loading: true,
+    actionBusy: false,
+    editing: false,
+    archiveView: false,
+    selected: new Set(),
+    query: "",
+    searchComposing: false,
+    // 검색 debounce 타이머. 값이 없어도 `clearTimeout(undefined)` 이 조용히 넘어가서
+    // 선언 없이도 돌아가던 자리다 — 선언하지 않으면 "없는 키를 읽는다" 를 잡는 검사가
+    // 이 하나 때문에 서 있을 수 없다.
+    searchTimer: null,
+    category: "all",
+    starredOnly: false,
+    /* 기본 정렬은 `added` 다. 예전 기본값이던 `changed` 는 git 커밋 시각이라, git 이
+       아닌 라이브러리에서는 전부 비어 있다 — 그러면 목록이 사실상 무작위로 보인다.
+       `added` 는 문서 자신의 프론트매터에 있고 어느 폴더에서나 있다. */
+    sortKey: "added",
+    sortDirection: "desc",
+    sheet: null,
+    ingestPlan: null,
+    ingestUrl: "",
+    ingestBusy: false,
+    ingestRequests: [],
+    ingestDetail: null,
+    ingestError: null,
+    ingestLoadNumber: 0,
+    ingestDetailLoadNumber: 0,
+    ingestPollTimer: null,
+    toast: null,
+    viewer: null,
+    starError: null,
+    loadNumber: 0
+  };
+  var starMutations = new Map();
+  var confirmedStarOverlays = new Map();
+  var historyTraversalPending = false;
+
+  /* 카테고리는 **라이브러리의 폴더**다. 예전에는 여기 네 개(engineering/business/
+     science/other)가 한국어 라벨과 함께 박혀 있었고, 그 목록에 없는 폴더의 자료는
+     전부 "기타" 로 접혔다 — 남의 폴더 이름은 화면에 나올 수조차 없었다는 뜻이다.
+     이제 목록에 있는 자료의 첫 경로 조각이 곧 칩이 된다. 라벨도 폴더 이름 그대로다:
+     번역표를 두면 그 표에 없는 폴더가 다시 이등 시민이 된다. */
+  var UNCATEGORIZED = "\u0000none";
+
+  var ICON_SHAPES = {
+    link: [
+      ["path", { d: "M10 13.5a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 0 0-5-5l-1 1" }],
+      ["path", { d: "M14 10.5a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 0 0 5 5l1-1" }]
+    ],
+    copy: [
+      ["rect", { x: "9", y: "9", width: "11", height: "11", rx: "2" }],
+      ["path", { d: "M15 5.5V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h.5" }]
+    ],
+    back: [
+      ["path", { d: "M15 18l-6-6 6-6" }]
+    ],
+    search: [
+      ["circle", { cx: "11", cy: "11", r: "7" }],
+      ["path", { d: "M20 20l-3.6-3.6" }]
+    ],
+    chevron: [
+      ["path", { d: "M9 6l6 6-6 6" }]
+    ],
+    warning: [
+      ["circle", { cx: "12", cy: "12", r: "9" }],
+      ["path", { d: "M12 7.6v5.2M12 16.2v.1" }]
+    ],
+    archive: [
+      ["path", { d: "M5 8.5h14v10H5zM4 5.5h16v3H4zM9 12h6" }]
+    ],
+    restore: [
+      ["path", { d: "M4.5 11a7.5 7.5 0 1 0 2.2-5.3" }],
+      ["path", { d: "M4.5 5.5v5.5H10" }]
+    ],
+    trash: [
+      ["path", { d: "M5 7h14M10 11v5M14 11v5M7 7l.7 12h8.6L17 7M9 7l.8-2h4.4l.8 2" }]
+    ],
+    refresh: [
+      ["path", { d: "M20 11a8 8 0 0 0-14.5-3L4 10" }],
+      ["path", { d: "M4 5v5h5M4 13a8 8 0 0 0 14.5 3L20 14" }],
+      ["path", { d: "M20 19v-5h-5" }]
+    ]
+  };
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function append(parent) {
+    for (var i = 1; i < arguments.length; i += 1) {
+      var child = arguments[i];
+      if (child) parent.appendChild(child);
+    }
+    return parent;
+  }
+
+  function icon(name, size) {
+    var svg = document.createElementNS(SVG_NS, "svg");
+    var px = String(size || 18);
+    svg.setAttribute("width", px);
+    svg.setAttribute("height", px);
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", name === "chevron" ? "2.8" : "2.1");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    var shapes = ICON_SHAPES[name] || [];
+    shapes.forEach(function (shape) {
+      var child = document.createElementNS(SVG_NS, shape[0]);
+      Object.keys(shape[1]).forEach(function (key) {
+        child.setAttribute(key, shape[1][key]);
+      });
+      svg.appendChild(child);
+    });
+    return svg;
+  }
+
+  function stringValue(value, fallback) {
+    if (typeof value === "string") return value;
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    return fallback === undefined ? "" : fallback;
+  }
+
+  function objectValue(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+  }
+
+  function valueType(value) {
+    if (value === undefined) return "없음";
+    if (value === null) return "null";
+    if (Array.isArray(value)) return "array";
+    return typeof value;
+  }
+
+  function contractTypeError(field, expected, value) {
+    var actual = valueType(value);
+    var message = actual === "없음"
+      ? '응답이 계약을 어겼습니다: 필드 "' + field + '"가 없습니다 (필요한 타입: ' + expected + ')'
+      : '응답이 계약을 어겼습니다: 필드 "' + field + '"는 ' + expected + '이어야 하지만 ' + actual + '입니다';
+    return new Error(message);
+  }
+
+  function requiredArray(object, field) {
+    if (!Object.prototype.hasOwnProperty.call(object, field) || !Array.isArray(object[field])) {
+      throw contractTypeError(field, "array", object[field]);
+    }
+    return object[field];
+  }
+
+  function requiredObject(object, field) {
+    if (!Object.prototype.hasOwnProperty.call(object, field) || !objectValue(object[field])) {
+      throw contractTypeError(field, "object", object[field]);
+    }
+    return object[field];
+  }
+
+  function safeRepoPath(value) {
+    var path = stringValue(value, "");
+    if (!path || path.charAt(0) === "/" || path.charAt(0) === "\\" || path.indexOf("\\") !== -1) return false;
+    if (path.indexOf("\u0000") !== -1) return false;
+    return path.split("/").every(function (part) {
+      return part !== "" && part !== "." && part !== "..";
+    });
+  }
+
+  function pathOf(entry) {
+    var value = objectValue(entry);
+    if (typeof entry === "string") return entry;
+    if (!value) return "";
+    if (typeof value.path === "string") return value.path;
+    if (objectValue(value.item) && typeof value.item.path === "string") return value.item.path;
+    return "";
+  }
+
+  function fieldOf(entry, field, fallback) {
+    var value = objectValue(entry);
+    if (value && value[field] !== undefined && value[field] !== null) return value[field];
+    if (value && objectValue(value.item) && value.item[field] !== undefined && value.item[field] !== null) {
+      return value.item[field];
+    }
+    return fallback;
+  }
+
+  function entryFrom(value) {
+    if (typeof value === "string") {
+      return { path: value, title: basename(value) };
+    }
+    var object = objectValue(value);
+    return object ? object : { path: "", title: "" };
+  }
+
+  function entriesFrom(value) {
+    return value.map(entryFrom);
+  }
+
+  function basename(path) {
+    var value = stringValue(path, "");
+    var parts = value.split("/");
+    return parts[parts.length - 1] || value || "이름 없는 자료";
+  }
+
+  function normalizeItems(value, field) {
+    if (!Array.isArray(value)) throw contractTypeError(field || "items", "array", value);
+    return value.map(function (entry, index) {
+      var item = objectValue(entry);
+      if (!item) throw contractTypeError((field || "items") + "[" + index + "]", "object", entry);
+      if (typeof item.starred !== "boolean") {
+        throw contractTypeError((field || "items") + "[" + index + "].starred", "boolean", item.starred);
+      }
+      item._searchIndex = (stringValue(item.title, "") + " " + stringValue(item.channel, "")).toLocaleLowerCase("ko-KR");
+      return item;
+    });
+  }
+
+  function normalizeArchive(value) {
+    var object = objectValue(value);
+    if (!object) throw contractTypeError("archive", "object", value);
+    return {
+      archived: normalizeItems(requiredArray(object, "archived"), "archive.archived"),
+      needs_attention: entriesFrom(requiredArray(object, "needs_attention"))
+    };
+  }
+
+  function normalizeHead(value) {
+    var object = objectValue(value) || {};
+    return { sha: stringValue(object.sha, ""), committed_at: stringValue(object.committed_at, "") };
+  }
+
+  function normalizeWarnings(value) {
+    if (!Array.isArray(value)) throw contractTypeError("warnings", "array", value);
+    return value.map(function (warning) {
+      return stringValue(warning, JSON.stringify(warning));
+    });
+  }
+
+  function normalizePayload(value) {
+    var object = objectValue(value);
+    if (!object) throw contractTypeError("응답", "object", value);
+    return {
+      items: normalizeItems(requiredArray(object, "items"), "items"),
+      archive: normalizeArchive(requiredObject(object, "archive")),
+      warnings: normalizeWarnings(object.warnings),
+      repoHead: normalizeHead(object.repo_head || object.repoHead),
+      stale: object.stale === true,
+      error: object.error !== undefined && object.error !== null ? object.error : null,
+      command: object.command,
+      exitCode: object.exit_code !== undefined ? object.exit_code : object.exitCode,
+      stderr: object.stderr,
+      status: object.status
+    };
+  }
+
+  function commandText(value) {
+    if (Array.isArray(value)) return value.map(function (part) { return stringValue(part, ""); }).join(" ");
+    return stringValue(value, "");
+  }
+
+  function jsonText(value) {
+    if (typeof value === "string") return value;
+    try { return JSON.stringify(value); } catch (error) { return String(value); }
+  }
+
+  function makeError(payload, fallbackMessage, status) {
+    var normalized = objectValue(payload) || {};
+    var message = stringValue(normalized.error, fallbackMessage || "목록을 불러오지 못했습니다");
+    return {
+      message: message,
+      command: normalized.command !== undefined ? commandText(normalized.command) : "GET /api/items",
+      exitCode: normalized.exit_code !== undefined ? normalized.exit_code : (normalized.exitCode !== undefined ? normalized.exitCode : status),
+      stderr: stringValue(normalized.stderr, ""),
+      status: status || normalized.status || null
+    };
+  }
+
+  function getInitialPayload() {
+    if (!Object.prototype.hasOwnProperty.call(window, "__LEARNING_DATA__")) return null;
+    var value = window.__LEARNING_DATA__;
+    if (value === null || value === undefined) return null;
+    if (typeof value === "string") {
+      try { return JSON.parse(value); } catch (error) {
+        return { error: "인라인 초기 데이터 JSON을 읽지 못했습니다", command: "index.html", exit_code: null, stderr: error.message };
+      }
+    }
+    return value;
+  }
+
+  function apiUrl(name) {
+    var path = window.location.pathname;
+    var prefix = path === "/learning" || path.indexOf("/learning/") === 0 ? "/learning/" : "/";
+    return prefix + "api/" + name;
+  }
+
+  function readResponse(response) {
+    return response.text().then(function (body) {
+      if (!body.trim()) return null;
+      try { return JSON.parse(body); } catch (error) {
+        return { error: "서버 응답 JSON을 읽지 못했습니다", command: response.url, exit_code: response.status, stderr: body };
+      }
+    });
+  }
+
+  function normalizeIngestRequests(value, field) {
+    if (!Array.isArray(value)) throw contractTypeError(field || "requests", "array", value);
+    return value.map(function (entry, index) {
+      var object = objectValue(entry);
+      if (!object) throw contractTypeError((field || "requests") + "[" + index + "]", "object", entry);
+      // 🔴 id 는 **정수**다(SQLite `attempts.id`). 예전 스풀은 hex 문자열이었고 이 검사가
+      //    `string` 을 요구했다 — 큐를 SQLite 로 옮긴 뒤 이 한 줄 때문에 매 폴링이 계약
+      //    오류로 죽었다(실측 2026-08-18: 목을 실제 형식으로 바꾸자마자 드러났다).
+      if (typeof object.id !== "number" || !Number.isFinite(object.id)) {
+        throw contractTypeError((field || "requests") + "[" + index + "].id", "number", object.id);
+      }
+      return object;
+    });
+  }
+
+  function ingestRecord(id) {
+    for (var i = 0; i < state.ingestRequests.length; i += 1) {
+      if (state.ingestRequests[i].id === id) return state.ingestRequests[i];
+    }
+    return null;
+  }
+
+  // TESTABLE:INGEST_BADGE_START
+  /* 진행 중인 적재를 그 문서의 행으로 접는 결정. DOM 없이 판정되는 부분만 여기 둔다 —
+     화면을 못 여는 CI 에서 잴 수 있는 것이 이만큼이고, 나머지(행 높이·배지 자리)는
+     브라우저로만 잡힌다(#207 에서 실제로 그랬다). */
+  var INGEST_ACTIVE_STATUSES = ["queued", "running", "cancelling"];
+
+  function ingestStatusIsActive(status) {
+    return INGEST_ACTIVE_STATUSES.indexOf(String(status == null ? "" : status)) >= 0;
+  }
+
+  /* 진행 중이면서 **이미 문서를 남긴** 적재를 문서 경로로 색인한다. 그 근거는 저장
+     영수증이고, 백엔드가 목록과 같은 철자로 맞춰 보낸다. */
+  function ingestDocumentIndex(requests) {
+    var found = {};
+    (requests || []).forEach(function (entry) {
+      if (!entry || !entry.document) return;
+      if (!ingestStatusIsActive(entry.status)) return;
+      found[entry.document] = entry;
+    });
+    return found;
+  }
+
+  /* 큐 카드로 그릴 것인가.
+
+     🔴 **문서가 목록에 도착했다고 카드를 지우지 않는다.** 한 판 그렇게 만들었다가
+     적대검증에서 뒤집혔다: 그 카드가 그 적재의 **중지 버튼과 로그 버튼이 있는 유일한
+     자리**다. 접는 순간 4분째부터 20분째까지 — 적재의 대부분 — 이 취소도 진단도 안 되는
+     구간이 된다. 그리고 접는 판정을 `state.items`(전체 목록)로 하는데 화면에 그려지는
+     것은 **거른 목록**이라, 검색이나 카테고리를 하나 누르면 행도 카드도 둘 다 사라졌다.
+
+     그래서 카드는 남고, 대신 "이미 목록에 있다" 는 사실을 카드가 스스로 말한다. 이
+     단계가 풀려던 문제는 중복이 아니라 **사용자가 도착을 모른다**는 것이었다. */
+  function ingestCardVisible(entry) {
+    if (!entry) return false;
+    return ingestStatusIsActive(entry.status) || String(entry.status) === "failed";
+  }
+
+  /* 배지 문구. 단계 이름을 그대로 보여 주지 않는다 — `document_saved` 는 우리 말이고,
+     사용자가 아는 것은 "글은 이미 여기 있고, 나머지가 오는 중" 하나다.
+
+     🔴 데스크톱의 날짜 칸은 90px 이고 `text-overflow: ellipsis` 다. 경과 시간까지 넣으면
+     124~133px 이 되어 **하필 경과가 잘린다** — 유일하게 변하는 부분이라 "돌고 있다" 를
+     보여 주는 것이 그것인데(적대검증 실측). 짧은 쪽이 칸에 들어가고, 경과는 자리가 넉넉한
+     모바일 메타 줄과 적재 카드가 그대로 보여 준다. */
+  function ingestBadgeLabel() {
+    return "다듬는 중";
+  }
+
+  function ingestBadgeLong(elapsedText) {
+    var elapsed = String(elapsedText == null ? "" : elapsedText).replace(/^경과 /, "");
+    return "다듬는 중" + (elapsed ? " · " + elapsed : "");
+  }
+  // TESTABLE:INGEST_BADGE_END
+
+  function ingestIsActive(entry) {
+    return !!entry && ingestStatusIsActive(entry.status);
+  }
+
+  function activeIngestRequests() {
+    return state.ingestRequests.filter(ingestIsActive);
+  }
+
+  // 시각은 ISO 8601 문자열이다(예 "2026-08-18T00:11:22+00:00"). 큐가 SQLite 로 바뀌면서
+  // epoch 실수 대신 사람이 DB 에서 바로 읽을 수 있는 표기를 쓴다.
+  function ingestTime(value) {
+    if (!value) return NaN;
+    var parsed = Date.parse(String(value));
+    return Number.isFinite(parsed) ? parsed / 1000 : NaN;
+  }
+
+  function ingestElapsed(entry) {
+    var start = entry ? ingestTime(entry.started_at || entry.created_at) : NaN;
+    if (!Number.isFinite(start)) return "경과 정보 없음";
+    var end = entry && ingestIsActive(entry) ? Date.now() / 1000 : ingestTime(entry.finished_at);
+    if (!Number.isFinite(end)) end = Date.now() / 1000;
+    var seconds = Math.max(0, Math.floor(end - start));
+    if (seconds < 60) return "경과 " + seconds + "초";
+    var minutes = Math.floor(seconds / 60);
+    var rest = seconds % 60;
+    if (minutes < 60) return "경과 " + minutes + "분 " + rest + "초";
+    return "경과 " + Math.floor(minutes / 60) + "시간 " + (minutes % 60) + "분";
+  }
+
+  function ingestErrorFrom(payload, status, fallback) {
+    var object = objectValue(payload) || {};
+    return {
+      message: stringValue(object.error, fallback || "적재 요청이 실패했습니다"),
+      exitCode: object.exit_code !== undefined ? object.exit_code : status,
+      stderr: stringValue(object.stderr, ""),
+      status: status || null
+    };
+  }
+
+  // 🔴 오류 슬롯(`state.ingestError`)을 **폴링과 조작이 같이** 쓰고 있었다. 폴링은 주기마다
+  //    성공하면 `state.ingestError = null` 을 했으므로, 사용자가 방금 받은 조작 오류(409 중복
+  //    적재, 취소 실패, 기록 삭제 실패)가 **읽기 전에 사라졌다** — 다른 적재가 돌고 있을 때만
+  //    폴링이 도니 "적재 중에는 오류가 안 보인다"는 형태로 나타난다. 검색창이 사라진 것과 같은
+  //    부류다: 배경 갱신이 사용자에게 필요한 상태를 소유한 채 지운다.
+  //    규칙 — 배경 폴링은 **자기가 낸** 오류만 지운다. 조작 오류는 사용자가 닫거나, 다음 조작이
+  //    시작될 때만 사라진다.
+  function setActionError(error, fallback) {
+    var next = error && error.message ? error : { message: fallback };
+    next.fromAction = true;
+    state.ingestError = next;
+  }
+
+  function setPollError(error, fallback) {
+    if (state.ingestError && state.ingestError.fromAction) return;
+    state.ingestError = error && error.message ? error : { message: fallback };
+  }
+
+  function clearPollError() {
+    if (state.ingestError && state.ingestError.fromAction) return;
+    state.ingestError = null;
+  }
+
+  function clearIngestPoll() {
+    if (state.ingestPollTimer !== null) {
+      window.clearTimeout(state.ingestPollTimer);
+      state.ingestPollTimer = null;
+    }
+  }
+
+  function scheduleIngestPoll() {
+    clearIngestPoll();
+    if (!activeIngestRequests().length) return;
+    state.ingestPollTimer = window.setTimeout(function () {
+      state.ingestPollTimer = null;
+      loadIngest();
+    }, INGEST_POLL_MS);
+  }
+
+  function loadIngestDetail(id) {
+    if (!id) return;
+    var detailLoadNumber = state.ingestDetailLoadNumber + 1;
+    state.ingestDetailLoadNumber = detailLoadNumber;
+    window.fetch(apiUrl("ingest/" + encodeURIComponent(id)), {
+      method: "GET",
+      cache: "no-store",
+      headers: { Accept: "application/json" }
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok) throw ingestErrorFrom(payload, response.status, "적재 로그를 읽지 못했습니다");
+        return payload;
+      });
+    }).then(function (payload) {
+      if (detailLoadNumber !== state.ingestDetailLoadNumber) return;
+      state.ingestDetail = payload;
+      clearPollError();
+      renderIngestBackground();
+    }).catch(function (error) {
+      if (detailLoadNumber !== state.ingestDetailLoadNumber) return;
+      setPollError(error, "적재 로그를 읽지 못했습니다");
+      renderIngestBackground();
+    });
+  }
+
+  function loadIngest() {
+    var ingestLoadNumber = state.ingestLoadNumber + 1;
+    state.ingestLoadNumber = ingestLoadNumber;
+    var oldActive = {};
+    activeIngestRequests().forEach(function (entry) { oldActive[entry.id] = true; });
+    window.fetch(apiUrl("ingest"), {
+      method: "GET",
+      cache: "no-store",
+      headers: { Accept: "application/json" }
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok) throw ingestErrorFrom(payload, response.status, "적재 상태를 읽지 못했습니다");
+        return payload;
+      });
+    }).then(function (payload) {
+      if (ingestLoadNumber !== state.ingestLoadNumber) return;
+      var object = objectValue(payload);
+      if (!object) throw contractTypeError("적재 응답", "object", payload);
+      var records = normalizeIngestRequests(object.requests, "requests");
+      var completed = records.some(function (entry) {
+        return oldActive[entry.id] && (entry.status === "done" || entry.status === "failed" || entry.status === "cancelled");
+      });
+      state.ingestRequests = records;
+      clearPollError();
+      if (completed) loadData(false);
+      scheduleIngestPoll();
+      renderIngestBackground();
+    }).catch(function (error) {
+      if (ingestLoadNumber !== state.ingestLoadNumber) return;
+      setPollError(error, "적재 상태를 읽지 못했습니다");
+      scheduleIngestPoll();
+      renderIngestBackground();
+    });
+  }
+
+  function requestIngestPlan() {
+    var url = state.ingestUrl.trim();
+    if (!url || state.ingestBusy) return;
+    state.ingestBusy = true;
+    state.ingestError = null;
+    render();
+    window.fetch(apiUrl("ingest/plan"), {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ url: url })
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok) throw ingestErrorFrom(payload, response.status, "적재 계획을 만들지 못했습니다");
+        return payload;
+      });
+    }).then(function (payload) {
+      state.ingestPlan = payload;
+      state.ingestUrl = stringValue(payload.url, url);
+      state.ingestError = null;
+    }).catch(function (error) {
+      setActionError(error, "적재 계획을 만들지 못했습니다");
+    }).finally(function () {
+      state.ingestBusy = false;
+      render();
+    });
+  }
+
+  function runIngestPlan() {
+    var plan = state.ingestPlan;
+    if (!plan || state.ingestBusy) return;
+    var planUrl = stringValue(plan.url, "");
+    if (!planUrl) return;
+    state.ingestBusy = true;
+    state.ingestError = null;
+    render();
+    window.fetch(apiUrl("ingest/run"), {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ url: planUrl })
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok) throw ingestErrorFrom(payload, response.status, "적재 큐 등록에 실패했습니다");
+        return payload;
+      });
+    }).then(function (payload) {
+      state.ingestPlan = null;
+      state.ingestUrl = "";
+      state.ingestError = null;
+      if (payload && payload.duplicate === true) {
+        // 재부상 — 큐에는 아무것도 안 생기고 목록 정렬만 바뀐다. 큐 폴링이 아니라
+        // 자료 목록을 다시 받아야 화면에 보인다.
+        showToast("기존 문서를 맨 위로 올렸습니다");
+        loadData(false);
+      } else {
+        showToast("적재 큐에 넣었습니다");
+        loadIngest();
+      }
+    }).catch(function (error) {
+      setActionError(error, "적재 큐 등록에 실패했습니다");
+    }).finally(function () {
+      state.ingestBusy = false;
+      render();
+    });
+  }
+
+  function cancelIngest(id) {
+    if (state.ingestBusy) return;
+    state.ingestBusy = true;
+    state.ingestError = null;
+    render();
+    window.fetch(apiUrl("ingest/" + encodeURIComponent(id) + "/cancel"), {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: "{}"
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok) throw ingestErrorFrom(payload, response.status, "적재를 중지하지 못했습니다");
+        return payload;
+      });
+    }).then(function (payload) {
+      // 서버가 확정하지 못하면 "cancelling" 을 돌려준다 — 유닛이 아직 멈추는 중이라는
+      // 뜻이고 확정은 스윕이 한다. 그걸 "취소했습니다"로 말하면 거짓이다.
+      // 🔴 확정을 긍정형으로 판정한다. 부정형(중지중이 아니면 취소됨)으로 쓰면 status 가
+      // 없거나 모르는 값일 때 낙관 쪽으로 기울어, 확정 안 된 취소를 취소됐다고 말한다.
+      var confirmed = stringValue(payload && payload.status, "") === "cancelled";
+      showToast(confirmed ? "적재를 취소했습니다" : "중지를 요청했습니다 — 유닛이 멈추는 중입니다");
+      loadIngest();
+    }).catch(function (error) {
+      setActionError(error, "적재를 중지하지 못했습니다");
+    }).finally(function () {
+      state.ingestBusy = false;
+      render();
+    });
+  }
+
+  function retryIngest(id) {
+    if (state.ingestBusy) return;
+    state.ingestBusy = true;
+    state.ingestError = null;
+    render();
+    window.fetch(apiUrl("ingest/" + encodeURIComponent(id) + "/retry"), {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: "{}"
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok) throw ingestErrorFrom(payload, response.status, "다시 시도하지 못했습니다");
+        return payload;
+      });
+    }).then(function () {
+      state.ingestDetail = null;
+      showToast("다시 큐에 넣었습니다");
+      loadIngest();
+    }).catch(function (error) {
+      setActionError(error, "다시 시도하지 못했습니다");
+    }).finally(function () {
+      state.ingestBusy = false;
+      render();
+    });
+  }
+
+  function deleteIngest(id) {
+    if (state.ingestBusy) return;
+    state.ingestBusy = true;
+    state.ingestError = null;
+    render();
+    window.fetch(apiUrl("ingest/" + encodeURIComponent(id) + "/delete"), {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: "{}"
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok) throw ingestErrorFrom(payload, response.status, "적재 기록을 지우지 못했습니다");
+        return payload;
+      });
+    }).then(function () {
+      state.ingestDetail = null;
+      showToast("적재 기록을 지웠습니다");
+      loadIngest();
+    }).catch(function (error) {
+      setActionError(error, "적재 기록을 지우지 못했습니다");
+    }).finally(function () {
+      state.ingestBusy = false;
+      render();
+    });
+  }
+
+  function applyPayload(payload, httpStatus, loadNumber) {
+    var normalized = normalizePayload(payload);
+    state.items = normalized.items;
+    state.archive = normalized.archive;
+    state.warnings = normalized.warnings;
+    state.repoHead = normalized.repoHead;
+    state.stale = normalized.stale;
+    state.error = normalized.error !== null ? makeError(payload, "수집이 실패했습니다", httpStatus) : null;
+    if (state.error && !state.stale) state.stale = payload.stale === true;
+    state.selected.clear();
+    confirmedStarOverlays.forEach(function (confirmation, path) {
+      if (!normalized.stale && loadNumber > confirmation.afterLoadNumber) {
+        confirmedStarOverlays.delete(path);
+      } else {
+        setStarValue(path, confirmation.starred);
+      }
+    });
+    starMutations.forEach(function (mutation, path) {
+      setStarValue(path, mutation.desired);
+    });
+  }
+
+  function loadData(useInline) {
+    var loadNumber = state.loadNumber + 1;
+    state.loadNumber = loadNumber;
+    state.loading = true;
+    state.actionError = null;
+    renderBackground();
+
+    var initial = useInline ? getInitialPayload() : null;
+    var promise;
+    if (initial !== null) {
+      promise = Promise.resolve({ payload: initial, status: 200 });
+    } else {
+      promise = window.fetch(apiUrl("items"), {
+        method: "GET",
+        cache: "no-store",
+        headers: { Accept: "application/json" }
+      }).then(function (response) {
+        return readResponse(response).then(function (payload) {
+          return { payload: payload, status: response.status, ok: response.ok };
+        });
+      });
+    }
+
+    promise.then(function (result) {
+      if (loadNumber !== state.loadNumber) return;
+      try {
+        if (result.ok === false) {
+          var failedPayload = result.payload;
+          var failedObject = objectValue(failedPayload);
+          var hasSnapshotField = failedObject && ["items", "archive", "warnings"].some(function (field) {
+            return Object.prototype.hasOwnProperty.call(failedObject, field);
+          });
+          if (hasSnapshotField) {
+            applyPayload(failedPayload, result.status, loadNumber);
+            state.error = makeError(failedPayload, "수집 요청이 실패했습니다", result.status);
+          } else {
+            state.error = makeError(failedPayload, "수집 요청이 실패했습니다", result.status);
+            if (failedObject && failedObject.stale === true) state.stale = true;
+          }
+        } else {
+          applyPayload(result.payload, result.status, loadNumber);
+        }
+      } catch (error) {
+        state.error = makeError({}, error.message || "응답을 해석하지 못했습니다", result.status);
+      }
+    }).catch(function (error) {
+      if (loadNumber !== state.loadNumber) return;
+      state.error = makeError({}, "수집 요청에 연결하지 못했습니다", null);
+      state.error.stderr = error && error.message ? error.message : "네트워크 오류";
+    }).finally(function () {
+      if (loadNumber !== state.loadNumber) return;
+      state.loading = false;
+      renderBackground();
+    });
+  }
+
+  function mutationsLocked() {
+    return state.loading || state.actionBusy || state.stale || Boolean(state.error);
+  }
+
+  function itemMutable(entry) {
+    return safeRepoPath(pathOf(entry)) && fieldOf(entry, "mutable", true) !== false;
+  }
+
+  function entryCanChange(entry) {
+    var known = catalogEntry(pathOf(entry));
+    return itemMutable(entry) && (!known || itemMutable(known));
+  }
+
+  function catalogEntry(path) {
+    /* 목록이 곧 폴더이므로 보관하지 않은 자료는 전부 여기 있다. */
+    for (var i = 0; i < state.items.length; i += 1) {
+      if (pathOf(state.items[i]) === path) return state.items[i];
+    }
+    return null;
+  }
+
+  function titleOf(entry) {
+    var direct = stringValue(fieldOf(entry, "title", ""), "");
+    if (direct) return direct;
+    var path = pathOf(entry);
+    var known = catalogEntry(path);
+    var knownTitle = known ? stringValue(fieldOf(known, "title", ""), "") : "";
+    return knownTitle || basename(path);
+  }
+
+  function channelOf(entry) { return stringValue(fieldOf(entry, "channel", ""), "채널 없음"); }
+  function durationOf(entry) { return stringValue(fieldOf(entry, "duration", ""), "길이 없음"); }
+  function topicOf(entry) {
+    var path = pathOf(entry);
+    var slash = path.indexOf("/");
+    return slash === -1 ? "" : path.slice(0, slash);
+  }
+  function categoryKey(entry) {
+    return topicOf(entry) || UNCATEGORIZED;
+  }
+  /* 지금 목록에 실제로 있는 카테고리. 폴더가 하나도 없으면 **빈 배열**이고, 그러면
+     칩 줄 자체가 그려지지 않는다 — 구조가 없는 사람에게 구조의 잔해를 보여주지 않는다. */
+  function categoryDefinitions() {
+    var items = state.items || [];
+    var seen = Object.create(null);
+    var hasLoose = false;
+    for (var i = 0; i < items.length; i += 1) {
+      var topic = topicOf(items[i]);
+      if (topic) seen[topic] = true; else hasLoose = true;
+    }
+    var keys = Object.keys(seen).sort(function (a, b) { return a.localeCompare(b, "ko"); });
+    if (!keys.length) return [];
+    var definitions = [{ key: "all", label: "전체" }];
+    keys.forEach(function (key) { definitions.push({ key: key, label: key }); });
+    if (hasLoose) definitions.push({ key: UNCATEGORIZED, label: "분류 없음" });
+    return definitions;
+  }
+  function addedOf(entry) { return stringValue(fieldOf(entry, "added", ""), "날짜 없음"); }
+
+  /* 발행본 파일 이름. 앱과 같은 오리진(`doc/<이름>`)으로 띄우려면 URL 이 아니라 이름이 필요하다.
+     `:8000` 절대 URL 로 직접 열면 앱 껍데기(뒤로가기)를 잃고, 앱이 https 면 iframe 이 차단된다. */
+  function publishedName(item) {
+    var names = publishCandidates(item);
+    for (var i = 0; i < names.length; i += 1) {
+      var candidate = stringValue(names[i], "").trim();
+      if (!candidate) continue;
+      var bare = candidate;
+      if (/^[a-z][a-z0-9+.-]*:/i.test(candidate) || candidate.charAt(0) === "/") {
+        try {
+          bare = decodeURIComponent(new URL(candidate, window.location.origin).pathname);
+        } catch (error) { continue; }
+        bare = bare.slice(bare.lastIndexOf("/") + 1);
+      }
+      if (/^[^/?#\\]+\.html$/i.test(bare)) return bare;
+    }
+    return null;
+  }
+
+  function docHref(item) {
+    /* 🔴 발행 여부로 갈린다. 목록이 폴더 전체가 되기 전에는 목록에 있는 것이 곧
+       발행본이라 `doc/` 하나면 됐다. 지금은 미발행 자료도 목록에 있고, 그것도
+       읽을 수 있어야 한다 — 읽기가 공유를 기다릴 이유가 없다. */
+    if (item && item.published === true) {
+      var name = publishedName(item);
+      if (name) return "doc/" + encodeURIComponent(name);
+    }
+    var html = stringValue(fieldOf(item, "html_path", ""), "");
+    if (html) {
+      return "read/" + html.split("/").map(encodeURIComponent).join("/");
+    }
+    return null;
+  }
+
+  function publishCandidates(item) {
+    var nested = objectValue(item && item.published);
+    var candidates = [
+      item && item.public_url,
+      item && item.published_url,
+      item && item.publish_url,
+      item && item.public_path,
+      item && item.published_path,
+      item && item.publish_path,
+      item && item.canonical_path,
+      item && item.canonical_name,
+      item && item.public_name,
+      item && item.href,
+      item && item.link,
+      item && item.alias,
+      nested && nested.url,
+      nested && nested.path,
+      nested && nested.name
+    ];
+    if (item && Array.isArray(item.aliases)) {
+      item.aliases.forEach(function (alias) {
+        if (typeof alias === "string") candidates.push(alias);
+        else if (objectValue(alias)) candidates.push(alias.url, alias.path, alias.name);
+      });
+    }
+    var derived = canonicalName(item);
+    if (derived) candidates.push(derived);
+    if (item && item.url) candidates.push(item.url);
+    return candidates;
+  }
+
+  /* 앱 밖(`:8000`) 절대 URL. 뷰어 바의 "주소 복사" 와 뷰어를 쓸 수 없는 항목의 폴백이다. */
+  function publicHref(item) {
+    var candidates = publishCandidates(item);
+    for (var i = 0; i < candidates.length; i += 1) {
+      var candidate = stringValue(candidates[i], "").trim();
+      if (!candidate || candidate.indexOf("javascript:") === 0 || candidate.indexOf("data:") === 0) continue;
+      if (candidate.indexOf("//") === 0) continue;
+      if (/^[a-z][a-z0-9+.-]*:/i.test(candidate)) {
+        try {
+          var external = new URL(candidate, window.location.origin);
+          if (external.protocol === "http:" || external.protocol === "https:") return external.href;
+        } catch (error) { continue; }
+      } else if (candidate.charAt(0) === "/") {
+        try {
+          var absolute = new URL(candidate, window.location.origin);
+          if (absolute.protocol === "http:" || absolute.protocol === "https:") return absolute.href;
+        } catch (error) { continue; }
+      } else if (/^[^/?#\\]+\.html(?:[?#].*)?$/i.test(candidate)) {
+        return "http://" + window.location.hostname + ":8000/" + encodeURIComponent(candidate);
+      }
+    }
+    return null;
+  }
+
+  function canonicalName(item) {
+    var videoId = stringValue(item && item.video_id, "");
+    var htmlPath = stringValue(item && item.html_path, "");
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(videoId) || !htmlPath.endsWith(".html")) return null;
+    var filename = basename(htmlPath).slice(0, -5);
+    var marker = "--" + videoId;
+    var markerAt = filename.lastIndexOf(marker);
+    var dateMatch = /^(\d{4}-\d{2}-\d{2})--(.+)$/.exec(filename);
+    if (!dateMatch || markerAt <= dateMatch[1].length + 2) return null;
+    var slug = filename.slice(dateMatch[1].length + 2, markerAt);
+    if (!slug || slug.indexOf("/") !== -1 || slug.indexOf("\\") !== -1) return null;
+    return "learning-" + slug + "-" + videoId + ".html";
+  }
+
+  function searchableText(item) {
+    if (typeof item._searchIndex === "string") return item._searchIndex;
+    return (titleOf(item) + " " + channelOf(item)).toLocaleLowerCase("ko-KR");
+  }
+
+  function filteredItems() {
+    var query = state.query.trim().toLocaleLowerCase("ko-KR");
+    return state.items.filter(function (item) {
+      if (state.category !== "all" && categoryKey(item) !== state.category) return false;
+      if (state.starredOnly && item.starred !== true) return false;
+      if (!query) return true;
+      return searchableText(item).indexOf(query) !== -1;
+    });
+  }
+
+  function categoryCount(key) {
+    var query = state.query.trim().toLocaleLowerCase("ko-KR");
+    return state.items.filter(function (item) {
+      if (key !== "all" && categoryKey(item) !== key) return false;
+      if (state.starredOnly && item.starred !== true) return false;
+      return !query || searchableText(item).indexOf(query) !== -1;
+    }).length;
+  }
+
+  function starredCount() {
+    return state.items.filter(function (item) { return item.starred === true; }).length;
+  }
+
+  function scopeSubtitle() {
+    /* 센티널을 그대로 찍으면 제목에 제어문자가 나온다. 분류 없음만 이름을 준다. */
+    var suffix = state.category === "all" ? "최근순"
+      : (state.category === UNCATEGORIZED ? "분류 없음" : state.category);
+    if (state.starredOnly) suffix += " · 별표";
+    return filteredItems().length + "건 · " + suffix;
+  }
+
+  function youtubeUrlLooksValid(value) {
+    var raw = stringValue(value, "").trim();
+    if (!raw || /[\u0000-\u001f\u007f\s]/.test(raw)) return false;
+    try {
+      var parsed = new URL(raw);
+      var host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+      return (host === "youtube.com" || host === "www.youtube.com" || host === "m.youtube.com" ||
+              host === "music.youtube.com" || host === "youtu.be" || host === "www.youtu.be") &&
+             Boolean(parsed.pathname.replace(/^\/+/, "") || parsed.search);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function compareValues(left, right, key) {
+    var a = stringValue(fieldOf(left, key, ""), "").toLocaleLowerCase("ko-KR");
+    var b = stringValue(fieldOf(right, key, ""), "").toLocaleLowerCase("ko-KR");
+    if (key === "added" || key === "changed") {
+      // 날짜·시각은 대소문자 접기 없이 문자열 그대로 비교한다 (ISO 는 사전순 = 시간순).
+      a = stringValue(fieldOf(left, key === "changed" ? "changed_at" : key, ""), "");
+      b = stringValue(fieldOf(right, key === "changed" ? "changed_at" : key, ""), "");
+      // 변경 시각을 모르는 항목은 `added` 로 내려간다 — 정렬이 통째로 무너지지 않게.
+      if (key === "changed" && !a && !b) {
+        a = stringValue(fieldOf(left, "added", ""), "");
+        b = stringValue(fieldOf(right, "added", ""), "");
+      }
+    }
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+  }
+
+  function sortedItems(items) {
+    var result = items.slice();
+    result.sort(function (left, right) {
+      var order = compareValues(left, right, state.sortKey);
+      if (order !== 0) return state.sortDirection === "asc" ? order : -order;
+      var leftPath = pathOf(left);
+      var rightPath = pathOf(right);
+      return leftPath < rightPath ? -1 : (leftPath > rightPath ? 1 : 0);
+    });
+    return result;
+  }
+
+  function dateKey(entry) {
+    var value = addedOf(entry);
+    return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : "unknown";
+  }
+
+  function localDateKey(date) {
+    var year = date.getFullYear();
+    var month = String(date.getMonth() + 1).padStart(2, "0");
+    var day = String(date.getDate()).padStart(2, "0");
+    return year + "-" + month + "-" + day;
+  }
+
+  function dateGroup(key) {
+    if (key === "unknown") return { key: "unknown", label: "날짜 없음", priority: 0, order: "" };
+    var today = new Date();
+    var todayKey = localDateKey(today);
+    if (key === todayKey) return { key: "today", label: "오늘", priority: 4, order: todayKey };
+    var yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+    if (key === localDateKey(yesterday)) return { key: "yesterday", label: "어제", priority: 3, order: key };
+    var monday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    var day = monday.getDay();
+    monday.setDate(monday.getDate() - (day === 0 ? 6 : day - 1));
+    var mondayKey = localDateKey(monday);
+    if (key >= mondayKey && key < todayKey) {
+      return { key: "week:" + mondayKey, label: "이번 주", priority: 2, order: mondayKey };
+    }
+    var parts = key.split("-");
+    var monthKey = parts[0] + "-" + parts[1];
+    return { key: "month:" + monthKey, label: parts[1] + "월", priority: 1, order: monthKey };
+  }
+
+  function groupItems(items) {
+    var groups = [];
+    var byKey = new Map();
+    items.forEach(function (item) {
+      var descriptor = dateGroup(dateKey(item));
+      var group = byKey.get(descriptor.key);
+      if (!group) {
+        group = { key: descriptor.key, label: descriptor.label, priority: descriptor.priority, order: descriptor.order, items: [] };
+        byKey.set(descriptor.key, group);
+        groups.push(group);
+      }
+      group.items.push(item);
+    });
+    groups.sort(function (left, right) {
+      if (left.priority !== right.priority) return right.priority - left.priority;
+      if (left.order < right.order) return 1;
+      if (left.order > right.order) return -1;
+      return 0;
+    });
+    return groups;
+  }
+
+  function formatTimestamp(value) {
+    var text = stringValue(value, "");
+    if (!text) return "기준 정보 없음";
+    var date = new Date(text);
+    if (Number.isNaN(date.getTime())) return text;
+    return date.toLocaleString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  }
+
+  function archiveCount() {
+    return state.archive.archived.length + state.archive.needs_attention.length;
+  }
+
+  function learningView() {
+    if (state.viewer) return "viewer";
+    if (state.archiveView) return "archive";
+    return "list";
+  }
+
+  function listHistorySnapshot(scrollY) {
+    return {
+      query: state.query,
+      category: state.category,
+      starredOnly: state.starredOnly,
+      sortKey: state.sortKey,
+      sortDirection: state.sortDirection,
+      scrollY: Math.max(0, Number(scrollY) || 0)
+    };
+  }
+
+  function historyState(view, details) {
+    var next = Object.assign({}, objectValue(window.history.state) || {}, details || {});
+    next.learningView = view;
+    return next;
+  }
+
+  function syncCurrentListHistory() {
+    if (!window.history || !window.history.replaceState || learningView() !== "list") return;
+    try {
+      window.history.replaceState(
+        historyState("list", { learningList: listHistorySnapshot(window.scrollY) }),
+        "",
+        window.location.href
+      );
+    } catch (error) { /* 히스토리를 못 써도 현재 화면 조작은 유지한다. */ }
+  }
+
+  function restoreListSnapshot(value) {
+    var saved = objectValue(value) || {};
+    var category = stringValue(saved.category, "all");
+    /* 저장된 칩이 지금 라이브러리에 없을 수 있다(폴더를 지웠거나 다른 라이브러리다).
+       여기서 목록을 알 수 없으므로 되돌리기만 하고, 실재 판정은 렌더가 한다. */
+    var sortKey = stringValue(saved.sortKey, "added");
+    if (["title", "channel", "duration", "added", "changed"].indexOf(sortKey) === -1) sortKey = "added";
+    state.query = stringValue(saved.query, "");
+    state.category = category;
+    state.starredOnly = saved.starredOnly === true;
+    state.sortKey = sortKey;
+    state.sortDirection = saved.sortDirection === "asc" ? "asc" : "desc";
+    return Math.max(0, Number(saved.scrollY) || 0);
+  }
+
+  function renderHistoryDestination(destination) {
+    historyTraversalPending = false;
+    var entry = objectValue(destination) || {};
+    var view = entry.learningView;
+    state.editing = false;
+    state.selected.clear();
+    state.sheet = null;
+    var restoreScroll = null;
+    if (view === "archive") {
+      state.archiveView = true;
+      state.viewer = null;
+    } else if (view === "viewer" && objectValue(entry.learningViewer)) {
+      state.archiveView = false;
+      state.viewer = entry.learningViewer;
+    } else {
+      state.archiveView = false;
+      state.viewer = null;
+      restoreScroll = restoreListSnapshot(entry.learningList);
+    }
+    render();
+    if (restoreScroll !== null) {
+      window.requestAnimationFrame(function () { window.scrollTo(0, restoreScroll); });
+    }
+  }
+
+  function pushSubview(view, details) {
+    syncCurrentListHistory();
+    if (window.history && window.history.pushState) {
+      try {
+        window.history.pushState(historyState(view, details), "", window.location.href);
+      } catch (error) { /* 히스토리를 못 써도 subview 자체는 연다. */ }
+    }
+  }
+
+  function openArchive() {
+    if (learningView() !== "list") return;
+    pushSubview("archive");
+    state.archiveView = true;
+    state.viewer = null;
+    state.editing = false;
+    state.selected.clear();
+    render();
+  }
+
+  function returnToList() {
+    if (historyTraversalPending) return;
+    if (window.history && window.history.state && window.history.state.learningView !== "list") {
+      historyTraversalPending = true;
+      window.history.back();
+      return;
+    }
+    renderHistoryDestination({ learningView: "list", learningList: listHistorySnapshot(window.scrollY) });
+  }
+
+  function makeCategoryChips() {
+    var controls = el("div", "filter-controls");
+    var chips = el("div", "category-chips");
+    chips.setAttribute("role", "tablist");
+    /* 폴더가 하나도 없으면 칩 줄을 아예 만들지 않는다. 다만 **별표 필터는 남는다** —
+       그건 분류가 아니라 내 표시이고, 평평한 라이브러리에서도 뜻이 있다. */
+    var definitions = categoryDefinitions();
+    if (definitions.length && !definitions.some(function (entry) { return entry.key === state.category; })) {
+      state.category = "all";
+    }
+    definitions.forEach(function (definition) {
+      var count = categoryCount(definition.key);
+      var button = el("button", "category-chip" + (state.category === definition.key ? " is-selected" : "") + (count === 0 ? " is-zero" : ""), definition.label);
+      button.type = "button";
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", state.category === definition.key ? "true" : "false");
+      button.setAttribute("data-category", definition.key);
+      if (count > 0) button.appendChild(el("span", "count", count));
+      button.addEventListener("click", function () {
+        state.category = definition.key;
+        syncCurrentListHistory();
+        render();
+      });
+      chips.appendChild(button);
+    });
+    if (definitions.length) controls.appendChild(chips);
+    var star = el("button", "category-chip star-filter" + (state.starredOnly ? " is-selected" : ""), "별표");
+    star.type = "button";
+    star.setAttribute("aria-pressed", state.starredOnly ? "true" : "false");
+    star.setAttribute("aria-label", state.starredOnly ? "별표 필터 해제" : "별표 자료만 보기");
+    star.setAttribute("data-star-filter", "true");
+    star.appendChild(el("span", "count", starredCount()));
+    star.addEventListener("click", function () {
+      state.starredOnly = !state.starredOnly;
+      syncCurrentListHistory();
+      render();
+    });
+    controls.appendChild(star);
+    return controls;
+  }
+
+  function makeIngestComposer() {
+    var composer = el("div", "ingest-composer");
+    var input = el("input");
+    input.type = "url";
+    input.placeholder = "유튜브 링크 붙여넣기";
+    input.setAttribute("aria-label", "유튜브 링크 붙여넣기");
+    input.setAttribute("data-focus-key", "ingest-url");
+    input.value = state.ingestUrl;
+    input.addEventListener("input", function () {
+      state.ingestUrl = input.value;
+      render();
+    });
+    composer.appendChild(input);
+    if (youtubeUrlLooksValid(state.ingestUrl)) {
+      var submit = el("button", "ingest-submit", "적재");
+      submit.type = "button";
+      submit.disabled = state.ingestBusy;
+      submit.addEventListener("click", requestIngestPlan);
+      composer.appendChild(submit);
+    }
+    return composer;
+  }
+
+  function pageSubtitle() {
+    if (state.loading) return "목록을 불러오는 중";
+    if (state.archiveView) return "리스트에 없는 것들";
+    if (state.error) return "목록을 만들 수 없습니다";
+
+    var subtitle = scopeSubtitle();
+    var active = activeIngestRequests();
+    var running = active.filter(function (entry) { return entry.status === "running" || entry.status === "cancelling"; }).length;
+    var waiting = active.filter(function (entry) { return entry.status === "queued"; }).length;
+    var failed = state.ingestRequests.filter(function (entry) { return entry.status === "failed"; }).length;
+    var ingestSummary = [];
+    if (running) ingestSummary.push("적재 " + running + "건 진행");
+    if (waiting) ingestSummary.push(waiting + "건 대기");
+    if (failed) ingestSummary.push(failed + "건 실패");
+    if (ingestSummary.length) subtitle += " · " + ingestSummary.join(" · ");
+    return subtitle;
+  }
+
+  function makeHeader() {
+    var header = el("header", "app-header");
+    var nav = el("div", "nav-row");
+    if (state.archiveView) {
+      var back = el("button", "nav-button back");
+      back.type = "button";
+      back.setAttribute("aria-label", "목록으로 돌아가기");
+      append(back, icon("back", 18), el("span", "", "목록"));
+      back.addEventListener("click", returnToList);
+      nav.appendChild(back);
+    }
+    nav.appendChild(el("span", "nav-spacer"));
+
+    if (!state.archiveView) {
+      var archiveButton = el("button", "header-action", "보관함");
+      archiveButton.type = "button";
+      archiveButton.appendChild(el("span", "count", archiveCount()));
+      archiveButton.addEventListener("click", function () {
+        openArchive();
+      });
+      nav.appendChild(archiveButton);
+      var editButton = el("button", "header-action strong", state.editing ? "완료" : "편집");
+      editButton.type = "button";
+      editButton.disabled = mutationsLocked() || state.items.length === 0;
+      editButton.addEventListener("click", function () {
+        if (mutationsLocked()) return;
+        state.editing = !state.editing;
+        state.selected.clear();
+        render();
+      });
+      nav.appendChild(editButton);
+    }
+    header.appendChild(nav);
+
+    var title = el("h1", "page-title", state.archiveView ? "보관함" : "Learning Library");
+    header.appendChild(title);
+    header.appendChild(el("p", "page-subtitle", pageSubtitle()));
+    if (state.warnings.length) {
+      var warningBadge = el("span", "warning-badge");
+      append(warningBadge, icon("warning", 14), el("span", "", "경고 " + state.warnings.length));
+      header.appendChild(warningBadge);
+    }
+
+    /* 🔴 적재 중에 검색창·주제 칩을 숨기면 안 된다. `state.query`·`state.category` 는 그대로
+       남아 목록을 계속 걸러내는데, 그것을 되돌릴 UI 가 사라져 사용자가 **갇힌다** — 실측
+       2026-07-31 사용자 보고: 검색한 뒤 적재하니 "검색 결과가 없습니다" 만 남고 검색창이 없어
+       지울 수도 없었다. #258 에서 세로 공간을 아끼려고 `&& !activeIngestRequests().length` 를
+       붙였는데, 그 조건에 주석도 테스트도 없었다.
+       규칙: **켜 둔 상태를 되돌리는 UI 는 그 상태가 살아 있는 동안 화면에 있어야 한다.** */
+    if (!state.archiveView) {
+      var search = el("label", "search-wrap");
+      var searchIcon = icon("search", 17);
+      searchIcon.setAttribute("aria-hidden", "true");
+      search.appendChild(searchIcon);
+      var input = el("input");
+      input.type = "search";
+      input.placeholder = "제목 · 채널 검색";
+      input.setAttribute("aria-label", "제목과 채널 검색");
+      input.setAttribute("data-focus-key", "search");
+      input.value = state.query;
+      function scheduleSearchRender() {
+        window.clearTimeout(state.searchTimer);
+        state.searchTimer = window.setTimeout(function () {
+          syncCurrentListHistory();
+          render();
+        }, 130);
+      }
+      /* iOS 한글 IME는 조합 중에도 input을 보낸다. 그때 render()가 input DOM을 교체하면
+         포커스·캐럿은 복원해도 IME 조합 세션은 복원할 수 없어 글자가 분리되거나 덮인다.
+         조합 직전의 예약 렌더까지 취소하고, compositionend 뒤 기존 검색 경로를 재개한다. */
+      input.addEventListener("compositionstart", function () {
+        state.searchComposing = true;
+        window.clearTimeout(state.searchTimer);
+      });
+      input.addEventListener("input", function (event) {
+        state.query = input.value;
+        window.clearTimeout(state.searchTimer);
+        if (state.searchComposing || event.isComposing) return;
+        scheduleSearchRender();
+      });
+      input.addEventListener("compositionend", function () {
+        state.searchComposing = false;
+        state.query = input.value;
+        scheduleSearchRender();
+      });
+      search.appendChild(input);
+      header.appendChild(search);
+      header.appendChild(makeCategoryChips());
+    }
+    if (!state.archiveView) header.appendChild(makeIngestComposer());
+    return header;
+  }
+
+  function makeWarningPanel() {
+    if (!state.warnings.length) return null;
+    var details = el("details", "warning-panel");
+    /* 🔴 `<details>` 의 열림은 DOM 이 갖는 상태다. `render()` 가 매번 새로 만들면 그 상태가
+       사라져, 적재가 도는 동안(주기적 폴링) 열자마자 다시 닫힌다 — 실측 2026-07-31 사용자 보고.
+       열림 여부를 `state` 에 두고 되살린다. */
+    details.open = state.warningsOpen;
+    details.addEventListener("toggle", function () { state.warningsOpen = details.open; });
+    var summary = el("summary", "", "수집 경고 " + state.warnings.length + "건");
+    details.appendChild(summary);
+    var list = el("ul", "warning-list");
+    state.warnings.forEach(function (warning) { list.appendChild(el("li", "", warning)); });
+    details.appendChild(list);
+    return details;
+  }
+
+  function makeErrorCard() {
+    if (!state.error) return null;
+    var card = el("article", "error-card");
+    card.setAttribute("role", "alert");
+    var heading = el("h2", "error-heading");
+    append(heading, icon("warning", 17), el("span", "", "수집이 실패했습니다"));
+    card.appendChild(heading);
+    var exitText = state.error.exitCode === null || state.error.exitCode === undefined ? "없음" : String(state.error.exitCode);
+    var lead = el("p");
+    var manifestFailure = state.error.command.indexOf("manifest --json") !== -1;
+    lead.appendChild(el("span", "", manifestFailure ? "learn.py manifest --json 이 " : "요청이 "));
+    var exitCode = el("code", "", "exit " + exitText);
+    lead.appendChild(exitCode);
+    lead.appendChild(el("span", "", " 로 끝났습니다."));
+    card.appendChild(lead);
+    card.appendChild(errorField("사유", state.error.message));
+    card.appendChild(errorField("실행 명령", state.error.command || DEFAULT_COMMAND));
+    card.appendChild(errorField("stderr", state.error.stderr || "없음"));
+    var retry = el("button", "refresh-button");
+    retry.type = "button";
+    retry.disabled = state.loading;
+    append(retry, icon("refresh", 16), el("span", "", "다시 수집"));
+    retry.addEventListener("click", function () { loadData(false); });
+    card.appendChild(retry);
+    return card;
+  }
+
+  function errorField(label, value, extraClass) {
+    var field = el("div", "error-field");
+    field.appendChild(el("span", "error-field-label", label));
+    field.appendChild(el("code", "error-value" + (extraClass ? " " + extraClass : ""), value));
+    return field;
+  }
+
+  function makeStaleNotice() {
+    if (!state.stale) return null;
+    var notice = el("p", "stale-notice");
+    notice.appendChild(icon("warning", 16));
+    var text = el("span");
+    text.appendChild(el("span", "", "마지막 성공 기준 " + (state.items.length || 0) + "건은 아래에 있지만 "));
+    text.appendChild(el("strong", "", "최신이 아닙니다"));
+    text.appendChild(el("span", "", ". 보기만 가능하고 발행·회수는 잠겨 있습니다."));
+    notice.appendChild(text);
+    return notice;
+  }
+
+  function makeDesktopHead() {
+    if (state.archiveView || !state.items.length) return null;
+    var head = el("div", "desktop-list-head");
+    if (state.editing) {
+      var selectSpacer = el("span", "desktop-select-spacer");
+      selectSpacer.setAttribute("aria-hidden", "true");
+      head.appendChild(selectSpacer);
+    }
+    [
+      ["title", "제목"],
+      ["channel", "채널"],
+      ["duration", "길이"],
+      ["added", "추가"],
+      ["changed", "최근적재"]
+    ].forEach(function (definition) {
+      var button = el("button", "sort-button", definition[1]);
+      button.type = "button";
+      button.setAttribute("aria-label", definition[1] + " 기준으로 정렬");
+      if (state.sortKey === definition[0]) {
+        button.setAttribute("aria-sort", state.sortDirection === "asc" ? "ascending" : "descending");
+        button.appendChild(el("span", "sort-indicator", state.sortDirection === "asc" ? "위" : "아래"));
+      } else {
+        button.setAttribute("aria-sort", "none");
+      }
+      button.addEventListener("click", function () {
+        if (state.sortKey === definition[0]) {
+          state.sortDirection = state.sortDirection === "asc" ? "desc" : "asc";
+        } else {
+          state.sortKey = definition[0];
+          state.sortDirection = (definition[0] === "added" || definition[0] === "changed") ? "desc" : "asc";
+        }
+        syncCurrentListHistory();
+        render();
+      });
+      head.appendChild(button);
+    });
+    head.appendChild(el("span", "", ""));
+    return head;
+  }
+
+  function ingestByDocument() {
+    return ingestDocumentIndex(state.ingestRequests);
+  }
+
+  function makeItemRow(item, ingesting) {
+    var path = pathOf(item);
+    var row = el("li", "item-row" + (state.editing ? " is-editing" : "")
+      + (ingesting ? " is-ingesting" : ""));
+    row.setAttribute("data-item-path", path);
+    var canChange = !mutationsLocked() && itemMutable(item);
+
+    if (state.editing) {
+      var checkWrap = el("div", "edit-check");
+      var check = el("input");
+      check.type = "checkbox";
+      check.checked = state.selected.has(path);
+      check.disabled = !canChange;
+      check.setAttribute("aria-label", "보관 선택");
+      check.addEventListener("click", function (event) { event.stopPropagation(); });
+      check.addEventListener("change", function () {
+        if (check.checked) state.selected.add(path); else state.selected.delete(path);
+        render();
+      });
+      checkWrap.appendChild(check);
+      row.appendChild(checkWrap);
+    }
+
+    // 뷰어로 열 수 있으면 같은 오리진 주소를 준다 — 가운데클릭·새 탭도 그대로 살아 있다.
+    var inApp = docHref(item);
+    var href = inApp || publicHref(item);
+    var link = el(href ? "a" : "div", "item-link" + (href ? "" : " no-link"));
+    if (href) link.href = href;
+    if (!href) link.setAttribute("aria-disabled", "true");
+    if (inApp && !state.editing) {
+      link.addEventListener("click", function (event) {
+        // 새 탭 의도(가운데클릭·⌘/Ctrl·Shift)는 브라우저에 맡긴다.
+        if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        openDoc(item);
+      });
+    }
+    if (state.editing) {
+      link.setAttribute("role", "button");
+      link.setAttribute("tabindex", canChange ? "0" : "-1");
+      link.addEventListener("click", function (event) {
+        event.preventDefault();
+        if (!canChange) return;
+        if (state.selected.has(path)) state.selected.delete(path); else state.selected.add(path);
+        render();
+      });
+      link.addEventListener("keydown", function (event) {
+        if ((event.key === "Enter" || event.key === " ") && canChange) {
+          event.preventDefault();
+          if (state.selected.has(path)) state.selected.delete(path); else state.selected.add(path);
+          render();
+        }
+      });
+    }
+
+    var copy = el("span", "item-copy");
+    copy.appendChild(el("span", "cell-title", titleOf(item)));
+    var badge = ingesting ? ingestBadgeText() : "";
+    var badgeMeta = ingesting ? ingestBadgeMeta(ingesting) : "";
+    var plainMeta = [channelOf(item), durationOf(item), topicOf(item)]
+      .filter(function (part) { return part; }).join(" · ");
+    var mobile = el("span", "mobile-meta",
+      badgeMeta ? (plainMeta ? badgeMeta + " · " + plainMeta : badgeMeta) : plainMeta);
+    // 배지는 폴링이 제자리에서 갈아 끼운다. 원래 문구를 들고 있어야 되돌릴 수 있다.
+    mobile.setAttribute("data-meta-plain", plainMeta);
+    copy.appendChild(mobile);
+    link.appendChild(copy);
+    link.appendChild(el("span", "cell-channel", channelOf(item)));
+    link.appendChild(el("span", "cell-duration", durationOf(item)));
+    /* 🔴 배지는 날짜 칸을 **겸한다** — 새 그리드 자식을 붙이면 세 번째 칸이 다음 줄로
+       떨어져 행 높이가 두 배가 된다(실측 52 -> 96px, #207). 적재 중인 자료의 "추가된
+       날짜" 는 아직 도착하는 중이므로, 그 자리에 진행을 적는 것이 자리 다툼도 아니다. */
+    var added = el("span", "cell-added" + (ingesting ? " is-ingesting" : ""),
+      ingesting ? badge : addedOf(item));
+    // 🔴 **무조건** 적는다. 늦게 적으면, 적재 중에 일어난 전체 렌더가 배지만 있고 원래
+    //    날짜가 없는 칸을 만들고, 다음 폴링이 그 자리에 빈 문자열을 넣어 **날짜가 통째로
+    //    사라진다**(적대검증에서 재현: 정렬 헤더 클릭 → 폴링 한 번 → 빈 칸).
+    added.setAttribute("data-added-plain", addedOf(item));
+    link.appendChild(added);
+    var arrow = el("span", "item-arrow");
+    arrow.appendChild(icon("chevron", 15));
+    link.appendChild(arrow);
+    row.appendChild(link);
+    if (!state.editing) {
+      var starred = item.starred === true;
+      var star = el("button", "star-button" + (starred ? " is-starred" : ""), starred ? "★" : "☆");
+      star.type = "button";
+      star.setAttribute("data-star-path", path);
+      star.setAttribute("aria-pressed", starred ? "true" : "false");
+      star.setAttribute("aria-label", starred ? titleOf(item) + " 별표 해제" : titleOf(item) + " 별표 추가");
+      star.setAttribute("aria-busy", starMutations.has(path) ? "true" : "false");
+      /* 프론트매터가 없는 문서에는 상태를 적을 수 없다 — 이 앱은 남의 문서를
+         수리하지 않는다. 그때 버튼이 눌리는데 409 가 나면 UI 가 거짓말한 것이다.
+         생산자가 이 신호를 안 주면(남의 `scripts/learn.py`) 눌리게 두고 백엔드가
+         판정한다: 모른다고 막아 버리면 멀쩡한 라이브러리의 별표가 통째로 죽는다. */
+      var stateWritable = item.state_writable !== false;
+      star.disabled = mutationsLocked() || !safeRepoPath(path) || !stateWritable;
+      if (!stateWritable) star.title = "프론트매터가 없어 별표를 적을 수 없습니다";
+      star.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        requestStar(item, item.starred !== true);
+      });
+      row.appendChild(star);
+
+      /* 발행은 이제 자료별 액션이다. 예전에는 목록에 들어올 자격이었고, 발행하지
+         않은 자료는 보관함에서 찾아야 했다 — 앱을 막 깐 사람에게 자기 첫 자료가
+         목록에 없는 이유를 설명할 방법이 없었다. */
+      var published = item.published === true;
+      var share = el("button", "star-button share-button" + (published ? " is-shared" : ""), "");
+      share.type = "button";
+      share.appendChild(icon("link", 15));
+      share.setAttribute("data-share-path", path);
+      share.setAttribute("aria-pressed", published ? "true" : "false");
+      share.setAttribute("aria-label",
+        published ? titleOf(item) + " 공유 링크 회수" : titleOf(item) + " 공유 링크 만들기");
+      share.title = published ? "공유 링크 회수" : "공유 링크 만들기";
+      share.disabled = !canChange || !safeRepoPath(path);
+      if (share.disabled && !mutationsLocked()) share.title = "이 항목은 변경할 수 없습니다";
+      share.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        openSheet(published ? "unpublish" : "publish", [path]);
+      });
+      row.appendChild(share);
+    }
+    if (state.selected.has(path)) row.classList.add("is-selected");
+    return row;
+  }
+
+  /* 제목은 fetch 직후에 이미 알려진다 — `A5k--Wsg7WE 적재 중` 은 무엇이 도는지 알려주지
+     못한다. 스킬이 흘린 메타를 러너가 status 에 옮겨두므로 있으면 그것을 쓰고, 없으면
+     video_id 로 곱게 내려앉는다(옛 적재 기록에는 메타가 없다). */
+  function ingestBadgeText() {
+    return ingestBadgeLabel();
+  }
+
+  function ingestBadgeMeta(entry) {
+    return ingestBadgeLong(ingestElapsed(entry));
+  }
+
+  function ingestDisplayName(entry) {
+    var title = stringValue(entry && entry.title, "");
+    if (title) return title;
+    return stringValue(entry && entry.video_id, "알 수 없는 영상");
+  }
+
+  function ingestSubtitle(entry) {
+    var parts = [];
+    if (entry && stringValue(entry.channel, "")) parts.push(entry.channel);
+    if (entry && stringValue(entry.duration, "")) parts.push(entry.duration);
+    return parts.join(" · ");
+  }
+
+  function makeIngestRow(entry, queueNumber) {
+    var status = stringValue(entry.status, "");
+    var rowClass = "ingest-row";
+    if (status === "queued") rowClass += " is-waiting";
+    if (status === "failed") rowClass += " is-failed";
+    if (status === "cancelled") rowClass += " is-cancelled";
+    var row = el("article", rowClass);
+    var head = el("div", "ingest-row-head");
+    if (status === "running" || status === "cancelling") head.appendChild(el("span", "ingest-spinner"));
+    if (status === "failed") head.appendChild(el("span", "ingest-status-dot"));
+    if (status === "queued") head.appendChild(el("span", "queue-number", queueNumber));
+    var title = ingestDisplayName(entry);
+    if (status === "running") title += " 적재 중";
+    if (status === "cancelling") title += " 중지 중";
+    if (status === "failed") title += " 적재 실패";
+    head.appendChild(el("span", "ingest-row-title", title));
+    if (status === "queued") {
+      head.appendChild(el("span", "ingest-row-time", "대기"));
+    } else if (status !== "cancelled") {
+      head.appendChild(el("span", "ingest-row-time", ingestElapsed(entry)));
+    }
+    row.appendChild(head);
+
+    var subtitle = ingestSubtitle(entry);
+    if (subtitle) row.appendChild(el("p", "ingest-row-sub", subtitle));
+
+    if (status === "failed") {
+      // 🔴 **요약이 있으면 그것만 읽으면 되게 한다.**
+      //    예전에는 일반 문구(`error`)를 **항상 위에** 그리고 그 아래 요약을 붙였다. 그런데
+      //    `error` 는 실패 종류당 한 문장으로 고정이라("claude가 exit 0으로 끝났지만 적재 완료
+      //    표시가 없습니다 …") 매번 같은 말이 먼저 눈에 들어오고, 정작 이 건에서 무슨 일이
+      //    있었는지 말해 주는 요약은 그 아래로 밀렸다. 읽는 사람에게는 반복되는 머리말이다.
+      //    이제 요약이 있으면 **요약이 본문**이고, 기계 정보(exit·재시도)만 작게 남긴다.
+      var summary = stringValue(entry.failure_summary, "");
+      var machine = [];
+      if (entry.exit_code !== undefined) {
+        machine.push("exit " + (entry.exit_code === null ? "없음" : String(entry.exit_code)));
+      }
+      if (entry.retry_of) machine.push("#" + String(entry.retry_of) + " 다시 시도");
+
+      if (summary) {
+        row.appendChild(el("p", "ingest-row-summary", summary));
+        // 기계 정보는 진단에 쓰이므로 버리지 않는다 — 다만 본문 자리를 뺏지 않게 아래로.
+        if (machine.length) row.appendChild(el("p", "ingest-row-detail", machine.join(" · ")));
+      } else {
+        // 요약이 없을 때만 일반 문구가 최선의 설명이다.
+        var detail = stringValue(entry.error, "적재가 실패했습니다");
+        if (machine.length) detail += " · " + machine.join(" · ");
+        row.appendChild(el("p", "ingest-row-detail", detail));
+        var why = stringValue(entry.failure_summary_error, "");
+        if (why) row.appendChild(el("p", "ingest-row-summary is-missing", "이유 요약 없음 — " + why));
+      }
+    }
+
+    var actions = el("div", "ingest-actions");
+    if (status === "queued") {
+      var cancelWaiting = el("button", "ingest-action danger", "취소");
+      cancelWaiting.type = "button";
+      cancelWaiting.disabled = state.ingestBusy;
+      cancelWaiting.addEventListener("click", function () { cancelIngest(entry.id); });
+      actions.appendChild(cancelWaiting);
+    } else if (status === "running" || status === "cancelling") {
+      // 🔴 `cancelling` 에서도 버튼을 살린다. 서버는 이 상태의 재취소를 허용하는데
+      // (INGEST_RUNNING_STATES) 화면만 막고 있었다 — stop 이 실제로 실패하면 레코드가
+      // cancelling 으로 남고, 새로고침하면 사용자에게 출구가 없었다(회복이 curl 뿐).
+      // 실패한 stop 은 러너에 SIGTERM 을 못 보낸 것이라 적재가 예산 끝까지 완주하므로,
+      // 재시도가 그걸 끊는 유일한 화면 수단이다. 이미 멈춘 유닛에 stop 을 다시 보내도
+      // rc=0 이라 무해하다(레퍼런스 박스 실측 2026-08-04).
+      var stop = el("button", "ingest-action danger", status === "cancelling" ? "중지 재시도" : "중지");
+      stop.type = "button";
+      stop.disabled = state.ingestBusy;
+      stop.addEventListener("click", function () { cancelIngest(entry.id); });
+      actions.appendChild(stop);
+    } else if (status === "failed") {
+      var again = el("button", "ingest-action", "다시 시도");
+      again.type = "button";
+      again.disabled = state.ingestBusy;
+      again.addEventListener("click", function () { retryIngest(entry.id); });
+      actions.appendChild(again);
+      var log = el("button", "ingest-action", "로그 보기");
+      log.type = "button";
+      log.disabled = state.ingestBusy;
+      log.addEventListener("click", function () { loadIngestDetail(entry.id); });
+      actions.appendChild(log);
+      var remove = el("button", "ingest-action danger", "지우기");
+      remove.type = "button";
+      remove.disabled = state.ingestBusy;
+      remove.addEventListener("click", function () { deleteIngest(entry.id); });
+      actions.appendChild(remove);
+    }
+    if (actions.childNodes.length) row.appendChild(actions);
+
+    if (state.ingestDetail && state.ingestDetail.id === entry.id) {
+      row.appendChild(errorField("로그", state.ingestDetail.log || "로그가 비어 있습니다", "ingest-log"));
+    }
+    return row;
+  }
+
+  function makeIngestQueue() {
+    var records = state.ingestRequests.filter(ingestCardVisible);
+    if (!records.length && !state.ingestError) return null;
+    var section = el("section", "ingest-queue");
+    if (records.length) section.appendChild(el("h2", "ingest-queue-heading", "적재 큐 · " + records.length + "건"));
+    if (state.ingestError) {
+      var error = el("article", "error-card");
+      error.setAttribute("role", "alert");
+      // 🔴 제목을 "읽지 못했습니다" 로 못박아 두면 **읽기는 성공하고 요청이 거부된** 경우까지
+      //    읽기 실패로 보고한다(실측 2026-07-31: 409 "이미 계획되었거나 큐에 있습니다" 가
+      //    "적재 상태를 읽지 못했습니다" 아래에 붙어, 원인을 엉뚱한 곳에서 찾게 만들었다).
+      var status = state.ingestError.status;
+      var rejected = typeof status === "number" && status >= 400 && status < 500;
+      error.appendChild(el("h2", "error-heading", rejected ? "요청이 거부되었습니다" : "적재 상태를 읽지 못했습니다"));
+      error.appendChild(el("p", "", state.ingestError.message || "원인을 알 수 없습니다"));
+      // 조작 오류는 폴링이 지우지 않으니 **닫는 길**이 화면에 있어야 한다
+      // (켜 둔 상태를 되돌리는 UI 는 그 상태가 살아 있는 동안 화면에 있어야 한다).
+      if (state.ingestError.fromAction) {
+        var dismiss = el("button", "error-dismiss", "닫기");
+        dismiss.type = "button";
+        dismiss.addEventListener("click", function () {
+          state.ingestError = null;
+          render();
+        });
+        error.appendChild(dismiss);
+      }
+      section.appendChild(error);
+    }
+    if (records.length) {
+      var stack = el("div", "ingest-stack");
+      var activeNumber = 0;
+      records.forEach(function (entry) {
+        var number = "";
+        if (entry.status === "queued" || entry.status === "running" || entry.status === "cancelling") {
+          activeNumber += 1;
+          if (entry.status === "queued") number = activeNumber;
+        }
+        stack.appendChild(makeIngestRow(entry, number));
+      });
+      section.appendChild(stack);
+    }
+    return section;
+  }
+
+  function makeIngestSlot() {
+    var slot = el("div", "ingest-slot");
+    slot.setAttribute("data-ingest-slot", "true");
+    var queue = makeIngestQueue();
+    if (queue) slot.appendChild(queue);
+    return slot;
+  }
+
+  function makeList() {
+    var visible = sortedItems(filteredItems());
+    if (!visible.length) {
+      var empty = el("section", "empty-panel");
+      if (state.starredOnly) {
+        empty.appendChild(el("h2", "", "별표 조건에 맞는 자료가 없습니다"));
+        empty.appendChild(el("p", "", "검색어나 주제를 바꾸거나 별표 필터를 해제해 보세요."));
+      } else if (state.category !== "all" && !state.query) {
+        empty.appendChild(el("h2", "", "이 카테고리에 자료가 없습니다"));
+        empty.appendChild(el("p", "", "다른 주제를 선택해 보세요."));
+      } else {
+        empty.appendChild(el("h2", "", state.query ? "검색 결과가 없습니다" : "아직 자료가 없습니다"));
+        empty.appendChild(el("p", "", state.query ? "제목이나 채널을 다시 검색해 보세요." : "유튜브 링크를 붙여넣어 첫 자료를 만들어 보세요."));
+      }
+      /* 🔴 두 번째 출구. 걸러내는 상태가 켜져 있으면 **비었다는 화면 안에서** 되돌릴 수 있게
+         한다 — 위 헤더가 어떤 이유로든 안 보이는 상황이 다시 오더라도 갇히지 않는다. */
+      if (state.query || state.category !== "all" || state.starredOnly) {
+        var reset = el("button", "empty-reset", "검색·주제·별표 지우고 전체 보기");
+        reset.type = "button";
+        reset.addEventListener("click", function () {
+          state.query = "";
+          state.category = "all";
+          state.starredOnly = false;
+          syncCurrentListHistory();
+          render();
+        });
+        empty.appendChild(reset);
+      }
+      return empty;
+    }
+    var fragment = document.createDocumentFragment();
+    var ingesting = ingestByDocument();
+    groupItems(visible).forEach(function (group) {
+      var section = el("section", "date-section");
+      section.appendChild(el("h2", "date-heading", group.label));
+      var list = el("ul", "list-group");
+      group.items.forEach(function (item) {
+        list.appendChild(makeItemRow(item, ingesting[pathOf(item)]));
+      });
+      section.appendChild(list);
+      fragment.appendChild(section);
+    });
+    var wrapper = el("div", "item-groups");
+    wrapper.appendChild(fragment);
+    return wrapper;
+  }
+
+  function makeArchiveSection(title, entries, kind) {
+    if (!entries.length) return null;
+    var section = el("section", "archive-section");
+    section.appendChild(el("h2", "archive-heading", title + " · " + entries.length));
+    var list = el("ul", "archive-group");
+    entries.forEach(function (entry) { list.appendChild(makeArchiveRow(entry, kind)); });
+    section.appendChild(list);
+    return section;
+  }
+
+  function archiveDetail(entry, kind) {
+    if (kind === "attention") {
+      var reason = stringValue(fieldOf(entry, "reason", ""), "");
+      var labels = {
+        dangling: "끊어진 링크",
+        worktree_target: "워크트리 대상",
+        canonical_direct_file: "canonical 자리에 실제 파일",
+        canonical_other_document: "이름 충돌",
+        archived_but_live: "불변식 위반",
+        orphan_archive_record: "고아 보관 기록",
+        unmapped_learning_target: "연결되지 않은 learning 대상"
+      };
+      return labels[reason] || stringValue(fieldOf(entry, "message", fieldOf(entry, "detail", "자동으로 고치지 않고 확인이 필요합니다")), "확인이 필요합니다");
+    }
+    var archivedAt = stringValue(fieldOf(entry, "archived_at", fieldOf(entry, "archivedAt", "")), "");
+    return archivedAt ? archivedAt + " 보관" : "공유 링크를 회수한 자료";
+  }
+
+  function makeArchiveRow(entry, kind) {
+    var row = el("li", "archive-row");
+    var copy = el("div", "archive-copy");
+    copy.appendChild(el("div", "archive-title", titleOf(entry)));
+    copy.appendChild(el("div", "archive-detail" + (kind === "attention" ? " attention" : ""), archiveDetail(entry, kind)));
+    var path = pathOf(entry);
+    if (path) copy.appendChild(el("code", "archive-path", path));
+    row.appendChild(copy);
+    var actions = el("div", "archive-actions");
+    var mutable = entryCanChange(entry);
+    var locked = mutationsLocked();
+
+    if (kind === "archived") {
+      var known = Boolean(catalogEntry(path)) || Boolean(
+        objectValue(entry) &&
+        (fieldOf(entry, "html_path", null) || fieldOf(entry, "video_id", null) || fieldOf(entry, "channel", null) || fieldOf(entry, "mutable", null) !== null)
+      );
+      var restore = el("button", "row-action", "복원");
+      restore.type = "button";
+      restore.disabled = locked || !safeRepoPath(path) || !known || !mutable;
+      restore.addEventListener("click", function () { openSheet("restore", [path]); });
+      actions.appendChild(restore);
+      if (!known) {
+        var forget = el("button", "row-action danger", "기록 삭제");
+        forget.type = "button";
+        forget.disabled = locked || !safeRepoPath(path);
+        forget.addEventListener("click", function () { openSheet("forget", [path]); });
+        actions.appendChild(forget);
+      }
+    } else {
+      var aliases = fieldOf(entry, "aliases", fieldOf(entry, "names", []));
+      var canUnpublish = fieldOf(entry, "can_unpublish", fieldOf(entry, "canUnpublish", false)) === true || (Array.isArray(aliases) && aliases.length > 0);
+      if (canUnpublish && safeRepoPath(path)) {
+        var unpublish = el("button", "row-action danger", "회수");
+        unpublish.type = "button";
+        unpublish.disabled = locked || !mutable;
+        unpublish.addEventListener("click", function () { openSheet("unpublish", [path]); });
+        actions.appendChild(unpublish);
+      }
+      var attentionReason = stringValue(fieldOf(entry, "reason", ""), "");
+      var canForget = fieldOf(entry, "orphan", false) === true || fieldOf(entry, "can_forget", fieldOf(entry, "canForget", false)) === true || attentionReason === "orphan_archive_record";
+      if (canForget && safeRepoPath(path)) {
+        var attentionForget = el("button", "row-action danger", "기록 삭제");
+        attentionForget.type = "button";
+        attentionForget.disabled = locked;
+        attentionForget.addEventListener("click", function () { openSheet("forget", [path]); });
+        actions.appendChild(attentionForget);
+      }
+    }
+    row.appendChild(actions);
+    return row;
+  }
+
+  function makeArchiveView() {
+    var content = el("main", "content");
+    content.appendChild(el("p", "archive-intro", "보관한 자료와 점검이 필요한 항목을 한 곳에서 확인합니다."));
+    var errorCard = makeErrorCard();
+    if (errorCard) content.appendChild(errorCard);
+    var stale = makeStaleNotice();
+    if (stale) content.appendChild(stale);
+    var warning = makeWarningPanel();
+    if (warning) content.appendChild(warning);
+
+    var attention = makeArchiveSection("점검 필요", state.archive.needs_attention, "attention");
+    var archived = makeArchiveSection("보관", state.archive.archived, "archived");
+    if (attention) content.appendChild(attention);
+    if (archived) content.appendChild(archived);
+    if (!attention && !archived && !state.error) {
+      var empty = el("section", "empty-panel");
+      empty.appendChild(el("h2", "", "보관함이 비어 있습니다"));
+      empty.appendChild(el("p", "", "보관한 자료와 점검이 필요한 항목이 여기에 표시됩니다."));
+      content.appendChild(empty);
+    }
+    content.appendChild(makeFooter());
+    return content;
+  }
+
+  function makeFooter() {
+    var foot = el("p", "repo-foot");
+    var sha = state.repoHead.sha || "없음";
+    foot.appendChild(el("span", "", "기준 "));
+    foot.appendChild(el("code", "", sha));
+    foot.appendChild(el("span", "", " · "));
+    foot.appendChild(el("span", "", formatTimestamp(state.repoHead.committed_at)));
+    return foot;
+  }
+
+  function makeSelectionBar() {
+    if (!state.editing) return null;
+    var bar = el("div", "selection-bar");
+    var inner = el("div", "selection-bar-inner");
+    inner.appendChild(el("span", "selection-count", state.selected.size + "개 선택됨"));
+    inner.appendChild(el("span", "selection-spacer"));
+    var action = el("button", "archive-action", "보관함으로");
+    action.type = "button";
+    action.disabled = mutationsLocked() || state.selected.size === 0;
+    action.addEventListener("click", function () {
+      if (!action.disabled) openSheet("archive", Array.from(state.selected));
+    });
+    inner.appendChild(action);
+    bar.appendChild(inner);
+    return bar;
+  }
+
+  function sheetCopy(kind, count) {
+    if (kind === "archive") return {
+      title: count + "개를 보관함으로 옮깁니다",
+      message: "공유 링크 " + count + "개를 회수하고 리스트에서 뺍니다. 레포 파일은 그대로 둡니다.",
+      confirm: "회수하고 보관",
+      danger: true
+    };
+    if (kind === "publish") return { title: "이 자료를 발행합니다", message: "공유 링크를 만듭니다. 목록에서의 자리는 그대로입니다.", confirm: "발행", danger: false };
+    if (kind === "unpublish") return { title: "이 자료의 공유 링크를 회수합니다", message: "레포 파일은 그대로 두고 발행 상태만 바꿉니다.", confirm: "회수", danger: true };
+    if (kind === "restore") return { title: "보관을 해제합니다", message: "자료를 보관함에서 빼 목록으로 되돌립니다. 공유 링크는 자동으로 복구하지 않습니다.", confirm: "복원", danger: false };
+    return { title: "보관 기록을 삭제합니다", message: "레포 파일과 공유 링크는 건드리지 않고 보관 기록만 삭제합니다.", confirm: "기록 삭제", danger: true };
+  }
+
+  function openSheet(kind, paths) {
+    var validPaths = paths.filter(function (path) { return safeRepoPath(path); });
+    if (!validPaths.length || mutationsLocked()) return;
+    state.sheet = { kind: kind, paths: validPaths };
+    render();
+    window.setTimeout(function () {
+      var confirmButton = root.querySelector("[data-sheet-confirm]");
+      if (confirmButton) confirmButton.focus();
+    }, 0);
+  }
+
+  function makeSheet() {
+    if (!state.sheet) return null;
+    var sheet = state.sheet;
+    var copy = sheetCopy(sheet.kind, sheet.paths.length);
+    var backdrop = el("div", "sheet-backdrop");
+    backdrop.setAttribute("role", "presentation");
+    backdrop.addEventListener("click", function (event) {
+      if (event.target === backdrop) { state.sheet = null; render(); }
+    });
+    var dialog = el("div", "action-sheet");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    dialog.setAttribute("aria-labelledby", "sheet-title");
+    var group = el("div", "sheet-group");
+    var heading = el("div", "sheet-heading");
+    var headingTitle = el("h2", "", copy.title);
+    headingTitle.id = "sheet-title";
+    heading.appendChild(headingTitle);
+    heading.appendChild(el("p", "", copy.message));
+    if (sheet.kind === "archive" && sheet.paths.length) {
+      var list = el("ul", "sheet-items");
+      sheet.paths.slice(0, 5).forEach(function (path) {
+        list.appendChild(el("li", "", titleOf(catalogEntry(path) || { path: path })));
+      });
+      if (sheet.paths.length > 5) list.appendChild(el("li", "", "외 " + (sheet.paths.length - 5) + "개"));
+      heading.appendChild(list);
+    }
+    group.appendChild(heading);
+    var confirm = el("button", "sheet-button" + (copy.danger ? " danger" : ""), copy.confirm);
+    confirm.type = "button";
+    confirm.setAttribute("data-sheet-confirm", "true");
+    confirm.disabled = state.actionBusy;
+    confirm.addEventListener("click", function () { performAction(sheet.kind, sheet.paths); });
+    group.appendChild(confirm);
+    dialog.appendChild(group);
+    var cancelGroup = el("div", "sheet-group");
+    var cancel = el("button", "sheet-button cancel", "취소");
+    cancel.type = "button";
+    cancel.addEventListener("click", function () { state.sheet = null; render(); });
+    cancelGroup.appendChild(cancel);
+    dialog.appendChild(cancelGroup);
+    backdrop.appendChild(dialog);
+    return backdrop;
+  }
+
+  function makeIngestSheet() {
+    var plan = state.ingestPlan;
+    if (!plan) return null;
+    var backdrop = el("div", "sheet-backdrop");
+    backdrop.setAttribute("role", "presentation");
+    backdrop.addEventListener("click", function (event) {
+      if (event.target === backdrop && !state.ingestBusy) {
+        state.ingestPlan = null;
+        render();
+      }
+    });
+    var dialog = el("div", "action-sheet");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    dialog.setAttribute("aria-labelledby", "ingest-sheet-title");
+    var group = el("div", "sheet-group");
+    var heading = el("div", "sheet-heading");
+    var duplicate = plan.duplicate === true;
+    var title = el("h2", "", duplicate ? "이미 적재된 영상입니다" : "이 계획대로 실행합니다");
+    title.id = "ingest-sheet-title";
+    heading.appendChild(title);
+    heading.appendChild(el("p", "", duplicate
+      ? "적재를 다시 돌리지 않습니다. 승인하면 기존 문서를 목록 맨 위로 올립니다."
+      : "승인하면 이 데브박스에서 Claude Code 헤드리스 적재가 큐에 들어갑니다. 자동 실행은 없습니다."));
+    var details = (duplicate ? [
+      "기존 문서 : " + stringValue(plan.existing_title, "확인 불가"),
+      "경로     : " + stringValue(plan.existing_path, "확인 불가"),
+      "입력     : " + stringValue(plan.url, "확인 불가")
+    ] : [
+      "cwd      : " + stringValue(plan.cwd, "확인 불가"),
+      "실행     : " + stringValue(plan.execution, "/learning-ingest"),
+      "입력     : " + stringValue(plan.url, "확인 불가"),
+      "계정     : " + stringValue(plan.account, "구독 (API 키 미주입)")
+    ]).join("\n");
+    heading.appendChild(el("div", "plan-details", details));
+    group.appendChild(heading);
+    var confirm = el("button", "sheet-button", duplicate ? "맨 위로 올리기" : "실행");
+    confirm.type = "button";
+    confirm.disabled = state.ingestBusy;
+    confirm.addEventListener("click", runIngestPlan);
+    group.appendChild(confirm);
+    dialog.appendChild(group);
+    var cancelGroup = el("div", "sheet-group");
+    var cancel = el("button", "sheet-button cancel", "취소");
+    cancel.type = "button";
+    cancel.disabled = state.ingestBusy;
+    cancel.addEventListener("click", function () {
+      state.ingestPlan = null;
+      state.ingestError = null;
+      render();
+    });
+    cancelGroup.appendChild(cancel);
+    dialog.appendChild(cancelGroup);
+    backdrop.appendChild(dialog);
+    return backdrop;
+  }
+
+  function actionErrorFrom(payload, status) {
+    var object = objectValue(payload) || {};
+    var error = makeError(object, "작업이 실패했습니다", status);
+    if (object.command === undefined) error.command = "POST API";
+    if (object.results && Array.isArray(object.results)) {
+      var failed = object.results.filter(function (result) { return objectValue(result) && result.ok === false; });
+      if (failed.length) error.stderr = failed.map(function (result) { return jsonText(result); }).join("\n");
+    }
+    return error;
+  }
+
+  function performAction(kind, paths) {
+    if (mutationsLocked()) return;
+    var endpoint = kind;
+    var body;
+    if (kind === "archive") body = { paths: paths };
+    else body = { path: paths[0] };
+    state.sheet = null;
+    state.actionBusy = true;
+    state.actionError = null;
+    render();
+    window.fetch(apiUrl(endpoint), {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok || (objectValue(payload) && payload.ok === false)) {
+          throw actionErrorFrom(payload, response.status);
+        }
+        if (objectValue(payload) && Array.isArray(payload.results)) {
+          var failures = payload.results.filter(function (result) { return objectValue(result) && result.ok === false; });
+          if (failures.length) throw actionErrorFrom(payload, response.status);
+        }
+        return payload;
+      });
+    }).then(function () {
+      state.editing = false;
+      state.selected.clear();
+      showToast(actionSuccess(kind));
+      loadData(false);
+    }).catch(function (error) {
+      state.actionError = error && error.message ? error : makeError({}, "작업이 실패했습니다", null);
+      showToast(state.actionError.message, true);
+    }).finally(function () {
+      state.actionBusy = false;
+      render();
+    });
+  }
+
+  function setStarValue(path, starred) {
+    var groups = [state.items, state.archive.archived];
+    groups.forEach(function (entries) {
+      entries.forEach(function (entry) {
+        if (pathOf(entry) === path) entry.starred = starred;
+      });
+    });
+  }
+
+  function requestStar(item, desired) {
+    var path = pathOf(item);
+    if (!safeRepoPath(path) || mutationsLocked()) return;
+    var mutation = starMutations.get(path);
+    if (!mutation) {
+      mutation = { confirmed: item.starred === true, desired: desired === true, running: false };
+      starMutations.set(path, mutation);
+    } else {
+      mutation.desired = desired === true;
+    }
+    state.starError = null;
+    setStarValue(path, mutation.desired);
+    render();
+    flushStar(path);
+  }
+
+  function flushStar(path) {
+    var mutation = starMutations.get(path);
+    if (!mutation || mutation.running) return;
+    mutation.running = true;
+    var requested = mutation.desired;
+    window.fetch(apiUrl("star"), {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ path: path, starred: requested })
+    }).then(function (response) {
+      return readResponse(response).then(function (payload) {
+        if (!response.ok || !objectValue(payload) || payload.ok !== true) {
+          throw actionErrorFrom(payload, response.status);
+        }
+        if (payload.path !== path || typeof payload.starred !== "boolean" || payload.starred !== requested) {
+          throw makeError({}, "별표 응답이 요청과 일치하지 않습니다", response.status);
+        }
+        return payload;
+      });
+    }).then(function () {
+      var current = starMutations.get(path);
+      if (!current) return;
+      current.confirmed = requested;
+      current.running = false;
+      if (current.desired !== requested) {
+        flushStar(path);
+        return;
+      }
+      starMutations.delete(path);
+      confirmedStarOverlays.set(path, { starred: requested, afterLoadNumber: state.loadNumber });
+      setStarValue(path, requested);
+      syncCurrentListHistory();
+      render();
+    }).catch(function (error) {
+      var current = starMutations.get(path);
+      if (!current) return;
+      setStarValue(path, current.confirmed);
+      starMutations.delete(path);
+      state.starError = error && error.message ? error : makeError({}, "별표를 저장하지 못했습니다", null);
+      showToast(state.starError.message, true);
+      syncCurrentListHistory();
+      render();
+    });
+  }
+
+  /* 🔴 토스트는 **반드시 스스로 사라진다.** 예전에는 타이머가 `performAction` 안에만 있어서
+     적재 관련 토스트 3개(큐 등록·취소·기록 삭제)는 화면에 계속 남았다 — 다음 화면까지 따라와
+     방금 한 일인지 옛일인지 구분이 안 됐다(실측 2026-07-31 사용자 보고).
+     만드는 길을 이 함수 하나로 모아, 타이머 없는 토스트가 생길 수 없게 한다.
+
+     성공은 1초 — 확인만 하면 되는 알림이다. 오류는 6초: "복사가 막혔습니다 — <주소>" 는
+     주소를 손으로 복사하는 **유일한 수단**이라 1초면 읽을 수 없다. */
+  var TOAST_MS = { success: 1000, error: 6000 };
+  var toastTimer = null;
+
+  function showToast(message, isError) {
+    state.toast = { message: message, error: !!isError };
+    if (toastTimer) window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(function () {
+      toastTimer = null;
+      state.toast = null;
+      render();
+    }, isError ? TOAST_MS.error : TOAST_MS.success);
+  }
+
+  function actionSuccess(kind) {
+    if (kind === "archive") return "보관함으로 옮겼습니다";
+    if (kind === "publish") return "발행했습니다";
+    if (kind === "unpublish") return "공유 링크를 회수했습니다";
+    if (kind === "restore") return "보관을 해제했습니다";
+    return "보관 기록을 삭제했습니다";
+  }
+
+  /* 문서를 앱 안에서 띄운다. 브라우저 히스토리에 한 칸 넣어 기기 뒤로가기(스와이프·Alt+←)도
+     같은 동작이 되게 한다 — 뒤로가기 버튼과 기기 뒤로가기가 갈라지면 그게 더 헷갈린다. */
+  function openDoc(item) {
+    if (learningView() !== "list") return;
+    var src = docHref(item);
+    if (!src) return;
+    var viewer = { src: src, title: titleOf(item), external: publicHref(item) };
+    pushSubview("viewer", { learningViewer: viewer });
+    state.archiveView = false;
+    state.viewer = viewer;
+    render();
+  }
+
+  function closeDoc() {
+    if (!state.viewer) return;
+    returnToList();
+  }
+
+  window.addEventListener("popstate", function (event) {
+    renderHistoryDestination(event.state);
+  });
+
+  /* 문서 주소를 클립보드로. `navigator.clipboard` 는 보안 컨텍스트(https·localhost)에서만 있고
+     테일넷 http 로 열면 없다 — 그때는 execCommand 로 내려가고, 그것도 안 되면 주소를 토스트로
+     띄워 손으로 복사할 수 있게 한다(조용히 실패 금지). */
+  function copyLink(url) {
+    function done(ok) {
+      if (ok) showToast("주소를 복사했습니다");
+      else showToast("복사가 막혔습니다 — " + url, true);
+      render();
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(function () { done(true); }, function () { done(fallbackCopy(url)); });
+      return;
+    }
+    done(fallbackCopy(url));
+  }
+
+  function fallbackCopy(text) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "readonly");
+    area.style.cssText = "position:fixed;top:-1000px;left:0;opacity:0";
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (error) { ok = false; }
+    document.body.removeChild(area);
+    return ok;
+  }
+
+  /* 🔴 뷰어는 `root` **밖**에 산다. `render()` 가 `root` 를 통째로 비우기 때문에, 뷰어가 그 안에
+     있으면 폴링이 돌 때마다 `<iframe>` 이 DOM 에서 떨어졌다 붙는다 — 브라우저는 그때마다
+     문서를 **처음부터 다시 로드한다**. 사용자에게는 문서가 깜빡이고 안 보이는 것으로 보였다
+     (실측 2026-07-31: 적재가 도는 동안 자료를 열면 계속 리로드). 그래서 뷰어는 자기 호스트를
+     갖고, **`src` 가 바뀔 때만** 다시 만든다. `.viewer` 는 `position: fixed; inset: 0` 이라
+     `root` 밖으로 나가도 화면 위치가 같다. */
+  var viewerHost = document.createElement("div");
+  document.body.appendChild(viewerHost);
+  var viewerSrc = null;
+
+  function syncViewer() {
+    var next = state.viewer ? state.viewer.src : null;
+    if (next === viewerSrc) return;
+    viewerSrc = next;
+    viewerHost.textContent = "";
+    var view = makeViewer();
+    if (view) viewerHost.appendChild(view);
+  }
+
+  function makeViewer() {
+    if (!state.viewer) return null;
+    var wrap = el("div", "viewer");
+    wrap.setAttribute("role", "dialog");
+    wrap.setAttribute("aria-label", state.viewer.title || "문서");
+    var bar = el("div", "viewer-bar");
+    var back = el("button", "viewer-back");
+    back.type = "button";
+    back.appendChild(icon("back", 18));
+    back.appendChild(el("span", "", "목록"));
+    back.addEventListener("click", closeDoc);
+    bar.appendChild(back);
+    bar.appendChild(el("span", "viewer-title", state.viewer.title || "문서"));
+    if (state.viewer.external) {
+      var copy = el("button", "viewer-copy");
+      copy.type = "button";
+      copy.title = "이 문서 주소 복사";
+      copy.setAttribute("aria-label", "이 문서 주소 복사");
+      copy.appendChild(icon("copy", 17));
+      copy.addEventListener("click", function () { copyLink(state.viewer.external); });
+      bar.appendChild(copy);
+    }
+    wrap.appendChild(bar);
+    var frame = el("iframe", "viewer-frame");
+    frame.src = state.viewer.src;
+    frame.title = state.viewer.title || "문서";
+    wrap.appendChild(frame);
+    return wrap;
+  }
+
+  /* 🔴 적재가 도는 동안 폴링이 `render()` 를 부르는데, `render()` 는 `root` 를 통째로
+     비우고 다시 만든다. 그러면 **포커스된 입력 요소가 사라진다** — iOS 에서는 키보드가 내려가고
+     길게 눌러 띄운 "붙여넣기" 메뉴가 닫혀서, 적재 중에는 링크를 붙여넣을 수가 없었다
+     (실측 2026-07-31 사용자 보고). 입력 중에는 그리지 않고, 손을 뗀 뒤에 밀린 것을 그린다.
+     이러면 적재 상태 표시가 잠깐 멈추지만, 그건 **사용자가 직접 보고 있는 화면**이 아니다. */
+  var renderDeferred = false;
+
+  function typingInApp() {
+    var active = document.activeElement;
+    if (!active || !root.contains(active)) return false;
+    var tag = active.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || active.isContentEditable === true;
+  }
+
+  /* 🔴 위 방어를 **모든** render 에 걸었더니 사용자 조작의 결과까지 삼켰다 — 실측
+     2026-07-31(배포본): 링크를 붙여넣고 커서가 입력창에 있는 동안 "적재" 버튼이 **나타나지
+     않았다**(blur 하면 나타난다). 계획 시트도, 409 오류 카드도 같은 이유로 안 뜬다. 즉
+     "붙여넣고 눌렀는데 아무 일도 안 난다"의 뿌리가 이것이다.
+
+     뿌리는 미루기가 아니라 **재렌더가 DOM 이 가진 상태를 부순다**는 것이다(뷰어 iframe·`<details>`
+     와 같은 부류 — 포커스와 캐럿도 DOM 이 가진 상태다). 그래서 순서를 바꾼다:
+       · `render()` — 사용자 조작은 항상 그리되, 복원할 수 없는 IME 조합 중에만 미룬다.
+         그 밖의 검색 타이핑은 포커스·캐럿을 되살린다.
+       · `renderBackground()` — 자료 목록 재수집용. 타이핑 중이면 미룬다. 포커스 복원으로는
+         iOS 의 길게 눌러 띄운 "붙여넣기" 메뉴를 되살릴 수 없어서, 그 방어만 남긴다.
+       · `renderIngestBackground()` — 적재 폴링용. 큐 슬롯과 상태 문구만 바꾼다. */
+  function focusKeyOf(node) {
+    return node && node.getAttribute ? node.getAttribute("data-focus-key") : null;
+  }
+
+  function captureFocus() {
+    var active = document.activeElement;
+    if (!active || !root.contains(active)) return null;
+    var key = focusKeyOf(active);
+    if (!key) return null;
+    var start = null;
+    var end = null;
+    try { start = active.selectionStart; end = active.selectionEnd; } catch (error) {}
+    return { key: key, start: start, end: end };
+  }
+
+  function restoreFocus(saved) {
+    if (!saved) return;
+    var node = root.querySelector('[data-focus-key="' + saved.key + '"]');
+    if (!node) return;
+    node.focus();
+    if (saved.start === null || saved.start === undefined) return;
+    try { node.setSelectionRange(saved.start, saved.end); } catch (error) {}
+  }
+
+  function renderBackground() {
+    if (typingInApp()) { renderDeferred = true; return; }
+    render();
+  }
+
+  /* 적재 상태는 폴링 주기마다 바뀌지만 목록 데이터는 그렇지 않다. 폴링 응답마다 root 전체를
+     다시 만들면 읽던 목록의 DOM·스크롤 앵커·content-visibility 계산이 반복해서 흔들린다.
+     폴링이 소유한 큐 슬롯과 상태 문구만 교체하고, 목록은 완료 후 loadData()가 실제 자료를
+     다시 수집할 때만 렌더한다. */
+  /* 적재 배지를 **제자리에서** 갈아 끼운다. 여기서 render() 를 부르면 검색 IME 조합과
+     포커스가 날아간다 — 이 함수가 애초에 존재하는 이유가 그것이다. 배지도 같은 규칙을
+     따른다: 행을 다시 만들지 않고 두 자리(날짜 칸·모바일 메타)만 고쳐 쓴다. */
+  function patchIngestBadges() {
+    var ingesting = ingestByDocument();
+    var rows = root.querySelectorAll(".item-row[data-item-path]");
+    Array.prototype.forEach.call(rows, function (row) {
+      var entry = ingesting[row.getAttribute("data-item-path")];
+      var badge = entry ? ingestBadgeText() : "";
+      row.classList.toggle("is-ingesting", !!entry);
+      var added = row.querySelector(".cell-added");
+      // 되돌릴 날짜는 첫 렌더가 적어 둔 것이다. 여기서 만들지 않는다 — 만들면 배지가
+      // 이미 붙은 칸에서 빈 문자열을 학습하고, 그 뒤로 날짜가 영영 안 돌아온다.
+      if (added && added.hasAttribute("data-added-plain")) {
+        added.classList.toggle("is-ingesting", !!entry);
+        added.textContent = badge || added.getAttribute("data-added-plain");
+      }
+      var mobile = row.querySelector(".mobile-meta");
+      if (mobile) {
+        var plain = mobile.getAttribute("data-meta-plain") || "";
+        var long = entry ? ingestBadgeMeta(entry) : "";
+        mobile.textContent = long ? (plain ? long + " · " + plain : long) : plain;
+      }
+    });
+  }
+
+  function renderIngestBackground() {
+    var subtitle = root.querySelector(".page-subtitle");
+    if (subtitle) subtitle.textContent = pageSubtitle();
+    patchIngestBadges();
+    var slot = root.querySelector("[data-ingest-slot]");
+    if (!slot) return;
+    var queue = makeIngestQueue();
+    slot.replaceChildren();
+    if (queue) slot.appendChild(queue);
+  }
+
+  function render() {
+    // 포커스·캐럿과 달리 IME 조합 세션은 새 input DOM에 복원할 수 없다. 검색 debounce뿐 아니라
+    // 별표 응답·토스트 만료 같은 비동기 render도 조합이 끝날 때까지 root를 교체하면 안 된다.
+    if (state.searchComposing) { renderDeferred = true; return; }
+    var savedFocus = captureFocus();
+    renderDeferred = false;
+    document.documentElement.setAttribute("data-learning-view", learningView());
+    root.textContent = "";
+    var shell = el("div", "app-shell" + (state.editing ? " is-editing" : ""));
+    var inner = el("div", "app-inner");
+    inner.appendChild(makeHeader());
+    if (state.archiveView) inner.appendChild(makeArchiveView());
+    else {
+      var main = el("main", "content");
+      var errorCard = makeErrorCard();
+      if (errorCard) main.appendChild(errorCard);
+      var stale = makeStaleNotice();
+      if (stale) main.appendChild(stale);
+      var warning = makeWarningPanel();
+      if (warning) main.appendChild(warning);
+      var actionError = state.actionError ? makeActionError(state.actionError) : null;
+      if (actionError) main.appendChild(actionError);
+      var starError = state.starError ? makeActionError(state.starError) : null;
+      if (starError) main.appendChild(starError);
+      main.appendChild(makeIngestSlot());
+      var desktopHead = makeDesktopHead();
+      if (desktopHead) main.appendChild(desktopHead);
+      if (!state.loading && (!state.error || state.items.length)) main.appendChild(makeList());
+      else if (state.loading) main.appendChild(el("section", "empty-panel", "목록을 불러오는 중"));
+      main.appendChild(makeFooter());
+      inner.appendChild(main);
+    }
+    shell.appendChild(inner);
+    var bar = makeSelectionBar();
+    if (bar) shell.appendChild(bar);
+    var sheet = makeSheet();
+    var ingestSheet = makeIngestSheet();
+    // 🔴 모달이 떠 있으면 토스트를 띄우지 않는다. 토스트는 `z-index:60` 에 하단 정렬이고 시트는
+    //    `50` 에 하단 정렬이라, 둘이 겹치면 토스트가 정확히 시트의 **주 버튼 자리**에 앉는다
+    //    (실측 2026-07-31: "이 계획대로 실행합니다" 다이얼로그의 `실행` 자리에 "적재 기록을
+    //    지웠습니다" 가 보여, 버튼 라벨이 완료 메시지인 것처럼 읽히고 누를 수도 없었다).
+    //    모달이 화면을 소유하는 동안 지난 작업의 알림은 물러나야 한다.
+    if (state.toast && !sheet && !ingestSheet) {
+      var toast = el("div", "toast" + (state.toast.error ? " error" : ""), state.toast.message);
+      toast.setAttribute("role", "status");
+      shell.appendChild(toast);
+    }
+    if (sheet) shell.appendChild(sheet);
+    if (ingestSheet) shell.appendChild(ingestSheet);
+    root.appendChild(shell);
+    // 🔴 모달이 떠 있으면 되살리지 않는다 — 시트가 화면을 소유하는 동안 커서를 뒤 화면의
+    //    입력창으로 되돌리면 iOS 에서 키보드가 시트를 덮는다.
+    if (!sheet && !ingestSheet) restoreFocus(savedFocus);
+    syncViewer();
+  }
+
+  function makeActionError(error) {
+    var card = el("article", "error-card");
+    card.setAttribute("role", "alert");
+    var heading = el("h2", "error-heading", "작업이 실패했습니다");
+    card.appendChild(heading);
+    card.appendChild(el("p", "", error.message || "작업이 실패했습니다"));
+    card.appendChild(errorField("실행 명령", error.command || "POST API"));
+    card.appendChild(errorField("exit code", error.exitCode === null || error.exitCode === undefined ? "없음" : String(error.exitCode)));
+    card.appendChild(errorField("stderr", error.stderr || "없음"));
+    return card;
+  }
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && state.viewer) {
+      closeDoc();
+    } else if (event.key === "Escape" && state.sheet) {
+      state.sheet = null;
+      render();
+    } else if (event.key === "Escape" && state.ingestPlan && !state.ingestBusy) {
+      state.ingestPlan = null;
+      render();
+    }
+  });
+
+  if (window.history && "scrollRestoration" in window.history) {
+    window.history.scrollRestoration = "manual";
+  }
+  if (window.history && window.history.replaceState) {
+    try {
+      window.history.replaceState(
+        historyState("list", { learningList: listHistorySnapshot(window.scrollY), learningViewer: null }),
+        "",
+        window.location.href
+      );
+    } catch (error) { /* 초기 목록은 History API 없이도 표시한다. */ }
+  }
+  render();
+  loadData(true);
+  document.addEventListener("focusout", function () {
+    if (!renderDeferred) return;
+    window.setTimeout(function () {
+      if (renderDeferred && !typingInApp()) render();
+    }, 0);
+  });
+  loadIngest();
+}());
+</script>
+<script src="/airlock-return.js" data-mode="corner" defer></script>
+</body>
+</html>

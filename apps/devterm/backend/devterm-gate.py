@@ -68,6 +68,25 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bin_discovery  # noqa: E402
 
+
+def _account_tool(env_name, command):
+    """Resolve an optional bundled account helper.
+
+    The installer normally writes an explicit path into the unit. Keep that path
+    authoritative when present, but recover from a partially rendered/manual unit by
+    finding the helper shipped beside this backend (or an installed trusted command).
+    Feature flags still decide whether any caller uses the result.
+    """
+    configured = os.environ.get(env_name, "").strip()
+    if configured:
+        return os.path.expanduser(configured)
+    bundled = os.path.realpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "bin", command))
+    if os.path.isfile(bundled):
+        return bundled
+    return bin_discovery.find_bin(command)[0] or ""
+
+
 ALLOW = {s.strip().lower() for s in os.environ.get("AIRLOCK_OWNER", "").split(",") if s.strip()}
 # ssh hosts whose tmux sessions are also surfaced as tabs (comma-separated).
 # Empty = local sessions only. Fully inert when unset.
@@ -84,8 +103,9 @@ CODE_ROOT = os.path.realpath(os.path.expanduser(os.environ["AIRLOCK_CODE_ROOT"])
 MARKWAND = os.environ.get("DEVTERM_MARKWAND", "false").lower() == "true" and bool(CODE_ROOT)
 ACCOUNTS = os.environ.get("DEVTERM_ACCOUNTS", "false").lower() == "true"
 XAI = os.environ.get("DEVTERM_XAI", "false").lower() == "true"
-CLAUDE_SWITCH = os.path.expanduser(os.environ.get("DEVTERM_CLAUDE_SWITCH", ""))
-CLAUDE_STATUS = os.path.expanduser(os.environ.get("DEVTERM_CLAUDE_STATUS", ""))
+CLAUDE_SWITCH = _account_tool("DEVTERM_CLAUDE_SWITCH", "claude-switch") if ACCOUNTS else ""
+CLAUDE_STATUS = _account_tool("DEVTERM_CLAUDE_STATUS", "claude-status") \
+    if (ACCOUNTS or XAI) else ""
 # A shared usage store used to annotate the account pool with utilization. Both are
 # optional; no host is hardcoded. Left empty => the account list still works, just
 # without usage numbers.
@@ -1639,6 +1659,52 @@ def _xai_enabled():
     return XAI and CLAUDE_STATUS and os.path.isfile(CLAUDE_STATUS)
 
 
+_CLAUDE_KIND_ALIASES = {
+    "personal": "personal", "개인": "personal",
+    "team": "team", "팀": "team",
+}
+_CLAUDE_KIND_VARIANTS = {
+    "personal": ("personal", "개인"),
+    "team": ("team", "팀"),
+}
+
+
+def _claude_kind(kind):
+    """Canonicalize the two legacy localized pool labels without guessing unknowns."""
+    if not isinstance(kind, str):
+        return ""
+    value = kind.strip()
+    return _CLAUDE_KIND_ALIASES.get(value.casefold(),
+                                    _CLAUDE_KIND_ALIASES.get(value, value))
+
+
+def _claude_store_entry(store, email, kind):
+    """Pick the newest canonical/legacy fleet entry for one account identity."""
+    if not isinstance(store, dict) or not isinstance(email, str) or not email:
+        return {}
+    original = kind.strip() if isinstance(kind, str) else kind
+    canonical = _claude_kind(original)
+    variants = []
+    for value in (original, canonical, *_CLAUDE_KIND_VARIANTS.get(canonical, ())):
+        if isinstance(value, str) and value and value not in variants:
+            variants.append(value)
+    best = None
+    best_at = None
+    best_is_canonical = False
+    for value in variants:
+        entry = store.get(f"{email}|{value}")
+        if not isinstance(entry, dict):
+            continue
+        observed_at = _finite_number(entry.get("observedAt"))
+        is_canonical = value == canonical
+        if best is None or (observed_at is not None
+                            and (best_at is None or observed_at > best_at)) \
+                or (observed_at == best_at and is_canonical
+                    and not best_is_canonical):
+            best, best_at, best_is_canonical = entry, observed_at, is_canonical
+    return best or {}
+
+
 def _codex_bin():
     """Absolute path to the codex executable, or None when this box has none.
 
@@ -1693,7 +1759,8 @@ async def _acct_list_with_usage():
     store = await asyncio.get_running_loop().run_in_executor(None, _fetch_fleet_store)
     now = time.time()
     for a in data.get("accounts", []):
-        ent = store.get(f"{a.get('email')}|{a.get('kind')}") or {}
+        ent = _claude_store_entry(store, a.get("email"), a.get("kind"))
+        a["kind"] = _claude_kind(a.get("kind"))
         if ent.get("usage"):
             # age = how old the reading is. Without it a number cannot be trusted.
             a["usage"] = dict(ent["usage"],
@@ -1724,8 +1791,10 @@ async def _serve_accounts(cw):
     for account in data.get("accounts", []) if isinstance(data, dict) else []:
         if not isinstance(account, dict):
             continue
-        key = f"{account.get('email')}|{account.get('kind')}"
-        local = local_store.get(key)
+        account["kind"] = _claude_kind(account.get("kind"))
+        email, kind = account.get("email"), account.get("kind")
+        key = f"{email}|{kind}" if isinstance(email, str) and email and kind else ""
+        local = local_store.get(key) if key else None
         fleet_usage = account.get("usage")
         fleet_at = (_finite_number(fleet_usage.get("observedAt"))
                     if isinstance(fleet_usage, dict) else None)
@@ -2467,7 +2536,8 @@ def _claude_usage_key_parts(key):
     parts = key.split("|")
     if len(parts) != 2 or not parts[0] or not parts[1]:
         return None
-    return parts[0], parts[1]
+    kind = _claude_kind(parts[1])
+    return (parts[0], kind) if kind else None
 
 
 def _claude_usage_normalize_usage(raw):
@@ -2515,11 +2585,18 @@ def _claude_usage_records(raw, now):
         return {}
     records = {}
     for key, raw_entry in raw["accounts"].items():
-        if _claude_usage_key_parts(key) is None:
+        parts = _claude_usage_key_parts(key)
+        if parts is None:
             continue
         entry = _claude_usage_validate_entry(raw_entry, now)
-        if entry is not None:
-            records[key] = entry
+        canonical_key = f"{parts[0]}|{parts[1]}"
+        current = records.get(canonical_key)
+        source_is_canonical = key == canonical_key
+        if entry is not None and (current is None
+                                  or entry["valueAt"] > current["valueAt"]
+                                  or (entry["valueAt"] == current["valueAt"]
+                                      and source_is_canonical)):
+            records[canonical_key] = entry
     return records
 
 
@@ -2541,7 +2618,7 @@ def _claude_usage_candidate(result, now):
     kind = result.get("kind")
     if not isinstance(email, str) or not email or not isinstance(kind, str) or not kind:
         return None
-    key = f"{email}|{kind}"
+    key = f"{email}|{_claude_kind(kind)}"
     if _claude_usage_key_parts(key) is None:
         return None
     usage = _claude_usage_normalize_usage(result.get("usage"))
@@ -2902,9 +2979,13 @@ async def _run_probe_result(args=()):
     except asyncio.TimeoutError:
         proc.kill(); await proc.wait()
         return b"504 Gateway Timeout", {"error": "probe timeout"}
+    if proc.returncode != 0:
+        return b"500 Internal Server Error", {"error": "probe failed"}
     try:
         payload = json.loads(out.decode().strip().splitlines()[-1])
     except (ValueError, IndexError, UnicodeDecodeError):
+        return b"500 Internal Server Error", {"error": "probe output invalid"}
+    if not isinstance(payload, dict):
         return b"500 Internal Server Error", {"error": "probe output invalid"}
     return b"200 OK", payload
 

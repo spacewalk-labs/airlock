@@ -36,12 +36,25 @@ c_gno=$(code                                    "http://127.0.0.1:${GATE}/")
 acct_note=""
 if [ "${AIRLOCK_DEVTERM_ACCOUNTS:-false}" = true ]; then
   acct_body=$(curl -s --max-time 8 -H "${HDR}: ${OWNER}" "http://127.0.0.1:${BACKEND}/accounts")
+  if claude_status_body=$(curl -fsS --max-time 30 -H "${HDR}: ${OWNER}" \
+      "http://127.0.0.1:${BACKEND}/claude-status"); then
+    claude_status_fetch=1
+  else
+    claude_status_fetch=0
+  fi
   c_adeny=$(code -H "${HDR}: nobody@example.com" "http://127.0.0.1:${BACKEND}/accounts")
   case "$acct_body" in
     *'"enabled": true'*|*'"enabled":true'*) acct_ok=1 ;;
     *) acct_ok=0 ;;
   esac
-  acct_note=" | accounts enabled=${acct_ok}/1 deny=${c_adeny}/403"
+  if [ "$claude_status_fetch" = 1 ] && printf '%s' "$claude_status_body" | python3 -c '
+import json, sys
+j = json.load(sys.stdin)
+if not (isinstance(j, dict) and isinstance(j.get("host"), str)
+        and isinstance(j.get("live"), dict) and isinstance(j.get("pool"), list)):
+    raise SystemExit(1)
+'; then claude_status_ok=1; else claude_status_ok=0; fi
+  acct_note=" | accounts enabled=${acct_ok}/1 probe=${claude_status_ok}/1 deny=${c_adeny}/403"
 fi
 xai_note=""
 if [ "${AIRLOCK_DEVTERM_XAI:-false}" = true ]; then
@@ -58,6 +71,7 @@ echo "[devterm smoke] ttyd=${c_ttyd}/200 | backend owner=${c_bown}/200 deny=${c_
 fail=0
 if [ "${AIRLOCK_DEVTERM_ACCOUNTS:-false}" = true ]; then
   [ "${acct_ok:-0}" = 1 ] || { echo "FAIL /accounts reports disabled (claude-switch missing?)"; fail=1; }
+  [ "${claude_status_ok:-0}" = 1 ] || { echo "FAIL /claude-status reports disabled (probe helper missing?)"; fail=1; }
   [ "${c_adeny:-}" = 403 ] || { echo "FAIL /accounts other identity not denied (GATE HOLE)"; fail=1; }
 fi
 if [ "${AIRLOCK_DEVTERM_XAI:-false}" = true ]; then

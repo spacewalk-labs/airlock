@@ -6,7 +6,7 @@ Wants=airlock-devterm.service
 [Service]
 Type=simple
 Environment=PATH=WDIR/home/.local/bin:WDIR/home/.npm-global/bin:NODE_BIN:/usr/local/bin:/usr/bin:/bin
-Environment=DEVTERM_REV=816478a6f301
+Environment=DEVTERM_REV=18220605ffbd
 Environment=DEVTERM_LISTEN_HOST=127.0.0.1
 Environment=DEVTERM_LISTEN_PORT=19913
 Environment=DEVTERM_TTYD_HOST=127.0.0.1

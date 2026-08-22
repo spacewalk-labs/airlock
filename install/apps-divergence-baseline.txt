@@ -156,12 +156,16 @@ content	apps/publish/airlock-app.toml
 only-work	apps/learning/airlock-app.toml
 only-work	apps/learning/backend/airlock-learning.py
 only-work	apps/learning/backend/ingest_runner.py
+only-work	apps/learning/backend/providers.py
 only-work	apps/learning/backend/save_document.py
 only-work	apps/learning/deactivate.sh
 only-work	apps/learning/frontend/learning.html
 only-work	apps/learning/install.sh
 only-work	apps/learning/render.sh
+only-work	apps/learning/skill/SKILL.md
+only-work	apps/learning/skill/transcript.py
 only-work	apps/learning/smoke.sh
+only-work	apps/learning/test-frontend-contract.mjs
 # 7) 2026-08-22 shared state directory: apps/publish/install.sh stopped chmod'ing the
 #    SHARED state directory (~/.local/state/airlock) to 0700 on every install. That
 #    directory holds the ledger and dev-monitor's spool, and the spool is written by a
@@ -170,3 +174,15 @@ only-work	apps/learning/smoke.sh
 #    the install reporting success. Batch 1's shape: work is the live consumer and the
 #    public copy is behind until the next publish sync, not a designed split.
 content	apps/publish/install.sh
+# 8) 2026-08-22 secret drop double header: the embedded panel drew a second title bar
+#    inside the widget's own, because the guard keyed on `close` (which panel.html hands
+#    over precisely when embedded) instead of on who owns the window. The fix edits
+#    web/secretdrop.js and adds its first test. Batch 1's shape — work is the live
+#    consumer and the public copy is behind until the next publish sync, not a designed
+#    split. test-secretdrop-js.mjs sits beside test-accounts-js.mjs (batch 1, above),
+#    which is only-work for the same reason and is expected to empty the same way.
+#    🔴 Both paths are inside the 15-file set the pending public release decision covers
+#    (alp-release-scope) — web/secretdrop.js is NOT in that set today, so releasing the
+#    recommended 15 files does NOT carry this fix. It needs the next publish sync.
+only-work	apps/devterm/test-secretdrop-js.mjs
+content	apps/devterm/web/secretdrop.js

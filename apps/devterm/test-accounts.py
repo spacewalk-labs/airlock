@@ -72,6 +72,66 @@ check("NaN is not a number", g._finite_number(float("nan")) is None)
 check("bool is not a number", g._finite_number(True) is None)
 check("int passes", g._finite_number(0) == 0)
 
+# A rendered/manual unit may carry the feature flag but omit the helper environment
+# variable. The app still ships the helper beside this backend, so that omission must
+# not turn every live reading into {enabled:false}.
+_saved_status_env = os.environ.pop("DEVTERM_CLAUDE_STATUS", None)
+try:
+    discovered_status = g._account_tool("DEVTERM_CLAUDE_STATUS", "claude-status")
+finally:
+    if _saved_status_env is not None:
+        os.environ["DEVTERM_CLAUDE_STATUS"] = _saved_status_env
+check("accounts flag without a status env still finds the bundled probe",
+      os.path.samefile(discovered_status, "apps/devterm/bin/claude-status"))
+
+# Discovery is a recovery path for enabled account features, not a reason to turn
+# those features on. Import a fresh gate with both flags disabled and no explicit
+# helper paths so this cannot be masked by the globals used by the route tests below.
+_disabled_env = dict(os.environ, DEVTERM_ACCOUNTS="false", DEVTERM_XAI="false",
+                     PYTHONDONTWRITEBYTECODE="1")
+_disabled_env.pop("DEVTERM_CLAUDE_SWITCH", None)
+_disabled_env.pop("DEVTERM_CLAUDE_STATUS", None)
+_disabled_probe = subprocess.run(
+    [sys.executable, "-c", """
+import importlib.util, json
+spec = importlib.util.spec_from_file_location(
+    'disabled_gate', 'apps/devterm/backend/devterm-gate.py')
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+print(json.dumps([gate.CLAUDE_SWITCH, gate.CLAUDE_STATUS]))
+"""], env=_disabled_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    text=True, timeout=30)
+check("disabled account features do not auto-discover bundled helpers",
+      _disabled_probe.returncode == 0 and _disabled_probe.stdout.strip() == '["", ""]')
+
+
+def _run_probe_script(source):
+    saved_status = g.CLAUDE_STATUS
+    tmp = tempfile.mkdtemp(prefix="devterm-probe-contract-")
+    try:
+        path = os.path.join(tmp, "probe.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(source)
+        g.CLAUDE_STATUS = path
+        return asyncio.run(g._run_probe_result())
+    finally:
+        g.CLAUDE_STATUS = saved_status
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+check("probe rejects a non-object JSON payload",
+      _run_probe_script('print("[]")\n')[0] == b"500 Internal Server Error")
+check("probe rejects a nonzero helper even when it prints JSON",
+      _run_probe_script('print("{}")\nraise SystemExit(1)\n')[0]
+      == b"500 Internal Server Error")
+check("probe accepts an object from a successful helper",
+      _run_probe_script('print("{}")\n') == (b"200 OK", {}))
+_smoke_source = open("apps/devterm/smoke.sh", encoding="utf-8").read()
+check("smoke allows the backend probe timeout and validates the full-status shape",
+      "--max-time 30" in _smoke_source
+      and 'isinstance(j.get("live"), dict)' in _smoke_source
+      and 'isinstance(j.get("pool"), list)' in _smoke_source)
+
 # xAI status: one auth file, five explicit states, and no credential material in output.
 _xai_tmp = tempfile.mkdtemp(prefix="devterm-xai-")
 _xai_saved_auth = cs.XAI_AUTH
@@ -990,7 +1050,7 @@ async def _claude_usage_route_case():
         async def account_list():
             return {"active": "slot-a", "accounts": [{
                 "name": "slot-a", "active": True, "email": "claude@example.com",
-                "kind": "personal", "holders": ["box-a"],
+                "kind": "개인", "holders": ["box-a"],
                 "usage": copy.deepcopy(fleet_usage),
             }]}
 
@@ -1022,7 +1082,8 @@ check("P1 live route returns its probe payload unchanged",
       route_reads[1] == (b"200 OK", _claude_result()))
 check("P1 newer live reading replaces the older fleet value on the next account list",
       route_reads[0][1]["accounts"][0]["usage"]["use5h"] == 12
-      and route_reads[2][1]["accounts"][0]["usage"]["use5h"] == 71)
+      and route_reads[2][1]["accounts"][0]["usage"]["use5h"] == 71
+      and route_reads[2][1]["accounts"][0]["kind"] == "personal")
 check("P1 live reading is available with no fleet store",
       route_reads[3][1]["accounts"][0]["usage"]["use7d"] == 62)
 
@@ -1031,6 +1092,81 @@ stored_mode = stat.S_IMODE(os.stat(g.CLAUDE_USAGE_STATE).st_mode)
 check("P1 store survives a simulated restart and is mode 0600",
       loaded_after_route["claude@example.com|personal"]["usage"]["use5h"] == 71
       and stored_mode == 0o600)
+
+# The legacy pool used localized kinds. A fresh probe always emits personal/team, so
+# both aliases must converge on one stored identity or a close/reopen loses the value.
+_legacy_alias_now = time.time()
+_write_claude_store({"version": 1, "accounts": {
+    "team@example.com|팀": {
+        "usage": {"use5h": 31, "use7d": 41, "reset5h": None, "reset7d": None},
+        "valueAt": _legacy_alias_now,
+    },
+    "team@example.com|team": {
+        "usage": {"use5h": 51, "use7d": 61, "reset5h": None, "reset7d": None},
+        "valueAt": _legacy_alias_now + 1,
+    },
+}})
+legacy_team = asyncio.run(_serve_accounts_fixture({
+    "name": "slot-team", "active": True, "email": "team@example.com",
+    "kind": "팀", "usage": {"err": "no data"},
+}))["payload"]["accounts"][0]
+check("P1 legacy team kind reopens from the newest canonicalized saved value",
+      legacy_team["kind"] == "team"
+      and legacy_team["usage"]["use5h"] == 51
+      and legacy_team["usage"]["stale"] is True)
+
+_fleet_alias_store = {
+    "same@example.com|개인": {"observedAt": _legacy_alias_now + 2,
+                               "usage": {"use5h": 22}},
+    "same@example.com|personal": {"observedAt": _legacy_alias_now + 1,
+                                   "usage": {"use5h": 11}},
+}
+check("P1 newest fleet alias wins when legacy and canonical keys coexist",
+      g._claude_store_entry(_fleet_alias_store, "same@example.com", "personal")
+      ["usage"]["use5h"] == 22)
+
+_fleet_alias_tie = {
+    "same@example.com|개인": {"observedAt": _legacy_alias_now,
+                               "holders": ["legacy-only"]},
+    "same@example.com|personal": {"observedAt": _legacy_alias_now,
+                                   "usage": {"use5h": 11}},
+}
+check("P1 canonical fleet alias wins a timestamp tie for every input spelling",
+      g._claude_store_entry(_fleet_alias_tie, "same@example.com", "personal")
+      ["usage"]["use5h"] == 11
+      and g._claude_store_entry(_fleet_alias_tie, "same@example.com", "개인")
+      ["usage"]["use5h"] == 11)
+
+_local_alias_entry = {
+    "usage": {"use5h": 11, "use7d": 21, "reset5h": None, "reset7d": None},
+    "valueAt": _legacy_alias_now,
+}
+_local_legacy_entry = {
+    "usage": {"use5h": 22, "use7d": 32, "reset5h": None, "reset7d": None},
+    "valueAt": _legacy_alias_now,
+}
+_canonical_first = g._claude_usage_records({"version": 1, "accounts": {
+    "same@example.com|personal": _local_alias_entry,
+    "same@example.com|개인": _local_legacy_entry,
+}}, _legacy_alias_now + 1)
+_legacy_first = g._claude_usage_records({"version": 1, "accounts": {
+    "same@example.com|개인": _local_legacy_entry,
+    "same@example.com|personal": _local_alias_entry,
+}}, _legacy_alias_now + 1)
+check("P1 canonical local alias wins a valueAt tie regardless of JSON order",
+      _canonical_first["same@example.com|personal"]["usage"]["use5h"] == 11
+      and _legacy_first["same@example.com|personal"]["usage"]["use5h"] == 11)
+
+_write_claude_store({"version": 1, "accounts": {
+    "same@example.com|0": _local_alias_entry,
+}})
+_invalid_kind_rows = [asyncio.run(_serve_accounts_fixture({
+    "name": "bad-kind", "active": True, "email": "same@example.com",
+    "kind": bad_kind, "usage": {"err": "no data"},
+}))["payload"]["accounts"][0] for bad_kind in (0, [], {})]
+check("P1 non-string kinds neither crash the list nor collide with string store keys",
+      all(row["kind"] == "" and row["usage"].get("err") == "no data"
+          for row in _invalid_kind_rows))
 
 # Recency and complete-field replacement. Ties belong to the fleet entry.
 _merge_now = time.time()
@@ -1088,7 +1224,7 @@ async def _real_list_recency_case():
         async def communicate(self):
             payload = {"active": "slot-a", "accounts": [{
                 "name": "slot-a", "active": True, "email": "claude@example.com",
-                "kind": "personal", "sub": "Claude",
+                "kind": "개인", "sub": "Claude",
             }]}
             return json.dumps(payload).encode(), b""
 
@@ -1107,7 +1243,7 @@ async def _real_list_recency_case():
 
         g.asyncio.create_subprocess_exec = create_proc
         g._fetch_fleet_store = lambda: {
-            "claude@example.com|personal": {
+            "claude@example.com|개인": {
                 "usage": {"use5h": 20, "use7d": 21,
                           "reset5h": "fleet-5", "reset7d": "fleet-7"},
                 "observedAt": fleet_at, "holders": ["box-a"],
@@ -1130,6 +1266,7 @@ real_fleet_at, real_recency = asyncio.run(_real_list_recency_case())
 check("P1 real fleet reader carries observedAt into tie and newer comparisons",
       real_recency[0]["accounts"][0]["usage"]["observedAt"] == real_fleet_at
       and real_recency[0]["accounts"][0]["usage"]["use5h"] == 20
+      and real_recency[0]["accounts"][0]["kind"] == "personal"
       and real_recency[1]["accounts"][0]["usage"]["use5h"] == 80)
 
 # Every malformed store shape quietly falls back to the fleet reading.

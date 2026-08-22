@@ -46,9 +46,10 @@ window.initSecretDrop = function initSecretDrop(deps) {
   };
 
   /* The UI body, drawn into `host`. close = how to dismiss (remove the modal / ask the
-     parent to). Terminal and clipboard mode differ in ONE place (delivery); saving,
-     validation, the list and deletion are shared. */
-  function renderSecretUI(host, close) {
+     parent to). ownsChrome = this UI draws its own title bar, which is true only when
+     nothing above it already does. Terminal and clipboard mode differ in ONE place
+     (delivery); saving, validation, the list and deletion are shared. */
+  function renderSecretUI(host, close, ownsChrome) {
     let closed = false, busy = false;
     const deliveryBtns = [], deleteBtns = [];
     const markClosed = () => { closed = true; };
@@ -71,15 +72,17 @@ window.initSecretDrop = function initSecretDrop(deps) {
       return d;
     };
 
-    // Title only when this UI owns its window (devterm's modal, or the panel opened as a
-    // tab). Inside the widget's iframe the modal header already says what this is.
+    // Title only when this UI owns its window — devterm's modal, whose makeModal() draws
+    // no header at all. Keyed on ownsChrome, NOT on `close`: the embedded panel is handed
+    // a close action so its buttons work, but the widget's modal already draws the title
+    // and the X above it, so keying on `close` drew both and the header appeared twice.
     const hd = document.createElement('div'); hd.style.cssText = 'display:flex;align-items:center;gap:10px;';
-    if (close) hd.appendChild(uiTitle('Secret drop'));
+    if (ownsChrome) hd.appendChild(uiTitle('Secret drop'));
     const sub = document.createElement('div');
     sub.textContent = terminalMode ? 'The value stays in this modal; the terminal gets only a path'
                                    : 'The value stays in this window; only a path is copied out';
     sub.style.cssText = 'flex:1;color:#8a92a6;font:12.5px/1.45 system-ui;'; hd.appendChild(sub);
-    if (close) hd.appendChild(mkCloseBtn(close));
+    if (ownsChrome && close) hd.appendChild(mkCloseBtn(close));
     wrap.appendChild(hd);
 
     const nameIn = document.createElement('input');
@@ -280,15 +283,15 @@ window.initSecretDrop = function initSecretDrop(deps) {
     };
     const onKey = (e) => { if (e.key === 'Escape') close(); };
     document.addEventListener('keydown', onKey);
-    ui = renderSecretUI(box, close);
+    ui = renderSecretUI(box, close, true);   // makeModal draws no header — this UI is the window
     ov.addEventListener('mousedown', (e) => { if (e.target === ov) close(); });
     ov.appendChild(box); document.body.appendChild(ov);
   }
 
-  // panel.html — already inside a modal (the widget's iframe), so it draws straight into
-  // the page with no overlay. close = ask the parent to dismiss; without it no close
-  // button is drawn.
-  function renderSecretPanel(container, close) { return renderSecretUI(container, close || null); }
+  // panel.html — never owns its own title bar. Embedded, the widget's modal draws it;
+  // standalone, panel.html's own #top does. Either way ownsChrome is false, while `close`
+  // still drives the Close button in the action row.
+  function renderSecretPanel(container, close) { return renderSecretUI(container, close || null, false); }
 
   return { openSecretDrop: openSecretDrop, renderSecretPanel: renderSecretPanel };
 };
