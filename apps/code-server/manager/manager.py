@@ -12,9 +12,9 @@ request whose identity header is not in the allow list.
 
 Config (all from the environment, set by the systemd unit):
   AIRLOCK_CODE_SERVER_MANAGER_HOST  listen host (must be 127.0.0.1; default so)
-  AIRLOCK_CODE_SERVER_MANAGER_PORT  listen port                    (default 18810)
+  AIRLOCK_CODE_SERVER_MANAGER_PORT  listen port                    (default 19932)
   AIRLOCK_CODE_SERVER_SLOTS         max concurrent slots           (default 4)
-  AIRLOCK_CODE_SERVER_BACKEND_PORT  slot 1's port; slot N = base+N-1 (default 18811)
+  AIRLOCK_CODE_SERVER_BACKEND_PORT  slot 1's port; slot N = base+N-1 (default 19933)
   AIRLOCK_CODE_SERVER_ALLOW         comma-separated allowed logins (fail-closed)
   AIRLOCK_IDENTITY_HEADER           identity header to read (no hardcoded default)
 """
@@ -26,7 +26,7 @@ import sys
 import time
 
 LISTEN_HOST = os.environ.get("AIRLOCK_CODE_SERVER_MANAGER_HOST", "127.0.0.1")
-LISTEN_PORT = int(os.environ.get("AIRLOCK_CODE_SERVER_MANAGER_PORT", "18810"))
+LISTEN_PORT = int(os.environ.get("AIRLOCK_CODE_SERVER_MANAGER_PORT", "19932"))
 if LISTEN_HOST != "127.0.0.1":
     sys.exit("[FATAL] AIRLOCK_CODE_SERVER_MANAGER_HOST must be 127.0.0.1")
 
@@ -36,7 +36,7 @@ if MAX_SLOTS < 1:
 
 # Slot 1 lives on BACKEND_PORT; slot N lives on BACKEND_PORT + N - 1. This must
 # match the systemd unit template and the nginx /s/N/ routing.
-BACKEND_PORT = int(os.environ.get("AIRLOCK_CODE_SERVER_BACKEND_PORT", "18811"))
+BACKEND_PORT = int(os.environ.get("AIRLOCK_CODE_SERVER_BACKEND_PORT", "19933"))
 
 ALLOW = [x.strip() for x in os.environ.get("AIRLOCK_CODE_SERVER_ALLOW", "").split(",") if x.strip()]
 

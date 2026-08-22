@@ -393,7 +393,7 @@ airlock_serve_check() {
   # NOT require_cmd: that die()s, which would abort an otherwise-successful install at
   # its last line over a check that is allowed to skip.
   if ! command -v curl >/dev/null 2>&1; then
-    log "serve check skipped: curl is not installed, so the entrance cannot be fetched here."
+    log "serve check skipped: curl is not installed, so the hub URL cannot be fetched here."
     return 2
   fi
   url="$(airlock_entrance_url)" || url=""

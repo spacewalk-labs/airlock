@@ -550,7 +550,7 @@ TOML
   pass_out="$(PATH="$GB:$PATH" AIRLOCK_DRY_RUN=0 FAKE_HTTP_CODE=200 AIRLOCK_TS_FQDN=probe.example.ts.net \
     bash -c ". \"$ROOT/install/lib.sh\"; airlock_serve_check" 2>&1)"
   case "$pass_out" in
-    *reachab*|*"entrance answers"*|*"tailnet entrance"*)
+    *reachab*|*"entrance answers"*|*"hub answers"*|*"tailnet entrance"*)
       bad "serve: pass message claims reachability it cannot establish -> $pass_out" ;;
     *"serve frontend OK"*) ok "serve: pass message claims only the frontend" ;;
     *) bad "serve: unexpected pass wording -> $pass_out" ;;

@@ -80,7 +80,7 @@ tailscale serve: shimmed (serve --bg --http=9999 http://127.0.0.1:18806)
 [hello-example smoke] backend=200/200 allowed=200/200 denied=403/403 anonymous=403/403
 airlock-ledger: committed hello-example
 [airlock] serve check skipped: this box cannot resolve its own tailnet name (MagicDNS off?).
-[airlock] done. Entrance: https://box.example.ts.net/
+[airlock] done. Open: https://box.example.ts.net/
 [airlock] INGRESS UNVERIFIED — nothing here proves another device can reach this box. A request to our own tailnet name never leaves the machine, so this run cannot tell a healthy box from one whose inbound path is broken. Open https://box.example.ts.net/ from your phone or laptop once; that is the check.
 installer rc=0
 PASS  install exits 0 (0)
@@ -115,7 +115,7 @@ tailscale serve: shimmed (serve --bg --http=9999 http://127.0.0.1:18806)
 [hello-example smoke] backend=200/200 allowed=200/200 denied=403/403 anonymous=403/403
 airlock-ledger: committed hello-example
 [airlock] serve check skipped: this box cannot resolve its own tailnet name (MagicDNS off?).
-[airlock] done. Entrance: https://box.example.ts.net/
+[airlock] done. Open: https://box.example.ts.net/
 [airlock] INGRESS UNVERIFIED — nothing here proves another device can reach this box. A request to our own tailnet name never leaves the machine, so this run cannot tell a healthy box from one whose inbound path is broken. Open https://box.example.ts.net/ from your phone or laptop once; that is the check.
 PASS  rerun exits 0 (0)
 PASS  unit bytes unchanged (885b3aead4ceeeb0)
@@ -154,7 +154,7 @@ tailscale serve: shimmed (serve --bg --http=9999 http://127.0.0.1:18806)
 [hello-example smoke] backend=200/200 allowed=200/200 denied=403/403 anonymous=403/403
 airlock-ledger: committed hello-example
 [airlock] serve check skipped: this box cannot resolve its own tailnet name (MagicDNS off?).
-[airlock] done. Entrance: https://box.example.ts.net/
+[airlock] done. Open: https://box.example.ts.net/
 [airlock] INGRESS UNVERIFIED — nothing here proves another device can reach this box. A request to our own tailnet name never leaves the machine, so this run cannot tell a healthy box from one whose inbound path is broken. Open https://box.example.ts.net/ from your phone or laptop once; that is the check.
 PASS  upgrade exits 0 (0)
 PASS  unit carries the new port
@@ -198,7 +198,7 @@ tailscale serve: shimmed (serve --bg --https=443 http://127.0.0.1:18802)
 [airlock] plaintext ingress: :9999 -> 301 https (hub)
 tailscale serve: shimmed (serve --bg --http=9999 http://127.0.0.1:18806)
 [airlock] serve check skipped: this box cannot resolve its own tailnet name (MagicDNS off?).
-[airlock] done. Entrance: https://box.example.ts.net/
+[airlock] done. Open: https://box.example.ts.net/
 [airlock] INGRESS UNVERIFIED — nothing here proves another device can reach this box. A request to our own tailnet name never leaves the machine, so this run cannot tell a healthy box from one whose inbound path is broken. Open https://box.example.ts.net/ from your phone or laptop once; that is the check.
 PASS  remove-run exits 0 (0)
 PASS  unit removed

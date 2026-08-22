@@ -108,7 +108,7 @@ stricter than today's app-name grammar (`bin/airlock-config:45` allows case,
 (`bin/airlock-config:452`), so `a-b` and `a_b` would collide; the tighter
 grammar removes that class along with case/length ambiguity. All ten built-in
 ids already conform; the legacy fallback keeps the old grammar until it retires.
-Two ids are reserved and cannot be packaged: `hub` (the platform entrance) and —
+Two ids are reserved and cannot be packaged: `hub` (the platform entry point) and —
 amended in child 3 — `core`, the prerequisites pseudo-owner (F11): a package
 named core could masquerade as the immutable platform rows.
 

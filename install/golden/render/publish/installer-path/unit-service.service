@@ -1,12 +1,12 @@
 [Unit]
-Description=airlock publish — static-share manager + uploads (127.0.0.1:18803)
+Description=airlock publish — static-share manager + uploads (127.0.0.1:19922)
 After=network.target
 
 [Service]
 Type=simple
 # Optional secret (the external-publish token) — safe if the file is absent.
 EnvironmentFile=-%h/.config/airlock-publish.env
-Environment=AIRLOCK_PUBLISH_BACKEND_PORT=18803
+Environment=AIRLOCK_PUBLISH_BACKEND_PORT=19922
 Environment=AIRLOCK_PUBLISH_SHARE_DIR=/opt/airlock/share
 Environment=AIRLOCK_PUBLISH_UPLOADS_DIR=WDIR/home/uploads
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login

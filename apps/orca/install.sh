@@ -381,7 +381,7 @@ log "wrote nginx fragment: $frag"
 # NOTE: smoke runs from the orchestrator AFTER nginx is rendered + reloaded
 # (the gate isn't live until then). See install/airlock-install.sh.
 if [ "$ORCA_WEB_ENABLED" = 1 ]; then
-  log "orca installed (owner: ${AIRLOCK_OWNER}) — patched client at /orca-web/, entrance https://${FQDN}:${HTTPS_PORT}/"
+  log "orca installed (owner: ${AIRLOCK_OWNER}) — patched client at /orca-web/, open https://${FQDN}:${HTTPS_PORT}/"
 else
-  log "orca installed (owner: ${AIRLOCK_OWNER}) — upstream client, entrance https://${FQDN}:${HTTPS_PORT}/"
+  log "orca installed (owner: ${AIRLOCK_OWNER}) — upstream client, open https://${FQDN}:${HTTPS_PORT}/"
 fi

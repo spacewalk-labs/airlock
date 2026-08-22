@@ -3,9 +3,9 @@ id = "orca"
 
 # Transcribed from the former APP_DEFAULTS["orca"] entry.
 [config.defaults]
-https_port = 8446
-gate_port = 18820
-backend_port = 18821
+https_port = 19940
+gate_port = 19941
+backend_port = 19942
 
 # Transcribed from install/prerequisites.tsv's nine orca rows (F11).
 [[prerequisites]]

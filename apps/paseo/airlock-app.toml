@@ -17,11 +17,11 @@ runtime_env = [
 ]
 
 [config.defaults]
-https_port = 8447
-gate_port = 18822
-backend_port = 6767
+https_port = 19950
+gate_port = 19951
+backend_port = 19952
 browse = false
-browse_ws_port = 6768
+browse_ws_port = 19953
 # empty = the installer's own pinned version wins. A value here OVERRIDES
 # that pin, so it must default to "" — a real version string would silently
 # freeze every box on this release.

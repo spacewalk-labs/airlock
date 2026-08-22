@@ -67,7 +67,7 @@ render_dev_monitor_unit() {
   local BACKEND_PORT="$1" MESSAGES="$2" IDENTITY_HEADER="$3" cors_hosts="$4" DEVMON_ENV="$5"
   local TOKEN_FRESHNESS="${6:-false}" TOKEN_WARN_HOURS="${7:-24}" TOKEN_STALE_HOURS="${8:-24}"
   local SPOOL_HARDENING="${9:-false}" guard=""
-  local BACKEND_PY="$ROOT/apps/dev-monitor/backend/airlock-dev-monitor.py"
+  local BACKEND_PY="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/backend/airlock-dev-monitor.py"
   if [ "$SPOOL_HARDENING" = true ]; then
     guard=$'\nExecStartPre=/usr/bin/systemctl is-active --quiet airlock-dev-monitor-spool-firewall.service'
   fi

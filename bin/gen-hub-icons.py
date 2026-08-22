@@ -6,13 +6,21 @@ Single source of truth for the porthole marks shipped in hub/assets/:
   - favicon.png          : 64x64 round "porthole coin" (transparent corners)
 
 Both show the same porthole: a dome + perspective grid seen through a hatch
-window, over a green deep-space gradient with a hatch ring and rim glints. The
-disc is a vertical gradient (darker green at the top, green at the bottom) so the
-dome reads cleanly; the tone is a green in place of the internal build's navy,
-keeping the two recognizably apart on a phone home screen. The dome/grid artwork
-lives in bin/airlock-mark.png (white, transparent); this script tints the tile
-and composites the mark, drawn at high resolution and downsampled for clean
-edges.
+window, over a deep-space navy gradient with a hatch ring and rim glints. The
+disc is a vertical gradient (lighter navy at the top, darker at the bottom) so
+the dome reads cleanly. The dome/grid artwork lives in bin/airlock-mark.png
+(white, transparent); this script tints the tile and composites the mark, drawn
+at high resolution and downsampled for clean edges.
+
+On the colour: this shipped green for a while, specifically so that the public
+build and the internal one could be told apart on a phone home screen. That is
+no longer the goal — the owner decided on 2026-08-22 that the two should look
+the same, and that the mark ships as-is. The distinction that green was buying
+is gone on purpose, not by accident.
+
+The mark is a trademark and is NOT covered by the source licence; see NOTICE.
+Anyone redistributing a modified Airlock should replace these two files and the
+`[branding]` block in airlock.toml.
 
 Re-run after changing PARAMS:  python3 bin/gen-hub-icons.py   (needs Pillow)
 """
@@ -26,14 +34,16 @@ OUT = os.path.join(HERE, "..", "hub", "assets")
 MARK = Image.open(os.path.join(HERE, "airlock-mark.png")).convert("RGBA")
 SS = 4  # supersample, then downsample for antialiasing
 
-# green deep-space palette (vertical gradient: darker top -> green bottom)
-GTOP = (22, 76, 50)     # gradient top (muted deep emerald)
-GBOT = (14, 48, 32)     # gradient bottom (forest green)
-GLOW = (150, 224, 184)  # soft glow behind the dome
+# deep-space navy palette (vertical gradient: lighter top -> darker bottom).
+# Keeps the green build's lightness relationships exactly; only the hue moved,
+# so the dome and grid read at the same strength they were tuned for.
+GTOP = (20, 52, 96)     # gradient top (deep royal navy)
+GBOT = (10, 26, 56)     # gradient bottom (near the UI canvas, #0a0f1e)
+GLOW = (150, 196, 240)  # soft glow behind the dome
 GLOW_A = 55             # glow strength (kept gentle so the top stays dark)
-RING = (200, 240, 216)  # hatch ring
-GLINT1 = (238, 255, 246)
-GLINT2 = (224, 250, 235)
+RING = (204, 226, 250)  # hatch ring
+GLINT1 = (240, 248, 255)
+GLINT2 = (226, 240, 253)
 
 
 def _vgrad(w, h, top, bot):

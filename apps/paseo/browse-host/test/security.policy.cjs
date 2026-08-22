@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // Locks the PROPORTIONATE url policy (owner-only tool): loopback / RFC1918 /
 // tailnet are ALLOWED (browsing one's own dev servers is the point); only cloud-

@@ -1,16 +1,16 @@
 [Unit]
-Description=airlock devterm-gate — custom client + API, proxies to ttyd (127.0.0.1:9912)
+Description=airlock devterm-gate — custom client + API, proxies to ttyd (127.0.0.1:19913)
 After=network.target airlock-devterm.service
 Wants=airlock-devterm.service
 
 [Service]
 Type=simple
 Environment=PATH=WDIR/home/.local/bin:WDIR/home/.npm-global/bin:NODE_BIN:/usr/local/bin:/usr/bin:/bin
-Environment=DEVTERM_REV=4256276e7f2b
+Environment=DEVTERM_REV=816478a6f301
 Environment=DEVTERM_LISTEN_HOST=127.0.0.1
-Environment=DEVTERM_LISTEN_PORT=9912
+Environment=DEVTERM_LISTEN_PORT=19913
 Environment=DEVTERM_TTYD_HOST=127.0.0.1
-Environment=DEVTERM_TTYD_PORT=9911
+Environment=DEVTERM_TTYD_PORT=19912
 Environment=DEVTERM_WEB=WDIR/home/.local/share/airlock-devterm/web
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
 Environment=AIRLOCK_OWNER=owner@example.com

@@ -27,7 +27,7 @@ Environment=PASEO_HOME=WDIR/home/.paseo
 Environment=PASEO_TRUSTED_PROXIES=127.0.0.1
 # DNS-rebinding host allowlist — must accept the Host the gate forwards (fqdn WITH
 # the https port, gate specific (3)) plus localhost.
-Environment=PASEO_HOSTNAMES=<your-box>.ts.net,<your-box>.ts.net:8447,localhost
+Environment=PASEO_HOSTNAMES=<your-box>.ts.net,<your-box>.ts.net:19950,localhost
 # Headless: no dictation/voice (avoids an unexpected ~600MB speech model download).
 Environment=PASEO_DICTATION_ENABLED=false
 Environment=PASEO_VOICE_MODE_ENABLED=false
@@ -44,7 +44,7 @@ Environment=PASEO_VOICE_MODE_ENABLED=false
 ExecStartPre=-/usr/bin/python3 ROOT/apps/paseo/paseo-clear-stale-pid.py WDIR/home/.paseo/paseo.pid
 # --foreground: Type=simple. --no-relay: no upstream relay outbound. --web-ui: the
 # browser UI. --listen 127.0.0.1: loopback bind (the gate is the only ingress).
-ExecStart=WDIR/home/.npm-global/bin/paseo daemon start --foreground --no-relay --web-ui --listen 127.0.0.1:6767
+ExecStart=WDIR/home/.npm-global/bin/paseo daemon start --foreground --no-relay --web-ui --listen 127.0.0.1:19952
 # always, not on-failure: the web UI's "restart daemon" is a websocket shutdown RPC
 # that exits the worker cleanly (status 0) and expects a supervisor to bring it back.
 # Under on-failure systemd reads that as an intended stop and leaves it dead — so the

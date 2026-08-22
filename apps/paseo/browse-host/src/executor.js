@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // Playwright-backed executor for Paseo browser automation commands.
 //

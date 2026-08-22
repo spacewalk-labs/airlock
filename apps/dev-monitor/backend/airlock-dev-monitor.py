@@ -49,7 +49,7 @@ try:
 except ImportError:
     TOKENS = None
 
-PORT = int(os.environ.get('AIRLOCK_DEV_MONITOR_BACKEND_PORT', '18804'))
+PORT = int(os.environ.get('AIRLOCK_DEV_MONITOR_BACKEND_PORT', '19923'))
 IDENTITY_HEADER = os.environ.get('AIRLOCK_IDENTITY_HEADER', 'Tailscale-User-Login')
 # Whether the optional message/action console was requested in configuration.
 MESSAGES_REQUESTED = os.environ.get(

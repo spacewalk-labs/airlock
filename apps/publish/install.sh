@@ -207,8 +207,18 @@ if [ "$PUBLIC_MODE" = local ]; then
   else
     mkdir_nginx_path "$GATED_DIR" no
   fi
+  # This is the SHARED state directory — the ledger lives here, and so does
+  # dev-monitor's spool, which is written by a second uid that has to traverse it.
+  # Narrowing the directory therefore breaks another app: measured 2026-08-22, publish
+  # ran after dev-monitor opened it, closed it back to 0700, and the spool writer could
+  # not write at all — `bin/airlock-smoke` reported `preview needs_action_count is None`
+  # and nothing said why. Opening the directory again made that check pass.
+  #
+  # Nothing is lost by dropping it. The one file publish keeps here is written 0600 by
+  # the backend (apps/publish/backend/airlock-publish.py, `os.chmod(tmp, 0o600)` before
+  # the replace), which is the protection that actually applies to a file. A mode on the
+  # directory was belt-and-braces over a shared resource this app does not own.
   airlock_run mkdir -p "$STATE_DIR"        # owner identities live here — not in a web root
-  airlock_run chmod 700 "$STATE_DIR"
   if [ "${HTPASSWD_DIR#/opt/}" != "$HTPASSWD_DIR" ]; then
     mkdir_nginx_path "$HTPASSWD_DIR" yes
     airlock_run sudo chown "$(id -un):$(id -gn)" "$HTPASSWD_DIR"

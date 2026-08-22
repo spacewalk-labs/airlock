@@ -814,14 +814,14 @@ fi
 # would rightly refuse to create one).
 reset_box
 GD="$TMP/gd"; mkdir -p "$GD" "$STATE"
-mkcfg "$GD/airlock.toml"    # hub only; hub's plaintext http_port default is 9999
-printf '{"version":1,"entries":{"gone":{"committed":{"path":"/nowhere","digest":"0000000000000000000000000000000000000000000000000000000000000000","lifecycle":{"install":true,"smoke":true,"deactivate":false},"artifacts":{"units":[],"fragments":[],"webroot":[],"files":[],"serve_ports":[9999]}}}}}\n' > "$STATE/app-ledger.json"
+mkcfg "$GD/airlock.toml"    # hub only; hub's plaintext http_port default is 19901
+printf '{"version":1,"entries":{"gone":{"committed":{"path":"/nowhere","digest":"0000000000000000000000000000000000000000000000000000000000000000","lifecycle":{"install":true,"smoke":true,"deactivate":false},"artifacts":{"units":[],"fragments":[],"webroot":[],"files":[],"serve_ports":[19901]}}}}}\n' > "$STATE/app-ledger.json"
 : > "$TMP/tailscale.log"
 out="$(env HOME="$FAKEHOME" AIRLOCK_CONFIG="$GD/airlock.toml" bash "$ROOT/bin/airlock-teardown" gone 2>&1)" && rc=0 || rc=$?
-if [ "$rc" = 0 ] && ! grep -q -- "--http=9999 off" "$TMP/tailscale.log"; then
+if [ "$rc" = 0 ] && ! grep -q -- "--http=19901 off" "$TMP/tailscale.log"; then
   ok "guard: a recorded serve port claimed by a desired app is not turned off"
 else
-  bad "guard: serve-off guard (rc=$rc, log: $(grep 9999 "$TMP/tailscale.log" 2>/dev/null || echo none))"
+  bad "guard: serve-off guard (rc=$rc, log: $(grep 19901 "$TMP/tailscale.log" 2>/dev/null || echo none))"
 fi
 
 # Child 4/P3 review finding (Major): `validate` is fatal on an unknown/
@@ -1597,8 +1597,8 @@ manifest "$PC/pkg/airlock-app.toml" tc listen <<EOF
 webroot = ["tc/"]
 serve_ports = ["listen"]
 EOF
-mkcfg "$PC/airlock.toml" "[apps.tc]" "listen = 9999" "[packages.tc]" "path = \"$PC/pkg\""
-msg="$(run "$PC/airlock.toml" validate 2>&1)" && bad "collision: packaged serve value over hub's 9999 accepted" || {
+mkcfg "$PC/airlock.toml" "[apps.tc]" "listen = 19901" "[packages.tc]" "path = \"$PC/pkg\""
+msg="$(run "$PC/airlock.toml" validate 2>&1)" && bad "collision: packaged serve value over hub's 19901 accepted" || {
   grep -q "built-in" <<<"$msg" \
     && ok "collision: packaged serve value colliding with a built-in plaintext port is fatal" \
     || bad "collision: wrong message: $msg"; }

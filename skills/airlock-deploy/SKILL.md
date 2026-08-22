@@ -5,7 +5,7 @@ description: Install or re-deploy Airlock on this box from airlock.toml — vali
 
 # airlock-deploy
 
-Deploy Airlock (a self-hosted dev hub behind a Tailscale identity gate) on the
+Deploy Airlock (a self-hosted developer workspace behind a Tailscale identity check) on the
 current box. Everything site-specific lives in `airlock.toml`; the installer reads
 it only through `bin/airlock-config`.
 
@@ -53,7 +53,7 @@ and the separate-port apps → smokes every enabled app.
 - `systemctl --user status 'airlock-*'` — enabled app backends are active.
 - `sudo tailscale serve status` — the hub (443 + http port) and each separate-port
   app (devterm/code-server/orca/paseo) are mapped to their loopback gate.
-- Entrance: `https://<this-box>.<tailnet>/` — the hub launcher lists the enabled apps.
+- Open: `https://<this-box>.<tailnet>/` — the hub launcher lists the enabled apps.
 
 ## Notes
 

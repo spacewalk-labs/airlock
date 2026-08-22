@@ -110,7 +110,21 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] \
     || [ -e "$RETIREMENT_FILE" ] || [ -L "$RETIREMENT_FILE" ] \
     || [ -n "$_known_builtins" ]; }; then
   require_cmd flock
-  install -d -m 0700 "$_state_dir"
+  # `install -d -m` sets the mode on an EXISTING directory too, and that turned a
+  # default into an enforcement nobody declared. dev-monitor's spool is written by a
+  # second uid, so that uid has to TRAVERSE this directory
+  # (apps/dev-monitor/install-spool-hardening.sh checks exactly that) — and 0700 forbids
+  # it. Re-asserting the mode here meant the check could never pass: widen it and the
+  # next run closes it again.
+  #
+  # Measured 2026-08-22 on a box updating to this revision: the install died at
+  # dev-monitor four times, and setting the directory to 710 by hand did not survive a
+  # single re-run.
+  #
+  # 0700 is still what a directory created HERE gets. What changed is that it is a
+  # default rather than a reassertion — an existing directory keeps the mode its owner,
+  # or an app that declared why, gave it.
+  [ -d "$_state_dir" ] || install -d -m 0700 "$_state_dir"
   airlock_pin_state_dir
   _state_dir="${AIRLOCK_STATE_DIR:-$_state_dir}"
   LEDGER_FILE="$_state_dir/app-ledger.json"
@@ -486,13 +500,13 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   fi
 fi
 
-# The closing lines name the entrance and then name what was not established. The
+# The closing lines name the URL to open and then name what was not established. The
 # second is not a footnote on the first: an install that ends "done" while the box is
 # unreachable is the failure this whole check exists for, and only the operator, on
 # another device, can rule it out.
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "done (dry run — nothing was changed). Entrance would be: https://<your-box>.<tailnet>.ts.net/"
+  log "done (dry run — nothing was changed). You would open: https://<your-box>.<tailnet>.ts.net/"
 else
-  log "done. Entrance: $(airlock_entrance_url)"
+  log "done. Open: $(airlock_entrance_url)"
   airlock_ingress_unverified
 fi

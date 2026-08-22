@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Server-side browser automation host for self-hosted Paseo (loopback WS sidecar, Playwright-backed).",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "bin": {
     "paseo-browse-host": "bin/paseo-browse-host.js"
   },

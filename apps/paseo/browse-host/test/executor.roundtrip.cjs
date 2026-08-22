@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // Direct round-trip test of the executor against real Chromium (no daemon).
 // Validates command handlers + ref loop + response payload shapes.

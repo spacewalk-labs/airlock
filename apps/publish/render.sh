@@ -13,7 +13,7 @@ render_publish_unit_service() {
         INGEST_URL="$5" BASE_URL="$6" TOKEN_ENV="$7" PUBLIC_MODE="$8" PUBLIC_DIR="$9"
   shift 9
   local STATE_DIR="$1" GATED_DIR="$2" HTPASSWD_DIR="$3" HTPASSWD_BIN="$4"
-  local BACKEND_PY="$ROOT/apps/publish/backend/airlock-publish.py"
+  local BACKEND_PY="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/backend/airlock-publish.py"
   cat <<UNIT
 [Unit]
 Description=airlock publish — static-share manager + uploads (127.0.0.1:${BACKEND_PORT})
@@ -50,7 +50,7 @@ UNIT
 render_publish_unit_cleanup() {
   local UPLOADS_DIR="$1" PUBLIC_MODE="$2" PUBLIC_DIR="$3" STATE_DIR="$4" \
         GATED_DIR="$5" HTPASSWD_DIR="$6" HTPASSWD_BIN="$7"
-  local BACKEND_PY="$ROOT/apps/publish/backend/airlock-publish.py"
+  local BACKEND_PY="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/backend/airlock-publish.py"
   cat <<UNIT
 [Unit]
 Description=airlock publish — uploads TTL sweep (24h) + public snapshot expiry

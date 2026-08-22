@@ -144,11 +144,29 @@ content	apps/publish/frontend/publish.html
 content	apps/publish/render.sh
 content	apps/publish/test-bundle-plan-state.mjs
 content	apps/publish/test-local-target.py
+content	apps/code-server/manager/manager.py
+content	apps/feedback/README.md
+content	apps/feedback/airlock-app.toml
+content	apps/orca/README.md
+content	apps/paseo/browse-host/README.md
+content	apps/paseo/browse-host/smoke.sh
+content	apps/paseo/browse-host/src/host.js
+content	apps/paseo/browse-host/src/stream-server.js
+content	apps/publish/airlock-app.toml
 only-work	apps/learning/airlock-app.toml
 only-work	apps/learning/backend/airlock-learning.py
 only-work	apps/learning/backend/ingest_runner.py
+only-work	apps/learning/backend/save_document.py
 only-work	apps/learning/deactivate.sh
 only-work	apps/learning/frontend/learning.html
 only-work	apps/learning/install.sh
 only-work	apps/learning/render.sh
 only-work	apps/learning/smoke.sh
+# 7) 2026-08-22 shared state directory: apps/publish/install.sh stopped chmod'ing the
+#    SHARED state directory (~/.local/state/airlock) to 0700 on every install. That
+#    directory holds the ledger and dev-monitor's spool, and the spool is written by a
+#    second uid that has to traverse it — measured on hardware, publish closed it after
+#    dev-monitor opened it and the spool writer could not write at all, at RUNTIME, with
+#    the install reporting success. Batch 1's shape: work is the live consumer and the
+#    public copy is behind until the next publish sync, not a designed split.
+content	apps/publish/install.sh

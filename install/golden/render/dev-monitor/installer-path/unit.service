@@ -1,10 +1,10 @@
 [Unit]
-Description=airlock dev-monitor — system observability (127.0.0.1:18804)
+Description=airlock dev-monitor — system observability (127.0.0.1:19923)
 After=network.target
 
 [Service]
 Type=simple
-Environment=AIRLOCK_DEV_MONITOR_BACKEND_PORT=18804
+Environment=AIRLOCK_DEV_MONITOR_BACKEND_PORT=19923
 Environment=AIRLOCK_DEV_MONITOR_MESSAGES=false
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
 Environment=AIRLOCK_DEV_MONITOR_CORS_HOSTS=box.example.ts.net,box

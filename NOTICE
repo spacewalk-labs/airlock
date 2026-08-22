@@ -1,6 +1,13 @@
 Airlock — third-party components and licenses
 =============================================
 
+Airlock
+Copyright 2026 Sunghyeon Cho
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0 — see LICENSE for the
+full text and for the AGPL-3.0 carve-out that applies to the paseo patches.
+
 Airlock is an installer/composer. It does NOT bundle the upstream tools below;
 each is fetched at install time from its own source. Airlock ships only its own
 glue (identity gate, config layer, custom UIs) plus, where noted, patches.
@@ -21,14 +28,14 @@ orca web client   github.com/stablyai/orca          MIT           vendored BUILT
 paseo (CLI)       github.com/getpaseo/paseo         AGPL-3.0      npm i @getpaseo/cli at install (not redistributed)
 paseo patches     apps/paseo/patches/               AGPL-3.0      our patches — derivative of paseo, see that dir
 paseo web-ui patcher apps/paseo/browse-host/bin/patch-web-ui.js  AGPL-3.0  encodes derivative edits of paseo's web-ui
-paseo browse-host apps/paseo/browse-host/ (ours)    MIT           loopback-WS sidecar; needs Playwright (follow-up, not wired in v1)
+paseo browse-host apps/paseo/browse-host/ (ours)    Apache-2.0    loopback-WS sidecar; needs Playwright (follow-up, not wired in v1)
 Playwright/Chromium (only if browse-host used)      Apache-2.0 / (Chromium BSD)  downloaded at install
 
 Everything else under apps/ (hub, publish, notepad, dev-monitor backends/UIs, the
-gate, config layer, installers) is Airlock's own code under MIT (repo root LICENSE).
+gate, config layer, installers) is Airlock's own code under Apache-2.0 (repo root LICENSE).
 
 Orca web client (apps/orca/web-bundle/dist/) — derived from stablyai/orca, MIT,
-Copyright (c) 2026 Lovecast Inc.; local patches under this repo's MIT license. Unlike
+Copyright (c) 2026 Lovecast Inc.; local patches under this repo's Apache-2.0 license. Unlike
 the other upstream tools, this is a BUILT derivative we REDISTRIBUTE (it ships in the
 repo and is served at /orca-web/), which the upstream MIT license permits with this
 attribution. Provenance + patch summary: apps/orca/web-bundle/README.md.
@@ -44,11 +51,11 @@ Notes
   are NOT redistributed by Airlock; the installer fetches them from upstream and
   verifies sha256 where applicable. Operators accept the upstream terms of those
   binaries.
-- Mixed-license: the Airlock core is MIT. Paseo (@getpaseo/cli) is AGPL-3.0 and
+- Mixed-license: the Airlock core is Apache-2.0. Paseo (@getpaseo/cli) is AGPL-3.0 and
   runs as a SEPARATE PROCESS — the core talks to it over loopback IPC/WS, so the
   core is not a derivative of paseo (mere aggregation). The paseo *patches* and the
   *web-ui patcher* ARE derivatives of paseo and carry AGPL-3.0; the browse-host
-  sidecar is an independent program (no paseo imports) and is MIT. The full
+  sidecar is an independent program (no paseo imports) and is Apache-2.0. The full
   AGPL-3.0 text is vendored at apps/paseo/patches/LICENSE. This is NOT legal advice.
 - Vendored (redistributed) libraries: unlike the downloaded binaries above, the
   markwand viewer's client-side libraries — highlight.js (BSD-3-Clause), marked
@@ -60,15 +67,23 @@ Notes
   staged by the platform from there now) are the upstream projects' own
   logos, vendored for the launcher tiles (nominative use — identifying the
   tool each tile opens), and are their respective trademarks, not
-  MIT-licensed Airlock code. The Airlock porthole mark
+  Apache-2.0-licensed Airlock code. The Airlock porthole mark
   (hub/assets/apple-touch-icon.png, favicon.png;
-  artwork bin/airlock-mark.png; generator bin/gen-hub-icons.py) is the author's
-  own under the repo-root MIT license. So is the per-app icon set — the glyph
+  artwork bin/airlock-mark.png; generator bin/gen-hub-icons.py) is the
+  author's own work, but it is ALSO a brand mark, and a brand mark is a
+  trademark rather than a copyrightable asset. The source licence covers the
+  files; it does not grant permission to use the mark to identify a different
+  product. **If you redistribute a modified Airlock, replace those three files
+  and the `[branding]` block in airlock.toml** — otherwise your build presents
+  itself under someone else's mark, which is the one thing the licence cannot
+  give you.
+    The per-app icon set carries no such restriction — the glyph
   sprite in hub/index.html, the favicons and iOS home-screen icons it produces
   (hub/assets/app-icons/*.svg and *.png, apps/devterm/web/favicon.svg and
   apple-touch-icon.png, and the inline mark in apps/code-server/web/shell.html),
-  and their generator bin/gen-app-icons.py. Those glyphs are drawn for this
-  repo — generic marks for the kind of tool each tile opens, not any upstream
-  project's logo.
+  and their generator bin/gen-app-icons.py — are the author's own under the
+  repo's source licence. Those glyphs are drawn for this repo: generic marks for
+  the kind of tool each tile opens, not any upstream project's logo and not
+  brand marks of anything. Keep them, change them, ship them.
 - TODO(before public release): complete a hash/provenance inventory of all
   downloads and re-confirm each upstream's current license.

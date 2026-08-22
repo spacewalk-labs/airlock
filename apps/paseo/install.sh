@@ -66,7 +66,7 @@ CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
 # browse-host (config-gated). When BROWSE=true we add the /browse-view/ stream
 # route to the gate and run browse-host/install.sh at the end (warn-only).
 BROWSE="${AIRLOCK_PASEO_BROWSE:-false}"
-BROWSE_WS_PORT="${AIRLOCK_PASEO_BROWSE_WS_PORT:-6768}"
+BROWSE_WS_PORT="${AIRLOCK_PASEO_BROWSE_WS_PORT:-19953}"
 
 # ---- Resource backstop: a tier table, not a formula ----
 # The unit once carried a flat MemoryMax=8G with no MemoryHigh, which is a silent

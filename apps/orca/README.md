@@ -5,13 +5,13 @@ One browser tab attaches to this box's [**Orca ADE**](https://github.com/stablya
 **Tailscale identity** (no password); the box **owner only** may enter.
 
 ```
-browser ──https/WireGuard──▶ tailscale serve :8446
+browser ──https/WireGuard──▶ tailscale serve :19940
                               │  identity header injected by tailscale serve
                               ▼
-                   127.0.0.1:18820  nginx owner gate  ── not the owner? 403
+                   127.0.0.1:19941  nginx owner gate  ── not the owner? 403
                               │  (WS-safe proxy: no X-Forwarded-*, which would
                               ▼   break orca's Origin check)
-                   0.0.0.0:18821  orca serve  ── nft loopback-only (gate reaches it,
+                   0.0.0.0:19942  orca serve  ── nft loopback-only (gate reaches it,
                               │                    the tailnet cannot)
                     ┌─────────┴──────────┐
               web client            runtime

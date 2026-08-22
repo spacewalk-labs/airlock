@@ -17,7 +17,7 @@ ExecStartPre=/bin/sh -c 'for _ in $(seq 1 100); do [ -S /tmp/.X11-unix/X59 ] && 
 # the endpoint the web client dials to the public gate (default ws://0.0.0.0:BACKEND
 # is not browser-reachable). The webClientUrl is only ever emitted to serve.log
 # (Electron stdout never reaches journald), so capture it there.
-ExecStart=/bin/sh -c 'exec WDIR/home/.local/share/airlock-orca/squashfs-root/AppRun serve --port 18821 --pairing-code <pairing-code> --pairing-address wss://<your-box>.ts.net:8446 > WDIR/home/.local/share/airlock-orca/serve.log 2>&1'
+ExecStart=/bin/sh -c 'exec WDIR/home/.local/share/airlock-orca/squashfs-root/AppRun serve --port 19942 --pairing-code <pairing-code> --pairing-address wss://<your-box>.ts.net:19940 > WDIR/home/.local/share/airlock-orca/serve.log 2>&1'
 # The daemon self-detaches into app-orca-*.scope, so reclaim it on stop.
 ExecStopPost=WDIR/render/bin/airlock-orca-reap
 Restart=on-failure

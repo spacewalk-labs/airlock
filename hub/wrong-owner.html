@@ -4,24 +4,31 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Not your box</title>
+<link rel="stylesheet" href="/assets/airlock-tokens.css">
 <style>
-  :root { --bg:#f5f5f7; --text:#1d1d1f; --muted:#6e6e73; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#000; --text:#f5f5f7; --muted:#98989d; } }
+  /* Values come from the token sheet. This page had its own palette, and its
+     dark background was pure #000 while the launcher's was navy — the two
+     pages did not match each other, which nobody noticed because you rarely
+     see both. */
   body {
     margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-    background:var(--bg); color:var(--text); text-align:center; padding:2rem;
-    font:17px/1.5 -apple-system,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+    background:var(--airlock-canvas); color:var(--airlock-ink);
+    text-align:center; padding:var(--airlock-sp-8);
+    font:var(--airlock-fs-body)/var(--airlock-lh) var(--airlock-font);
+    letter-spacing:var(--airlock-track);
   }
   .box { max-width:28rem; }
-  h1 { font-size:1.4rem; margin:0 0 .5rem; }
-  p { color:var(--muted); margin:.4rem 0; }
+  .mark { width:64px; height:64px; opacity:.5; margin:0 auto var(--airlock-sp-4); display:block; }
+  h1 { font-size:var(--airlock-fs-h2); margin:0 0 var(--airlock-sp-2); font-weight:600; }
+  p { color:var(--airlock-body); margin:var(--airlock-sp-1) 0; font-size:var(--airlock-fs-sm); }
 </style>
 </head>
 <body>
   <div class="box">
+    <img class="mark" src="/assets/favicon.png" alt="" aria-hidden="true">
     <h1>This isn't your Airlock</h1>
     <p>You're signed in, but you're not the owner of this box.</p>
-    <p>Each Airlock instance is single-owner. Open your own box's entrance instead.</p>
+    <p>Each Airlock instance is single-owner. Open your own box instead.</p>
   </div>
 </body>
 </html>

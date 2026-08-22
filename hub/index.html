@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Airlock</title>
+<link rel="stylesheet" href="/assets/airlock-tokens.css">
 <link rel="icon" type="image/png" href="/assets/favicon.png">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <meta name="theme-color" content="#0a0f1e">
@@ -12,52 +13,39 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Airlock">
 <style>
-  :root {
-    --bg: #f5f5f7; --surface: #fff; --text: #1d1d1f; --muted: #6e6e73;
-    --line: #d2d2d7; --accent: #0066cc;
-    --tile-fallback: linear-gradient(160deg, #ffffff, #eceff2);
-    --tile-glyph-fallback: #0f766e;
-    --ic-shadow: 0 3px 8px -2px rgba(0,0,0,.20), 0 1px 2px rgba(0,0,0,.10);
-    --ic-shadow-hover: 0 9px 18px -5px rgba(0,0,0,.28), 0 2px 5px rgba(0,0,0,.12);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      /* near-black navy (not pure #000) so the dark "coding" tiles stay visible */
-      --bg: #0a0c11; --surface: #16181d; --text: #f5f5f7; --muted: #98989d;
-      --line: #2a2d34; --accent: #2997ff;
-      --ic-shadow: 0 3px 10px -2px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
-      --ic-shadow-hover: 0 10px 20px -5px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.08);
-    }
-  }
+  /* Colour, type, spacing and radius all come from /assets/airlock-tokens.css.
+     There is no light/dark block here any more: the token sheet ships dark as
+     canonical and overrides it for light, so this file never states a value and
+     cannot drift from the rest of the system. */
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    margin: 0; background: var(--airlock-canvas); color: var(--airlock-ink);
     font: 17px/1.5 -apple-system, "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
     -webkit-font-smoothing: antialiased;
     padding: max(env(safe-area-inset-top), 1.5rem) 1.25rem 3rem;
   }
   header { max-width: 880px; margin: 0 auto 2rem; display: flex; align-items: center; gap: 1rem;
-           padding-bottom: 0.9rem; border-bottom: 1px solid var(--line); }
+           padding-bottom: 0.9rem; border-bottom: 1px solid var(--airlock-hairline); }
   h1 { font-size: 1.25rem; margin: 0; letter-spacing: -0.02em; font-weight: 700; }
-  .who { margin-left: auto; color: var(--muted); font-size: 0.9rem; font-weight: 500;
-         padding: 4px 12px; border: 1px solid var(--line); border-radius: 999px; white-space: nowrap; }
+  .who { margin-left: auto; color: var(--airlock-mute); font-size: 0.9rem; font-weight: 500;
+         padding: 4px 12px; border: 1px solid var(--airlock-hairline); border-radius: 999px; white-space: nowrap; }
   .who:empty { display: none; }
   main { max-width: 880px; margin: 0 auto; }
   .sec-h { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
-           color: var(--muted); margin: 0 0 1.25rem; display: flex; align-items: center; gap: 8px; }
-  .sec-h::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+           color: var(--airlock-mute); margin: 0 0 1.25rem; display: flex; align-items: center; gap: 8px; }
+  .sec-h::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--airlock-primary); }
 
   /* launcher grid — category-coloured tiles + shared glyph sprite */
   .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
           gap: 26px 12px; justify-items: center; }
   .app { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 82px;
-         text-decoration: none; color: var(--text); position: relative; }
+         text-decoration: none; color: var(--airlock-ink); position: relative; }
   .app .ic {
     width: 60px; height: 60px; border-radius: 15px; display: grid; place-items: center;
     overflow: hidden; position: relative;
-    color: var(--app-glyph, var(--tile-glyph-fallback));
-    background: var(--app-tile, var(--tile-fallback));
-    box-shadow: var(--ic-shadow);
+    color: var(--app-glyph, var(--airlock-primary));
+    background: var(--app-tile, var(--airlock-surface-2));
+    box-shadow: var(--airlock-shadow);
     transition: transform .16s cubic-bezier(.2,.8,.2,1), box-shadow .16s;
   }
   /* iOS-style glass edge: bright top-left / soft bottom-right corner rims */
@@ -68,15 +56,26 @@
       radial-gradient(145% 145% at 100% 100%, rgba(255,255,255,.18), rgba(255,255,255,0) 22%),
       linear-gradient(180deg, rgba(255,255,255,.05) 0%, rgba(255,255,255,0) 48%, rgba(0,0,0,.05) 100%);
   }
-  .app:hover .ic { transform: translateY(-3px); box-shadow: var(--ic-shadow-hover); }
+  .app:hover .ic { transform: translateY(-3px); box-shadow: var(--airlock-shadow-hover); }
   .app .ic svg { width: 36px; height: 36px; display: block; }
-  .app .ic svg, .app .ic svg * { color: var(--app-glyph, var(--tile-glyph-fallback)); }
+  .app .ic svg, .app .ic svg * { color: var(--app-glyph, var(--airlock-primary)); }
   /* real brand icon (orca, paseo): full-bleed image, no category tile behind it */
   .app .ic img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .app.has-brand .ic { background: none; box-shadow: var(--ic-shadow); }
+  .app.has-brand .ic { background: none; box-shadow: var(--airlock-shadow); }
   .app .lb { font-size: 0.85rem; font-weight: 500; text-align: center; line-height: 1.25; }
 
-  /* category palette — the tile bg + glyph colour per tool character.
+  /* Tile colour is the app's, not the system's.
+     Every other colour on this page is a token, and this block is the one
+     deliberate exception. It follows the iOS rule rather than ours: the system
+     owns the geometry — the squircle, the 60px, the shadow, the glass edge —
+     and the app owns its hue. A launcher whose tiles are all one colour is
+     tidier and worse; you find an app on a home screen by its colour before
+     you have read a single label.
+     So these are raw hex on purpose. They are DATA about each tool, not part
+     of the palette, and folding them into --airlock-* would make the design
+     system claim authorship of a decision it does not own. Today the value is
+     keyed off data-cat; per-app colour in airlock-app.toml is the next step,
+     and this rule is the fallback for an app that does not declare one.
      coding=dark+green · docs=blue · files=teal · system=slate · comms=green */
   .app[data-cat="coding"] { --app-tile: #16181f; --app-glyph: #6aac32; }
   .app[data-cat="docs"]   { --app-tile: #2f5aa8; --app-glyph: #ffffff; }
@@ -84,55 +83,55 @@
   .app[data-cat="system"] { --app-tile: #46597e; --app-glyph: #ffffff; }
   .app[data-cat="comms"]  { --app-tile: #3f9a5c; --app-glyph: #ffffff; }
 
-  .empty { color: var(--muted); }
+  .empty { color: var(--airlock-mute); }
 
   /* message strip — dev-monitor's "needs a person" preview, above the tool grid.
      Owner-only (matches the API's own gate); hidden entirely for anyone else, same as
      the feedback box below is hidden when its backend is off. */
   .msgstrip { max-width: 880px; margin: 0 auto 1.75rem; }
   .msgstrip[hidden] { display: none; }
-  .ms-quiet { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; color: var(--muted); }
-  .ms-quiet .ok { color: var(--text); font-weight: 500; }
-  .ms-card { border: 1px solid var(--line); border-radius: 14px; background: var(--surface);
+  .ms-quiet { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; color: var(--airlock-mute); }
+  .ms-quiet .ok { color: var(--airlock-ink); font-weight: 500; }
+  .ms-card { border: 1px solid var(--airlock-hairline); border-radius: 14px; background: var(--airlock-surface-1);
              padding: 0.9rem 1.1rem 0.3rem; }
   .ms-hd { display: flex; align-items: baseline; gap: 10px; margin-bottom: 0.4rem; }
   .ms-hd .ms-ttl { font-weight: 700; font-size: 0.95rem; }
-  .ms-hd .ms-cnt { color: var(--muted); font-size: 0.85rem; }
-  .ms-hd .ms-cnt b { color: var(--text); }
-  .ms-hd a { margin-left: auto; color: var(--accent); font-size: 0.82rem; text-decoration: none; }
+  .ms-hd .ms-cnt { color: var(--airlock-mute); font-size: 0.85rem; }
+  .ms-hd .ms-cnt b { color: var(--airlock-ink); }
+  .ms-hd a { margin-left: auto; color: var(--airlock-primary); font-size: 0.82rem; text-decoration: none; }
   .ms-row { display: flex; align-items: baseline; gap: 8px; padding: 7px 0;
-            border-top: 1px solid var(--line); text-decoration: none; color: inherit; }
+            border-top: 1px solid var(--airlock-hairline); text-decoration: none; color: inherit; }
   .ms-row:first-of-type { border-top: 0; }
   .ms-row .ms-t { font-size: 0.88rem; font-weight: 500; flex: 1; min-width: 0;
                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ms-row .ms-s { color: var(--muted); font-size: 0.76rem; white-space: nowrap; }
+  .ms-row .ms-s { color: var(--airlock-mute); font-size: 0.76rem; white-space: nowrap; }
 
   /* suggestion box — a same-origin feedback relay (see apps/feedback).
      Collapsed by default: the launcher stays quiet and only a small trigger
      shows. The panel below is revealed on click. */
   .feedback { max-width: 880px; margin: 2.75rem auto 0; }
   .fb-open {
-    border: 1px solid var(--line); border-radius: 999px; padding: 5px 14px; cursor: pointer;
-    background: transparent; color: var(--muted); font: inherit; font-size: 0.8rem; font-weight: 500;
+    border: 1px solid var(--airlock-hairline); border-radius: 999px; padding: 5px 14px; cursor: pointer;
+    background: transparent; color: var(--airlock-mute); font: inherit; font-size: 0.8rem; font-weight: 500;
     transition: color .15s, border-color .15s, background .15s;
   }
-  .fb-open:hover { color: var(--text); border-color: var(--muted); background: var(--surface); }
+  .fb-open:hover { color: var(--airlock-ink); border-color: var(--airlock-mute); background: var(--airlock-surface-1); }
   .fb-panel { position: relative; }        /* anchors the dismiss button */
   .fb-panel[hidden] { display: none; }
   .fb-panel .sec-h { margin-bottom: 0.75rem; padding-right: 2.75rem; }
   .feedback textarea {
     width: 100%; min-height: 84px; resize: vertical; box-sizing: border-box;
-    padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px;
-    background: var(--surface); color: var(--text); font: inherit;
+    padding: 12px 14px; border: 1px solid var(--airlock-hairline); border-radius: 12px;
+    background: var(--airlock-surface-1); color: var(--airlock-ink); font: inherit;
     -webkit-appearance: none;   /* iOS draws an inset shadow otherwise */
   }
-  .feedback textarea:focus { outline: none; border-color: var(--accent); }
+  .feedback textarea:focus { outline: none; border-color: var(--airlock-primary); }
   .fb-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
   /* Sized against the section headers, not the 17px body text: this is a small
      utility control at the foot of the page, not a page-level call to action. */
   .fb-send {
     border: 0; border-radius: 999px; padding: 5px 14px; cursor: pointer;
-    background: var(--accent); color: #fff; font: inherit; font-size: 0.8rem; font-weight: 600;
+    background: var(--airlock-primary); color: #fff; font: inherit; font-size: 0.8rem; font-weight: 600;
   }
   .fb-send:disabled { opacity: .55; cursor: default; }
   /* Dismiss sits at the panel's top-right, away from Send: it is an escape
@@ -140,16 +139,16 @@
   .fb-close {
     position: absolute; top: -7px; right: 0; width: 36px; height: 36px; padding: 0;
     display: grid; place-items: center; border: 0; border-radius: 999px;
-    background: none; color: var(--muted); cursor: pointer;
+    background: none; color: var(--airlock-mute); cursor: pointer;
     transition: color .15s, background .15s;
   }
-  .fb-close:hover { color: var(--text); background: var(--surface); }
+  .fb-close:hover { color: var(--airlock-ink); background: var(--airlock-surface-1); }
   .fb-close svg { width: 15px; height: 15px; display: block;
                   fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; }
-  .fb-status { min-width: 0; color: var(--muted); font-size: 0.8rem; }
-  .fb-status a { color: var(--accent); }
+  .fb-status { min-width: 0; color: var(--airlock-mute); font-size: 0.8rem; }
+  .fb-status a { color: var(--airlock-primary); }
 
-  footer { max-width: 880px; margin: 2.5rem auto 0; color: var(--muted); font-size: 0.8rem; }
+  footer { max-width: 880px; margin: 2.5rem auto 0; color: var(--airlock-mute); font-size: 0.8rem; }
 </style>
 </head>
 <body>
@@ -218,7 +217,7 @@
   </div>
 </section>
 
-<footer>Airlock · self-hosted dev hub · open source (MIT) · © 2026 Sunghyeon Cho</footer>
+<footer>Airlock · self-hosted developer workspace · open source (Apache-2.0) · © 2026 Sunghyeon Cho</footer>
 
 <script>
 async function j(url) { const r = await fetch(url, { cache: "no-store" }); return r.ok ? r.json() : null; }

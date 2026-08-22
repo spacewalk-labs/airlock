@@ -1,0 +1,351 @@
+<!doctype html>
+<!--
+  design-preview.html — every token in this system, rendered as the screens it
+  actually produces.
+
+  This exists because a palette is unreadable as a list of swatches. The rule
+  "one tile colour, glyphs do the distinguishing" is an argument on paper and
+  obvious the moment you see fourteen tiles next to each other.
+
+  Both themes are shown side by side deliberately: dark is canonical, and the
+  only way to notice that a token was tuned for one theme and forgotten in the
+  other is to look at them together.
+
+  It loads airlock-tokens.css rather than restating any value, so it cannot
+  drift from the system it is demonstrating. Open it directly from the repo.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airlock — design system preview</title>
+<link rel="stylesheet" href="airlock-tokens.css">
+<style>
+  /* Page chrome. Everything below the `demo` classes is the system itself. */
+  body {
+    margin: 0; padding: 32px 20px 80px;
+    background: #6b7280; color: #fff;
+    font: 400 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Noto Sans KR", sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .page-h { font-size: 22px; font-weight: 700; letter-spacing: -.022em; margin: 0 0 4px; }
+  .page-sub { opacity: .8; margin: 0 0 28px; font-size: 14px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 14px; }
+  @media (max-width: 900px) { .pair { grid-template-columns: 1fr; } }
+  .cap { font-size: 12px; font-weight: 600; letter-spacing: .06em;
+         text-transform: uppercase; opacity: .75; margin: 30px 0 8px; }
+  .cap-note { font-size: 13px; opacity: .8; margin: 0 0 10px; font-weight: 400;
+              letter-spacing: 0; text-transform: none; }
+
+  /* ── the demo surface: one panel per theme ─────────────────────────────── */
+  .demo {
+    background: var(--airlock-canvas);
+    color: var(--airlock-ink);
+    font-family: var(--airlock-font);
+    font-size: var(--airlock-fs-body);
+    line-height: var(--airlock-lh);
+    letter-spacing: var(--airlock-track);
+    border-radius: var(--airlock-r-lg);
+    padding: var(--airlock-sp-6);
+    overflow: hidden;
+  }
+  .demo-tag { font: 600 11px/1 ui-monospace, monospace; letter-spacing: .08em;
+              text-transform: uppercase; color: var(--airlock-mute);
+              margin-bottom: var(--airlock-sp-4); }
+
+  /* ── launcher ──────────────────────────────────────────────────────────── */
+  .lch-head { display: flex; align-items: center; gap: var(--airlock-sp-3);
+              padding-bottom: var(--airlock-sp-3);
+              border-bottom: 1px solid var(--airlock-hairline);
+              margin-bottom: var(--airlock-sp-5); }
+  .lch-title { font-size: 20px; font-weight: 700; letter-spacing: -.022em; }
+  .who { margin-left: auto; font-size: var(--airlock-fs-xs);
+         color: var(--airlock-mute); border: 1px solid var(--airlock-hairline);
+         border-radius: var(--airlock-r-pill); padding: 3px 10px; }
+  .sec { font-size: var(--airlock-fs-xs); font-weight: 600;
+         letter-spacing: var(--airlock-track-caps); text-transform: uppercase;
+         color: var(--airlock-mute); display: flex; align-items: center;
+         gap: 8px; margin: 0 0 var(--airlock-sp-4); }
+  .sec::before { content: ""; width: 6px; height: 6px; border-radius: 50%;
+                 background: var(--airlock-primary); }
+  .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
+          gap: var(--airlock-sp-5) var(--airlock-sp-2); justify-items: center; }
+  .app { display: flex; flex-direction: column; align-items: center; gap: 9px;
+         width: 72px; text-decoration: none; color: var(--airlock-body); }
+  .ic { width: 54px; height: 54px; border-radius: var(--airlock-r-tile);
+        display: grid; place-items: center; position: relative; overflow: hidden;
+        background: var(--airlock-surface-2); color: var(--airlock-primary);
+        box-shadow: var(--airlock-shadow);
+        transition: transform var(--airlock-dur-fast) var(--airlock-ease); }
+  .ic::after { content: ""; position: absolute; inset: 0; border-radius: inherit;
+    background:
+      radial-gradient(145% 145% at 0% 0%, rgba(255,255,255,.28), rgba(255,255,255,0) 20%),
+      radial-gradient(145% 145% at 100% 100%, rgba(255,255,255,.14), rgba(255,255,255,0) 22%); }
+  .app:hover .ic { transform: translateY(-3px); box-shadow: var(--airlock-shadow-hover); }
+  .ic svg { width: 26px; height: 26px; }
+  .lb { font-size: var(--airlock-fs-xs); font-weight: 500; text-align: center; }
+
+  /* ── status list ───────────────────────────────────────────────────────── */
+  .card { background: var(--airlock-surface-1); border-radius: var(--airlock-r-lg);
+          padding: var(--airlock-sp-4) var(--airlock-sp-5);
+          box-shadow: var(--airlock-shadow); }
+  .card-h { display: flex; align-items: baseline; gap: 10px;
+            margin-bottom: var(--airlock-sp-2); }
+  .card-t { font-weight: 700; font-size: var(--airlock-fs-sm); }
+  .card-n { font-size: var(--airlock-fs-xs); color: var(--airlock-mute); margin-left: auto; }
+  .row { display: flex; align-items: center; gap: var(--airlock-sp-3);
+         padding: 9px 0; border-top: 1px solid var(--airlock-hairline); }
+  .row:first-of-type { border-top: 0; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none;
+         background: var(--airlock-mute); }
+  .dot.warn { background: var(--airlock-warning); }
+  .dot.dngr { background: var(--airlock-danger); }
+  .row-t { font-size: var(--airlock-fs-sm); flex: 1; min-width: 0;
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+           color: var(--airlock-body); }
+  .row-t.on { color: var(--airlock-ink); font-weight: 500; }
+  .row-s { font-size: var(--airlock-fs-xs); color: var(--airlock-mute); flex: none; }
+  .pill { font-size: 11px; font-weight: 600; padding: 2px 9px;
+          border-radius: var(--airlock-r-pill);
+          background: var(--airlock-surface-2); color: var(--airlock-mute); }
+  .pill.warn { color: var(--airlock-warning); }
+  .pill.dngr { color: var(--airlock-danger); }
+
+  /* ── controls ──────────────────────────────────────────────────────────── */
+  .strip { display: flex; flex-wrap: wrap; gap: var(--airlock-sp-3);
+           align-items: center; }
+  .btn { height: 36px; padding: 0 18px; border-radius: var(--airlock-r-pill);
+         font: 500 var(--airlock-fs-sm)/1 var(--airlock-font); border: 0;
+         cursor: pointer; letter-spacing: var(--airlock-track);
+         background: var(--airlock-primary); color: var(--airlock-on-primary); }
+  .btn.quiet { background: var(--airlock-surface-1); color: var(--airlock-body);
+               border: 1px solid var(--airlock-hairline); }
+  .btn.focus { box-shadow: var(--airlock-focus); }
+  .inp { height: 36px; padding: 0 14px; border-radius: var(--airlock-r-md);
+         background: var(--airlock-surface-1); color: var(--airlock-ink);
+         border: 1px solid var(--airlock-hairline); min-width: 190px;
+         font: 400 var(--airlock-fs-sm)/1 var(--airlock-font); }
+  .inp::placeholder { color: var(--airlock-mute); }
+
+  /* ── text ladder demo ──────────────────────────────────────────────────── */
+  .lad-ink  { color: var(--airlock-ink); font-size: var(--airlock-fs-lg);
+              font-weight: 600; letter-spacing: -.022em; }
+  .lad-body { color: var(--airlock-body); }
+  .lad-mute { color: var(--airlock-mute); font-size: var(--airlock-fs-xs);
+              letter-spacing: var(--airlock-track-caps); text-transform: uppercase;
+              font-weight: 600; }
+  .link { color: var(--airlock-primary); text-decoration: none; font-weight: 500; }
+
+  /* ── 403 ───────────────────────────────────────────────────────────────── */
+  .deny { text-align: center; padding: var(--airlock-sp-8) var(--airlock-sp-4); }
+  .deny .mk { margin-bottom: var(--airlock-sp-4); }
+  .deny h2 { font-size: var(--airlock-fs-h2); margin: 0 0 var(--airlock-sp-2);
+             letter-spacing: -.022em; color: var(--airlock-ink); }
+  .deny p { margin: 0 auto; max-width: 34ch; color: var(--airlock-body);
+            font-size: var(--airlock-fs-sm); }
+
+  /* ── mark ──────────────────────────────────────────────────────────────── */
+  .marks { display: flex; align-items: center; gap: var(--airlock-sp-6);
+           flex-wrap: wrap; }
+  .mk-lbl { font-size: 11px; color: var(--airlock-mute); text-align: center;
+            margin-top: 6px; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1 class="page-h">Airlock — design system, rendered</h1>
+  <p class="page-sub">
+    Every screen below is built from <code>airlock-tokens.css</code> and states no
+    value of its own. Dark on the left is canonical; light on the right is the override.
+  </p>
+
+  <!-- ══ 1. brand mark ══════════════════════════════════════════════════ -->
+  <div class="cap">1 · Brand mark</div>
+  <p class="cap-note">
+    The shipped mark, not a proposal: a white dome over a receding ground grid,
+    seen through a hatch ring. It is generated by <code>bin/gen-hub-icons.py</code>
+    from <code>bin/airlock-mark.png</code>, so the images below are the real
+    <code>favicon.png</code> and <code>apple-touch-icon.png</code> rather than a
+    redrawing of them. The tone moved from green to deep-space navy on
+    2026-08-22; the geometry did not change.
+  </p>
+  <div class="pair">
+    <div class="demo" data-theme="dark">
+      <div class="demo-tag">dark · canonical</div>
+      <div class="marks">
+        <div><img src="/apple-touch-icon.png" width="96" height="96"
+             style="border-radius:21px" alt="Airlock home-screen icon"><div class="mk-lbl">apple-touch-icon · 96</div></div>
+        <div><img src="/apple-touch-icon.png" width="48" height="48"
+             style="border-radius:11px" alt=""><div class="mk-lbl">48</div></div>
+        <div><img src="/favicon.png" width="32" height="32" alt="favicon"><div class="mk-lbl">favicon · 32</div></div>
+        <div><img src="/favicon.png" width="16" height="16" alt=""><div class="mk-lbl">16 · tab</div></div>
+      </div>
+    </div>
+    <div class="demo" data-theme="light">
+      <div class="demo-tag">light</div>
+      <div class="marks">
+        <div><img src="/apple-touch-icon.png" width="96" height="96"
+             style="border-radius:21px" alt=""><div class="mk-lbl">apple-touch-icon · 96</div></div>
+        <div><img src="/apple-touch-icon.png" width="48" height="48"
+             style="border-radius:11px" alt=""><div class="mk-lbl">48</div></div>
+        <div><img src="/favicon.png" width="32" height="32" alt=""><div class="mk-lbl">favicon · 32</div></div>
+        <div><img src="/favicon.png" width="16" height="16" alt=""><div class="mk-lbl">16 · tab</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 2. launcher ════════════════════════════════════════════════════ -->
+  <div class="cap">2 · The launcher — one tile colour, glyphs do the work</div>
+  <p class="cap-note">
+    This is the rule that is hard to believe on paper. Every tile is
+    <code>surface-2</code>; nothing but the glyph tells the tools apart, and it
+    is still faster to scan than five competing hues, because the eye sorts
+    shapes without having to learn what each colour meant.
+  </p>
+  <div class="pair">
+    <div class="demo" data-theme="dark">
+      <div class="demo-tag">dark · canonical</div>
+      <div class="lch-head">
+        <img src="/favicon.png" width="26" height="26" alt="">
+        <span class="lch-title">Airlock</span>
+        <span class="who">josh</span>
+      </div>
+      <div class="sec">Tools</div>
+      <div class="apps">
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M7 10l3 2.5-3 2.5M12.5 15.5h4"/></svg></span><span class="lb">devterm</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/></svg></span><span class="lb">markwand</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M8 8l4-4 4 4"/><path d="M4 15v3.5A1.5 1.5 0 005.5 20h13a1.5 1.5 0 001.5-1.5V15"/></svg></span><span class="lb">publish</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2.5"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span><span class="lb">notepad</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17a8 8 0 1116 0"/><path d="M12 17l4-5"/></svg></span><span class="lb">monitor</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7l-5 5 5 5M15 7l5 5-5 5"/></svg></span><span class="lb">code</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4M9 12v1.5M15 12v1.5"/></svg></span><span class="lb">paseo</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg></span><span class="lb">logs</span></a>
+      </div>
+    </div>
+    <div class="demo" data-theme="light">
+      <div class="demo-tag">light</div>
+      <div class="lch-head">
+        <img src="/favicon.png" width="26" height="26" alt="">
+        <span class="lch-title">Airlock</span>
+        <span class="who">josh</span>
+      </div>
+      <div class="sec">Tools</div>
+      <div class="apps">
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M7 10l3 2.5-3 2.5M12.5 15.5h4"/></svg></span><span class="lb">devterm</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/></svg></span><span class="lb">markwand</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M8 8l4-4 4 4"/><path d="M4 15v3.5A1.5 1.5 0 005.5 20h13a1.5 1.5 0 001.5-1.5V15"/></svg></span><span class="lb">publish</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2.5"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span><span class="lb">notepad</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17a8 8 0 1116 0"/><path d="M12 17l4-5"/></svg></span><span class="lb">monitor</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7l-5 5 5 5M15 7l5 5-5 5"/></svg></span><span class="lb">code</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4M9 12v1.5M15 12v1.5"/></svg></span><span class="lb">paseo</span></a>
+        <a class="app"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg></span><span class="lb">logs</span></a>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 3. status ══════════════════════════════════════════════════════ -->
+  <div class="cap">3 · A status list — where the two state colours earn their keep</div>
+  <p class="cap-note">
+    Six rows are healthy and none of them is green. Healthy is the normal case,
+    so it is simply unremarkable; only the two rows that want a person are
+    coloured, and that is why they are impossible to miss.
+  </p>
+  <div class="pair">
+    <div class="demo" data-theme="dark">
+      <div class="demo-tag">dark · canonical</div>
+      <div class="card">
+        <div class="card-h"><span class="card-t">Services</span><span class="card-n">8 running</span></div>
+        <div class="row"><span class="dot dngr"></span><span class="row-t on">nginx — certificate expires in 2 days</span><span class="pill dngr">act</span></div>
+        <div class="row"><span class="dot warn"></span><span class="row-t on">disk — 87% of 512 GB used</span><span class="pill warn">watch</span></div>
+        <div class="row"><span class="dot"></span><span class="row-t">tailscaled</span><span class="row-s">up 41d</span></div>
+        <div class="row"><span class="dot"></span><span class="row-t">devterm</span><span class="row-s">up 41d</span></div>
+        <div class="row"><span class="dot"></span><span class="row-t">paseo</span><span class="row-s">up 6d</span></div>
+        <div class="row"><span class="dot"></span><span class="row-t">markwand</span><span class="row-s">up 41d</span></div>
+      </div>
+    </div>
+    <div class="demo" data-theme="light">
+      <div class="demo-tag">light</div>
+      <div class="card">
+        <div class="card-h"><span class="card-t">Services</span><span class="card-n">8 running</span></div>
+        <div class="row"><span class="dot dngr"></span><span class="row-t on">nginx — certificate expires in 2 days</span><span class="pill dngr">act</span></div>
+        <div class="row"><span class="dot warn"></span><span class="row-t on">disk — 87% of 512 GB used</span><span class="pill warn">watch</span></div>
+        <div class="row"><span class="dot"></span><span class="row-t">tailscaled</span><span class="row-s">up 41d</span></div>
+        <div class="row"><span class="dot"></span><span class="row-t">devterm</span><span class="row-s">up 41d</span></div>
+        <div class="row"><span class="dot"></span><span class="row-t">paseo</span><span class="row-s">up 6d</span></div>
+        <div class="row"><span class="dot"></span><span class="row-t">markwand</span><span class="row-s">up 41d</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 4. text ladder + controls ══════════════════════════════════════ -->
+  <div class="cap">4 · The text ladder, and controls</div>
+  <p class="cap-note">
+    Three levels of text and no colour between them. This is where hierarchy is
+    supposed to come from; the blue appears only on the things you can click.
+  </p>
+  <div class="pair">
+    <div class="demo" data-theme="dark">
+      <div class="demo-tag">dark · canonical</div>
+      <div class="lad-mute" style="margin-bottom:8px">Session</div>
+      <div class="lad-ink">Your work builds up on one box</div>
+      <p class="lad-body" style="margin:6px 0 16px">
+        Repos, notes, research and the services still running stay on the machine,
+        so the next task starts with what the last one left. <a class="link" href="#">Read the log</a>
+      </p>
+      <div class="strip">
+        <button class="btn">Open terminal</button>
+        <button class="btn quiet">Cancel</button>
+        <button class="btn quiet focus">Focused</button>
+        <input class="inp" placeholder="Search tools…">
+        <span class="pill">41 days</span>
+      </div>
+    </div>
+    <div class="demo" data-theme="light">
+      <div class="demo-tag">light</div>
+      <div class="lad-mute" style="margin-bottom:8px">Session</div>
+      <div class="lad-ink">Your work builds up on one box</div>
+      <p class="lad-body" style="margin:6px 0 16px">
+        Repos, notes, research and the services still running stay on the machine,
+        so the next task starts with what the last one left. <a class="link" href="#">Read the log</a>
+      </p>
+      <div class="strip">
+        <button class="btn">Open terminal</button>
+        <button class="btn quiet">Cancel</button>
+        <button class="btn quiet focus">Focused</button>
+        <input class="inp" placeholder="Search tools…">
+        <span class="pill">41 days</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 5. 403 ═════════════════════════════════════════════════════════ -->
+  <div class="cap">5 · The 403 — the gate is a feature, so it is not an error page</div>
+  <p class="cap-note">
+    Nobody is at fault here and the copy says so plainly. The mark is dimmed
+    rather than replaced with a warning icon: turning the door red would suggest
+    something broke, and nothing did.
+  </p>
+  <div class="pair">
+    <div class="demo" data-theme="dark">
+      <div class="demo-tag">dark · canonical</div>
+      <div class="deny">
+        <div class="mk"><img src="/favicon.png" width="64" height="64" style="opacity:.5" alt=""></div>
+        <h2>This box has an owner</h2>
+        <p>You reached it, but it is not yours. Nothing is wrong — the gate is doing its job.</p>
+      </div>
+    </div>
+    <div class="demo" data-theme="light">
+      <div class="demo-tag">light</div>
+      <div class="deny">
+        <div class="mk"><img src="/favicon.png" width="64" height="64" style="opacity:.5" alt=""></div>
+        <h2>This box has an owner</h2>
+        <p>You reached it, but it is not yours. Nothing is wrong — the gate is doing its job.</p>
+      </div>
+    </div>
+  </div>
+
+  </div>
+</body>
+</html>

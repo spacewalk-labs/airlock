@@ -94,8 +94,8 @@ APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 APP_DEFAULTS: dict[str, dict] = {
     # *_port pairs: http_port/public_port are PLAINTEXT tailnet ports that only
     # 301 to https (served by the loopback redirect_port) — no content, ever.
-    "hub":         {"https_port": 443, "http_port": 9999, "nginx_port": 18802,
-                    "redirect_port": 18806},
+    "hub":         {"https_port": 443, "http_port": 19901, "nginx_port": 19902,
+                    "redirect_port": 19903},
 }
 
 # Accepted in ANY app table (not a default: they carry no value when absent).
@@ -619,6 +619,7 @@ def cmd_validate(cfg: dict) -> "None":
                 f"— configure [packages.{name}].path to point at its "
                 f"manifest, or remove [apps.{name}] if this was a typo.")
     _validate_keys(cfg)
+    validate_shortcuts(cfg)
     _warn_deprecated_config(cfg, specs)
     _validate_code_root(cfg)
     _validate_ports(cfg)
@@ -650,7 +651,7 @@ def _validate_shape(cfg: dict) -> "None":
     for section, val in cfg.items():
         if not isinstance(val, dict):
             die(f"[{section}] must be a table; got {val!r}")
-    known = set(CLOSED_SECTIONS) | {"apps", "packages"}
+    known = set(CLOSED_SECTIONS) | {"apps", "packages", "shortcuts"}
     unknown = sorted(s for s in cfg if s not in known)
     if unknown:
         die("unknown config section(s): " + ", ".join(f"[{s}]" for s in unknown)
@@ -660,6 +661,10 @@ def _validate_shape(cfg: dict) -> "None":
         _validate_app_name(name)
         if not isinstance(table, dict):
             die(f"[apps.{name}] must be a table; got {table!r}")
+    for name, table in (cfg.get("shortcuts") or {}).items():
+        _validate_app_name(name)
+        if not isinstance(table, dict):
+            die(f"[shortcuts.{name}] must be a table; got {table!r}")
 
 
 def _validate_app_name(name: str) -> "None":
@@ -1268,7 +1273,7 @@ def _recorded_claims(ledger: dict, skip_id: str, roots: dict):
 
 
 def _builtin_plaintext_ports(cfg: dict, pkgs: dict) -> set:
-    """Listen ports the built-in plaintext sweep will map (hub's 9999 and any
+    """Listen ports the built-in plaintext sweep will map (hub's 19901 and any
     configured http_port/public_port on a non-packaged app)."""
     ports = set()
     for name, table in resolved(cfg).get("apps", {}).items():
@@ -1311,7 +1316,7 @@ def _validate_disjoint(pkgs: dict, cfg: dict) -> "None":
     # pool as serve ports (Major N1): the intra-app check in
     # packages_resolved stops at this package's own boundary, so without
     # this, a distinct package's redirect public port — or the built-in
-    # registry's (hub's 9999, e.g.) — was invisible to every check below.
+    # registry's (hub's 19901, e.g.) — was invisible to every check below.
     serve = {pid: set(p["serve_port_values"].values()) | set(p.get("plaintext_redirect_ports") or [])
             for pid, p in pkgs.items()}
     ids = sorted(pkgs)
@@ -1628,6 +1633,60 @@ def _validate_prereqs(pid: str, raw) -> list:
             rec[field] = v.strip()
         out.append(rec)
     return out
+
+
+_SHORTCUT_KEYS = ("label", "url", "cat", "glyph", "sub")
+
+
+def validate_shortcuts(cfg: dict) -> "None":
+    """[shortcuts.<id>] — a tile that sends you somewhere else, with nothing installed.
+
+    A shortcut is the honest shape for a service this box does not run: the
+    company chat, a GPU host's UI, another box's console. It is NOT a way to
+    skip packaging an app that belongs on this box — a shortcut points at
+    something that already exists somewhere, so on a fresh box it points at
+    nothing. Per-box personal apps stay packages for exactly that reason.
+
+    Deliberately narrower than a package [tile]:
+      * `url` is required and must be https. A shortcut leaves this origin, and
+        plain http here is the mixed-content/HSTS trap that took a whole demo
+        down on 2026-08-21 — the browser, not the config, decides that fight.
+      * `glyph` only (no `icon`): an icon file is staged out of a package, and a
+        shortcut has no package to stage from.
+    """
+    shortcuts = cfg.get("shortcuts") or {}
+    if not shortcuts:
+        return
+    app_names = set(cfg.get("apps") or {})
+    for sid, raw in shortcuts.items():
+        where = f"[shortcuts.{sid}]"
+        if sid in app_names:
+            die(f"{where} collides with [apps.{sid}]. One id renders one tile — "
+                f"rename the shortcut, or drop the app table if the app moved "
+                f"off this box.")
+        unknown = sorted(k for k in raw if k not in _SHORTCUT_KEYS)
+        if unknown:
+            die(f"{where} unknown key(s): {', '.join(unknown)}. "
+                f"Shortcut fields are {list(_SHORTCUT_KEYS)}.")
+        label = raw.get("label")
+        if not isinstance(label, str) or not label.strip():
+            die(f"{where} label must be a non-empty string; got {label!r}")
+        url = raw.get("url")
+        if not isinstance(url, str) or not url.startswith("https://") or len(url) <= len("https://"):
+            die(f"{where} url must be an absolute https:// address; got {url!r}. "
+                f"A shortcut leaves this origin, so http would be blocked as "
+                f"mixed content (and would arm HSTS on the target host).")
+        cat = raw.get("cat")
+        if cat not in _TILE_CATS:
+            die(f"{where} cat must be one of {list(_TILE_CATS)} "
+                f"(the hub's palette); got {cat!r}")
+        glyph = raw.get("glyph")
+        if not isinstance(glyph, str) or not glyph.strip():
+            die(f"{where} glyph must be a non-empty symbol id (a shortcut has no "
+                f"package to stage an icon file from); got {glyph!r}")
+        sub = raw.get("sub", "")
+        if not isinstance(sub, str):
+            die(f"{where} sub must be a string; got {sub!r}")
 
 
 def _validate_tile(pid: str, raw):
@@ -4054,6 +4113,19 @@ def cmd_webjson(cfg: dict) -> "None":
                     tile["icon"] = "/" + spec["icon"]["dest"]
                 entry["tile"] = tile
         apps[name] = entry
+    # [shortcuts.<id>] — tiles for things this box does not run. They carry no
+    # port and no package: the launcher already renders `tile.path` verbatim as
+    # the href, so an absolute https URL needs no renderer change. external=true
+    # because a shortcut leaves this origin (new tab, same rule as any
+    # third-party service).
+    for sid, raw in (r.get("shortcuts") or {}).items():
+        apps[sid] = {
+            "external": True,
+            "shortcut": True,
+            "tile": {"label": raw["label"], "sub": raw.get("sub", ""),
+                     "cat": raw["cat"], "path": raw["url"],
+                     "glyph": raw["glyph"]},
+        }
     out = {
         "product": r.get("branding", {}).get("product", "Airlock"),
         "site": r.get("site", {}).get("name", "Airlock"),

@@ -29,8 +29,8 @@ degrade to a clean "disabled" response when their dependencies are absent.
 Env:
   AIRLOCK_IDENTITY_HEADER  identity header name (e.g. Tailscale-User-Login)
   AIRLOCK_OWNER            comma-separated allow-list of logins (owner)
-  DEVTERM_LISTEN_HOST/PORT this gate's loopback bind (default 127.0.0.1:9912)
-  DEVTERM_TTYD_HOST/PORT   ttyd backend (default 127.0.0.1:9911)
+  DEVTERM_LISTEN_HOST/PORT this gate's loopback bind (default 127.0.0.1:19913)
+  DEVTERM_TTYD_HOST/PORT   ttyd backend (default 127.0.0.1:19912)
   DEVTERM_WEB              web root to serve (the custom client)
   AIRLOCK_CODE_ROOT        code root for the markwand file-open (optional)
   DEVTERM_MARKWAND         "true" to enable the terminal file-path -> markwand link
@@ -73,9 +73,9 @@ ALLOW = {s.strip().lower() for s in os.environ.get("AIRLOCK_OWNER", "").split(",
 # Empty = local sessions only. Fully inert when unset.
 REMOTE_HOSTS = [h.strip() for h in os.environ.get("DEVTERM_REMOTE_HOSTS", "").split(",") if h.strip()]
 LISTEN_HOST = os.environ.get("DEVTERM_LISTEN_HOST", "127.0.0.1")
-LISTEN_PORT = int(os.environ.get("DEVTERM_LISTEN_PORT", "9912"))
+LISTEN_PORT = int(os.environ.get("DEVTERM_LISTEN_PORT", "19913"))
 TTYD_HOST = os.environ.get("DEVTERM_TTYD_HOST", "127.0.0.1")
-TTYD_PORT = int(os.environ.get("DEVTERM_TTYD_PORT", "9911"))
+TTYD_PORT = int(os.environ.get("DEVTERM_TTYD_PORT", "19912"))
 WEB_ROOT = os.path.realpath(os.environ.get("DEVTERM_WEB", os.path.expanduser("~/.local/share/airlock-devterm/web")))
 
 # ---- optional feature config (all degrade to disabled when unset/absent) ----

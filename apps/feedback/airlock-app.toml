@@ -15,7 +15,7 @@ runtime_env = [
 ]
 
 [config.defaults]
-backend_port = 18805
+backend_port = 19924
 intake_url = "https://your-intake.example"
 token_env = "AIRLOCK_FEEDBACK_TOKEN"
 mail_to = ""

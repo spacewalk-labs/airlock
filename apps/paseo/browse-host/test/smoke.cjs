@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // Network-free smoke of the executor against the installed Playwright/Chromium.
 // Proves chromium launches, ai-mode snapshot yields @e refs, ref actions work,

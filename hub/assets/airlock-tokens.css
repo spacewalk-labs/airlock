@@ -1,0 +1,177 @@
+/*
+ * airlock-tokens.css — the single source of truth for Airlock's design values.
+ *
+ * The palette is 11 colours in four groups, and the naming is what makes it
+ * read as four things rather than eleven. `canvas / surface-1 / surface-2 /
+ * hairline` is one ladder; `ink / body / mute` is another. The names follow the
+ * house style shared by warp, ollama and linear.app, so anyone who has read one
+ * of those can read this without a legend.
+ *
+ * Rules, in the order they resolve disputes:
+ *
+ *   1. One primary colour. Information, emphasis, links, focus and normal
+ *      state are all the same blue.
+ *   2. Hierarchy comes from the two ladders, not from hue. If something needs
+ *      to recede, drop it from `ink` to `body` to `mute` — do not colour it.
+ *   3. Colour carries state and interaction. Never decoration.
+ *   4. Components read tokens. No raw hex outside this file.
+ *   5. A token's name and its value must agree. If a value stops matching its
+ *      name, rename the token. (Renames only get more expensive; the
+ *      references always outnumber the courage.)
+ *   6. Dark is canonical. Light is the override.
+ *
+ * There is no success colour. "Working" is the normal case, and the normal
+ * case is unremarkable — colouring it green makes every healthy row shout, and
+ * a reader who learns that a colour means nothing stops reading colour at all.
+ * linear.app ships one semantic colour and warp ships none; two is already
+ * generous for a tool this size.
+ *
+ * Contrast: every foreground/background pair is verified against WCAG AA by
+ * install/test-design-tokens.py, which fails the build rather than warning. A
+ * neutral that "looks about right" is exactly how a 3.3:1 grey ships.
+ */
+
+:root {
+  /* ─── Surfaces — one ladder, deep space ───────────────────────────────
+     Anchored on the navy already shipped as the hub's `theme-color`.
+     Deliberately not pure black: the dark tool surfaces have to stay visible
+     against it, and pure black flattens every elevation cue above it. */
+  --airlock-canvas:      #0a0f1e;   /* the page */
+  --airlock-surface-1:   #141b2e;   /* cards, panels, raised rows */
+  --airlock-surface-2:   #1d2740;   /* nested surface, hover fill, app tile */
+  --airlock-hairline:    #2b3752;   /* borders. never a text colour */
+
+  /* ─── Text — the other ladder ─────────────────────────────────────────
+     Three weights, not two. This is where hierarchy comes from; reaching for
+     a colour instead is how a palette grows without anyone deciding to. */
+  --airlock-ink:         #f5f5f7;   /* primary text */
+  --airlock-body:        #c3cbd9;   /* secondary text, long-form */
+  --airlock-mute:        #8b93a5;   /* labels, timestamps, disabled */
+
+  /* ─── Primary — the only strong colour on a screen ───────────────────── */
+  --airlock-primary:     #2997ff;
+  --airlock-on-primary:  #0a0f1e;   /* text placed ON the primary */
+
+  /* ─── State — reserved, never decorative ─────────────────────────────── */
+  --airlock-warning:     #ffb340;
+  --airlock-danger:      #ff6961;
+
+  /* ─── Edges and elevation ─────────────────────────────────────────────
+     In dark, a shadow alone does not separate two dark surfaces, so the 1px
+     white rim is what makes elevation readable at all. It is not ornament. */
+  --airlock-edge:         rgba(255, 255, 255, .10);
+  --airlock-shadow:       0 3px 10px -2px rgba(0, 0, 0, .55),
+                          0 0 0 1px rgba(255, 255, 255, .06);
+  --airlock-shadow-hover: 0 10px 20px -5px rgba(0, 0, 0, .60),
+                          0 0 0 1px rgba(255, 255, 255, .08);
+  --airlock-focus:        0 0 0 3px rgba(41, 151, 255, .30);
+
+  /* ─── Typography ──────────────────────────────────────────────────────
+     17px body at 1.5 with -0.022em tracking is the shipped hub setting and
+     stays. Sizes are literal px, not a computed scale: a scale would imply
+     the steps are derived, and they are not — they were chosen. */
+  --airlock-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                  "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+  --airlock-font-mono: "SF Mono", SFMono-Regular, "JetBrains Mono",
+                       "Cascadia Code", Consolas, D2Coding, monospace;
+
+  --airlock-fs-body:  17px;
+  --airlock-fs-lg:    20px;
+  --airlock-fs-sm:    15px;
+  --airlock-fs-xs:    13px;
+  --airlock-fs-h1:    28px;
+  --airlock-fs-h2:    21px;
+
+  --airlock-lh:         1.5;
+  --airlock-track:      -0.022em;   /* body and headings */
+  --airlock-track-caps: 0.04em;     /* uppercase labels only */
+
+  --airlock-fw-regular:  400;
+  --airlock-fw-medium:   500;
+  --airlock-fw-semibold: 600;
+  --airlock-fw-bold:     700;
+
+  /* ─── Radius ──────────────────────────────────────────────────────────
+     Four steps and a pill. The 15px app tile is the iOS squircle radius the
+     launcher already ships and is kept as its own step rather than folded
+     into the scale — at 60px the difference from 14px or 16px is visible. */
+  --airlock-r-sm:   8px;
+  --airlock-r-md:   12px;
+  --airlock-r-lg:   14px;
+  --airlock-r-tile: 15px;
+  --airlock-r-pill: 999px;
+
+  /* ─── Spacing — 4px base ──────────────────────────────────────────────── */
+  --airlock-sp-1:  4px;
+  --airlock-sp-2:  8px;
+  --airlock-sp-3:  12px;
+  --airlock-sp-4:  16px;
+  --airlock-sp-5:  20px;
+  --airlock-sp-6:  24px;
+  --airlock-sp-8:  32px;
+  --airlock-sp-12: 48px;
+
+  /* ─── Motion ──────────────────────────────────────────────────────────── */
+  --airlock-ease:     cubic-bezier(.2, .8, .2, 1);
+  --airlock-dur-fast: 160ms;
+  --airlock-dur-slow: 250ms;
+}
+
+/* ─── Light — derived, not canonical ─────────────────────────────────────── */
+@media (prefers-color-scheme: light) {
+  :root {
+    --airlock-canvas:     #f5f5f7;
+    --airlock-surface-1:  #ffffff;
+    --airlock-surface-2:  #eceff2;
+    --airlock-hairline:   #d2d2d7;
+
+    --airlock-ink:        #1d1d1f;
+    --airlock-body:       #4a4a4f;
+    --airlock-mute:       #646469;
+
+    --airlock-primary:    #0066cc;
+    --airlock-on-primary: #ffffff;
+
+    --airlock-warning:    #9a6700;
+    --airlock-danger:     #cf222e;
+
+    --airlock-edge:         rgba(0, 0, 0, .06);
+    --airlock-shadow:       0 3px 8px -2px rgba(0, 0, 0, .20),
+                            0 1px 2px rgba(0, 0, 0, .10);
+    --airlock-shadow-hover: 0 9px 18px -5px rgba(0, 0, 0, .28),
+                            0 2px 5px rgba(0, 0, 0, .12);
+    --airlock-focus:        0 0 0 3px rgba(0, 102, 204, .30);
+  }
+}
+
+/* Explicit overrides, for the theme toggle and for embedding one theme inside
+   the other. Same values as above. */
+[data-theme="light"] {
+  --airlock-canvas:     #f5f5f7;
+  --airlock-surface-1:  #ffffff;
+  --airlock-surface-2:  #eceff2;
+  --airlock-hairline:   #d2d2d7;
+  --airlock-ink:        #1d1d1f;
+  --airlock-body:       #4a4a4f;
+  --airlock-mute:       #646469;
+  --airlock-primary:    #0066cc;
+  --airlock-on-primary: #ffffff;
+  --airlock-warning:    #9a6700;
+  --airlock-danger:     #cf222e;
+  --airlock-edge:       rgba(0, 0, 0, .06);
+}
+
+[data-theme="dark"] {
+  --airlock-canvas:     #0a0f1e;
+  --airlock-surface-1:  #141b2e;
+  --airlock-surface-2:  #1d2740;
+  --airlock-hairline:   #2b3752;
+  --airlock-ink:        #f5f5f7;
+  --airlock-body:       #c3cbd9;
+  --airlock-mute:       #8b93a5;
+  --airlock-primary:    #2997ff;
+  --airlock-on-primary: #0a0f1e;
+  --airlock-warning:    #ffb340;
+  --airlock-danger:     #ff6961;
+  --airlock-edge:       rgba(255, 255, 255, .10);
+}

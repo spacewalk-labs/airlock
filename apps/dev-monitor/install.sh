@@ -121,6 +121,28 @@ if [ -n "$COMPAT_ENV" ]; then
     || die "compatibility env path must be absent or a regular file"
 fi
 
+# The spool is written by a SECOND UID, which therefore has to traverse every directory
+# above it. The one in the way is Airlock's own state directory: install/airlock-install.sh
+# creates it 0700, which is right for a directory holding the ledger and wrong for a
+# parent this app needs a foreign uid to walk through. So widen exactly that one bit,
+# here, where it is the OPERATOR doing it to their own directory — no sudo, and nothing
+# root-owned is involved.
+#
+# `o+x` and not `o+rx`: traverse, never list. The ledger beside us stays 0600 and the
+# directory stays unlistable, so what this grants is the ability to reach a path you
+# already know the name of, which is the whole requirement. Group would be narrower
+# still, but chgrp to a group the operator does not belong to needs root, and
+# install/test-monitor-spool-hardening.sh deliberately forbids root from touching the
+# user-owned state path at all.
+#
+# Measured 2026-08-22: without this the install dies in install-spool-hardening.sh's
+# cross-UID check, which is the check written to catch precisely this.
+_devmon_state_parent="$(dirname "$DEVMON_STATE")"
+if [ -d "$_devmon_state_parent" ]; then
+  chmod o+x "$_devmon_state_parent" \
+    || die "cannot make $_devmon_state_parent traversable for the spool writer"
+fi
+
 # Establish (or remove, when messages=false) the system-scope writer boundary before
 # rendering or restarting the user service. The rendered unit independently checks that
 # the firewall unit is active, so a missing rule fails closed on every later restart too.

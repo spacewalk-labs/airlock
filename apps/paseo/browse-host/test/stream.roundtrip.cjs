@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // Level 2 (§14.5/§14.8) live-stream transport e2e against real Chromium.
 // Proves: WS handshake -> ensureTab create-on-demand -> CDP jpeg screencast frame

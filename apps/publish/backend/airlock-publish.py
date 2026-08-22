@@ -53,7 +53,7 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.expanduser(os.environ.get('AIRLOCK_PUBLISH_SHARE_DIR', '~/public_html'))
-PORT = int(os.environ.get('AIRLOCK_PUBLISH_BACKEND_PORT', '18803'))
+PORT = int(os.environ.get('AIRLOCK_PUBLISH_BACKEND_PORT', '19922'))
 UPLOADS = os.path.expanduser(os.environ.get('AIRLOCK_PUBLISH_UPLOADS_DIR', '~/uploads'))
 HOME = os.path.expanduser('~')
 IDENTITY_HEADER = os.environ.get('AIRLOCK_IDENTITY_HEADER', 'Tailscale-User-Login')

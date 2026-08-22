@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // paseo-browse-host: a loopback WebSocket client that registers as a Paseo
 // browser automation host and drives headless Chromium via the executor.
@@ -17,7 +17,7 @@ const WS_PROTOCOL_VERSION = 1;
 
 function readConfig(env) {
   return {
-    wsUrl: env.PASEO_WS_URL || "ws://127.0.0.1:6767/ws",
+    wsUrl: env.PASEO_WS_URL || "ws://127.0.0.1:19952/ws",
     clientId: env.PASEO_HOST_CLIENT_ID || "airlock-paseo-browse-host",
     hostKind: env.PASEO_HOST_KIND || "server",
     // Optional daemon bearer token, sent as the `paseo.bearer.<token>` subprotocol.
@@ -30,7 +30,7 @@ function readConfig(env) {
     // owner-gates /browse-view/. Disabled with PASEO_BROWSE_STREAM_DISABLED=1.
     streamEnabled: env.PASEO_BROWSE_STREAM_DISABLED ? false : true,
     streamHost: env.PASEO_BROWSE_STREAM_HOST || "127.0.0.1",
-    streamPort: Number(env.PASEO_BROWSE_STREAM_PORT || 6768),
+    streamPort: Number(env.PASEO_BROWSE_STREAM_PORT || 19953),
     maxStreams: Number(env.PASEO_BROWSE_MAX_STREAMS || 4),
     // Exact allowed WS Origin(s) (CSWSH defense, §14.8). install.sh sets the box
     // FQDN origin; unset = warn-once + allow (owner gate still enforced).

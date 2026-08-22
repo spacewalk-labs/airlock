@@ -112,7 +112,7 @@ x86_64-only when this was written now pin arm64 assets — code-server
 
 | App | In-container status | Notes |
 |---|---|---|
-| hub | ✅ | static + nginx; the entrance |
+| hub | ✅ | static + nginx; the entry point |
 | paseo | ✅ (cleanest) | pure Node; binds loopback; needs agent CLIs (claude/codex/gemini) on PATH |
 | markwand, publish, notepad, dev-monitor | ✅ | Node/Python backends, loopback |
 | devterm | ✅ | needs PTY (`/dev/pts`) — present in OrbStack |
@@ -170,7 +170,7 @@ avoids the emulation entirely; the drop-in is harmless there anyway.
 - Upstream downloads under Rosetta succeeded (ttyd, filebrowser, markserv/paseo
   via npm).
 - `tailscale up` created the resident node and `tailscale serve --https=443`
-  exposed the hub; the entrance returned **200** to the owner over the tailnet
+  exposed the hub; the entry point returned **200** to the owner over the tailnet
   and `/whoami` reported the owner login.
 - The identity gate was confirmed at the loopback nginx: **owner=200,
   non-owner=403, no-header=403**.
@@ -184,5 +184,5 @@ avoids the emulation entirely; the drop-in is harmless there anyway.
 hence opt-in), and code-server (arm64 or amd64 — both assets pinned) end-to-end.
 
 **Recommended first run:** enable only hub + paseo + devterm + markwand +
-publish + notepad + dev-monitor + code-server (orca off). Confirm the entrance
+publish + notepad + dev-monitor + code-server (orca off). Confirm the entry point
 and one agent app end-to-end, then decide whether orca is worth its cost.

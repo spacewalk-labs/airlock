@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 
 // Real Chromium companion e2e: roster -> dock -> viewer canvas -> terminal close.

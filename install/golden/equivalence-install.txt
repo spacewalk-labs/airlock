@@ -13,7 +13,7 @@ ok: config valid
 [dry] sudo chmod o+x /opt/airlock
 [dry] sudo chown USER:GROUP /opt/airlock/share
 [dry] mkdir -p TMP/home/uploads
-[airlock] [dry] write TMP/home/.config/systemd/user/airlock-publish.service (127.0.0.1:18803, share=/opt/airlock/share)
+[airlock] [dry] write TMP/home/.config/systemd/user/airlock-publish.service (127.0.0.1:19922, share=/opt/airlock/share)
 [dry] systemctl --user daemon-reload
 [dry] systemctl --user enable airlock-publish.service airlock-publish-cleanup.timer
 [dry] systemctl --user restart airlock-publish.service
@@ -29,14 +29,14 @@ ok: config valid
 [airlock] [dry] download+verify ttyd 1.7.7 -> TMP/home/.local/bin/ttyd
 [dry] install -D -m755 ROOT/apps/devterm/bin/devterm-shell TMP/home/.local/bin/devterm-shell
 [airlock] [dry] install web/ -> TMP/home/.local/share/airlock-devterm/web (index.html config={"accounts":false,"xai":false,"markwand":false,"orca":false}, + ui.js/popup.css/panel.html)
-[airlock] [dry] write TMP/home/.config/systemd/user/airlock-devterm.service (ttyd -i 127.0.0.1 -p 9911)
-[airlock] [dry] write TMP/home/.config/systemd/user/airlock-devterm-gate.service (127.0.0.1:9912; accounts=false xai=false markwand=false orca=false)
+[airlock] [dry] write TMP/home/.config/systemd/user/airlock-devterm.service (ttyd -i 127.0.0.1 -p 19912)
+[airlock] [dry] write TMP/home/.config/systemd/user/airlock-devterm-gate.service (127.0.0.1:19913; accounts=false xai=false markwand=false orca=false)
 [dry] systemctl --user daemon-reload
 [dry] systemctl --user enable airlock-devterm.service airlock-devterm-gate.service
 [airlock] [dry] restart ttyd/gate units if changed
 [airlock] wrote nginx fragment: TMP/confd/servers.d/devterm.conf
 [airlock] devterm installed (owner: me@example.com; accounts=false, xai=false, markwand=false, orca=false)
-[dry] sudo tailscale serve --bg --https=8443 http://127.0.0.1:9910
+[dry] sudo tailscale serve --bg --https=19910 http://127.0.0.1:19911
 [airlock] rendering nginx site -> /etc/nginx/conf.d/airlock.conf
 [airlock] [dry] render-nginx.sh > /etc/nginx/conf.d/airlock.conf
 [dry] sudo nginx -t
@@ -44,8 +44,8 @@ ok: config valid
 [dry] loginctl enable-linger USER
 [dry] sudo systemctl enable nginx
 [dry] sudo systemctl enable tailscaled
-[dry] sudo tailscale serve --bg --https=443 http://127.0.0.1:18802
-[airlock] plaintext ingress: :9999 -> 301 https (hub)
-[dry] sudo tailscale serve --bg --http=9999 http://127.0.0.1:18806
+[dry] sudo tailscale serve --bg --https=443 http://127.0.0.1:19902
+[airlock] plaintext ingress: :19901 -> 301 https (hub)
+[dry] sudo tailscale serve --bg --http=19901 http://127.0.0.1:19903
 [airlock] serve check skipped: AIRLOCK_DRY_RUN=1 (nothing is serving)
-[airlock] done (dry run — nothing was changed). Entrance would be: https://<your-box>.<tailnet>.ts.net/
+[airlock] done (dry run — nothing was changed). You would open: https://<your-box>.<tailnet>.ts.net/

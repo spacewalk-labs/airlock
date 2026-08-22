@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 const assert = require("node:assert/strict");
 const { isTerminalCloseCode, applyRosterMessage, closeAction } = require("../web/browse-view-client.js");
 

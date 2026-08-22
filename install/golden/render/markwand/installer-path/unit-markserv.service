@@ -1,5 +1,5 @@
 [Unit]
-Description=airlock markserv — markdown viewer for TMP/code (127.0.0.1:18799)
+Description=airlock markserv — markdown viewer for TMP/code (127.0.0.1:19920)
 After=network.target
 
 [Service]
@@ -12,7 +12,7 @@ WorkingDirectory=TMP/code
 # — see airlock_cmd_dirs in install/lib.sh.
 Environment=PATH=WDIR/home/.local/bin:NODE_BIN:/usr/local/bin:/usr/bin:/bin
 # --livereloadport false: no chokidar watcher (avoids EACCES on symlinked trees)
-ExecStart=WDIR/home/.local/bin/markserv --address 127.0.0.1 --port 18799 --livereloadport false --browser false --silent TMP/code
+ExecStart=WDIR/home/.local/bin/markserv --address 127.0.0.1 --port 19920 --livereloadport false --browser false --silent TMP/code
 Restart=on-failure
 RestartSec=3
 

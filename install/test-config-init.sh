@@ -61,9 +61,9 @@ while read -r key expected; do
   got="$(AIRLOCK_CONFIG="$scratch/full.toml" "$CFG" get "$key" 2>/dev/null)"
   [ "$got" = "$expected" ] || { bad "defaulted port $key resolved to '$got', expected $expected"; ports_ok=0; }
 done <<'PORTS'
-apps.hub.nginx_port 18802
-apps.devterm.ttyd_port 9911
-apps.paseo.backend_port 6767
+apps.hub.nginx_port 19902
+apps.devterm.ttyd_port 19912
+apps.paseo.backend_port 19952
 PORTS
 [ "$ports_ok" = 1 ] && ok "ports nobody typed resolve to the manifest defaults"
 

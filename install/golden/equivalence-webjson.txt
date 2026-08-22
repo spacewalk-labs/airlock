@@ -3,7 +3,7 @@
     "devterm": {
       "audience": "owner",
       "packaged": true,
-      "port": 8443,
+      "port": 19910,
       "source_class": "shipped",
       "tile": {
         "cat": "coding",

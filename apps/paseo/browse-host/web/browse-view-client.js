@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 /* paseo-browse-host — live browser panel companion (task doc §14.2).
  *
  * Loaded by the self-hosted paseo web-ui (index.html <script>, injected at

@@ -46,7 +46,7 @@ def main() -> None:
         'AIRLOCK_CUTOVER_SLACK_ROUTINE_ENV',
         'DEV_MONITOR_SLACK_WEBHOOK',
     )
-    backend_port = value('AIRLOCK_CUTOVER_BACKEND_PORT', '18804')
+    backend_port = value('AIRLOCK_CUTOVER_BACKEND_PORT', '19923')
     spool_writer_user = value(
         'AIRLOCK_CUTOVER_SPOOL_WRITER_USER', 'airlock-dev-monitor-writer')
     spool_writer_group = value(
@@ -74,9 +74,9 @@ product = "Airlock"
 
 [apps.hub]
 https_port = 443
-http_port = 9999
-nginx_port = 18802
-redirect_port = 18806
+http_port = 19901
+nginx_port = 19902
+redirect_port = 19903
 
 [apps.dev-monitor]
 backend_port = {backend_port}

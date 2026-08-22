@@ -56,6 +56,11 @@ else
   # suffix, and the same blind spot in the python-compile step is why
   # bin/airlock-config had never been compiled by CI (see ci.yml's note there).
   #
+  # `Update Airlock.command` is named because the directory globs are all subtrees and
+  # it is the one shipped shell script at the root. A blind spot the shape of "one file
+  # in an unlisted directory" is exactly what the shebang detection above exists for,
+  # and it does not help if the pathspec never reaches the file.
+  #
   # --others --exclude-standard alongside --cached, for the same reason the leak
   # scan passes --untracked: in CI nothing is untracked and it changes nothing, and
   # locally it is the difference between scanning the file you just wrote and
@@ -64,6 +69,7 @@ else
   while IFS= read -r f; do files+=("$ROOT/$f"); done < <(
     git -C "$ROOT" ls-files --cached --others --exclude-standard \
       -- 'bin/*' 'install/*' 'gate/*' 'apps/*' 'hub/*' 'live/*' \
+         'Update Airlock.command' \
       | while IFS= read -r rel; do
           case "$rel" in
             *.sh) printf '%s\n' "$rel" ;;

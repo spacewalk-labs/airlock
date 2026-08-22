@@ -523,7 +523,7 @@ f="$(out_file)"; render_to "$f" render_paseo_unit "$UNIT_PATH" "$HOME_VAL" "$FQD
 golden_check_file "paseo/snap-override/unit.service" "$f"
 
 GATE_PORT=19702; WIDGET="/opt/airlock/hub/assets/airlock-return.js"
-BROWSE_WS_PORT=6768
+BROWSE_WS_PORT=19953
 CONFD_FIXTURE="/etc/airlock/nginx"
 
 for SET in browse-off browse-on icon-on icon-on-variants no-widget-menu; do

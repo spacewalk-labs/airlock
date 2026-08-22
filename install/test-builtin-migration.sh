@@ -2297,11 +2297,11 @@ expect_fail "MAJOR N1: package-vs-package collision (redirect public vs serve po
 reset_box
 n1_hub="$PKGROOT/n1-hub"
 mkpkg "$n1_hub" n1-hub 'contract = 1' 'id = "n1-hub"' \
-  '[config.defaults]' 'pub = 9999' 'red = 16961' \
+  '[config.defaults]' 'pub = 19901' 'red = 16961' \
   '[plaintext_redirect]' 'pub = "red"'
 cfg_n1hub="$CFGROOT/n1-hub.toml"
 { base_config; printf '[apps.n1-hub]\n'; } >"$cfg_n1hub"
-expect_fail "MAJOR N1: package-vs-built-in collision (redirect public vs hub's 9999) is fatal" \
+expect_fail "MAJOR N1: package-vs-built-in collision (redirect public vs hub's 19901) is fatal" \
   "built-in app's plaintext mapping already owns" run "$cfg_n1hub" validate
 
 reset_box

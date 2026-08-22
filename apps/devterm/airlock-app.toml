@@ -4,10 +4,10 @@ id = "devterm"
 # Transcribed from the former APP_DEFAULTS["devterm"] entry.
 # D-DEVTERM-9900 retired public_port/redirect_port. HTTPS only.
 [config.defaults]
-https_port = 8443
-gate_port = 9910
-ttyd_port = 9911
-backend_port = 9912
+https_port = 19910
+gate_port = 19911
+ttyd_port = 19912
+backend_port = 19913
 font_size = 15
 lang = "C.UTF-8"
 accounts = false

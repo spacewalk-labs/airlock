@@ -13,7 +13,7 @@ runtime_env = [
 ]
 
 [config.defaults]
-backend_port = 18804
+backend_port = 19923
 messages = false
 # Canonical per-lane webhook indirection. Values are environment-variable names,
 # never webhook URLs. The legacy slack_webhook_env remains an urgent-only alias

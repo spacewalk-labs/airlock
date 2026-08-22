@@ -1,12 +1,12 @@
 [Unit]
-Description=airlock feedback — suggestion-box relay (127.0.0.1:18805)
+Description=airlock feedback — suggestion-box relay (127.0.0.1:19924)
 After=network.target
 
 [Service]
 Type=simple
 # Optional secret (the intake token) — safe if the file is absent.
 EnvironmentFile=-%h/.config/airlock-feedback.env
-Environment=AIRLOCK_FEEDBACK_BACKEND_PORT=18805
+Environment=AIRLOCK_FEEDBACK_BACKEND_PORT=19924
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
 Environment=AIRLOCK_FEEDBACK_INTAKE_URL=https://your-intake.example
 Environment=AIRLOCK_FEEDBACK_TOKEN_ENV=AIRLOCK_FEEDBACK_TOKEN

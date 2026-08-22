@@ -223,15 +223,43 @@ expect_dir "$DEVMON_STATE/spool" 710 "$operator" "$WRITER_GROUP"
 expect_dir "$DEVMON_STATE" 710 "$operator" "$WRITER_GROUP"
 expect_dir "$DEVMON_STATE/spool/tmp" 3770 "$operator" "$WRITER_GROUP"
 expect_dir "$DEVMON_STATE/spool/new" 3770 "$operator" "$WRITER_GROUP"
+# Walk up until the writer can traverse, and name the first one it cannot. Without this
+# the operator is told about a leaf whose own mode is correct — the block is upstream.
+first_blocking_ancestor() {
+  local path="$1" blocking="$1"
+  while [ "$path" != / ] && [ -n "$path" ]; do
+    sudo -u "$WRITER_USER" test -x "$path" || blocking="$path"
+    path="$(dirname "$path")"
+  done
+  printf '%s' "$blocking"
+}
+
 expect_dir "$DEVMON_STATE/spool/processing" 700 "$operator" "$operator_group"
 expect_dir "$DEVMON_STATE/spool/bad" 700 "$operator" "$operator_group"
 
 # Check the effective cross-UID boundary as well as leaf metadata. This catches a 0700
 # ancestor that would silently make the configured writer unusable on another box.
-sudo -u "$WRITER_USER" test -x "$DEVMON_STATE"
-sudo -u "$WRITER_USER" test -x "$DEVMON_STATE/spool"
-sudo -u "$WRITER_USER" test -w "$DEVMON_STATE/spool/tmp"
-sudo -u "$WRITER_USER" test -w "$DEVMON_STATE/spool/new"
+#
+# Each carries its own message because THIS GUARD WAS ITSELF SILENT. Under `set -e` a
+# bare failing `test` ended the script with status 1 and no output at all — so the check
+# written to stop a silent failure produced one. Measured 2026-08-22 on a box updating
+# to this revision: the install died here four times and the only way to find out why
+# was `bash -x` on three nested scripts.
+#
+# The first line is the one that fires, and `first_blocking_ancestor` says WHICH
+# directory did it: the writer is a different uid, so any 0700 on the path defeats it,
+# and naming the leaf sends the reader to the wrong place.
+sudo -u "$WRITER_USER" test -x "$DEVMON_STATE" \
+  || die "spool writer $WRITER_USER cannot reach $DEVMON_STATE — blocked at $(first_blocking_ancestor "$DEVMON_STATE")
+       That directory needs to be traversable by the writer (mode 710 with group
+       $WRITER_GROUP, or 711). Note install/airlock-install.sh creates the state
+       directory 0700 on every run, so widening it by hand does not survive."
+sudo -u "$WRITER_USER" test -x "$DEVMON_STATE/spool" \
+  || die "spool writer $WRITER_USER cannot enter $DEVMON_STATE/spool (needs mode 710, group $WRITER_GROUP)"
+sudo -u "$WRITER_USER" test -w "$DEVMON_STATE/spool/tmp" \
+  || die "spool writer $WRITER_USER cannot write $DEVMON_STATE/spool/tmp (needs mode 3770, group $WRITER_GROUP)"
+sudo -u "$WRITER_USER" test -w "$DEVMON_STATE/spool/new" \
+  || die "spool writer $WRITER_USER cannot write $DEVMON_STATE/spool/new (needs mode 3770, group $WRITER_GROUP)"
 if sudo -u "$WRITER_USER" test -x "$DEVMON_STATE/spool/processing" \
    || sudo -u "$WRITER_USER" test -x "$DEVMON_STATE/spool/bad"; then
   die "spool writer can enter a collector-only lane"

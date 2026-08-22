@@ -46,7 +46,7 @@ mkdir -p "$AIRLOCK_WEBROOT" "$AIRLOCK_CONFD/hub-locations.d" "$AIRLOCK_CONFD/ser
 SITE="$(bash "$HERE/render-nginx.sh" 2>"$TMP/err")" || { bad "render-nginx exited non-zero"; cat "$TMP/err"; }
 
 # structural checks
-grep -q 'listen 127.0.0.1:18802;'                 <<<"$SITE" && ok "hub loopback port (default)" || bad "hub port"
+grep -q 'listen 127.0.0.1:19902;'                 <<<"$SITE" && ok "hub loopback port (default)" || bad "hub port"
 grep -q '$http_tailscale_user_login $hub_ok'       <<<"$SITE" && ok "hub_ok map uses ident" || bad "hub_ok map"
 
 # D7/F14 stage 4 (child 4/P3 flip): role is UNCONDITIONAL — every render
@@ -90,7 +90,7 @@ grep -qF '"role":"$airlock_role"' <<<"$AUD_SITE" \
 grep -q '"friend@example.com" 1;'                  <<<"$SITE" && ok "collaborator in hub map" || bad "collaborator"
 grep -q '$http_tailscale_user_login $owner_ok'     <<<"$SITE" && ok "owner_ok map present" || bad "owner_ok map"
 grep -q 'friend@example.com' <<<"$(grep -A3 '\$owner_ok {' <<<"$SITE")" && bad "owner_ok must NOT include collaborators" || ok "owner_ok excludes collaborators"
-grep -q 'listen 127.0.0.1:18806;'                  <<<"$SITE" && ok "hub redirect loopback port (default)" || bad "hub redirect port"
+grep -q 'listen 127.0.0.1:19903;'                  <<<"$SITE" && ok "hub redirect loopback port (default)" || bad "hub redirect port"
 # the authority must be the pinned FQDN — NOT $host (client-controlled = open
 # redirect) and not the short hostname (no cert).
 grep -q 'return 301 https://box.example.ts.net\$request_uri;' <<<"$SITE" \
@@ -98,7 +98,7 @@ grep -q 'return 301 https://box.example.ts.net\$request_uri;' <<<"$SITE" \
 grep -q 'return 301 https://\$host'                <<<"$SITE" && bad "redirect authority is client-controlled" \
   || ok "redirect authority is not \$host"
 # the redirect server must carry no content and no gate — only the 301
-awk '/listen 127.0.0.1:18806;/{f=1} f&&/proxy_pass|root |try_files/{print "leak"} f&&/^}/{f=0}' <<<"$SITE" \
+awk '/listen 127.0.0.1:19903;/{f=1} f&&/proxy_pass|root |try_files/{print "leak"} f&&/^}/{f=0}' <<<"$SITE" \
   | grep -q leak && bad "redirect server serves content" || ok "redirect server serves only the 301"
 grep -q 'include .*/servers.d/\*.conf;'            <<<"$SITE" && ok "servers.d include" || bad "servers.d include"
 grep -q 'include .*/hub-locations.d/\*.conf;'      <<<"$SITE" && ok "hub-locations.d include" || bad "hub-locations include"

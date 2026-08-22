@@ -60,7 +60,7 @@ equivalent to execution: see [SECURITY.md](../../SECURITY.md).
 
 ```toml
 [apps.dev-monitor]
-backend_port = 18804
+backend_port = 19923
 messages     = true
 # slack_webhook_urgent_env = "DEVMON_SLACK_WEBHOOK_URGENT"   # env NAME, not URL
 # slack_webhook_routine_env = "DEVMON_SLACK_WEBHOOK_ROUTINE" # either lane may be empty

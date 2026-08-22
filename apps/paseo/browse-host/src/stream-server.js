@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // Live browser-panel stream transport (task doc §14.5). A loopback WS server the
-// patched paseo web-ui reaches at wss://<fqdn>:8447/browse-view/<browserId>,
+// patched paseo web-ui reaches at wss://<fqdn>:19950/browse-view/<browserId>,
 // proxied by the owner-gated nginx paseo gate. On connect we bind (create-on-
 // demand via executor.ensureTab) the browserId's Playwright page, attach a CDP
 // screencast, stream jpeg frames out (binary, backpressure-acked), and dispatch
@@ -60,7 +60,7 @@ function frameHeader(meta) {
 }
 
 class BrowseStreamServer {
-  constructor({ executor, log, port = 6768, host = "127.0.0.1", allowedOrigins = null, tokenStore = null, maxStreams = 4, server = null } = {}) {
+  constructor({ executor, log, port = 19953, host = "127.0.0.1", allowedOrigins = null, tokenStore = null, maxStreams = 4, server = null } = {}) {
     this.executor = executor;
     this.log = log ?? (() => {});
     this.port = port;

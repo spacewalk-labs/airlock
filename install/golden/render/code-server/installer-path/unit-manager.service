@@ -1,5 +1,5 @@
 [Unit]
-Description=airlock code-server slot manager API (127.0.0.1:18810)
+Description=airlock code-server slot manager API (127.0.0.1:19932)
 # NOT After=default.target — same WantedBy=default.target ordering-cycle
 # anti-pattern fixed in apps/paseo/render.sh; see that comment for the exact
 # boot-log signature this produces. network.target matches
@@ -9,9 +9,9 @@ After=network.target
 [Service]
 Type=simple
 Environment=AIRLOCK_CODE_SERVER_MANAGER_HOST=127.0.0.1
-Environment=AIRLOCK_CODE_SERVER_MANAGER_PORT=18810
+Environment=AIRLOCK_CODE_SERVER_MANAGER_PORT=19932
 Environment=AIRLOCK_CODE_SERVER_SLOTS=4
-Environment=AIRLOCK_CODE_SERVER_BACKEND_PORT=18811
+Environment=AIRLOCK_CODE_SERVER_BACKEND_PORT=19933
 Environment=AIRLOCK_CODE_SERVER_ALLOW=owner@example.com
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
 Environment=XDG_RUNTIME_DIR=/run/user/%U

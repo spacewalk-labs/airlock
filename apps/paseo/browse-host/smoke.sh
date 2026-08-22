@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 # Smoke gate for the Paseo browse host sidecar (run as owner inside the box).
 # Asserts: unit active, registered with the live daemon (hello in daemon.log),
 # and a network-free executor round-trip against the installed Chromium
@@ -47,8 +47,8 @@ else
   echo "FAIL  install incomplete in $INSTALL_DIR (playwright/test)"; fail=1
 fi
 
-# 4) Level 2 live-view stream server listening on loopback 6768.
-STREAM_PORT="${PASEO_BROWSE_STREAM_PORT:-6768}"
+# 4) Level 2 live-view stream server listening on loopback 19953.
+STREAM_PORT="${PASEO_BROWSE_STREAM_PORT:-19953}"
 if ss -ltn 2>/dev/null | grep -qE "127\.0\.0\.1:${STREAM_PORT}\b"; then
   echo "  ok  stream server listening (127.0.0.1:${STREAM_PORT})"
 else

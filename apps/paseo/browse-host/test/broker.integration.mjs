@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Integration test against the REAL upstream Paseo broker.
 //
 // Loads @getpaseo/server's BrowserToolsBroker, registers a client that pipes

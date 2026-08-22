@@ -7,8 +7,8 @@ id = "markwand"
 # in install.sh (paths.code_root is not expressible in [config], the same
 # way notepad's publish dependency stays app-side per plan rev 3).
 [config.defaults]
-markserv_port = 18799
-filebrowser_port = 18801
+markserv_port = 19920
+filebrowser_port = 19921
 
 # Transcribed from install/prerequisites.tsv's six markwand rows (F11).
 [[prerequisites]]

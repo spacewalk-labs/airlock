@@ -44,7 +44,10 @@ require_cmd python3
 _state_dir="${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}"
 if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ "$adopt" = 1 ]; then
   require_cmd flock
-  install -d -m 0700 "$_state_dir"
+  # Not `install -d -m` unconditionally: on an existing directory that resets the mode,
+  # and a teardown has even less business narrowing a permission an app depends on than
+  # the installer does (see install/airlock-install.sh for the measurement).
+  [ -d "$_state_dir" ] || install -d -m 0700 "$_state_dir"
   airlock_pin_state_dir
   _state_dir="${AIRLOCK_STATE_DIR:-$_state_dir}"
   exec 9>>"$_state_dir/app-ledger.lock"

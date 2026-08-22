@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 # Install the Paseo server-side browse host sidecar (a loopback WS client that
 # registers a browser automation host with the paseo daemon and drives headless
 # Chromium).
@@ -23,9 +23,9 @@ SVC="airlock-paseo-browse-host.service"
 
 # Ports/origin. Defaults match airlock.toml [apps.paseo]; when wiring this in,
 # reconcile them with your resolved airlock config.
-PASEO_BACKEND_PORT="${PASEO_BACKEND_PORT:-6767}"
-PASEO_BROWSE_STREAM_PORT="${PASEO_BROWSE_STREAM_PORT:-6768}"
-PASEO_HTTPS_PORT="${PASEO_HTTPS_PORT:-8447}"
+PASEO_BACKEND_PORT="${PASEO_BACKEND_PORT:-19952}"
+PASEO_BROWSE_STREAM_PORT="${PASEO_BROWSE_STREAM_PORT:-19953}"
+PASEO_HTTPS_PORT="${PASEO_HTTPS_PORT:-19950}"
 
 log() { echo "[browse-host] $*"; }
 fatal() { echo "[FATAL] browse-host: $*" >&2; exit 1; }

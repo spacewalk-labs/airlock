@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // URL policy for the Paseo server-side browse host — deliberately PROPORTIONATE:
 // this is an owner-only tool on the owner's own box.

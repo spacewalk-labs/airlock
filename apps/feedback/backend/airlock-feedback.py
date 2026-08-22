@@ -35,7 +35,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = int(os.environ.get('AIRLOCK_FEEDBACK_BACKEND_PORT', '18805'))
+PORT = int(os.environ.get('AIRLOCK_FEEDBACK_BACKEND_PORT', '19924'))
 IDENTITY_HEADER = os.environ.get('AIRLOCK_IDENTITY_HEADER', 'Tailscale-User-Login')
 
 # ---- target 1: pluggable external intake (all optional) ----

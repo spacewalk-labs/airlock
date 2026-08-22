@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // Level 2 (§14.4) executor tests: ensureTab idempotency / concurrent dedupe /
 // immutable workspace binding, and back/forward/reload commands.

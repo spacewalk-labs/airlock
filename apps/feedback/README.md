@@ -26,7 +26,7 @@ Everything is same-origin under the hub's identity gate; no per-app auth.
 
 ```toml
 [apps.feedback]
-backend_port = 18805
+backend_port = 19924
 # target 1 — intake (protocol below)
 intake_url = "https://your-intake.example"   # you host this
 token_env  = "AIRLOCK_FEEDBACK_TOKEN"         # name of the env var holding the token

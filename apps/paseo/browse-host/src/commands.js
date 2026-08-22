@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 // Single source of truth for the commands this host implements.
 // The capability we advertise MUST equal what the executor can actually run —

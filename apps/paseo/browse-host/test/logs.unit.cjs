@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 "use strict";
 
 const { BrowserHostExecutor, redactText, redactUrl } = require("../src/executor.js");

@@ -1,13 +1,16 @@
 # Airlock
 
-A self-hosted **dev hub**: one browser entrance (add-to-homescreen PWA) that
-composes a suite of developer tools behind a single identity gate — a web
-terminal, a browser IDE, markdown/file viewers, a publish manager, a system
-monitor, and browser-based AI coding-agent environments.
+**A self-hosted workspace for a single dev server.**
 
-Airlock is a **composer/installer**, not a re-distribution of upstream tools.
-You fill in one config file and run one installer; Airlock wires up the tools
-(fetching each from its own upstream) behind a shared entrance and identity gate.
+Airlock turns one Tailscale-joined Linux box into a development environment you
+can reach from any device. Every tool sits behind a single identity check, and
+the whole thing is set up from one `airlock.toml` and one installer script, with
+each tool fetched from its own upstream rather than redistributed here.
+
+Working across several machines scatters your work. Keeping it on one box is
+what lets it accumulate: repos, notes, research, running services, and session
+history pile up in one place, so your next task starts with what the last one
+left.
 
 > Status: **v1 — all nine apps install from `airlock.toml` and are end-to-end
 > verified** on a fresh Tailscale-joined Ubuntu 24.04 box (owner reaches each app;
@@ -18,7 +21,7 @@ You fill in one config file and run one installer; Airlock wires up the tools
 
 | App | What it is | Upstream |
 |---|---|---|
-| **hub** | The entrance: launcher, PWA, return widget, icon system | (ours) |
+| **hub** | The way in: launcher, PWA, return widget, icon system | (ours) |
 | **devterm** | Browser web terminal (mobile-friendly) | ttyd (MIT) |
 | **markwand** | Markdown / file viewer + editor | markserv + filebrowser |
 | **publish** | Static-file publish manager (+ optional pluggable external target) | (ours) |
@@ -115,12 +118,18 @@ design. Status: reviewed draft, not yet hardware-verified.
 
 ## License
 
-**MIT** (© 2026 Sunghyeon Cho) for the Airlock core and all app integrations,
-**except** `apps/paseo/patches/` which is **AGPL-3.0** (modifications to Paseo).
-See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Upstream tools keep their own
-licenses.
+**Apache-2.0** (© 2026 Sunghyeon Cho) for the Airlock core and all app
+integrations, **except** `apps/paseo/patches/` and the web-ui patcher, which are
+**AGPL-3.0** (modifications to Paseo). See [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE). Upstream tools keep their own licenses.
+
+Apache-2.0 rather than MIT for two clauses MIT does not have: an express patent
+grant (§3), which is what an organisation's counsel looks for, and explicit
+trademark reservation (§6). The reasoning, and what is deliberately *not*
+licensed this way, is in
+[`docs/design/commercialisation-and-license.md`](docs/design/commercialisation-and-license.md).
 
 ## Security
 
-These are owner-only tools (shell, IDE, agent runners) — treat the identity gate
+These are owner-only tools (shell, IDE, agent runners) — treat the identity check
 as load-bearing. Read [`SECURITY.md`](SECURITY.md) before exposing Airlock.

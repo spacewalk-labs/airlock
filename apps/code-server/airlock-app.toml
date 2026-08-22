@@ -11,10 +11,10 @@ runtime_env = [
 ]
 
 [config.defaults]
-https_port = 8444
-gate_port = 18808
-backend_port = 18811
-manager_port = 18810
+https_port = 19930
+gate_port = 19931
+backend_port = 19933
+manager_port = 19932
 slots = 4
 
 # D8: code-server actually binds backend_port .. backend_port+slots-1 (one

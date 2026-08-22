@@ -148,6 +148,23 @@ grep -qF 'spool writer group has another explicit member' \
   "$ROOT/apps/dev-monitor/install-spool-hardening.sh"
 grep -qF 'spool writer can enter a collector-only lane' \
   "$ROOT/apps/dev-monitor/install-spool-hardening.sh"
+# The cross-UID probes must SAY something when they refuse. They used to be four bare
+# `test` commands under `set -e`, so the check written to catch a silent failure was
+# itself silent: exit 1, no output, on a real box. Pinning the messages is a text check
+# and cannot prove the script is not silent — what it does catch is the regression that
+# actually happened, someone dropping the `|| die` back off. A behavioural check would
+# have to run the hardening script against a 0700 ancestor, and that path installs a
+# system firewall unit, so it belongs in live phase verification rather than here.
+for _msg in 'cannot reach' 'cannot enter' 'cannot write'; do
+  grep -qF "$_msg" "$ROOT/apps/dev-monitor/install-spool-hardening.sh" || {
+    echo "cross-UID probe lost its message (\"$_msg\") — a failure here would be silent again" >&2
+    exit 1
+  }
+done
+grep -qF 'first_blocking_ancestor' "$ROOT/apps/dev-monitor/install-spool-hardening.sh" || {
+  echo 'the blocked-ancestor message no longer names which directory blocked' >&2
+  exit 1
+}
 grep -qF "sudo -u root -g root \"\$SETPRIV\" --reuid \"\$operator_uid\"" \
   "$ROOT/apps/dev-monitor/install-spool-hardening.sh"
 if grep -qF 'sudo install -d -m 710' "$ROOT/apps/dev-monitor/install-spool-hardening.sh"; then

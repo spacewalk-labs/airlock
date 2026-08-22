@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+# bin/airlock-update — update an installed Airlock to the released tree, then re-run
+# the installer over it.
+#
+#   bash bin/airlock-update              # update ~/workspace/airlock (or this checkout)
+#   bash bin/airlock-update --dry-run    # show what would change; change nothing
+#   bash bin/airlock-update --no-install # replace the files, skip the reinstall
+#   bash bin/airlock-update --machine m  # name the Linux machine instead of detecting it
+#
+# It also runs with no checkout in hand, which is how the FIRST update happens — the
+# installed tree predates this file, so there is nothing to invoke locally:
+#
+#   curl -fsSL https://raw.githubusercontent.com/spacewalk-labs/airlock/main/bin/airlock-update | bash
+#
+# ---------------------------------------------------------------------------------
+# Why this is not `git pull`.
+#
+# The documented install (and every box that followed it) does `git clone --depth=1`,
+# then `rm -rf .git`, then `git init` — deliberately, so the operator owns their copy
+# and can commit their own config. The consequence is that no installed box has a
+# remote pointing here, and the history it does have shares no commit with ours. So
+# `git pull` has nothing to pull, and `git merge --allow-unrelated-histories` resolves
+# against an EMPTY merge base, which makes a conflict out of every file that changed
+# on either side. Neither is an update path.
+#
+# What works is that a git tree is content-addressed independently of history:
+# `git checkout <ref> -- .` writes a tree into the working copy and does not care
+# whether the ref is an ancestor. So this fetches the release, writes it over the
+# checkout, and commits the result to the operator's OWN repository — which is what
+# makes the update reversible without us having to build a backup mechanism.
+#
+# The whole body is inside main(), called on the last line. A `curl | bash` that is
+# cut off mid-transfer then runs NOTHING instead of running the first half: bash
+# executes what it has read so far, and a truncated function definition is a syntax
+# error, not a partial update. (Measured: an earlier draft, truncated, replaced every
+# file and exited 0 without committing or re-running the installer.)
+# ---------------------------------------------------------------------------------
+set -uo pipefail
+
+main() {
+  local RELEASE_URL="${AIRLOCK_RELEASE_URL:-https://github.com/spacewalk-labs/airlock}"
+  local RELEASE_REF="${AIRLOCK_RELEASE_REF:-main}"
+  # A remote of our own, so we never touch `origin` — on an installed box that is the
+  # operator's private repository and the only copy of their edits.
+  local RELEASE_REMOTE=airlock-release
+  # The install guide pins this location; it is the fallback when the script is piped
+  # in from curl and has no checkout around it to infer from.
+  local DEFAULT_DIR="${AIRLOCK_DIR:-$HOME/workspace/airlock}"
+  # Present after every install, before and after the ledger existed (the webroot,
+  # install/airlock-install.sh). Version-independent, which is the point: the boxes
+  # this has to recognise were installed by code that no longer exists here.
+  local MACHINE_MARKER=/opt/airlock/hub
+
+  local dry=0 do_install=1 machine=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run)    dry=1 ;;
+      --no-install) do_install=0 ;;
+      --machine)    shift; [ $# -gt 0 ] || die "--machine 뒤에 머신 이름이 필요합니다"; machine="$1" ;;
+      --machine=*)  machine="${1#--machine=}" ;;
+      -h|--help)    usage; return 0 ;;
+      *)            die "모르는 옵션: $1" ;;
+    esac
+    shift
+  done
+
+  local ROOT=""
+  if [ -n "${AIRLOCK_DIR:-}" ]; then
+    # An explicit path wins over everything: the operator is telling us where it is.
+    is_checkout "$AIRLOCK_DIR" && ROOT="$AIRLOCK_DIR"
+  else
+    local _src="${BASH_SOURCE[0]:-}" _here _cand
+    if [ -n "$_src" ] && [ -f "$_src" ]; then
+      _here="$(cd "$(dirname "$_src")" && pwd)"
+      _cand="$(cd "$_here/.." && pwd)"
+      is_checkout "$_cand" && ROOT="$_cand"
+    fi
+    [ -n "$ROOT" ] || { is_checkout "$DEFAULT_DIR" && ROOT="$DEFAULT_DIR"; }
+  fi
+
+  if [ -z "$ROOT" ]; then
+    die "Airlock 설치본을 찾지 못했습니다.
+       찾은 곳: $DEFAULT_DIR
+       다른 곳에 있으면 그 경로를 알려 주세요:  AIRLOCK_DIR=/경로 bash bin/airlock-update"
+  fi
+
+  command -v git >/dev/null 2>&1 \
+    || die "git 이 없습니다. 맥이면 터미널에서 'xcode-select --install' 을 한 번 실행하세요."
+
+  cd "$ROOT" || die "$ROOT 로 들어가지 못했습니다"
+  say "대상: $ROOT"
+
+  # ---------------------------------------------------------------- 1) 저장소
+  #
+  # Everything below rewrites files in place, so the state before it must be
+  # recoverable. The operator's own repository IS the backup: one commit before, one
+  # after, and the update is `git reset --hard` away from being undone. A box that
+  # never ran `git init` gets one here rather than a second, hand-rolled backup path
+  # to keep correct.
+  local scratch; scratch="$(mktemp -d)"
+  # shellcheck disable=SC2064   # $scratch must expand now, not at trap time
+  trap "rm -rf '$scratch'" EXIT
+  if [ ! -d .git ]; then
+    if [ "$dry" = 1 ]; then
+      # A preview must not create a repository in someone's directory, but every
+      # comparison below is a git operation. So the preview gets a THROWAWAY git
+      # directory pointed at their files: the index and objects land in $scratch and
+      # their tree is never written to. An earlier draft just skipped `git init` here
+      # and then ran `git remote add` in a non-repository, so --dry-run died on
+      # exactly the boxes it existed for — and three tests passed anyway, because the
+      # failure and the intended behaviour look identical from outside (nothing
+      # changed).
+      say "[미리보기] 이 폴더는 아직 git 저장소가 아닙니다 — 임시 저장소로 비교만 합니다."
+      export GIT_DIR="$scratch/preview.git" GIT_WORK_TREE="$ROOT"
+      git init -q 2>/dev/null || git init -q --bare 2>/dev/null || true
+      git add -A 2>/dev/null || true
+    else
+      say "이 폴더는 아직 git 저장소가 아닙니다 — 되돌릴 수 있도록 지금 만듭니다."
+      git init -q -b main 2>/dev/null || git init -q
+      git add -A || die "현재 상태를 기록하지 못했습니다"
+      commit_or_die "airlock-update: 업데이트 전 상태"
+    fi
+  fi
+
+  # ---------------------------------------------------------------- 2) 배포본 받기
+  #
+  # Deliberately NOT `--depth=1`. A shallow fetch writes .git/shallow and marks the
+  # OPERATOR's repository shallow permanently, changing how their own clones, gc and
+  # later fetches behave — a lasting side effect on their property in exchange for
+  # nothing, since the release repository is a squashed mirror only a few commits deep.
+  say "최신 배포본을 받는 중… ($RELEASE_URL, $RELEASE_REF)"
+  if git remote get-url "$RELEASE_REMOTE" >/dev/null 2>&1; then
+    git remote set-url "$RELEASE_REMOTE" "$RELEASE_URL" || die "remote 를 고치지 못했습니다"
+  else
+    git remote add "$RELEASE_REMOTE" "$RELEASE_URL" || die "remote 를 추가하지 못했습니다"
+  fi
+  git fetch -q "$RELEASE_REMOTE" "$RELEASE_REF" \
+    || die "배포본을 받지 못했습니다 — 인터넷 연결을 확인해 주세요. (레포는 공개라 로그인은 필요 없습니다)"
+  local new; new="$(git rev-parse FETCH_HEAD)" || die "받은 내용을 읽지 못했습니다"
+
+  # ---------------------------------------------------------------- 3) 무엇이 바뀌나
+  #
+  # `-c core.quotePath=false` on every listing: without it git renders non-ASCII names
+  # as octal escapes, and the one message that names the OPERATOR's OWN files is
+  # exactly where that is least acceptable.
+  local release_paths changed_list changed stale
+  release_paths="$(git -c core.quotePath=false ls-tree -r --name-only "$new" | sort)"
+  # Restricted to paths the RELEASE carries. Without that intersection the operator's
+  # own tracked files read as differences and the script could never report an
+  # up-to-date box — it would claim work to do forever.
+  changed_list="$(git -c core.quotePath=false diff --name-only "$new" -- . 2>/dev/null | sort \
+    | comm -12 - <(printf '%s\n' "$release_paths") || true)"
+  changed="$(printf '%s' "$changed_list" | grep -c . || true)"
+  # Tracked here but absent from the release. NOT removed — a file we do not recognise
+  # is at least as likely to be the operator's as it is to be ours, and deleting
+  # someone else's work to tidy a directory listing is not a trade this script makes.
+  stale="$(comm -23 <(git -c core.quotePath=false ls-files | sort) \
+                    <(printf '%s\n' "$release_paths") 2>/dev/null || true)"
+
+  # THE ONE THAT IS NOT OBVIOUS, AND THE ONE THAT ACTUALLY LOSES DATA.
+  #
+  # The safety commit is `git add -A`, which obeys the box's OWN .gitignore. The
+  # overwrite is `git checkout <new> -- .`, which obeys nothing. Any release path that
+  # the box's older .gitignore happens to ignore therefore falls in the gap: it is
+  # written over with NO backup, and because the checkout stages it, the later
+  # `git reset --hard` DELETES it — silently, and not in the "kept" report either.
+  #
+  # This is not hypothetical for the boxes this script is for. `.gitignore` gained
+  # `!examples/app-package/airlock.toml` on 2026-08-08; a box installed before that
+  # ignores `examples/app-package/airlock.toml` while the release tracks it. Measured
+  # against a 2026-08-01 tree: that path is ignored, so it was in the gap.
+  #
+  # Closing it: force these into the safety commit, so `reset --hard` restores them.
+  local at_risk=""
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -e "$p" ] || continue
+    git ls-files --error-unmatch -- "$p" >/dev/null 2>&1 && continue
+    at_risk="$at_risk$p"$'\n'
+  done <<EOF
+$release_paths
+EOF
+
+  if [ "$changed" = 0 ]; then
+    say "이미 최신입니다 — 바뀔 파일이 없습니다."
+    [ "$do_install" = 1 ] || return 0
+  else
+    say "바뀔 파일 $changed 개:"
+    report_list "$changed_list"
+  fi
+  if [ -n "$stale" ]; then
+    say "배포본에 없는 파일 $(printf '%s' "$stale" | grep -c .) 개 — 지우지 않고 그대로 둡니다:"
+    report_list "$stale"
+  fi
+  if [ -n "$at_risk" ]; then
+    say "이 폴더의 .gitignore 가 가려 두었지만 배포본이 덮어쓸 파일 $(printf '%s' "$at_risk" | grep -c .) 개 — 되돌릴 수 있도록 먼저 기록합니다:"
+    report_list "$at_risk"
+  fi
+
+  if [ "$dry" = 1 ]; then
+    say "[미리보기] 여기까지입니다. 아무것도 바꾸지 않았습니다."
+    return 0
+  fi
+
+  # ---------------------------------------------------------------- 4) 머신 확인
+  #
+  # BEFORE anything is written. Detection can fail (no machine, two machines, orb not
+  # running), and failing after the overwrite leaves the worst state of all: a new
+  # checkout against an old install, which is neither the version they had nor the one
+  # they asked for.
+  if [ "$do_install" = 1 ] && [ "$(platform)" = Darwin ]; then
+    machine="$(resolve_machine "$machine" "$MACHINE_MARKER")" || return 1
+  fi
+
+  # ---------------------------------------------------------------- 5) 안전망
+  if [ -n "$(git status --porcelain 2>/dev/null)" ] || [ -n "$at_risk" ]; then
+    say "지금 상태를 먼저 기록합니다 (업데이트를 되돌릴 수 있게)."
+    git add -A || die "변경을 기록하지 못했습니다"
+    if [ -n "$at_risk" ]; then
+      # -f: these are ignored by the box's .gitignore, which is the entire reason they
+      # need forcing. Without it `add` skips them without saying so.
+      # A pipe makes this a subshell, which is fine: `git add` writes the index on
+      # disk, so the effect outlives the subshell even though shell variables would not.
+      printf '%s' "$at_risk" | while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        git add -f -- "$p" 2>/dev/null || say "기록하지 못한 파일: $p"
+      done
+    fi
+    commit_or_die "airlock-update: 업데이트 전 자동 저장"
+  fi
+
+  local before=""
+  git rev-parse --verify -q HEAD >/dev/null 2>&1 && before="$(git rev-parse HEAD)"
+
+  # ---------------------------------------------------------------- 6) 덮어쓰기
+  #
+  # `-- .` writes every path the release carries and touches nothing else, so files the
+  # operator added stay. `airlock.toml` at the root is in .gitignore on BOTH sides and
+  # in no tree, so it is never a candidate — but note that is a statement about that
+  # one path, not about the name: the release does carry
+  # examples/app-package/airlock.toml, which is why the at-risk pass above exists.
+  say "파일을 배포본으로 맞추는 중… (중간에 멈추면 git reset --hard HEAD 로 되돌립니다)"
+  git checkout "$new" -- . || die "파일을 바꾸지 못했습니다 (아무것도 안 바뀌었을 수 있습니다)"
+  git add -A || true
+  commit_or_warn "airlock-update: 배포본 ${new:0:12} 으로 갱신"
+  say "갱신했습니다."
+  [ -n "$before" ] && say "되돌리려면:  git -C \"$ROOT\" reset --hard $before"
+
+  [ "$do_install" = 1 ] || { say "설치기는 건너뜁니다 (--no-install)."; return 0; }
+
+  # ---------------------------------------------------------------- 7) 설치기 재실행
+  #
+  # Note what `reset --hard` does and does not undo: it restores THIS CHECKOUT. It does
+  # not roll back what the installer did inside the Linux machine — /opt/airlock, the
+  # user units, the rendered nginx config, the package versions. Undoing the files and
+  # re-running the installer is what returns the box, and the message above is worded
+  # for the checkout because that is what it actually restores.
+  if [ "$(platform)" != Darwin ]; then
+    say "설치기를 다시 돌립니다…"
+    bash install/airlock-install.sh
+    return $?
+  fi
+  say "설치기를 다시 돌립니다 (머신: $machine)…"
+  say "설치 중 경고가 여러 줄 나올 수 있습니다 — 마지막의 Entrance 주소가 나오면 성공입니다."
+  AIRLOCK_MACHINE="$machine" bash docker/orbstack-machine-setup.sh
+}
+
+say()  { printf '\033[1;36m[airlock-update]\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31m[airlock-update] 중단:\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() { printf '%s\n' \
+  "airlock-update — 이미 깔린 Airlock 을 최신 배포본으로 갱신합니다." \
+  "  bash bin/airlock-update              # 갱신하고 설치기까지 다시 돌립니다" \
+  "  bash bin/airlock-update --dry-run    # 무엇이 바뀌는지만 보여 줍니다" \
+  "  bash bin/airlock-update --no-install # 파일만 갱신하고 설치기는 건너뜁니다" \
+  "  bash bin/airlock-update --machine m  # 리눅스 머신 이름을 직접 지정합니다" \
+  "  AIRLOCK_DIR=/경로 를 앞에 붙이면 그 폴더를 갱신합니다."; }
+
+# The test seam for the macOS branch: a Linux CI cannot reach it, and it is the branch
+# that can install into the wrong machine. install/test-update.sh sets this and puts a
+# stub `orb` on PATH. Nothing else reads it.
+platform() { printf '%s' "${AIRLOCK_UPDATE_UNAME:-$(uname -s)}"; }
+
+is_checkout() {
+  [ -f "$1/bin/airlock-config" ] \
+    && [ -f "$1/install/airlock-install.sh" ] \
+    && [ -f "$1/docker/orbstack-machine-setup.sh" ]
+}
+
+# A safety commit that FAILED must never be reported as one. `|| true` here is how an
+# operator loses uncommitted work and is handed a recovery command that recovers a
+# different tree: commit.gpgsign with no key, a pre-commit hook, a full disk — all of
+# them make `git commit` fail, and all of them are invisible if its status is dropped.
+#
+# `--no-verify`, and `commit.gpgsign=false`, are deliberate and narrow. These two
+# commits are not contributions — they are a SNAPSHOT of what was already on disk, so
+# that the overwrite below is reversible. A pre-commit hook exists to judge work
+# someone is authoring; pointed at a snapshot it can only do one thing, which is
+# prevent the backup and leave the operator worse off than if we had never offered one.
+#
+# Measured, on the first real box this ran against: the checkout carried this
+# repository's own leak-scan pre-commit hook, and two config backups the operator had
+# made (`airlock.toml.bak-*`) contained the box's own hostname. The hook refused the
+# safety commit, so the update stopped — correct, but it stops on EVERY box that
+# followed our own guidance, which is every box worth updating.
+#
+# What is NOT bypassed is a commit that genuinely cannot be written — a full disk, a
+# read-only object store. Those still stop the run, which is the property that matters:
+# nothing gets overwritten unless the state before it was really recorded.
+commit_or_die() {
+  local out
+  if ! out="$(git -c user.name=airlock -c user.email=airlock@localhost \
+                  -c commit.gpgsign=false \
+                  commit -q --no-verify -m "$1" 2>&1)"; then
+    # An empty commit is not a failure — there was simply nothing to record.
+    case "$out" in *"nothing to commit"*|*"nothing added"*) return 0 ;; esac
+    die "업데이트 전 상태를 기록하지 못해 여기서 멈춥니다 — 기록 없이 덮어쓰면 되돌릴 수 없습니다.
+       git 이 한 말: ${out}
+       흔한 원인은 커밋 서명(commit.gpgsign)이나 pre-commit 훅입니다."
+  fi
+}
+commit_or_warn() {
+  git -c user.name=airlock -c user.email=airlock@localhost -c commit.gpgsign=false \
+      commit -q --no-verify -m "$1" >/dev/null 2>&1 || true
+}
+
+# Names, not just a count: "바뀔 파일 3 개" is not something an operator can check.
+report_list() {
+  printf '%s' "$1" | grep -c . >/dev/null || return 0
+  local total shown
+  total="$(printf '%s' "$1" | grep -c .)"
+  shown=12
+  printf '%s' "$1" | grep . | head -"$shown" | sed 's/^/         /'
+  [ "$total" -gt "$shown" ] && printf '         … 그리고 %s 개 더\n' "$((total - shown))"
+  return 0
+}
+
+# On a Mac the install lives in an OrbStack Linux machine, and its NAME is
+# per-operator: docker/orbstack-machine-setup.sh falls back to `airlock`, but the
+# install guide has people pass their own. Running the setup script without one would
+# not update their machine — it would CREATE A SECOND ONE and install into it, which
+# looks like a successful update and leaves the box they actually use untouched.
+resolve_machine() {
+  local given="$1" marker="$2" listing rc name found="" count
+  command -v orb >/dev/null 2>&1 \
+    || die "orb 을 찾지 못했습니다. OrbStack 을 한 번 실행한 뒤 다시 시도해 주세요."
+
+  if [ -n "$given" ]; then
+    # An explicit name gets the SAME check as a detected one. It is the documented
+    # escape from every detection failure, so leaving it unchecked would put the
+    # "second machine" outcome one typo away — and the setup script creates a machine
+    # whose name it does not recognise rather than refusing.
+    if orb run -m "$given" test -d "$marker" >/dev/null 2>&1; then
+      printf '%s' "$given"; return 0
+    fi
+    die "'$given' 에서 Airlock 설치를 찾지 못했습니다.
+       이름이 정확한지 봐 주세요 — 없는 이름을 주면 설치기가 그 이름으로 새 머신을 만듭니다.
+       목록: $(orb list 2>/dev/null | sed 's/[[:cntrl:]]\[[0-9;]*m//g' | awk 'NR>0 && $1!="NAME" {printf "%s ", $1}')"
+  fi
+
+  say "Airlock 이 설치된 리눅스 머신을 찾는 중…" >&2
+  # `orb list` failing is a different problem from "no machine has Airlock", and
+  # reporting the second when it is the first sends the operator to --machine, which
+  # is the one path that can build a machine they did not ask for.
+  listing="$(orb list 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die "OrbStack 에 머신 목록을 물어보지 못했습니다 (orb list 가 실패). OrbStack 이 켜져 있는지 봐 주세요."
+  fi
+  # Only machines that are ALREADY RUNNING are probed. `orb run` starts a stopped
+  # machine, so probing everything would boot every OrbStack machine the operator has —
+  # including ones that have nothing to do with Airlock — as a side effect of asking a
+  # question. Stopped ones are named at the end instead, so a stopped Airlock machine is
+  # still findable, by --machine, which starts exactly the one they chose.
+  #
+  # Strip ANSI: orb prints no colour into a pipe today (measured on the Mac mini), but a
+  # coloured name would silently match nothing and end up at --machine.
+  local skipped=""
+  while IFS=$'\t' read -r name state; do
+    [ -n "$name" ] || continue
+    case "$name" in NAME) continue ;; esac
+    if [ -n "$state" ] && [ "$state" != running ]; then
+      skipped="$skipped$name ($state)"$'\n'
+      continue
+    fi
+    if orb run -m "$name" test -d "$marker" >/dev/null 2>&1; then
+      found="$found$name"$'\n'
+    fi
+  done <<EOF
+$(printf '%s\n' "$listing" | sed 's/[[:cntrl:]]\[[0-9;]*m//g' | awk '{printf "%s\t%s\n", $1, $2}')
+EOF
+  count="$(printf '%s' "$found" | grep -c . || true)"
+  case "$count" in
+    1) name="$(printf '%s' "$found" | grep . | head -1)"
+       say "찾았습니다: $name" >&2; printf '%s' "$name"; return 0 ;;
+    0) die "돌고 있는 머신 중에 Airlock 이 설치된 것을 찾지 못했습니다.$(
+         [ -n "$skipped" ] && printf '\n       %s' "멈춰 있어 확인하지 않은 머신: $(printf '%s' "$skipped" | tr '\n' ' ')"
+       )
+       머신 이름을 아시면 이렇게 알려 주세요:  bash bin/airlock-update --machine <이름>
+       (설치할 때 쓰신 이름입니다. 'orb list' 로 목록을 볼 수 있습니다)" ;;
+    *) die "Airlock 이 설치된 머신이 여러 개입니다:
+$(printf '%s' "$found" | grep . | sed 's/^/         /')
+       어느 것을 갱신할지 골라 주세요:  bash bin/airlock-update --machine <이름>" ;;
+  esac
+}
+
+main "$@"

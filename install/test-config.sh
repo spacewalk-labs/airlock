@@ -67,17 +67,17 @@ provider = "tailscale"
 owner = "me@example.com"
 [apps.hub]
 [apps.devterm]
-backend_port = 9910
+backend_port = 19911
 TOML
 if run "$TMP/portclash.toml" validate >/dev/null 2>&1; then bad "validate: rejects port collision"; else ok "validate: rejects port collision"; fi
 
 # 3c. plaintext wiring: enabled apps with a plaintext port -> their redirect port
 pt="$(run "$TMP/good.toml" plaintext 2>/dev/null | tr '\t' ':' | sort | tr '\n' ',')"
-[ "$pt" = "hub:9999:18806," ] && ok "plaintext: listen -> redirect" || bad "plaintext: got '$pt'"
+[ "$pt" = "hub:19901:19903," ] && ok "plaintext: listen -> redirect" || bad "plaintext: got '$pt'"
 # D-DEVTERM-9900 retired the shipped 9900 default. Known ports are hub
 # plus any still-declared plaintext_redirect (none on shipped devterm).
 known="$(run "$TMP/good.toml" plaintext-known 2>/dev/null | sort -n | tr '\n' ',')"
-[ "$known" = "9999," ] && ok "plaintext-known: hub only" || bad "plaintext-known: got '$known'"
+[ "$known" = "19901," ] && ok "plaintext-known: hub only" || bad "plaintext-known: got '$known'"
 
 # 3d. webjson carries the measured FQDN so the launcher's cross-port links match
 # the cert regardless of the origin the page was opened from — and omits it when
@@ -170,7 +170,7 @@ echo "$env" | grep -q "AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login" && ok "env:
 echo "$env" | grep -q "AIRLOCK_OWNER=me@example.com" && ok "env: owner" || bad "env: owner"
 echo "$env" | grep -q "AIRLOCK_COLLABORATORS=a@example.com,b@example.com" && ok "env: collaborators joined" || bad "env: collaborators"
 echo "$env" | grep -q "AIRLOCK_DEVTERM_FONT_SIZE=16" && ok "env: app override" || bad "env: app override"
-echo "$env" | grep -q "AIRLOCK_DEVTERM_TTYD_PORT=9911" && ok "env: app default merged" || bad "env: app default"
+echo "$env" | grep -q "AIRLOCK_DEVTERM_TTYD_PORT=19912" && ok "env: app default merged" || bad "env: app default"
 echo "$env" | grep -q "AIRLOCK_DEVTERM_XAI=true" && ok "env: xAI app override" || bad "env: xAI app override"
 # site name with spaces must be shell-safe for eval
 ( eval "$env"; [ "$AIRLOCK_SITE_NAME" = "My Dev Hub" ] ) && ok "env: eval-safe quoting" || bad "env: quoting"
@@ -180,7 +180,7 @@ if run "$TMP/good.toml" env orca >/dev/null 2>&1; then bad "env: rejects disable
 
 # 7. get with default fallback + dotted key
 [ "$(run "$TMP/good.toml" get auth.owner 2>/dev/null)" = "me@example.com" ] && ok "get: dotted" || bad "get: dotted"
-[ "$(run "$TMP/good.toml" get apps.devterm.ttyd_port 2>/dev/null)" = "9911" ] && ok "get: default merged" || bad "get: default merged"
+[ "$(run "$TMP/good.toml" get apps.devterm.ttyd_port 2>/dev/null)" = "19912" ] && ok "get: default merged" || bad "get: default merged"
 
 # 8. code_root expands ~ — to the real home, not merely to something without a '~'
 [ "$(run "$TMP/good.toml" get paths.code_root 2>/dev/null)" = "$HOME/code" ] \
@@ -528,6 +528,19 @@ if run "$TMP/t.toml" validate >/dev/null 2>&1; then
     || ok "wide root: silent without collaborators"
 else
   bad "wide root: solo home dir must still validate"
+fi
+
+# --- 13. airlock.toml.example must validate --------------------------------
+# The tool points operators straight at this file — find_config() dies with
+# "copy airlock.toml.example and fill it in", and the unknown-key error says
+# "see airlock.toml.example". If it does not validate, the very first command a
+# new operator runs fails. It drifted exactly that way: D-DEVTERM-9900 retired
+# devterm's public_port/redirect_port from the manifest and the example kept
+# documenting both, so the shipped example died on its own validator.
+if run "$HERE/../airlock.toml.example" validate >/dev/null 2>&1; then
+  ok "example: airlock.toml.example validates"
+else
+  bad "example: airlock.toml.example validates — $(run "$HERE/../airlock.toml.example" validate 2>&1 | head -1)"
 fi
 
 echo "---"

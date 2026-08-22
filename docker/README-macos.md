@@ -86,6 +86,46 @@ orb -m airlock systemctl --user status airlock-paseo    # check an app
 orb -m airlock -u root tailscale status
 ```
 
+### 6. Update it later
+An installed checkout has no remote pointing here — step 2 has you drop `.git` and start
+your own repository — so `git pull` has nothing to fetch and
+`merge --allow-unrelated-histories` conflicts on every changed file. Use this instead:
+
+```bash
+bash bin/airlock-update              # --dry-run first to see what would change
+```
+
+**If your checkout predates this script** (it landed 2026-08-22), it is not in your tree
+yet. Fetch and run it in one line — the release repository is public, so no login:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/spacewalk-labs/airlock/main/bin/airlock-update | bash
+```
+
+After that first run, `Update Airlock` sits at the top of the checkout and a double-click
+runs it. That works with no Developer ID and no notarisation because the file arrives by
+`git`, and Gatekeeper's quarantine flag is set by whatever *downloads* a file.
+
+It writes the release tree over the checkout and commits the result to **your** repository,
+so the file update is one `git reset --hard` from being undone. Two limits on that:
+
+- It restores **this checkout**. It does not roll back what the installer did inside the
+  Linux machine — `/opt/airlock`, the user units, the rendered nginx config, package
+  versions. Undoing the files and re-running the installer is what returns the box.
+- Anything the installer changed keeps running until you do.
+
+What it will not touch: `airlock.toml` (in `.gitignore` on both sides, so no tree carries
+it), and any file it does not recognise — those are listed and left. Files that your
+checkout's older `.gitignore` happens to hide but the release does carry are committed
+first, so the undo restores them rather than deleting them.
+
+On a Mac it finds the machine Airlock is installed in rather than assuming the name.
+`orbstack-machine-setup.sh` defaults to `airlock`, so if you named yours something else a
+default-named run would build a **second** machine and install into it — a successful-looking
+update that leaves your box untouched. Only running machines are probed (`orb run` starts a
+stopped one). If two qualify, or if you pass a `--machine` name that has no Airlock in it,
+it stops and says so rather than guessing.
+
 ---
 
 ## Path B — systemd-in-Docker (experimental)
