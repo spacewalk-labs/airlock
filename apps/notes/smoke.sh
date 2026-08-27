@@ -162,6 +162,23 @@ state_path=pathlib.Path(os.environ["DOCKER_STATE"])
 log_path=pathlib.Path(os.environ["DOCKER_LOG"])
 argv=sys.argv[1:]
 objects=json.loads(state_path.read_text())
+rm_keeps={value for value in os.environ.get("FAKE_RM_KEEPS", "").split(",") if value}
+# "reported the removal, kept the object": rm exits 0, the object survives, and
+# every later query about it claims the object is gone.
+lying_path=state_path.parent / (state_path.name + ".lying")
+
+def lying_ids():
+    return set(json.loads(lying_path.read_text())) if lying_path.exists() else set()
+
+def start_lying(ident):
+    lying_path.write_text(json.dumps(sorted(lying_ids() | {ident})))
+
+def absence_reply(target):
+    # The runtime has no single fixed phrasing for a missing object and has
+    # changed the casing between releases; the installer must not depend on it.
+    if os.environ.get("FAKE_ABSENCE_MESSAGE") == "lowercase":
+        return f"error: no such object: {target}"
+    return f"Error: No such object: {target}"
 
 def save():
     state_path.write_text(json.dumps(objects, sort_keys=True))
@@ -197,9 +214,13 @@ if argv and argv[0] == "inspect":
         if argv[i] == "--format": fmt=argv[i+1]; i += 2
         else: ids.append(argv[i]); i += 1
     selected=[obj for obj in objects if obj["Id"] in ids]
+    lying=[ident for ident in ids if ident in lying_ids()]
+    if lying:
+        print(absence_reply(lying[0]), file=sys.stderr)
+        raise SystemExit(1)
     if len(selected) != len(ids):
         missing=next(ident for ident in ids if not any(obj["Id"] == ident for obj in selected))
-        print(f"Error: No such object: {missing}", file=sys.stderr)
+        print(absence_reply(missing), file=sys.stderr)
         raise SystemExit(1)
     if fmt is not None:
         for obj in selected:
@@ -232,6 +253,9 @@ if argv[:2] == ["rm", "-f"] and len(argv) == 3:
     log()
     ident=argv[2]
     if len(ident) != 64: raise SystemExit(2)
+    if ident in rm_keeps:
+        start_lying(ident)
+        raise SystemExit(0)
     remaining=[obj for obj in objects if obj["Id"] != ident]
     if len(remaining) == len(objects): raise SystemExit(1)
     objects[:]=remaining; save()
@@ -353,6 +377,71 @@ assert calls[-1][:2] == ["rm", "-f"]
 assert re.fullmatch(r"[0-9a-f]{64}", calls[-1][2])
 PY
 
+  # A retry inside one lifecycle finds objects already carrying the active
+  # nonce, and the fresh path must clear them before it creates anything.
+  # Whether that removal is believed cannot depend on how the runtime words
+  # "no such object": it words it in more than one way and changes the casing
+  # between releases, so a wording match turns a finished removal into a
+  # permanent install failure the day the wording moves.
+  stale_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  seed_stale() {
+    python3 - "$fake_state" "$stale_id" <<'PY'
+import json, sys
+json.dump([{"Id": sys.argv[2], "Name": "/airlock-notes-router",
+            "State": {"Running": True},
+            "Config": {"Labels": {"io.airlock.package": "notes",
+                                  "io.airlock.install-nonce": "fake-runtime-nonce-0001"}},
+            "Mounts": [], "HostConfig": {"NetworkMode": "none"}}],
+          open(sys.argv[1], "w", encoding="utf-8"))
+PY
+    rm -f "$fake_state.lying"
+  }
+  seed_stale
+  : > "$tmp/docker.log"
+  dialect_err="$tmp/dialect.err"
+  dialect_ok=1
+  DOCKER_LOG="$tmp/docker.log" DOCKER_STATE="$fake_state" PATH="$fakebin:$PATH" \
+    FAKE_ABSENCE_MESSAGE=lowercase \
+    AIRLOCK_CONFIG_BIN="$tmp/fake-config.py" AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$HERE" \
+    AIRLOCK_CONFD="$tmp/live-confd" AIRLOCK_INSTALL_NONCE=fake-runtime-nonce-0001 \
+    HOME="$home" bash "$HERE/install.sh" >/dev/null 2>"$dialect_err" || dialect_ok=0
+  python3 - "$fake_state" "$tmp/docker.log" "$stale_id" <<'PY' || dialect_ok=0
+import json, sys
+objects=json.load(open(sys.argv[1], encoding="utf-8"))
+assert sys.argv[3] not in {o["Id"] for o in objects}, objects
+assert len(objects) == 2, objects
+calls=[json.loads(line) for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
+assert [c[0] for c in calls] == ["rm", "run", "run"], calls
+PY
+  if [ "$dialect_ok" != 1 ]; then
+    echo "  notes smoke: a reworded absence reply blocked the active-nonce cleanup" >&2
+    tail -1 "$dialect_err" >&2 || true
+    fail=1
+  fi
+
+  # Negative control for the same removal: an object the runtime still lists is
+  # not gone, no matter how convincingly the absence is phrased.
+  seed_stale
+  : > "$tmp/docker.log"
+  liar_err="$tmp/liar.err"
+  liar_ok=1
+  if DOCKER_LOG="$tmp/docker.log" DOCKER_STATE="$fake_state" PATH="$fakebin:$PATH" \
+    FAKE_RM_KEEPS="$stale_id" \
+    AIRLOCK_CONFIG_BIN="$tmp/fake-config.py" AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$HERE" \
+    AIRLOCK_CONFD="$tmp/live-confd" AIRLOCK_INSTALL_NONCE=fake-runtime-nonce-0001 \
+    HOME="$home" bash "$HERE/install.sh" >/dev/null 2>"$liar_err"; then
+    liar_ok=0
+  fi
+  grep -Fq 'could not remove the active nonce' "$liar_err" || liar_ok=0
+  python3 - "$fake_state" "$stale_id" <<'PY' || liar_ok=0
+import json, sys
+assert {o["Id"] for o in json.load(open(sys.argv[1], encoding="utf-8"))} == {sys.argv[2]}
+PY
+  if [ "$liar_ok" != 1 ]; then
+    echo "  notes smoke: a still-listed container was accepted as removed" >&2
+    fail=1
+  fi
+
   cfg="$tmp/airlock.toml"
   cat > "$cfg" <<EOF
 [auth]
@@ -436,20 +525,43 @@ PY
 for v in json.load(open(sys.argv[1]))["vaults"]:
   if v["writable"]: print("\t".join((v["id"],str(v["editor_port"]),v["editor_path"])))' "$plan")
   supervisor_pid="$(systemctl --user show airlock-notes-editor.service -p MainPID --value 2>/dev/null)"
+  # EDITOR_CHILDREN_CHECK — install/test-notes-editor-children.py extracts this
+  # block verbatim between the markers and runs it against a fake /proc. Keep
+  # the markers; the extractor fails loudly if they stop matching.
   python3 - "$supervisor_pid" "$plan" <<'PY' || fail=1
-import json, pathlib, sys
+import json, os, pathlib, sys
 pid=sys.argv[1]; plan=json.load(open(sys.argv[2]))
+# AIRLOCK_PROC_ROOT exists only so the test above can reach this. Nothing in
+# production sets it. It has to exist because this block is reachable only from
+# a configured install, and that is how it shipped for months doing nothing at
+# all: it died on a bytes/str split before it evaluated a single child, so the
+# sandbox hardening it is supposed to prove was never actually checked anywhere.
+proc=os.environ.get("AIRLOCK_PROC_ROOT", "/proc")
 expected={v["editor_path"].rstrip("/") for v in plan["vaults"] if v["writable"]}
-children=pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
-seen=set()
+children=pathlib.Path(f"{proc}/{pid}/task/{pid}/children").read_text().split()
+seen=set(); bad=[]
 for child in children:
-    env=dict(item.split("=",1) for item in pathlib.Path(f"/proc/{child}/environ").read_bytes().split(b"\0") if b"=" in item)
-    env={key.decode(): value.decode() for key,value in env.items()}
-    assert env.get("SB_SHELL_BACKEND")=="off"
-    assert env.get("SB_RUNTIME_API")=="0"
+    # environ is NUL-separated *bytes*, so every separator that cuts it must be
+    # bytes too — `item.split("=",1)` raised TypeError on every live run.
+    env={}
+    for item in pathlib.Path(f"{proc}/{child}/environ").read_bytes().split(b"\0"):
+        if b"=" not in item: continue
+        key, value = item.split(b"=", 1)
+        env[key.decode()] = value.decode()
+    if env.get("SB_SHELL_BACKEND") != "off":
+        bad.append(f"child {child}: SB_SHELL_BACKEND={env.get('SB_SHELL_BACKEND')!r} want 'off'")
+    if env.get("SB_RUNTIME_API") != "0":
+        bad.append(f"child {child}: SB_RUNTIME_API={env.get('SB_RUNTIME_API')!r} want '0'")
     seen.add(env.get("SB_URL_PREFIX"))
-assert seen == expected, (seen, expected)
+if seen != expected:
+    bad.append(f"prefixes {sorted(str(p) for p in seen)} != writable vaults {sorted(expected)}")
+# Report every wrong child, not just the first: an operator reading a failed
+# live smoke needs the whole list, and a bare AssertionError named none of them.
+for line in bad:
+    print(f"editor children: {line}", file=sys.stderr)
+raise SystemExit(1 if bad else 0)
 PY
+  # :EDITOR_CHILDREN_CHECK
   if [ "$fail" = 0 ]; then
     echo "notes smoke: live ok containers=$expected owner=200 collaborator=403 no-header=403"
   else

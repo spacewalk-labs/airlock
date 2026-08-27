@@ -81,14 +81,25 @@ assert_docker_identity() {
 if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then assert_docker_identity; fi
 
 container_is_absent() {
-  local object_id="$1" inspect_error
-  if inspect_error="$(docker_run inspect "$object_id" 2>&1 >/dev/null)"; then
+  # Absence is a fact about the daemon's object list, never about the wording
+  # of an error reply. The runtime ships more than one phrasing for a missing
+  # object and changes the casing between releases, so matching the text fails
+  # in both directions: a finished removal is disbelieved the day the wording
+  # moves, and a reply that merely reads like an absence would retire an object
+  # that is still there. The re-query below cannot be worded away, and it stays
+  # "not absent" whenever it cannot answer.
+  local object_id="$1" listed
+  if docker_run inspect "$object_id" >/dev/null 2>&1; then
     return 1
   fi
-  case "$inspect_error" in
-    "Error: No such object: $object_id"|\
-    "Error response from daemon: No such container: $object_id") ;;
-    *) return 1 ;;
+  listed="$(docker_run ps -aq --no-trunc)" || return 1
+  # Whole-line membership without an external process. grep would be the
+  # obvious tool, but inside an `if` its exit 2 (grep error) and 127 (grep
+  # missing) are indistinguishable from exit 1 (no match), so a broken grep
+  # would fall through and report "absent" for a container that is still
+  # listed -- the very class of failure this function exists to prevent.
+  case $'\n'"$listed"$'\n' in
+    *$'\n'"$object_id"$'\n'*) return 1 ;;
   esac
   assert_docker_identity
 }

@@ -17,13 +17,12 @@ verdicts; a source that cannot be read stays in `sources[]` and on screen instea
 silently becoming “no jobs”. The collector is part of this backend—there is no sidecar
 unit, second port, nginx fragment or separate app package.
 
-When the owner console is enabled, the owner may run, temporarily pause, or resume a
-**currently observed user timer**. Every action re-measures the live user-timer allowlist
-and uses argv-only `systemctl --user`; system timers and cron files remain read-only.
-Writes reuse the existing console boundary (ingress owner identity + nginx-injected proxy
-secret + same-origin JSON POST). Pause is `stop`, not `disable`, so a restart restores the
-configured schedule. With `messages = false`, scheduled-job health stays visible and its
-write controls fail closed with the other owner-only routes.
+The tab is **read-only, on every install**. It has no run, pause or resume control and no
+route behind one: a screen that can start a box's jobs is a screen whose compromise starts
+them, and the value of watching does not need that. Jobs are changed on the box itself,
+over SSH, which is where the rare emergency belongs. This does not depend on the owner
+console below — enabling messages must never quietly enable job control with it, so the
+write surface is absent rather than gated.
 
 ## The message and action console
 

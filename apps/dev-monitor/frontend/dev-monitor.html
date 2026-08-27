@@ -317,10 +317,8 @@
     .cron-badge.ok { color: var(--success); border-color: var(--success); }
     .cron-badge.warn { color: var(--warning); border-color: var(--warning); }
     .cron-badge.bad { color: var(--danger); border-color: var(--danger); }
-    .cron-actions { display: flex; gap: 5px; }
-    .cron-actions button, .cron-tools button { background: transparent; border: 1px solid var(--line); border-radius: var(--r-pill); color: var(--text); padding: 4px 9px; cursor: pointer; font: inherit; font-size: 12px; }
-    .cron-actions button:hover, .cron-tools button:hover { background: var(--hover); }
-    .cron-actions button:disabled { opacity: .5; cursor: default; }
+    .cron-tools button { background: transparent; border: 1px solid var(--line); border-radius: var(--r-pill); color: var(--text); padding: 4px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+    .cron-tools button:hover { background: var(--hover); }
     .cron-sources { display: flex; flex-direction: column; gap: 6px; }
     .cron-source { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 11px; font-size: 12px; }
     .cron-source.bad { border-left: 3px solid var(--danger); }
@@ -513,12 +511,14 @@
         <label><input id="cron-attention" type="checkbox"> Attention only</label>
         <span class="meta" id="cron-meta">not loaded</span>
       </div>
+      <p class="note">Read-only: this screen watches scheduled jobs, it never runs, pauses
+        or resumes them. When a job really has to be touched, SSH into the box.</p>
       <div class="cards" id="cron-cards"></div>
     </div>
     <div class="section">
       <div class="cron-table">
-        <table><thead><tr><th>State</th><th>Job</th><th>Schedule</th><th>Last signal</th><th>Reboot</th><th>Owner action</th></tr></thead>
-        <tbody id="cron-rows"><tr><td colspan="6" class="empty">Open this tab to measure scheduled jobs.</td></tr></tbody></table>
+        <table><thead><tr><th>State</th><th>Job</th><th>Schedule</th><th>Last signal</th><th>Reboot</th></tr></thead>
+        <tbody id="cron-rows"><tr><td colspan="5" class="empty">Open this tab to measure scheduled jobs.</td></tr></tbody></table>
       </div>
     </div>
     <div class="section">
@@ -883,7 +883,6 @@
 
   // ---- scheduled jobs ----
   var cronSnapshot = null;
-  var cronControlsAvailable = false;
   function cronAxisTone(axis, value) {
     if ((axis === 'result' && value === 'failed') ||
         (axis === 'timing' && value === 'late') ||
@@ -928,14 +927,6 @@
       return !attentionOnly || cronTone(job) !== 'ok';
     });
     var rows = jobs.map(function (job) {
-      var controls = '';
-      if (job.controllable && cronControlsAvailable) {
-        controls = '<div class="cron-actions">' +
-          '<button type="button" data-cron-action="run" data-unit="' + escHTML(job.unit) + '">Run now</button>' +
-          '<button type="button" data-cron-action="' + (job.activeState === 'active' ? 'pause' : 'resume') +
-          '" data-unit="' + escHTML(job.unit) + '">' +
-          (job.activeState === 'active' ? 'Pause' : 'Resume') + '</button></div>';
-      }
       return '<tr><td>' +
         cronBadge('execution', job.execution, cronAxisTone('execution', job.execution)) +
         cronBadge('timing', job.timeliness, cronAxisTone('timing', job.timeliness)) +
@@ -945,13 +936,10 @@
         '</div></td><td class="job-meta">' + escHTML(job.schedule || '—') +
         '</td><td>' + escHTML(cronClock(job.lastSignal)) +
         '</td><td>' + cronBadge('', job.reboot, cronAxisTone('reboot', job.reboot)) +
-        '</td><td>' + controls + '</td></tr>';
+        '</td></tr>';
     }).join('');
     document.getElementById('cron-rows').innerHTML = rows ||
-      '<tr><td colspan="6" class="empty">No jobs match this view.</td></tr>';
-    document.querySelectorAll('[data-cron-action]').forEach(function (button) {
-      button.addEventListener('click', function () { cronAction(button); });
-    });
+      '<tr><td colspan="5" class="empty">No jobs match this view.</td></tr>';
 
     var sources = cronSnapshot.sources || [];
     document.getElementById('cron-sources').innerHTML = sources.map(function (source) {
@@ -968,42 +956,21 @@
   function loadCron() {
     var meta = document.getElementById('cron-meta');
     meta.textContent = 'measuring…';
-    return fetch(API + '/health', { cache: 'no-store' }).then(function (response) {
-      return response.ok ? response.json() : {};
-    }).catch(function () { return {}; }).then(function (health) {
-      cronControlsAvailable = health.messages === 'on';
-      return fetch(API + '/cron/jobs', { cache: 'no-store' });
-    }).then(function (response) {
+    return fetch(API + '/cron/jobs', { cache: 'no-store' }).then(function (response) {
       return response.json().catch(function () { return {}; }).then(function (data) {
         if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
         if (!Array.isArray(data.jobs) || !data.counts || !Array.isArray(data.sources))
           throw new Error('response shape is incomplete');
         cronSnapshot = data;
         meta.textContent = (data.hostname || 'this box') + ' · ' + data.jobs.length + ' jobs · ' +
-          (data.cached ? 'cached ' + data.cachedAgeSec + 's' : 'measured now') + ' · ' +
-          (cronControlsAvailable ? 'owner controls on' : 'read-only (owner console off)');
+          (data.cached ? 'cached ' + data.cachedAgeSec + 's' : 'measured now') + ' · read-only';
         cronRender();
       });
     }).catch(function (error) {
       meta.textContent = 'measurement failed';
       document.getElementById('cron-rows').innerHTML =
-        '<tr><td colspan="6" class="empty err">' + escHTML(error.message) + '</td></tr>';
+        '<tr><td colspan="5" class="empty err">' + escHTML(error.message) + '</td></tr>';
     });
-  }
-  function cronAction(button) {
-    var action = button.dataset.cronAction, unit = button.dataset.unit;
-    var label = action === 'run' ? 'run now' : action;
-    if (!window.confirm(label + ' ' + unit + '?')) return;
-    button.disabled = true;
-    ownerFetch('/cron/' + action, { method: 'POST', body: JSON.stringify({ unit: unit }) })
-      .then(ownerResponse).then(function (result) {
-        if (!result.ok || !result.data.ok) throw new Error(result.data.error || ('HTTP ' + result.status));
-        msgToast(result.data.message || 'Cron action completed.');
-        return loadCron();
-      }).catch(function (error) {
-        button.disabled = false;
-        msgToast('Cron action refused: ' + error.message);
-      });
   }
   document.getElementById('cron-reload').addEventListener('click', loadCron);
   document.getElementById('cron-attention').addEventListener('change', cronRender);

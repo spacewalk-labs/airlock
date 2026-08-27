@@ -515,60 +515,16 @@ class ServiceRestartTest(unittest.TestCase):
         self.assertFalse(system['action_allowed'])
 
 
-class CronActionTest(unittest.TestCase):
-    def setUp(self):
-        self.saved_known = devmon_cron.known_user_timers
-        self.saved_service = devmon_cron.timer_service
-        self.saved_run = devmon_cron.scan.run_cmd
-        self.saved_invalidate = devmon_cron.scan.invalidate_snapshot_cache
-
-    def tearDown(self):
-        devmon_cron.known_user_timers = self.saved_known
-        devmon_cron.timer_service = self.saved_service
-        devmon_cron.scan.run_cmd = self.saved_run
-        devmon_cron.scan.invalidate_snapshot_cache = self.saved_invalidate
-
-    def test_run_pause_resume_use_shell_free_user_systemctl(self):
-        devmon_cron.known_user_timers = lambda: {'backup.timer'}
-        devmon_cron.timer_service = lambda unit: 'backup.service'
-        calls, invalidations = [], []
-        devmon_cron.scan.run_cmd = lambda argv, timeout=15: (calls.append(argv) or (0, '', ''))
-        devmon_cron.scan.invalidate_snapshot_cache = lambda: invalidations.append(True)
-        for action in ('run', 'pause', 'resume'):
-            status, payload = devmon_cron.run_action(action, 'backup.timer')
-            self.assertEqual((status, payload['ok']), (200, True), payload)
-        self.assertEqual(calls, [
-            ['systemctl', '--user', 'start', '--no-block', 'backup.service'],
-            ['systemctl', '--user', 'stop', 'backup.timer'],
-            ['systemctl', '--user', 'start', 'backup.timer'],
-        ])
-        self.assertEqual(len(invalidations), 3)
-
-    def test_non_user_and_forged_units_fail_before_subprocess(self):
-        devmon_cron.known_user_timers = lambda: {'mine.timer'}
-        devmon_cron.scan.run_cmd = lambda *a, **k: self.fail('subprocess must not run')
-        for unit, expected in [('system.timer', 403), ('mine.service', 400),
-                               ('mine.timer; reboot', 400), (None, 400)]:
-            status, payload = devmon_cron.run_action('pause', unit)
-            self.assertEqual(status, expected, payload)
-
-    def test_run_refuses_when_timer_target_cannot_be_measured(self):
-        devmon_cron.known_user_timers = lambda: {'alias.timer'}
-        for show_result in ((1, '', 'transient failure'), (0, 'Unit=\n', '')):
-            with self.subTest(show_result=show_result):
-                calls = []
-                def fake_run(argv, timeout=15):
-                    calls.append(argv)
-                    if argv[:4] == ['systemctl', '--user', 'show', 'alias.timer']:
-                        return show_result
-                    self.fail('start must not be guessed')
-                devmon_cron.scan.run_cmd = fake_run
-                status, payload = devmon_cron.run_action('run', 'alias.timer')
-                self.assertEqual(status, 503, payload)
-                self.assertFalse(payload['ok'])
-                self.assertEqual(calls, [[
-                    'systemctl', '--user', 'show', 'alias.timer', '-p', 'Unit',
-                ]])
+class CronReadOnlyTest(unittest.TestCase):
+    # Scheduled jobs are observed, never changed, from the dashboard. This asserts the
+    # absence directly: a regression that restores any of these entrypoints — or the
+    # snapshot field that decided which rows got buttons — fails here, before any route
+    # or template has to notice.
+    def test_module_exposes_no_way_to_change_a_job(self):
+        for name in ('run_action', 'known_user_timers', 'timer_service', '_ACTIONS'):
+            self.assertFalse(hasattr(devmon_cron, name),
+                             f'cron write surface is back: devmon_cron.{name}')
+        self.assertNotIn('controllable', devmon_cron._PUBLIC_JOB_FIELDS)
 
     def test_public_snapshot_omits_commands_origins_and_raw_parse_failures(self):
         original = devmon_cron.scan.snapshot
@@ -664,6 +620,15 @@ class OwnerRouteTest(unittest.TestCase):
         conn.close()
         return r.status, json.loads(data or b'{}')
 
+    def _get(self, path):
+        import http.client
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        conn.request('GET', path)
+        r = conn.getresponse()
+        data = r.read()
+        conn.close()
+        return r.status, json.loads(data or b'{}')
+
     def test_percent_encoded_card_id_reaches_the_card(self):
         # What the browser actually sends. Before the fix this answered 404/card_not_found
         # for every card the shipped producer creates, so nothing could be read or run.
@@ -723,27 +688,23 @@ class OwnerRouteTest(unittest.TestCase):
                                      body=b'{"name":"airlock-alpha"}')
         self.assertEqual(status, 404, payload)
 
-    def test_owner_can_control_a_whitelisted_cron_timer(self):
-        saved = DM.CRON.run_action
-        try:
-            seen = []
-            DM.CRON.run_action = lambda action, unit: (
-                seen.append((action, unit)) or (200, {'ok': True, 'message': 'done'}))
-            status, payload = self._post('/api/owner/cron/pause', body=b'{"unit":"backup.timer"}')
-            self.assertEqual((status, payload.get('ok')), (200, True), payload)
-            self.assertEqual(seen, [('pause', 'backup.timer')])
-        finally:
-            DM.CRON.run_action = saved
+    def test_cron_write_routes_do_not_exist_for_a_fully_authorised_owner(self):
+        # The discriminating case. A request that clears every gate — owner identity,
+        # proxy secret, same origin, JSON body — must still find nothing here. A live
+        # route would answer 200/400/403 from the action handler instead.
+        for action in ('run', 'pause', 'resume'):
+            status, payload = self._post('/api/owner/cron/' + action,
+                                         body=b'{"unit":"backup.timer"}')
+            self.assertEqual(status, 404, (action, payload))
 
-    def test_cron_control_checks_owner_before_dispatch(self):
-        saved = DM.CRON.run_action
+    def test_cron_reading_is_untouched_by_the_write_removal(self):
+        saved = DM.CRON.snapshot
         try:
-            DM.CRON.run_action = lambda *a: self.fail('cron action must not run before owner gate')
-            status, _ = self._post('/api/owner/cron/run', body=b'{"unit":"backup.timer"}',
-                                   headers={'X-Devmon-Proxy-Secret': 'nope'})
-            self.assertEqual(status, 403)
+            DM.CRON.snapshot = lambda: {'jobs': [], 'counts': {}, 'sources': []}
+            status, payload = self._get('/api/cron/jobs')
+            self.assertEqual((status, payload.get('jobs')), (200, []), payload)
         finally:
-            DM.CRON.run_action = saved
+            DM.CRON.snapshot = saved
 
 
 import devmon_tokens as TOK  # noqa: E402  (imported here to sit with its own tests)

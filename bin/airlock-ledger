@@ -1635,22 +1635,46 @@ def _require_container_daemon(runtime: dict[str, Any] | None,
              "refusing to treat objects on another daemon as absent")
 
 
-def _docker_absence_error(stderr: str, object_id: str) -> bool:
-    message = stderr.strip()
-    return message in {
-        f"Error: No such object: {object_id}",
-        f"Error response from daemon: No such container: {object_id}",
-    }
+def _container_absent(object_id: str, inspect_exit: int) -> bool:
+    """Prove absence from the daemon's own object list, never from its prose.
+
+    Error text is not a contract: the runtime has shipped several phrasings for
+    a missing object and changes their casing between releases. Matching the
+    wording fails in both directions -- a removed container is demoted to
+    UNKNOWN the day the phrasing changes, wedging teardown, and an object that
+    is still listed would be retired on the strength of a reply that merely
+    reads like an absence. A structured, exit-code-checked re-query answers the
+    only question that matters, and stays UNKNOWN whenever it cannot.
+    """
+    probe = _container_id_query()
+    if probe.returncode != 0:
+        log(f"Docker inspect {object_id} is UNKNOWN (exit {inspect_exit}); the "
+            f"absence re-query also failed with exit {probe.returncode}")
+        return False
+    try:
+        listed = _container_ids_from(probe)
+    except LedgerError as exc:
+        # _inspect_container's callers treat it as total -- several of them run
+        # mid-teardown outside any handler. An unusable list must therefore
+        # close as UNKNOWN here rather than abort the loop from inside a probe.
+        log(f"Docker inspect {object_id} is UNKNOWN (exit {inspect_exit}); the "
+            f"absence re-query returned an unusable list: {exc}")
+        return False
+    if object_id in listed:
+        log(f"Docker inspect {object_id} is UNKNOWN (exit {inspect_exit}); the "
+            "daemon still lists the object")
+        return False
+    return True
 
 
 def _inspect_container(object_id: str) -> tuple[str, dict[str, Any] | None]:
-    """Return PRESENT/ABSENT/UNKNOWN; only Docker's exact absence responses
-    become ABSENT. Callers must retain the ledger record for UNKNOWN."""
+    """Return PRESENT/ABSENT/UNKNOWN; ABSENT only once the daemon's own
+    container list no longer carries the id. Callers must retain the ledger
+    record for UNKNOWN."""
     result = _docker(["inspect", object_id])
     if result.returncode != 0:
-        if _docker_absence_error(result.stderr, object_id):
+        if _container_absent(object_id, result.returncode):
             return "ABSENT", None
-        log(f"Docker inspect {object_id} is UNKNOWN (exit {result.returncode})")
         return "UNKNOWN", None
     try:
         values = json.loads(result.stdout)
@@ -1683,19 +1707,31 @@ def _inspect_container(object_id: str) -> tuple[str, dict[str, Any] | None]:
     return "PRESENT", {"id": returned_id, "name": name, "labels": labels}
 
 
-def _enumerate_containers(*, app_id: str | None = None,
-                          nonce: str | None = None) -> list[dict[str, Any]]:
+def _container_id_query(*, app_id: str | None = None,
+                        nonce: str | None = None) -> subprocess.CompletedProcess[str]:
+    """Raw id listing. Kept free of _inspect_container so the absence probe in
+    _container_absent cannot recurse back into the query it is answering."""
     args = ["ps", "-aq", "--no-trunc"]
     if app_id is not None:
         args += ["--filter", f"label={_PACKAGE_LABEL}={app_id}"]
     if nonce is not None:
         args += ["--filter", f"label={_NONCE_LABEL}={nonce}"]
-    result = _docker(args)
-    if result.returncode != 0:
-        fail(f"Docker container enumeration failed with exit {result.returncode}")
+    return _docker(args)
+
+
+def _container_ids_from(result: subprocess.CompletedProcess[str]) -> list[str]:
     ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if len(ids) != len(set(ids)) or any(not _CONTAINER_ID_RE.fullmatch(x) for x in ids):
         fail("Docker container enumeration returned invalid full ids")
+    return ids
+
+
+def _enumerate_containers(*, app_id: str | None = None,
+                          nonce: str | None = None) -> list[dict[str, Any]]:
+    result = _container_id_query(app_id=app_id, nonce=nonce)
+    if result.returncode != 0:
+        fail(f"Docker container enumeration failed with exit {result.returncode}")
+    ids = _container_ids_from(result)
     objects: list[dict[str, Any]] = []
     for object_id in ids:
         state, obj = _inspect_container(object_id)
@@ -1793,10 +1829,22 @@ def container_install_admission_for_load(app_id: str, entry: dict[str, Any]) -> 
     else:
         exact = _enumerate_containers(
             app_id=app_id, nonce=runtime["install_nonce"])
-        if exact:
-            fail(f"container load gate for {app_id}: fresh intent already has "
-                 f"{len(exact)} exact-label object(s)")
-        _check_live_container_admission(app_id, runtime["declarations"])
+        # Objects carrying this intent's own nonce are this run's own work: the
+        # nonce is journaled before any create, and the gate is consumed again
+        # from smoke -- after install created them, before the commit that ends
+        # "fresh". Refusing them would make that commit unreachable and leave
+        # every later run fresh again, so the refusal could never clear itself.
+        # What must still fail is an object wearing the active labels under a
+        # name the declaration never claimed, which is exactly what the
+        # commit-time capture refuses.
+        for obj in exact:
+            if not _container_name_matches(obj["name"], runtime["declarations"]):
+                fail(f"container load gate for {app_id}: container {obj['id']} "
+                     f"carries the active labels but name {obj['name']!r} is "
+                     "outside the declaration")
+        _check_live_container_admission(
+            app_id, runtime["declarations"],
+            allowed_pairs={(app_id, runtime["install_nonce"])})
         _require_container_daemon(runtime, f"container load gate for {app_id}")
     return {
         "install_nonce": runtime["install_nonce"],

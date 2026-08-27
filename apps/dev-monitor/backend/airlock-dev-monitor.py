@@ -928,15 +928,6 @@ class Handler(BaseHTTPRequestHandler):
                 'ok': ok, 'name': name, 'message': message,
             })
             return
-        if path.startswith('/api/owner/cron/'):
-            if CRON is None:
-                self._json(503, {'ok': False, 'error': 'cron collector unavailable'})
-                return
-            action = path.rsplit('/', 1)[-1]
-            status, payload = CRON.run_action(
-                action, body.get('unit') if isinstance(body, dict) else None)
-            self._json(status, payload)
-            return
         parts = path.split('/')
         if len(parts) == 6 and parts[:4] == ['', 'api', 'owner', 'messages']:
             card_id, action = self._seg(parts[4]), parts[5]

@@ -57,25 +57,19 @@ PY
 echo "[dev-monitor smoke] cron shape: ${cron_shape}"
 case "$cron_shape" in OK*) ;; *) fail=1 ;; esac
 
-# With the existing owner console enabled, a direct loopback POST cannot forge nginx's
-# secret and an unknown timer must be rejected without mutation. With it disabled, cron
-# writes stay behind the same fail-closed 404 as every other owner-only route.
-c_cron_direct=$(code -X POST -H 'Content-Type: application/json' \
-  -H 'Origin: http://127.0.0.1' -H "X-Devmon-Owner: ${OWNER}" \
-  --data '{"unit":"airlock-not-a-real-user.timer"}' \
-  "http://127.0.0.1:${BACKEND}/api/owner/cron/pause")
-c_cron_refuse=$(code -X POST -H "${HDR}: ${OWNER}" -H 'Content-Type: application/json' \
+# Scheduled jobs are read-only: the dashboard shows them and never starts, pauses or
+# resumes them. This asserts the absence, because absence is what can silently regress.
+# The request below clears every gate the owner console has — ingress owner identity,
+# nginx-injected proxy secret, same origin, JSON body — so with the console enabled a
+# 404 can only mean the route is not there; a restored route would answer 200/400/403
+# from its own handler. With the console disabled the same 404 arrives one gate earlier,
+# so the check is correct either way and needs no branch.
+c_cron_write=$(code -X POST -H "${HDR}: ${OWNER}" -H 'Content-Type: application/json' \
   -H "Origin: http://127.0.0.1:${HUB}" --data '{"unit":"airlock-not-a-real-user.timer"}' \
   "http://127.0.0.1:${HUB}/monitor/api/owner/cron/pause")
-if [ "$want" = true ]; then
-  echo "[dev-monitor smoke] cron controls: direct=${c_cron_direct}/403 unknown-user-timer=${c_cron_refuse}/403"
-  [ "$c_cron_direct" = 403 ] || { echo "FAIL direct loopback bypassed the cron owner gate"; fail=1; }
-  [ "$c_cron_refuse" = 403 ] || { echo "FAIL cron mutation allowlist did not refuse an unknown user timer"; fail=1; }
-else
-  echo "[dev-monitor smoke] cron controls off: direct=${c_cron_direct}/404 hub=${c_cron_refuse}/404"
-  [ "$c_cron_direct" = 404 ] || { echo "FAIL messages is off but direct cron control answered ${c_cron_direct}"; fail=1; }
-  [ "$c_cron_refuse" = 404 ] || { echo "FAIL messages is off but hub cron control answered ${c_cron_refuse}"; fail=1; }
-fi
+echo "[dev-monitor smoke] cron is read-only: write route=${c_cron_write}/404 (console=${want})"
+[ "$c_cron_write" = 404 ] || {
+  echo "FAIL a cron write route answered ${c_cron_write}; scheduled jobs must stay read-only"; fail=1; }
 
 # --- credential freshness ---
 # Same shape as the console check below: `state` is what the backend actually managed to

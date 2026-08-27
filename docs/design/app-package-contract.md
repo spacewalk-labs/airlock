@@ -726,8 +726,14 @@ replace that intent with a fresh one and retry. All other runtime objects whose
 names match the declared namespace and do not carry both labels for the active
 record are foreign collisions. The platform must never relabel, stop, or remove
 a foreign collision. An unrecorded object carrying both active-record labels is
-instead an unexpected owned object: it blocks lifecycle admission, but generic
-teardown must include it by nonce.
+instead an unexpected owned object, and whether it blocks lifecycle admission
+turns on its name. The load gate is consumed again from a package's smoke —
+after that package created this run's objects, and before the commit that would
+record them — so an object carrying the active labels under a **declared** name
+is this run's own work and is admitted. Refusing it there would make that commit
+unreachable and leave every later run fresh, so the refusal could never clear
+itself. A name **outside** the declaration blocks admission and commit alike.
+Generic teardown includes both by nonce.
 
 Images, volumes, and networks do not become owned merely because a container
 uses them. Contract-1 container packages use only images already present by
@@ -779,9 +785,14 @@ package label, and nonce to agree; recorded objects must also retain their exact
 name. It passes that full id, never a name or prefix, to `docker rm -f`, then
 inspects that id again.
 
-Runtime queries have three results: PRESENT with full identity, ABSENT only for
-the runtime's specified object-not-found response, and UNKNOWN for every other
-error. An identity mismatch, UNKNOWN result, non-zero `rm`, or PRESENT
+Runtime queries have three results: PRESENT with full identity, ABSENT only
+when a structured re-query of the runtime's own object list exits successfully
+and no longer carries that id, and UNKNOWN for every other error. Absence is
+never read out of an error message. The runtime has shipped more than one
+phrasing for a missing object and changes their casing between releases, so a
+wording match fails in both directions: it disbelieves a finished removal the
+day the phrasing moves, and it would retire an object that is still listed on
+the strength of a reply that merely reads like an absence. An identity mismatch, UNKNOWN result, non-zero `rm`, or PRESENT
 post-check is a teardown failure and retains the record for retry; even when a
 non-zero `rm` is followed by ABSENT, that attempt fails and the next retry may
 discharge the now absent record without issuing another removal. After all
@@ -796,8 +807,8 @@ guarantee as an ordinary configured deactivation.
 
 Contract 1's first container runtime is Docker. Supporting another runtime is a
 new contract decision, not an executable name hidden in per-box config: runtime
-identity, immutable object identity, filters, and absence errors must have one
-specified meaning before the ledger can trust them.
+identity, immutable object identity, filters, and a structured way to prove
+absence must have one specified meaning before the ledger can trust them.
 
 ## 3. Fixture specifications
 
@@ -1120,7 +1131,13 @@ lookalikes never enter the candidate set; (e) a new same-nonce id appearing
 after per-id removal makes the final label-set oracle fail, then remains an
 unexpected owned teardown candidate rather than a foreign collision; (f) fake-runtime
 arguments plus a real-runtime inventory prove the package did not pull/build an
-image or create a named volume/network. The fixture driver is a stateful fake
+image or create a named volume/network; (g) the package's smoke loads its own
+config in the window between the creates and the commit — this run's own
+exact-label objects are admitted there, while a foreign namespace collision
+appearing in that same window still blocks with a collision refusal; (h) a
+completed removal still converges when the runtime rewords its object-not-found
+reply, and an object the runtime still lists is never retired on the strength of
+such a reply. The fixture driver is a stateful fake
 runtime so it runs in CI; the Notes app acceptance additionally exercises one
 real Docker install and asks Docker itself for post-deactivation absence.
 

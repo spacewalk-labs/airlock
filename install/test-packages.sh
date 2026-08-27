@@ -2063,9 +2063,24 @@ if args[0] == "inspect" and len(args) == 2:
     query = args[1]
     object_id = query if query in state["objects"] else next(
         (oid for oid, obj in state["objects"].items() if obj["name"] == query), None)
+    def absence_reply(target):
+        # Docker has shipped more than one wording for "no such object" and
+        # changes the casing between releases, so the fixture can speak either
+        # dialect. The platform must not depend on which one it hears.
+        if control.get("absence_message") == "lowercase":
+            return f"error: no such object: {target}"
+        if control.get("absence_message") == "daemon":
+            return f"Error response from daemon: No such container: {target}"
+        return f"Error: No such object: {target}"
     if object_id is None:
         log("inspect-result", query=query, state="ABSENT")
-        print(f"Error: No such object: {query}", file=sys.stderr)
+        print(absence_reply(query), file=sys.stderr)
+        raise SystemExit(1)
+    if object_id in control.get("inspect_absent_liar", []):
+        # Present, but the query claims absence. Nothing may conclude the
+        # object is gone from that claim alone.
+        log("inspect-result", query=query, object_id=object_id, state="LIAR")
+        print(absence_reply(query), file=sys.stderr)
         raise SystemExit(1)
     if object_id in control.get("inspect_unknown", []):
         log("inspect-result", query=query, object_id=object_id, state="UNKNOWN")
@@ -2262,10 +2277,42 @@ if [ "\$(cat "$F16/mode" 2>/dev/null || true)" = outside-name ]; then
   create t16-outside-declaration
 fi
 EOF
-  cat > "$dir/smoke.sh" <<'EOF'
+  cat > "$dir/smoke.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exit 0
+# Real container-backed apps load their platform env from smoke.sh too, and
+# that happens after install.sh created the objects but before the ledger
+# commit. Opt-in so the other F16 cases keep the no-op smoke they assert on.
+[ -f "$F16/smoke-load" ] || exit 0
+. "\$AIRLOCK_ROOT/install/lib.sh"
+if [ -f "$F16/smoke-foreign" ]; then
+  # Inject one name-colliding object the way f16_seed does, so the smoke-phase
+  # gate still has a genuine namespace collision to refuse. It wears this
+  # package's own label under a DIFFERENT nonce on purpose: that is the variant
+  # that binds the assertion to the nonce half of the admitted pair. An
+  # unlabelled object would only re-prove that the empty pair is rejected --
+  # the install-time collision matrix already covers that, and mixing the two
+  # here would let the unlabelled one refuse first and mask this case.
+  python3 - "\$F16_DOCKER_STATE" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+s = json.load(open(path, encoding="utf-8"))
+object_id = f'{s["next_id"]:064x}'
+s["next_id"] += 1
+s["objects"][object_id] = {
+    "name": "airlock-t16-othernonce",
+    "labels": {"io.airlock.package": "t16",
+               "io.airlock.install-nonce":
+                   "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"}}
+tmp = path + ".tmp"
+open(tmp, "w", encoding="utf-8").write(json.dumps(s, sort_keys=True) + "\\n")
+os.replace(tmp, path)
+PY
+fi
+airlock_load t16
+[ -n "\${AIRLOCK_INSTALL_NONCE:-}" ] || die "smoke lost the journaled container nonce"
+[ "\${AIRLOCK_CONTAINER_RECONCILE_MODE:-}" = fresh ] \
+  || die "smoke saw reconcile mode '\${AIRLOCK_CONTAINER_RECONCILE_MODE:-}'"
 EOF
   cat > "$dir/deactivate.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -2279,7 +2326,7 @@ EOF
 f16_new_fixture() {
   reset_box
   f16_runtime_reset
-  rm -f "$F16/mode"
+  rm -f "$F16/mode" "$F16/smoke-load" "$F16/smoke-foreign"
   rm -rf "$F16/pkg" "$F16/pkg-gone"
   f16_mkpkg "$F16/pkg"
   mkcfg "$F16/airlock.toml" '[apps.t16]' '[packages.t16]' "path = \"$F16/pkg\""
@@ -2583,6 +2630,90 @@ if [ "$rc" = 0 ] && f16_object_absent "$f16_race_id" \
 else
   bad "F16: final-oracle retry did not converge as owned (rc=$rc)"
 fi
+
+# The load gate runs again inside smoke.sh, and smoke runs after install.sh
+# created this run's objects but before the ledger commit. A fresh intent must
+# therefore admit the objects carrying its own nonce -- refusing them deadlocks
+# the lifecycle permanently, because the commit that would end "fresh" is
+# exactly what the refusal prevents.
+f16_new_fixture
+: > "$F16/smoke-load"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] \
+   && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && [ "$(f16_state_eval "len([o for o in s['objects'].values() if o['labels'].get('io.airlock.package') == 't16']) == 2")" = True ] \
+   && ! grep -q "exact-label object" <<<"$out"; then
+  ok "F16: smoke-phase load on a fresh intent admits this run's own objects"
+else
+  bad "F16: the fresh-intent load gate deadlocked its own lifecycle (rc=$rc)"
+fi
+
+# Negative control for the same gate: admitting our own nonce must not admit
+# anyone else's. A name-colliding object owned by nobody, inserted between the
+# create and the smoke-phase load, still has to stop the run -- and stop it for
+# that reason, not for the self-collision the case above removed.
+f16_new_fixture
+: > "$F16/smoke-load"
+: > "$F16/smoke-foreign"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" != 0 ] \
+   && grep -q "container namespace collision" <<<"$out" \
+   `# bind the refusal to the LOAD gate: only airlock-config's admission call` \
+   `# emits this prefix. Without it the commit-time capture refuses the same` \
+   `# object with the same collision wording, and the case would pass even if` \
+   `# the smoke-phase gate had admitted a foreign nonce.` \
+   && grep -q "container runtime admission failed for app 't16'" <<<"$out" \
+   && [ "$(ledger_field t16 x '"committed" in e')" != True ] \
+   && [ "$(f16_state_eval "any(o['name'] == 'airlock-t16-othernonce' for o in s['objects'].values())")" = True ] \
+   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'rm-result'])")" = 0 ]; then
+  ok "F16: smoke-phase load still refuses a foreign namespace collision"
+else
+  bad "F16: smoke-phase load lost the foreign namespace guard (rc=$rc)"
+fi
+
+# Absence is a fact about the daemon's object list, not about the wording of an
+# error string. The runtime ships more than one phrasing and changes the casing
+# between releases, so a removal that actually completed must still converge.
+f16_new_fixture
+orch "$F16/airlock.toml" >/dev/null 2>&1 || bad "F16: absence-dialect setup install failed"
+read -r f16_dialect1 f16_dialect2 <<<"$(f16_ids)"
+f16_control '{"absence_message":"lowercase"}'
+mkcfg "$F16/airlock.toml"
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] \
+   && [ "$(f16_state_eval "'$f16_dialect1' not in s['objects'] and '$f16_dialect2' not in s['objects']")" = True ] \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ] \
+   && ! grep -q "not proven ABSENT" <<<"$out"; then
+  ok "F16: removal proves absence by re-query, not by the daemon's error wording"
+else
+  bad "F16: a reworded absence reply blocked a completed removal (rc=$rc)"
+fi
+f16_control '{}'
+
+# Negative control for that proof: the guard exists to catch "said it removed
+# it, did not". An object that is still listed must never be retired on the
+# strength of an absence reply, no matter how well phrased.
+f16_new_fixture
+orch "$F16/airlock.toml" >/dev/null 2>&1 || bad "F16: forged-absence setup install failed"
+read -r f16_liar1 f16_liar2 <<<"$(f16_ids)"
+f16_control "{\"inspect_absent_liar\":[\"$f16_liar1\"]}"
+mkcfg "$F16/airlock.toml"
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+f16_liar_reason="$(grep -c "is UNKNOWN (exit 1); the daemon still lists the object" <<<"$out")"
+f16_liar_refusal="$(grep -c "could not establish $f16_liar1" <<<"$out")"
+f16_liar_objects="$(f16_state_eval "'$f16_liar1' in s['objects'] and '$f16_liar2' in s['objects']")"
+f16_liar_record="$(ledger_field t16 x '"committed" in e')"
+f16_liar_rms="$(f16_log_eval "len([r for r in rows if r.get('event') == 'rm-result'])")"
+if [ "$rc" != 0 ] && [ "$f16_liar_reason" != 0 ] && [ "$f16_liar_refusal" != 0 ] \
+   && [ "$f16_liar_objects" = True ] && [ "$f16_liar_record" = True ] \
+   && [ "$f16_liar_rms" = 0 ]; then
+  ok "F16: a forged absence reply cannot retire a container the daemon still lists"
+else
+  bad "F16: absence proof accepted a claim the daemon's own list contradicts (rc=$rc reason=$f16_liar_reason refusal=$f16_liar_refusal objects=$f16_liar_objects record=$f16_liar_record rms=$f16_liar_rms)"
+fi
+f16_control '{}'
 
 # Package/runtime obligations: the fake rejected violations inline; this audit
 # pins the positive arguments too.  The Notes acceptance supplies the separate
