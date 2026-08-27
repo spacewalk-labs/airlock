@@ -20,7 +20,8 @@ AIRLOCK_CONFIG_BIN="$ROOT/bin/airlock-config"
 
 # This marker is asserted only after this process acquires fd 9 below. Never
 # trust a value inherited from a parent shell as proof of lock ownership.
-unset AIRLOCK_LEDGER_LOCK_HELD
+unset AIRLOCK_LEDGER_LOCK_HELD AIRLOCK_CONFIG_SNAPSHOT \
+  AIRLOCK_CONFIG_SNAPSHOT_SHA256
 
 # The exceptional path is one exact, package-scoped argv value.  Do not add an
 # environment alias: an exported value would silently remain active for later
@@ -29,6 +30,7 @@ unset AIRLOCK_LEDGER_LOCK_HELD
 _airlock_lifecycle_args=()
 _airlock_lifecycle_config_bin="$AIRLOCK_CONFIG_BIN"
 _airlock_config_wrapper=""
+_airlock_config_snapshot=""
 for _airlock_install_arg in "$@"; do
   case "$_airlock_install_arg" in
     --dangerously-admit-unverified=*)
@@ -47,6 +49,7 @@ done
 
 _airlock_cleanup_config_wrapper() {
   [ -z "$_airlock_config_wrapper" ] || rm -f -- "$_airlock_config_wrapper"
+  [ -z "$_airlock_config_snapshot" ] || rm -f -- "$_airlock_config_snapshot"
 }
 trap _airlock_cleanup_config_wrapper EXIT
 
@@ -75,6 +78,25 @@ PY
 fi
 airlock_preflight_bootstrap
 
+# Freeze the operator file before choosing the ledger-lock predicate. Config
+# edits made after this point belong to the next run; this run's validation,
+# plan/remove, app order, lifecycle env and renderers all consume one immutable
+# byte snapshot. AIRLOCK_CONFIG remains the original path so relative package
+# paths retain their documented base directory.
+_airlock_config_snapshot="$(mktemp)" || die "cannot create install config snapshot"
+_snapshot_receipt="$(airlock_config install-snapshot "$_airlock_config_snapshot")" || exit 2
+_snapshot_digest="$(printf '%s' "$_snapshot_receipt" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha256"])')" \
+  || die "cannot read install config snapshot digest"
+AIRLOCK_CONFIG="$(printf '%s' "$_snapshot_receipt" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["config_path"])')" \
+  || die "cannot read install config snapshot origin"
+[[ "$_snapshot_digest" =~ ^[0-9a-f]{64}$ ]] \
+  || die "install config snapshot returned an invalid digest"
+AIRLOCK_CONFIG_SNAPSHOT="$_airlock_config_snapshot"
+AIRLOCK_CONFIG_SNAPSHOT_SHA256="$_snapshot_digest"
+export AIRLOCK_CONFIG AIRLOCK_CONFIG_SNAPSHOT AIRLOCK_CONFIG_SNAPSHOT_SHA256
+
 # Packaged apps (docs/design/app-package-contract.md). One read-only probe up
 # front answers three things: the resolved config path (exported so app scripts
 # resolve the SAME config from any cwd — a packaged app's cwd is its package
@@ -85,6 +107,7 @@ export AIRLOCK_PKG_INFO
 AIRLOCK_CONFIG="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print(json.load(sys.stdin)["config_path"])')"
 export AIRLOCK_CONFIG AIRLOCK_ROOT
 _pkg_ids="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print("\n".join(sorted(json.load(sys.stdin)["packages"])))')"
+_app_ids="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print("\n".join(json.load(sys.stdin)["order"]))')"
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ "${#_airlock_lifecycle_args[@]}" -eq 1 ]; then
   log "[dry] DANGEROUS: would admit unverified package lock mismatch: ${_airlock_lifecycle_args[0]} (no audit or lock state will be written)"
 fi
@@ -136,12 +159,13 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] \
   # admit a concurrent manual recovery mutation into this run.
   AIRLOCK_LEDGER_LOCK_HELD=1
   export AIRLOCK_LEDGER_LOCK_HELD
-  # The pre-lock probe only decided the predicate. Re-read under the lock so
-  # plan/install/commit run on package state nothing concurrent can have
-  # changed between probe and acquire.
+  # Re-read the immutable snapshot under the lock. This is intentionally the
+  # same candidate as the gate probe, not a second read of a mutable operator
+  # file: gate, plan/remove and app install must never observe A/B configs.
   AIRLOCK_PKG_INFO="$(airlock_config package-info)" || exit 2
   export AIRLOCK_PKG_INFO
   _pkg_ids="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print("\n".join(sorted(json.load(sys.stdin)["packages"])))')"
+  _app_ids="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print("\n".join(json.load(sys.stdin)["order"]))')"
   if [ "${#_airlock_lifecycle_args[@]}" -eq 1 ]; then
     _breakglass_id="${_airlock_lifecycle_args[0]#*=}"
     _breakglass_receipt="$(printf '%s' "$AIRLOCK_PKG_INFO" \
@@ -212,6 +236,17 @@ take — previewing into $_scratch instead. Paths in the lines below are the scr
 fi
 export AIRLOCK_WEBROOT AIRLOCK_CONFD
 
+# Resolve every read-only candidate projection now, while all recorded apps are
+# still active and after dry-run scratch roots have reached their final values.
+# A bad manifest icon, launcher tile, env projection, plaintext mapping, or
+# prerequisite must not surface for the first time after reconcile has already
+# deactivated a working app.
+log "validating the complete install candidate"
+_candidate_preflight="$(printf '%s' "$AIRLOCK_PKG_INFO" \
+  | airlock_config install-preflight --package-info-stdin)" || exit 2
+[[ "$_candidate_preflight" =~ ^[0-9a-f]{64}$ ]] \
+  || die "complete install candidate preflight returned an invalid digest"
+
 # 1) hub static + frontend config
 # WEBROOT and CONFD live under system paths nginx can read. Create them with sudo
 # and hand ownership to the installing user, so the hub write + each app's fragment
@@ -225,7 +260,7 @@ airlock_run cp "$ROOT/hub/index.html" "$ROOT/hub/wrong-owner.html" "$WEBROOT/"
 # bin/gen-app-icons.py) — all served from /assets/, which same-origin subpath apps
 # reference directly. A recursive copy, so a new asset directory needs no wiring here.
 [ -d "$ROOT/hub/assets" ] && airlock_run cp -r "$ROOT/hub/assets/." "$WEBROOT/assets/"
-# [branding] icon_ring: the subpath apps (notepad, publish, markwand, dev-monitor)
+# [branding] icon_ring: the subpath apps (notepad, publish, fileview, dev-monitor)
 # take their favicon from assets/app-icons/, so ringing only each gate's own copy
 # left most tabs on a multi-box tailnet identical. Same filenames, ringed content —
 # no page is edited. SVG only; see ring_icon_svg's note on the PNG half.
@@ -261,8 +296,16 @@ fi
 # app without a deactivator) aborts here, before any install touches the box.
 # Sits after the roots above because teardown resolves against $CONFD/$WEBROOT.
 _active_ports=""
+_deactivate_failed=""
 if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
   && { [ -n "$_pkg_ids" ] || [ -f "$LEDGER_FILE" ] || [ -n "$_known_builtins" ]; }; }; then
+  # Close the read-to-reconcile window.  The first pass proved every static
+  # projection before any install mutation; this repeat proves it is still the
+  # same candidate immediately before the first ledger removal/deactivation.
+  _candidate_preflight_now="$(printf '%s' "$AIRLOCK_PKG_INFO" \
+    | airlock_config install-preflight --package-info-stdin)" || exit 2
+  [ "$_candidate_preflight_now" = "$_candidate_preflight" ] \
+    || die "install candidate changed before reconcile — no recorded app was deactivated"
   # Computed only on ledger-touching runs: a built-in-only box must see the
   # exact byte stream it saw before packages existed.
   _active_ports="$(airlock_config plaintext | awk '{print $2}' | tr '\n' ' ')"
@@ -271,6 +314,15 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
     [ "$_rc" = 3 ] && die "a recorded app without a deactivator blocks this change (see above) — the one exit is the explicit teardown command it names"
     die "installed-state ledger plan failed (rc=$_rc)"
   }
+  # 🔴 One package's failed teardown must not strand the others. This loop
+  # deactivates EVERY changed package before ANY of them reinstalls (so a port
+  # an old install still holds is free before the new one binds), which means
+  # aborting in the middle leaves the packages already processed deactivated
+  # with nothing to bring them back. Measured twice on a real box (2026-08-26):
+  # one deactivator exited 1 and four unrelated apps stayed down.
+  # So: record the failure, keep going, skip only that package's install, and
+  # fail loudly at the end. The ledger keeps a failed package's record, so the
+  # next run re-plans exactly the same teardown.
   while IFS=$'\t' read -r _action _id; do
     [ -n "${_action:-}" ] || continue
     case "$_action" in
@@ -278,10 +330,12 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
         # airlock-ledger honours AIRLOCK_DRY_RUN itself ([dry] per artifact),
         # which previews more than airlock_run's one-line command echo would.
         log "reconcile: removing '$_id' (recorded but no longer in config)"
-        printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" remove "$_id" --active-ports "$_active_ports" ;;
+        printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" remove "$_id" --active-ports "$_active_ports" \
+          || { log "reconcile FAILED: could not remove '$_id' (see above)"; _deactivate_failed="$_deactivate_failed $_id"; } ;;
       upgrade-deactivate)
         log "reconcile: '$_id' changed — deactivating the recorded install before the fresh one"
-        printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" remove "$_id" --for-upgrade --active-ports "$_active_ports" ;;
+        printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" remove "$_id" --for-upgrade --active-ports "$_active_ports" \
+          || { log "reconcile FAILED: could not deactivate '$_id' (see above); its install is skipped, the rest continue"; _deactivate_failed="$_deactivate_failed $_id"; } ;;
       fresh|reinstall|upgrade-diff)
         : ;;  # handled by the install/commit path below
       *)
@@ -312,6 +366,12 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
     esac
   done <<<"$_adopt_scan"
 fi
+
+# 1c) The first platform-owned user unit. Apps own their own units below, but the secret
+# drop's TTL must remain enforced when no consuming app is installed or running. The
+# helper owns both render/install and the symmetric explicit teardown path.
+log "installing platform secret TTL timer"
+AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-secret-timer.sh" install
 
 # 2) enabled app installers (each drops its own nginx fragment into $CONFD/*)
 # Child 4/P3: validate already refused any enabled app that is neither hub
@@ -360,6 +420,11 @@ print("1" if "dry-run-exec" in (pkg.get("certifications") or []) else "0")
     else
       log "[dry] would install packaged app: $app from $pkg_dir (script not run)"
     fi
+  elif case " $_deactivate_failed " in *" $app "*) true ;; *) false ;; esac; then
+    # Its recorded teardown failed above, so the box still holds the OLD
+    # install's artifacts. Installing over them would let the ledger commit a
+    # new record while the old one still names artifacts nobody will reclaim.
+    log "skipping install of '$app': its recorded deactivation failed above"
   else
     log "installing packaged app: $app ($pkg_dir)"
     printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" intent "$app" --active-ports "$_active_ports" >/dev/null
@@ -383,7 +448,7 @@ print("1" if "dry-run-exec" in (pkg.get("certifications") or []) else "0")
     airlock_render_serve_https "$app"
     _installed_pkgs="$_installed_pkgs $app"
   fi
-done < <(airlock_config apps)
+done <<<"$_app_ids"
 
 # 3) render the main site (includes the fragments from step 2)
 log "rendering nginx site -> $NGINX_SITE"
@@ -463,7 +528,7 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
       AIRLOCK_CONFIG_BIN="$_airlock_lifecycle_config_bin" \
       bash "$s" </dev/null) 9>&- \
       || { log "smoke FAILED: $app"; smoke_fail=1; _smoke_failed="$_smoke_failed $app"; }
-  done < <(airlock_config apps)
+  done <<<"$_app_ids"
 
   # 6b-ledger) commit packaged installs that met the commit condition:
   # install.sh succeeded AND smoke.sh ran and succeeded (F6 guarantees the
@@ -479,6 +544,11 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   done
   [ "$smoke_fail" = 0 ] || die "one or more app smokes failed"
   [ "$_commit_fail" = 0 ] || die "one or more ledger commits failed (see above)"
+fi
+# Last, so the run still reinstalls, renders, smokes and commits everything it
+# could before it reports the packages it could not take down.
+if [ -n "$_deactivate_failed" ]; then
+  die "reconcile could not deactivate:$_deactivate_failed — every other app was reinstalled; re-run after fixing the deactivator(s) named above"
 fi
 
 # 6b) the layer in front of the loopback smokes: is the serve mapping assembled, is TLS

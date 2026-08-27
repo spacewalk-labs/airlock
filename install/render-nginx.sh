@@ -103,7 +103,7 @@ server {
     }
 
     # shared "return to Airlock" widget — served at a stable /airlock-return.js so
-    # same-origin subpath apps (markwand, notepad, publish, dev-monitor) can load
+    # same-origin subpath apps (fileview, notepad, publish, dev-monitor) can load
     # it. Separate-port gates serve their own copy (see emit_owner_gate). The
     # orchestrator copies hub/assets/ (incl. airlock-return.js) to <webroot>/assets.
     location = /airlock-return.js {
@@ -129,7 +129,7 @@ server {
         try_files $uri $uri/ /index.html;
     }
 
-    # same-origin subpath apps (markwand, publish, dev-monitor, notepad) drop
+    # same-origin subpath apps (fileview, publish, dev-monitor, notepad) drop
     # location fragments here as they are installed. They inherit the server-level
     # gate above — fragments are plain proxies, no per-location guard needed.
     include @@CONFD@@/hub-locations.d/*.conf;

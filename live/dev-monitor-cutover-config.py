@@ -35,7 +35,6 @@ def q(raw: str) -> str:
 def main() -> None:
     owner = required('AIRLOCK_CUTOVER_OWNER')
     site_name = value('AIRLOCK_CUTOVER_SITE_NAME', 'Airlock')
-    code_root = value('AIRLOCK_CUTOVER_CODE_ROOT', os.path.expanduser('~'))
     roster = value('AIRLOCK_CUTOVER_ROSTER_PATH', '')
     compat_env_path = value('AIRLOCK_CUTOVER_COMPAT_ENV_PATH', '')
     urgent_env = value(
@@ -66,7 +65,6 @@ owner = {q(owner)}
 collaborators = []
 
 [paths]
-code_root = {q(code_root)}
 wiki = ""
 
 [branding]

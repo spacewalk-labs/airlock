@@ -10,9 +10,9 @@
 # checkout (mktemp -d), so nothing can pass by accidentally resolving
 # $ROOT/apps.
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -54,12 +54,31 @@ cat >"$SHIM/sudo" <<'STUB'
 while [ $# -gt 0 ]; do
   case "$1" in -n) shift ;; -u) shift 2 ;; *) break ;; esac
 done
+# Deterministic config A/B race seam for the orchestrator regression below.
+# The first mutation command runs after the installer has frozen and fully
+# preflighted A; replace the operator file with B before ledger reconcile.
+if [ -n "${AIRLOCK_TEST_CONFIG_RACE_REPLACEMENT:-}" ] \
+   && [ -n "${AIRLOCK_TEST_CONFIG_RACE_DONE:-}" ] \
+   && [ ! -e "$AIRLOCK_TEST_CONFIG_RACE_DONE" ]; then
+  cp "$AIRLOCK_TEST_CONFIG_RACE_REPLACEMENT" "$AIRLOCK_CONFIG"
+  : > "$AIRLOCK_TEST_CONFIG_RACE_DONE"
+fi
 exec "$@"
 STUB
 cat >"$SHIM/systemctl" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TMP/systemctl.log"
 case "\$*" in *daemon-reload*) [ -e "$TMP/reload-fails" ] && exit 1 ;; esac
+# Real systemd's \`disable\` REMOVES a symlinked unit file itself. Opt-in seam
+# (flag file) so a test can model that; every other test sees the old shim.
+if [ -e "$TMP/disable-removes-unit" ]; then
+  case "\$*" in
+    *disable*)
+      for _a in "\$@"; do
+        case "\$_a" in *.service|*.timer) rm -f "$UU/\$_a" ;; esac
+      done ;;
+  esac
+fi
 exit 0
 STUB
 cat >"$SHIM/tailscale" <<STUB
@@ -188,6 +207,95 @@ if run "$CFGDIR/ok.toml" validate >/dev/null 2>&1; then
   ok "resolver: a conforming package validates"
 else
   bad "resolver: a conforming package validates"
+fi
+
+preflight_a="$(run "$CFGDIR/ok.toml" install-preflight 2>/dev/null)" || preflight_a=""
+preflight_b="$(run "$CFGDIR/ok.toml" install-preflight 2>/dev/null)" || preflight_b=""
+if [[ "$preflight_a" =~ ^[0-9a-f]{64}$ ]] && [ "$preflight_a" = "$preflight_b" ]; then
+  ok "candidate preflight: every static projection resolves to one deterministic digest"
+else
+  bad "candidate preflight: digest is missing or unstable ($preflight_a / $preflight_b)"
+fi
+pkginfo="$(run "$CFGDIR/ok.toml" package-info 2>/dev/null)" || pkginfo=""
+preflight_bound="$(printf '%s' "$pkginfo" | AIRLOCK_CONFIG="$CFGDIR/ok.toml" \
+  python3 "$CFG" install-preflight --package-info-stdin 2>/dev/null)" \
+  || preflight_bound=""
+if [[ "$preflight_bound" =~ ^[0-9a-f]{64}$ ]]; then
+  ok "candidate preflight: exact ledger package-info authority is bound into the digest"
+else
+  bad "candidate preflight: exact package-info authority was not accepted"
+fi
+out="$(printf '{}' | AIRLOCK_CONFIG="$CFGDIR/ok.toml" python3 "$CFG" \
+  install-preflight --package-info-stdin 2>&1)" && rc=0 || rc=$?
+if [ "$rc" != 0 ] && grep -q "differs from the orchestrator snapshot" <<<"$out"; then
+  ok "candidate preflight: ledger package-info authority must exactly match the candidate"
+else
+  bad "candidate preflight: mismatched package-info authority was accepted (rc=$rc)"
+fi
+
+# PRIVATE_RELEASE_PATH launcher oracle: these are explicit package manifests,
+# with no [shortcuts] or other fallback catalog input. webjson must project the
+# three private tiles verbatim (except the documented staged icon URL rewrite).
+TILES="$TMP/private-tiles"; mkdir -p "$TILES"
+for private_id in vm-monitor slides-manager notes-stack; do
+  mkpkg "$TILES/$private_id" "$private_id" 1
+done
+cat >>"$TILES/vm-monitor/airlock-app.toml" <<'EOF'
+[tile]
+label = "Windows VM"
+sub = "Private Windows monitor"
+cat = "system"
+path = "/vm-monitor/"
+glyph = "monitor"
+EOF
+printf '<svg xmlns="http://www.w3.org/2000/svg"/>\n' >"$TILES/slides-manager/tile.svg"
+cat >>"$TILES/slides-manager/airlock-app.toml" <<'EOF'
+[tile]
+label = "Slides"
+sub = "Private gallery"
+cat = "docs"
+path = "/slides/"
+icon = "tile.svg"
+EOF
+cat >>"$TILES/notes-stack/airlock-app.toml" <<'EOF'
+[tile]
+label = "Notes"
+sub = "Private notes"
+cat = "docs"
+path = "/notes/"
+glyph = "note"
+EOF
+mkcfg "$TILES/airlock.toml" \
+  "[apps.vm-monitor]" "backend_port = 18931" \
+  "[apps.slides-manager]" "backend_port = 18932" \
+  "[apps.notes-stack]" "backend_port = 18933" \
+  "[packages.vm-monitor]" "path = \"$TILES/vm-monitor\"" \
+  "[packages.slides-manager]" "path = \"$TILES/slides-manager\"" \
+  "[packages.notes-stack]" "path = \"$TILES/notes-stack\""
+tiles_json="$(run "$TILES/airlock.toml" webjson 2>/dev/null)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$tiles_json" | python3 -c '
+import json, sys
+apps = json.load(sys.stdin)["apps"]
+assert {k for k, v in apps.items() if v.get("packaged")} == {
+    "vm-monitor", "slides-manager", "notes-stack"
+}
+assert sum(bool(v.get("shortcut")) for v in apps.values()) == 0
+assert apps["vm-monitor"]["tile"] == {
+    "label": "Windows VM", "sub": "Private Windows monitor", "cat": "system",
+    "path": "/vm-monitor/", "glyph": "monitor",
+}
+assert apps["slides-manager"]["tile"] == {
+    "label": "Slides", "sub": "Private gallery", "cat": "docs",
+    "path": "/slides/", "icon": "/assets/apps/slides-manager/tile.svg",
+}
+assert apps["notes-stack"]["tile"] == {
+    "label": "Notes", "sub": "Private notes", "cat": "docs",
+    "path": "/notes/", "glyph": "note",
+}
+' >/dev/null 2>&1; then
+  ok "private tiles: vm-monitor/slides-manager/notes manifests project into webjson with fallback inputs=0"
+else
+  bad "private tiles: manifest-to-webjson projection drifted (rc=$rc)"
 fi
 
 mkcfg "$CFGDIR/git.toml" "[apps.t1]" "[packages.t1]" 'source = "git+https://example.com/x.git"'
@@ -888,6 +996,125 @@ if [ "$rc" = 0 ] && [ "$(ledger_field t7 x '"committed" in e or "intent" in e')"
   ok "retry: the re-run finishes the removal and drops the record"
 else
   bad "retry: re-run did not converge (rc=$rc)"
+fi
+
+# A projection that used to be consumed only after reconcile must fail while
+# the old app is still active. A malformed prerequisites inventory is ideal
+# for this oracle: ordinary config/package validation passes, but the complete
+# candidate projection cannot be assembled. The installer intentionally pins
+# its in-tree inventory, so the controlled bad inventory is passed to the
+# read-only command directly; the ordering assertion below proves that exact
+# command is fatal before the first ledger plan/removal in the orchestrator.
+reset_box
+PF="$TMP/install-preflight"; mkdir -p "$PF/cfg"; mkpkg "$PF/pkg" pf-old 1
+mkcfg "$PF/cfg/airlock.toml" "[apps.pf-old]" "backend_port = 18917" \
+  "[packages.pf-old]" "path = \"$PF/pkg\""
+orch "$PF/cfg/airlock.toml" >/dev/null 2>&1 || bad "candidate preflight: setup install failed"
+mkcfg "$PF/cfg/airlock.toml"  # dropping pf-old would normally deactivate it
+printf 'malformed\tprerequisite\n' > "$PF/prerequisites.tsv"
+out="$(AIRLOCK_PREREQUISITES="$PF/prerequisites.tsv" run "$PF/cfg/airlock.toml" install-preflight 2>&1)" \
+  && rc=0 || rc=$?
+if [ "$rc" != 0 ] \
+   && grep -q "invalid declaration" <<<"$out" \
+   && [ -f "$WEB/pf-old/marker" ] \
+   && [ "$(ledger_field pf-old x '"committed" in e')" = True ]; then
+  ok "candidate preflight: a late projection failure occurs before reconcile deactivates the old app"
+else
+  bad "candidate preflight: old app changed before candidate rejection (rc=$rc, marker=$([ -f "$WEB/pf-old/marker" ] && echo present || echo missing))"
+fi
+python3 - "$ROOT/install/airlock-install.sh" <<'PY' \
+  && ok "candidate preflight: fatal projection resolution is wired before ledger reconcile" \
+  || bad "candidate preflight: orchestrator ordering no longer protects reconcile"
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+first = source.index('_candidate_preflight="$(printf \'%s\' "$AIRLOCK_PKG_INFO"')
+repeat = source.index('_candidate_preflight_now="$(printf \'%s\' "$AIRLOCK_PKG_INFO"')
+plan = source.index('_plan="$(printf')
+remove = source.index('"$ROOT/bin/airlock-ledger" remove "$_id"')
+assert first < repeat < plan < remove
+PY
+
+# Actual orchestrator A/B race: A retains the installed app, while the first
+# post-preflight mutation swaps the operator file to B (which drops it). The
+# running installer must remain bound to A's AIRLOCK_PKG_INFO and app order;
+# B is visible only to the next run. No remove/deactivate and no ledger loss.
+reset_box
+RACE="$TMP/config-race"; mkdir -p "$RACE/cfg"; mkpkg "$RACE/pkg" race-old 1
+python3 - "$RACE/pkg/deactivate.sh" "$RACE/deactivate.log" <<'PY'
+from pathlib import Path
+import sys
+
+path, log = map(Path, sys.argv[1:])
+text = path.read_text(encoding="utf-8")
+text = text.replace('set -euo pipefail\n', f'set -euo pipefail\nprintf "deactivate\\n" >> "{log}"\n', 1)
+path.write_text(text, encoding="utf-8")
+PY
+mkcfg "$RACE/cfg/airlock.toml" "[apps.race-old]" "backend_port = 18927" \
+  "[packages.race-old]" "path = \"$RACE/pkg\""
+mkcfg "$RACE/cfg/drop.toml"
+orch "$RACE/cfg/airlock.toml" >/dev/null 2>&1 \
+  || bad "candidate snapshot race: setup install failed"
+rm -f "$RACE/deactivate.log"
+out="$(orch "$RACE/cfg/airlock.toml" \
+  AIRLOCK_TEST_CONFIG_RACE_REPLACEMENT="$RACE/cfg/drop.toml" \
+  AIRLOCK_TEST_CONFIG_RACE_DONE="$RACE/raced" 2>&1)" && rc=0 || rc=$?
+deactivate_count="$([ -e "$RACE/deactivate.log" ] && wc -l < "$RACE/deactivate.log" || printf 0)"
+if [ "$rc" = 0 ] \
+   && [ -e "$RACE/raced" ] \
+   && ! grep -q '\[apps.race-old\]' "$RACE/cfg/airlock.toml" \
+   && [ "$deactivate_count" = 0 ] \
+   && [ -f "$WEB/race-old/marker" ] \
+   && [ "$(ledger_field race-old x '"committed" in e')" = True ]; then
+  ok "candidate snapshot race: config B causes remove/deactivate calls=0; A marker and ledger stay intact"
+else
+  bad "candidate snapshot race: running install mixed config A/B (rc=$rc, deactivate_calls=$deactivate_count, marker=$([ -f "$WEB/race-old/marker" ] && echo present || echo missing))"
+fi
+
+# The private snapshot itself is owned by the installer uid, so freezing only
+# its pathname is insufficient: that uid can still truncate/replace it after
+# the final preflight.  Interpose python3 only for this run and rewrite the
+# actual AIRLOCK_CONFIG_SNAPSHOT from A to B immediately after the second
+# (final) install-preflight returns.  The next projection must reject B by its
+# exact digest before the A ledger can plan a remove/deactivate.
+rm -f "$RACE/deactivate.log" "$RACE/snapshot-raced" "$RACE/preflight-count"
+mkcfg "$RACE/cfg/airlock.toml" "[apps.race-old]" "backend_port = 18927" \
+  "[packages.race-old]" "path = \"$RACE/pkg\""
+mkdir -p "$RACE/python-shim" "$RACE/snapshots"
+REAL_PYTHON="$(command -v python3)"
+cat >"$RACE/python-shim/python3" <<EOF
+#!/usr/bin/env bash
+"$REAL_PYTHON" "\$@"
+rc=\$?
+if [ "\$rc" = 0 ] \
+   && [ "\${1:-}" = "$CFG" ] \
+   && [ "\${2:-}" = install-preflight ]; then
+  count_file="$RACE/preflight-count"
+  count=0
+  [ ! -f "\$count_file" ] || count="\$(cat "\$count_file")"
+  count=\$((count + 1))
+  printf '%s\n' "\$count" >"\$count_file"
+  if [ "\$count" = 2 ]; then
+    cp "$RACE/cfg/drop.toml" "\$AIRLOCK_CONFIG_SNAPSHOT"
+    : >"$RACE/snapshot-raced"
+  fi
+fi
+exit "\$rc"
+EOF
+chmod +x "$RACE/python-shim/python3"
+out="$(orch "$RACE/cfg/airlock.toml" \
+  PATH="$RACE/python-shim:$PATH" TMPDIR="$RACE/snapshots" 2>&1)" && rc=0 || rc=$?
+deactivate_count="$([ -e "$RACE/deactivate.log" ] && wc -l < "$RACE/deactivate.log" || printf 0)"
+if [ "$rc" != 0 ] \
+   && [ -e "$RACE/snapshot-raced" ] \
+   && grep -q 'snapshot digest changed' <<<"$out" \
+   && [ "$deactivate_count" = 0 ] \
+   && [ -f "$WEB/race-old/marker" ] \
+   && [ "$(ledger_field race-old x '"committed" in e')" = True ]; then
+  ok "candidate snapshot mutation: post-preflight A->B is rejected; deactivate calls=0 and A marker/ledger survive"
+else
+  bad "candidate snapshot mutation: mutable snapshot reached reconcile (rc=$rc, deactivate_calls=$deactivate_count, marker=$([ -f "$WEB/race-old/marker" ] && echo present || echo missing))"
 fi
 
 # No-deactivator upgrade: a failed record-diff teardown must keep the old
@@ -1680,6 +1907,810 @@ if [ "$rc" = 0 ] && [ "$seen" = "$SS/cwd/srel" ]; then
 else
   bad "smoke-pin: not pinned (rc=$rc, seen=$seen)"
 fi
+
+# =============================================================================
+# F16 — container intent, collision, and runtime-proven removal
+# =============================================================================
+# A stateful Docker fake keeps this fixture runnable in CI, but deliberately
+# implements only the API surface the platform and this package are allowed to
+# use.  It rejects name filters, short-id/name removals, mutable image refs,
+# pulls/builds, and named volumes/networks at the command boundary.  Every
+# runtime result is persisted independently of the ledger so the assertions can
+# prove that a record disappears only after Docker itself answered ABSENT.
+F16="$TMP/f16"
+F16_DOCKER_STATE="$F16/docker-state.json"
+F16_DOCKER_CONTROL="$F16/docker-control.json"
+F16_DOCKER_LOG="$F16/docker.log"
+F16_DOCKER_AUDIT="$F16/docker-audit.log"
+F16_IMAGE="registry.invalid/airlock-t16@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+export F16_DOCKER_STATE F16_DOCKER_CONTROL F16_DOCKER_LOG F16_DOCKER_AUDIT F16_IMAGE
+mkdir -p "$F16"
+: > "$F16_DOCKER_AUDIT"
+
+cat > "$SHIM/docker" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+STATE = Path(os.environ["F16_DOCKER_STATE"])
+CONTROL = Path(os.environ["F16_DOCKER_CONTROL"])
+LOG = Path(os.environ["F16_DOCKER_LOG"])
+AUDIT = Path(os.environ["F16_DOCKER_AUDIT"])
+LEDGER = Path(os.environ["AIRLOCK_STATE_DIR"]) / "app-ledger.json"
+PACKAGE_LABEL = "io.airlock.package"
+NONCE_LABEL = "io.airlock.install-nonce"
+FULL_ID = re.compile(r"[0-9a-f]{64}")
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path, value):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def ledger_fact():
+    raw = read_json(LEDGER, {"entries": {}})
+    entry = (raw.get("entries") or {}).get("t16") or {}
+    kinds = [kind for kind in ("committed", "intent") if kind in entry]
+    intent = entry.get("intent") or {}
+    runtime = intent.get("container_runtime") or {}
+    return {"ledger_kind": "+".join(kinds) or "none",
+            "ledger_nonce": runtime.get("install_nonce")}
+
+
+def log(event, **extra):
+    row = {"event": event, "argv": sys.argv[1:], **ledger_fact(), **extra}
+    line = json.dumps(row, sort_keys=True) + "\n"
+    for path in (LOG, AUDIT):
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(line)
+
+
+def die(message, rc=64):
+    log("rejected", reason=message)
+    print(message, file=sys.stderr)
+    raise SystemExit(rc)
+
+
+def labels_from_filters(args):
+    labels = {}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--filter":
+            if index + 1 >= len(args):
+                die("--filter requires a value")
+            value = args[index + 1]
+            index += 2
+        elif arg.startswith("--filter="):
+            value = arg.split("=", 1)[1]
+            index += 1
+        else:
+            index += 1
+            continue
+        if value.startswith("name="):
+            die("name filters are forbidden: candidates come from exact labels")
+        if not value.startswith("label=") or "=" not in value[6:]:
+            die(f"unsupported filter {value!r}")
+        key, val = value[6:].split("=", 1)
+        labels[key] = val
+    return labels
+
+
+state = read_json(STATE, {"next_id": 1, "objects": {}, "rm_calls": 0,
+                          "images": [os.environ["F16_IMAGE"]],
+                          "volumes": [], "networks": ["bridge", "host", "none"]})
+control = read_json(CONTROL, {})
+args = sys.argv[1:]
+log("call")
+if not args:
+    die("missing docker command")
+
+if args == ["info"]:
+    log("info-ok")
+    raise SystemExit(0)
+if args == ["info", "--format", "{{.ID}}"]:
+    identity = control.get("daemon_identity", "t16-fixture-daemon")
+    log("daemon-identity", identity=identity)
+    print(identity)
+    raise SystemExit(0)
+
+if args[0] in {"pull", "build"} or args[:2] in (["volume", "create"], ["network", "create"]):
+    die("pull/build/named volume/network creation is forbidden")
+
+if args[0] == "ps":
+    if not all(arg in {"ps", "-aq", "--no-trunc", "--filter"}
+               or arg.startswith(("--filter=", "label=")) for arg in args):
+        die(f"unsupported ps arguments: {args!r}")
+    filters = labels_from_filters(args)
+    ids = []
+    for object_id, obj in state["objects"].items():
+        if all(obj["labels"].get(k) == v for k, v in filters.items()):
+            ids.append(object_id)
+    ids.sort()
+    exact_pair = PACKAGE_LABEL in filters and NONCE_LABEL in filters
+    if (exact_pair and not ids and control.get("spawn_on_filtered_empty")
+            and not control.get("spawned")
+            and state.get("rm_calls", 0) >= control.get("spawn_after_rm", 0)):
+        object_id = f'{state["next_id"]:064x}'
+        state["next_id"] += 1
+        state["objects"][object_id] = {
+            "name": control.get("spawn_name", "airlock-t16-race"),
+            "labels": {PACKAGE_LABEL: filters[PACKAGE_LABEL],
+                       NONCE_LABEL: filters[NONCE_LABEL]},
+        }
+        control["spawned"] = True
+        write_json(STATE, state)
+        write_json(CONTROL, control)
+        ids = [object_id]
+        log("race-spawn", object_id=object_id, filters=filters)
+    log("ps-result", ids=ids, filters=filters)
+    if ids:
+        print("\n".join(ids))
+    raise SystemExit(0)
+
+if args[0] == "inspect" and len(args) == 2:
+    query = args[1]
+    object_id = query if query in state["objects"] else next(
+        (oid for oid, obj in state["objects"].items() if obj["name"] == query), None)
+    if object_id is None:
+        log("inspect-result", query=query, state="ABSENT")
+        print(f"Error: No such object: {query}", file=sys.stderr)
+        raise SystemExit(1)
+    if object_id in control.get("inspect_unknown", []):
+        log("inspect-result", query=query, object_id=object_id, state="UNKNOWN")
+        print("fixture daemon query failed", file=sys.stderr)
+        raise SystemExit(2)
+    obj = state["objects"][object_id]
+    returned_id = (control.get("inspect_id_mismatch") or {}).get(object_id, object_id)
+    log("inspect-result", query=query, object_id=object_id,
+        returned_id=returned_id, state="PRESENT")
+    print(json.dumps([{"Id": returned_id, "Name": "/" + obj["name"],
+                       "Config": {"Labels": obj["labels"]}}], sort_keys=True))
+    raise SystemExit(0)
+
+if args[0] == "run":
+    if args[-1] != os.environ["F16_IMAGE"] or args[-1] not in state["images"]:
+        die("docker run must use the preseeded immutable image digest")
+    if "--pull=never" not in args:
+        die("docker run must use --pull=never")
+    if any(arg in {"-v", "--volume"} or arg.startswith("--volume=") for arg in args):
+        die("named/short volume syntax is forbidden")
+    if "--network=bridge" not in args:
+        die("only the built-in bridge network is allowed by this fixture")
+    if "--tmpfs" not in args:
+        die("the fixture requires an explicit tmpfs")
+    mounts = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--mount"]
+    if not mounts or any(not value.startswith("type=bind,") for value in mounts):
+        die("only explicit bind mounts are allowed")
+    name = None
+    labels = {}
+    index = 1
+    while index < len(args) - 1:
+        arg = args[index]
+        if arg == "--name":
+            name = args[index + 1]
+            index += 2
+        elif arg == "--label":
+            key, value = args[index + 1].split("=", 1)
+            labels[key] = value
+            index += 2
+        elif arg in {"--tmpfs", "--mount"}:
+            index += 2
+        else:
+            index += 1
+    if not name or any(obj["name"] == name for obj in state["objects"].values()):
+        die("container name is missing or already exists")
+    if set(labels) != {PACKAGE_LABEL, NONCE_LABEL} or labels[PACKAGE_LABEL] != "t16":
+        die("create requires exactly the package and install-nonce labels")
+    entry = (read_json(LEDGER, {"entries": {}}).get("entries") or {}).get("t16") or {}
+    intent_runtime = (entry.get("intent") or {}).get("container_runtime") or {}
+    if intent_runtime.get("install_nonce") != labels[NONCE_LABEL]:
+        die("container create happened before its durable matching intent")
+    object_id = f'{state["next_id"]:064x}'
+    state["next_id"] += 1
+    state["objects"][object_id] = {"name": name, "labels": labels}
+    write_json(STATE, state)
+    log("authorized-create", object_id=object_id, name=name,
+        install_nonce=labels[NONCE_LABEL], policy_ok=True)
+    print(object_id)
+    raise SystemExit(0)
+
+if args[0] == "rm" and len(args) == 3 and args[1] == "-f":
+    object_id = args[2]
+    if not FULL_ID.fullmatch(object_id):
+        die("rm requires one full immutable 64-hex id")
+    state["rm_calls"] = state.get("rm_calls", 0) + 1
+    if object_id in control.get("rm_zero_keep", []):
+        write_json(STATE, state)
+        log("rm-result", object_id=object_id, rc=0, removed=False)
+        raise SystemExit(0)
+    if object_id in control.get("rm_nonzero_delete", []):
+        state["objects"].pop(object_id, None)
+        write_json(STATE, state)
+        log("rm-result", object_id=object_id, rc=1, removed=True)
+        print("fixture rm failed after deleting", file=sys.stderr)
+        raise SystemExit(1)
+    state["objects"].pop(object_id, None)
+    write_json(STATE, state)
+    log("rm-result", object_id=object_id, rc=0, removed=True)
+    raise SystemExit(0)
+
+die(f"unsupported docker invocation: {args!r}")
+PY
+chmod +x "$SHIM/docker"
+
+f16_runtime_reset() {
+  mkdir -p "$F16"
+  printf '{"images":["%s"],"networks":["bridge","host","none"],"next_id":1,"objects":{},"rm_calls":0,"volumes":[]}\n' \
+    "$F16_IMAGE" > "$F16_DOCKER_STATE"
+  printf '{}\n' > "$F16_DOCKER_CONTROL"
+  : > "$F16_DOCKER_LOG"
+}
+
+f16_control() {
+  printf '%s\n' "$1" > "$F16_DOCKER_CONTROL"
+}
+
+f16_state_eval() {
+  python3 - "$F16_DOCKER_STATE" "$1" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1], encoding="utf-8"))
+print(eval(sys.argv[2], {"s": s}))
+PY
+}
+
+f16_log_eval() {
+  python3 - "$F16_DOCKER_LOG" "$1" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+print(eval(sys.argv[2], {"rows": rows}))
+PY
+}
+
+f16_audit_eval() {
+  python3 - "$F16_DOCKER_AUDIT" "$1" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+print(eval(sys.argv[2], {"rows": rows, "len": len, "all": all, "any": any}))
+PY
+}
+
+f16_seed() { # f16_seed <name> <package-label|-> <nonce-label|->
+  python3 - "$F16_DOCKER_STATE" "$1" "$2" "$3" <<'PY'
+import json, os, sys
+path, name, package, nonce = sys.argv[1:]
+s = json.load(open(path, encoding="utf-8"))
+object_id = f'{s["next_id"]:064x}'
+s["next_id"] += 1
+labels = {}
+if package != "-": labels["io.airlock.package"] = package
+if nonce != "-": labels["io.airlock.install-nonce"] = nonce
+s["objects"][object_id] = {"name": name, "labels": labels}
+tmp = path + ".tmp"
+open(tmp, "w", encoding="utf-8").write(json.dumps(s, sort_keys=True) + "\n")
+os.replace(tmp, path)
+print(object_id)
+PY
+}
+
+f16_ids() {
+  ledger_field t16 x '" ".join(o["id"] for o in e.get("committed",{}).get("container_runtime",{}).get("objects",[]))'
+}
+
+f16_nonce() {
+  ledger_field t16 x 'e.get("committed",{}).get("container_runtime",{}).get("install_nonce","")'
+}
+
+f16_intent_nonce() {
+  ledger_field t16 x 'e.get("intent",{}).get("container_runtime",{}).get("install_nonce","")'
+}
+
+f16_object_absent() {
+  local object_id="$1" out rc
+  out="$(docker inspect "$object_id" 2>&1)" && rc=0 || rc=$?
+  [ "$rc" != 0 ] && grep -qx "Error: No such object: $object_id" <<<"$out"
+}
+
+f16_mkpkg() {
+  local dir="$1"
+  mkdir -p "$dir" "$F16/data"
+  cat > "$dir/airlock-app.toml" <<'EOF'
+contract = 1
+id = "t16"
+[artifacts]
+containers = ["airlock-t16-*"]
+EOF
+  cat > "$dir/install.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load t16
+[ -n "\${AIRLOCK_INSTALL_NONCE:-}" ] || die "missing journaled container nonce"
+mapfile -t ids < <(docker ps -aq --no-trunc \
+  --filter "label=io.airlock.package=t16" \
+  --filter "label=io.airlock.install-nonce=\$AIRLOCK_INSTALL_NONCE")
+if [ "\${#ids[@]}" -eq 2 ]; then
+  exit 0
+fi
+[ "\${#ids[@]}" -eq 0 ] || die "active nonce has an unexpected object count"
+create() {
+  docker run --detach --pull=never --network=bridge \
+    --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+    --mount "type=bind,src=$F16/data,dst=/data,ro" \
+    --name "\$1" \
+    --label io.airlock.package=t16 \
+    --label "io.airlock.install-nonce=\$AIRLOCK_INSTALL_NONCE" \
+    "$F16_IMAGE" >/dev/null
+}
+create airlock-t16-one
+if [ "\$(cat "$F16/mode" 2>/dev/null || true)" = crash-after-one ]; then
+  exit 16
+fi
+create airlock-t16-two
+if [ "\$(cat "$F16/mode" 2>/dev/null || true)" = outside-name ]; then
+  create t16-outside-declaration
+fi
+EOF
+  cat > "$dir/smoke.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+EOF
+  cat > "$dir/deactivate.sh" <<'EOF'
+#!/usr/bin/env bash
+# Intentionally no-op: F16 proves the platform's generic full-id teardown.
+set -euo pipefail
+exit 0
+EOF
+  chmod +x "$dir"/*.sh
+}
+
+f16_new_fixture() {
+  reset_box
+  f16_runtime_reset
+  rm -f "$F16/mode"
+  rm -rf "$F16/pkg" "$F16/pkg-gone"
+  f16_mkpkg "$F16/pkg"
+  mkcfg "$F16/airlock.toml" '[apps.t16]' '[packages.t16]' "path = \"$F16/pkg\""
+}
+
+f16_removal_proven_before_drop() { # ids...
+  local object_id
+  for object_id in "$@"; do
+    [ "$(f16_log_eval "any(r.get('event') == 'inspect-result' and r.get('query') == '$object_id' and r.get('state') == 'ABSENT' and 'committed' in r.get('ledger_kind','') for r in rows)")" = True ] \
+      || return 1
+  done
+  [ "$(f16_log_eval "any(r.get('event') == 'ps-result' and not r.get('ids') and 'committed' in r.get('ledger_kind','') and r.get('filters',{}).get('io.airlock.package') == 't16' for r in rows)")" = True ]
+}
+
+# Positive path: intent precedes create, commit captures two immutable objects,
+# and a same-digest reconcile admits exactly that set without a new create.
+f16_new_fixture
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+read -r f16_id1 f16_id2 <<<"$(f16_ids)"
+f16_nonce1="$(f16_nonce)"
+if [ "$rc" = 0 ] && [ -n "$f16_nonce1" ] \
+   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'authorized-create' and r.get('ledger_kind') == 'intent' and r.get('ledger_nonce') == r.get('install_nonce')])")" = 2 ]; then
+  ok "F16: durable matching intent exists before each first-install container create"
+else
+  bad "F16: create preceded intent or initial install failed (rc=$rc): $(tail -5 <<<"$out")"
+fi
+if [[ "$f16_id1" =~ ^[0-9a-f]{64}$ && "$f16_id2" =~ ^[0-9a-f]{64}$ ]] \
+   && [ "$f16_id1" != "$f16_id2" ] \
+   && [ "$(ledger_field t16 x 'len(e.get("committed",{}).get("container_runtime",{}).get("objects",[]))')" = 2 ]; then
+  ok "F16: commit records the intent nonce and two distinct full immutable ids"
+else
+  bad "F16: committed container identity set is incomplete"
+fi
+f16_create_before="$(f16_log_eval "len([r for r in rows if r.get('event') == 'authorized-create'])")"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] && [ "$(f16_nonce)" = "$f16_nonce1" ] \
+   && [ "$(f16_ids)" = "$f16_id1 $f16_id2" ] \
+   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'authorized-create'])")" = "$f16_create_before" ]; then
+  ok "F16: same-digest reconcile reuses the nonce and exact committed ids without mutation"
+else
+  bad "F16: same-digest reconcile changed nonce/id set or created an object"
+fi
+
+# Normal configured removal: exact-id ABSENT and exact-label empty are observed
+# by the fake while the committed entry is still present, then the entry drops.
+mkcfg "$F16/airlock.toml"
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] && f16_removal_proven_before_drop "$f16_id1" "$f16_id2" \
+   && f16_object_absent "$f16_id1" && f16_object_absent "$f16_id2"; then
+  ok "F16: normal removal proves exact ids and two-label set ABSENT before ledger drop"
+else
+  bad "F16: normal removal lacked runtime-proven pre-drop absence (rc=$rc)"
+fi
+[ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ] \
+  && ok "F16: normal removal drops the ledger entry only after runtime absence" \
+  || bad "F16: normal removal retained the entry after proven absence"
+
+# Path-gone and digest-mismatch each force recorded/generic teardown and must
+# retain the same proof ordering as the ordinary deactivator path.
+mkcfg "$F16/airlock.toml" '[apps.t16]' '[packages.t16]' "path = \"$F16/pkg\""
+orch "$F16/airlock.toml" >/dev/null 2>&1 || bad "F16: path-gone setup install failed"
+read -r f16_pg1 f16_pg2 <<<"$(f16_ids)"
+mv "$F16/pkg" "$F16/pkg-gone"
+mkcfg "$F16/airlock.toml"
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] && f16_removal_proven_before_drop "$f16_pg1" "$f16_pg2" \
+   && f16_object_absent "$f16_pg1" && f16_object_absent "$f16_pg2" \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ]; then
+  ok "F16: path-gone removal proves runtime absence before dropping the record"
+else
+  bad "F16: path-gone removal did not converge with proof (rc=$rc)"
+fi
+mv "$F16/pkg-gone" "$F16/pkg"
+
+mkcfg "$F16/airlock.toml" '[apps.t16]' '[packages.t16]' "path = \"$F16/pkg\""
+orch "$F16/airlock.toml" >/dev/null 2>&1 || bad "F16: digest-mismatch setup install failed"
+read -r f16_dm1 f16_dm2 <<<"$(f16_ids)"
+printf '# digest mutation\n' >> "$F16/pkg/install.sh"
+mkcfg "$F16/airlock.toml"
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] && f16_removal_proven_before_drop "$f16_dm1" "$f16_dm2" \
+   && f16_object_absent "$f16_dm1" && f16_object_absent "$f16_dm2" \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ]; then
+  ok "F16: digest-mismatch removal proves runtime absence before dropping the record"
+else
+  bad "F16: digest-mismatch removal did not converge with proof (rc=$rc)"
+fi
+
+# Intent-only crash after one create: retry tears down by the old recorded
+# nonce before replacing the journal with a fresh nonce and committing two.
+f16_new_fixture
+printf 'crash-after-one\n' > "$F16/mode"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+f16_crash_nonce="$(f16_intent_nonce)"
+f16_crash_id="$(f16_state_eval "next(iter(s['objects'])) if len(s['objects']) == 1 else ''")"
+if [ "$rc" != 0 ] && [ -n "$f16_crash_nonce" ] && [[ "$f16_crash_id" =~ ^[0-9a-f]{64}$ ]] \
+   && [ "$(ledger_field t16 x '"intent" in e and "committed" not in e')" = True ]; then
+  ok "F16: crash after first create leaves one object and an intent-only nonce"
+else
+  bad "F16: crash fixture did not preserve its intent-only recovery record"
+fi
+rm -f "$F16/mode"
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+f16_retry_nonce="$(f16_nonce)"
+if [ "$rc" = 0 ] && [ "$f16_retry_nonce" != "$f16_crash_nonce" ] \
+   && f16_object_absent "$f16_crash_id" \
+   && [ "$(f16_log_eval "any(r.get('event') == 'inspect-result' and r.get('query') == '$f16_crash_id' and r.get('state') == 'ABSENT' and r.get('ledger_kind') == 'intent' for r in rows)")" = True ] \
+   && [ "$(ledger_field t16 x 'len(e.get("committed",{}).get("container_runtime",{}).get("objects",[]))')" = 2 ]; then
+  ok "F16: intent-crash retry proves old absence, journals a fresh nonce, and commits two"
+else
+  bad "F16: intent-crash retry reused/orphaned the old nonce set (rc=$rc)"
+fi
+
+# Foreign namespace matrix: every incomplete/wrong ownership pair blocks an
+# install and is untouched.  Once inserted beside a legitimate committed set,
+# the same objects are diagnostic-only during removal; a substring lookalike
+# never enters the candidate/diagnostic namespace at all.
+f16_new_fixture
+f16_other_nonce="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+f16_foreign_ids="$(f16_seed airlock-t16-no-label - -)"
+f16_foreign_ids="$f16_foreign_ids $(f16_seed airlock-t16-package-only t16 -)"
+f16_foreign_ids="$f16_foreign_ids $(f16_seed airlock-t16-nonce-only - "$f16_other_nonce")"
+f16_foreign_ids="$f16_foreign_ids $(f16_seed airlock-t16-both-other other "$f16_other_nonce")"
+f16_foreign_ids="$f16_foreign_ids $(f16_seed airlock-t16-other-nonce t16 "$f16_other_nonce")"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+f16_foreign_present=1
+for f16_id in $f16_foreign_ids; do
+  [ "$(f16_state_eval "'$f16_id' in s['objects']")" = True ] || f16_foreign_present=0
+done
+if [ "$rc" != 0 ] && [ "$f16_foreign_present" = 1 ] \
+   && grep -q "container namespace collision" <<<"$out" \
+   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'authorized-create'])")" = 0 ]; then
+  ok "F16: every foreign label variant blocks install and remains untouched"
+else
+  bad "F16: foreign collision matrix was mutated or admitted (rc=$rc)"
+fi
+
+f16_new_fixture
+orch "$F16/airlock.toml" >/dev/null 2>&1 || bad "F16: foreign-removal setup install failed"
+read -r f16_owned1 f16_owned2 <<<"$(f16_ids)"
+f16_other_nonce="CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+f16_foreign_ids="$(f16_seed airlock-t16-no-label - -)"
+f16_foreign_ids="$f16_foreign_ids $(f16_seed airlock-t16-package-only t16 -)"
+f16_foreign_ids="$f16_foreign_ids $(f16_seed airlock-t16-nonce-only - "$f16_other_nonce")"
+f16_foreign_ids="$f16_foreign_ids $(f16_seed airlock-t16-both-other other "$f16_other_nonce")"
+f16_foreign_ids="$f16_foreign_ids $(f16_seed airlock-t16-other-nonce t16 "$f16_other_nonce")"
+f16_lookalike="$(f16_seed xairlock-t16-substring - -)"
+mkcfg "$F16/airlock.toml"
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+f16_foreign_present=1
+for f16_id in $f16_foreign_ids "$f16_lookalike"; do
+  [ "$(f16_state_eval "'$f16_id' in s['objects']")" = True ] || f16_foreign_present=0
+done
+if [ "$rc" = 0 ] && [ "$f16_foreign_present" = 1 ] \
+   && f16_object_absent "$f16_owned1" && f16_object_absent "$f16_owned2" \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ]; then
+  ok "F16: removal deletes owned ids but leaves every foreign collision untouched"
+else
+  bad "F16: removal crossed the foreign ownership boundary (rc=$rc)"
+fi
+if [ "$(grep -c "foreign container collision left untouched" <<<"$out")" = 5 ] \
+   && ! grep -q "xairlock-t16-substring" <<<"$out" \
+   && [ "$(f16_log_eval "any(any(str(a).startswith('name=') for a in r.get('argv',[])) for r in rows)")" = False ]; then
+  ok "F16: foreign matches are diagnostic-only and substring lookalikes/name filters are excluded"
+else
+  bad "F16: foreign diagnostics or substring/name-filter candidate selection drifted"
+fi
+
+# One committed snapshot drives the four independent failure controls.  A
+# fixture restore is test setup only; every exercised command still consumes a
+# validated v6 record and a separately modelled live runtime.
+f16_new_fixture
+orch "$F16/airlock.toml" >/dev/null 2>&1 || bad "F16: failure-control setup install failed"
+read -r f16_fault1 f16_fault2 <<<"$(f16_ids)"
+mkcfg "$F16/airlock.toml"
+cp "$STATE/app-ledger.json" "$F16/ledger.snapshot"
+cp "$F16_DOCKER_STATE" "$F16/docker.snapshot"
+f16_restore_fault() {
+  cp "$F16/ledger.snapshot" "$STATE/app-ledger.json"
+  cp "$F16/docker.snapshot" "$F16_DOCKER_STATE"
+  f16_control '{}'
+  : > "$F16_DOCKER_LOG"
+}
+
+f16_restore_fault
+f16_control "{\"inspect_unknown\":[\"$f16_fault1\"]}"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" != 0 ] && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && [ "$(f16_state_eval "'$f16_fault1' in s['objects'] and '$f16_fault2' in s['objects']")" = True ]; then
+  ok "F16: UNKNOWN runtime query fails closed with record and objects retained"
+else
+  bad "F16: UNKNOWN runtime query lost evidence or passed (rc=$rc)"
+fi
+
+f16_restore_fault
+f16_control "{\"rm_zero_keep\":[\"$f16_fault1\"]}"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" != 0 ] && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && [ "$(f16_state_eval "'$f16_fault1' in s['objects']")" = True ]; then
+  ok "F16: rm zero with object still PRESENT fails and retains the record"
+else
+  bad "F16: rm-zero/PRESENT was mistaken for removal (rc=$rc)"
+fi
+
+f16_restore_fault
+f16_control "{\"rm_nonzero_delete\":[\"$f16_fault1\"]}"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+f16_nonzero_first=0
+if [ "$rc" != 0 ] && f16_object_absent "$f16_fault1" \
+   && [ "$(ledger_field t16 x '"committed" in e')" = True ]; then
+  f16_nonzero_first=1
+fi
+f16_control '{}'
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$f16_nonzero_first" = 1 ] && [ "$rc" = 0 ] \
+   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'rm-result'])")" = 0 ] \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ]; then
+  ok "F16: non-zero rm followed by ABSENT retains once, then retry drops without another rm"
+else
+  bad "F16: nonzero-rm/ABSENT retry semantics drifted (first=$f16_nonzero_first rc=$rc)"
+fi
+
+f16_restore_fault
+f16_replacement="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+f16_control "{\"inspect_id_mismatch\":{\"$f16_fault1\":\"$f16_replacement\"}}"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" != 0 ] && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'rm-result'])")" = 0 ]; then
+  ok "F16: immutable-id replacement fails preflight with the record retained"
+else
+  bad "F16: immutable-id replacement reached removal or dropped evidence (rc=$rc)"
+fi
+
+f16_restore_fault
+f16_control '{"daemon_identity":"t16-other-daemon"}'
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" != 0 ] && grep -q "Docker daemon identity changed" <<<"$out" \
+   && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && [ "$(f16_state_eval "'$f16_fault1' in s['objects'] and '$f16_fault2' in s['objects']")" = True ] \
+   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'rm-result'])")" = 0 ]; then
+  ok "F16: Docker daemon identity change fails before mutation with record and objects retained"
+else
+  bad "F16: daemon identity change crossed the mutation boundary (rc=$rc)"
+fi
+f16_control '{}'
+
+# An exact active label pair outside the declaration is invalid at commit, but
+# teardown authority comes from the nonce and therefore still includes it.
+f16_new_fixture
+printf 'outside-name\n' > "$F16/mode"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+f16_outside_id="$(f16_state_eval "next((oid for oid,o in s['objects'].items() if o['name'] == 't16-outside-declaration'),'')")"
+if [ "$rc" != 0 ] && [[ "$f16_outside_id" =~ ^[0-9a-f]{64}$ ]] \
+   && [ "$(ledger_field t16 x '"intent" in e and "committed" not in e')" = True ] \
+   && grep -q "outside the declaration" <<<"$out"; then
+  ok "F16: exact-label object outside the namespace blocks commit and keeps intent"
+else
+  bad "F16: outside-namespace exact-label object reached commit (rc=$rc)"
+fi
+mkcfg "$F16/airlock.toml"
+rm -f "$F16/mode"
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] && f16_object_absent "$f16_outside_id" \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ]; then
+  ok "F16: nonce-driven teardown removes the exact-label object outside the declaration"
+else
+  bad "F16: nonce teardown orphaned the outside-namespace object (rc=$rc)"
+fi
+
+# A same-nonce object born after all planned ids were removed is caught by the
+# final label-set oracle.  On retry it is owned (not foreign), becomes a union
+# candidate, and is removed before the record can drop.
+f16_new_fixture
+orch "$F16/airlock.toml" >/dev/null 2>&1 || bad "F16: final-oracle setup install failed"
+mkcfg "$F16/airlock.toml"
+f16_control '{"spawn_after_rm":2,"spawn_name":"airlock-t16-race","spawn_on_filtered_empty":true}'
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+f16_race_id="$(f16_state_eval "next((oid for oid,o in s['objects'].items() if o['name'] == 'airlock-t16-race'),'')")"
+if [ "$rc" != 0 ] && [[ "$f16_race_id" =~ ^[0-9a-f]{64}$ ]] \
+   && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && grep -q "final container label-set is not empty" <<<"$out"; then
+  ok "F16: final label-set oracle catches a new same-nonce id and retains the record"
+else
+  bad "F16: final-oracle race escaped or lost its record (rc=$rc)"
+fi
+f16_control '{}'
+: > "$F16_DOCKER_LOG"
+out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 0 ] && f16_object_absent "$f16_race_id" \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ] \
+   && ! grep -q "foreign container collision" <<<"$out"; then
+  ok "F16: retry removes the race id as unexpected owned, not foreign"
+else
+  bad "F16: final-oracle retry did not converge as owned (rc=$rc)"
+fi
+
+# Package/runtime obligations: the fake rejected violations inline; this audit
+# pins the positive arguments too.  The Notes acceptance supplies the separate
+# real-Docker before/after image/volume/network inventory required by D9/F16.
+if [ "$(f16_audit_eval "all(len(r.get('object_id','')) == 64 for r in rows if r.get('event') == 'rm-result')")" = True ] \
+   && [ "$(f16_audit_eval "all(r.get('policy_ok') is True for r in rows if r.get('event') == 'authorized-create')")" = True ]; then
+  ok "F16: fake runtime enforces immutable image, pull-never, bind/tmpfs, built-in network, and full-id rm"
+else
+  bad "F16: runtime argument policy or full-id removal was not proved"
+fi
+if [ "$(f16_audit_eval "any(r.get('argv',[None])[0] in ('pull','build') or r.get('argv',[])[:2] in (['volume','create'],['network','create']) for r in rows if r.get('argv'))")" = False ] \
+   && [ "$(f16_state_eval "s['images'] == ['$F16_IMAGE'] and s['volumes'] == [] and s['networks'] == ['bridge','host','none']")" = True ]; then
+  ok "F16: fixture creates no image, named volume, or named network"
+else
+  bad "F16: forbidden Docker resource inventory changed"
+fi
+
+# =============================================================================
+# F17 — 폭발 반경: 한 패키지의 deactivate 실패가 다른 패키지를 끌어내리지 않는다
+#
+# 재조정은 바뀐 패키지를 **전부** 먼저 비활성화한 뒤 설치한다(옛 설치가 쥔
+# 포트를 새 것이 잡기 전에 놓게 하려고). 그래서 중간에 죽으면 이미 내려간
+# 패키지들이 되살아날 길 없이 남는다 — 2026-08-26 실기기에서 두 번 났고,
+# 한 번은 무관한 앱 넷이 down 인 채 남았다.
+#
+# 원장은 **기록된 경로**의 deactivator 를 지문까지 맞춰 보고 부르므로, 여기서도
+# 그 모양 그대로 만든다: a1 에서 설치해 a1 이 기록되게 하고, 설정을 a2 로 옮겨
+# `upgrade-deactivate` 를 유발한다. a1 은 손대지 않으므로 그 deactivator 가 실제로
+# 돈다. 실패는 패키지 트리 밖의 플래그 파일로 만든다 — 스크립트를 고치면 지문이
+# 달라져 아예 안 불리기 때문이다.
+# =============================================================================
+reset_box
+BR="$TMP/blast"; mkdir -p "$BR/cfg"
+mkpkg "$BR/a1" ba 1
+mkpkg "$BR/b1" bb 1
+# a 의 deactivator: 플래그가 있으면 실패한다 (트리 밖 조건이라 지문은 안정)
+cat >"$BR/a1/deactivate.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+[ -e "$TMP/blast-fail" ] && exit 1
+rm -f "\$AIRLOCK_WEBROOT/\$AIRLOCK_APP_ID/marker"
+exit 0
+EOF
+chmod +x "$BR/a1/deactivate.sh"
+blast_cfg() { # blast_cfg <a-dir> <b-dir>
+  mkcfg "$BR/cfg/airlock.toml" \
+    '[apps.ba]' 'backend_port = 18901' '[packages.ba]' "path = \"$1\"" \
+    '[apps.bb]' 'backend_port = 18902' '[packages.bb]' "path = \"$2\""
+}
+blast_cfg "$BR/a1" "$BR/b1"
+orch "$BR/cfg/airlock.toml" >/dev/null 2>&1 || bad "F17: first install failed"
+
+# 둘 다 '바뀜'으로 계획되게 새 디렉터리로 옮긴다. a1·b1 은 그대로 두므로
+# 기록된 deactivator 는 여전히 지문이 맞아 실제로 실행된다.
+mkpkg "$BR/a2" ba 1
+mkpkg "$BR/b2" bb 1
+: > "$TMP/blast-fail"
+blast_cfg "$BR/a2" "$BR/b2"
+n_bb_before="$(grep -c '^ROOT=' "$TMP/invoke-bb.log" 2>/dev/null || echo 0)"
+out_blast="$(orch "$BR/cfg/airlock.toml" 2>&1)" && rc_blast=0 || rc_blast=$?
+
+[ "$rc_blast" != 0 ] \
+  && ok "F17: 비활성화 실패가 실행을 실패로 끝낸다 (조용히 넘어가지 않는다)" \
+  || bad "F17: run exited 0 despite a failed deactivation"
+grep -q "reconcile FAILED: could not deactivate 'ba'" <<<"$out_blast" \
+  && ok "F17: 실패한 패키지를 이름으로 말한다" \
+  || bad "F17: failure was not named (out: $(tail -3 <<<"$out_blast"))"
+grep -q "skipping install of 'ba'" <<<"$out_blast" \
+  && ok "F17: 내리지 못한 패키지는 그 위에 설치하지 않는다" \
+  || bad "F17: the failed package was installed over its stale artifacts"
+n_bb_after="$(grep -c '^ROOT=' "$TMP/invoke-bb.log" 2>/dev/null || echo 0)"
+[ "$n_bb_after" -gt "$n_bb_before" ] \
+  && ok "F17: 무관한 패키지는 그대로 재설치된다 (끌려 내려가지 않는다)" \
+  || bad "F17: bb was not reinstalled (before=$n_bb_before after=$n_bb_after)"
+[ -f "$WEB/bb/marker" ] \
+  && ok "F17: 무관한 패키지가 실제로 다시 서 있다" \
+  || bad "F17: bb marker missing after the run"
+[ "$(ledger_field ba x '"committed" in e')" = True ] \
+  && ok "F17: 실패한 패키지의 기록은 남아 다음 실행이 재시도한다" \
+  || bad "F17: ba ledger record was dropped despite the failed teardown"
+
+# =============================================================================
+# F18 — disable 이 유닛 파일을 먼저 지워도 회수는 성공이어야 한다
+#
+# _teardown_unit 의 부재 검사는 `disable` **앞**에만 있다. 그런데 유닛이
+# 심링크면 `systemctl --user disable` 이 그 파일을 스스로 지우고, 그 뒤의
+# unlink 는 반드시 ENOENT 로 죽는다. 그것을 실패로 세면 기록이 안 지워지고,
+# 다음 실행이 같은 회수를 다시 계획해 같은 자리에서 또 죽는다 — 교착이다.
+# system 쪽은 `sudo rm -f` 라 원래 멀쩡했다. user 쪽만 그랬다.
+# =============================================================================
+reset_box
+DG="$TMP/dgone"; mkdir -p "$DG/cfg"; mkpkg "$DG/pkg" dg 1
+manifest "$DG/pkg/airlock-app.toml" dg <<EOF
+[artifacts]
+units = ["dg.service"]
+EOF
+cat > "$DG/pkg/install.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf '[Unit]\n' > "$UU/dg.service"
+EOF
+cat > "$DG/pkg/smoke.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+# 이 deactivator 는 유닛에 손대지 않는다 — 실제 systemd 처럼 disable 이 지운다.
+cat > "$DG/pkg/deactivate.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$DG/pkg"/*.sh
+mkcfg "$DG/cfg/airlock.toml" "[apps.dg]" "backend_port = 18926" "[packages.dg]" "path = \"$DG/pkg\""
+orch "$DG/cfg/airlock.toml" >/dev/null 2>&1 || bad "F18: 첫 설치 실패"
+[ -f "$UU/dg.service" ] || bad "F18: 유닛이 설치되지 않았다"
+: > "$TMP/disable-removes-unit"
+mkcfg "$DG/cfg/airlock.toml"          # 패키지를 뺀다 -> 재조정이 회수한다
+out_dg="$(orch "$DG/cfg/airlock.toml" 2>&1)" && rc_dg=0 || rc_dg=$?
+rm -f "$TMP/disable-removes-unit"
+
+[ "$rc_dg" = 0 ] \
+  && ok "F18: disable 이 먼저 지운 유닛도 회수가 성공으로 끝난다" \
+  || bad "F18: teardown failed (rc=$rc_dg): $(tail -3 <<<"$out_dg")"
+[ ! -e "$UU/dg.service" ] \
+  && ok "F18: 유닛이 실제로 사라져 있다 (후조건이 성립한다)" \
+  || bad "F18: unit file survived"
+[ "$(ledger_field dg x '"committed" in e or "intent" in e')" != True ] \
+  && ok "F18: 기록이 지워져 교착에 빠지지 않는다" \
+  || bad "F18: ledger record kept — the deadlock is still there"
 
 echo "---"
 echo "passed=$pass failed=$fail"

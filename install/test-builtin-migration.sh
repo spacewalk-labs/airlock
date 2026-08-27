@@ -10,9 +10,9 @@
 # resolver must never fire against $ROOT/apps in this test (equivalence with
 # a manifest-less box is install/test-equivalence.sh's job, not this file's).
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -302,7 +302,7 @@ assert contract["schema_version"] == 1
 assert contract["bundle_entitlements"] == {
     "code-server": [], "dev-monitor": ["rooted-artifact", "system-unit"],
     "devterm": [], "feedback": [], "learning": [],
-    "markwand": [], "notepad": [],
+    "fileview": [], "notepad": [], "notes": [],
     "orca": ["rooted-artifact", "system-unit"],
     "paseo": [], "publish": [],
 }
@@ -418,10 +418,10 @@ else
   bad "v1 committed ride-through+teardown (rc=$td_rc)"
   failure_detail "$td_out"
 fi
-if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["version"] == 5 and d["events"] == []' "$STATE/app-ledger.json"; then
-  ok "v1 ride-through's teardown persisted the store as v5 with empty audit history"
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["version"] == 6 and d["events"] == []' "$STATE/app-ledger.json"; then
+  ok "v1 ride-through's teardown persisted the store as v6 with empty audit history"
 else
-  bad "store was not rewritten as v5 after the v1 teardown"
+  bad "store was not rewritten as v6 after the v1 teardown"
 fi
 
 # v2 committed ride-through: same, through the ordinary remove path (deps
@@ -478,7 +478,7 @@ else
   failure_detail "$td_out"
 fi
 
-# v3 -> v5 normalisation, PERSISTED. Tearing the v3 record down would prove
+# v3 -> v6 normalisation, PERSISTED. Tearing the v3 record down would prove
 # nothing: teardown drops the entry, so its current shape never reaches disk and a
 # normalisation that forgot `capabilities` entirely would still go green. The
 # mutation is therefore driven through a DIFFERENT app, so the record under
@@ -525,10 +525,10 @@ r = d["entries"]["v3keep"]["committed"]
 print(d["version"], r["digest"] == "d" * 64, json.dumps(r["capabilities"]))
 ' "$STATE/app-ledger.json" 2>&1)"
 if [ "$rc_v3i" = 0 ] && [ "$rc_v3c" = 0 ] \
-   && [ "$v3_disk" = '5 True ["rooted-artifact", "system-unit"]' ]; then
-  ok "v3 record normalises through v4 capabilities to v5 ON DISK"
+   && [ "$v3_disk" = '6 True ["rooted-artifact", "system-unit"]' ]; then
+  ok "v3 record normalises through v4 capabilities to v6 ON DISK"
 else
-  bad "v3 -> v5 persist (intent=$rc_v3i commit=$rc_v3c disk=$v3_disk)"
+  bad "v3 -> v6 persist (intent=$rc_v3i commit=$rc_v3c disk=$v3_disk)"
   failure_detail "$v3i_out
 $v3c_out"
 fi
@@ -605,7 +605,7 @@ d["entries"]["og-c"] = {
         "artifacts": {"units": [], "fragments": [], "webroot": [], "files": [], "rooted": [], "serve_ports": []},
         "serve_mappings": {"k": {"listen": 19999, "mode": "https", "target": 1}},
         "unit_scopes": {}, "order": None, "roots": common_roots, "source_class": "explicit",
-        "capabilities": [],
+        "capabilities": [], "container_runtime": None,
     },
     "intent": {
         "path": "/nonexistent/og-c", "digest": "e" * 64,
@@ -614,7 +614,7 @@ d["entries"]["og-c"] = {
         "deps": [], "anchors": {}, "roots": common_roots,
         "serve_mappings": {"k": {"listen": 18543, "mode": "https", "target": 2}},
         "unit_scopes": {}, "order": None, "source_class": "explicit",
-        "capabilities": [],
+        "capabilities": [], "container_runtime": None,
     },
 }
 json.dump(d, open(p, "w"))
@@ -657,7 +657,7 @@ d["entries"]["og-d"] = {
         "artifacts": {"units": [], "fragments": [], "webroot": [], "files": [], "rooted": [], "serve_ports": []},
         "serve_mappings": {"k": {"listen": 18643, "mode": "https", "target": 1}},
         "unit_scopes": {}, "order": None, "roots": common_roots, "source_class": "explicit",
-        "capabilities": [],
+        "capabilities": [], "container_runtime": None,
     },
     "intent": {
         "path": "/nonexistent/og-d", "digest": "e" * 64,
@@ -666,7 +666,7 @@ d["entries"]["og-d"] = {
         "deps": [], "anchors": {}, "roots": common_roots,
         "serve_mappings": {"k": {"listen": 29999, "mode": "https", "target": 2}},
         "unit_scopes": {}, "order": None, "source_class": "explicit",
-        "capabilities": [],
+        "capabilities": [], "container_runtime": None,
     },
 }
 json.dump(d, open(p, "w"))
@@ -2716,14 +2716,13 @@ provider = "tailscale"
 owner = "owner@example.com"
 
 [paths]
-code_root = "$MM/code"
 
 [apps.hub]
 [apps.code-server]
 [apps.dev-monitor]
 [apps.devterm]
 [apps.feedback]
-[apps.markwand]
+[apps.fileview]
 [apps.notepad]
 [apps.orca]
 [apps.paseo]
@@ -2773,7 +2772,7 @@ fi
 # of them takes the SAME single path: the migrated-shipped package dry run.
 # There is no more "shipped but not yet migrated" or "no manifest" case to
 # distinguish among real built-in ids.
-for id in code-server dev-monitor devterm feedback markwand notepad orca paseo publish; do
+for id in code-server dev-monitor devterm feedback fileview notepad orca paseo publish; do
   [ -f "$ROOT/apps/$id/airlock-app.toml" ] \
     || bad "mixed-matrix: $id has no shipped manifest — the nine-built-in premise broke"
   if grep -qF "[dry] installing packaged app: $id (" <<<"$out_mm"; then
@@ -3374,14 +3373,11 @@ POSITIVE = [
     ("feedback", f"{CONFD}/hub-locations.d/feedback.conf", "nginx fragment"),
     ("feedback", f"{UU}/airlock-feedback.service", "unit"),
 
-    ("markwand", f"{CONFD}/hub-locations.d/markwand.conf", "nginx fragment"),
-    ("markwand", f"{UU}/airlock-markserv.service", "markserv unit"),
-    ("markwand", f"{UU}/airlock-filebrowser.service", "filebrowser unit"),
-    ("markwand", f"{WEB}/__mw", "static asset dir (9 files, one dir claim)"),
-    ("markwand", f"{HOME}/.local/bin/markserv", "markserv binary"),
-    ("markwand", f"{HOME}/.local/lib/node_modules/markserv", "npm tree"),
-    ("markwand", f"{HOME}/.local/bin/filebrowser", "filebrowser binary"),
-    ("markwand", f"{HOME}/.config/filebrowser/branding", "filebrowser branding dir"),
+    ("fileview", f"{CONFD}/hub-locations.d/fileview.conf", "nginx fragment"),
+    ("fileview", f"{UU}/airlock-fileview.service", "unit"),
+    ("fileview", f"{WEB}/__fv", "static asset dir (one dir claim)"),
+    ("fileview", f"{HOME}/.local/bin/filebrowser", "filebrowser binary"),
+    ("fileview", f"{HOME}/.config/airlock-fileview", "filebrowser state dir (db)"),
 
     ("notepad", f"{WEB}/notepad/index.html",
      "clipboard page (apps/notepad/install.sh: install -m644 ... $WEBROOT/notepad/index.html)"),
@@ -3418,7 +3414,7 @@ NEGATIVE = [
     ("code-server", f"{HOME}/.local/share/airlock-code-server", "extensions/slots — user state, retained"),
     ("dev-monitor", f"{HOME}/.local/state/airlock/dev-monitor", "spool/messages.db — retained"),
     ("devterm", f"{HOME}/.config/airlock-devterm/tabs.json", "user tabs — retained"),
-    ("markwand", f"{HOME}/.config/filebrowser/fb.db", "filebrowser db — retained"),
+    ("fileview", f"{HOME}/.config/filebrowser/fb.db", "filebrowser db — retained"),
     ("paseo", f"{HOME}/.paseo/config.json", "paseo config — retained, patched in place"),
     ("paseo", f"{HOME}/.cache/ms-playwright", "shared Playwright cache — never Airlock's alone"),
     ("publish", "/opt/airlock/share", "public share dir — retained data"),
@@ -3475,7 +3471,7 @@ for g in "$ROOT/install/golden/render/nginx/site.conf" \
   [ -s "$g" ] && ok "E: F13 baseline present: ${g#"$ROOT"/}" \
     || bad "E: F13 baseline missing or empty: ${g#"$ROOT"/}"
 done
-for app in code-server dev-monitor devterm feedback markwand orca paseo publish; do
+for app in code-server dev-monitor devterm feedback fileview orca paseo publish; do
   [ -d "$ROOT/install/golden/render/$app" ] \
     && ok "E: F13a/b per-app goldens present: $app" \
     || bad "E: F13a/b goldens missing for $app"

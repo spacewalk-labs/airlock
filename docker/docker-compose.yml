@@ -30,10 +30,11 @@ services:
       # Persistence: Tailscale identity + the owner's home (app state).
       - airlock-tsstate:/var/lib/tailscale
       - airlock-home:/home/airlock
-      # Your real code, edited live. Point [paths].code_root in airlock.toml at
-      # /code, and set the host side to the Mac dir you work in. Mount a project
-      # directory: everything under it is collaborator-readable AND writable, and
-      # the guest cannot warn you about a host home dir it cannot see.
+      # Your real code, edited live: set the host side to the Mac dir you work in
+      # and it appears at /code inside. Nothing to configure in airlock.toml —
+      # fileview serves the guest's filesystem. Mount a project directory:
+      # whatever you mount is collaborator-readable AND writable, and the guest
+      # cannot warn you about a host home dir it cannot see.
       - ${AIRLOCK_CODE_DIR:-./_code}:/code
     devices:
       # tailscaled TUN. Remove and set TS_USERSPACE=true in airlock.env if the

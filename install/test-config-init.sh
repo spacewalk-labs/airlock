@@ -49,8 +49,8 @@ fi
 #    These three values are the ones docs/tasks/active/macos-app-launcher.md cites as
 #    evidence that the 186-line example is a bluff.
 # shellcheck disable=SC2088  # literal on purpose: airlock-config expands ~ itself
-"$CFG" init --owner me@example.com --code-root '~/code' --site-name Test \
-       --apps devterm,markwand,paseo > "$scratch/full.toml" 2>/dev/null
+"$CFG" init --owner me@example.com --site-name Test \
+       --apps devterm,fileview,paseo > "$scratch/full.toml" 2>/dev/null
 if AIRLOCK_CONFIG="$scratch/full.toml" "$CFG" validate >/dev/null 2>&1; then
   ok "a generated config passes the real validator"
 else
@@ -79,7 +79,7 @@ import sys, tomllib
 # three operator values.
 doc = tomllib.load(open(sys.argv[1], "rb"))
 allowed = {("airlock", "config_version"), ("site", "name"),
-           ("auth", "provider"), ("auth", "owner"), ("paths", "code_root")}
+           ("auth", "provider"), ("auth", "owner")}
 extra = []
 for section, table in doc.items():
     if section == "apps":
@@ -139,7 +139,6 @@ refuse() {
 }
 refuse "an owner that is not a login"        --owner notalogin --apps devterm
 refuse "an app this checkout does not ship"  --owner me@example.com --apps nosuchapp
-refuse "markwand with no code_root"          --owner me@example.com --apps markwand
 refuse "a flag with no value"                --owner
 refuse "an unknown flag"                     --owner me@example.com --nope x
 "$CFG" init >/dev/null 2>&1
@@ -172,7 +171,7 @@ mkdir -p "$watched"
 printf 'DO NOT OVERWRITE\n' > "$watched/airlock.toml"
 find "$watched" -type f -exec sha256sum {} + | sort > "$scratch/before.sums"
 (cd "$watched" && AIRLOCK_CONFIG="$watched/airlock.toml" "$CFG" init \
-    --owner me@example.com --code-root '/tmp/x' --apps markwand) >/dev/null 2>&1
+    --owner me@example.com --apps fileview) >/dev/null 2>&1
 find "$watched" -type f -exec sha256sum {} + | sort > "$scratch/after.sums"
 if cmp -s "$scratch/before.sums" "$scratch/after.sums"; then
   ok "init creates and modifies no file, even run inside a directory holding a config"
@@ -190,7 +189,7 @@ while read -r app; do
   seen_apps=$((seen_apps+1))
   [ "$app" = orca ] && continue
   # shellcheck disable=SC2088  # literal on purpose, as above
-  "$CFG" init --owner me@example.com --code-root '~/code' --apps "$app" > "$scratch/one.toml" 2>/dev/null
+  "$CFG" init --owner me@example.com --apps "$app" > "$scratch/one.toml" 2>/dev/null
   AIRLOCK_CONFIG="$scratch/one.toml" "$CFG" validate >/dev/null 2>&1 || {
     bad "selecting '$app' alone produced a config that does not validate"; every_ok=0; }
 done < <("$CFG" catalog | python3 -c 'import json,sys; [print(a["id"]) for a in json.load(sys.stdin)["apps"]]')
@@ -301,20 +300,27 @@ else
   bad "a dependency on an unshipped app produced rc=$miss_rc: $(printf '%s' "$miss_out" | head -1)"
 fi
 
-# 14. `--code-root` is checked by init's own rule, not left to validate. Accepting a
-#     relative path here means the GUI reports it on the install screen, in the
-#     validator's words, about a value chosen three screens earlier.
-for bad_root in relative "   " ""; do
-  "$CFG" init --owner me@example.com --apps markwand --code-root "$bad_root" >"$scratch/cr.toml" 2>/dev/null
-  cr_rc=$?
-  if [ "$cr_rc" -ne 2 ]; then
-    bad "init accepted --code-root '$bad_root' (rc=$cr_rc) and left it for validate"
-  elif [ -s "$scratch/cr.toml" ]; then
-    bad "init refused --code-root '$bad_root' but had already written to stdout"
-  else
-    ok "init refuses --code-root '$bad_root' before writing anything"
-  fi
-done
+# 14. `--code-root` is gone with the key it wrote. It used to be REQUIRED as soon as
+#     fileview was selected; fileview now serves the filesystem and has no root to
+#     choose, so the flag must be rejected as unknown rather than quietly ignored —
+#     a silently-accepted flag would let a caller believe it had set a boundary.
+"$CFG" init --owner me@example.com --apps fileview --code-root /srv/code >"$scratch/cr.toml" 2>/dev/null
+cr_rc=$?
+if [ "$cr_rc" -ne 2 ]; then
+  bad "init accepted the retired --code-root flag (rc=$cr_rc)"
+elif [ -s "$scratch/cr.toml" ]; then
+  bad "init refused --code-root but had already written to stdout"
+else
+  ok "init refuses the retired --code-root flag before writing anything"
+fi
+
+# ...and fileview alone, with no path flag at all, produces a config that validates.
+"$CFG" init --owner me@example.com --apps fileview >"$scratch/mw.toml" 2>/dev/null
+if AIRLOCK_CONFIG="$scratch/mw.toml" "$CFG" validate >/dev/null 2>&1; then
+  ok "init fileview needs no path flag"
+else
+  bad "init fileview needs no path flag"
+fi
 
 echo "---"
 echo "passed=$pass failed=$fail"

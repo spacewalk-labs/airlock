@@ -1,0 +1,300 @@
+/*
+ * tokens.css — fileview's layer over the Airlock design system.
+ *
+ * The colours, type scale, radii, spacing and motion are Airlock's and live in
+ * hub/assets/airlock-tokens.css, which this app links FIRST (viewer.html, and the
+ * head of every sandboxed srcdoc document app.js builds). This file holds two
+ * things and nothing else:
+ *
+ *   1. Role aliases. `--bg` is not a colour, it is the name of a job — "the
+ *      surface you read a file on" — bound to the SoT token that does that job.
+ *      The alias layer is what keeps 1,945 lines of app.js from hard-coding the
+ *      SoT's physical token names, and it is why this file has no theme blocks:
+ *      `var(--airlock-canvas)` already resolves per theme.
+ *   2. This app's own components — long-form prose, tables, GFM callouts.
+ *
+ * There are no colour VALUES here. A hex in this file is a second source of truth
+ * for a palette that already has one, and install/test-design-review.py fails
+ * the build when one appears (the syntax-highlighting palette in hljs-theme.css is
+ * the one exemption, and it is one Airlock does not own).
+ *
+ * The prose and callout structure came from the Markwand Dev Server
+ * (https://github.com/givepro91/markwand, MIT — see NOTICE). The structure is
+ * upstream's; every value it renders with is Airlock's.
+ */
+
+:root {
+  /* ─── Surfaces ────────────────────────────────────────────────────────
+     Two of them, and which is which is the layout: the top bar and the file
+     tree are the recessed chrome, the pane you read a file in is the raised
+     surface. Same arrangement as a Finder window. */
+  --chrome:   var(--airlock-canvas);
+  --bg:       var(--airlock-surface-1);
+  --bg-hover: var(--airlock-surface-2);
+  --code-bg:  var(--airlock-surface-2);
+
+  /* ─── Text — three weights, which is where hierarchy comes from ─────── */
+  --text:       var(--airlock-ink);
+  --text-body:  var(--airlock-body);
+  --text-muted: var(--airlock-mute);
+
+  /* ─── Lines ───────────────────────────────────────────────────────────
+     --border separates two surfaces; --border-muted divides content inside
+     one. Neither is ever a text colour. */
+  --border:       var(--airlock-hairline);
+  --border-muted: var(--airlock-edge);
+
+  /* ─── The one strong colour ──────────────────────────────────────────
+     Links, focus, the selected row, and every callout that is not a warning
+     or a danger. There is no second accent and no success colour. */
+  --accent:          var(--airlock-primary);
+  --accent-contrast: var(--airlock-on-primary);
+
+  /* ─── State ───────────────────────────────────────────────────────────── */
+  --color-warning: var(--airlock-warning);
+  --color-danger:  var(--airlock-danger);
+
+  /* A selected tree row is a filled accent pill, the way a Finder list marks
+     a selection. Derived from the accent so there is nothing to keep in step. */
+  --select-bg:   var(--accent);
+  --select-text: var(--accent-contrast);
+
+  /* Callout washes, mixed from the state colour at paint time rather than
+     stored as six more values that could drift from it. */
+  --tint-accent:  color-mix(in srgb, var(--accent) 14%, transparent);
+  --tint-warning: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  --tint-danger:  color-mix(in srgb, var(--color-danger) 14%, transparent);
+
+  /* ─── Elevation ───────────────────────────────────────────────────────── */
+  --shadow:       var(--airlock-shadow);
+  --shadow-hover: var(--airlock-shadow-hover);
+  --focus:        var(--airlock-focus);
+
+  /* ─── Typography ──────────────────────────────────────────────────────
+     Airlock's scale, used one step lower than the hub uses it: --fs-sm is the
+     SoT's smallest step and carries the tree and the toolbar, --fs-lg is the
+     SoT's body size and carries prose. Nothing here invents a size — a dense
+     tool that needs its own scale is a second design system wearing a
+     density argument. */
+  --font-sans: var(--airlock-font);
+  --font-mono: var(--airlock-font-mono);
+
+  --fs-sm:  var(--airlock-fs-xs);     /* chrome: tree rows, toolbar, captions */
+  --fs-md:  var(--airlock-fs-sm);     /* code, tables, the editor */
+  --fs-lg:  var(--airlock-fs-body);   /* long-form prose */
+  --fs-xl:  var(--airlock-fs-h2);
+  --fs-2xl: var(--airlock-fs-h1);
+
+  --lh-normal:  var(--airlock-lh);
+  --lh-relaxed: 1.55;   /* the plain-text editor, where lines do not wrap */
+  --lh-loose:   1.7;    /* long-form prose */
+  --track:      var(--airlock-track);
+  --track-caps: var(--airlock-track-caps);
+
+  --fw-medium:   var(--airlock-fw-medium);
+  --fw-semibold: var(--airlock-fw-semibold);
+  --fw-bold:     var(--airlock-fw-bold);
+
+  /* ─── Radius ──────────────────────────────────────────────────────────── */
+  --r-sm:   var(--airlock-r-sm);
+  --r-md:   var(--airlock-r-md);
+  --r-lg:   var(--airlock-r-lg);
+  --r-pill: var(--airlock-r-pill);
+
+  /* ─── Spacing ─────────────────────────────────────────────────────────── */
+  --sp-1:  var(--airlock-sp-1);
+  --sp-2:  var(--airlock-sp-2);
+  --sp-3:  var(--airlock-sp-3);
+  --sp-4:  var(--airlock-sp-4);
+  --sp-5:  var(--airlock-sp-5);
+  --sp-6:  var(--airlock-sp-6);
+  --sp-8:  var(--airlock-sp-8);
+  --sp-12: var(--airlock-sp-12);
+
+  /* ─── Motion ──────────────────────────────────────────────────────────── */
+  --ease:     var(--airlock-ease);
+  --dur-fast: var(--airlock-dur-fast);
+  --dur-slow: var(--airlock-dur-slow);
+
+  /* ─── Stacking — one layer, for the menu and the toast ────────────────── */
+  --z-overlay: 300;
+}
+
+/* ========== body baseline ==========
+   Every document this app paints — the viewer shell and each sandboxed srcdoc —
+   starts here. The reading pane is the raised surface, so `--bg`, not `--chrome`. */
+/* Tracking is deliberately NOT set here. Airlock's -0.022em is a body-and-heading
+   value; inherited globally it also tightens 13px chrome, which needs the room,
+   and monospace, where it breaks the grid the font exists for. It is applied
+   where it belongs, on prose and headings, and nowhere else. */
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ========== long-form prose (the rendered-markdown pane) ========== */
+.markdown-viewer,
+body > .markdown-body,
+body > .container {
+  font-family: var(--font-sans);
+  font-size: var(--fs-lg);
+  line-height: var(--lh-loose);
+  letter-spacing: var(--track);
+  color: var(--text-body);
+  max-width: 78ch;
+  margin: 0 auto;
+  padding: var(--sp-8) var(--sp-6) var(--sp-12);
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Headings are ink against the body's lighter grey — the ladder doing the work
+   a second colour would otherwise be asked to do. */
+h1, h2, h3, h4, h5, h6 {
+  color: var(--text);
+  font-weight: var(--fw-semibold);
+  line-height: 1.25;
+  letter-spacing: var(--track);
+  margin: var(--sp-8) 0 var(--sp-3);
+}
+h1 { font-size: var(--fs-2xl); margin-top: var(--sp-8); border-bottom: 1px solid var(--border-muted); padding-bottom: var(--sp-2); }
+h2 { font-size: var(--fs-xl); margin-top: var(--sp-8); border-bottom: 1px solid var(--border-muted); padding-bottom: var(--sp-2); }
+h3 { font-size: var(--fs-lg); }
+h4 { font-size: var(--fs-md); }
+h5 { font-size: var(--fs-md); color: var(--text-muted); }
+h6 {
+  font-size: var(--fs-sm); color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: var(--track-caps);
+}
+
+p { margin: 0 0 var(--sp-4); }
+
+ul, ol { padding-left: var(--sp-5); margin: 0 0 var(--sp-4); }
+li { margin: 0 0 var(--sp-1); }
+li > ul, li > ol { margin-top: var(--sp-1); margin-bottom: 0; }
+li > p { margin: 0 0 var(--sp-2); }
+
+code {
+  background: var(--code-bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  letter-spacing: 0;
+  padding: 0.15em 0.4em;
+  border-radius: var(--r-sm);
+}
+pre {
+  background: var(--code-bg);
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+  overflow-x: auto;
+  margin: var(--sp-4) 0;
+}
+pre code { background: transparent; padding: 0; font-size: 0.875em; }
+
+blockquote {
+  border-left: 3px solid var(--border);
+  color: var(--text-muted);
+  margin: var(--sp-4) 0;
+  padding: var(--sp-1) var(--sp-4);
+  background: transparent;
+}
+
+/* ========== tables — rules above and below, no zebra, no vertical lines ========== */
+.markdown-viewer table,
+body > .markdown-body table {
+  display: table;
+  width: 100%;
+  max-width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0;
+  margin: var(--sp-5) 0;
+  font-size: 0.95em;
+  background: transparent;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  border-left: none;
+  border-right: none;
+}
+.markdown-viewer th, .markdown-viewer td,
+body > .markdown-body th, body > .markdown-body td {
+  padding: 10px 14px;
+  border: none;
+  border-bottom: 1px solid var(--border-muted);
+  background: transparent;
+  vertical-align: top;
+  text-align: left;
+}
+.markdown-viewer th, body > .markdown-body th {
+  color: var(--text);
+  font-weight: var(--fw-semibold);
+  border-bottom: 1px solid var(--border);
+}
+.markdown-viewer tr:last-child td,
+body > .markdown-body tr:last-child td { border-bottom: none; }
+
+hr { border: none; border-top: 1px solid var(--border-muted); margin: var(--sp-6) 0; }
+
+/* ========== GFM Alert callouts ==========
+   GitHub ships five colours here. Airlock ships one accent plus warning and
+   danger, and rule 3 says colour carries state — so note, tip and important all
+   read as "the app is telling you something", which is the accent, and only the
+   two that mean "this can hurt" get their own. */
+blockquote.fileview-alert {
+  border-left-width: 3px;
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  padding: var(--sp-3) var(--sp-4);
+  margin: var(--sp-4) 0;
+  color: var(--text-body);
+}
+blockquote.fileview-alert .fileview-alert-title {
+  font-weight: var(--fw-semibold);
+  font-size: var(--fs-sm);
+  text-transform: uppercase;
+  letter-spacing: var(--track-caps);
+  margin: 0 0 var(--sp-2);
+  display: flex; align-items: center; gap: var(--sp-2);
+}
+/* The title is ink and the rule is the colour. Setting the title in the state
+   colour reads well and measures badly: at 13px, `warning` came out 4.06:1 on
+   its own 14% wash and `caution` 4.27:1, both under AA — and the wash is what
+   made them worse, because it lifts the background toward the very hue the text
+   is set in. A 3px rule has no such problem: it is not text, its bar is 3:1, and
+   it clears that in both themes. */
+blockquote.fileview-alert .fileview-alert-title { color: var(--text); }
+blockquote.fileview-alert.alert-note,
+blockquote.fileview-alert.alert-tip,
+blockquote.fileview-alert.alert-important   { border-left-color: var(--accent); background: var(--tint-accent); }
+blockquote.fileview-alert.alert-warning     { border-left-color: var(--color-warning); background: var(--tint-warning); }
+blockquote.fileview-alert.alert-caution     { border-left-color: var(--color-danger);  background: var(--tint-danger); }
+
+/* ========== heading anchor (appears on hover) ========== */
+.fileview-anchor {
+  visibility: hidden;
+  margin-left: var(--sp-2);
+  font-size: 0.7em;
+  color: var(--text-muted);
+  text-decoration: none;
+  user-select: none;
+  cursor: pointer;
+}
+.fileview-anchor:hover { color: var(--accent); }
+h1:hover .fileview-anchor, h2:hover .fileview-anchor, h3:hover .fileview-anchor,
+h4:hover .fileview-anchor, h5:hover .fileview-anchor, h6:hover .fileview-anchor { visibility: visible; }
+
+/* the heading you just jumped to, marked once and then left alone */
+@keyframes fileview-flash {
+  0%   { background: var(--tint-accent); }
+  100% { background: transparent; }
+}
+:target { animation: fileview-flash 1.6s ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  :target { animation: none; }
+}

@@ -3,9 +3,9 @@
 # the small, human-readable reference patches; no @getpaseo bundle, npm, or network is
 # involved. Each positive assertion has a deliberately broken-anchor control beside it.
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -117,6 +117,14 @@ const webStateConstants = {
   COMBINED_SHA: manifest.web_ui.combined_sha256,
   THREE_ANCHOR_BROWSE_ONLY_SHA: manifest.web_ui.three_anchor_browse_only_sha256,
   THREE_ANCHOR_COMBINED_SHA: manifest.web_ui.three_anchor_combined_sha256,
+  ONE_ANCHOR_GENERAL_ONLY_SHA: manifest.web_ui.one_anchor_general_only_sha256,
+  ONE_ANCHOR_GENERAL_COMBINED_SHA: manifest.web_ui.one_anchor_general_combined_sha256,
+  ONE_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA:
+    manifest.web_ui.one_anchor_general_three_anchor_browse_sha256,
+  TWO_ANCHOR_GENERAL_ONLY_SHA: manifest.web_ui.two_anchor_general_only_sha256,
+  TWO_ANCHOR_GENERAL_COMBINED_SHA: manifest.web_ui.two_anchor_general_combined_sha256,
+  TWO_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA:
+    manifest.web_ui.two_anchor_general_three_anchor_browse_sha256,
 };
 for (const [name, value] of Object.entries(webStateConstants)) {
   if (!web.includes(`const ${name} = "${value}";`)) {
@@ -435,6 +443,147 @@ if negative_js "$PATCH_DIR/orphan-process-group.mjs" "$GROUP_CODEX_BAD" 20 "$TMP
   ok "process group codex negative control: dispose-anchor drift skips rc 20"
 else
   bad "process group codex negative control: skipped patch did not fail the positive assertion"
+fi
+
+# ------------------------------------------ platform Claude pool-record contract
+# The platform, not paseo or devterm, owns ~/.claude-accounts now. This compact schema
+# names the fields a refresh write-back must retain when present and deliberately leaves
+# every object open: upstream adds fields without coordinating with this repository, so a
+# validator-projected write is data loss even when every currently-known field is listed.
+# Pin both the schema vocabulary and a deletion control here, beside the vendored patch it
+# governs. A prose reference can drift while remaining plausible; deleting any contracted
+# field below must make this test fail.
+POOL_SCHEMA_OUT="$TMP/pool-schema.out"
+POOL_SCHEMA_RC=0
+python3 - "$ROOT/schemas/credentials/pool-record-v1.json" >"$POOL_SCHEMA_OUT" 2>&1 <<'PY' || POOL_SCHEMA_RC=$?
+import copy
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+raw = path.read_bytes()
+schema = json.loads(raw)
+canonical = (json.dumps(schema, sort_keys=True, separators=(",", ":")) + "\n").encode()
+assert raw == canonical, "schema must use the repository's canonical one-line JSON form"
+
+required = [
+    "_meta.email",
+    "_meta.kind",
+    "_meta.org",
+    "claudeAiOauth.accessToken",
+    "claudeAiOauth.expiresAt",
+    "claudeAiOauth.rateLimitTier",
+    "claudeAiOauth.refreshToken",
+    "claudeAiOauth.refreshTokenExpiresAt",
+    "claudeAiOauth.scopes",
+    "claudeAiOauth.subscriptionType",
+]
+updates_allowed = [
+    "claudeAiOauth.accessToken",
+    "claudeAiOauth.rateLimitTier",
+    "claudeAiOauth.refreshToken",
+    "claudeAiOauth.subscriptionType",
+]
+assert schema["schema_id"] == "airlock-claude-pool-record"
+assert schema["scope"] == "public-contract-index" and schema["version"] == 1
+assert schema["required_objects"] == ["claudeAiOauth"]
+assert schema["open_objects"] == ["$", "_meta", "claudeAiOauth"]
+assert schema["preserve_unknown_fields"] is True
+assert schema["required_writeback_fields_if_present"] == required
+assert schema["allowed_refresh_updates"] == updates_allowed
+assert sorted(schema["field_types"]) == required
+
+def leaves(value, prefix=""):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{prefix}.{key}" if prefix else key
+            yield from leaves(child, child_path)
+    else:
+        yield prefix, value
+
+def lookup(value, dotted):
+    current = value
+    for part in dotted.split("."):
+        if not isinstance(current, dict) or part not in current:
+            raise AssertionError(f"write-back dropped {dotted}")
+        current = current[part]
+    return current
+
+def assign(value, dotted, replacement):
+    parts = dotted.split(".")
+    current = value
+    for part in parts[:-1]:
+        current = current[part]
+    current[parts[-1]] = replacement
+
+def remove(value, dotted):
+    parts = dotted.split(".")
+    current = value
+    for part in parts[:-1]:
+        current = current[part]
+    del current[parts[-1]]
+
+def assert_writeback(before, after, updates):
+    assert isinstance(after.get("claudeAiOauth"), dict), "required object was dropped"
+    for dotted in required:
+        try:
+            old = lookup(before, dotted)
+        except AssertionError:
+            continue
+        expected = updates.get(dotted, old)
+        assert lookup(after, dotted) == expected, f"write-back changed {dotted} outside its contract"
+    for dotted, old in leaves(before):
+        if dotted not in updates:
+            assert lookup(after, dotted) == old, f"write-back dropped or changed {dotted}"
+
+# Values are inert, local sentinels. The test emits only assertions and counts, never data.
+before = {
+    "claudeAiOauth": {
+        "accessToken": "redacted-old",
+        "refreshToken": "redacted-old",
+        "expiresAt": 1,
+        "refreshTokenExpiresAt": 2,
+        "scopes": ["scope-a"],
+        "subscriptionType": "kind-a",
+        "rateLimitTier": "tier-a",
+        "futureProviderField": {"nested": True},
+    },
+    "_meta": {"email": "account.invalid", "org": None, "kind": "personal", "futureMeta": 3},
+    "futureTopLevel": {"nested": 4},
+}
+updates = {dotted: "redacted-new" for dotted in updates_allowed}
+after = copy.deepcopy(before)
+for dotted, replacement in updates.items():
+    assign(after, dotted, replacement)
+assert_writeback(before, after, updates)
+
+for dotted in required:
+    broken = copy.deepcopy(after)
+    remove(broken, dotted)
+    try:
+        assert_writeback(before, broken, updates)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"negative control did not detect deletion of {dotted}")
+
+for dotted in ("claudeAiOauth.futureProviderField", "_meta.futureMeta", "futureTopLevel"):
+    broken = copy.deepcopy(after)
+    remove(broken, dotted)
+    try:
+        assert_writeback(before, broken, updates)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"negative control did not detect deletion of {dotted}")
+PY
+if [ "$POOL_SCHEMA_RC" -eq 0 ]; then
+  ok "platform pool schema: canonical shape pins every known preservation field"
+  ok "platform pool schema negative controls: known and unknown field deletion is rejected"
+else
+  bad "platform pool schema: shape or deletion controls"
+  sed 's/^/    /' "$POOL_SCHEMA_OUT"
 fi
 
 # ------------------------------------------------- credential key preservation

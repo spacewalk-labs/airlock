@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Viewer</title>
+  <meta name="apple-mobile-web-app-title" content="File Viewer">
+  <!-- Icons are generated from the launcher tile — bin/gen-app-icons.py, SoT hub/index.html.
+       Same-origin subpath app: /assets/ is the hub's, copied there by the installer.
+       These used to be the hub's own porthole marks, which said "Airlock" on a tab
+       that is File Viewer's. -->
+  <link rel="icon" type="image/svg+xml" href="/assets/app-icons/fileview.svg">
+  <link rel="apple-touch-icon" href="/assets/app-icons/fileview.png">
+  <!-- The two values the browser paints its own chrome with. They cannot be
+       tokens — no stylesheet has loaded when the browser reads them — so they are
+       --airlock-canvas written out, and install/test-design-review.py fails the
+       build if either stops matching it. -->
+  <meta name="theme-color" media="(prefers-color-scheme: dark)"  content="#0a0f1e">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f5f7">
+  <!-- The design system, then this app's layer over it. Order matters: tokens.css
+       is aliases (--bg: var(--airlock-surface-1)), not values. /assets/ is the
+       hub's, same-origin, and the installer stamps ?v= on both. -->
+  <!-- Where the tree opens. This is NOT a setting and there is no key for it: the
+       installer writes the home directory of the account the service runs as, and
+       that is the same account whose reach bounds the whole app (SECURITY.md). The
+       filesystem root is still right there above it — this decides where you land,
+       not what you can see. Empty means land at the root, which is what happens if
+       the file is served unstamped. -->
+  <meta name="fileview-home" content="">
+  <link rel="stylesheet" href="/assets/airlock-tokens.css">
+  <link rel="stylesheet" href="/__fv/tokens.css">
+  <!-- The syntax palette. The srcdoc documents link it themselves; the viewer needs
+       it too, because the rendered-markdown pane paints into THIS document and the
+       fenced code blocks in it are highlighted by the same hljs spans. -->
+  <link rel="stylesheet" href="/__fv/hljs-theme.css">
+  <!-- highlight.js (self-hosted, common build) — the parent colours code, so the
+       code srcdoc keeps static markup and runs no scripts. -->
+  <script src="/__fv/highlight.min.js" defer></script>
+  <!-- marked + DOMPurify (self-hosted) — for rendering .ipynb markdown cells. The
+       parent parses/sanitizes, then injects static HTML. -->
+  <script src="/__fv/marked.min.js" defer></script>
+  <script src="/__fv/purify.min.js" defer></script>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100vh; overflow: hidden; max-width: none; }
+    body { display: flex; flex-direction: column; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: var(--fs-md); line-height: var(--lh-normal); }
+
+    /* ===== toolbar =====
+       A Mac window's toolbar: one recessed strip, a hairline under it, and
+       controls that are quiet until you touch them. Nothing in here is
+       coloured for decoration — the only fill is the one that means "this is
+       on" or "this is the primary action". */
+    #ms-bar {
+      flex: 0 0 auto;
+      display: flex; align-items: center; gap: var(--sp-1);
+      padding: var(--sp-2) var(--sp-3);
+      padding-left: 56px;   /* reserve room for the corner return widget (top-left) */
+      background: var(--chrome);
+      border-bottom: 1px solid var(--border);
+      font-size: var(--fs-sm);
+      color: var(--text-muted);
+    }
+    #ms-bar .ms-brand {
+      font-weight: var(--fw-semibold); color: var(--text);
+      padding-right: var(--sp-2);
+      white-space: nowrap;
+    }
+    #ms-bar .ms-path {
+      flex: 1 1 auto;
+      font-family: var(--font-mono);
+      font-size: var(--fs-sm);
+      letter-spacing: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      cursor: pointer;
+      padding: 3px var(--sp-2);
+      border-radius: var(--r-sm);
+    }
+    #ms-bar .ms-path:hover { background: var(--bg-hover); color: var(--text); }
+    #ms-bar .ms-mtime {
+      font-family: var(--font-mono);
+      font-size: var(--fs-sm);
+      letter-spacing: 0;
+      color: var(--text-muted);
+      flex: 0 0 auto;
+      padding: 0 var(--sp-2);
+    }
+    #ms-bar .ms-mtime:empty { display: none; }
+
+    /* One control shape. Square by default; the two that carry a word grow to
+       fit it, which is the only difference between them. */
+    #ms-bar button, #ms-bar a.btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      gap: 5px;
+      flex: 0 0 auto;
+      min-width: 28px; height: 28px;
+      padding: 0 5px;
+      background: transparent; border: none;
+      color: var(--text-muted);
+      border-radius: var(--r-sm);
+      cursor: pointer; font: inherit; font-size: var(--fs-sm);
+      text-decoration: none;
+      transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+    }
+    #ms-bar button.labelled, #ms-bar a.btn { padding: 0 10px; }
+    #ms-bar .ic { width: 16px; height: 16px; flex: 0 0 auto; display: block; }
+    #ms-bar button:hover:not([disabled]), #ms-bar a.btn:hover {
+      background: var(--bg-hover); color: var(--text);
+    }
+    #ms-bar button:focus-visible, #ms-bar a.btn:focus-visible {
+      outline: none; box-shadow: var(--focus); color: var(--text);
+    }
+    #ms-bar button[disabled] { opacity: 0.35; cursor: default; }
+    #ms-bar button[aria-pressed="true"]:not([disabled]) {
+      background: var(--select-bg); color: var(--select-text);
+    }
+    #ms-bar #ms-save {
+      background: var(--accent); color: var(--accent-contrast);
+      font-weight: var(--fw-semibold);
+    }
+    /* `display: inline-flex` on the controls overrides the `hidden` attribute's
+       own `display: none`, so a hidden button stays on screen. Save had a
+       one-off rule and survived; the raw toggle did not, and sat in the toolbar
+       with no file open. One rule for everything in here. */
+    #ms-bar [hidden] { display: none !important; }
+    #ms-bar #ms-save:hover:not([disabled]) { background: var(--accent); opacity: 0.85; }
+    /* An unsaved edit is state, so it gets the state colour and nothing else. */
+    #ms-bar #ms-save.dirty::after {
+      content: ""; width: 5px; height: 5px; border-radius: 50%;
+      background: var(--color-warning); flex: 0 0 auto;
+    }
+    /* a hairline between control groups, in place of a gap nobody would read */
+    #ms-bar .ms-sep {
+      flex: 0 0 auto; width: 1px; height: 18px;
+      margin: 0 var(--sp-1);
+      background: var(--border);
+    }
+
+    /* right-click menu */
+    #ms-menu {
+      position: fixed; z-index: calc(var(--z-overlay) + 1);
+      min-width: 200px; padding: var(--sp-1) 0;
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: var(--r-md);
+      box-shadow: var(--shadow-hover);
+      font-size: var(--fs-sm); font-family: var(--font-sans);
+    }
+    #ms-menu[hidden] { display: none; }
+    #ms-menu .mi {
+      display: block; width: 100%; text-align: left;
+      background: transparent; border: none; color: inherit;
+      padding: 6px var(--sp-4); cursor: pointer; font: inherit;
+    }
+    #ms-menu .mi:hover { background: var(--bg-hover); }
+    #ms-menu .mi:focus-visible { outline: none; background: var(--bg-hover); box-shadow: var(--focus); }
+    #ms-menu .mi.danger { color: var(--color-danger); }
+    #ms-menu .sep { height: 1px; margin: var(--sp-1) 0; background: var(--border-muted); }
+    #ms-menu .hdr {
+      padding: 4px var(--sp-4) 6px; font-family: var(--font-mono); font-size: var(--fs-sm);
+      color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 260px;
+    }
+
+    /* path copy toast */
+    #ms-toast {
+      position: fixed; bottom: var(--sp-6); left: 50%; transform: translateX(-50%);
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: var(--r-pill);
+      padding: var(--sp-2) var(--sp-5);
+      font-size: var(--fs-sm); font-family: var(--font-sans);
+      box-shadow: var(--shadow-hover);
+      opacity: 0; pointer-events: none;
+      transition: opacity var(--dur-slow) var(--ease);
+      z-index: var(--z-overlay);
+    }
+    #ms-toast.show { opacity: 1; }
+
+    /* ===== main split ===== */
+    main { flex: 1 1 auto; display: flex; min-height: 0; position: relative; }
+    #ms-treepane {
+      flex: 0 0 320px;
+      display: flex; flex-direction: column; min-height: 0;
+      background: var(--chrome);
+      border-right: 1px solid var(--border);
+      transition: flex-basis var(--dur-slow) var(--ease);
+    }
+    #ms-searchbar {
+      flex: 0 0 auto; display: flex; gap: var(--sp-2);
+      padding: var(--sp-2) var(--sp-2) 0;
+    }
+    #ms-searchbar input {
+      flex: 1 1 auto; min-width: 0;
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: var(--r-sm);
+      padding: 4px 8px; font-size: var(--fs-sm); font-family: var(--font-sans);
+    }
+    #ms-searchbar input::placeholder { color: var(--text-muted); }
+    #ms-searchbar input:focus-visible { outline: none; border-color: var(--accent); box-shadow: var(--focus); }
+    #ms-searchbar button {
+      flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+      width: 26px; height: 26px;
+      background: transparent; color: var(--text-muted);
+      border: 1px solid var(--border); border-radius: var(--r-sm);
+      cursor: pointer; padding: 0;
+      transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+    }
+    #ms-searchbar button .ic { width: 15px; height: 15px; display: block; }
+    #ms-searchbar button:hover { background: var(--bg-hover); color: var(--text); }
+    #ms-searchbar button:focus-visible { outline: none; box-shadow: var(--focus); color: var(--text); }
+    #ms-scope {
+      flex: 0 0 auto; padding: 4px var(--sp-3) 0;
+      font-family: var(--font-mono); font-size: var(--fs-sm);
+      color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    #ms-scope:empty { display: none; }
+    #ms-scope { cursor: pointer; }
+    /* The word is ink and the mark is the colour. `--color-warning` on the chrome
+       measures 4.47:1 in the light theme at 13px — the design system checks that
+       token at the large-text bar because that is what it is for, and this is
+       small text. A dot has no such bar. */
+    #ms-scope .warn { color: var(--text); font-weight: var(--fw-medium); }
+    #ms-scope .warn::before {
+      content: ""; display: inline-block;
+      width: 6px; height: 6px; border-radius: 50%;
+      margin-right: 6px;
+      background: var(--color-warning);
+    }
+    #ms-tree {
+      flex: 1 1 auto;
+      overflow: auto;
+      padding: var(--sp-3) var(--sp-2);
+      font-size: var(--fs-sm);
+    }
+    /* a directory the pointer is dragging files onto */
+    #ms-tree .ms-row.droptarget { outline: 2px dashed var(--accent); outline-offset: -2px; }
+    #ms-treepane.collapsed {
+      flex: 0 0 36px !important;   /* wins over an inline flex-basis set by drag-resize */
+      overflow: hidden;
+    }
+    #ms-treepane.collapsed #ms-searchbar, #ms-treepane.collapsed #ms-scope { display: none; }
+    /* Collapsed, the rows are not "narrow" — they are gone. Hiding only their
+       contents left arrow-navigable empty boxes behind, and at the stacked
+       breakpoint the pane is 0px wide, so they were zero-width empty boxes.
+       `display: none` also takes them out of what app.js counts as visible. */
+    #ms-treepane.collapsed .ms-node,
+    #ms-treepane.collapsed .ms-children { display: none; }
+    /* sidebar drag-resize handle (touch-aware) */
+    #ms-resize {
+      flex: 0 0 5px;
+      cursor: col-resize;
+      background: transparent;
+      transition: background var(--dur-fast) var(--ease);
+      touch-action: none;   /* stop the browser from hijacking scroll/gestures while dragging */
+    }
+    #ms-resize:focus-visible { outline: none; background: var(--accent); }
+    #ms-resize:hover { background: var(--border); }
+    #ms-resize.dragging { background: var(--accent); }
+    #ms-viewer { flex: 1 1 auto; border: none; background: var(--bg); width: 100%; height: 100%; }
+    #ms-viewer[hidden], #ms-pane[hidden] { display: none; }
+    /* Parent-document render target. Used where an iframe cannot work: a sandboxed
+       srcdoc has an opaque origin, so its subresource requests carry no cookie —
+       which is exactly how images/media authenticate against filebrowser now. The
+       srcdoc path stays for self-contained views (code/json/csv/ipynb/notices). */
+    #ms-pane { flex: 1 1 auto; min-width: 0; overflow: auto; background: var(--bg); }
+    /* the tokens sheet reserves 260px on the left for a ToC sidebar; this pane has
+       no ToC (the tree is the navigation), so take the space back */
+    /* the sheet already centres prose; nothing to take back here */
+    #ms-editor {
+      display: block; width: 100%; height: 100%; box-sizing: border-box;
+      margin: 0; border: none; outline: none; resize: none;
+      padding: var(--sp-6) var(--sp-8);
+      background: var(--bg); color: var(--text);
+      font-family: var(--font-mono); font-size: var(--fs-md); line-height: var(--lh-relaxed);
+      letter-spacing: 0; tab-size: 2; white-space: pre; overflow-wrap: normal;
+    }
+    #ms-pane .media-wrap { height: 100%; display: flex; align-items: center; justify-content: center; padding: var(--sp-4); box-sizing: border-box; }
+    #ms-pane .media-wrap img, #ms-pane .media-wrap video { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: var(--r-md); box-shadow: var(--shadow-hover); background: var(--bg-hover); }
+    #ms-pane .media-wrap.audio { flex-direction: column; gap: var(--sp-4); }
+    #ms-pane .media-wrap audio { width: min(560px, 80vw); }
+    #ms-pane .media-wrap .fname { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-muted); }
+
+    /* ===== tree node =====
+       A Finder list: a disclosure triangle where there is something to open,
+       and the filename. There is no per-file icon and there is no per-file
+       colour, so a name cannot be sorted into a category by looking at it —
+       which is the same promise install/test-fileview-tree.mjs pins, made in
+       CSS. `.env` is a filename like any other. */
+    .ms-node { user-select: none; }
+    .ms-row {
+      display: flex; align-items: center; gap: var(--sp-1);
+      padding: 4px 8px 4px 4px;
+      min-height: 26px; box-sizing: border-box;
+      border-radius: var(--r-sm);
+      cursor: default;
+      color: var(--text);
+      white-space: nowrap;
+    }
+    .ms-row:hover { background: var(--bg-hover); }
+    .ms-row:focus-visible { outline: none; box-shadow: var(--focus); }
+    .ms-row.active { background: var(--select-bg); color: var(--select-text); }
+    /* The triangle is drawn, not typed: a glyph would be a font's opinion and
+       would not rotate. */
+    .ms-chev {
+      flex: 0 0 auto;
+      width: 16px; height: 16px;
+      position: relative;
+      transition: transform var(--dur-fast) var(--ease);
+    }
+    .ms-chev::before {
+      content: "";
+      position: absolute; top: 50%; left: 50%;
+      width: 5px; height: 5px;
+      margin: -3px 0 0 -3px;
+      border-right: 1.5px solid var(--text-muted);
+      border-bottom: 1.5px solid var(--text-muted);
+      border-radius: 1px;
+      transform: rotate(-45deg);
+    }
+    .ms-row.active .ms-chev::before { border-color: var(--select-text); }
+    .ms-chev.expanded { transform: rotate(90deg); }
+    .ms-chev.leaf::before { content: none; }
+    .ms-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+    /* One indent guide per level, at the hairline weight the rest of the app
+       divides content with. */
+    .ms-children {
+      margin-left: 12px;
+      border-left: 1px solid var(--border-muted);
+      padding-left: var(--sp-1);
+    }
+    .ms-loading { color: var(--text-muted); padding: 4px 12px; }
+    .ms-error { color: var(--color-danger); padding: 4px 12px; font-size: var(--fs-sm); }
+
+    @media (max-width: 800px) {
+      main { flex-direction: column; }
+      #ms-treepane { flex: 0 0 35vh; border-right: none; border-bottom: 1px solid var(--border); }
+      /* stacked layout = an easy-to-grab horizontal grip; drag vertically to resize */
+      #ms-resize {
+        flex: 0 0 24px; cursor: row-resize;
+        background: var(--chrome); border-bottom: 1px solid var(--border-muted);
+        display: flex; align-items: center; justify-content: center;
+      }
+      #ms-resize::after {
+        content: ""; width: 40px; height: 4px; border-radius: 2px;
+        background: var(--text-muted); opacity: 0.55;
+      }
+      #ms-resize.dragging { background: var(--accent); }
+      #ms-resize.dragging::after { background: var(--accent-contrast); opacity: 1; }
+      /* 28px is a pointer target. A finger needs about 44, so everything that can
+         be tapped grows with the layout — including the tree rows, which are the
+         most-tapped control in the app, and the splitter, which was a 14px strip. */
+      #ms-bar { gap: var(--sp-2); padding: var(--sp-2); padding-left: 52px; }
+      #ms-bar button, #ms-bar a.btn { min-width: 44px; height: 44px; }
+      #ms-searchbar button { width: 42px; height: 42px; }
+      #ms-searchbar input { padding: 10px 10px; }
+      .ms-row { min-height: 44px; }
+      /* collapsing with the toggle fully hides the tree so the body goes full-screen */
+      #ms-treepane.collapsed { flex: 0 0 0px !important; padding: 0; border-bottom: none; }
+      #ms-treepane.collapsed + #ms-resize { display: none; }
+    }
+
+    /* Thin scrollbars that recede — the Mac default, asked for explicitly
+       because a web view otherwise gets the platform's widest one. */
+    #ms-tree, #ms-pane, #ms-editor { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+    @media (prefers-reduced-motion: reduce) {
+      #ms-bar button, #ms-bar a.btn, #ms-treepane, #ms-resize, #ms-toast, .ms-chev,
+      #ms-searchbar button { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Control icons. One sprite, drawn once, referenced by <use> — a 16px grid,
+       1.5px strokes, currentColor, no fills. Nothing here identifies a FILE:
+       the tree has no icons at all, and adding one would be the emoji set back
+       in monochrome. These are verbs, and each one is also spelled out in the
+       button's aria-label because a shape is not a name. -->
+  <svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+    <symbol id="i-sidebar" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M6.25 2.75v10.5"/>
+    </symbol>
+    <symbol id="i-refresh" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M13.25 8a5.25 5.25 0 1 1-1.6-3.78"/><path d="M13.4 2.6v3h-3"/>
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="5.75" y="5.75" width="8.5" height="8.5" rx="2"/>
+      <path d="M10.25 3.75v-.5a2 2 0 0 0-2-2h-5a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h.5"/>
+    </symbol>
+    <symbol id="i-download" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M8 1.75v8"/><path d="M4.75 6.75 8 10l3.25-3.25"/><path d="M2.25 11.5v.75a2 2 0 0 0 2 2h7.5a2 2 0 0 0 2-2v-.75"/>
+    </symbol>
+    <symbol id="i-raw" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5.75 4.5 2.5 8l3.25 3.5"/><path d="M10.25 4.5 13.5 8l-3.25 3.5"/>
+    </symbol>
+    <symbol id="i-structured" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M2.25 4h11.5"/><path d="M2.25 8h11.5"/><path d="M2.25 12h7"/>
+    </symbol>
+    <symbol id="i-edit" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M11.4 2.35a1.9 1.9 0 0 1 2.7 2.7l-7.3 7.3-3.4.7.7-3.4z"/>
+    </symbol>
+    <symbol id="i-view" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M.9 8S3.6 3.5 8 3.5 15.1 8 15.1 8 12.4 12.5 8 12.5.9 8 .9 8Z"/><circle cx="8" cy="8" r="2"/>
+    </symbol>
+    <symbol id="i-save" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M2.75 8.5 6.25 12l7-8"/>
+    </symbol>
+    <symbol id="i-theme-auto" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="8" cy="8" r="5.25"/><path d="M8 2.75a5.25 5.25 0 0 1 0 10.5z" fill="currentColor" stroke="none"/>
+    </symbol>
+    <symbol id="i-theme-light" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="8" cy="8" r="3"/>
+      <path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.05 3.05l1.06 1.06M11.89 11.89l1.06 1.06M12.95 3.05l-1.06 1.06M4.11 11.89l-1.06 1.06"/>
+    </symbol>
+    <symbol id="i-theme-dark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8 5.6 5.6 0 1 0 13.2 9.6Z"/>
+    </symbol>
+    <symbol id="i-newfile" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9 1.75H4.25a1.5 1.5 0 0 0-1.5 1.5v9.5a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5V6z"/>
+      <path d="M9 1.75V6h4.25"/><path d="M8 8.5v4M6 10.5h4"/>
+    </symbol>
+    <symbol id="i-newfolder" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M1.75 12.25v-8a1.5 1.5 0 0 1 1.5-1.5h2.6l1.4 1.75h5.5a1.5 1.5 0 0 1 1.5 1.5v6.25a1.5 1.5 0 0 1-1.5 1.5h-9.5a1.5 1.5 0 0 1-1.5-1.5Z"/>
+      <path d="M8 7.5v4M6 9.5h4"/>
+    </symbol>
+  </svg>
+
+  <div id="ms-bar">
+    <button id="ms-tree-toggle" aria-label="Toggle sidebar" title="Toggle sidebar" aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#i-sidebar"/></svg></button>
+    <button id="ms-refresh" aria-label="Re-read the tree from disk" title="Refresh"><svg class="ic" aria-hidden="true"><use href="#i-refresh"/></svg></button>
+    <span class="ms-sep" aria-hidden="true"></span>
+    <span class="ms-brand">File Viewer</span>
+    <span class="ms-path" id="ms-path" title="Click path to copy" aria-label="Current file path (click to copy)">—</span>
+    <span class="ms-mtime" id="ms-mtime" title="Last modified" aria-label="Document last modified"></span>
+    <button id="ms-copy" disabled aria-label="Copy file contents to clipboard" title="Copy contents"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg></button>
+    <button id="ms-download" disabled aria-label="Download current file" title="Download"><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg></button>
+    <button id="ms-rawtoggle" hidden aria-label="Show the raw text instead" title="Raw text"><svg class="ic" aria-hidden="true"><use id="ms-rawtoggle-ic" href="#i-raw"/></svg></button>
+    <button id="ms-edit" disabled aria-label="Edit this file" title="Edit" aria-pressed="false"><svg class="ic" aria-hidden="true"><use id="ms-edit-ic" href="#i-edit"/></svg></button>
+    <button id="ms-save" class="labelled" hidden aria-label="Save changes (Ctrl+S)" title="Save (Ctrl+S)"><svg class="ic" aria-hidden="true"><use href="#i-save"/></svg>Save</button>
+    <span class="ms-sep" aria-hidden="true"></span>
+    <button data-theme-btn="system" aria-label="Follow the system theme" title="System" aria-pressed="true"><svg class="ic" aria-hidden="true"><use href="#i-theme-auto"/></svg></button>
+    <button data-theme-btn="light"  aria-label="Light theme" title="Light" aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#i-theme-light"/></svg></button>
+    <button data-theme-btn="dark"   aria-label="Dark theme"  title="Dark"  aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#i-theme-dark"/></svg></button>
+  </div>
+  <main>
+    <div id="ms-treepane">
+      <div id="ms-searchbar">
+        <input id="ms-search" type="search" placeholder="Search…" autocomplete="off"
+               aria-label="Search file names under the scope shown below">
+        <button id="ms-newfile" title="New file here" aria-label="New file here"><svg class="ic" aria-hidden="true"><use href="#i-newfile"/></svg></button>
+        <button id="ms-newdir" title="New folder here" aria-label="New folder here"><svg class="ic" aria-hidden="true"><use href="#i-newfolder"/></svg></button>
+      </div>
+      <div id="ms-scope" title="Search looks under this directory only"></div>
+      <!-- No tabindex here on purpose: the tab stop lives on one ROW (roving
+           tabindex, app.js). Putting it on the container as well made Shift+Tab
+           out of a row land here and get sent straight back in — a one-way
+           keyboard trap. -->
+      <div id="ms-tree" role="tree" aria-label="Files">
+        <div class="ms-loading">Loading tree…</div>
+      </div>
+    </div>
+    <!-- aria-valuenow is required on a focusable separator and is kept current by
+         app.js; aria-orientation flips with the layout, because at the stacked
+         breakpoint the keys that move it are Up/Down rather than Left/Right. -->
+    <div id="ms-resize" role="separator" tabindex="0" aria-orientation="vertical"
+         aria-valuemin="200" aria-valuemax="800" aria-valuenow="320"
+         aria-label="Resize the file tree (arrow keys)"></div>
+    <iframe id="ms-viewer" title="viewer" src="about:blank"></iframe>
+    <div id="ms-pane" hidden></div>
+  </main>
+  <div id="ms-toast" role="status" aria-live="polite">Copied!</div>
+  <div id="ms-menu" role="menu" hidden></div>
+
+  <script src="/__fv/app.js" defer></script>
+  <!-- Shared "return to Airlock" widget (corner mode). Served at /airlock-return.js
+       by the hub gate; it also polls the unread-message badge. Hidden inside iframes. -->
+  <script src="/airlock-return.js" data-mode="corner" defer></script>
+</body>
+</html>

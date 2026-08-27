@@ -14,9 +14,10 @@
 #                   MEMMAX MEMHIGH TASKSMAX NNP_BLOCK
 # HOME is a local (shadows $HOME for this function only — pops on return) so
 # the heredoc body below can reference ${HOME} exactly as the source does.
-# PY/PID_GUARD: interpreter + apps/paseo/paseo-clear-stale-pid.py path, spliced
-# into an ExecStartPre that reaps a stale $HOME/.paseo/paseo.pid before start
-# (see that script's header for why: upstream never reaps it itself).
+# PY/PID_GUARD are retained as reserved positional arguments so callers do not
+# change ABI. Stale-pid cleanup now runs once in install.sh, only after resource
+# ownership has been measured and handed over. It must never run in ExecStartPre:
+# a failed candidate may otherwise unlink a live legacy daemon's shared pidfile.
 # MEMMAX/MEMHIGH/TASKSMAX: resource backstop, picked from the box's RAM tier by
 # the caller (install.sh). Passed in rather than computed here so the rendered text
 # stays a pure function of its arguments — the golden-render tests depend on it.
@@ -30,8 +31,9 @@
 # shape that deleted three words from this unit on 2026-08-07.
 render_paseo_unit() {
   local UNIT_PATH="$1" HOME="$2" FQDN="$3" HTTPS_PORT="$4" PASEO_BIN="$5" BACKEND_PORT="$6" \
-        PY="$7" PID_GUARD="$8" MEMMAX="$9" MEMHIGH="${10}" TASKSMAX="${11}" \
+        MEMMAX="$9" MEMHIGH="${10}" TASKSMAX="${11}" \
         NNP_BLOCK="${12:-NoNewPrivileges=yes}"
+  : "$7" "$8" # reserved PY/PID_GUARD ABI slots; cleanup belongs to install.sh
   cat <<UNITEOF
 [Unit]
 Description=airlock-paseo — Paseo daemon (coding-agent orchestration + web UI) behind the owner gate
@@ -47,6 +49,10 @@ Documentation=https://github.com/getpaseo/paseo
 # network.target matches every other app unit in this repo (dev-monitor,
 # devterm, feedback, publish, code-server) and carries no such back-edge.
 After=network.target
+# Bound even intentional clean-exit restarts. A collision or configuration
+# failure exits non-zero and is not retried at all (Restart=on-success below).
+StartLimitIntervalSec=30
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -66,34 +72,28 @@ Environment=PASEO_HOSTNAMES=${FQDN},${FQDN}:${HTTPS_PORT},localhost
 # Headless: no dictation/voice (avoids an unexpected ~600MB speech model download).
 Environment=PASEO_DICTATION_ENABLED=false
 Environment=PASEO_VOICE_MODE_ENABLED=false
-# Reap a stale singleton pidfile before every start (including on-boot and every
-# Restart=always retry): upstream (@getpaseo/cli) writes \$PASEO_HOME/paseo.pid to
-# enforce "only one daemon" but never reaps it itself, so a record surviving a
-# reboot (stale pid, sometimes already reused by an unrelated process) makes the
-# daemon refuse to start FOREVER with "Another Paseo daemon is already running" —
-# measured on a real box, RestartSec=3 looping it (counter into double digits).
-# Leading '-': a guard-script problem must never block the real ExecStart; the
-# script itself only ever deletes the file when it can prove staleness (dead pid,
-# or a live pid whose uid/hostname/start-time contradict the record) and always
-# exits 0 either way. See apps/paseo/paseo-clear-stale-pid.py.
-ExecStartPre=-${PY} ${PID_GUARD} ${HOME}/.paseo/paseo.pid
+# No ExecStartPre pidfile cleanup here. PASEO_HOME and paseo.pid can be shared
+# with a legacy service; candidate-side cleanup would mutate that live service's
+# singleton state on every failed start. The installer performs one authorized
+# cleanup only after it has measured and stopped the actual resource owner.
 # --foreground: Type=simple. --no-relay: no upstream relay outbound. --web-ui: the
 # browser UI. --listen 127.0.0.1: loopback bind (the gate is the only ingress).
 ExecStart=${PASEO_BIN} daemon start --foreground --no-relay --web-ui --listen 127.0.0.1:${BACKEND_PORT}
-# always, not on-failure: the web UI's "restart daemon" is a websocket shutdown RPC
-# that exits the worker cleanly (status 0) and expects a supervisor to bring it back.
-# Under on-failure systemd reads that as an intended stop and leaves it dead — so the
-# button permanently kills the daemon (the gate stays up, so it just looks hung).
-# An explicit 'systemctl --user stop' still stops it: always only covers self-exit.
+# The web UI's "restart daemon" is a websocket shutdown RPC that exits cleanly
+# (status 0), so on-success preserves that behavior. A duplicate singleton or
+# broken configuration exits non-zero and must remain failed for diagnosis; an
+# unconditional restart loop previously reached 53 attempts on a real box.
+# An explicit 'systemctl --user stop' still suppresses restart as usual.
 # (Single quotes, not backticks: this heredoc is unquoted, so backticks here would
 # be command substitution — the comment would RUN at install time and vanish.)
-Restart=always
+Restart=on-success
 RestartSec=3
 # Backstop, not a reservation (idle ~440M) — a ceiling this unit must never cross,
-# not memory set aside for it. Picked by the installer from a RAM tier table
-# (standard 5.5G/5G; >=16 GiB -> 14G/12G), so a runaway multi-session tree cannot take
-# the machine down with it. No box is refused over this: on a box smaller than the
-# tier the ceiling is inert and the installer says so.
+# not memory set aside for it. The installer sizes it as a SHARE of whatever the box
+# was given: MemoryMax = 11/16 of RAM, MemoryHigh = 10/16 (owner, 2026-08-22). So an
+# 8GB machine gets 5632M/5120M and a 72 GiB dev box gets 50688M/46080M, instead of
+# both getting the same number off a fixed table. A runaway multi-session tree cannot
+# take the machine down with it, and no box is ever refused over this.
 #
 # MemoryHigh, a little under max, is the part that matters in practice. MemoryMax alone
 # is a cliff: the cgroup runs flat out to the ceiling and then the allocation is
@@ -134,6 +134,32 @@ WantedBy=default.target
 UNITEOF
 }
 
+# render_paseo_uistate_unit UISTATE_PORT
+# The loopback home for the web-UI state paseo otherwise keeps per browser (today:
+# the sidebar's project/workspace order). Same shape as every other airlock
+# loopback backend — no secrets, no EnvironmentFile, no network beyond 127.0.0.1.
+render_paseo_uistate_unit() {
+  local UISTATE_PORT="$1"
+  local BACKEND_PY="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/backend/airlock-paseo-uistate.py"
+  cat <<UNIT
+[Unit]
+Description=airlock paseo ui-state — cross-device web-UI state (127.0.0.1:${UISTATE_PORT})
+After=network.target
+
+[Service]
+Type=simple
+Environment=AIRLOCK_PASEO_UISTATE_PORT=${UISTATE_PORT}
+ExecStart=$(command -v python3) ${BACKEND_PY}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
 # render_paseo_nginx_base GATE_PORT BACKEND_PORT FQDN HTTPS_PORT WIDGET WIDGET_MENU_ATTRS
 # Body still carries the @@ICON_LOC@@ / @@BROWSE_LOC@@ markers — spliced by
 # render_paseo_nginx below, exactly as install.sh's sed -i does on the file.
@@ -141,9 +167,11 @@ UNITEOF
 # statements in install.sh, outside this heredoc — render_paseo_nginx (the
 # composition function) emits them, matching the original structure exactly.
 render_paseo_nginx_base() {
-  local GATE_PORT="$1" BACKEND_PORT="$2" FQDN="$3" HTTPS_PORT="$4" WIDGET="$5" WIDGET_MENU_ATTRS="$6"
+  local GATE_PORT="$1" BACKEND_PORT="$2" FQDN="$3" HTTPS_PORT="$4" WIDGET="$5" WIDGET_MENU_ATTRS="$6" \
+        UISTATE_PORT="$7"
   sed -e "s/@@LISTEN@@/${GATE_PORT}/g" \
       -e "s|@@UPSTREAM@@|127.0.0.1:${BACKEND_PORT}|g" \
+      -e "s|@@UISTATE@@|127.0.0.1:${UISTATE_PORT}|g" \
       -e "s|@@HOSTPORT@@|${FQDN}:${HTTPS_PORT}|g" \
       -e "s|@@WIDGET@@|${WIDGET}|g" \
       -e "s|@@WIDGET_MENU@@|${WIDGET_MENU_ATTRS}|g" <<'NGINX'
@@ -151,9 +179,30 @@ server {
     listen 127.0.0.1:@@LISTEN@@;
     server_name _;
 
+    # Uploads pass through this gate: pasted screenshots, attached files, anything
+    # the agent UI POSTs. Nobody set a size here, so nginx's built-in 1m applied and
+    # a normal screenshot (1-4 MB) came back 413. Unset is not a decision — the
+    # neighbours behind this same owner gate all made one, and orca and the browse
+    # box both chose 0. Match them: the gate already refuses everyone who is not the
+    # owner, so a body cap adds nothing here that $owner_ok does not already do.
+    client_max_body_size 0;
+
     # paseo serves an upstream web UI we cannot edit, so the gate serves + injects
     # the shared "return to Airlock" widget (floating, bottom-right).
     location = /airlock-return.js { alias @@WIDGET@@; default_type application/javascript; add_header Cache-Control "no-cache" always; access_log off; }
+
+    # Cross-device web-UI state. Paseo keeps the sidebar's project/workspace order
+    # in the browser, so a drag on one device is invisible on the next; the patched
+    # bundle reads and writes it here instead. Guarded per location like every other
+    # route in this server — this gate has no server-level `if`, and without the
+    # guard the owner's state would be writable by anyone the tailnet lets through.
+    # The trailing slash on proxy_pass strips the prefix: the backend sees /<key>.
+    location /airlock-ui-state/ {
+        if ($owner_ok = 0) { return 403; }
+        proxy_pass http://@@UISTATE@@/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
 @@ICON_LOC@@
 @@BROWSE_LOC@@
     location / {
@@ -236,7 +285,7 @@ ILOC2
 }
 
 # render_paseo_nginx GATE_PORT BACKEND_PORT FQDN HTTPS_PORT WIDGET WIDGET_MENU_ATTRS \
-#                    BROWSE BROWSE_WS_PORT ICON_LOC_BODY(may be empty)
+#                    BROWSE BROWSE_WS_PORT ICON_LOC_BODY(may be empty) UISTATE_PORT
 #
 # ICON_LOC_BODY is the caller-supplied already-rendered @@ICON_LOC@@ splice
 # text (favicon [+ variants], or empty when icon_ring is off) — install.sh
@@ -245,7 +294,8 @@ ILOC2
 # render_paseo_icon_variants above are the pieces a caller composes it from.
 render_paseo_nginx() {
   local GATE_PORT="$1" BACKEND_PORT="$2" FQDN="$3" HTTPS_PORT="$4" WIDGET="$5" \
-        WIDGET_MENU_ATTRS="$6" BROWSE="$7" BROWSE_WS_PORT="$8" ICON_LOC_BODY="${9:-}"
+        WIDGET_MENU_ATTRS="$6" BROWSE="$7" BROWSE_WS_PORT="$8" ICON_LOC_BODY="${9:-}" \
+        UISTATE_PORT="${10:-}"
   local frag; frag="$(mktemp)"
   {
     echo "# paseo owner gate — generated by apps/paseo/install.sh"
@@ -253,7 +303,7 @@ render_paseo_nginx() {
     echo "# the paseo daemon requires behind TLS: X-Forwarded-Proto https and a Host"
     echo "# WITH the https port. See install.sh header + apps/paseo/README.md."
     render_paseo_nginx_base "$GATE_PORT" "$BACKEND_PORT" "$FQDN" "$HTTPS_PORT" \
-      "$WIDGET" "$WIDGET_MENU_ATTRS"
+      "$WIDGET" "$WIDGET_MENU_ATTRS" "$UISTATE_PORT"
   } > "$frag"
 
   if [ "$BROWSE" = true ]; then

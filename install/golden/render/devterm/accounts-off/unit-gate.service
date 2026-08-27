@@ -15,12 +15,13 @@ Environment=DEVTERM_WEB=/home/example/.local/share/airlock-devterm/web
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
 Environment=AIRLOCK_OWNER=owner@example.com
 Environment=AIRLOCK_CODE_ROOT=
-Environment=DEVTERM_MARKWAND=false
+Environment=DEVTERM_FILEVIEW=false
 Environment=DEVTERM_ACCOUNTS=false
 Environment=DEVTERM_XAI=false
 Environment=DEVTERM_REMOTE_HOSTS=
-Environment=DEVTERM_SECRET_TTL=1800
 Environment=DEVTERM_ORCA_SHIM=
+Environment=DEVTERM_ACCOUNTS_BIN=ROOT/bin/airlock-accounts
+Environment=DEVTERM_SECRET_BIN=ROOT/bin/airlock-secret
 ExecStart=/usr/bin/python3 ROOT/apps/devterm/backend/devterm-gate.py
 # KillMode=process, same reason as the ttyd unit: the gate starts a detached
 # `codex login --device-auth` that must outlive a redeploy. setsid does not leave the

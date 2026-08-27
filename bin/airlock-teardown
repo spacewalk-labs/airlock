@@ -16,6 +16,10 @@
 # docs/design/app-package-contract.md's D6 amendment.
 #
 # Honours AIRLOCK_DRY_RUN=1 (prints the plan, changes nothing).
+#
+# `--platform-secret-timer` is deliberately separate from app teardown. Removing the
+# platform sweep when one consumer is removed would violate the store TTL for every other
+# consumer; this explicit mode is the symmetric exit for the platform-owned unit itself.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -23,12 +27,21 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
 
+if [ "${1:-}" = --platform-secret-timer ]; then
+  [ "$#" -eq 1 ] \
+    || die "usage: airlock-teardown [--adopt] <app-id> | --platform-secret-timer"
+  AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-secret-timer.sh" uninstall
+  log "teardown complete: platform secret timer"
+  exit 0
+fi
+
 adopt=0
 if [ "${1:-}" = --adopt ]; then
   adopt=1
   shift
 fi
-[ $# -eq 1 ] || die "usage: airlock-teardown [--adopt] <app-id>"
+[ $# -eq 1 ] \
+  || die "usage: airlock-teardown [--adopt] <app-id> | --platform-secret-timer"
 app="$1"
 
 require_cmd python3

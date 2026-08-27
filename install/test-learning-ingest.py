@@ -978,14 +978,27 @@ def main(argv):
         fake_home = os.path.join(tmp, "fake-home")
         fake_bin = os.path.join(tmp, "fake-bin")
         os.makedirs(fake_bin, exist_ok=True)
-        os.makedirs(os.path.join(fake_home, ".codex"), exist_ok=True)
-        with open(os.path.join(fake_home, ".codex", "auth.json"), "w") as handle:
-            handle.write("{}")
+        os.makedirs(fake_home, exist_ok=True)
         for name in ("claude", "codex"):
             with open(os.path.join(fake_bin, name), "w", encoding="utf-8") as handle:
                 handle.write("#!/bin/sh\nexit 0\n")
             os.chmod(os.path.join(fake_bin, name), 0o755)
-        base_env = {"PATH": fake_bin, "HOME": fake_home}
+        # The app no longer knows any credential path. This fake implements only the
+        # platform's boolean selection contract, so the test goes red if providers.py
+        # regresses to probing HOME or starts depending on human status fields.
+        fake_status = os.path.join(fake_bin, "airlock-accounts-status")
+        with open(fake_status, "w", encoding="utf-8") as handle:
+            handle.write(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "if sys.argv[1:] != ['login-state', '--json']: raise SystemExit(2)\n"
+                "print(json.dumps({'schema_version': 1, 'providers': {"
+                "'claude': os.environ.get('FAKE_CLAUDE') == '1', "
+                "'codex': os.environ.get('FAKE_CODEX') == '1'}}))\n")
+        os.chmod(fake_status, 0o755)
+        base_env = {"PATH": fake_bin, "HOME": fake_home,
+                    "AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN": fake_status,
+                    "FAKE_CLAUDE": "0", "FAKE_CODEX": "1"}
 
         empty = PROV.select("auto", {"PATH": os.path.join(tmp, "nothing"), "HOME": fake_home})
         check("CLI 가 하나도 없으면 고르지 못하고 사유를 낸다",
@@ -996,16 +1009,14 @@ def main(argv):
         picked = PROV.select("auto", base_env)
         check("로그인 흔적이 있는 제공자를 먼저 고른다", picked[0].id == "codex",
               f"{picked[0].id}: {picked[2]}")
-        os.makedirs(os.path.join(fake_home, ".claude"), exist_ok=True)
-        with open(os.path.join(fake_home, ".claude", ".credentials.json"), "w") as handle:
-            handle.write("{}")
+        base_env["FAKE_CLAUDE"] = "1"
         picked = PROV.select("auto", base_env)
         check("둘 다 흔적이 있으면 선언 순서대로 고른다", picked[0].id == "claude",
               f"{picked[0].id}: {picked[2]}")
 
         # 흔적이 없어도 막지는 않는다 — 실행해 보지 않고 로그인을 확신할 방법은 없다.
-        os.unlink(os.path.join(fake_home, ".claude", ".credentials.json"))
-        shutil.rmtree(os.path.join(fake_home, ".codex"))
+        base_env["FAKE_CLAUDE"] = "0"
+        base_env["FAKE_CODEX"] = "0"
         picked = PROV.select("auto", base_env)
         check("흔적이 없어도 설치된 CLI 로 실행은 한다",
               picked[0] is not None and "로그인 흔적을 찾지 못" in picked[2], str(picked[2]))
@@ -1092,14 +1103,18 @@ def main(argv):
         render_out = subprocess.run(
             ["bash", "-c",
              f'. "{root}/apps/learning/render.sh"; '
-             'render_learning_unit_server /lib /share /state 18832 auto /backend "/probe/bin"; '
+             'render_learning_unit_server /lib /share /state 18832 auto /backend "/probe/bin" /platform/status; '
              'echo "@@SPLIT@@"; '
-             'render_learning_unit_ingest /lib /state auto "/probe/bin" /backend "A_KEY B_KEY"'],
+             'render_learning_unit_ingest /lib /state auto "/probe/bin" /backend "A_KEY B_KEY" /platform/status'],
             capture_output=True, text=True, timeout=60).stdout
         server_unit, ingest_unit = render_out.split("@@SPLIT@@")
         check("서버 유닛이 PATH 를 받는다", "Environment=PATH=/probe/bin" in server_unit,
               repr(server_unit[:200]))
         check("워커 유닛도 같은 PATH 를 받는다", "Environment=PATH=/probe/bin" in ingest_unit)
+        check("서버 유닛이 플랫폼 로그인 probe 를 D5 이름으로 받는다",
+              "AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN=/platform/status" in server_unit)
+        check("워커 유닛도 같은 플랫폼 로그인 probe 를 받는다",
+              "AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN=/platform/status" in ingest_unit)
         # 🔴 유닛이 지우는 목록과 어댑터가 지우는 목록은 **한 벌이어야 한다.** 두 벌로
         #    두었더니 실제로 어긋났다(한쪽에 OPENAI_BASE_URL 이 없었다).
         check("워커 유닛의 UnsetEnvironment 를 어댑터가 준다",
@@ -1120,7 +1135,8 @@ def main(argv):
         #    워커 시험이 가짜 CLI 를 그 이름으로 걸어 뒀으므로 함께 걷어야 이 시험이 성립한다.
         saved_env = {name: os.environ.pop(name, None)
                      for name in ("AIRLOCK_LEARNING_AGENT", "AIRLOCK_LEARNING_CLAUDE_BIN",
-                                  "AIRLOCK_LEARNING_CODEX_BIN")}
+                                  "AIRLOCK_LEARNING_CODEX_BIN",
+                                  "AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN")}
         previous_path = os.environ["PATH"]
         os.environ["AIRLOCK_LEARNING_AGENT"] = "claude"
         os.environ["PATH"] = os.path.join(tmp, "nothing")

@@ -8,8 +8,12 @@
 //   node bin/patch-web-ui.js --browse <web-ui-dir> <companion-js-path>
 //   node bin/patch-web-ui.js <web-ui-dir> <companion-js-path>  # legacy --browse
 //
-// The always-on subagent-stream group makes a visible provider-subagent panel
-// subscribe to its parent agent's timeline. The optional browse group applies
+// The always-on general group (CLI flag `--subagent-stream`, kept for callers that
+// predate it carrying a second edit) does two things: it makes a visible
+// provider-subagent panel subscribe to its parent agent's timeline, it moves the
+// fresh-install font-size defaults to 18 (ui) / 14 (code), and it points the sidebar
+// order store at the airlock ui-state backend so the order follows the owner across
+// devices instead of living in one browser. The optional browse group applies
 // THREE minimal, verified-unique edits so the self-hosted web runtime can open
 // live browser panels:
 //   1+2. un-gate the "New browser" button callbacks (vo/Wo) on web;
@@ -29,19 +33,35 @@ const childProcess = require("node:child_process");
 
 // SHA-256 of the ORIGINAL (unpatched) bundle we derived anchors against.
 const PINNED_SHA = "435dff4ee752a352ee81ff1eae02338163455b2f7e9b605f1ef30967007ce28c";
-const GENERAL_ONLY_SHA = "6cc40f4d39f1bd9a65234c360b134ee6342afd2ac877586e3f61ee35d81a6eff";
+const GENERAL_ONLY_SHA = "670b7048aaac21d29a04e4a7e44fcee049c65d81b98ded03fad71b79e8afadba";
 // SHA-256 of the fully patched browse group (all FOUR anchors). Until 2026-08-21
 // the fourth (coarse-pointer) edit shipped only from the reference box's own tree,
 // so this hash was the one labelled "legacy" here — the bytes did not change, the
 // owner of the fourth anchor did.
 const BROWSE_ONLY_SHA = "769e57f5fbdc31a9a8bbcf32ee8de6602c61f1705102f7e7ff5d9ebbd733117a";
-const COMBINED_SHA = "c74929516273d623698ab4646a5ffa826af35edfc714e0997e1ef4581eb5dfe2";
+const COMBINED_SHA = "f89ae3ae99905c0c1e1c8e6090e0e44dcd10fd8043c80338aa1792704fcb0e67";
 // The transitional shape: a box installed by an earlier revision of THIS patcher
 // carries the first three browse edits and not the fourth. It is a state we must
 // recognise (not refuse) so such a box gains the fourth anchor on the next install
 // instead of failing the SHA pin. Retire these two once no box reports them.
 const THREE_ANCHOR_BROWSE_ONLY_SHA = "8a31b87021fc2e0b70b8b2009fd7bf19bd9da89f4ae0c86af2353ae5e1bcb6b9";
-const THREE_ANCHOR_COMBINED_SHA = "fa7c2470a1040b886125c5a58ed53b87e0c222b3b6a73f3a81588d502f75540f";
+const THREE_ANCHOR_COMBINED_SHA = "9f5c599500b78a69b8771ff3df7cb05dc58982354d4b22df24d9072182cf65bb";
+// The general group grew a second anchor (appearance-default-font-sizes) the same
+// way the browse group grew its fourth: a box installed by an earlier revision of
+// this patcher carries only `provider-subagent-visible-parent`, which now reads as
+// "partial". These three name the bytes of that shape so such a box is recognised
+// and completed on the next install instead of refused. Retire them once no box
+// reports them.
+const ONE_ANCHOR_GENERAL_ONLY_SHA = "6cc40f4d39f1bd9a65234c360b134ee6342afd2ac877586e3f61ee35d81a6eff";
+const ONE_ANCHOR_GENERAL_COMBINED_SHA = "c74929516273d623698ab4646a5ffa826af35edfc714e0997e1ef4581eb5dfe2";
+const ONE_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA = "fa7c2470a1040b886125c5a58ed53b87e0c222b3b6a73f3a81588d502f75540f";
+// ...and the same again for the group's SECOND revision (subagent-stream +
+// font-size defaults, no shared sidebar storage): every box installed between
+// #254 and #255 carries this shape. Both revisions read as "partial", which is
+// why each browse shape accepts a PAIR of hashes rather than one.
+const TWO_ANCHOR_GENERAL_ONLY_SHA = "c0e1972ed7be9fff2df9d4c1fb9c90ba4dc39fd412a522d98ae3776fb0741de6";
+const TWO_ANCHOR_GENERAL_COMBINED_SHA = "67646ec71d1e64db703b1b0d5277dc1898501b73ab67b048884c6b578e704549";
+const TWO_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA = "7702c7e018ebadbaef91d40440c3e898ac419bb417b2bf9494924c6be6ee0164";
 const PINNED_VERSION = "@getpaseo/cli@0.2.5 (index-55db56b9)";
 
 // Each anchor MUST occur exactly once in the pinned bundle (verified).
@@ -82,6 +102,32 @@ const SUBAGENT_STREAM_PATCHES = [
     name: "provider-subagent-visible-parent",
     find: 'return"agent"===l?.kind?[l.agentId]:[]',
     repl: 'return"agent"===l?.kind?[l.agentId]:"provider_subagent"===l?.kind?[l.parentAgentId]:[]',
+  },
+  {
+    // Fresh-install appearance defaults: DEFAULT_UI_FONT_SIZE 16 -> 18 and
+    // DEFAULT_CODE_FONT_SIZE 12 -> 14, inside the clamps the settings UI already
+    // enforces (ui 11..24, code 9..22 — left untouched here). Both are per-device
+    // settings persisted under `@paseo:app-settings`, so this moves what a device
+    // gets when it has NEVER saved settings; a device that already stored a value
+    // keeps it and must change it in Settings -> Appearance.
+    name: "appearance-default-font-sizes",
+    find: "b=1e4,S=0,h=1e6,_=16,O=11,T=24,F=12,I=9,E=22,N=200",
+    repl: "b=1e4,S=0,h=1e6,_=18,O=11,T=24,F=14,I=9,E=22,N=200",
+  },
+  {
+    // Cross-device sidebar order. Upstream persists the project/workspace order in
+    // this ONE store, through AsyncStorage — localStorage on web — so the order is a
+    // property of the browser, not of the box, and a drag on the Mac is invisible on
+    // the iPad. The daemon has no route that would hold it either. This swaps that
+    // store's storage (and only that store's) for the airlock ui-state backend behind
+    // the same owner gate, keeping the local one as the write-through cache:
+    //   read  — server first; 404 or unreachable falls back to what this device kept,
+    //   write — local first (so an offline reorder still sticks), then the server.
+    // The fallback is what keeps a non-airlock or service-down box working exactly as
+    // upstream does, instead of losing the order to a failed fetch.
+    name: "sidebar-order-shared-storage",
+    find: '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>o.default),partialize:',
+    repl: '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e);return{getItem:async e=>{try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok)return await t.text()}catch(t){}return l.getItem(e)},setItem:async(e,t)=>{await l.setItem(e,t);try{await fetch(u(e),{method:"PUT",headers:{"content-type":"application/json"},body:t})}catch(n){}},removeItem:async e=>{await l.removeItem(e);try{await fetch(u(e),{method:"DELETE"})}catch(t){}}}})(o.default))),partialize:',
   },
 ];
 const GROUPS = {
@@ -189,6 +235,15 @@ function productionShasForStates(states) {
   if (general === "patched" && browse === "patched") return [COMBINED_SHA];
   if (general === "unpatched" && browse === "partial") return [THREE_ANCHOR_BROWSE_ONLY_SHA];
   if (general === "patched" && browse === "partial") return [THREE_ANCHOR_COMBINED_SHA];
+  if (general === "partial" && browse === "unpatched") {
+    return [ONE_ANCHOR_GENERAL_ONLY_SHA, TWO_ANCHOR_GENERAL_ONLY_SHA];
+  }
+  if (general === "partial" && browse === "patched") {
+    return [ONE_ANCHOR_GENERAL_COMBINED_SHA, TWO_ANCHOR_GENERAL_COMBINED_SHA];
+  }
+  if (general === "partial" && browse === "partial") {
+    return [ONE_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA, TWO_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA];
+  }
   throw new Error(`unsupported patch state: general=${general} browse=${browse}`);
 }
 
@@ -386,6 +441,12 @@ module.exports = {
   PINNED_SHA,
   THREE_ANCHOR_BROWSE_ONLY_SHA,
   THREE_ANCHOR_COMBINED_SHA,
+  ONE_ANCHOR_GENERAL_ONLY_SHA,
+  ONE_ANCHOR_GENERAL_COMBINED_SHA,
+  ONE_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA,
+  TWO_ANCHOR_GENERAL_ONLY_SHA,
+  TWO_ANCHOR_GENERAL_COMBINED_SHA,
+  TWO_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA,
   SUBAGENT_STREAM_PATCHES,
   patchBundleContent,
   patchedName,

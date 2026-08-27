@@ -15,9 +15,9 @@
 #   bash install/test-equivalence.sh            # compare against goldens
 #   bash install/test-equivalence.sh --regen    # rewrite goldens (commit the diff)
 set -euo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -44,6 +44,23 @@ export AIRLOCK_WEBROOT="$TMP/web"
 export AIRLOCK_CONFD="$TMP/confd"
 export AIRLOCK_TS_FQDN="box.example.ts.net"
 export AIRLOCK_DRY_RUN=1
+# The remaining host reads, pinned like everything above (measured 2026-08-25:
+# on a box with airlock actually installed, the transcript grew dev-monitor's
+# `pre-ledger artifact(s) found` line and lost `chmod o+x /opt/airlock` —
+# a --regen there would have baked that box's state into the goldens).
+#   - adopt-scan globs the system unit dir and the two static platform dirs
+#     for known-builtin artifacts: point all three at empty scratch dirs, the
+#     fixed "nothing pre-installed" state every run sees.
+#   - publish's mkdir_nginx_path decides its chmod lines by which ancestors
+#     of /opt/airlock/share already exist: pin the dry run's existence probes
+#     to a scratch root where /opt exists and /opt/airlock does not.
+# install/test-equivalence-hermetic.sh proves these pins hold: it re-runs
+# this suite with all four variables polluted toward a populated fake host.
+mkdir -p "$TMP/unit-system" "$TMP/platform-etc" "$TMP/platform-opt" "$TMP/fsroot/opt"
+export AIRLOCK_UNIT_DIR_SYSTEM="$TMP/unit-system"
+export AIRLOCK_PLATFORM_ETC="$TMP/platform-etc"
+export AIRLOCK_PLATFORM_OPT="$TMP/platform-opt"
+export AIRLOCK_DRY_RUN_FSROOT="$TMP/fsroot"
 
 cat > "$AIRLOCK_CONFIG" <<EOF
 [site]
@@ -54,7 +71,6 @@ provider = "tailscale"
 owner = "me@example.com"
 
 [paths]
-code_root = "$TMP/code"
 
 [apps.hub]
 [apps.notepad]

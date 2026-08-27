@@ -19,18 +19,17 @@ name = "My Dev Hub"
 [auth]
 provider = "tailscale"        # v1: the only supported provider (fail-closed).
 owner    = "me@example.com"   # full access
-# Collaborators get the WHOLE hub tier, not a read-only view: markwand (browse and
-# EDIT everything under code_root below), publish (delete shared items), notepad,
-# dev-monitor, feedback. Only the shell-grade apps — devterm, code-server, orca,
-# paseo — stay owner-only. Add someone here only if that is what you mean.
+# Collaborators get the WHOLE hub tier, not a read-only view: fileview (browse and
+# EDIT every file this box's user account can reach), publish (delete shared
+# items), notepad, dev-monitor, feedback. Only the shell-grade apps — devterm,
+# code-server, orca, paseo — stay owner-only. Add someone here only if that is
+# what you mean.
 collaborators = []
 
 [paths]
-# The root markwand serves: markserv renders it, filebrowser edits it. Everything
-# UNDER here is readable and writable by the owner and every collaborator, dotfiles
-# included, and the viewer also reads THROUGH symlinks that point outside it.
-# There is no exclusion mechanism (see SECURITY.md).
-code_root = "~"
+# fileview has no root setting: it serves the filesystem, bounded by what this
+# box's user account can reach (see SECURITY.md). `code_root` used to live here
+# and is retired — delete the line if you still have it.
 # Exported as AIRLOCK_WIKI for your own skills/tooling. Airlock itself does not
 # read it. Empty = wiki-less.
 wiki = ""
@@ -76,12 +75,20 @@ product = "Airlock"
 # `glyph` only (no `icon`): an icon file is staged out of a package, and a
 # shortcut has no package to stage from. Symbol ids live in hub/index.html.
 #
+# `audience` defaults to "shared" here, the opposite of a package's default.
+# A package that says nothing resolves to "owner" because it serves this box and
+# silence must not widen that. A shortcut serves nothing here — it is a link to
+# an address that already exists elsewhere and is gated by whatever serves it —
+# so there is nothing for silence to widen. Set `audience = "owner"` to keep one
+# link off a collaborator's launcher.
+#
 # [shortcuts.team-chat]
 # label = "Team Chat"
 # url   = "https://chat.example.com/"
 # cat   = "comms"                 # coding · docs · files · system · comms
 # glyph = "app-chat"
 # sub   = "team chat — runs elsewhere"
+# audience = "shared"             # "shared" (default) · "owner"
 
 [apps.hub]        # required — the entrance
 https_port    = 443
@@ -98,15 +105,11 @@ gate_port    = 19911  # loopback nginx owner-gate
 backend_port = 19913  # loopback devterm-gate (serves the custom client + API, proxies to ttyd)
 ttyd_port    = 19912  # loopback ttyd (pure PTY backend)
 font_size    = 15
-# secret_ttl_sec = 1800   # secret drop lifetime (default 30 min). The drop stores a typed
-#                         # value in ~/.devterm-secrets (0700 dir, 0600 files) and hands
-#                         # out only the PATH, so a key never enters scrollback or history.
-#                         # It is safe because it expires — see SECURITY.md.
 # lang = "C.UTF-8"    # locale for the ttyd/tmux environment (LANG/LC_CTYPE)
 # --- Optional features (all default off; degrade cleanly when their deps are absent) ---
 # accounts   = true                          # Claude Code login + account pool, and Codex login UI.
-#                                            # Ships with airlock (apps/devterm/bin/claude-switch,
-#                                            # claude-status); the Codex half needs the `codex` CLI.
+#                                            # Uses platform bin/airlock-accounts and
+#                                            # airlock-accounts-status; Codex needs its own CLI.
 # xai        = true                          # OpenCode xAI credential status + login/logout UI.
 #                                            # Uses `opencode`; this is separate from Orca's Grok login.
 # claude_switch = ""                          # override: path to your own claude-switch CLI
@@ -115,11 +118,10 @@ font_size    = 15
 # fleet_store_url = ""                        # URL of a shared usage store (optional; no host is hardcoded)
 # remote_hosts = "hostA,hostB"               # comma-separated ssh hosts whose tmux sessions also appear as tabs
 # orca_shim  = "~/.config/orca/linux-orca-cli-shim/orca"  # Orca CLI shim -> enables the worktree sidebar
-# The terminal file-path -> markwand link turns on automatically when [apps.markwand]
-# is enabled and [paths].code_root is set.
+# The terminal file-path -> fileview link turns on automatically when
+# [apps.fileview] is enabled.
 
-[apps.markwand]
-markserv_port    = 19920
+[apps.fileview]
 filebrowser_port = 19921
 
 [apps.publish]

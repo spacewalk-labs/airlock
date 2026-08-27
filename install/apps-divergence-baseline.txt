@@ -11,10 +11,23 @@
 #    state helpers, fonts, and patches landed on airlock-apps. Work does not
 #    get a second copy of those files. Existing files PARITY edited on the
 #    apps side stay content-diff. Copying them into work would undo the split.
-# 3) 2026-08-22: apps/learning — a NEW app packaged here first. It is only-work
-#    because it does not exist on the apps side yet, not because it is split:
-#    this batch is expected to empty at the next publish-sync, unlike (1) and (2).
-#    docs/tasks/active/learning-app-package.md
+# 3) 2026-08-22 -> 2026-08-25: apps/learning — published. The owner ruled every
+#    app public ("다 공개앱으로 일단넣어", 2026-08-25) and airlock-apps#12 merged
+#    (7d883903), so this batch emptied exactly as it said it would. What is left
+#    is the batch (2) mirror image: the published app carries its own lifecycle
+#    test on the apps side.
+only-apps	apps/learning/tests/lifecycle.sh
+#    Three of learning's shells differ by MODE only: 100644 here, 100755 on the
+#    apps side, where the publish gate requires the executable bit. Every other
+#    app is 100755 on both sides, so work is the odd one out and the honest fix
+#    would be to flip it here — but cutline-guard refuses exactly that
+#    ("PolicyError: mode 100644->100755 is not allowed", measured 2026-08-25).
+#    Two rules therefore disagree, and this file is not the place to overrule
+#    either. Recorded as content drift, with the reason, so the next reader does
+#    not mistake it for a stale entry that should have healed.
+content	apps/learning/deactivate.sh
+content	apps/learning/install.sh
+content	apps/learning/smoke.sh
 only-work	apps/devterm/test-accounts-js.mjs
 # 3) 2026-08-18 P3 severity/routing: one work-ahead backend module. devmon_email.py is the
 #    email lane's transport — a real source file of a mirrored app, which the public copy
@@ -56,16 +69,23 @@ only-apps	apps/devterm/NOTICE
 only-apps	apps/devterm/tests/lifecycle.sh
 only-apps	apps/devterm/tests/parity.sh
 only-apps	apps/devterm/tests/parity_test.py
+# 10) 2026-08-24 platform-owned credentials P2a: the work tree deliberately removes
+#    devterm's bundled account binaries after installing compatibility shims that target
+#    the platform copies. airlock-apps still has the two stale files until the next
+#    publish sync, so both are only-apps in the intended post-P2a tree. claude-status was
+#    previously a content split; changing its kind is part of the ownership move.
+only-apps	apps/devterm/bin/claude-status
+only-apps	apps/devterm/bin/claude-switch
 only-apps	apps/devterm/web/keytest.html
 only-apps	apps/devterm/web/vendor/D2Coding-OFL.txt
 only-apps	apps/devterm/web/vendor/d2coding-400.woff2
 only-apps	apps/devterm/web/vendor/d2coding-700.woff2
 only-apps	apps/feedback/tests/lifecycle.sh
 only-apps	apps/feedback/tests/parity.sh
-only-apps	apps/markwand/state.sh
-only-apps	apps/markwand/static/markwand-manifest.json
-only-apps	apps/markwand/tests/lifecycle.sh
-only-apps	apps/markwand/tests/parity.sh
+only-apps	apps/fileview/state.sh
+only-apps	apps/fileview/static/fileview-manifest.json
+only-apps	apps/fileview/tests/lifecycle.sh
+only-apps	apps/fileview/tests/parity.sh
 only-apps	apps/notepad/render.sh
 only-apps	apps/notepad/tests/lifecycle.sh
 only-apps	apps/notepad/tests/parity.sh
@@ -84,7 +104,6 @@ only-apps	apps/paseo/tests/parity.sh
 only-apps	apps/publish/tests/lifecycle.sh
 only-apps	apps/publish/tests/parity.sh
 content	apps/code-server/README.md
-content	apps/code-server/airlock-app.toml
 content	apps/code-server/install.sh
 content	apps/dev-monitor/README.md
 content	apps/dev-monitor/airlock-app.toml
@@ -93,6 +112,7 @@ content	apps/dev-monitor/backend/devmon_messages.py
 content	apps/dev-monitor/backend/devmon_spool.py
 content	apps/dev-monitor/backend/devmon_owner.py
 content	apps/dev-monitor/backend/devmon_slack.py
+content	apps/dev-monitor/backend/devmon_tokens.py
 content	apps/dev-monitor/backend/test_devmon.py
 content	apps/dev-monitor/frontend/dev-monitor.html
 content	apps/dev-monitor/install.sh
@@ -100,10 +120,10 @@ content	apps/dev-monitor/render.sh
 content	apps/dev-monitor/smoke.sh
 content	apps/dev-monitor/migrate-legacy-state.py
 content	apps/dev-monitor/test-backend.py
+content	apps/dev-monitor/token-freshness.py
 content	apps/devterm/README.md
 content	apps/devterm/airlock-app.toml
 content	apps/devterm/backend/devterm-gate.py
-content	apps/devterm/bin/claude-status
 content	apps/devterm/deactivate.sh
 content	apps/devterm/install.sh
 content	apps/devterm/render.sh
@@ -113,10 +133,6 @@ content	apps/devterm/web/accounts.js
 content	apps/devterm/web/app.js
 content	apps/devterm/web/index.html
 content	apps/feedback/backend/airlock-feedback.py
-content	apps/markwand/airlock-app.toml
-content	apps/markwand/install.sh
-content	apps/markwand/render.sh
-content	apps/markwand/static/markwand-split.html
 content	apps/notepad/airlock-app.toml
 content	apps/notepad/deactivate.sh
 content	apps/notepad/frontend/notepad.html
@@ -135,6 +151,12 @@ content	apps/paseo/browse-host/install.sh
 content	apps/paseo/README.md
 content	apps/paseo/airlock-app.toml
 content	apps/paseo/install.sh
+# 9) 2026-08-23 legacy singleton handover: the private installer now authorizes
+#    stale-pid cleanup only after measuring and releasing the actual Paseo owner.
+#    The public apps release is explicitly out of scope for this card, so this
+#    existing mirrored helper is an expected work-ahead content split until a
+#    separately authorized publish sync.
+content	apps/paseo/paseo-clear-stale-pid.py
 content	apps/paseo/patches/README.md
 content	apps/paseo/patches/anchor-manifest.json
 content	apps/paseo/render.sh
@@ -153,19 +175,6 @@ content	apps/paseo/browse-host/smoke.sh
 content	apps/paseo/browse-host/src/host.js
 content	apps/paseo/browse-host/src/stream-server.js
 content	apps/publish/airlock-app.toml
-only-work	apps/learning/airlock-app.toml
-only-work	apps/learning/backend/airlock-learning.py
-only-work	apps/learning/backend/ingest_runner.py
-only-work	apps/learning/backend/providers.py
-only-work	apps/learning/backend/save_document.py
-only-work	apps/learning/deactivate.sh
-only-work	apps/learning/frontend/learning.html
-only-work	apps/learning/install.sh
-only-work	apps/learning/render.sh
-only-work	apps/learning/skill/SKILL.md
-only-work	apps/learning/skill/transcript.py
-only-work	apps/learning/smoke.sh
-only-work	apps/learning/test-frontend-contract.mjs
 # 7) 2026-08-22 shared state directory: apps/publish/install.sh stopped chmod'ing the
 #    SHARED state directory (~/.local/state/airlock) to 0700 on every install. That
 #    directory holds the ledger and dev-monitor's spool, and the spool is written by a
@@ -174,6 +183,17 @@ only-work	apps/learning/test-frontend-contract.mjs
 #    the install reporting success. Batch 1's shape: work is the live consumer and the
 #    public copy is behind until the next publish sync, not a designed split.
 content	apps/publish/install.sh
+# 12) 2026-08-24 platform-owned credentials P4-P5: devterm's secret test now drives
+# the platform CLI through the HTTP relay, and paseo's installer comment names the
+# platform pool-record schema it is preserving. These are content changes awaiting the
+# next public mirror sync; neither is an intentional long-term implementation fork.
+content	apps/devterm/test-secrets.py
+content	apps/paseo/patches/credential-key-preservation.test.mjs
+# 11) 2026-08-24 platform-owned credentials P3: the transport boundary is a new
+# work-ahead backend module. It invokes the handed-in platform CLI while
+# devmon_tokens.py stays a pure (raw JSON, clock) verdict engine. The public mirror
+# receives it at the next publish sync; it is not a permanent private-only file.
+only-work	apps/dev-monitor/backend/devmon_accounts.py
 # 8) 2026-08-22 secret drop double header: the embedded panel drew a second title bar
 #    inside the widget's own, because the guard keyed on `close` (which panel.html hands
 #    over precisely when embedded) instead of on who owns the window. The fix edits
@@ -186,3 +206,59 @@ content	apps/publish/install.sh
 #    recommended 15 files does NOT carry this fix. It needs the next publish sync.
 only-work	apps/devterm/test-secretdrop-js.mjs
 content	apps/devterm/web/secretdrop.js
+# 9) 2026-08-23 D5 ABI enforcement (apps/ cutover prerequisite): every app package
+#    stopped deriving the platform root by climbing "$0/../..", stopped defaulting
+#    AIRLOCK_ROOT, and stopped reading platform paths outside install/lib.sh and
+#    gate/*. Standing gate: install/check-app-abi.sh (controls in test-app-abi.sh).
+#    Batch 1's shape — work is the live consumer of apps/ and the public copy is
+#    behind until the next publish sync, not a designed split. This batch is
+#    expected to EMPTY at that sync, like batch 3, unlike batches 1-2.
+#    The four .in/render/token-timer entries are the same change reaching the two
+#    files where @REPO@ conflated "the platform" with "this package": the units now
+#    carry @APPDIR@, so nothing bakes <platform>/apps/<id> into systemd any more.
+content	apps/code-server/smoke.sh
+content	apps/dev-monitor/install-token-timer.sh
+content	apps/dev-monitor/systemd/airlock-token-freshness-failed.service.in
+content	apps/dev-monitor/systemd/airlock-token-freshness.service.in
+content	apps/feedback/install.sh
+content	apps/feedback/render.sh
+content	apps/feedback/smoke.sh
+content	apps/notepad/smoke.sh
+content	apps/orca/smoke.sh
+content	apps/paseo/smoke.sh
+content	apps/publish/smoke.sh
+
+# 4) 2026-08-25: apps/notes — published. The owner ruled every app public
+#    ("다 공개앱으로 일단넣어", 2026-08-25), airlock-apps#11 merged (e0a75067),
+#    and the eleven only-work paths this batch listed all healed. What remains
+#    is the mirror image of batch (2): one test that lives only on the apps
+#    side, because the published app carries its own lifecycle test there.
+only-apps	apps/notes/tests/lifecycle.sh
+
+# 5) 2026-08-25: markwand -> fileview 개명. **예고한 대로 비워졌다.**
+#    개명이 공개본에 실렸고(airlock-apps#13, 42f24f82), 이 batch 가 등록해 둔 서른한 줄
+#    중 스물아홉이 healed 가 됐다 — work 에만 있던 fileview 열, 공개본에만 남아 있던
+#    markwand 열아홉이다. 그 줄들을 여기서 지운다: 나은 항목을 남겨 두면 이 파일은
+#    「아는 갈라짐」이 아니라 「한때 갈라졌던 것」의 목록이 되고, 그 위에서는 kind 가
+#    나빠져도 눈에 띄지 않는다.
+#    같은 개명이 apps/code-server/airlock-app.toml 의 content 갈라짐도 지웠다(공개본
+#    주석이 이제 work 와 같은 이름을 부른다). 그것도 함께 뺀다.
+#    남는 둘은 설계된 갈라짐이다 — 공개본의 install.sh 와 viewer.html 은 공개본에만
+#    있는 parity 편집 셋(manifest 설치 · 설정 변경 전 fail-closed DB 백업 · linger 경고)을
+#    지고 있어 같은 파일이되 내용이 다르다. only-work 가 content 로 바뀐 것은 나빠진
+#    것이 아니라 나아진 것이고, 그 새 kind 를 여기 적어 둔다.
+content	apps/fileview/install.sh
+content	apps/fileview/static/viewer.html
+content	apps/learning/airlock-app.toml
+content	apps/learning/backend/providers.py
+content	apps/learning/render.sh
+content	apps/notes/install.sh
+content	apps/notes/smoke.sh
+# 9) 2026-08-25 paseo ui-state: the cross-device sidebar-order backend and its two
+#    offline test files. Batch 1's shape — work is the live consumer and the public
+#    copy is behind until the next publish sync, not a designed split. The unit, the
+#    gate location and the bundle anchor that use them are edits to files this list
+#    already tracks; only these three paths are new.
+only-work	apps/paseo/backend/airlock-paseo-uistate.py
+only-work	apps/paseo/test-uistate-adapter.mjs
+only-work	apps/paseo/test-uistate-backend.py

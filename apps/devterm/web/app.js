@@ -13,7 +13,7 @@
  * in by the installer. Nothing is hardcoded. Optional features degrade cleanly:
  *   accounts  — Claude account pool + Codex login UI (needs the account tools)
  *   xai       — OpenCode xAI login UI
- *   markwand  — click a file path in the terminal to open it in markwand
+ *   fileview  — click a file path in the terminal to open it in fileview
  *   orca      — the Orca worktree sidebar layout
  */
 'use strict';
@@ -21,7 +21,7 @@
 // Runtime config + feature flags (see index.html). Absent keys => feature off.
 const DT = window.__DEVTERM || {};
 const FEAT = { accounts: !!DT.accounts, xai: !!DT.xai,
-               markwand: !!DT.markwand, orca: !!DT.orca };
+               fileview: !!DT.fileview, orca: !!DT.orca };
 
 (async function main() {
 
@@ -121,7 +121,7 @@ const TABS_KEY = 'devterm-tabs';
 function savedThemeKey() { try { const p = JSON.parse(localStorage.getItem(TABS_KEY)) || {}; return THEMES[p.theme] ? p.theme : DEFAULT_THEME; } catch (e) { return DEFAULT_THEME; } }
 
 const term = new Terminal({
-  fontFamily: 'ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace',
+  fontFamily: 'ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "DejaVu Sans Mono", "Liberation Mono", "Symbols Nerd Font Mono", monospace',
   fontSize: 14,
   lineHeight: 1.2,                 // starting placeholder — applyLineHeight() snaps to an integer CSS-px cell height per device dpr (wide spacing + crisp)
   cursorBlink: true,
@@ -161,9 +161,9 @@ try {
   }));
 } catch (e) {}
 
-// ---- click a file path (.md/.json/...) in the terminal -> open it in markwand (modal, new tab on failure) ----
+// ---- click a file path (.md/.json/...) in the terminal -> open it in fileview (modal, new tab on failure) ----
 // gate /resolve maps an absolute/~ path, or a path relative to the session pane cwd,
-// into code_root -> /markwand/... URL. Optional (FEAT.markwand).
+// -> /fileview/?path=... URL. Optional (FEAT.fileview).
 const VIEW_EXT = 'markdown|md|json|yaml|yml|toml|txt|log|csv|tsv|conf|cfg|ini|env|xml|html|htm|css|jsx|tsx|js|ts|py|bash|zsh|sh|rb|go|rs|sql|svg';
 // path-form (with dirs) + bare filename (no dir) — the gate searches under the session cwd for a bare name.
 // \p{L}\p{N} + u flag = unicode filenames recognized too (\w is ASCII-only).
@@ -195,14 +195,13 @@ function resolveWhy(j, p) {
   const r = j && j.reason;
   if (r === 'ambiguous')    return j.count + ' candidates — path is ambiguous: ' + p;
   if (r === 'no_cwd')       return '⚠️ Could not read the session working dir (remote/abnormal session?) — retry with an absolute or ~/… path: ' + p;
-  if (r === 'outside_code') return '⚠️ File exists but is outside code_root (the markwand root) — check it is symlinked under code_root: ' + p;
   if (r === 'notfound')     return '⚠️ Not found — no "' + (j.base || p) + '" under the session folder (' + (j.cwd || '?') + ')';
   if (r === 'empty')        return '⚠️ Empty path';
-  if (r === 'disabled')     return '⚠️ File opening (markwand) is not enabled';
-  return '⚠️ Cannot open in markwand: ' + p;
+  if (r === 'disabled')     return '⚠️ File opening (fileview) is not enabled';
+  return '⚠️ Cannot open in fileview: ' + p;
 }
 
-function openMarkwand(pathText) {
+function openFileview(pathText) {
   const p = pathText.replace(/[),.;:]+$/, '');
   const qs = 'resolve?path=' + encodeURIComponent(p) + '&session=' + encodeURIComponent(currentSession());
   const amb = (j) => j && j.reason === 'ambiguous' && j.hits && j.hits.length;
@@ -217,7 +216,7 @@ function openMarkwand(pathText) {
     return;
   }
   // md/json/... = modal (loading) immediately on click -> fill iframe after resolve
-  const m = openMarkwandModal(p);
+  const m = openFileviewModal(p);
   fetch(qs, { cache: 'no-store' }).then((r) => r.json()).then((j) => {
     if (j && j.ok) m.load(hubBase() + j.url, j.rel || p);
     else if (amb(j)) { m.close(); openPickerModal(p, j.hits); }
@@ -225,11 +224,11 @@ function openMarkwand(pathText) {
   }).catch(() => { m.close(); flash('⚠️ resolve request failed (no gate response): ' + p, 8000, 'error'); });
 }
 
-// open by extension — html = new tab / else = markwand modal
+// open by extension — html = new tab / else = fileview modal
 function openResolvedHit(hit) {
   const url = hubBase() + hit.url;
   if (/\.html?$/i.test(hit.rel)) window.open(url, '_blank', 'noopener,noreferrer');
-  else openMarkwandModal(hit.rel).load(url, hit.rel);
+  else openFileviewModal(hit.rel).load(url, hit.rel);
 }
 
 // several candidates -> pick from a newest-first list (top ★ = newest)
@@ -261,7 +260,7 @@ function openPickerModal(query, hits) {
 }
 
 // open a modal immediately (loading) and return an api — .load(url,title) fills the iframe / .close()
-function openMarkwandModal(title) {
+function openFileviewModal(title) {
   const { ov, box } = makeModal(30, 'padding:0;width:96vw;max-width:1120px;height:88vh;display:flex;flex-direction:column;overflow:hidden;');
   const bar = document.createElement('div');
   bar.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 12px;background:#222634;border-bottom:1px solid #33384a;flex:0 0 auto;';
@@ -294,7 +293,7 @@ function openMarkwandModal(title) {
   };
 }
 
-if (FEAT.markwand) try {
+if (FEAT.fileview) try {
   term.registerLinkProvider({
     provideLinks: function (y, callback) {
       let line;
@@ -313,7 +312,7 @@ if (FEAT.markwand) try {
           text: txt,
           range: { start: { x: c0 + 1, y: y }, end: { x: c1 + 1, y: y } },
           decorations: { underline: true, pointerCursor: true },
-          activate: function (ev, t) { if (ev) ev.preventDefault(); openMarkwand(t); },
+          activate: function (ev, t) { if (ev) ev.preventDefault(); openFileview(t); },
         });
         if (links.length > 40) break;
       }
@@ -417,7 +416,7 @@ function linkAtCell(row, col) {
   while ((m = URL_RE.exec(s)) !== null) {
     if (hitInMatch(map, m.index, m.index + m[0].length - 1, row, col)) return { kind: 'url', text: m[0] };
   }
-  if (FEAT.markwand) {
+  if (FEAT.fileview) {
     FILE_PATH_RE.lastIndex = 0;
     while ((m = FILE_PATH_RE.exec(s)) !== null) {
       const st = m.index;
@@ -454,7 +453,7 @@ function linkAtCell(row, col) {
     if (!hit) return;                                    // was a drag -> no intervention (keep tmux selection)
     if (Math.abs(ev.clientX - dx) + Math.abs(ev.clientY - dy) > DRAG_PX) return;   // safety net (missed mousemove)
     if (hit.kind === 'url') window.open(hit.text, '_blank', 'noopener,noreferrer');
-    else openMarkwand(hit.text);
+    else openFileview(hit.text);
   }, true);
 })();
 

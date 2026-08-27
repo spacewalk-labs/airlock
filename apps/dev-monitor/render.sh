@@ -58,7 +58,8 @@ ENVF
 }
 
 # render_dev_monitor_unit BACKEND_PORT MESSAGES IDENTITY_HEADER cors_hosts DEVMON_ENV \
-#                         [TOKEN_FRESHNESS TOKEN_WARN_HOURS TOKEN_STALE_HOURS]
+#                         [TOKEN_FRESHNESS TOKEN_WARN_HOURS TOKEN_STALE_HOURS
+#                          SPOOL_HARDENING ACCOUNTS_STATUS_BIN]
 # The token arguments default rather than being required: this function is called by
 # install/test-systemd-ordering.sh and by fixtures written before the feature existed,
 # and an unset positional under `set -u` would turn a missing argument into an unbound
@@ -67,6 +68,7 @@ render_dev_monitor_unit() {
   local BACKEND_PORT="$1" MESSAGES="$2" IDENTITY_HEADER="$3" cors_hosts="$4" DEVMON_ENV="$5"
   local TOKEN_FRESHNESS="${6:-false}" TOKEN_WARN_HOURS="${7:-24}" TOKEN_STALE_HOURS="${8:-24}"
   local SPOOL_HARDENING="${9:-false}" guard=""
+  local ACCOUNTS_STATUS_BIN="${10:-${AIRLOCK_ACCOUNTS_STATUS_BIN:-}}"
   local BACKEND_PY="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/backend/airlock-dev-monitor.py"
   if [ "$SPOOL_HARDENING" = true ]; then
     guard=$'\nExecStartPre=/usr/bin/systemctl is-active --quiet airlock-dev-monitor-spool-firewall.service'
@@ -85,6 +87,7 @@ Environment=AIRLOCK_DEV_MONITOR_CORS_HOSTS=${cors_hosts}
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS=${TOKEN_FRESHNESS}
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS=${TOKEN_WARN_HOURS}
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS=${TOKEN_STALE_HOURS}
+Environment=AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN=${ACCOUNTS_STATUS_BIN}
 # '-' = optional: with messages off the file is absent by design, and the backend
 # then serves observability only. Secrets stay in this 0600 file, out of the unit.
 EnvironmentFile=-${DEVMON_ENV}${guard}

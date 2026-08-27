@@ -90,11 +90,11 @@ note = "Privileged ingress setup"
 # The versioned tree's directory name bakes in VER + ARCH_TAG
 # (install.sh: code-server-${VER}-linux-${ARCH_TAG}). A wildcard there
 # (e.g. code-server-*-linux-*) validated in isolation but DIED at validate
-# once markwand was also configured: the D2 disjointness check
+# once fileview was also configured: the D2 disjointness check
 # (_may_overlap in bin/airlock-config) compares claims segment-by-segment
 # and can only PROVE two claims disjoint at a segment where both sides are
 # wildcard-free literals that differ; the wildcard here sits exactly at the
-# segment position where this path and markwand's
+# segment position where this path and fileview's
 # ~/.local/lib/node_modules/markserv/ diverge (this pattern is also one
 # segment SHORTER, so the comparison never reaches a later literal
 # position) — so the conservative check could not rule out an overlap and

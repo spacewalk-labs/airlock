@@ -290,7 +290,7 @@ def stamp_png(png, app_id):
 
     Why: the PNG is the one artifact nothing can re-derive without a browser, so
     a reviewer's test can only ask it questions — and colour questions cannot
-    tell two apps of the same category apart. Copy publish.png over markwand.png
+    tell two apps of the same category apart. Copy publish.png over fileview.png
     and every colour in it is still right. The chunk is the icon saying whose it
     is, and install/test-app-icons.py reads it back. tEXt is standard PNG
     (chunk order after IHDR is free, browsers ignore it) and deterministic, so

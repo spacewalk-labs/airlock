@@ -23,14 +23,14 @@ provider = "tailscale"
 owner = "me@example.com"
 collaborators = ["a@example.com", "b@example.com"]
 [paths]
-code_root = "~/code"
+wiki = "~/wiki"
 [branding]
 product = "Airlock"
 [apps.hub]
 [apps.devterm]
 font_size = 16
 xai = true
-[apps.markwand]
+[apps.fileview]
 TOML
 
 cat >"$TMP/badprovider.toml" <<'TOML'
@@ -103,7 +103,7 @@ grep -q '"fqdn"' <<<"$wj2" && bad "webjson: empty fqdn emitted" || ok "webjson: 
 
 # 4. apps lists enabled tables
 apps="$(run "$TMP/good.toml" apps 2>/dev/null | sort | tr '\n' ',')"
-[ "$apps" = "devterm,hub,markwand," ] && ok "apps: enabled list" || bad "apps: got '$apps'"
+[ "$apps" = "devterm,fileview,hub," ] && ok "apps: enabled list" || bad "apps: got '$apps'"
 
 # App names cross a line-oriented shell API. A quoted TOML key may contain an
 # escaped newline, so both validation and the direct `apps` command must reject
@@ -182,45 +182,27 @@ if run "$TMP/good.toml" env orca >/dev/null 2>&1; then bad "env: rejects disable
 [ "$(run "$TMP/good.toml" get auth.owner 2>/dev/null)" = "me@example.com" ] && ok "get: dotted" || bad "get: dotted"
 [ "$(run "$TMP/good.toml" get apps.devterm.ttyd_port 2>/dev/null)" = "19912" ] && ok "get: default merged" || bad "get: default merged"
 
-# 8. code_root expands ~ — to the real home, not merely to something without a '~'
-[ "$(run "$TMP/good.toml" get paths.code_root 2>/dev/null)" = "$HOME/code" ] \
+# 8. a [paths] value expands ~ — to the real home, not merely to something without a '~'
+[ "$(run "$TMP/good.toml" get paths.wiki 2>/dev/null)" = "$HOME/wiki" ] \
   && ok "get: ~ expanded to \$HOME" || bad "get: ~ expanded to \$HOME"
 
-# --- 9. code_root is mandatory for markwand, never guessed -------------------
-# markwand hands this directory to markserv (read) and filebrowser (write), and
-# the hub gate admits collaborators — so an installer must not pick it silently.
+# --- 9. code_root is retired: it names a boundary that no longer exists --------
+# fileview's filebrowser runs with `--root /`, so there is nothing to configure.
+# A leftover key must NOT fail the box (every config written before this release
+# carries one) — it gets the targeted retired-key message instead.
 mk() { printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n[apps.hub]\n%s\n' "$1" >"$TMP/t.toml"; }
 
-mk '[apps.markwand]'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "code_root: rejects missing"; else ok "code_root: rejects missing"; fi
-# (capture, don't pipe: `run` exits non-zero here and pipefail would mask grep)
-msg="$(run "$TMP/t.toml" validate 2>&1)"
-grep -q 'code_root' <<<"$msg" && ok "code_root: names the key" || bad "code_root: names the key"
-grep -q '~/code' <<<"$msg" && ok "code_root: gives the migration" || bad "code_root: gives the migration"
-
 mk '[paths]
-code_root = ""
-[apps.markwand]'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "code_root: rejects empty"; else ok "code_root: rejects empty"; fi
+code_root = "~/code"
+[apps.fileview]'
+if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "code_root: retired, does not fail"; else bad "code_root: retired, does not fail"; fi
+cr_msg="$(run "$TMP/t.toml" validate 2>&1)"
+grep -q 'code_root' <<<"$cr_msg" && ok "code_root: names the key" || bad "code_root: names the key"
+grep -q -- '--root /' <<<"$cr_msg" && ok "code_root: says what replaced it" || bad "code_root: says what replaced it"
 
-mk '[paths]
-code_root = "   "
-[apps.markwand]'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "code_root: rejects whitespace"; else ok "code_root: rejects whitespace"; fi
-
-mk '[paths]
-code_root = false
-[apps.markwand]'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "code_root: rejects non-string"; else ok "code_root: rejects non-string"; fi
-
-mk '[paths]
-code_root = "code"
-[apps.markwand]'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "code_root: rejects relative"; else ok "code_root: rejects relative"; fi
-
-# ...but only markwand needs it; a box without markwand is unaffected.
-mk '[apps.devterm]'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "code_root: optional without markwand"; else bad "code_root: optional without markwand"; fi
+# fileview no longer needs any path key at all.
+mk '[apps.fileview]'
+if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "fileview: validates with no [paths] at all"; else bad "fileview: validates with no [paths] at all"; fi
 
 # --- 10. unknown key = typo = die (a typo would silently keep the default) ---
 mk '[paths]
@@ -231,6 +213,24 @@ if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects unknown [
 mk '[apps.dev-monitor]
 message = true'
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects unknown app key"; else ok "keys: rejects unknown app key"; fi
+
+# P2a moves the defaults behind these two devterm keys to platform binaries, but the
+# keys themselves must remain declared: config validation is fail-closed and existing
+# operators may still use them as explicit gate-tool overrides.
+mk '[apps.devterm]
+claude_switch = "/opt/operator/claude-switch"
+claude_status = "/opt/operator/claude-status"'
+if run "$TMP/t.toml" validate >/dev/null 2>&1; then
+  devterm_override_env="$(run "$TMP/t.toml" env devterm 2>/dev/null)"
+  if grep -q '^AIRLOCK_DEVTERM_CLAUDE_SWITCH=/opt/operator/claude-switch$' <<<"$devterm_override_env" \
+     && grep -q '^AIRLOCK_DEVTERM_CLAUDE_STATUS=/opt/operator/claude-status$' <<<"$devterm_override_env"; then
+    ok "devterm: legacy account-tool override keys still validate and export"
+  else
+    bad "devterm: account-tool override keys validated but did not export"
+  fi
+else
+  bad "devterm: legacy account-tool override keys remain accepted"
+fi
 
 mk '[apps.dev-monitor]
 slack_webhook_urgent_env = "DEVMON_URGENT"
@@ -435,11 +435,11 @@ if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects table sha
 
 # `~nosuchuser` is an easy typo and pathlib raises on it — must be actionable.
 mk '[paths]
-code_root = "~nosuchuser1234/code"
-[apps.markwand]'
+wiki = "~nosuchuser1234/wiki"
+[apps.fileview]'
 msg="$(run "$TMP/t.toml" validate 2>&1)"
-grep -q 'Traceback' <<<"$msg" && bad "code_root: traceback on bad ~user" || ok "code_root: no traceback on bad ~user"
-grep -q 'cannot expand' <<<"$msg" && ok "code_root: actionable ~user error" || bad "code_root: actionable ~user error"
+grep -q 'Traceback' <<<"$msg" && bad "paths: traceback on bad ~user" || ok "paths: no traceback on bad ~user"
+grep -q 'cannot expand' <<<"$msg" && ok "paths: actionable ~user error" || bad "paths: actionable ~user error"
 
 # An unknown app TABLE is fatal (child 4/P3: the local/custom-app escape
 # hatch retired along with the built-in registry — every nine built-ins are
@@ -466,7 +466,7 @@ run "$TMP/t.toml" env paseo 2>/dev/null | grep -q "AIRLOCK_PASEO_VERSION=''" \
 mk '[paths]
 code_root = "/srv/code"
 mount_exclude = ["snap"]
-[apps.markwand]'
+[apps.fileview]'
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "retired: mount_exclude does not fail"; else bad "retired: mount_exclude does not fail"; fi
 msg="$(run "$TMP/t.toml" validate 2>&1 >/dev/null)"
 grep -q 'mount_exclude' <<<"$msg" && ok "retired: names mount_exclude" || bad "retired: names mount_exclude"
@@ -514,21 +514,14 @@ skil_allow = "x"
 TOML
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "retired: a typo beside it still fails"; else ok "retired: a typo beside it still fails"; fi
 
-# --- 12. wide code_root + collaborators = warning (heuristic, not a gate) ----
-printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\ncollaborators = ["c@example.com"]\n[paths]\ncode_root = "%s"\n[apps.hub]\n[apps.markwand]\n' "$HOME" >"$TMP/t.toml"
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "wide root: warns, does not fail"; else bad "wide root: warns, does not fail"; fi
-run "$TMP/t.toml" validate 2>&1 >/dev/null | grep -qi 'home directory' \
-  && ok "wide root: warning names the risk" || bad "wide root: warning missing"
-# no collaborators -> no warning (a solo box may legitimately use the home dir).
-# Capture rather than pipe: under pipefail a failing validate would satisfy `|| ok`.
-printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n[paths]\ncode_root = "%s"\n[apps.hub]\n[apps.markwand]\n' "$HOME" >"$TMP/t.toml"
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then
-  msg="$(run "$TMP/t.toml" validate 2>&1 >/dev/null)"
-  grep -qi 'home directory' <<<"$msg" && bad "wide root: warns without collaborators" \
-    || ok "wide root: silent without collaborators"
-else
-  bad "wide root: solo home dir must still validate"
-fi
+# --- 12. no scope warning is possible any more -------------------------------
+# There used to be a heuristic warning here: code_root == $HOME plus collaborators
+# meant handing over every dotfile. The key is gone and the root is always /, so
+# the warning has no input to look at. What replaced it is a plain statement in
+# SECURITY.md — the scope is the unix account, always. Assert the key's absence
+# does not resurrect a gate: a collaborators box validates with no [paths] at all.
+printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\ncollaborators = ["c@example.com"]\n[apps.hub]\n[apps.fileview]\n' >"$TMP/t.toml"
+if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "scope: fileview + collaborators validates with no paths key"; else bad "scope: fileview + collaborators validates with no paths key"; fi
 
 # --- 13. airlock.toml.example must validate --------------------------------
 # The tool points operators straight at this file — find_config() dies with
@@ -542,6 +535,127 @@ if run "$HERE/../airlock.toml.example" validate >/dev/null 2>&1; then
 else
   bad "example: airlock.toml.example validates — $(run "$HERE/../airlock.toml.example" validate 2>&1 | head -1)"
 fi
+
+# --- 14. [shortcuts.<id>] ---------------------------------------------------
+# The table shipped in #199 with no test at all — every assertion below is the
+# first one it has had. A shortcut is the one tile whose href leaves this origin
+# and whose target nobody here authorises, so the fields that keep it honest
+# (https, a real glyph, a heading the launcher can draw) are exactly the fields
+# a silent regression would take away.
+sc() {   # a good config plus the shortcut body passed in
+  printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n[paths]\ncode_root = "~/code"\n[apps.hub]\n[apps.fileview]\n%s\n' "$1" >"$TMP/sc.toml"
+}
+SC_OK='[shortcuts.team-chat]
+label = "Team Chat"
+url = "https://chat.example.com/"
+cat = "comms"
+glyph = "app-chat"'
+
+sc "$SC_OK"
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then ok "shortcut: minimal table validates"; else bad "shortcut: minimal table validates"; fi
+
+# http is not a style preference here: the browser blocks it as mixed content on
+# an https launcher, and the attempt arms HSTS on the target host.
+sc "${SC_OK/https:\/\/chat/http://chat}"
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects http url"; else ok "shortcut: rejects http url"; fi
+# A hub subpath is a package's shape, not a shortcut's — accepting it would make
+# the two tables interchangeable and the [tile] path rule bypassable.
+sc "${SC_OK/https:\/\/chat.example.com\//\/chat\/}"
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects relative url"; else ok "shortcut: rejects relative url"; fi
+sc "${SC_OK/app-chat/}"
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects empty glyph"; else ok "shortcut: rejects empty glyph"; fi
+# Non-empty was never enough: an invented symbol id validated, installed, and
+# smoked green, then rendered a blank tile (2026-08-25: app-docs, app-files,
+# app-system, app-notes). The glyph must exist in hub/index.html's sprite.
+# Positive control on both sides: the good config above already proves a real
+# id (app-chat) passes; here the invented one must fail, and the error must
+# name the shortcut, the bad glyph, and the candidates.
+sc "${SC_OK/app-chat/app-docs}"
+gout="$(run "$TMP/sc.toml" validate 2>&1)"
+if [ $? -ne 0 ] && grep -Fq 'does not exist in the hub sprite' <<<"$gout" \
+   && grep -Fq 'team-chat' <<<"$gout" && grep -Fq 'app-docs' <<<"$gout" \
+   && grep -Fq 'Available glyphs:' <<<"$gout"; then
+  ok "shortcut: rejects glyph absent from the sprite, naming id+glyph+candidates"
+else
+  bad "shortcut: rejects glyph absent from the sprite — $(head -1 <<<"$gout")"
+fi
+# A near-miss gets a did-you-mean so the fix is one read away.
+sc "${SC_OK/app-chat/app-chatt}"
+gout="$(run "$TMP/sc.toml" validate 2>&1)"
+if [ $? -ne 0 ] && grep -Fq 'Did you mean' <<<"$gout" && grep -Fq 'app-chat' <<<"$gout"; then
+  ok "shortcut: near-miss glyph suggests the close sprite id"
+else
+  bad "shortcut: near-miss glyph suggests the close sprite id — $(head -1 <<<"$gout")"
+fi
+sc "${SC_OK/comms/chat}"
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects unknown cat"; else ok "shortcut: rejects unknown cat"; fi
+sc "$SC_OK
+icon = \"icons/chat.png\""
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects unknown key"; else ok "shortcut: rejects unknown key"; fi
+# One id renders one tile. A collision would have the launcher draw whichever of
+# the two webjson wrote last, which is neither an error nor a choice anyone made.
+sc "${SC_OK/team-chat/fileview}"
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects id colliding with an app"; else ok "shortcut: rejects id colliding with an app"; fi
+
+# `section` — the launcher heading. Optional, defaulted in webjson so the
+# launcher never has to invent one.
+sc "$SC_OK
+section = \"Shared services\""
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then ok "shortcut: section validates"; else bad "shortcut: section validates"; fi
+wjs="$(run "$TMP/sc.toml" webjson 2>/dev/null)"
+grep -q '"section": "Shared services"' <<<"$wjs" && ok "shortcut: webjson carries the declared section" \
+  || bad "shortcut: webjson carries the declared section"
+sc "$SC_OK"
+wjs="$(run "$TMP/sc.toml" webjson 2>/dev/null)"
+grep -q '"section": "Shortcuts"' <<<"$wjs" && ok "shortcut: webjson defaults the section" \
+  || bad "shortcut: webjson defaults the section"
+# The launcher tells a viewer that these tiles leave the gate, and it decides
+# that from `shortcut`, not from `external` — a packaged app on its own port is
+# external too and is still behind the gate.
+grep -q '"shortcut": true' <<<"$wjs" && ok "shortcut: webjson marks the tile as a shortcut" \
+  || bad "shortcut: webjson marks the tile as a shortcut"
+# `audience` — who the launcher shows this tile to. The regression this pins is
+# the one that shipped: the shortcut entry carried NO audience key at all, and
+# airlockTileVisible reads a missing audience as owner-only (#249), so the five
+# company shortcuts were invisible to collaborators and nothing in the config
+# could say otherwise. Owner decision 2026-08-25 made them shared.
+grep -q '"audience": "shared"' <<<"$wjs" && ok "shortcut: webjson defaults audience to shared" \
+  || bad "shortcut: webjson defaults audience to shared"
+sc "$SC_OK
+audience = \"owner\""
+wjs="$(run "$TMP/sc.toml" webjson 2>/dev/null)"
+grep -q '"audience": "owner"' <<<"$wjs" && ok "shortcut: webjson carries a declared owner audience" \
+  || bad "shortcut: webjson carries a declared owner audience"
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then ok "shortcut: audience=owner validates"; else bad "shortcut: audience=owner validates"; fi
+sc "$SC_OK
+audience = \"everyone\""
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects unknown audience"; else ok "shortcut: rejects unknown audience"; fi
+# The default is the whole point of the change, so it is asserted where the
+# launcher reads it, not only where validate accepts it: a shortcut that says
+# nothing must reach collaborators.
+sc "$SC_OK"
+wjs="$(run "$TMP/sc.toml" webjson 2>/dev/null)"
+python3 - "$wjs" <<'PYEOF' && ok "shortcut: silent shortcut resolves shared, package silence still resolves owner" \
+  || bad "shortcut: silent shortcut resolves shared, package silence still resolves owner"
+import json, sys
+d = json.loads(sys.argv[1])
+sc = d["apps"]["team-chat"]
+assert sc["audience"] == "shared", sc
+# and the package rule is untouched in the same output
+fv = d["apps"]["fileview"]
+assert fv["audience"] == "owner", fv
+PYEOF
+sc "$SC_OK
+section = \"\""
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects empty section"; else ok "shortcut: rejects empty section"; fi
+# Two headings differing only by an invisible character render as one name over
+# two grids — the screen cannot show the difference, so validate must.
+sc "$SC_OK
+section = \"Shared\tservices\""
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects control char in section"; else ok "shortcut: rejects control char in section"; fi
+sc "$SC_OK
+section = \"$(printf 'x%.0s' $(seq 33))\""
+if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects over-long section"; else ok "shortcut: rejects over-long section"; fi
 
 echo "---"
 echo "passed=$pass failed=$fail"

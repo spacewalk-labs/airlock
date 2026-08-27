@@ -2,10 +2,14 @@
 # paseo smoke — against a live install (after orchestrator render + reload).
 # paseo may answer / with a redirect, so 200 OR 302 both count as reachable.
 set -uo pipefail
-# ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_ID,
-# falling back to $0-relative computation for a standalone invocation.
+# ABI (D5): the caller sets AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID and runs
+# this script with cwd = AIRLOCK_APP_DIR. AIRLOCK_ROOT is REQUIRED: the platform
+# root cannot be derived from $0, because "$0/../.." is only the platform when the
+# package happens to sit in the platform's own apps/ tree — the arrangement the
+# apps/ cutover ends. $0-relative self-location (this file's own directory) stays
+# fine and is what AIRLOCK_APP_DIR falls back to.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-paseo}"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
@@ -21,6 +25,16 @@ c_be=$(code   "http://127.0.0.1:${BACKEND}/")
 c_own=$(code  -H "${HDR}: ${OWNER}"           "http://127.0.0.1:${GATE}/")
 c_deny=$(code -H "${HDR}: nobody@example.com" "http://127.0.0.1:${GATE}/")
 c_no=$(code                                    "http://127.0.0.1:${GATE}/")
+
+# --- cross-device ui-state route ---
+# Two answers matter and they are different failures: the owner must be able to READ
+# the shared sidebar order (404 counts — nothing stored yet is the normal first state,
+# and the patched bundle falls back to the device's own copy), and a non-owner must be
+# refused. A route that answered everyone would put the owner's workspace layout, and
+# a writable store, in front of every identity the tailnet lets reach this gate.
+UISTATE_KEY=sidebar-project-workspace-order
+c_ui_own=$(code  -H "${HDR}: ${OWNER}"           "http://127.0.0.1:${GATE}/airlock-ui-state/${UISTATE_KEY}")
+c_ui_deny=$(code -H "${HDR}: nobody@example.com" "http://127.0.0.1:${GATE}/airlock-ui-state/${UISTATE_KEY}")
 
 # --- installed paseo version vs this tree's pin ---
 # install.sh dies on a version mismatch, but only on the path where it just
@@ -42,7 +56,7 @@ if [ -n "$paseo_bin" ]; then
 fi
 pin=$(sed -n 's/^PASEO_VER="\${AIRLOCK_PASEO_VERSION:-\([^}]*\)}".*/\1/p' "$HERE/install.sh" 2>/dev/null | head -1)
 
-echo "[paseo smoke] backend=${c_be}/200|302 owner=${c_own}/200|302 deny=${c_deny}/403 no-header=${c_no}/403 paseo=${ver:-?}/${pin:-?}"
+echo "[paseo smoke] backend=${c_be}/200|302 owner=${c_own}/200|302 deny=${c_deny}/403 no-header=${c_no}/403 ui-state=${c_ui_own}/200|404,${c_ui_deny}/403 paseo=${ver:-?}/${pin:-?}"
 fail=0
 # Not-measured and measured-wrong are different answers. Only the second is a FAIL —
 # but "the unit is running and I cannot read its version" is the first masquerading
@@ -65,4 +79,7 @@ fi
 { [ "$c_own" = 200 ] || [ "$c_own" = 302 ]; } || { echo "FAIL owner"; fail=1; }
 [ "$c_deny" = 403 ] || { echo "FAIL deny (gate hole)"; fail=1; }
 [ "$c_no"   = 403 ] || { echo "FAIL no-header (gate hole)"; fail=1; }
+{ [ "$c_ui_own" = 200 ] || [ "$c_ui_own" = 404 ]; } \
+  || { echo "FAIL ui-state (cross-device sidebar order not reachable through the gate: ${c_ui_own})"; fail=1; }
+[ "$c_ui_deny" = 403 ] || { echo "FAIL ui-state deny (gate hole: ${c_ui_deny})"; fail=1; }
 [ "$fail" = 0 ]

@@ -5,7 +5,7 @@ set -uo pipefail
 # ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_ID,
 # falling back to $0-relative computation for a standalone invocation.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-dev-monitor}"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
@@ -16,21 +16,66 @@ airlock_load hub
 HUB="$AIRLOCK_HUB_NGINX_PORT"
 HDR="$AIRLOCK_IDENTITY_HEADER"
 OWNER="${AIRLOCK_OWNER%%,*}"
+want="${AIRLOCK_DEV_MONITOR_MESSAGES:-false}"
 
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$@"; }
 c_be=$(code                                    "http://127.0.0.1:${BACKEND}/api/overview")
 c_ui=$(code   -H "${HDR}: ${OWNER}"            "http://127.0.0.1:${HUB}/monitor/")
 c_api=$(code  -H "${HDR}: ${OWNER}"            "http://127.0.0.1:${HUB}/monitor/api/overview")
+c_cron=$(curl -s -o /dev/null -w '%{http_code}' --max-time 35 -H "${HDR}: ${OWNER}" \
+         "http://127.0.0.1:${HUB}/monitor/api/cron/jobs")
 c_deny=$(code -H "${HDR}: nobody@example.com"  "http://127.0.0.1:${HUB}/monitor/api/overview")
 c_no=$(code                                     "http://127.0.0.1:${HUB}/monitor/api/overview")
 
-echo "[dev-monitor smoke] backend=${c_be}/200 ui=${c_ui}/200 api=${c_api}/200 deny=${c_deny}/403 no-header=${c_no}/403"
+echo "[dev-monitor smoke] backend=${c_be}/200 ui=${c_ui}/200 api=${c_api}/200 cron=${c_cron}/200 deny=${c_deny}/403 no-header=${c_no}/403"
 fail=0
 [ "$c_be"   = 200 ] || { echo "FAIL backend overview"; fail=1; }
 [ "$c_ui"   = 200 ] || { echo "FAIL dashboard UI"; fail=1; }
 [ "$c_api"  = 200 ] || { echo "FAIL hub api overview"; fail=1; }
+[ "$c_cron" = 200 ] || { echo "FAIL cron snapshot"; fail=1; }
 [ "$c_deny" = 403 ] || { echo "FAIL other identity not denied (GATE HOLE)"; fail=1; }
 [ "$c_no"   = 403 ] || { echo "FAIL missing header not denied (GATE HOLE)"; fail=1; }
+
+# --- cron/timer health + bounded owner controls ---
+cron_body=$(curl -s --max-time 35 -H "${HDR}: ${OWNER}" \
+            "http://127.0.0.1:${HUB}/monitor/api/cron/jobs" || true)
+cron_shape=$(python3 - "$cron_body" <<'PY' 2>&1 || true
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception as exc:
+    print('FAIL cron snapshot is not JSON: %s' % exc); raise SystemExit
+if data.get('schemaVersion') != 3:
+    print('FAIL cron schemaVersion=%r' % data.get('schemaVersion')); raise SystemExit
+if not isinstance(data.get('jobs'), list) or not isinstance(data.get('counts'), dict):
+    print('FAIL cron jobs/counts shape'); raise SystemExit
+if not isinstance(data.get('sources'), list) or not data['sources']:
+    print('FAIL cron sources are absent'); raise SystemExit
+print('OK jobs=%d sources=%d' % (len(data['jobs']), len(data['sources'])))
+PY
+)
+echo "[dev-monitor smoke] cron shape: ${cron_shape}"
+case "$cron_shape" in OK*) ;; *) fail=1 ;; esac
+
+# With the existing owner console enabled, a direct loopback POST cannot forge nginx's
+# secret and an unknown timer must be rejected without mutation. With it disabled, cron
+# writes stay behind the same fail-closed 404 as every other owner-only route.
+c_cron_direct=$(code -X POST -H 'Content-Type: application/json' \
+  -H 'Origin: http://127.0.0.1' -H "X-Devmon-Owner: ${OWNER}" \
+  --data '{"unit":"airlock-not-a-real-user.timer"}' \
+  "http://127.0.0.1:${BACKEND}/api/owner/cron/pause")
+c_cron_refuse=$(code -X POST -H "${HDR}: ${OWNER}" -H 'Content-Type: application/json' \
+  -H "Origin: http://127.0.0.1:${HUB}" --data '{"unit":"airlock-not-a-real-user.timer"}' \
+  "http://127.0.0.1:${HUB}/monitor/api/owner/cron/pause")
+if [ "$want" = true ]; then
+  echo "[dev-monitor smoke] cron controls: direct=${c_cron_direct}/403 unknown-user-timer=${c_cron_refuse}/403"
+  [ "$c_cron_direct" = 403 ] || { echo "FAIL direct loopback bypassed the cron owner gate"; fail=1; }
+  [ "$c_cron_refuse" = 403 ] || { echo "FAIL cron mutation allowlist did not refuse an unknown user timer"; fail=1; }
+else
+  echo "[dev-monitor smoke] cron controls off: direct=${c_cron_direct}/404 hub=${c_cron_refuse}/404"
+  [ "$c_cron_direct" = 404 ] || { echo "FAIL messages is off but direct cron control answered ${c_cron_direct}"; fail=1; }
+  [ "$c_cron_refuse" = 404 ] || { echo "FAIL messages is off but hub cron control answered ${c_cron_refuse}"; fail=1; }
+fi
 
 # --- credential freshness ---
 # Same shape as the console check below: `state` is what the backend actually managed to
@@ -59,7 +104,6 @@ fi
 health_json=$(curl -s --max-time 6 "http://127.0.0.1:${BACKEND}/api/health" || true)
 state=$(printf '%s' "$health_json" \
         | python3 -c 'import sys,json; print(json.load(sys.stdin).get("messages","?"))' 2>/dev/null || echo '?')
-want="${AIRLOCK_DEV_MONITOR_MESSAGES:-false}"
 echo "[dev-monitor smoke] messages: configured=${want} running=${state}"
 if [ "$want" = true ]; then
   [ "$state" = on ] || { echo "FAIL messages = true but the console did not start (see journalctl --user -u airlock-dev-monitor)"; fail=1; }
@@ -138,6 +182,7 @@ import time
 import urllib.request
 
 sys.path.insert(0, sys.argv[4])
+import devmon_email
 import devmon_messages as messages
 
 configured = {}
@@ -150,12 +195,18 @@ try:
 except FileNotFoundError:
     pass
 off = "off: no webhook configured"
-expected_workers = {"slack-urgent": off, "slack-routine": off}
+expected_workers = {
+    "slack-urgent": off,
+    "slack-routine": off,
+    "email": "off: no transport configured",
+}
 if sys.argv[1] == "true":
     if configured.get("AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT") or configured.get("AIRLOCK_DEVMON_SLACK_WEBHOOK"):
         expected_workers["slack-urgent"] = "on"
     if configured.get("AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE"):
         expected_workers["slack-routine"] = "on"
+    if devmon_email.config_from_env(configured) is not None:
+        expected_workers["email"] = "on"
 fields = {
     "worker_state", "delivery_state", "last_success_at", "last_success_age_seconds", "pending_count",
     "oldest_pending_age_seconds", "last_error", "last_error_at",

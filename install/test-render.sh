@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Test install/render-nginx.sh: renders a valid site and passes `nginx -t`.
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -90,6 +90,22 @@ grep -qF '"role":"$airlock_role"' <<<"$AUD_SITE" \
 grep -q '"friend@example.com" 1;'                  <<<"$SITE" && ok "collaborator in hub map" || bad "collaborator"
 grep -q '$http_tailscale_user_login $owner_ok'     <<<"$SITE" && ok "owner_ok map present" || bad "owner_ok map"
 grep -q 'friend@example.com' <<<"$(grep -A3 '\$owner_ok {' <<<"$SITE")" && bad "owner_ok must NOT include collaborators" || ok "owner_ok excludes collaborators"
+# D7. A hub-subpath app is inside the $hub_ok server, so an owner-only manifest
+# is only true if its own fragment narrows further. fileview's audience is
+# operator-selectable, so the guard has to track it — and anything that is not
+# "shared" (including a value this renderer does not know) must narrow, never
+# widen. Without this the tile hides while the URL stays open, which reads as a
+# closed door and is not one.
+( . "$ROOT/apps/fileview/render.sh"
+  g_owner="$(render_fileview_nginx 1 owner  | grep -c 'if ($owner_ok = 0) { return 403; }')"
+  g_share="$(render_fileview_nginx 1 shared | grep -c 'owner_ok' || true)"
+  g_junk="$( render_fileview_nginx 1 zzzz   | grep -c 'if ($owner_ok = 0) { return 403; }')"
+  [ "$g_owner" = 3 ] || { echo "FAIL audience: owner must guard all 3 fileview content locations (got $g_owner)"; exit 1; }
+  [ "$g_share" = 0 ] || { echo "FAIL audience: shared must emit no owner guard (got $g_share)"; exit 1; }
+  [ "$g_junk"  = 3 ] || { echo "FAIL audience: an unknown audience must fail closed (got $g_junk)"; exit 1; }
+) && ok "audience: fileview guard tracks the declared audience, unknown fails closed" \
+  || bad "audience: fileview guard does not track the declared audience"
+
 grep -q 'listen 127.0.0.1:19903;'                  <<<"$SITE" && ok "hub redirect loopback port (default)" || bad "hub redirect port"
 # the authority must be the pinned FQDN — NOT $host (client-controlled = open
 # redirect) and not the short hostname (no cert).
@@ -120,6 +136,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$INSTALL_BIN/sudo"
 chmod +x "$INSTALL_BIN/systemctl" "$INSTALL_BIN/sudo"
 if PATH="$INSTALL_BIN:$PATH" HOME="$TMP/local-home" AIRLOCK_DRY_RUN=0 AIRLOCK_CONFIG="$LOCAL_CONFIG" \
   AIRLOCK_CONFD="$LOCAL_CONFD" AIRLOCK_WEBROOT="$TMP/local-web" \
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
   bash "$ROOT/apps/publish/install.sh" >"$TMP/local-publish.log" 2>&1; then
   ok "local publish installer generated its gated fragment"
 else
@@ -137,6 +154,7 @@ printf '%s\n' \
   'base_url = "https://docs.example"' 'token_env = "PUBLISH_TEST_TOKEN"' >"$REMOTE_CONFIG"
 if PATH="$INSTALL_BIN:$PATH" HOME="$TMP/remote-home" AIRLOCK_DRY_RUN=0 AIRLOCK_CONFIG="$REMOTE_CONFIG" \
   AIRLOCK_CONFD="$LOCAL_CONFD" AIRLOCK_WEBROOT="$TMP/remote-web" \
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
   bash "$ROOT/apps/publish/install.sh" >"$TMP/remote-publish.log" 2>&1; then
   [ ! -e "$GATED_FRAGMENT" ] && ok "remote install retracts the gated fragment" || bad "remote install left gated fragment active"
 else

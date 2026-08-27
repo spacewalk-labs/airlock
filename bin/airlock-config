@@ -8,11 +8,13 @@ Usage:
   airlock-config validate            # fail-closed sanity checks (run first)
   airlock-config catalog             # installable apps as JSON, with NO config
                                      #   yet (the picker question; see cmd_catalog)
-  airlock-config init --owner <login> [--code-root <path>] [--site-name <name>]
+  airlock-config init --owner <login> [--site-name <name>]
                       [--apps a,b,c] # the smallest config that validates -> stdout
   airlock-config apps                # list enabled app names (one per line)
   airlock-config get <dotted.key>    # e.g. auth.owner, apps.devterm.public_port
   airlock-config env <app>           # KEY=VALUE lines for `eval` in bash
+  airlock-config container-admit <app>
+                                     # pre-container-mutation runtime guard
   airlock-config json                # full resolved config (defaults merged)
   airlock-config webjson             # frontend-safe subset (/__airlock.json)
   airlock-config plaintext           # app<TAB>listen<TAB>target plaintext rows
@@ -20,6 +22,12 @@ Usage:
   airlock-config plaintext-retirement-drop <port>
                                      # recovery: forget a manually verified intent
   airlock-config package-info        # resolved [packages.*] as JSON (see D1/D6)
+  airlock-config install-snapshot <private-path>
+                                     # ORCHESTRATOR-INTERNAL: freeze the exact
+                                     #   operator config bytes for one run
+  airlock-config install-preflight [--package-info-stdin]
+                                     # ORCHESTRATOR-INTERNAL: resolve every
+                                     #   candidate projection before reconcile
   airlock-config lock-finalize       # ORCHESTRATOR-INTERNAL: record missing
                                      #   explicit-package digests after success
   airlock-config canonical-package-info <id> <repository-id> <full-40-hex-sha>
@@ -45,10 +53,13 @@ Requires Python >= 3.11 (tomllib).
 from __future__ import annotations
 
 import copy
+import contextlib
 import datetime as dt
+import difflib
 import fcntl
 import hashlib
 import heapq
+import io
 import json
 import os
 import re
@@ -110,7 +121,7 @@ CLOSED_SECTIONS: dict[str, frozenset] = {
     "airlock":  frozenset({"config_version"}),
     "site":     frozenset({"name"}),
     "auth":     frozenset({"provider", "owner", "collaborators"}),
-    "paths":    frozenset({"code_root", "wiki"}),
+    "paths":    frozenset({"wiki"}),
     "branding": frozenset({"product", "icon_ring"}),
 }
 
@@ -127,10 +138,17 @@ RETIRED_KEYS: dict[str, str] = {
         "same card sent as a `prompt` naming the same skill ran anyway. It was never "
         "the lock it reads as. What bounds a run is the approval: the owner reads the "
         "derived plan and clicks, and that plan runs or nothing does (see SECURITY.md).",
+    "paths.code_root":
+        "is gone (2026-08-23). Remove it. It was never a designed setting: markserv "
+        "and filebrowser each demand a root argument, so the installer had to write "
+        "one somewhere and it became a config key — and then read as a boundary it "
+        "never enforced. The viewer now runs with `--root /` and the tree is the "
+        "filesystem; what bounds it is the unix account the user service runs as "
+        "(see SECURITY.md).",
     "paths.mount_exclude":
-        "was never implemented — nothing was ever excluded. Remove it. Everything "
-        "under code_root is served read+write to the owner and every "
-        "collaborator (see SECURITY.md).",
+        "was never implemented — nothing was ever excluded. Remove it. The viewer "
+        "hides nothing and has no ignore list: dotfiles, .env included, list and "
+        "open like any other file (see SECURITY.md).",
     "auth.read_open":
         "was never implemented — no read-only tier exists. Remove it. Access is "
         "owner + collaborators; nothing else is admitted.",
@@ -163,10 +181,11 @@ PACKAGE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
 
 MANIFEST_NAME = "airlock-app.toml"
 
-# The five artifact classes the ledger can record and tear down. Everything an
+# The artifact classes the ledger can record and tear down. Everything an
 # app's scripts create OUTSIDE its package dir must be declared in one of them
 # (app *data* is deliberately never declared and never torn down).
-ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "rooted", "serve_ports")
+ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "rooted",
+                    "containers", "serve_ports")
 
 # A unit name may glob in the stem but must end in a real unit suffix — a bare
 # `..` or `*` would otherwise resolve outside (or to all of) the unit dirs.
@@ -174,6 +193,7 @@ UNIT_SUFFIXES = (".service", ".socket", ".timer", ".path", ".target")
 
 _SERVE_KEY_RE = re.compile(r"^[a-z0-9_]+\Z")
 _WILDCARD_RE = re.compile(r"[*?\[]")
+_CONTAINER_DECL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\*?\Z")
 
 # Full manifest schema (D2). Unknown fields anywhere in the manifest are fatal —
 # fail-closed applies to the manifest too (F10).
@@ -218,7 +238,8 @@ BUNDLE_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
     # nothing elevated. The ingest worker spawns an agent CLI, which is a child
     # of a user unit and needs no capability the platform mediates.
     "learning": (),
-    "markwand": (),
+    "fileview": (),
+    "notes": (),
     "notepad": (),
     "orca": ("rooted-artifact", "system-unit"),
     "paseo": (),
@@ -501,6 +522,14 @@ def find_config() -> Path:
     env = os.environ.get("AIRLOCK_CONFIG")
     if env:
         p = Path(env).expanduser()
+        # The installer has already resolved and frozen this origin together
+        # with AIRLOCK_CONFIG_SNAPSHOT. Do not resolve it again: replacing,
+        # deleting, or retargeting the operator path during the run must not
+        # change either the package-path base or package-info.config_path.
+        if os.environ.get("AIRLOCK_CONFIG_SNAPSHOT"):
+            if not p.is_absolute():
+                die("AIRLOCK_CONFIG must be absolute while an install snapshot is active")
+            return p
         if not p.exists():
             die(f"AIRLOCK_CONFIG points to a missing file: {p}")
         return p.resolve()
@@ -517,15 +546,64 @@ def find_config() -> Path:
 
 def load() -> dict:
     path = find_config()
+    # The installer freezes the operator file once, before it decides whether
+    # this run needs the ledger lock.  Every later config command reads those
+    # exact bytes while ``find_config()`` deliberately continues to return the
+    # original path: relative [packages.*] paths are still relative to the
+    # operator file, not to the private snapshot in /tmp.
+    snapshot = os.environ.get("AIRLOCK_CONFIG_SNAPSHOT")
+    read_path = Path(snapshot) if snapshot else path
     try:
-        with path.open("rb") as fh:
-            return tomllib.load(fh)
+        # Read once, then authenticate and parse those same bytes.  The
+        # snapshot pathname is private but still owned by the installing uid;
+        # pathname permissions alone therefore cannot make it immutable.  An
+        # exact digest on every projection makes a replacement or in-place
+        # rewrite fail before that projection can influence reconcile.
+        data = read_path.read_bytes()
+        if snapshot:
+            expected = os.environ.get("AIRLOCK_CONFIG_SNAPSHOT_SHA256", "")
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                die("install config snapshot is missing its exact SHA-256 authority", code=2)
+            actual = hashlib.sha256(data).hexdigest()
+            if actual != expected:
+                die("install config snapshot digest changed during this run — "
+                    "refusing the projection before reconcile", code=2)
+        return tomllib.loads(data.decode("utf-8"))
     except ValueError as e:
         # ValueError, not just tomllib.TOMLDecodeError (a ValueError
         # subclass): tomllib decodes the bytes as UTF-8 before parsing, so
         # one invalid byte raises a plain UnicodeDecodeError first — missing
         # that turned a clean die() into a raw traceback.
         die(f"{path}: invalid TOML: {e}")
+
+
+def cmd_install_snapshot(target: str) -> "None":
+    """Freeze the exact operator-file bytes for one installer invocation.
+
+    This is orchestrator-internal.  The caller supplies an already-created,
+    private regular file (mktemp); refusing links and non-regular targets keeps
+    the snapshot from becoming a general write primitive.
+    """
+    source = find_config()
+    destination = Path(target)
+    try:
+        data = source.read_bytes()
+        # Reject invalid bytes before publishing them as the run's authority.
+        tomllib.loads(data.decode("utf-8"))
+        flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(destination, flags)
+        with os.fdopen(fd, "wb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                die(f"install snapshot target is not a regular non-symlink file: {destination}", code=2)
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except (OSError, UnicodeError, ValueError) as exc:
+        die(f"cannot freeze install config {source} -> {destination}: {exc}", code=2)
+    print(json.dumps({"config_path": str(source),
+                      "sha256": hashlib.sha256(data).hexdigest()},
+                     sort_keys=True, separators=(",", ":")))
 
 
 def _preflight_config_abi(cfg: dict) -> int:
@@ -566,6 +644,16 @@ def resolved(cfg: dict) -> dict:
             merged = dict(spec["schema"]["defaults"])
             if spec["audience"] is not None:
                 merged["audience"] = spec["audience"]["default"]
+            else:
+                # Fail-closed: a manifest that declares no [audience] serves the
+                # owner alone. Silence used to mean "everyone the hub admits",
+                # which made reach an accident of being inside the hub server
+                # rather than a stated claim — a package could widen its own
+                # audience by omitting a block. There is no operator override
+                # here on purpose: `audience` is not an allowed key for such a
+                # manifest (see the allowed-keys branch), so the only way to
+                # serve collaborators is to say so in [audience].
+                merged["audience"] = "owner"
             merged.update(table or {})
             apps[name] = merged
             continue
@@ -576,7 +664,7 @@ def resolved(cfg: dict) -> dict:
         merged.update(table or {})
         apps[name] = merged
     paths = out.setdefault("paths", {})
-    for k in ("code_root", "wiki"):
+    for k in ("wiki",):
         if paths.get(k):
             paths[k] = str(_expanduser(str(paths[k]), f"paths.{k}"))
     return out
@@ -620,8 +708,12 @@ def cmd_validate(cfg: dict) -> "None":
                 f"manifest, or remove [apps.{name}] if this was a typo.")
     _validate_keys(cfg)
     validate_shortcuts(cfg)
+    _validate_tile_glyphs(specs)  # a glyph must exist in the sprite, or the
+    # tile renders as an empty square with no error anywhere (2026-08-25).
+    # The other tile axis, `icon`, is already fail-closed by package_specs
+    # above: every declared icon strict-resolves to a regular readable file
+    # inside the package (_validate_icon_source, F4) or validate dies.
     _warn_deprecated_config(cfg, specs)
-    _validate_code_root(cfg)
     _validate_ports(cfg)
     _validate_plaintext_retirement_intents(cfg)
     _read_ledger()          # F9a: a corrupt ledger fails validate, loudly
@@ -818,32 +910,6 @@ def _validate_packaged_types(cfg: dict, specs: dict) -> "None":
                     f"package manifest); got {val!r}")
 
 
-def _validate_code_root(cfg: dict) -> "None":
-    """[apps.markwand] serves code_root — so it must be stated, never guessed.
-
-    Markwand hands markserv (read) and filebrowser (write) this directory. It is
-    the file surface the owner AND every collaborator get, so it is not something
-    an installer may pick on the operator's behalf.
-    """
-    if "markwand" not in (cfg.get("apps", {}) or {}):
-        return
-    raw = (cfg.get("paths", {}) or {}).get("code_root")
-    hint = ("\n  [apps.markwand] serves this directory to the owner and every "
-            "collaborator, read AND write — it must be stated, not guessed.\n"
-            "  Older versions silently defaulted to ~/code: set "
-            'code_root = "~/code" to keep that. See SECURITY.md.')
-    if raw is None:
-        die("[apps.markwand] is enabled but [paths].code_root is not set." + hint)
-    if not isinstance(raw, str) or not raw.strip():
-        die(f"[paths].code_root must be a non-empty path string; got {raw!r}." + hint)
-    root = _expanduser(raw.strip(), "paths.code_root")
-    if not root.is_absolute():
-        die(f"[paths].code_root must be absolute (or ~-relative); got {raw!r}."
-            "\n  A relative path resolves against whatever directory the service "
-            "happens to start in.")
-    _warn_wide_code_root(cfg, root)
-
-
 def _expanduser(raw: str, where: str) -> Path:
     """`~` expansion that reports a bad path instead of raising.
 
@@ -856,31 +922,6 @@ def _expanduser(raw: str, where: str) -> Path:
         die(f"{where}: cannot expand {raw!r} ({e}). "
             "Use an absolute path, or a `~` that names a real user.")
         raise  # unreachable; die() exits
-
-
-def _warn_wide_code_root(cfg: dict, root: Path) -> "None":
-    """Best-effort nudge, not a boundary check.
-
-    If collaborators are configured and code_root is the home directory (or an
-    ancestor of it), every dotfile and credential under it is theirs to read and
-    edit. This is a lexical/realpath heuristic — it cannot see through a bind
-    mount (the Docker path mounts an arbitrary host dir at /code), so a clean
-    result proves nothing.
-    """
-    if not (cfg.get("auth", {}) or {}).get("collaborators"):
-        return
-    try:
-        root_r = root.resolve()
-        home_r = Path.home().resolve()   # RuntimeError when HOME is unset
-    except (RuntimeError, OSError, ValueError):   # ValueError: NUL in the path
-        return
-    if root_r == home_r or root_r in home_r.parents:
-        sys.stderr.write(
-            f"airlock-config: warning: [paths].code_root = {root} covers the home "
-            f"directory, and [auth].collaborators is not empty.\n"
-            "  Collaborators get read+write on everything under it (~/.ssh, ~/.config, "
-            "tokens), and the viewer reads through symlinks that leave it.\n"
-            "  Point it at a project directory instead. See SECURITY.md.\n")
 
 
 def _validate_ports(cfg: dict) -> "None":
@@ -969,8 +1010,21 @@ def _artifact_roots() -> dict:
     }
 
 
+def _container_claims_overlap(left: str, right: str) -> bool:
+    """Exact intersection for D9's literal-or-final-star name grammar."""
+    left_prefix = left[:-1] if left.endswith("*") else None
+    right_prefix = right[:-1] if right.endswith("*") else None
+    if left_prefix is None and right_prefix is None:
+        return left == right
+    if left_prefix is None:
+        return left.startswith(right_prefix)
+    if right_prefix is None:
+        return right.startswith(left_prefix)
+    return left_prefix.startswith(right_prefix) or right_prefix.startswith(left_prefix)
+
+
 def _validate_artifacts(pid: str, raw) -> tuple[dict, dict]:
-    """[artifacts] grammar, fail-closed per class. Returns all five classes
+    """[artifacts] grammar, fail-closed per class. Returns all classes
     (missing ones as empty lists)."""
     if raw is None:
         raw = {}
@@ -1004,7 +1058,10 @@ def _validate_artifacts(pid: str, raw) -> tuple[dict, dict]:
         else:
             if any(not isinstance(v, str) or not v.strip() for v in vals):
                 die(f"package '{pid}': artifacts.{cls} must be a list of non-empty strings")
-            out[cls] = [v.strip() for v in vals]
+            if cls == "containers" and any(v != v.strip() for v in vals):
+                die(f"package '{pid}': artifacts.containers entries must not have "
+                    "leading or trailing whitespace")
+            out[cls] = list(vals) if cls == "containers" else [v.strip() for v in vals]
     for name in out["units"]:
         if ("/" in name or name in (".", "..")
                 or name.startswith("-") or "**" in name
@@ -1076,7 +1133,12 @@ def _validate_artifacts(pid: str, raw) -> tuple[dict, dict]:
     # text below; the actual admission decision never re-derives it.
     webroot_parent_forbidden = _ledger_module()._rooted_dynamic_anchor_forbidden(webroot_parent)
     for p in out["rooted"]:
-        expanded = p.replace("${webroot_parent}", webroot_parent)
+        # bin/airlock-ledger's OWN substitution, for the same no-drift reason
+        # the containment check below already states: the platform anchors
+        # are env-overridable there (_platform_dir), and a literal
+        # replace() here would resolve this pattern into a different space
+        # than the allowlist admits.
+        expanded = _ledger_module()._rooted_substitute(p, webroot_parent)
         if not os.path.isabs(expanded) or any(s in (".", "..") for s in expanded.split("/")):
             die(f"package '{pid}': artifacts.rooted entry {p!r} must be absolute after ${'{'}webroot_parent{'}'} substitution with no '.' or '..' segments")
         if any(c in seg for seg in expanded.split("/")[:-1] for c in "*?[") or "**" in expanded:
@@ -1097,6 +1159,20 @@ def _validate_artifacts(pid: str, raw) -> tuple[dict, dict]:
                     "so ${webroot_parent} grants no authority here; move the webroot to "
                     "a deeper path, or manage this artifact by hand")
             die(f"package '{pid}': artifacts.rooted entry {p!r} is outside the rooted allowlist{hint}")
+    for declaration in out["containers"]:
+        if (_CONTAINER_DECL_RE.fullmatch(declaration) is None
+                or declaration.startswith("-")
+                or any(char.isspace() for char in declaration)):
+            die(f"package '{pid}': artifacts.containers entry {declaration!r} must "
+                "be a literal Docker container name or a non-empty literal prefix "
+                "followed by one final '*' (no '/', whitespace, option-like name, "
+                "or other wildcard position)")
+    for index, left in enumerate(out["containers"]):
+        for right in out["containers"][index + 1:]:
+            if _container_claims_overlap(left, right):
+                die(f"package '{pid}': artifacts.containers declarations {left!r} "
+                    f"and {right!r} overlap — each runtime name must have one exact "
+                    "declaration owner")
     for k in out["serve_ports"]:
         if _SERVE_KEY_RE.fullmatch(k) is None:
             die(f"package '{pid}': artifacts.serve_ports entry {k!r} is not a "
@@ -1212,7 +1288,8 @@ def _pattern_claims(arts: dict, roots: dict, unit_scopes: dict | None = None) ->
             q = os.path.join(home, q[2:].lstrip("/"))
         claims.append(_canon_claim(q))
     for p in arts.get("rooted", []):
-        q = str(p).replace("${webroot_parent}", str(Path(roots["webroot"]).parent))
+        q = _ledger_module()._rooted_substitute(
+            str(p), str(Path(roots["webroot"]).parent))
         claims.append(_canon_claim(q))
     return claims
 
@@ -1272,6 +1349,22 @@ def _recorded_claims(ledger: dict, skip_id: str, roots: dict):
     return paths, ports
 
 
+def _recorded_container_claims(ledger: dict, skip_id: str) -> list[tuple[str, str]]:
+    """Container declarations retained by every other id's journal record."""
+    claims = []
+    for rid, entry in (ledger.get("entries") or {}).items():
+        if rid == skip_id or not isinstance(entry, dict):
+            continue
+        for kind in ("committed", "intent"):
+            record = entry.get(kind)
+            runtime = record.get("container_runtime") if isinstance(record, dict) else None
+            if not isinstance(runtime, dict):
+                continue
+            for declaration in runtime.get("declarations") or []:
+                claims.append((rid, declaration))
+    return claims
+
+
 def _builtin_plaintext_ports(cfg: dict, pkgs: dict) -> set:
     """Listen ports the built-in plaintext sweep will map (hub's 19901 and any
     configured http_port/public_port on a non-packaged app)."""
@@ -1312,6 +1405,7 @@ def _validate_disjoint(pkgs: dict, cfg: dict) -> "None":
     roots = _artifact_roots()
     ledger = _read_ledger()
     mine = {pid: _pattern_claims(p["artifacts"], roots, p.get("unit_scopes")) for pid, p in pkgs.items()}
+    containers = {pid: list(p["artifacts"]["containers"]) for pid, p in pkgs.items()}
     # plaintext_redirect ports (public AND redirect) join the SAME ownership
     # pool as serve ports (Major N1): the intra-app check in
     # packages_resolved stops at this package's own boundary, so without
@@ -1358,6 +1452,12 @@ def _validate_disjoint(pkgs: dict, cfg: dict) -> "None":
                         die(f"packages '{a}' and '{b}' claim overlapping artifacts: "
                             f"{ca!r} vs {cb!r}. Ownership must be exclusive — give "
                             "them distinct literal path prefixes (D2).")
+            for ca in containers[a]:
+                for cb in containers[b]:
+                    if _container_claims_overlap(ca, cb):
+                        die(f"packages '{a}' and '{b}' claim overlapping container "
+                            f"namespaces: {ca!r} vs {cb!r}. Container ownership must "
+                            "be exclusive (D9).")
             both = serve[a] & serve[b]
             if both:
                 die(f"packages '{a}' and '{b}' both claim serve port "
@@ -1386,6 +1486,13 @@ def _validate_disjoint(pkgs: dict, cfg: dict) -> "None":
                     f"which is recorded under id '{rid}' in the installed-state "
                     "ledger. The record owns it until removed — tear that app "
                     f"down first (bin/airlock-teardown {rid}).")
+        for rid, recorded in _recorded_container_claims(ledger, pid):
+            for declaration in containers[pid]:
+                if _container_claims_overlap(declaration, recorded):
+                    die(f"package '{pid}' claims container namespace {declaration!r}, "
+                        f"which overlaps {recorded!r} recorded under id '{rid}' in "
+                        "the installed-state ledger. The record owns it until removed "
+                        f"— tear that app down first (bin/airlock-teardown {rid}).")
 
 
 def _regular_file(p: Path) -> bool:
@@ -1635,7 +1742,92 @@ def _validate_prereqs(pid: str, raw) -> list:
     return out
 
 
-_SHORTCUT_KEYS = ("label", "url", "cat", "glyph", "sub")
+_SHORTCUT_KEYS = ("label", "url", "cat", "glyph", "sub", "section", "audience")
+
+# A shortcut's audience defaults to "shared", which is the opposite of the
+# package rule (#249: silence resolves to "owner"). The two rules differ because
+# the thing being widened differs. #249 fails closed because a PACKAGE serves
+# this box through the hub's nginx — declaring nothing let it widen its own
+# reach over this box's filesystem and services, which is the operator's call to
+# make, not the hub's to make by omission. A shortcut has no fragment, no port
+# and no package: it is an anchor to an address that already exists elsewhere
+# and is gated by whatever serves it. There is nothing of this box behind it, so
+# there is nothing for silence to widen.
+# Owner decision 2026-08-25: the company shortcuts are visible to collaborators.
+# Narrowing one stays a single line — `audience = "owner"`.
+_SHORTCUT_AUDIENCE_DEFAULT = "shared"
+
+# The heading a shortcut is filed under when it does not name one. Resolved
+# HERE and not in the launcher so the default has one home: webjson always
+# carries a section string for a shortcut, and hub/index.html only groups by
+# the string it is handed. A second default in JS would be a second thing to
+# keep in step, and the one that drifts is the one nothing validates.
+_SHORTCUT_SECTION_DEFAULT = "Shortcuts"
+# A heading, not a sentence. Long enough for "개인 전용 도구" or "Shared services",
+# short enough that it cannot become the paragraph that belongs in `sub`.
+_SHORTCUT_SECTION_MAX = 32
+
+
+# The hub sprite is the closed set of symbol ids a `glyph` may name. It is
+# read from the shipped launcher itself (hub/index.html) rather than from a
+# hand-kept list, because the sprite is the document the browser will actually
+# resolve the id in — a name that is not there renders as an EMPTY tile, with
+# no error anywhere. Measured 2026-08-25: four invented glyph names passed
+# validate, install, and smoke, and only the screen showed blank squares.
+_SPRITE_PATH = REPO_ROOT / "hub" / "index.html"
+_SPRITE_SYMBOL_RE = re.compile(r'<symbol id="([^"]+)"')
+_sprite_glyph_cache = None
+
+
+def sprite_glyphs() -> "frozenset[str]":
+    """Symbol ids that exist in the hub sprite — fail-closed.
+
+    An unreadable sprite or a sprite with zero symbols dies here instead of
+    returning an empty set: an empty set would fail every glyph with a message
+    blaming the config, when the broken thing is the sprite (or this regex)."""
+    global _sprite_glyph_cache
+    if _sprite_glyph_cache is not None:
+        return _sprite_glyph_cache
+    try:
+        html = _SPRITE_PATH.read_text(encoding="utf-8")
+    except OSError as e:
+        die(f"cannot read the hub sprite at {_SPRITE_PATH}: {e} — glyph names "
+            f"cannot be checked, and an unchecked name is a blank tile")
+    ids = frozenset(_SPRITE_SYMBOL_RE.findall(html))
+    if not ids:
+        die(f"no <symbol id=...> found in {_SPRITE_PATH} — the sprite moved "
+            f"or changed shape, so no glyph name can be verified")
+    _sprite_glyph_cache = ids
+    return ids
+
+
+def _check_glyph_exists(where: str, glyph: str) -> "None":
+    """Die unless `glyph` names a real <symbol> in the hub sprite."""
+    ids = sprite_glyphs()
+    if glyph in ids:
+        return
+    close = difflib.get_close_matches(glyph, sorted(ids), n=3)
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    die(f"{where} glyph \"{glyph}\" does not exist in the hub sprite — "
+        f"hub/index.html has no <symbol id=\"{glyph}\">, so the launcher "
+        f"would draw an empty tile.{hint} "
+        f"Available glyphs: {', '.join(sorted(ids))}")
+
+
+def _validate_tile_glyphs(specs: dict) -> "None":
+    """Every packaged [tile] glyph must name a real sprite symbol.
+
+    Runs at validate (not at manifest parse) so that read-only consumers like
+    webjson keep working on a box whose checkout predates a sprite rename;
+    validate is the gate every install runs first, and that is where a bad
+    name must stop the pipeline."""
+    for pid in sorted(specs):
+        tile = specs[pid]["tile"]
+        if tile is not None and tile["glyph"] is not None:
+            _check_glyph_exists(
+                f"package '{pid}' manifest "
+                f"({Path(specs[pid]['dir']) / 'airlock-app.toml'}): [tile]",
+                tile["glyph"])
 
 
 def validate_shortcuts(cfg: dict) -> "None":
@@ -1653,6 +1845,16 @@ def validate_shortcuts(cfg: dict) -> "None":
         down on 2026-08-21 — the browser, not the config, decides that fight.
       * `glyph` only (no `icon`): an icon file is staged out of a package, and a
         shortcut has no package to stage from.
+
+    Wider than a package [tile] in exactly one place: `section`, the launcher
+    heading this tile is filed under. It is config rather than code because the
+    grouping a box wants is a fact about that box's team, not about Airlock. The
+    launcher this table was written for had been drawing its own two headings,
+    in its own language, for months before Airlock existed; a shipped English
+    constant could not have said what those headings say. Only shortcuts carry
+    it: a package tile is something this box runs, so it belongs under the one
+    heading the hub already draws, and letting packages scatter across headings
+    would buy nothing and cost an empty-section case.
     """
     shortcuts = cfg.get("shortcuts") or {}
     if not shortcuts:
@@ -1684,9 +1886,34 @@ def validate_shortcuts(cfg: dict) -> "None":
         if not isinstance(glyph, str) or not glyph.strip():
             die(f"{where} glyph must be a non-empty symbol id (a shortcut has no "
                 f"package to stage an icon file from); got {glyph!r}")
+        # Non-empty is not enough: an invented id validates, installs, smokes
+        # green, and renders a blank tile. The sprite is the truth (2026-08-25).
+        _check_glyph_exists(where, glyph.strip())
         sub = raw.get("sub", "")
         if not isinstance(sub, str):
             die(f"{where} sub must be a string; got {sub!r}")
+        section = raw.get("section", _SHORTCUT_SECTION_DEFAULT)
+        if not isinstance(section, str) or not section.strip():
+            die(f"{where} section must be a non-empty string (the launcher "
+                f"heading this tile is filed under); got {section!r}")
+        # A heading is drawn as text, so a control character would be an
+        # invisible difference between two headings that look identical — two
+        # sections, one visible name, and no way to tell from the screen which
+        # tile went where.
+        if _CTRL_RE.search(section):
+            die(f"{where} section contains a control character — it is drawn as "
+                f"a launcher heading, and two headings that differ only by an "
+                f"invisible character render as one name and two sections.")
+        if len(section.strip()) > _SHORTCUT_SECTION_MAX:
+            die(f"{where} section is {len(section.strip())} characters; the "
+                f"limit is {_SHORTCUT_SECTION_MAX}. It is a heading, not a "
+                f"description — put the sentence in `sub`.")
+        audience = raw.get("audience", _SHORTCUT_AUDIENCE_DEFAULT)
+        if audience not in ("shared", "owner"):
+            die(f"{where} audience must be \"shared\" or \"owner\"; got "
+                f"{audience!r}. Default is {_SHORTCUT_AUDIENCE_DEFAULT!r} — a "
+                f"shortcut runs nothing here, so `owner` is how you say this "
+                f"link itself should not be shown to collaborators.")
 
 
 def _validate_tile(pid: str, raw):
@@ -1967,11 +2194,14 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
         "AIRLOCK_AUTH_PROVIDER", "AIRLOCK_IDENTITY_HEADER", "AIRLOCK_OWNER",
         "AIRLOCK_COLLABORATORS", "AIRLOCK_CODE_ROOT", "AIRLOCK_WIKI",
         "AIRLOCK_APP_DIR", "AIRLOCK_APP_ID", "AIRLOCK_ROOT", "AIRLOCK_CONFIG",
+        "AIRLOCK_ACCOUNTS_BIN", "AIRLOCK_ACCOUNTS_STATUS_BIN", "AIRLOCK_SECRET_BIN",
         # STATE_DIR is exported only when the operator sets it; a package
         # reading it is still reading a PLATFORM name (with its own fallback),
         # never a config key called `dir` — so exempt it in both cases.
         "AIRLOCK_STATE_DIR", "AIRLOCK_WEBROOT", "AIRLOCK_CONFD",
-        "AIRLOCK_TS_FQDN", "AIRLOCK_PKG_INFO",
+        "AIRLOCK_TS_FQDN", "AIRLOCK_PKG_INFO", "AIRLOCK_INSTALL_NONCE",
+        "AIRLOCK_CONTAINER_RECONCILE_MODE",
+        "AIRLOCK_CONTAINER_DAEMON_IDENTITY",
     }
     # Built at runtime around the package id; both are SEARCH patterns
     # (finditer over file text), not validators — matches are compared
@@ -2941,12 +3171,12 @@ def _toml_str(value: str) -> str:
     return '"' + "".join(out) + '"'
 
 
-def cmd_init(owner: str, code_root, site_name, selected: list) -> "None":
+def cmd_init(owner: str, site_name, selected: list) -> "None":
     """Write the smallest airlock.toml that validates, to STDOUT.
 
     The macOS launcher's picker (docs/tasks/active/macos-app-launcher.md,
-    Phase 1b) is mechanically this: two real inputs — a Tailscale login and a
-    code directory — plus one table per ticked app. airlock.toml.example is 186
+    Phase 1b) is mechanically this: one real input — a Tailscale login — plus
+    one table per ticked app. airlock.toml.example is 186
     lines and shows a port for nearly every app, which reads as "choose twenty
     ports"; every one of them is defaulted by the manifests, so none of that
     belongs in a generated file.
@@ -2955,13 +3185,8 @@ def cmd_init(owner: str, code_root, site_name, selected: list) -> "None":
     wrong, and the caller redirects. It also means this command can be tested
     without a filesystem.
 
-    Three things it does NOT do:
+    Two things it does NOT do:
 
-    - It does not guess `code_root`. Markwand serves that directory read AND
-      write to the owner and every collaborator (_validate_code_root), so an
-      installer may not pick it — which is why --code-root is required as soon
-      as markwand is selected, here rather than at validate time, so a GUI
-      fails at the picker instead of three screens later.
     - It does not know about architecture. The apps run in the Linux
       environment, whose arch is not this machine's; `catalog` reports each
       app's constraint and the caller compares. Guessing here would refuse
@@ -2998,22 +3223,6 @@ def cmd_init(owner: str, code_root, site_name, selected: list) -> "None":
                 chosen.add(dep)
                 added.add(dep)
                 frontier.append(dep)
-    if "markwand" in chosen and not (code_root or "").strip():
-        die("--code-root is required when markwand is selected: it serves that "
-            "directory to the owner and every collaborator, read and write, so "
-            "it cannot be guessed (see SECURITY.md).", code=2)
-    if code_root is not None:
-        # The same rule _validate_code_root applies, applied now. Accepting
-        # `--code-root relative` here and rejecting it at validate is precisely
-        # the failure this command exists to move earlier: the GUI would report it
-        # on the install screen, in the validator's words, about a value the
-        # operator chose three screens back.
-        if not code_root.strip():
-            die("--code-root must be a non-empty path", code=2)
-        if not _expanduser(code_root.strip(), "--code-root").is_absolute():
-            die(f"--code-root must be absolute (or ~-relative); got "
-                f"{code_root!r}.\n  A relative path resolves against whatever "
-                "directory the service happens to start in.", code=2)
     if added:
         print("added as dependencies: " + ", ".join(sorted(added)), file=sys.stderr)
     # Dependencies before dependents, ties alphabetical. app_order re-derives the
@@ -3053,8 +3262,6 @@ def cmd_init(owner: str, code_root, site_name, selected: list) -> "None":
     if site_name:
         lines += ["", "[site]", f"name = {_toml_str(site_name)}"]
     lines += ["", "[auth]", 'provider = "tailscale"', f"owner = {_toml_str(owner)}"]
-    if code_root:
-        lines += ["", "[paths]", f"code_root = {_toml_str(code_root)}"]
     # [apps.hub] is not a choice: cmd_validate requires it ("the entrance") and
     # it is a RESERVED_PACKAGE_ID with no apps/hub tree, so it never appears in
     # `catalog` either. A picker cannot offer to switch off the front door.
@@ -3137,6 +3344,16 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
     serve_mappings = _shipped_default_serve_mappings(spec)
 
     ledger_mod = _ledger_module()
+    # Container declarations are package inputs, but their durable runtime
+    # identity lives in record.container_runtime (D9), not in the filesystem
+    # artifact map expanded below. Keep the two projections explicit so the
+    # adoption path cannot accidentally feed a seventh key to the six-class
+    # path/port expander.
+    ledger_artifacts = {
+        name: list(spec["artifacts"][name])
+        for name in ledger_mod.ARTIFACT_CLASSES
+    }
+    container_declarations = list(spec["artifacts"]["containers"])
     # expand_declared is airlock-ledger's own function and expects its own
     # STRING-valued root set (`_current_roots()`), not airlock-config's
     # Path-valued `_artifact_roots()` (used everywhere else here for
@@ -3146,7 +3363,7 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
     live_roots = ledger_mod._current_roots()
     try:
         expanded = ledger_mod.expand_declared(
-            spec["artifacts"], {}, live_roots,
+            ledger_artifacts, {}, live_roots,
             unit_scopes=spec["unit_scopes"], capabilities=spec["capabilities"])
     except ledger_mod.LedgerError as e:
         return True, False, f"artifact expansion failed: {e}", None
@@ -3188,6 +3405,12 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
         mode, listen = sorted(collide)[0]
         return True, False, (f"serve mapping ({mode}, {listen}) is recorded under "
                         "another id in the installed-state ledger"), None
+    for rid, recorded in _recorded_container_claims(ledger, pid):
+        for declaration in container_declarations:
+            if _container_claims_overlap(declaration, recorded):
+                return True, False, (f"container namespace {declaration!r} overlaps "
+                                f"{recorded!r} recorded under id '{rid}' in the "
+                                "installed-state ledger"), None
 
     # 2) vs the platform's own fixed claims, and vs the roots themselves.
     platform_claims = _platform_state_claims(roots)
@@ -3216,6 +3439,12 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
             mode, listen = sorted(overlap_ports)[0]
             return True, False, (f"serve mapping ({mode}, {listen}) is declared by "
                             f"configured app '{other_pid}'"), None
+        for declaration in container_declarations:
+            for other in p["artifacts"]["containers"]:
+                if _container_claims_overlap(declaration, other):
+                    return True, False, (f"container namespace {declaration!r} "
+                                    f"overlaps configured app '{other_pid}' "
+                                    f"declaration ({other!r})"), None
 
     # 4) vs the built-in plaintext-registry ports (hub's own).
     builtin_ports = _builtin_plaintext_ports(cfg, pkgs)
@@ -3224,9 +3453,27 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
         return True, False, (f"serve mapping port {sorted(http_collide)[0]} is a "
                         "built-in app's plaintext mapping"), None
 
+    # A pre-ledger runtime object has no immutable id/nonce evidence the
+    # platform can safely adopt. Reporting --adopt and later dropping only a
+    # newly generated empty nonce would leave that live object behind and make
+    # the next install wedge on a foreign collision. Keep detection and forced
+    # adoption on this same predicate: an existing path plus a live namespace
+    # match is an EXCLUDE requiring manual resolution, never an ADOPT command.
+    if container_declarations:
+        try:
+            live_containers = ledger_mod._enumerate_containers()
+        except ledger_mod.LedgerError as e:
+            return True, False, f"container namespace probe failed: {e}", None
+        for obj in live_containers:
+            if ledger_mod._container_name_matches(obj["name"], container_declarations):
+                return True, False, (f"container namespace is occupied by live "
+                                f"container {obj['name']!r}; pre-ledger runtime "
+                                "identity cannot be adopted safely"), None
+
     package = {
         "dir": str(_shipped_root() / pid),
-        "artifacts": spec["artifacts"],
+        "artifacts": ledger_artifacts,
+        "containers": container_declarations,
         "serve_port_values": {k: v["listen"] for k, v in serve_mappings.items()},
         "serve_mappings": serve_mappings,
         "unit_scopes": spec["unit_scopes"],
@@ -3568,6 +3815,55 @@ def cmd_package_info(cfg: dict) -> "None":
         "order": app_order(cfg),
         "packages": packages_resolved(cfg),
     }, indent=2, sort_keys=True))
+
+
+def cmd_install_preflight(cfg: dict, expected_package_info: dict | None = None) -> "None":
+    """Resolve every read-only projection before reconcile can remove an app.
+
+    A candidate that fails only when a later projection is first read must be
+    rejected while every old app is still active. The canonical digest lets the
+    orchestrator repeat the same closed projection immediately before reconcile
+    and reject a candidate that changed in between.
+    """
+    projections: dict[str, str] = {}
+
+    def capture(name: str, function, *args) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            function(cfg, *args)
+        projections[name] = output.getvalue()
+
+    capture("validate", cmd_validate)
+    capture("package-info", cmd_package_info)
+    if expected_package_info is not None:
+        try:
+            actual_package_info = json.loads(projections["package-info"])
+        except json.JSONDecodeError as exc:  # internal output must stay JSON
+            die(f"install preflight produced invalid package-info: {exc}", code=2)
+        if actual_package_info != expected_package_info:
+            die("install candidate package-info differs from the orchestrator snapshot — "
+                "refusing reconcile before any recorded app is deactivated", code=2)
+        # Make the caller-supplied ledger authority an explicit digest input,
+        # even though equality above already proved the two structures match.
+        projections["package-info-authority"] = json.dumps(
+            expected_package_info, sort_keys=True, separators=(",", ":"))
+    capture("apps", cmd_apps)
+    capture("webjson", cmd_webjson)
+    capture("plaintext", cmd_plaintext)
+    capture("plaintext-known", cmd_plaintext_known)
+    capture("prereqs", cmd_prereqs)
+    capture("known-builtins", cmd_known_builtins)
+    capture("adopt-scan", cmd_adopt_scan)
+    for app in app_order(cfg):
+        # lifecycle=False: capture the candidate env projection only. The
+        # container load gate inside cmd_env reads reconcile-phase ledger
+        # state (this run's intent does not exist yet; a crashed run's may)
+        # and belongs to airlock_load, after reconcile has repaired it.
+        capture(f"env:{app}", cmd_env, app, False)
+    for package_id in sorted(package_specs(cfg)):
+        capture(f"icon-src:{package_id}", cmd_icon_src, package_id)
+    payload = json.dumps(projections, sort_keys=True, separators=(",", ":")).encode()
+    print(hashlib.sha256(payload).hexdigest())
 
 
 def cmd_lock_finalize(cfg: dict, override_receipt: str | None = None) -> "None":
@@ -4012,8 +4308,9 @@ def _envkey(app: str, key: str) -> str:
     return f"AIRLOCK_{app.replace('-', '_').upper()}_{key.upper()}"
 
 
-def cmd_env(cfg: dict, app: str) -> "None":
-    _warn_deprecated_config(cfg, package_specs(cfg), only_app=app)
+def cmd_env(cfg: dict, app: str, lifecycle: bool = True) -> "None":
+    specs = package_specs(cfg)
+    _warn_deprecated_config(cfg, specs, only_app=app)
     r = resolved(cfg)
     if app not in r.get("apps", {}):
         die(f"app not enabled (no [apps.{app}] table): {app}")
@@ -4032,9 +4329,46 @@ def cmd_env(cfg: dict, app: str) -> "None":
         "AIRLOCK_IDENTITY_HEADER": identity_header(cfg),
         "AIRLOCK_OWNER": auth.get("owner", ""),
         "AIRLOCK_COLLABORATORS": ",".join(collaborators),
-        "AIRLOCK_CODE_ROOT": paths.get("code_root", ""),
         "AIRLOCK_WIKI": paths.get("wiki", ""),
     }
+    # D9: the ledger writes a container intent before lifecycle code runs.
+    # Read that authoritative nonce on the installer's first airlock_load;
+    # never trust an ambient value and never fall back to committed (a
+    # same-digest reinstall first journals an intent that reuses that nonce).
+    # Dry runs deliberately have no intent and therefore receive an empty
+    # value; the certified bundled installer uses its deterministic fallback.
+    spec = specs.get(app)
+    if spec is not None and spec["artifacts"]["containers"]:
+        # Emit an explicit empty assignment when no intent exists. `eval` of
+        # this projection must clear a caller-supplied ambient nonce rather
+        # than leaving lifecycle code to mistake it for platform authority.
+        common["AIRLOCK_INSTALL_NONCE"] = ""
+        common["AIRLOCK_CONTAINER_RECONCILE_MODE"] = ""
+        common["AIRLOCK_CONTAINER_DAEMON_IDENTITY"] = ""
+        # The load gate below is LIFECYCLE-PHASE state, not a candidate
+        # projection: this run's intent is journaled only during reconcile, so
+        # at install-preflight time the only intent that can exist is a
+        # leftover from a crashed run — whose old-nonce teardown and fresh
+        # journal are exactly what reconcile is about to perform. Running the
+        # gate that early would (a) wedge crash recovery forever (the old
+        # nonce's surviving objects fail the fresh-intent admission before the
+        # repair path can reach them) and (b) make the preflight digest depend
+        # on run phase. The candidate projection is therefore the no-intent
+        # form: the explicit empty triple above.
+        if lifecycle:
+            entry = (_read_ledger().get("entries") or {}).get(app) or {}
+            intent = entry.get("intent") if isinstance(entry, dict) else None
+            runtime = intent.get("container_runtime") if isinstance(intent, dict) else None
+            if isinstance(runtime, dict):
+                ledger_mod = _ledger_module()
+                try:
+                    admission = ledger_mod.container_install_admission_for_load(app, entry)
+                except ledger_mod.LedgerError as exc:
+                    die(f"container runtime admission failed for app {app!r}: {exc}")
+                if admission is not None:
+                    common["AIRLOCK_INSTALL_NONCE"] = admission["install_nonce"]
+                    common["AIRLOCK_CONTAINER_RECONCILE_MODE"] = admission["mode"]
+                    common["AIRLOCK_CONTAINER_DAEMON_IDENTITY"] = admission["daemon_identity"]
     lines = [f"{k}={shlex.quote(str(v))}" for k, v in common.items()]
     for key, val in r["apps"][app].items():
         # Nested tables (e.g. [apps.publish.public_target]) are not flattened into
@@ -4044,6 +4378,25 @@ def cmd_env(cfg: dict, app: str) -> "None":
         v = ("true" if val else "false") if isinstance(val, bool) else str(val)
         lines.append(f"{_envkey(app, key)}={shlex.quote(v)}")
     print("\n".join(lines))
+
+
+def cmd_container_admit(cfg: dict, app: str) -> "None":
+    specs = package_specs(cfg)
+    if app not in resolved(cfg).get("apps", {}):
+        die(f"app not enabled (no [apps.{app}] table): {app}")
+    spec = specs.get(app)
+    if spec is None or not spec["artifacts"]["containers"]:
+        die(f"app {app!r} has no container artifact declaration")
+    entry = (_read_ledger().get("entries") or {}).get(app) or {}
+    ledger_mod = _ledger_module()
+    try:
+        admission = ledger_mod.container_install_admission_for_load(app, entry)
+    except ledger_mod.LedgerError as exc:
+        die(f"container runtime admission failed for app {app!r}: {exc}")
+    if admission is None:
+        die(f"container runtime admission failed for app {app!r}: no intent record")
+    print(f"{admission['mode']}\t{admission['install_nonce']}\t"
+          f"{admission['daemon_identity']}")
 
 
 def cmd_json(cfg: dict) -> "None":
@@ -4099,8 +4452,11 @@ def cmd_webjson(cfg: dict) -> "None":
             # at all and is filtered out of the tile grid by name anyway.
             entry["packaged"] = True
             entry["source_class"] = spec["source_class"]
-            if spec["audience"] is not None:
-                entry["audience"] = table.get("audience")
+            # Always carry an audience: resolved() gives an undeclared manifest
+            # the fail-closed "owner", and the launcher filter treats anything
+            # that is not "shared" as owner-only. Emitting nothing here would
+            # hand the launcher an undefined it has to guess about.
+            entry["audience"] = table.get("audience", "owner")
             if spec["tile"] is not None:
                 tile = {"label": spec["tile"]["label"],
                         "sub": spec["tile"]["sub"],
@@ -4118,10 +4474,23 @@ def cmd_webjson(cfg: dict) -> "None":
     # the href, so an absolute https URL needs no renderer change. external=true
     # because a shortcut leaves this origin (new tab, same rule as any
     # third-party service).
+    #
+    # `section` is always present here, defaulted if the table omitted it, so the
+    # launcher groups by a string it was handed rather than by one it invents.
+    # `shortcut: true` is what the launcher reads to say "this leaves the Airlock
+    # gate" on screen — external alone cannot: a packaged app on its own port is
+    # external too and is still behind the gate.
     for sid, raw in (r.get("shortcuts") or {}).items():
         apps[sid] = {
             "external": True,
             "shortcut": True,
+            "section": raw.get("section", _SHORTCUT_SECTION_DEFAULT).strip(),
+            # Always emitted, like a package's. The launcher's airlockTileVisible
+            # treats a MISSING audience the same as "owner" (#249), so a shortcut
+            # that omitted the key here was owner-only no matter what the config
+            # said — the five company shortcuts were invisible to collaborators
+            # and nothing in the config could say otherwise.
+            "audience": raw.get("audience", _SHORTCUT_AUDIENCE_DEFAULT),
             "tile": {"label": raw["label"], "sub": raw.get("sub", ""),
                      "cat": raw["cat"], "path": raw["url"],
                      "glyph": raw["glyph"]},
@@ -4180,18 +4549,16 @@ def main(argv: list[str]) -> int:
     if cmd == "init":
         # Same reason as catalog: this command exists to CREATE the config that
         # every command below load() requires, so it cannot wait for one.
-        owner = code_root = site_name = None
+        owner = site_name = None
         apps: list = []
         rest_iter = iter(rest)
         for arg in rest_iter:
-            if arg in ("--owner", "--code-root", "--site-name", "--apps"):
+            if arg in ("--owner", "--site-name", "--apps"):
                 value = next(rest_iter, None)
                 if value is None:
                     die(f"{arg} requires a value", code=2)
                 if arg == "--owner":
                     owner = value
-                elif arg == "--code-root":
-                    code_root = value
                 elif arg == "--site-name":
                     site_name = value
                 else:
@@ -4204,11 +4571,11 @@ def main(argv: list[str]) -> int:
             else:
                 die(f"unknown argument for init: {arg}\n"
                     "  usage: airlock-config init --owner <login> "
-                    "[--code-root <path>] [--site-name <name>] "
+                    "[--site-name <name>] "
                     "[--apps a,b,c]", code=2)
         if owner is None:
             die("init requires --owner <login>", code=2)
-        cmd_init(owner, code_root, site_name, apps)
+        cmd_init(owner, site_name, apps)
         return 0
     if cmd == "catalog":
         if rest:
@@ -4220,6 +4587,11 @@ def main(argv: list[str]) -> int:
             die("--dangerously-admit-unverified has no meaning for catalog: it "
                 "lists shipped manifests and admits nothing", code=2)
         cmd_catalog()
+        return 0
+    if cmd == "install-snapshot":
+        if len(rest) != 1:
+            die("install-snapshot requires one private target path", code=2)
+        cmd_install_snapshot(rest[0])
         return 0
     cfg = load()
     _preflight_config_abi(cfg)
@@ -4257,12 +4629,29 @@ def main(argv: list[str]) -> int:
         if not rest:
             die("env requires an app name", code=2)
         cmd_env(cfg, rest[0])
+    elif cmd == "container-admit":
+        if len(rest) != 1:
+            die("container-admit requires one app name", code=2)
+        cmd_container_admit(cfg, rest[0])
     elif cmd == "json":
         cmd_json(cfg)
     elif cmd == "webjson":
         cmd_webjson(cfg)
     elif cmd == "package-info":
         cmd_package_info(cfg)
+    elif cmd == "install-preflight":
+        if not rest:
+            expected_package_info = None
+        elif rest == ["--package-info-stdin"]:
+            try:
+                expected_package_info = json.load(sys.stdin)
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                die(f"install-preflight package-info stdin is invalid JSON: {exc}", code=2)
+            if not isinstance(expected_package_info, dict):
+                die("install-preflight package-info stdin must be a JSON object", code=2)
+        else:
+            die("install-preflight takes only --package-info-stdin", code=2)
+        cmd_install_preflight(cfg, expected_package_info)
     elif cmd == "lock-finalize":
         if _DANGEROUS_ADMIT_UNVERIFIED is None:
             if rest:

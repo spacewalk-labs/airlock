@@ -20,7 +20,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 HERE="${AIRLOCK_APP_DIR:-$HERE}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-learning}"
 # shellcheck source=/dev/null
@@ -100,6 +100,16 @@ INGEST_PATH="${INGEST_PATH}:/usr/local/bin:/usr/bin:/bin"
 UNSAFE_ENV="$(python3 "$HERE/backend/providers.py" --unsafe-env)" \
   || die "could not read the billing-env list from the provider adapter"
 PROVIDER="${AIRLOCK_LEARNING_PROVIDER:-auto}"
+# The platform path is a handed-in D5 capability, not something this package derives
+# from AIRLOCK_ROOT. Resolve it once so both units keep working across cwd changes.
+case "$AIRLOCK_ACCOUNTS_STATUS_BIN" in
+  /*) ;;
+  *) die "AIRLOCK_ACCOUNTS_STATUS_BIN must be an absolute D5 platform path" ;;
+esac
+[ -f "$AIRLOCK_ACCOUNTS_STATUS_BIN" ] && [ -x "$AIRLOCK_ACCOUNTS_STATUS_BIN" ] \
+  || die "AIRLOCK_ACCOUNTS_STATUS_BIN does not name an executable platform file"
+ACCOUNTS_STATUS_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+  "$AIRLOCK_ACCOUNTS_STATUS_BIN")"
 case "$PROVIDER" in
   auto|claude|codex) ;;
   *) die "provider must be auto, claude or codex; got '$PROVIDER'" ;;
@@ -136,9 +146,11 @@ if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -z "${AIRLOCK_RENDER_DIR:-}" ]; then
 else
 install -d "$UNIT_DIR"
 render_learning_unit_server "$LIBRARY" "$PUBLISH_SHARE" "$STATE_DIR" "$PORT" "$LISTING" \
-  "$APP_DIR_LOCAL/backend" "$INGEST_PATH" > "$UNIT_DIR/airlock-learning.service"
+  "$APP_DIR_LOCAL/backend" "$INGEST_PATH" "$ACCOUNTS_STATUS_BIN" \
+  > "$UNIT_DIR/airlock-learning.service"
 render_learning_unit_ingest "$LIBRARY" "$STATE_DIR" "$PROVIDER" "$INGEST_PATH" \
-  "$APP_DIR_LOCAL/backend" "$UNSAFE_ENV" > "$UNIT_DIR/airlock-learning-ingest.service"
+  "$APP_DIR_LOCAL/backend" "$UNSAFE_ENV" "$ACCOUNTS_STATUS_BIN" \
+  > "$UNIT_DIR/airlock-learning-ingest.service"
 fi
 log "wrote units: airlock-learning.service, airlock-learning-ingest.service"
 

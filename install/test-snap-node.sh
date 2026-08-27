@@ -108,6 +108,7 @@ run_paseo_dry() {   # run_paseo_dry <dir> <path> [VAR=VAL ...]  ; echoes output,
     env HOME="$d/home" AIRLOCK_CONFIG="$cfg" AIRLOCK_TS_FQDN="box.example.ts.net" \
         AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$d/render" \
         AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368 PATH="$pth" \
+        AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/paseo" AIRLOCK_APP_ID=paseo \
         "$@" bash "$ROOT/apps/paseo/install.sh" 2>&1
   )"; local rc=$?
   printf '%s' "$out"
@@ -162,7 +163,7 @@ if [ "$rc" -eq 0 ] && [ -f "$unit" ]; then
   grep -q 'command not found' <<<"$out" \
     && bad "rendering the override reason executed something" \
     || ok "the reason text reached the unit literally"
-  grep -qx 'MemoryMax=14G' "$unit" \
+  grep -qx 'MemoryMax=22528M' "$unit" \
     && ok "the override changed only the one directive (memory backstop intact)" \
     || { bad "the override moved something else"; grep -E '^(Memory|Tasks)' "$unit" | sed 's/^/    /'; }
   printf '%s' "$out" | grep -q 'WARNING: paseo is being installed against a snap-wrapped node' \
@@ -221,10 +222,10 @@ else
   ok "no manifest prescribes a snap node"
 fi
 # One command, one fix: install/preflight.sh:160 rejects two apps declaring
-# different fixes for the same command, so paseo and markwand have to agree.
+# different fixes for the same command, so paseo and fileview have to agree.
 nfix="$(grep -h -A1 'command = "node"' "$ROOT/apps"/*/airlock-app.toml | grep '^fix = ' | sort -u | wc -l)"
 [ "$nfix" -le 1 ] \
-  && ok "paseo and markwand prescribe the same node fix" \
+  && ok "paseo and fileview prescribe the same node fix" \
   || bad "the two node prerequisites disagree on their fix ($nfix distinct) — preflight will reject this"
 
 echo "---"

@@ -3401,6 +3401,110 @@ class TestLaneWorkerStartup(unittest.TestCase):
         self.assertIn('messages failed to start', stderr.getvalue())
 
 
+class TestSmokeLaneCheckAgainstBackend(unittest.TestCase):
+    """smoke.sh 의 lane 검사와 백엔드 /api/health 를 같은 시험에서 맞댄다.
+
+    2026-08-24 라이브검증 실측 — 백엔드는 HEALTH_LANES(슬랙 둘 + email) 세 lane 을 내는데
+    smoke.sh 의 expected_workers 는 슬랙 둘만 적어 두어, 첫 실기기 설치에서 "lane keys" 로
+    주간 검증이 붉어졌다 (수정 = d6ce2aa). CI 는 살아 있는 백엔드가 없어 두 산출물의 표류를
+    아무도 못 쟀다 — 그래서 여기서는 smoke.sh 에 **박혀 있는 그 검사 코드를 그대로 꺼내**
+    진짜 backend 모듈의 _message_lanes_health() 출력에 대고 실행한다. 어느 쪽이 먼저
+    움직이든 이 시험이 갈라진 날 붉어진다.
+
+    양방향: ① messages 가 꺼진 구성(want=false)에서 검사가 통과해야 하고, ② 모양이 진짜로
+    깨지면(lane 누락 · 필드 누락 · worker_state 불일치) 검사가 rc=1 로 실패해야 한다.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        here = os.path.dirname(os.path.abspath(__file__))
+        cls.backend_dir = here
+        smoke_path = os.path.join(here, os.pardir, 'smoke.sh')
+        with open(smoke_path, encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        # The lane check lives in one heredoc: lane_result=$(python3 - ... <<'PY' ... PY
+        start = next(i for i, line in enumerate(lines)
+                     if 'lane_result=$(python3' in line and "<<'PY'" in line)
+        end = next(i for i in range(start + 1, len(lines)) if lines[i] == 'PY')
+        cls.check_source = '\n'.join(lines[start + 1:end]) + '\n'
+        # 양성 대조군 — 추출이 빈 문자열이나 엉뚱한 조각이면 아래 전부가 헛돈다.
+        assert 'expected_workers' in cls.check_source and 'check_once' in cls.check_source
+
+        backend_path = os.path.join(here, 'airlock-dev-monitor.py')
+        spec = importlib.util.spec_from_file_location(
+            'airlock_dev_monitor_smoke_lane_test', backend_path)
+        cls.backend = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.backend)
+
+    def _serve_and_run(self, payload):
+        """Serve payload as /api/health and run the smoke's lane check against it."""
+        import http.server
+
+        body = json.dumps(payload).encode('utf-8')
+
+        class Health(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(('127.0.0.1', 0), Health)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # smoke.sh 와 같은 argv: want=false(콘솔 꺼짐), env 파일 없음, 포트, backend 경로.
+            proc = subprocess.run(
+                ['python3', '-', 'false', '/nonexistent/dev-monitor.env',
+                 str(server.server_address[1]), self.backend_dir],
+                input=self.check_source, capture_output=True, text=True, timeout=60)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+        return proc
+
+    def _off_health(self):
+        # 콘솔이 꺼진 설치의 실제 백엔드 출력 — idle fallback + per-lane off 문구.
+        self.backend._MESSAGES_STATE = 'off'
+        self.backend.OWNER_CONFIG = None
+        self.backend._MESSAGE_LANE_WORKER_STATES.update(self.backend._LANE_UNCONFIGURED)
+        return self.backend._message_lanes_health()
+
+    def test_messages_off_config_passes_against_real_backend_output(self):
+        proc = self._serve_and_run({'ok': True, 'message_lanes': self._off_health()})
+        self.assertEqual(
+            (proc.returncode, proc.stdout.strip()), (0, 'ok'),
+            'smoke 의 lane 검사가 백엔드의 꺼진-구성 출력과 갈라졌습니다: '
+            'stdout=%r stderr=%r' % (proc.stdout, proc.stderr))
+
+    def test_missing_lane_fails_as_lane_keys(self):
+        # 2026-08-24 결함의 거울상: 한쪽에만 있는 lane 은 "lane keys" 로 붉어야 한다.
+        health = self._off_health()
+        del health['email']
+        proc = self._serve_and_run({'ok': True, 'message_lanes': health})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn('lane keys', proc.stdout)
+
+    def test_missing_field_fails_as_shape(self):
+        health = self._off_health()
+        del health['slack-urgent']['last_success_age_seconds']
+        proc = self._serve_and_run({'ok': True, 'message_lanes': health})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn('shape', proc.stdout)
+
+    def test_wrong_worker_state_fails(self):
+        health = self._off_health()
+        health['email']['worker_state'] = 'on'
+        proc = self._serve_and_run({'ok': True, 'message_lanes': health})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn('worker_state', proc.stdout)
+
+
 class TestSlack(unittest.TestCase):
     def setUp(self):
         fresh_db()

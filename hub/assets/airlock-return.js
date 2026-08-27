@@ -11,7 +11,7 @@
  *     floats over the app and the user can move it out of the way. Position is
  *     remembered per-device in localStorage. data-anchor picks the default corner.
  *   - corner: a fixed rounded tile in the top-left (the Airlock mark, light on
- *     dark). For same-origin subpath tools (markwand, notepad, publish, ...).
+ *     dark). For same-origin subpath tools (fileview, notepad, publish, ...).
  *   - native: an inline tile appended into a data-target placeholder
  *     (default #airlock-slot) so a frontend can place it in its own header.
  *

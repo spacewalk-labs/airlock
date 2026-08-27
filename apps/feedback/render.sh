@@ -9,7 +9,10 @@
 render_feedback_unit() {
   local BACKEND_PORT="$1" IDENTITY_HEADER="$2" INTAKE_URL="$3" TOKEN_ENV="$4" \
         MAIL_TO="$5" MAIL_FROM="$6" MAIL_API="$7" MAIL_KEY_ENV="$8"
-  local BACKEND_PY="$ROOT/apps/feedback/backend/airlock-feedback.py"
+  # The package's own directory, never "$ROOT/apps/feedback" — this path is
+  # baked into a systemd unit, and after the apps/ cutover the package does not
+  # live under the platform root. Same shape as publish/dev-monitor's render.sh.
+  local BACKEND_PY="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/backend/airlock-feedback.py"
   cat <<UNIT
 [Unit]
 Description=airlock feedback — suggestion-box relay (127.0.0.1:${BACKEND_PORT})

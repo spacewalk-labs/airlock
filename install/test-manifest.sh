@@ -6,9 +6,9 @@
 # apps/ tree. The real config, ledger, preflight, and nginx entry points run
 # against scratch roots and small command shims.
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -416,11 +416,70 @@ else
   failure_detail "$out_neither"
 fi
 
+# A17g/A17h: a glyph must name a <symbol> that actually exists in the hub
+# sprite. Before this check, four invented names (`app-docs`, `app-files`,
+# `app-system`, `app-notes`) passed validate, install, and smoke on
+# 2026-08-25 and rendered as blank tiles — the browser resolves an unknown
+# <use> reference to nothing, silently. Positive control on both sides:
+# the invented name must FAIL and a real sprite id must PASS, so a broken
+# sprite reader cannot go green either way.
+reset_box
+pkg="$PKGROOT/a17g-glyph-missing"; mkpkg "$pkg" a17g
+pkg_manifest "$pkg" 'contract = 1' 'id = "a17g"' '[tile]' 'label = "A17g"' 'sub = "sub"' 'cat = "docs"' 'glyph = "app-docs"'
+cfg="$CFGROOT/a17g.toml"; make_pkg_cfg "$cfg" a17g "$pkg"
+out_g="$(run "$cfg" validate 2>&1)"; rc_g=$?
+if [ "$rc_g" -ne 0 ] \
+   && grep -Fq 'does not exist in the hub sprite' <<<"$out_g" \
+   && grep -Fq 'a17g' <<<"$out_g" \
+   && grep -Fq 'app-docs' <<<"$out_g" \
+   && grep -Fq 'Available glyphs:' <<<"$out_g"; then
+  ok "A17g tile glyph absent from the sprite is fatal and names app, glyph, candidates"
+else
+  bad "A17g tile glyph absent from the sprite (rc=$rc_g)"
+  failure_detail "$out_g"
+fi
+
+reset_box
+pkg="$PKGROOT/a17h-glyph-real"; mkpkg "$pkg" a17h
+pkg_manifest "$pkg" 'contract = 1' 'id = "a17h"' '[tile]' 'label = "A17h"' 'sub = "sub"' 'cat = "docs"' 'glyph = "app-notepad"'
+cfg="$CFGROOT/a17h.toml"; make_pkg_cfg "$cfg" a17h "$pkg"
+expect_ok "A17h tile glyph naming a real sprite symbol validates" run "$cfg" validate
+
 reset_box
 pkg="$PKGROOT/a18-icon-path"; mkpkg "$pkg" a18
 pkg_manifest "$pkg" 'contract = 1' 'id = "a18"' '[tile]' 'label = "A18"' 'sub = "sub"' 'cat = "docs"' 'icon = "../x.svg"'
 cfg="$CFGROOT/a18.toml"; make_pkg_cfg "$cfg" a18 "$pkg"
 expect_fail "A18 icon path rejects dot segments" "no '.'/'..' segments" run "$cfg" validate
+
+# A18b/A18c: the OTHER tile axis. A17g closed `glyph` against the sprite; an
+# `icon` is a file staged out of the package, and validate must refuse a name
+# that points at nothing just as fail-closed. That check is wired through
+# package_specs (_validate_icon_source strict-resolves the source, F4), but
+# until these fixtures nothing pinned the VALIDATE axis — F53 exercises
+# icon-src only, so moving the check off validate's path would have gone
+# green. Positive control on both sides: a missing file must FAIL naming app
+# and path, and a real file must PASS.
+reset_box
+pkg="$PKGROOT/a18b-icon-missing"; mkpkg "$pkg" a18b
+pkg_manifest "$pkg" 'contract = 1' 'id = "a18b"' '[tile]' 'label = "A18b"' 'sub = "sub"' 'cat = "docs"' 'icon = "no-such.png"'
+cfg="$CFGROOT/a18b.toml"; make_pkg_cfg "$cfg" a18b "$pkg"
+out_i="$(run "$cfg" validate 2>&1)"; rc_i=$?
+if [ "$rc_i" -ne 0 ] \
+   && grep -Fq 'does not resolve to a file inside the package' <<<"$out_i" \
+   && grep -Fq "package 'a18b'" <<<"$out_i" \
+   && grep -Fq 'no-such.png' <<<"$out_i"; then
+  ok "A18b tile icon naming a missing file is fatal at validate, naming app and path"
+else
+  bad "A18b tile icon naming a missing file (rc=$rc_i)"
+  failure_detail "$out_i"
+fi
+
+reset_box
+pkg="$PKGROOT/a18c-icon-real"; mkpkg "$pkg" a18c
+printf 'icon\n' >"$pkg/icon.png"
+pkg_manifest "$pkg" 'contract = 1' 'id = "a18c"' '[tile]' 'label = "A18c"' 'sub = "sub"' 'cat = "docs"' 'icon = "icon.png"'
+cfg="$CFGROOT/a18c.toml"; make_pkg_cfg "$cfg" a18c "$pkg"
+expect_ok "A18c tile icon naming a real package file validates" run "$cfg" validate
 
 reset_box
 pkg="$PKGROOT/a19-audience"; mkpkg "$pkg" a19
@@ -528,7 +587,7 @@ pkg_manifest "$pkg" \
   'label = "Full"' \
   'sub = "Complete"' \
   'cat = "docs"' \
-  'glyph = "full-box"' \
+  'glyph = "app-default"' \
   '[audience]' \
   'supported = ["shared", "owner"]' \
   'default = "shared"'
@@ -575,14 +634,14 @@ assert d["prerequisites"] == [{
 assert d["artifacts"] == {
     "units": ["full.service"], "fragments": ["full.conf"],
     "webroot": ["full/"], "files": ["~/full.state"],
-    "rooted": [],
+    "rooted": [], "containers": [],
     "serve_ports": ["serve_port"]
 }
 assert d["unit_scopes"] == {"full.service": "user"}
 assert d["source_class"] == "explicit"
 assert d["tile"] == {
     "label": "Full", "sub": "Complete", "cat": "docs",
-    "path": None, "icon": None, "glyph": "full-box"
+    "path": None, "icon": None, "glyph": "app-default"
 }
 assert d["audience"] == {"supported": ["shared", "owner"], "default": "shared"}
 ' >/dev/null 2>&1 && full_roundtrip=1
@@ -882,10 +941,12 @@ if [ -f "$STATE/app-ledger.json" ]; then
   python3 -c '
 import json, sys
 d=json.load(open(sys.argv[1]))
-assert d["version"] == 5 and d["events"] == []
+assert d["version"] == 6 and d["events"] == []
 for e in d["entries"].values():
   for kind in ("committed", "intent"):
-    if kind in e: assert "deps" in e[kind]
+    if kind in e:
+      assert "deps" in e[kind]
+      assert e[kind]["container_runtime"] is None
 ' "$STATE/app-ledger.json" >/dev/null 2>&1 && version_deps=1
 fi
 if [ "$rc_info" = 0 ] && [ "$rc_intent" = 0 ] && [ "$version_deps" = 1 ]; then

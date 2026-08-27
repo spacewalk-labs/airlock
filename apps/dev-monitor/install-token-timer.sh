@@ -13,18 +13,31 @@
 # timer, asks SYSTEMD (not the filesystem) whether it really appears in list-timers, and
 # says what it did.
 #
-# The unit files are TEMPLATES. The repository path, the spool and the schedule are
+# The unit files are TEMPLATES. The package path, the spool and the schedule are
 # site-specific, and this tree is mirrored to a public repository where a hostname is a
-# leak — so they carry @REPO@ / @SPOOL@ / @SPOOLFLAG@ / @SNAPSHOT@ / @PYTHON@ /
-# @WARNHOURS@ / @STALEHOURS@ / @ONCALENDAR@ and this script substitutes them.
+# leak — so they carry @APPDIR@ / @SPOOL@ / @SPOOLFLAG@ / @SNAPSHOT@ / @PYTHON@ /
+# @WARNHOURS@ / @STALEHOURS@ / @ONCALENDAR@ / @ACCOUNTSSTATUSBIN@ and this script
+# substitutes them.
 #
-#   bash apps/dev-monitor/install-token-timer.sh [--oncalendar 'daily'] [--warn-hours 24]
-#                                                [--stale-hours 24] [--no-messages]
-#   bash apps/dev-monitor/install-token-timer.sh --uninstall
+# AIRLOCK_ROOT (the platform checkout) is required — see the REPO assignment below.
+#
+#   AIRLOCK_ROOT=/path/to/airlock bash .../install-token-timer.sh \
+#       [--oncalendar 'daily'] [--warn-hours 24] [--stale-hours 24] [--no-messages]
+#   AIRLOCK_ROOT=/path/to/airlock bash .../install-token-timer.sh --uninstall
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$HERE/../.." && pwd)"
+# Two roots, and conflating them is what @REPO@ used to do. @APPDIR@ is this
+# package (the files the timer executes: token-freshness.py, its alarm, its
+# README) and is $0-relative, so it follows the package out of the platform tree.
+# AIRLOCK_ROOT is the PLATFORM checkout, needed only to reach install/lib.sh for
+# the declared config read; it cannot be derived from $0 and the operator supplies it.
+APPDIR="${AIRLOCK_APP_DIR:-$HERE}"
+ROOT="${AIRLOCK_ROOT:?set AIRLOCK_ROOT to the Airlock platform checkout (the one holding install/lib.sh)}"
+# Sourced BEFORE this script's own say()/die(), so those keep their [token-timer]
+# prefix and lib.sh's generic pair does not shadow them.
+# shellcheck source=/dev/null
+. "$ROOT/install/lib.sh"
 UNITDIR="$HOME/.config/systemd/user"
 STATE="$HOME/.local/state/airlock/dev-monitor"
 SPOOL="$STATE/spool"
@@ -72,9 +85,10 @@ fi
 # Written out one call per key rather than through a helper taking the key as an
 # argument: a key assembled at runtime is invisible to airlock-config's declaration lint,
 # which can only see call sites it can read literally.
-CFG="$REPO/bin/airlock-config"
-[ -n "$WARN_HOURS" ]  || WARN_HOURS="$("$CFG" get apps.dev-monitor.token_freshness_warn_hours 2>/dev/null || true)"
-[ -n "$STALE_HOURS" ] || STALE_HOURS="$("$CFG" get apps.dev-monitor.token_freshness_stale_hours 2>/dev/null || true)"
+# airlock_config (install/lib.sh) rather than bin/airlock-config by path: the
+# binary's location is platform-internal and not part of the app ABI.
+[ -n "$WARN_HOURS" ]  || WARN_HOURS="$(airlock_config get apps.dev-monitor.token_freshness_warn_hours 2>/dev/null || true)"
+[ -n "$STALE_HOURS" ] || STALE_HOURS="$(airlock_config get apps.dev-monitor.token_freshness_stale_hours 2>/dev/null || true)"
 [ -n "$WARN_HOURS" ]  || WARN_HOURS=24
 [ -n "$STALE_HOURS" ] || STALE_HOURS=24
 case "$WARN_HOURS"  in ''|*[!0-9]*) die "--warn-hours must be a positive integer: got '$WARN_HOURS'" ;; esac
@@ -85,15 +99,29 @@ case "$STALE_HOURS" in ''|*[!0-9]*) die "--stale-hours must be a positive intege
 # A worktree is a legitimate checkout and also the thing somebody deletes on a Friday. A
 # timer pointed at one fails forever afterwards, and the failure looks like a broken
 # checker rather than a missing directory. Same refusal as live/install-timer.sh.
-if [ -f "$REPO/.git" ]; then
-  die "$REPO is a git worktree. Point the timer at a permanent clone — a worktree gets reclaimed and the job then fails on every tick for a reason that has nothing to do with airlock."
-fi
+# Rooted at the PACKAGE, not the platform: the units execute this package's files,
+# so it is this package's checkout that must not evaporate. Walk up to the nearest
+# .git and use the same tell as before — a linked worktree's .git is a FILE.
+_d="$APPDIR"
+while [ "$_d" != / ]; do
+  if [ -e "$_d/.git" ]; then
+    [ -f "$_d/.git" ] && die "$_d is a git worktree. Point the timer at a permanent clone — a worktree gets reclaimed and the job then fails on every tick for a reason that has nothing to do with airlock."
+    break
+  fi
+  _d="$(dirname "$_d")"
+done
 
 # The templates end up as absolute paths inside unit files; a newline would inject
 # further directives, and the placeholder check below cannot see that.
 for v in "$SPOOL" "$SNAPSHOT" "$ONCALENDAR"; do
   case "$v" in *[$'\n\r']*) die "unit values must not contain newlines" ;; esac
 done
+case "$AIRLOCK_ACCOUNTS_STATUS_BIN" in
+  /*) ;;
+  *) die "AIRLOCK_ACCOUNTS_STATUS_BIN must be an absolute D5 platform path" ;;
+esac
+[ -f "$AIRLOCK_ACCOUNTS_STATUS_BIN" ] && [ -x "$AIRLOCK_ACCOUNTS_STATUS_BIN" ] \
+  || die "AIRLOCK_ACCOUNTS_STATUS_BIN does not name an executable platform file"
 
 # sed's REPLACEMENT side is not a literal: '&' means "the whole match" and a backslash
 # escapes. A path containing either would render a unit line that is not the path the
@@ -129,10 +157,11 @@ linger="$(loginctl show-user "$who" -p Linger --value 2>/dev/null || echo '')"
 
 mkdir -p "$UNITDIR" "$STATE"
 for u in "${UNITS[@]}"; do
-  sed -e "s|@REPO@|$(sed_replacement "$REPO")|g" \
+  sed -e "s|@APPDIR@|$(sed_replacement "$APPDIR")|g" \
       -e "s|@SPOOLFLAG@|$(sed_replacement "$SPOOLFLAG")|g" \
       -e "s|@SPOOL@|$(sed_replacement "$SPOOL")|g" \
       -e "s|@SNAPSHOT@|$(sed_replacement "$SNAPSHOT")|g" \
+      -e "s|@ACCOUNTSSTATUSBIN@|$(sed_replacement "$AIRLOCK_ACCOUNTS_STATUS_BIN")|g" \
       -e "s|@PYTHON@|$(sed_replacement "$PYTHON")|g" -e "s|@WARNHOURS@|$WARN_HOURS|g" \
       -e "s|@STALEHOURS@|$STALE_HOURS|g" -e "s|@ONCALENDAR@|$(sed_replacement "$ONCALENDAR")|g" \
     "$HERE/systemd/$u.in" > "$UNITDIR/$u" || die "could not render $u"

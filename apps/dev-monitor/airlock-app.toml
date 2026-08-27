@@ -7,6 +7,7 @@ id = "dev-monitor"
 # it as config would create a knob that does nothing, because the installer
 # overwrites whatever it was set to.
 runtime_env = [
+  "AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN",
   "AIRLOCK_DEV_MONITOR_CORS_HOSTS",
   "AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT",
   "AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE",
@@ -133,3 +134,11 @@ sub = "system status"
 cat = "system"
 path = "/monitor/"
 glyph = "app-monitor"
+
+# D7. Shared covers the observation surface only. The message/action console is
+# owner-scoped in the backend itself (devmon_owner.py checks the ingress-injected
+# identity AND an nginx-only proxy secret), so widening the tile does not widen
+# the console — see SECURITY.md, "who can read the console".
+[audience]
+supported = ["shared", "owner"]
+default = "shared"

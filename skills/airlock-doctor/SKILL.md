@@ -100,7 +100,7 @@ fi
   loopback ruleset (`nft list table inet airlock_orca` must show `iif != "lo" …
   drop`); paseo needs node ≥ 20 and the three gate headers (`X-Forwarded-Proto
   https`, `Host <fqdn>:<port>`, trusted proxy) or its WebSocket dies.
-- **markwand/filebrowser** — a re-run must stop `airlock-filebrowser` before
+- **fileview/filebrowser** — a re-run must stop `airlock-filebrowser` before
   `filebrowser config set` (SQLite lock), else it times out.
 - **notepad** needs `[apps.publish]` (it uses the publish upload backend).
 - **A denied identity seeing the wrong-owner page with 403 is correct**, not a bug.

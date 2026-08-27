@@ -7,16 +7,19 @@
 #                                        --> serves web/ + API, proxies /ws,/token --> ttyd --> tmux
 #
 # Config comes from airlock.toml ([apps.devterm]). Optional features (Claude account
-# pool, Codex login, markwand file-open, Orca worktree sidebar) turn on only when their
+# pool, Codex login, fileview file-open, Orca worktree sidebar) turn on only when their
 # config + tools are present; otherwise they no-op cleanly.
 # Honors AIRLOCK_DRY_RUN=1 (print system-mutating steps instead of running them).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_DIR/
-# AIRLOCK_APP_ID, falling back to $0-relative computation for a standalone
-# invocation (a test harness that runs this script directly).
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+# ABI (D5): the caller sets AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID and runs
+# this script with cwd = AIRLOCK_APP_DIR. AIRLOCK_ROOT is REQUIRED: the platform
+# root cannot be derived from $0, because "$0/../.." is only the platform when the
+# package happens to sit in the platform's own apps/ tree — the arrangement the
+# apps/ cutover ends. $0-relative self-location (this file's own directory) stays
+# fine and is what AIRLOCK_APP_DIR falls back to.
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 HERE="${AIRLOCK_APP_DIR:-$HERE}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-devterm}"
 # shellcheck source=/dev/null
@@ -39,21 +42,12 @@ IDENTITY_HEADER="${AIRLOCK_IDENTITY_HEADER:?}"
 ACCOUNTS="${AIRLOCK_DEVTERM_ACCOUNTS:-false}"
 XAI="${AIRLOCK_DEVTERM_XAI:-false}"
 REMOTE_HOSTS="${AIRLOCK_DEVTERM_REMOTE_HOSTS:-}"
-# Secret-drop lifetime. A secret drop is only safe because it expires, so the TTL is a
-# first-class setting rather than a constant buried in the gate.
-SECRET_TTL="${AIRLOCK_DEVTERM_SECRET_TTL_SEC:-1800}"
-CLAUDE_SWITCH="${AIRLOCK_DEVTERM_CLAUDE_SWITCH:-}"
-CLAUDE_STATUS="${AIRLOCK_DEVTERM_CLAUDE_STATUS:-}"
+CLAUDE_SWITCH_CFG="${AIRLOCK_DEVTERM_CLAUDE_SWITCH:-}"
+CLAUDE_STATUS_CFG="${AIRLOCK_DEVTERM_CLAUDE_STATUS:-}"
 FLEET_STORE="${AIRLOCK_DEVTERM_FLEET_STORE:-}"
 FLEET_STORE_URL="${AIRLOCK_DEVTERM_FLEET_STORE_URL:-}"
 ORCA_SHIM_CFG="${AIRLOCK_DEVTERM_ORCA_SHIM:-}"
-CODE_ROOT="${AIRLOCK_CODE_ROOT:-}"
 WEB_ROOT="$HOME/.local/share/airlock-devterm/web"
-# claude-switch/claude-status are installed as standalone files in ~/.local/bin, so
-# the shared bin_discovery module they import cannot stay a repo sibling — it is
-# staged here. Inside the already-declared ~/.local/share/airlock-devterm/ artifact,
-# so the ledger reclaims it with the rest.
-LIB_ROOT="$HOME/.local/share/airlock-devterm/lib"
 GATE_PY="$HERE/backend/devterm-gate.py"
 UNIT_DIR="$HOME/.config/systemd/user"
 # AIRLOCK_RENDER_DIR: harness-only destination-root override (highest
@@ -69,13 +63,47 @@ fi
 require_cmd tmux python3 curl sha256sum systemctl tailscale sudo
 PY="$(command -v python3)"
 
+# The D5 ABI hands platform tools in as paths. Resolve them once here, before either
+# the unit or the terminal compatibility shim records them: an interactive shell has
+# none of these AIRLOCK_* variables, and baking a variable reference into the shim
+# would preserve the filename while breaking the command it promises. realpath also
+# makes a caller-supplied symlink or relative segment stable across later cwd changes.
+resolve_platform_bin() {
+  local abi_name="$1" path="$2" resolved
+  case "$path" in
+    /*) ;;
+    *) die "$abi_name must be an absolute path; got: $path" ;;
+  esac
+  resolved="$(python3 - "$path" <<'PY'
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+  [ -f "$resolved" ] && [ -x "$resolved" ] \
+    || die "$abi_name does not name an executable platform file: $resolved"
+  printf '%s\n' "$resolved"
+}
+
+PLATFORM_ACCOUNTS_BIN="$(resolve_platform_bin AIRLOCK_ACCOUNTS_BIN "$AIRLOCK_ACCOUNTS_BIN")"
+PLATFORM_ACCOUNTS_STATUS_BIN="$(resolve_platform_bin AIRLOCK_ACCOUNTS_STATUS_BIN "$AIRLOCK_ACCOUNTS_STATUS_BIN")"
+PLATFORM_SECRET_BIN="$(resolve_platform_bin AIRLOCK_SECRET_BIN "$AIRLOCK_SECRET_BIN")"
+
+# These app config keys remain compatibility overrides. Their empty default now means
+# the platform-owned binary rather than an app-bundled copy; see airlock-app.toml for
+# why the fail-closed config schema prevents retiring them without a real replacement.
+CLAUDE_SWITCH="${CLAUDE_SWITCH_CFG:-$PLATFORM_ACCOUNTS_BIN}"
+CLAUDE_STATUS="${CLAUDE_STATUS_CFG:-$PLATFORM_ACCOUNTS_STATUS_BIN}"
+
 # is app <name> enabled in airlock.toml?
 app_enabled() { airlock_config apps | grep -qx "$1"; }
 
 # --- resolve optional feature wiring ---
-# markwand file-open: on only when [apps.markwand] is enabled AND a code_root is set.
-MARKWAND=false
-if app_enabled markwand && [ -n "$CODE_ROOT" ]; then MARKWAND=true; fi
+# fileview file-open: on whenever [apps.fileview] is enabled. It used to also
+# require a code_root; fileview serves the filesystem now, so there is no second
+# condition and no path to thread through.
+FILEVIEW=false
+if app_enabled fileview; then FILEVIEW=true; fi
 # Orca worktree sidebar: use the configured shim path, else the conventional one when
 # [apps.orca] is enabled, else empty (feature off). The gate checks the file at runtime.
 ORCA_SHIM=""
@@ -113,26 +141,45 @@ provision_ttyd
 # --- 2. shell wrapper ---
 airlock_run install -D -m755 "$HERE/bin/devterm-shell" "$HOME/.local/bin/devterm-shell"
 
-# --- 2b. Account probes (Claude pool and/or OpenCode xAI) ---
-# The bundled claude-switch/claude-status are the default: they make Claude Code login
-# and account switching work out of the box. Setting claude_switch/claude_status in
-# airlock.toml points at your own build instead (the bundled copies are still installed,
-# so the CLI stays available in the terminal).
-if [ "$ACCOUNTS" = true ]; then
-  airlock_run install -D -m755 "$HERE/bin/claude-switch" "$HOME/.local/bin/claude-switch"
-  [ -n "$CLAUDE_SWITCH" ] || CLAUDE_SWITCH="$HOME/.local/bin/claude-switch"
+# --- 2b. Account-tool terminal compatibility shims ---
+# These two paths remain devterm artifacts because the installed-state ledger has no
+# ownership-transfer operation: dropping them from the manifest would make record-diff
+# delete them on upgrade. Replace each existing file atomically with a tiny shim instead.
+# The temp file lives beside the destination, so mv(1) cannot cross filesystems and the
+# promised terminal path is never briefly absent — important on boxes with live logins.
+install_exec_shim() {
+  local target="$1" dest="$2" tmp
+  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+    log "[dry] atomically replace $dest with exec shim -> $target"
+    return
+  fi
+  install -d "$(dirname "$dest")"
+  tmp="$(mktemp "${dest}.tmp.XXXXXX")"
+  if ! render_devterm_exec_shim "$target" > "$tmp"; then
+    rm -f "$tmp"
+    die "could not render compatibility shim: $dest"
+  fi
+  if ! chmod 755 "$tmp" || ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    die "could not atomically install compatibility shim: $dest"
+  fi
+}
+
+# Feature flags decide whether a fresh install promises the terminal affordance, but
+# they must not protect a stale file from an upgrade. Both paths are unconditional
+# manifest artifacts, so record-diff deliberately leaves them alone; if an older
+# devterm already installed its full credential writer, replace that existing path
+# even when the feature has since been disabled. -L also catches a broken symlink.
+if [ "$ACCOUNTS" = true ] || [ -e "$HOME/.local/bin/claude-switch" ] || [ -L "$HOME/.local/bin/claude-switch" ]; then
+  install_exec_shim "$PLATFORM_ACCOUNTS_BIN" "$HOME/.local/bin/claude-switch"
 fi
-if [ "$ACCOUNTS" = true ] || [ "$XAI" = true ]; then
-  airlock_run install -D -m755 "$HERE/bin/claude-status" "$HOME/.local/bin/claude-status"
-  # The probes import this; it is the only file they need beyond themselves. They
-  # refuse to start without it rather than falling back to a PATH-only lookup, so it
-  # is installed in the same step, not lazily.
-  airlock_run install -D -m644 "$HERE/backend/bin_discovery.py" "$LIB_ROOT/bin_discovery.py"
-  [ -n "$CLAUDE_STATUS" ] || CLAUDE_STATUS="$HOME/.local/bin/claude-status"
+if [ "$ACCOUNTS" = true ] || [ "$XAI" = true ] \
+   || [ -e "$HOME/.local/bin/claude-status" ] || [ -L "$HOME/.local/bin/claude-status" ]; then
+  install_exec_shim "$PLATFORM_ACCOUNTS_STATUS_BIN" "$HOME/.local/bin/claude-status"
 fi
 
 # --- 3. custom web client into WEB_ROOT (index.html templated with runtime config) ---
-CFG_JSON="{\"accounts\":${ACCOUNTS},\"xai\":${XAI},\"markwand\":${MARKWAND},\"orca\":$([ -n "$ORCA_SHIM" ] && echo true || echo false)}"
+CFG_JSON="{\"accounts\":${ACCOUNTS},\"xai\":${XAI},\"fileview\":${FILEVIEW},\"orca\":$([ -n "$ORCA_SHIM" ] && echo true || echo false)}"
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] install web/ -> $WEB_ROOT (index.html config=${CFG_JSON}, + ui.js/popup.css/panel.html)"
 else
@@ -211,13 +258,19 @@ add_env DEVTERM_TTYD_PORT "$TTYD_PORT"
 add_env DEVTERM_WEB "$WEB_ROOT"
 add_env AIRLOCK_IDENTITY_HEADER "$IDENTITY_HEADER"
 add_env AIRLOCK_OWNER "$AIRLOCK_OWNER"
-add_env AIRLOCK_CODE_ROOT "$CODE_ROOT"
-add_env DEVTERM_MARKWAND "$MARKWAND"
+add_env DEVTERM_FILEVIEW "$FILEVIEW"
 add_env DEVTERM_ACCOUNTS "$ACCOUNTS"
 add_env DEVTERM_XAI "$XAI"
 add_env DEVTERM_REMOTE_HOSTS "$REMOTE_HOSTS"
-add_env DEVTERM_SECRET_TTL "$SECRET_TTL"
 add_env DEVTERM_ORCA_SHIM "$ORCA_SHIM"
+# Always hand the non-overridable platform account path to the Codex lifecycle
+# endpoints. DEVTERM_CLAUDE_SWITCH may intentionally name an operator compatibility
+# tool, which is not required to know the platform-only codex-auth verb.
+add_env DEVTERM_ACCOUNTS_BIN "$PLATFORM_ACCOUNTS_BIN"
+# The drop exists independently of the account feature. Hand the platform store in on
+# every gate unit; deriving $ROOT/bin here would make this package depend on its source
+# layout again after the apps/ split.
+add_env DEVTERM_SECRET_BIN "$PLATFORM_SECRET_BIN"
 # claude-status also carries the xAI adapter, so wire it for either feature.
 if [ "$ACCOUNTS" = true ] || [ "$XAI" = true ]; then
   add_env DEVTERM_CLAUDE_STATUS "$CLAUDE_STATUS"
@@ -234,7 +287,7 @@ changed_gate=0
 # install/lib.sh's fail-closed guard (RENDER_DIR without DRY_RUN=1 never reaches
 # this line) and apps/feedback/install.sh's identical comment.
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -z "${AIRLOCK_RENDER_DIR:-}" ]; then
-  log "[dry] write $UNIT_DIR/airlock-devterm-gate.service (127.0.0.1:$BACKEND_PORT; accounts=$ACCOUNTS xai=$XAI markwand=$MARKWAND orca=$([ -n "$ORCA_SHIM" ] && echo true || echo false))"
+  log "[dry] write $UNIT_DIR/airlock-devterm-gate.service (127.0.0.1:$BACKEND_PORT; accounts=$ACCOUNTS xai=$XAI fileview=$FILEVIEW orca=$([ -n "$ORCA_SHIM" ] && echo true || echo false))"
 else
   if render_devterm_unit_gate "$BACKEND_PORT" "$gate_env" "$PY" "$GATE_PY" \
      | write_if_changed "$UNIT_DIR/airlock-devterm-gate.service"
@@ -272,4 +325,4 @@ log "wrote nginx fragment: $frag"
 # orchestrator will not open :9900 from this manifest.
 
 # NOTE: smoke runs from the orchestrator AFTER nginx is rendered + reloaded.
-log "devterm installed (owner: ${AIRLOCK_OWNER}; accounts=${ACCOUNTS}, xai=${XAI}, markwand=${MARKWAND}, orca=$([ -n "$ORCA_SHIM" ] && echo true || echo false))"
+log "devterm installed (owner: ${AIRLOCK_OWNER}; accounts=${ACCOUNTS}, xai=${XAI}, fileview=${FILEVIEW}, orca=$([ -n "$ORCA_SHIM" ] && echo true || echo false))"

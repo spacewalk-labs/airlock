@@ -23,7 +23,7 @@ left.
 |---|---|---|
 | **hub** | The way in: launcher, PWA, return widget, icon system | (ours) |
 | **devterm** | Browser web terminal (mobile-friendly) | ttyd (MIT) |
-| **markwand** | Markdown / file viewer + editor | markserv + filebrowser |
+| **fileview** | Directory viewer + editor | filebrowser (API only) |
 | **publish** | Static-file publish manager (+ optional pluggable external target) | (ours) |
 | **notepad** | Clipboard / image upload scratchpad | (ours) |
 | **dev-monitor** | System / service / network / storage monitor (+ optional owner-only message & action console) | (ours) |
@@ -67,11 +67,10 @@ name — MagicDNS off, some container runtimes), and `1` on failure. `3` is not 
 because a run that never checked the ingress is not a run that verified it; open the
 URL from another device once, which is the only check that can settle it.
 
-> **Before you set `code_root` or add a collaborator:** markwand serves everything
-> under `[paths].code_root` — dotfiles included — read **and write**, to the owner
-> *and* every collaborator, and the viewer reads through symlinks that leave it.
-> There is no exclusion list. Point it at a project directory, not at `~`.
-> See [`SECURITY.md`](SECURITY.md#two-tiers-and-what-a-collaborator-actually-gets).
+> **Before you add a collaborator:** fileview serves **the whole filesystem this
+> box's user account can reach** — dotfiles included — read **and write**. There is
+> no root setting and no ignore list. The bound is the unix account, nothing else.
+> See [SECURITY.md](SECURITY.md).
 
 ### Reboot survival (automatic)
 

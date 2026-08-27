@@ -18,11 +18,15 @@ import asyncio, contextlib, copy, importlib.machinery, importlib.util, inspect, 
 os.environ.setdefault("AIRLOCK_OWNER", "owner@example.com")
 spec = importlib.util.spec_from_file_location("gate", "apps/devterm/backend/devterm-gate.py")
 g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
-# claude-status has no .py extension (it is a command on PATH), so it needs an explicit
-# source loader. Importing it runs no side effects — main() is behind __main__.
-cs_loader = importlib.machinery.SourceFileLoader("claude_status", "apps/devterm/bin/claude-status")
+# airlock-accounts-status has no .py extension, so it needs an explicit source loader.
+# Importing it runs no side effects — main() is behind __main__.
+cs_loader = importlib.machinery.SourceFileLoader("claude_status", "bin/airlock-accounts-status")
 cs_spec = importlib.util.spec_from_loader("claude_status", cs_loader)
 cs = importlib.util.module_from_spec(cs_spec); cs_loader.exec_module(cs)
+# The platform account writer is extensionless for the same reason.
+ac_loader = importlib.machinery.SourceFileLoader("airlock_accounts", "bin/airlock-accounts")
+ac_spec = importlib.util.spec_from_loader("airlock_accounts", ac_loader)
+ac = importlib.util.module_from_spec(ac_spec); ac_loader.exec_module(ac)
 
 fails = []
 def check(name, cond):
@@ -72,21 +76,199 @@ check("NaN is not a number", g._finite_number(float("nan")) is None)
 check("bool is not a number", g._finite_number(True) is None)
 check("int passes", g._finite_number(0) == 0)
 
-# A rendered/manual unit may carry the feature flag but omit the helper environment
-# variable. The app still ships the helper beside this backend, so that omission must
-# not turn every live reading into {enabled:false}.
+# P2b: Codex preservation is platform-owned and its machine output is boolean-only.
+_codex_auth_tmp = tempfile.mkdtemp(prefix="platform-codex-auth-")
+_saved_ac_paths = ac.CODEX_AUTH, ac.CODEX_AUTH_BAK
+try:
+    ac.CODEX_AUTH = os.path.join(_codex_auth_tmp, "auth.json")
+    ac.CODEX_AUTH_BAK = ac.CODEX_AUTH + ".pre-relogin"
+    marker = b'{"fixture":"previous-login-no-secret"}\n'
+    with open(ac.CODEX_AUTH, "wb") as f:
+        f.write(marker)
+    backup_out = io.StringIO()
+    with contextlib.redirect_stdout(backup_out):
+        backup_rc = ac.cmd_codex_auth("backup", as_json=True)
+    with open(ac.CODEX_AUTH, "wb") as f:
+        f.write(b'{"fixture":"replacement"}\n')
+    restore_out = io.StringIO()
+    with contextlib.redirect_stdout(restore_out):
+        restore_rc = ac.cmd_codex_auth("restore", as_json=True)
+    with open(ac.CODEX_AUTH, "rb") as f:
+        restored_bytes = f.read()
+    backup_json, restore_json = json.loads(backup_out.getvalue()), json.loads(restore_out.getvalue())
+    check("platform Codex backup reports booleans only",
+          backup_rc == 0 and backup_json == {"ok": True, "backedUp": True}
+          and "previous-login" not in backup_out.getvalue())
+    check("platform Codex restore puts the exact previous file back",
+          restore_rc == 0 and restore_json == {"ok": True, "restored": True}
+          and restored_bytes == marker and not os.path.exists(ac.CODEX_AUTH_BAK))
+    os.unlink(ac.CODEX_AUTH)
+    missing_out = io.StringIO()
+    with contextlib.redirect_stdout(missing_out):
+        missing_rc = ac.cmd_codex_auth("backup", as_json=True)
+    check("platform Codex backup reports an absent login without inventing one",
+          missing_rc == 0
+          and json.loads(missing_out.getvalue()) == {"ok": True, "backedUp": False})
+    with open(ac.CODEX_AUTH, "wb") as f:
+        f.write(marker)
+    generation_out = io.StringIO()
+    with contextlib.redirect_stdout(generation_out):
+        generation_rc = ac.cmd_codex_auth("generation", as_json=True)
+    generation_json = json.loads(generation_out.getvalue())
+    check("platform Codex generation returns metadata only",
+          generation_rc == 0 and generation_json.get("ok") is True
+          and generation_json.get("present") is True
+          and type(generation_json.get("generation")) is int
+          and set(generation_json) == {"ok", "present", "generation"})
+finally:
+    ac.CODEX_AUTH, ac.CODEX_AUTH_BAK = _saved_ac_paths
+    shutil.rmtree(_codex_auth_tmp, ignore_errors=True)
+
+# Codex itself honors CODEX_HOME, so the platform lifecycle must follow the same
+# environment or it can preserve the wrong login while device-auth erases the real one.
+_codex_override_tmp = tempfile.mkdtemp(prefix="platform-codex-home-")
+try:
+    override_auth = os.path.join(_codex_override_tmp, "auth.json")
+    override_marker = b'{"fixture":"override-login"}\n'
+    with open(override_auth, "wb") as f:
+        f.write(override_marker)
+    override_env = dict(os.environ, HOME=_codex_override_tmp,
+                        CODEX_HOME=_codex_override_tmp)
+    platform_script = os.path.abspath("bin/airlock-accounts")
+    backup = subprocess.run(
+        [sys.executable, platform_script, "codex-auth", "backup", "--json"],
+        env=override_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    with open(override_auth, "wb") as f:
+        f.write(b'{"fixture":"replacement"}\n')
+    restore = subprocess.run(
+        [sys.executable, platform_script, "codex-auth", "restore", "--json"],
+        env=override_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    with open(override_auth, "rb") as f:
+        override_restored = f.read()
+    check("platform Codex lifecycle follows CODEX_HOME",
+          backup.returncode == 0 and restore.returncode == 0
+          and override_restored == override_marker
+          and override_marker not in backup.stdout + restore.stdout)
+finally:
+    shutil.rmtree(_codex_override_tmp, ignore_errors=True)
+
+
+async def _codex_relogin_handler_contract():
+    """The ownership move must not reorder backup/start or break cancel restore."""
+    saved = (g._codex_bin, g._codex_available, g._codex_auth_lifecycle,
+             g._send_json, g._invalidate_codex_usage_cache,
+             g.asyncio.create_subprocess_exec, g.asyncio.sleep, g.CODEX_LOGIN_OUT)
+    capture_dir = tempfile.mkdtemp(prefix="codex-relogin-handler-")
+    events, sent = [], []
+
+    class Proc:
+        returncode = 0
+        async def wait(self):
+            return 0
+
+    async def lifecycle(action):
+        events.append(action)
+        return (True, None)
+
+    async def spawn(*args, **_kwargs):
+        events.append(tuple(args))
+        return Proc()
+
+    async def send(_cw, status, payload, **_kwargs):
+        sent.append((status, payload))
+
+    async def no_sleep(_seconds):
+        return None
+
+    try:
+        g._codex_bin = lambda: "/fake/codex"
+        # Cancellation recovery must not depend on the executable still existing.
+        g._codex_available = lambda: False
+        g._codex_auth_lifecycle = lifecycle
+        g._send_json = send
+        g._invalidate_codex_usage_cache = lambda: events.append("invalidate")
+        g.asyncio.create_subprocess_exec = spawn
+        g.asyncio.sleep = no_sleep
+        g.CODEX_LOGIN_OUT = os.path.join(capture_dir, "capture.out")
+        await g._serve_codex_login_start(None)
+        start_events = list(events)
+        events.clear(); sent.clear()
+        await g._serve_codex_login_cancel(None)
+        return start_events, list(events), list(sent)
+    finally:
+        (g._codex_bin, g._codex_available, g._codex_auth_lifecycle,
+         g._send_json, g._invalidate_codex_usage_cache,
+         g.asyncio.create_subprocess_exec, g.asyncio.sleep, g.CODEX_LOGIN_OUT) = saved
+        shutil.rmtree(capture_dir, ignore_errors=True)
+
+
+_start_events, _cancel_events, _cancel_sent = asyncio.run(_codex_relogin_handler_contract())
+check("Codex re-login awaits platform backup before pkill and device-auth spawn",
+      "backup" in _start_events
+      and next(i for i, event in enumerate(_start_events)
+               if isinstance(event, tuple) and event[:2] == ("pkill", "-f"))
+          > _start_events.index("backup")
+      and next(i for i, event in enumerate(_start_events)
+               if isinstance(event, tuple)
+               and event[:3] == ("/fake/codex", "login", "--device-auth"))
+          > _start_events.index("backup"))
+check("Codex cancel restores through the platform and invalidates the old usage cache",
+      _cancel_events[-2:] == ["restore", "invalidate"]
+      and _cancel_sent == [(b"200 OK", {"ok": True, "restored": True})])
+
+
+async def _codex_backup_failure_contract():
+    saved = (g._codex_bin, g._codex_auth_lifecycle, g._send_json,
+             g.asyncio.create_subprocess_exec)
+    spawned, sent = [], []
+
+    async def lifecycle(_action):
+        return None, "platform accounts operation failed"
+
+    async def spawn(*args, **_kwargs):
+        spawned.append(args)
+        raise AssertionError("Codex must not launch after backup failure")
+
+    async def send(_cw, status, payload, **_kwargs):
+        sent.append((status, payload))
+
+    try:
+        g._codex_bin = lambda: "/fake/codex"
+        g._codex_auth_lifecycle = lifecycle
+        g._send_json = send
+        g.asyncio.create_subprocess_exec = spawn
+        await g._serve_codex_login_start(None)
+        return spawned, sent
+    finally:
+        (g._codex_bin, g._codex_auth_lifecycle, g._send_json,
+         g.asyncio.create_subprocess_exec) = saved
+
+
+_backup_failure_spawned, _backup_failure_sent = asyncio.run(_codex_backup_failure_contract())
+check("Codex re-login fails closed before spawn when platform backup fails",
+      not _backup_failure_spawned
+      and _backup_failure_sent == [(b"400 Bad Request", {
+          "ok": False, "error": "platform accounts operation failed"})])
+
+# A rendered/manual unit may carry the feature flag but omit the platform path. After
+# the ownership move there is deliberately no app sibling or PATH fallback: starting
+# an enabled feature with no ABI bridge must fail loudly instead of running stale code.
 _saved_status_env = os.environ.pop("DEVTERM_CLAUDE_STATUS", None)
 try:
-    discovered_status = g._account_tool("DEVTERM_CLAUDE_STATUS", "claude-status")
+    try:
+        g._account_tool("DEVTERM_CLAUDE_STATUS")
+        missing_status_error = ""
+    except RuntimeError as exc:
+        missing_status_error = str(exc)
 finally:
     if _saved_status_env is not None:
         os.environ["DEVTERM_CLAUDE_STATUS"] = _saved_status_env
-check("accounts flag without a status env still finds the bundled probe",
-      os.path.samefile(discovered_status, "apps/devterm/bin/claude-status"))
+check("enabled account feature without a status env fails loudly",
+      "DEVTERM_CLAUDE_STATUS is required" in missing_status_error)
 
-# Discovery is a recovery path for enabled account features, not a reason to turn
-# those features on. Import a fresh gate with both flags disabled and no explicit
-# helper paths so this cannot be masked by the globals used by the route tests below.
+# Platform wiring is required only for enabled account features, not a reason to turn
+# those features on. Import a fresh gate with both flags disabled and no explicit tool
+# paths so this cannot be masked by the globals used by the route tests below.
 _disabled_env = dict(os.environ, DEVTERM_ACCOUNTS="false", DEVTERM_XAI="false",
                      PYTHONDONTWRITEBYTECODE="1")
 _disabled_env.pop("DEVTERM_CLAUDE_SWITCH", None)
@@ -101,7 +283,7 @@ spec.loader.exec_module(gate)
 print(json.dumps([gate.CLAUDE_SWITCH, gate.CLAUDE_STATUS]))
 """], env=_disabled_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     text=True, timeout=30)
-check("disabled account features do not auto-discover bundled helpers",
+check("disabled account features do not require platform tools",
       _disabled_probe.returncode == 0 and _disabled_probe.stdout.strip() == '["", ""]')
 
 
@@ -257,14 +439,14 @@ async def _xai_gate_cases():
             0, result={"state": "err", "reason": "ACCESSDONOTEMIT",
                        "access": "OTHERSECRET"})
         await g._serve_xai_status(None)
-        # Reproduce the installed-only failure: the script exists and passes the
-        # gate's os.path.isfile guard, but its required staged lib does not. Running
-        # the real script exits before argument parsing with empty stdout, so the
-        # route must answer 500 rather than pretending the feature is disabled.
+        # Reproduce a broken configured platform copy: the script exists and passes
+        # the gate's os.path.isfile guard, but its required sibling module does not.
+        # It exits before argument parsing with empty stdout, so the route must answer
+        # 500 rather than pretending the feature is disabled.
         installed_home = os.path.join(_xai_tmp, "home")
         installed_status = os.path.join(installed_home, ".local", "bin", "claude-status")
         os.makedirs(os.path.dirname(installed_status), exist_ok=True)
-        shutil.copy2("apps/devterm/bin/claude-status", installed_status)
+        shutil.copy2("bin/airlock-accounts-status", installed_status)
         os.chmod(installed_status, 0o755)
         os.environ["HOME"] = installed_home
         g.CLAUDE_STATUS = installed_status
@@ -382,51 +564,6 @@ check("xAI cancel obeys the same disabled gate without touching a process",
       not _xai_disabled_cancelled
       and any(cw == "disabled" and status == b"400 Bad Request"
               for cw, status, _payload in _xai_serial_sent))
-
-
-def _xai_only_installer_case():
-    tmp = tempfile.mkdtemp(prefix="devterm-xai-install-")
-    try:
-        home = os.path.join(tmp, "home")
-        render = os.path.join(tmp, "render")
-        shims = os.path.join(tmp, "shims")
-        os.makedirs(home); os.makedirs(render); os.makedirs(shims)
-        cfg = os.path.join(tmp, "airlock.toml")
-        with open(cfg, "w", encoding="utf-8") as f:
-            f.write('[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n'
-                    '[apps.hub]\n[apps.devterm]\nxai = true\n')
-        path = os.environ.get("PATH", "")
-        for command in ("tmux", "python3", "curl", "sha256sum",
-                        "systemctl", "tailscale", "sudo"):
-            if shutil.which(command, path=path):
-                continue
-            shim = os.path.join(shims, command)
-            with open(shim, "w", encoding="utf-8") as f:
-                f.write("#!/bin/sh\nexit 0\n")
-            os.chmod(shim, 0o755)
-        env = dict(os.environ, HOME=home, AIRLOCK_CONFIG=cfg,
-                   AIRLOCK_TS_FQDN="box.example.ts.net", AIRLOCK_DRY_RUN="1",
-                   AIRLOCK_RENDER_DIR=render, PATH=shims + os.pathsep + path)
-        result = subprocess.run(
-            ["bash", "apps/devterm/install.sh"], env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
-        unit = os.path.join(render, "units", "airlock-devterm-gate.service")
-        unit_text = open(unit, encoding="utf-8").read() if os.path.isfile(unit) else ""
-        return result.returncode, result.stdout, unit_text
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-_xai_install_rc, _xai_install_out, _xai_install_unit = _xai_only_installer_case()
-check("xAI-only real installer dry-run succeeds", _xai_install_rc == 0)
-check("xAI-only installer stages claude-status and bin_discovery together",
-      "bin/claude-status" in _xai_install_out
-      and "backend/bin_discovery.py" in _xai_install_out
-      and "bin/claude-switch" not in _xai_install_out)
-check("xAI-only installer wires the flag and status probe, not Claude pool tools",
-      "Environment=DEVTERM_XAI=true" in _xai_install_unit
-      and "Environment=DEVTERM_CLAUDE_STATUS=" in _xai_install_unit
-      and "Environment=DEVTERM_CLAUDE_SWITCH=" not in _xai_install_unit)
 
 
 async def _xai_logout_timeout_case():
@@ -635,6 +772,24 @@ g._codex_usage_state_save()
 g._invalidate_codex_usage_cache()
 check("login/logout drops the file, so a restart cannot resurrect it",
       not os.path.exists(g.CODEX_USAGE_STATE))
+
+async def _unavailable_generation_case():
+    saved_cache = dict(g._codex_usage_cache)
+    saved_auth_mtime = g._codex_auth_mtime
+    try:
+        g._codex_auth_mtime = lambda: g._CODEX_AUTH_GENERATION_UNAVAILABLE
+        g._codex_usage_cache.update(
+            valueAt=time.time(), lastTryAt=time.time(), authMtime="login-A",
+            payload={"use5h": 1, "use7d": 2, "stale": False}, task=None)
+        return await g._codex_usage_cached()
+    finally:
+        g._codex_usage_cache.clear(); g._codex_usage_cache.update(saved_cache)
+        g._codex_auth_mtime = saved_auth_mtime
+
+_unavailable_generation = asyncio.run(_unavailable_generation_case())
+check("unavailable auth generation never serves or commits cached usage",
+      _unavailable_generation.get("err") == "auth-generation-unavailable"
+      and not g._codex_has_usage_value(_unavailable_generation))
 
 g._codex_auth_mtime = _real_auth_mtime
 shutil.rmtree(_codex_state_tmp, ignore_errors=True)
@@ -1533,7 +1688,7 @@ try:
           g._codex_bin() == _fnm)
     check("...and what is returned is really executable", os.access(g._codex_bin(), os.X_OK))
     check("...so the endpoints stop refusing", g._codex_available() is True)
-    check("claude-status resolves the same binary as the gate (one contract, one module)",
+    check("platform status resolves the same binary as the gate (one contract, one module)",
           cs._codex_bin() == _fnm)
 finally:
     os.environ.clear(); os.environ.update(_disc_saved)

@@ -46,8 +46,16 @@ except ImportError:
 # of those modules and must keep working on an install that has no message console.
 try:
     import devmon_tokens as TOKENS
+    import devmon_accounts as TOKEN_ACCOUNTS
 except ImportError:
     TOKENS = None
+    TOKEN_ACCOUNTS = None
+
+# Cron health is core observability, independent of the optional message console.
+try:
+    import devmon_cron as CRON
+except ImportError:
+    CRON = None
 
 PORT = int(os.environ.get('AIRLOCK_DEV_MONITOR_BACKEND_PORT', '19923'))
 IDENTITY_HEADER = os.environ.get('AIRLOCK_IDENTITY_HEADER', 'Tailscale-User-Login')
@@ -669,7 +677,10 @@ def token_freshness_info():
     """
     snapshot_path = TOKENS.snapshot_path()
     last = TOKENS.read_snapshot(snapshot_path)
-    live = TOKENS.check_all(warn_hours=TOKEN_WARN_HOURS, stale_hours=TOKEN_STALE_HOURS)
+    raw, source_error = TOKEN_ACCOUNTS.raw_deadlines()
+    live = TOKENS.check_all(raw, warn_hours=TOKEN_WARN_HOURS,
+                            stale_hours=TOKEN_STALE_HOURS)
+    live['source_error'] = source_error
     live['last_check'] = {
         'path': snapshot_path,
         # None both times, and they mean different things: never = the timer has never
@@ -784,6 +795,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, token_freshness_info())
             return
+        if path in ('/api/cron/jobs', '/cron/jobs'):
+            if CRON is None:
+                self._json(503, {'ok': False, 'error': 'cron collector unavailable'})
+                return
+            try:
+                self._json(200, CRON.snapshot())
+            except Exception as exc:
+                self._json(500, {'ok': False, 'error': f'cron collection failed: {exc}'})
+            return
         if path in ('/api/history', '/history'):
             self._json(200, history_summary())
             return
@@ -814,7 +834,8 @@ class Handler(BaseHTTPRequestHandler):
                              'messages': _messages_state(),
                              'message_lanes': _message_lanes_health(),
                              'messages_requested': MESSAGES_REQUESTED,
-                             'token_freshness': _token_state()})
+                             'token_freshness': _token_state(),
+                             'cron': 'on' if CRON is not None else 'unavailable'})
             return
         self._json(404, {'ok': False, 'error': f'unknown path: {path}'})
 
@@ -906,6 +927,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200 if ok else 400, {
                 'ok': ok, 'name': name, 'message': message,
             })
+            return
+        if path.startswith('/api/owner/cron/'):
+            if CRON is None:
+                self._json(503, {'ok': False, 'error': 'cron collector unavailable'})
+                return
+            action = path.rsplit('/', 1)[-1]
+            status, payload = CRON.run_action(
+                action, body.get('unit') if isinstance(body, dict) else None)
+            self._json(status, payload)
             return
         parts = path.split('/')
         if len(parts) == 6 and parts[:4] == ['', 'api', 'owner', 'messages']:

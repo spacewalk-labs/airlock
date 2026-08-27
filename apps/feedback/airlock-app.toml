@@ -55,3 +55,10 @@ fragments = ["hub-locations.d/feedback.conf"]
 
 # No [tile]: feedback is the suggestion box shipped inside the hub launcher,
 # not a launcher tile (hub/index.html filters it out of the grid today).
+
+# D7. Shared: the suggestion box in the hub launcher. The backend attaches the
+# gate-verified identity server-side, so a collaborator can only ever submit as
+# themselves.
+[audience]
+supported = ["shared", "owner"]
+default = "shared"

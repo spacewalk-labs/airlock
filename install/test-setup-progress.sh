@@ -19,7 +19,7 @@
 # Offline and inert: no OrbStack, no VM, no network, no machine state anywhere.
 set -uo pipefail
 # install/test-render-parity.sh gates that every suite whose text mentions an app
-# installer pins the RAM the paseo installer picks its memory tier from. The gate is a
+# installer pins the RAM the paseo installer takes its memory share from. The gate is a
 # deliberately coarse text scan — it does not reason about WHICH app a path resolves to
 # — so suites that never install paseo carry the pin anyway and it sits inert. Cheaper
 # than a gate that tries to be clever about which mention counts.

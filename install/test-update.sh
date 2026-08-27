@@ -26,7 +26,7 @@
 # Offline: the "release" is a local git repository, reached as a path. No network.
 set -uo pipefail
 # install/test-render-parity.sh gates that every suite whose text mentions an app
-# installer pins the RAM the paseo installer picks its memory tier from. This suite
+# installer pins the RAM the paseo installer takes its memory share from. This suite
 # never installs anything, so the pin sits inert — cheaper than a gate clever enough to
 # know that.
 export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368

@@ -1,0 +1,94 @@
+contract = 1
+id = "notes"
+
+# Notes is one owner-only tile over three roles: a SilverBullet editor, a
+# containerized Perlite reader, and the validated vault registry below. Vault
+# contents are operator data and never become package artifacts.
+
+[config.defaults]
+# The hub proxies one same-origin reader endpoint to this loopback-only router.
+# It is config because another local service may already own the default port.
+reader_port = 19960
+# Each writable vault needs one loopback SilverBullet listener. Reserving a
+# configurable base keeps the whole derived range visible to Airlock's global
+# port-collision check.
+editor_port_base = 19961
+# This is both the maximum registry size and the number of editor ports Airlock
+# reserves. It is config so small boxes can reserve a smaller, explicit range.
+vault_slots = 10
+
+[[config.port_spans]]
+base = "editor_port_base"
+count = "vault_slots"
+
+[config.tables.vaults]
+allowed_keys = ["default_vault", "entries"]
+
+[config]
+runtime_env = [
+  "AIRLOCK_NOTES_PLAN",
+  "AIRLOCK_NOTES_SILVERBULLET_BIN",
+]
+
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Registry validation and editor supervision"
+
+[[prerequisites]]
+command = "docker"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y docker.io"
+note = "Container runtime; the package uses immutable images already present"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User editor supervisor"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Pinned SilverBullet download and smoke probes"
+
+[[prerequisites]]
+command = "sha256sum"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y coreutils"
+note = "Pinned SilverBullet release verification"
+
+[[prerequisites]]
+command = "unzip"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y unzip"
+note = "Pinned SilverBullet archive extraction"
+
+# The two literal user artifacts are the editor supervisor and the hub fragment.
+# Package runtime files are removable; vault directories are retained data and
+# deliberately absent. Containers are a bounded package namespace whose actual
+# immutable ids are committed by the platform ledger (D9).
+[artifacts]
+containers = ["airlock-notes-*"]
+units = ["airlock-notes-editor.service"]
+fragments = ["hub-locations.d/notes.conf"]
+files = ["~/.local/opt/airlock-notes/", "~/.local/share/airlock/notes/"]
+
+[audience]
+supported = ["owner"]
+default = "owner"
+
+[tile]
+label = "Notes"
+sub = "vault reader & editor"
+cat = "docs"
+path = "/notes/"
+glyph = "app-silverbullet"

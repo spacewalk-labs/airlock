@@ -71,8 +71,13 @@ ${method}
             scopes: ["user:inference", "user:profile"],
             subscriptionType: "max",
             rateLimitTier: "default_claude_max_20x",
+            providerExtension: { retained: true },
         },
-        _meta: { email: "fixture@example.invalid", org: "Fixture Org", kind: "max" },
+        _meta: {
+            email: "fixture@example.invalid", org: "Fixture Org", kind: "max",
+            platformExtension: { retained: true },
+        },
+        futureTopLevel: { retained: true },
     };
     const P = "/fake/.credentials.json";
     const mem = makeFs({ [P]: JSON.stringify(FIXTURE, null, 2) });
@@ -92,13 +97,22 @@ ${method}
     "(2) expiresAt / refreshTokenExpiresAt / scopes survive the write-back");
     ok(out._meta && out._meta.email === FIXTURE._meta.email, "(3) the top-level _meta block survives");
 
+    // schemas/credentials/pool-record-v1.json deliberately leaves all three objects
+    // open. Drive the ACTUAL extracted save method, not a model of it: reconstructing
+    // only today's named fields is still a contract violation even when every named
+    // assertion above survives.
+    ok(out.claudeAiOauth.providerExtension?.retained === true
+        && out._meta?.platformExtension?.retained === true
+        && out.futureTopLevel?.retained === true,
+    "(4) unknown fields survive at the OAuth, metadata, and record levels");
+
     // A file the schema rejects must be left exactly as it was, and must say so.
     const mem2 = makeFs({ [P]: "{ not json" });
     const warns2 = [];
     const t2 = new (build(mem2.api))({ warn: (o, m) => warns2.push(m) });
     await t2.saveClaudeCredentials(P, { accessToken: "FAKE-access-new" });
-    ok(mem2.store.get(P) === "{ not json", "(4) an unreadable credential file is not clobbered");
-    ok(warns2.some((w) => String(w).includes("[paseo-cred-preserve]")), "(5) that failure warns instead of passing silently");
+    ok(mem2.store.get(P) === "{ not json", "(5) an unreadable credential file is not clobbered");
+    ok(warns2.some((w) => String(w).includes("[paseo-cred-preserve]")), "(6) that failure warns instead of passing silently");
 }
 
 if (MODE === "codex") {

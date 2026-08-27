@@ -124,12 +124,11 @@ owner = "$LIVE_OWNER"
 collaborators = []
 
 [paths]
-code_root = "$HOMEDIR"
 wiki = ""
 
 [apps.hub]
 [apps.devterm]
-[apps.markwand]
+[apps.fileview]
 [apps.publish]
 [apps.notepad]
 [apps.dev-monitor]
@@ -152,7 +151,7 @@ chown "$LIVE_USER:$LIVE_USER" "$HOMEDIR/airlock.toml"
 #
 # This is deliberate and it is the most valuable thing in this script. A fix string
 # is documentation that nobody executes, which means it rots silently: until
-# 2026-08-07 every node row in paseo and markwand said `snap install node
+# 2026-08-07 every node row in paseo and fileview said `snap install node
 # --classic`, and the installer now refuses a snap node. Running them here means a
 # wrong fix string turns this run red instead of turning up on somebody's fresh box
 # six months later.

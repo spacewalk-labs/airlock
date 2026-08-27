@@ -12,6 +12,10 @@ Documentation=https://github.com/getpaseo/paseo
 # network.target matches every other app unit in this repo (dev-monitor,
 # devterm, feedback, publish, code-server) and carries no such back-edge.
 After=network.target
+# Bound even intentional clean-exit restarts. A collision or configuration
+# failure exits non-zero and is not retried at all (Restart=on-success below).
+StartLimitIntervalSec=30
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -31,34 +35,28 @@ Environment=PASEO_HOSTNAMES=<your-box>.ts.net,<your-box>.ts.net:19950,localhost
 # Headless: no dictation/voice (avoids an unexpected ~600MB speech model download).
 Environment=PASEO_DICTATION_ENABLED=false
 Environment=PASEO_VOICE_MODE_ENABLED=false
-# Reap a stale singleton pidfile before every start (including on-boot and every
-# Restart=always retry): upstream (@getpaseo/cli) writes $PASEO_HOME/paseo.pid to
-# enforce "only one daemon" but never reaps it itself, so a record surviving a
-# reboot (stale pid, sometimes already reused by an unrelated process) makes the
-# daemon refuse to start FOREVER with "Another Paseo daemon is already running" —
-# measured on a real box, RestartSec=3 looping it (counter into double digits).
-# Leading '-': a guard-script problem must never block the real ExecStart; the
-# script itself only ever deletes the file when it can prove staleness (dead pid,
-# or a live pid whose uid/hostname/start-time contradict the record) and always
-# exits 0 either way. See apps/paseo/paseo-clear-stale-pid.py.
-ExecStartPre=-/usr/bin/python3 ROOT/apps/paseo/paseo-clear-stale-pid.py WDIR/home/.paseo/paseo.pid
+# No ExecStartPre pidfile cleanup here. PASEO_HOME and paseo.pid can be shared
+# with a legacy service; candidate-side cleanup would mutate that live service's
+# singleton state on every failed start. The installer performs one authorized
+# cleanup only after it has measured and stopped the actual resource owner.
 # --foreground: Type=simple. --no-relay: no upstream relay outbound. --web-ui: the
 # browser UI. --listen 127.0.0.1: loopback bind (the gate is the only ingress).
 ExecStart=WDIR/home/.npm-global/bin/paseo daemon start --foreground --no-relay --web-ui --listen 127.0.0.1:19952
-# always, not on-failure: the web UI's "restart daemon" is a websocket shutdown RPC
-# that exits the worker cleanly (status 0) and expects a supervisor to bring it back.
-# Under on-failure systemd reads that as an intended stop and leaves it dead — so the
-# button permanently kills the daemon (the gate stays up, so it just looks hung).
-# An explicit 'systemctl --user stop' still stops it: always only covers self-exit.
+# The web UI's "restart daemon" is a websocket shutdown RPC that exits cleanly
+# (status 0), so on-success preserves that behavior. A duplicate singleton or
+# broken configuration exits non-zero and must remain failed for diagnosis; an
+# unconditional restart loop previously reached 53 attempts on a real box.
+# An explicit 'systemctl --user stop' still suppresses restart as usual.
 # (Single quotes, not backticks: this heredoc is unquoted, so backticks here would
 # be command substitution — the comment would RUN at install time and vanish.)
-Restart=always
+Restart=on-success
 RestartSec=3
 # Backstop, not a reservation (idle ~440M) — a ceiling this unit must never cross,
-# not memory set aside for it. Picked by the installer from a RAM tier table
-# (standard 5.5G/5G; >=16 GiB -> 14G/12G), so a runaway multi-session tree cannot take
-# the machine down with it. No box is refused over this: on a box smaller than the
-# tier the ceiling is inert and the installer says so.
+# not memory set aside for it. The installer sizes it as a SHARE of whatever the box
+# was given: MemoryMax = 11/16 of RAM, MemoryHigh = 10/16 (owner, 2026-08-22). So an
+# 8GB machine gets 5632M/5120M and a 72 GiB dev box gets 50688M/46080M, instead of
+# both getting the same number off a fixed table. A runaway multi-session tree cannot
+# take the machine down with it, and no box is ever refused over this.
 #
 # MemoryHigh, a little under max, is the part that matters in practice. MemoryMax alone
 # is a cliff: the cgroup runs flat out to the ceiling and then the allocation is
@@ -72,8 +70,8 @@ RestartSec=3
 #       app.slice/airlock-paseo.service/memory.events
 # 'high' climbing is by design; 'max' climbing means the box is too small.
 # Keep high < max — above max it is inert.
-MemoryMax=14G
-MemoryHigh=12G
+MemoryMax=22528M
+MemoryHigh=20480M
 # Agent trees fork wide (a CLI plus its children per session, times N sessions).
 # 1024 was a real ceiling on a busy box: pids.events 'max' climbs, fork() starts
 # failing, and it surfaces as unrelated-looking tool errors rather than as a

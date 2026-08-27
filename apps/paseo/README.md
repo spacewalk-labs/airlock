@@ -103,11 +103,56 @@ chromium download or a web-ui SHA-drift never breaks the hub or the daemon).
 Default off keeps the install lean — chromium is a ~150MB download and the
 Level-2 web-ui patch is SHA-pinned to `@getpaseo/cli`. See `browse-host/README.md`.
 
+## Cross-device web-UI state (`/airlock-ui-state/`)
+
+Paseo keeps the sidebar's project/workspace **order** in the browser — a zustand
+`persist` store keyed `sidebar-project-workspace-order`, backed by localStorage on
+web. That makes the order a property of the device, not of the box: drag a workspace
+on the Mac and the iPad still shows the old order. Upstream has no server-side home
+for it (the daemon exposes no general key/value route), so the order never crosses
+the wire at all.
+
+Airlock gives it one:
+
+```
+browser ──▶ tailscale serve ──▶ nginx owner gate ──┬─▶ /  ............ paseo daemon
+                                                   └─▶ /airlock-ui-state/<key>
+                                                             ▼
+                                    airlock-paseo-uistate.service (127.0.0.1:19954)
+                                    ~/.local/state/airlock/paseo-ui-state/<key>.json
+```
+
+Three properties are the design, not incidental:
+
+- **The gate is the authentication.** The backend binds loopback and carries none of
+  its own, exactly like airlock's other loopback backends. The route repeats the
+  `$owner_ok` guard, because this server has no server-level `if` — without it the
+  route would be a writable hole for every identity the tailnet lets through.
+- **The key allowlist is the second wall.** Paseo persists plenty of other things
+  (draft reviews, a daemon registry, dismissed callouts); only the sidebar order is
+  asked for here, and an unlisted key is 404 on every verb. A patched bundle cannot
+  turn this into a general store for whatever upstream persists next.
+- **Local stays the fallback, not the loser.** The bundle patch reads the server
+  first and falls back to this device's own copy on 404 or on an unreachable
+  backend; writes go local first, then to the server. A box without the service, or
+  offline, behaves exactly like upstream instead of losing the order.
+
+What it deliberately does NOT do: push. The store reads the server when the page
+loads and writes on every change, so a reorder on one device shows up on the next one
+at its next load — not live in an already-open tab. A live channel would mean holding
+a socket open for a list of strings; a reload is the cheaper convergence.
+
+The patch itself is one anchor in the always-on group of
+`browse-host/bin/patch-web-ui.js` (`sidebar-order-shared-storage`) and swaps the
+storage of that ONE store — no other persisted state changes hands.
+
 ## Files
 
 | File | Role |
 |---|---|
 | `install.sh` | provision + pin `@getpaseo/cli` · depth4 patch · systemd `--user` unit · nginx owner-gate fragment (direct, +3 headers) · `tailscale serve` · browse-host wiring when `browse = true` |
-| `smoke.sh` | gate health: backend reachable, owner 200/302, deny 403, no-header 403 |
+| `smoke.sh` | gate health: backend reachable, owner 200/302, deny 403, no-header 403, ui-state readable by the owner and 403 for anyone else |
+| `backend/airlock-paseo-uistate.py` | loopback store for the cross-device sidebar order (one JSON blob per allowlisted key) |
+| `test-uistate-backend.py` | offline checks for what that backend refuses: unlisted keys, traversal, oversized and non-JSON bodies |
 | `patches/` | the AGPL depth4 patch + its licensing note |
 | `browse-host/` | Apache-2.0 sidecar for agent browser tools + live panels (wired in when `browse = true`) |

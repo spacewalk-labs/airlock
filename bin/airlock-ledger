@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 
-LEDGER_VERSION = 5
+LEDGER_VERSION = 6
 LEDGER_FILENAME = "app-ledger.json"
 # What an install was AUTHORIZED to do, recorded on the record itself so a
 # later load checks the decision admission already made instead of re-deriving
@@ -46,6 +46,7 @@ LEDGER_FILENAME = "app-ledger.json"
 CAPABILITIES = ("rooted-artifact", "system-unit")
 ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "rooted", "serve_ports")
 LEGACY_ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "serve_ports")
+PACKAGE_ARTIFACT_CLASSES = ARTIFACT_CLASSES + ("containers",)
 PATH_CLASSES = ("units", "fragments", "webroot", "files", "rooted")
 LIFECYCLE_KEYS = ("install", "smoke", "deactivate")
 DESTRUCTIVE_ACTIONS = frozenset(("remove", "teardown-intent", "upgrade-deactivate"))
@@ -57,11 +58,19 @@ INTENT_RECORD_FIELDS_V5 = (
     "roots", "deps", "anchors", "serve_mappings", "unit_scopes", "order",
     "source_class", "capabilities",
 )
+INTENT_RECORD_FIELDS_V6 = INTENT_RECORD_FIELDS_V5 + ("container_runtime",)
 COMMITTED_RECORD_FIELDS_V5 = (
     "path", "digest", "lifecycle", "artifacts", "deps", "serve_mappings",
     "unit_scopes", "order", "roots", "source_class", "capabilities",
 )
+COMMITTED_RECORD_FIELDS_V6 = COMMITTED_RECORD_FIELDS_V5 + ("container_runtime",)
 STORE_FIELDS_V5 = ("version", "entries", "events")
+STORE_FIELDS_V6 = STORE_FIELDS_V5
+CONTAINER_RUNTIME_INTENT_FIELDS = (
+    "runtime", "daemon_identity", "install_nonce", "declarations",
+)
+CONTAINER_RUNTIME_COMMITTED_FIELDS = CONTAINER_RUNTIME_INTENT_FIELDS + ("objects",)
+CONTAINER_OBJECT_FIELDS = ("id", "name")
 # Mirrors PACKAGE_ID_RE in bin/airlock-config (the config owns the grammar;
 # the store re-checks it so a hand-made entry cannot smuggle an id the CLI
 # cannot address, e.g. one starting with '-').
@@ -80,6 +89,12 @@ _DEP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 # re-checks it here so a hand-edited record cannot smuggle one past to
 # expansion/removal.
 _UNIT_WILDCARD_RE = re.compile(r"[*?\[]")
+_CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}\Z")
+_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}\Z")
+_DAEMON_ID_RE = re.compile(r"^docker:[A-Za-z0-9][A-Za-z0-9:_-]{0,255}\Z")
+_PACKAGE_LABEL = "io.airlock.package"
+_NONCE_LABEL = "io.airlock.install-nonce"
 
 
 class LedgerError(Exception):
@@ -158,6 +173,48 @@ def _webroot() -> str:
     return _real_root(os.environ.get("AIRLOCK_WEBROOT") or "/opt/airlock/hub")
 
 
+def _platform_dir(which: str) -> str:
+    """The two static platform dirs a rooted pattern may anchor under.
+    Env-overridable the same way every other root above is (the fixture
+    seam _unit_dir/_conf_dir/_webroot already provide), so a test fixture
+    never globs the real box's /etc/airlock or /opt/airlock — the
+    equivalence harness measured exactly that host-dependence
+    (install/test-equivalence.sh). Unset, these are the literal platform
+    paths, byte-for-byte the pre-seam behaviour. An override is validated
+    with the SAME rule the dynamic webroot anchor gets: one that collapses
+    to "/" or an FHS system root must not silently authorize the whole
+    filesystem — but unlike the dynamic anchor (silently excluded, other
+    anchors remain), a broken platform override fails loudly, because
+    excluding it would refuse every shipped rooted artifact with no hint
+    why."""
+    env = "AIRLOCK_PLATFORM_ETC" if which == "etc" else "AIRLOCK_PLATFORM_OPT"
+    raw = (os.environ.get(env) or "").strip()
+    if not raw:
+        return "/etc/airlock" if which == "etc" else "/opt/airlock"
+    resolved = _real_root(raw)
+    if _rooted_dynamic_anchor_forbidden(resolved):
+        fail(f"{env}={raw!r} resolves to {resolved!r}, which cannot anchor "
+             "rooted artifacts (needs at least two path components outside "
+             "the protected system roots)")
+    return resolved
+
+
+def _rooted_substitute(pattern: str, webroot_parent: str) -> str:
+    """Resolve a declared rooted pattern's anchor: the ${webroot_parent}
+    token first, then the two static platform anchors, re-anchored onto
+    _platform_dir's current value. THE one substitution — expansion,
+    anchor recording (_pattern_anchor), record validation, and
+    bin/airlock-config's manifest validation all call this, so no site can
+    resolve a pattern into a different space than the allowlist admits
+    (the hand-copied-drift hazard airlock-config's containment check
+    already documents)."""
+    s = pattern.replace("${webroot_parent}", webroot_parent)
+    for literal, which in (("/etc/airlock", "etc"), ("/opt/airlock", "opt")):
+        if s == literal or s.startswith(literal + "/"):
+            return _platform_dir(which) + s[len(literal):]
+    return s
+
+
 ROOT_KEYS = ("unit_user", "unit_system", "confd", "webroot", "home")
 
 
@@ -228,7 +285,11 @@ def _rooted_authorization_allowlist() -> tuple[str, ...]:
     excluded, so any rooted pattern that needed it is refused, same as if
     the artifact genuinely lived somewhere else."""
     dynamic = _rooted_webroot_parent(_current_roots())
-    anchors = ["/etc/airlock", "/opt/airlock"]
+    # _platform_dir, not literals: the anchors must live in the same space
+    # patterns are substituted into (_rooted_substitute), or an env-scoped
+    # fixture's own expansion would be refused by an allowlist still naming
+    # the real box's dirs. Unset env resolves to the same two literals.
+    anchors = [_platform_dir("etc"), _platform_dir("opt")]
     if not _rooted_dynamic_anchor_forbidden(dynamic):
         anchors.append(dynamic)
     return tuple(anchors)
@@ -254,6 +315,63 @@ def _validate_lifecycle(value: Any, where: str) -> None:
         fail(f"{where}: lifecycle must contain install, smoke, and deactivate")
     if any(not isinstance(value[key], bool) for key in LIFECYCLE_KEYS):
         fail(f"{where}: lifecycle values must be boolean")
+
+
+def _validate_container_declarations(value: Any, where: str) -> None:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        fail(f"{where}: expected a string list")
+    if len(value) != len(set(value)):
+        fail(f"{where}: declarations must not contain duplicates")
+    for item in value:
+        literal = item[:-1] if item.endswith("*") else item
+        if (not literal or item.count("*") != (1 if item.endswith("*") else 0)
+                or not _CONTAINER_NAME_RE.fullmatch(literal)):
+            fail(f"{where}: {item!r} must be a literal container name or a "
+                 "non-empty literal prefix followed by one final '*'")
+    for index, left in enumerate(value):
+        for right in value[index + 1:]:
+            if _container_claims_overlap([left], [right]):
+                fail(f"{where}: declarations {left!r} and {right!r} overlap")
+
+
+def _validate_container_runtime(value: Any, where: str, *, committed: bool) -> None:
+    if value is None:
+        return
+    required = set(CONTAINER_RUNTIME_COMMITTED_FIELDS if committed
+                   else CONTAINER_RUNTIME_INTENT_FIELDS)
+    if not isinstance(value, dict) or set(value) != required:
+        fail(f"{where}: invalid container runtime shape")
+    if value["runtime"] != "docker":
+        fail(f"{where}.runtime: only 'docker' is supported")
+    daemon_identity = value["daemon_identity"]
+    if not isinstance(daemon_identity, str) or not _DAEMON_ID_RE.fullmatch(daemon_identity):
+        fail(f"{where}.daemon_identity: invalid Docker daemon identity")
+    nonce = value["install_nonce"]
+    if not isinstance(nonce, str) or not _NONCE_RE.fullmatch(nonce):
+        fail(f"{where}.install_nonce: invalid nonce")
+    _validate_container_declarations(value["declarations"],
+                                     f"{where}.declarations")
+    if committed:
+        objects = value["objects"]
+        if not isinstance(objects, list):
+            fail(f"{where}.objects: expected a list")
+        ids: set[str] = set()
+        names: set[str] = set()
+        for index, obj in enumerate(objects):
+            owhere = f"{where}.objects[{index}]"
+            if not isinstance(obj, dict) or set(obj) != set(CONTAINER_OBJECT_FIELDS):
+                fail(f"{owhere}: expected exactly id and name")
+            object_id, name = obj["id"], obj["name"]
+            if not isinstance(object_id, str) or not _CONTAINER_ID_RE.fullmatch(object_id):
+                fail(f"{owhere}.id: expected a full 64-hex Docker id")
+            if not isinstance(name, str) or not _CONTAINER_NAME_RE.fullmatch(name):
+                fail(f"{owhere}.name: invalid container name")
+            if not _container_name_matches(name, value["declarations"]):
+                fail(f"{owhere}.name: outside the recorded declarations")
+            if object_id in ids or name in names:
+                fail(f"{where}.objects: ids and names must be unique")
+            ids.add(object_id)
+            names.add(name)
 
 
 def _validate_artifact_map(value: Any, where: str, declared: bool, *, version: int = LEDGER_VERSION,
@@ -349,7 +467,7 @@ def _validate_artifact_map(value: Any, where: str, declared: bool, *, version: i
                 fail(f"{where}.rooted: cannot validate without a roots snapshot")
             for item in items:
                 s = str(item)
-                substituted = s.replace("${webroot_parent}", _rooted_webroot_parent(roots))
+                substituted = _rooted_substitute(s, _rooted_webroot_parent(roots))
                 if not os.path.isabs(substituted) or any(
                         x in (".", "..") for x in substituted.split("/")):
                     fail(f"{where}.rooted: {item!r} must be absolute after "
@@ -553,8 +671,10 @@ def _validate_record(record: Any, kind: str, where: str, *,
             required.update(("serve_mappings", "unit_scopes", "order", "source_class"))
         if version >= 4:
             required.add("capabilities")
-        if version >= LEDGER_VERSION:
+        if version >= 5:
             required = set(INTENT_RECORD_FIELDS_V5)
+        if version >= 6:
+            required = set(INTENT_RECORD_FIELDS_V6)
         if set(record) != required:
             fail(f"{where}: invalid intent record shape")
         _validate_provenance(record, kind, where)
@@ -619,6 +739,10 @@ def _validate_record(record: Any, kind: str, where: str, *,
             _require_system_unit_scope_claim(record["unit_scopes"],
                                              record["capabilities"], where,
                                              symmetric=True)
+        if version >= 6:
+            _validate_container_runtime(record["container_runtime"],
+                                        f"{where}.container_runtime",
+                                        committed=False)
     else:
         required = {"path", "digest", "lifecycle", "artifacts"}
         if version >= 2:
@@ -627,8 +751,10 @@ def _validate_record(record: Any, kind: str, where: str, *,
             required.update(("serve_mappings", "unit_scopes", "order", "roots", "source_class"))
         if version >= 4:
             required.add("capabilities")
-        if version >= LEDGER_VERSION:
+        if version >= 5:
             required = set(COMMITTED_RECORD_FIELDS_V5)
+        if version >= 6:
+            required = set(COMMITTED_RECORD_FIELDS_V6)
         if set(record) != required:
             fail(f"{where}: invalid committed record shape")
         _validate_provenance(record, kind, where)
@@ -675,6 +801,10 @@ def _validate_record(record: Any, kind: str, where: str, *,
                     and "system-unit" not in record["capabilities"]):
                 fail(f"{where}: artifacts.units contains a system unit but "
                      "capabilities does not claim 'system-unit'")
+        if version >= 6:
+            _validate_container_runtime(record["container_runtime"],
+                                        f"{where}.container_runtime",
+                                        committed=True)
 
 
 def _validate_store(store: Any, path: Path) -> dict[str, Any]:
@@ -685,7 +815,7 @@ def _validate_store(store: Any, path: Path) -> dict[str, Any]:
     # version must stay in this set by NAME, or raising the constant silently
     # evicts the one version most boxes are actually on and kills them here —
     # before the normalisation below, which exists to upgrade them, ever runs.
-    if not _is_int(version) or version not in (1, 2, 3, 4, LEDGER_VERSION):
+    if not _is_int(version) or version not in (1, 2, 3, 4, 5, LEDGER_VERSION):
         hint = ""
         if _is_int(version) and version > LEDGER_VERSION:
             hint = ("; this state was written by a newer airlock, so the tree is "
@@ -693,7 +823,7 @@ def _validate_store(store: Any, path: Path) -> dict[str, Any]:
                     "airlock checkout rather than editing the ledger")
         fail(f"{path}: unsupported ledger version {store.get('version')!r}; "
              f"this airlock reads up to version {LEDGER_VERSION}{hint}")
-    expected_top = (set(STORE_FIELDS_V5)
+    expected_top = (set(STORE_FIELDS_V6)
                     if version >= 5 else {"version", "entries"})
     if set(store) != expected_top:
         fail(f"{path}: invalid ledger shape")
@@ -730,7 +860,7 @@ def _validate_store(store: Any, path: Path) -> dict[str, Any]:
     # write_store would then refuse its own output.
     normalised = copy.deepcopy(store)
     normalised["version"] = LEDGER_VERSION
-    normalised["events"] = []
+    normalised.setdefault("events", [])
     if version in (1, 2):
         for entry in normalised["entries"].values():
             for kind in ("committed", "intent"):
@@ -773,6 +903,14 @@ def _validate_store(store: Any, path: Path) -> dict[str, Any]:
             record = entry.get(kind)
             if record is not None and "capabilities" not in record:
                 record["capabilities"] = _record_capabilities(record, kind)
+    # v1-v5 -> v6. Older stores had no runtime object class; null is the only
+    # honest migration because no immutable ids or ownership nonce were ever
+    # recorded by those versions.
+    for entry in normalised["entries"].values():
+        for kind in ("committed", "intent"):
+            record = entry.get(kind)
+            if record is not None:
+                record.setdefault("container_runtime", None)
     return normalised
 
 
@@ -859,7 +997,7 @@ def _normalise_package(app_id: str, raw: Any) -> dict[str, Any]:
     if not isinstance(directory, str) or not directory:
         fail(f"package-info: packages.{app_id}.dir must be a non-empty string")
     raw_artifacts = raw.get("artifacts", {})
-    if not isinstance(raw_artifacts, dict) or set(raw_artifacts) - set(ARTIFACT_CLASSES):
+    if not isinstance(raw_artifacts, dict) or set(raw_artifacts) - set(PACKAGE_ARTIFACT_CLASSES):
         fail(f"package-info: packages.{app_id}.artifacts has unknown keys")
     artifacts: dict[str, list[str]] = {}
     for name in ARTIFACT_CLASSES:
@@ -867,6 +1005,9 @@ def _normalise_package(app_id: str, raw: Any) -> dict[str, Any]:
         if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
             fail(f"package-info: packages.{app_id}.artifacts.{name} must be a string list")
         artifacts[name] = list(values)
+    raw_containers = raw_artifacts.get("containers", [])
+    _validate_container_declarations(
+        raw_containers, f"package-info: packages.{app_id}.artifacts.containers")
 
     raw_ports = raw.get("serve_port_values", {})
     _validate_port_values(raw_ports, f"package-info: packages.{app_id}.serve_port_values")
@@ -923,6 +1064,7 @@ def _normalise_package(app_id: str, raw: Any) -> dict[str, Any]:
     return {
         "dir": directory,
         "artifacts": artifacts,
+        "containers": list(raw_containers),
         "serve_port_values": port_values,
         "serve_mappings": mappings,
         "unit_scopes": dict(raw_scopes),
@@ -1017,9 +1159,34 @@ def _intent_record(app_id: str, package: dict[str, Any], store: dict[str, Any]) 
         fail(f"package facts for {app_id} carry no capabilities — every producer "
              "must derive them (bin/airlock-config's manifest spec, or a copy of "
              "that spec's list on the adopt path)")
+    digest = digest_tree(path)
+    declarations = list(package.get("containers") or ())
+    container_runtime = None
+    if declarations and not is_dry_run():
+        daemon_identity = _docker_daemon_identity()
+        committed = (store["entries"].get(app_id) or {}).get("committed")
+        previous = committed.get("container_runtime") if committed is not None else None
+        # Same-tree reconcile is the sole nonce-reuse path. The committed
+        # immutable ids remain authoritative and are admitted separately
+        # before this intent can be persisted.
+        if (committed is not None and committed["path"] == path
+                and committed["digest"] == digest and previous is not None
+                and previous["declarations"] == declarations):
+            if previous["daemon_identity"] != daemon_identity:
+                fail(f"same-digest reconcile for {app_id} reached a different "
+                     "Docker daemon; refusing nonce reuse")
+            nonce = previous["install_nonce"]
+        else:
+            nonce = secrets.token_urlsafe(32)
+        container_runtime = {
+            "runtime": "docker",
+            "daemon_identity": daemon_identity,
+            "install_nonce": nonce,
+            "declarations": declarations,
+        }
     return {
         "path": path,
-        "digest": digest_tree(path),
+        "digest": digest,
         "artifacts_declared": copy.deepcopy(package["artifacts"]),
         "serve_port_values": copy.deepcopy(package["serve_port_values"]),
         "serve_mappings": copy.deepcopy(package["serve_mappings"]),
@@ -1045,6 +1212,7 @@ def _intent_record(app_id: str, package: dict[str, Any], store: dict[str, Any]) 
         # so teardown can tell a post-record redirect from a box that was
         # always laid out that way.
         "anchors": _record_anchors(package["artifacts"], _current_roots()),
+        "container_runtime": container_runtime,
     }
 
 
@@ -1069,7 +1237,7 @@ def _pattern_anchor(cls: str, pattern: str, root: str, roots: dict[str, str]) ->
     if cls in ("files", "rooted"):
         raw = pattern
         if cls == "rooted":
-            raw = raw.replace("${webroot_parent}", str(Path(roots["webroot"]).parent))
+            raw = _rooted_substitute(raw, str(Path(roots["webroot"]).parent))
         if raw.startswith("~/"):
             raw = os.path.join(roots["home"], raw[2:].lstrip("/"))
         rooted = os.path.abspath(raw)
@@ -1246,7 +1414,7 @@ def expand_declared(declared: dict[str, Any], port_values: dict[str, Any],
     expanded["files"] = _sort_paths(_canonical_artifact(m) for m in matches)
     matches = []
     for pattern in declared["rooted"]:
-        rooted = pattern.replace("${webroot_parent}", _rooted_webroot_parent(roots))
+        rooted = _rooted_substitute(pattern, _rooted_webroot_parent(roots))
         matches.extend(_glob_matches(rooted))
     _check_anchor(anchors, "rooted", "", declared["rooted"], roots,
                   "artifacts_declared.rooted")
@@ -1379,6 +1547,391 @@ def _artifact_difference(old: dict[str, list[Any]], new: dict[str, list[Any]]) -
                                    if not _still_owned(p))
     result["serve_ports"] = sorted(set(old["serve_ports"]) - set(new["serve_ports"]))
     return result
+
+
+def _container_name_matches(name: str, declarations: list[str]) -> bool:
+    return any(name.startswith(item[:-1]) if item.endswith("*") else name == item
+               for item in declarations)
+
+
+def _container_claims_overlap(left: list[str], right: list[str]) -> bool:
+    for a in left:
+        ap, aw = (a[:-1], True) if a.endswith("*") else (a, False)
+        for b in right:
+            bp, bw = (b[:-1], True) if b.endswith("*") else (b, False)
+            if ((not aw and not bw and ap == bp)
+                    or (aw and bw and (ap.startswith(bp) or bp.startswith(ap)))
+                    or (aw and not bw and bp.startswith(ap))
+                    or (not aw and bw and ap.startswith(bp))):
+                return True
+    return False
+
+
+def _check_container_claim_conflicts(store: dict[str, Any], app_id: str,
+                                     declarations: list[str]) -> None:
+    if not declarations:
+        return
+    for other_id, entry in sorted(store["entries"].items()):
+        if other_id == app_id:
+            continue
+        for kind in ("committed", "intent"):
+            record = entry.get(kind)
+            runtime = record.get("container_runtime") if record is not None else None
+            if runtime is not None and _container_claims_overlap(
+                    declarations, runtime["declarations"]):
+                fail(f"container claim for {app_id} overlaps {other_id}.{kind}")
+
+
+_DOCKER_BASE: list[str] | None = None
+
+
+def _docker_base() -> list[str]:
+    global _DOCKER_BASE
+    if _DOCKER_BASE is not None:
+        return _DOCKER_BASE
+    candidates = (["docker"], ["sudo", "-n", "docker"])
+    for candidate in candidates:
+        try:
+            probe = subprocess.run(candidate + ["info"], check=False,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+        if probe.returncode == 0:
+            _DOCKER_BASE = list(candidate)
+            return _DOCKER_BASE
+    fail("Docker daemon unavailable (tried docker and sudo -n docker)")
+
+
+def _docker(args: list[str]) -> subprocess.CompletedProcess[str]:
+    command = _docker_base() + args
+    try:
+        return subprocess.run(command, check=False, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        fail(f"Docker command failed to start: {exc}")
+
+
+def _docker_daemon_identity() -> str:
+    """Stable Engine identity, independent of direct-vs-sudo client choice."""
+    result = _docker(["info", "--format", "{{.ID}}"])
+    if result.returncode != 0:
+        fail(f"Docker daemon identity query failed with exit {result.returncode}")
+    raw = result.stdout.strip()
+    identity = f"docker:{raw}"
+    if not _DAEMON_ID_RE.fullmatch(identity):
+        fail("Docker daemon identity query returned an invalid value")
+    return identity
+
+
+def _require_container_daemon(runtime: dict[str, Any] | None,
+                              where: str) -> None:
+    if runtime is None:
+        return
+    current = _docker_daemon_identity()
+    if current != runtime["daemon_identity"]:
+        fail(f"{where}: Docker daemon identity changed "
+             f"(recorded={runtime['daemon_identity']!r}, current={current!r}); "
+             "refusing to treat objects on another daemon as absent")
+
+
+def _docker_absence_error(stderr: str, object_id: str) -> bool:
+    message = stderr.strip()
+    return message in {
+        f"Error: No such object: {object_id}",
+        f"Error response from daemon: No such container: {object_id}",
+    }
+
+
+def _inspect_container(object_id: str) -> tuple[str, dict[str, Any] | None]:
+    """Return PRESENT/ABSENT/UNKNOWN; only Docker's exact absence responses
+    become ABSENT. Callers must retain the ledger record for UNKNOWN."""
+    result = _docker(["inspect", object_id])
+    if result.returncode != 0:
+        if _docker_absence_error(result.stderr, object_id):
+            return "ABSENT", None
+        log(f"Docker inspect {object_id} is UNKNOWN (exit {result.returncode})")
+        return "UNKNOWN", None
+    try:
+        values = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log(f"Docker inspect {object_id} returned invalid JSON (UNKNOWN)")
+        return "UNKNOWN", None
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        log(f"Docker inspect {object_id} returned an invalid object shape (UNKNOWN)")
+        return "UNKNOWN", None
+    raw = values[0]
+    returned_id = raw.get("Id")
+    raw_name = raw.get("Name")
+    config = raw.get("Config")
+    if not isinstance(config, dict):
+        log(f"Docker inspect {object_id} returned an invalid Config (UNKNOWN)")
+        return "UNKNOWN", None
+    raw_labels = config.get("Labels")
+    labels = {} if raw_labels is None else raw_labels
+    if (not isinstance(returned_id, str) or not _CONTAINER_ID_RE.fullmatch(returned_id)
+            or returned_id != object_id or not isinstance(raw_name, str)
+            or not raw_name.startswith("/") or not isinstance(labels, dict)
+            or any(not isinstance(k, str) or not isinstance(v, str)
+                   for k, v in labels.items())):
+        log(f"Docker inspect {object_id} returned an invalid identity (UNKNOWN)")
+        return "UNKNOWN", None
+    name = raw_name[1:]
+    if not _CONTAINER_NAME_RE.fullmatch(name):
+        log(f"Docker inspect {object_id} returned an invalid name (UNKNOWN)")
+        return "UNKNOWN", None
+    return "PRESENT", {"id": returned_id, "name": name, "labels": labels}
+
+
+def _enumerate_containers(*, app_id: str | None = None,
+                          nonce: str | None = None) -> list[dict[str, Any]]:
+    args = ["ps", "-aq", "--no-trunc"]
+    if app_id is not None:
+        args += ["--filter", f"label={_PACKAGE_LABEL}={app_id}"]
+    if nonce is not None:
+        args += ["--filter", f"label={_NONCE_LABEL}={nonce}"]
+    result = _docker(args)
+    if result.returncode != 0:
+        fail(f"Docker container enumeration failed with exit {result.returncode}")
+    ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(ids) != len(set(ids)) or any(not _CONTAINER_ID_RE.fullmatch(x) for x in ids):
+        fail("Docker container enumeration returned invalid full ids")
+    objects: list[dict[str, Any]] = []
+    for object_id in ids:
+        state, obj = _inspect_container(object_id)
+        if state == "ABSENT":
+            continue
+        if state == "UNKNOWN" or obj is None:
+            fail(f"Docker container enumeration could not establish {object_id}")
+        if ((app_id is None or obj["labels"].get(_PACKAGE_LABEL) == app_id)
+                and (nonce is None or obj["labels"].get(_NONCE_LABEL) == nonce)):
+            objects.append(obj)
+    return objects
+
+
+def _runtime_objects(runtime: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+    if runtime is None:
+        return {}
+    return {obj["id"]: obj for obj in runtime.get("objects", [])}
+
+
+def _check_live_container_admission(app_id: str, declarations: list[str],
+                                    *, allowed_pairs: set[tuple[str, str]] = frozenset()) -> None:
+    for obj in _enumerate_containers():
+        if not _container_name_matches(obj["name"], declarations):
+            continue
+        pair = (obj["labels"].get(_PACKAGE_LABEL, ""),
+                obj["labels"].get(_NONCE_LABEL, ""))
+        if pair not in allowed_pairs:
+            fail(f"container namespace collision for {app_id}: {obj['name']} "
+                 f"({obj['id']}) is not owned by an admitted record")
+
+
+def _capture_container_runtime(app_id: str, intent_runtime: dict[str, Any] | None,
+                               committed_runtime: dict[str, Any] | None = None, *,
+                               allowed_pairs: set[tuple[str, str]] = frozenset()) -> dict[str, Any] | None:
+    if intent_runtime is None:
+        return None
+    _require_container_daemon(intent_runtime, f"container capture for {app_id}")
+    if (committed_runtime is not None
+            and committed_runtime["daemon_identity"] != intent_runtime["daemon_identity"]):
+        fail(f"container capture for {app_id}: intent and committed records "
+             "name different Docker daemons")
+    nonce = intent_runtime["install_nonce"]
+    declarations = intent_runtime["declarations"]
+    exact = _enumerate_containers(app_id=app_id, nonce=nonce)
+    for obj in exact:
+        if not _container_name_matches(obj["name"], declarations):
+            fail(f"container {obj['id']} carries the active labels but name "
+                 f"{obj['name']!r} is outside the declaration")
+    exact_ids = {obj["id"] for obj in exact}
+    for obj in _enumerate_containers():
+        pair = (obj["labels"].get(_PACKAGE_LABEL, ""),
+                obj["labels"].get(_NONCE_LABEL, ""))
+        if (_container_name_matches(obj["name"], declarations)
+                and obj["id"] not in exact_ids and pair not in allowed_pairs):
+            fail(f"container namespace collision for {app_id}: {obj['name']} "
+                 "does not carry both active-record labels")
+    _require_container_daemon(intent_runtime, f"container capture for {app_id}")
+    objects = sorted(({"id": obj["id"], "name": obj["name"]} for obj in exact),
+                     key=lambda obj: (obj["name"], obj["id"]))
+    if committed_runtime is not None and committed_runtime["install_nonce"] == nonce:
+        expected = sorted(committed_runtime["objects"],
+                          key=lambda obj: (obj["name"], obj["id"]))
+        if objects != expected:
+            fail("same-digest container reconcile changed an immutable id or name")
+    return {
+        "runtime": "docker",
+        "daemon_identity": intent_runtime["daemon_identity"],
+        "install_nonce": nonce,
+        "declarations": list(declarations), "objects": objects,
+    }
+
+
+def container_install_admission_for_load(app_id: str, entry: dict[str, Any]) -> dict[str, str] | None:
+    """Second, pre-lifecycle admission gate consumed by airlock-config env."""
+    if not isinstance(entry, dict):
+        fail(f"container load gate for {app_id}: invalid ledger entry")
+    intent = entry.get("intent")
+    if not isinstance(intent, dict):
+        return None
+    runtime = intent.get("container_runtime")
+    if runtime is None:
+        return None
+    _require_container_daemon(runtime, f"container load gate for {app_id}")
+    committed = entry.get("committed")
+    committed_runtime = (committed.get("container_runtime")
+                         if isinstance(committed, dict) else None)
+    mode = "fresh"
+    if committed is not None:
+        if (committed_runtime is None
+                or committed_runtime["install_nonce"] != runtime["install_nonce"]):
+            fail(f"container load gate for {app_id}: intent is not a "
+                 "same-nonce reconcile of the committed runtime")
+        _capture_container_runtime(app_id, runtime, committed_runtime)
+        mode = "reuse-required"
+    else:
+        exact = _enumerate_containers(
+            app_id=app_id, nonce=runtime["install_nonce"])
+        if exact:
+            fail(f"container load gate for {app_id}: fresh intent already has "
+                 f"{len(exact)} exact-label object(s)")
+        _check_live_container_admission(app_id, runtime["declarations"])
+        _require_container_daemon(runtime, f"container load gate for {app_id}")
+    return {
+        "install_nonce": runtime["install_nonce"],
+        "mode": mode,
+        "daemon_identity": runtime["daemon_identity"],
+    }
+
+
+def container_install_nonce_for_load(app_id: str, entry: dict[str, Any]) -> str | None:
+    admission = container_install_admission_for_load(app_id, entry)
+    return admission["install_nonce"] if admission is not None else None
+
+
+def _prepare_container_teardown(app_id: str, runtime: dict[str, Any] | None,
+                                dry: bool) -> dict[str, Any] | None:
+    if runtime is None:
+        return None
+    if dry:
+        return {"runtime": runtime, "objects": _runtime_objects(runtime)}
+    _require_container_daemon(runtime, f"container teardown preflight for {app_id}")
+    nonce = runtime["install_nonce"]
+    recorded = _runtime_objects(runtime)
+    exact = _enumerate_containers(app_id=app_id, nonce=nonce)
+    candidates = dict(recorded)
+    for obj in exact:
+        candidates.setdefault(obj["id"], {"id": obj["id"], "name": obj["name"]})
+    # Establish every candidate identity before any removal. Unexpected
+    # exact-nonce objects are intentionally included even outside the claim.
+    for object_id, expected in candidates.items():
+        state, obj = _inspect_container(object_id)
+        if state == "ABSENT":
+            continue
+        if state == "UNKNOWN" or obj is None:
+            fail(f"cannot establish container {object_id} before teardown")
+        if (obj["labels"].get(_PACKAGE_LABEL) != app_id
+                or obj["labels"].get(_NONCE_LABEL) != nonce):
+            fail(f"container {object_id} identity labels changed; refusing removal")
+        if object_id in recorded and obj["name"] != expected["name"]:
+            fail(f"container {object_id} recorded name changed from "
+                 f"{expected['name']!r} to {obj['name']!r}; refusing removal")
+    # Foreign namespace matches are diagnostics only during removal.
+    exact_ids = {obj["id"] for obj in exact}
+    for obj in _enumerate_containers():
+        if (_container_name_matches(obj["name"], runtime["declarations"])
+                and obj["id"] not in exact_ids):
+            log(f"foreign container collision left untouched: {obj['name']} ({obj['id']})")
+    _require_container_daemon(runtime, f"container teardown preflight for {app_id}")
+    return {"runtime": runtime, "objects": candidates}
+
+
+def _execute_container_teardown(app_id: str, plan: dict[str, Any] | None,
+                                dry: bool) -> bool:
+    if plan is None:
+        return True
+    runtime = plan["runtime"]
+    nonce = runtime["install_nonce"]
+    recorded = _runtime_objects(runtime)
+    if dry:
+        log(f"[dry] would remove Docker containers with exact labels "
+            f"{_PACKAGE_LABEL}={app_id}, {_NONCE_LABEL}={nonce}")
+        return True
+    try:
+        _require_container_daemon(runtime, f"container teardown execution for {app_id}")
+    except LedgerError as exc:
+        log(str(exc))
+        return False
+    ok = True
+    for object_id in sorted(plan["objects"]):
+        state, obj = _inspect_container(object_id)
+        if state == "ABSENT":
+            continue
+        if state == "UNKNOWN" or obj is None:
+            ok = False
+            continue
+        if (obj["labels"].get(_PACKAGE_LABEL) != app_id
+                or obj["labels"].get(_NONCE_LABEL) != nonce
+                or (object_id in recorded and obj["name"] != recorded[object_id]["name"])):
+            log(f"container {object_id} identity changed after preflight; refusing removal")
+            ok = False
+            continue
+        result = _docker(["rm", "-f", object_id])
+        if result.returncode != 0:
+            log(f"docker rm -f {object_id} failed with exit {result.returncode}")
+            ok = False
+        post_state, _ = _inspect_container(object_id)
+        if post_state != "ABSENT":
+            log(f"container {object_id} is not proven ABSENT after removal")
+            ok = False
+        elif result.returncode == 0:
+            log(f"removed container {object_id}")
+    try:
+        _require_container_daemon(runtime, f"final container oracle for {app_id}")
+        remaining = _enumerate_containers(app_id=app_id, nonce=nonce)
+        _require_container_daemon(runtime, f"final container oracle for {app_id}")
+    except LedgerError as exc:
+        log(f"final container label-set query failed: {exc}")
+        return False
+    if remaining:
+        log(f"final container label-set is not empty ({len(remaining)} present)")
+        ok = False
+    return ok
+
+
+def _container_runtimes_are_empty(app_id: str,
+                                  runtimes: list[dict[str, Any] | None],
+                                  dry: bool) -> bool:
+    """One write-adjacent snapshot for every runtime record being retired."""
+    active = [runtime for runtime in runtimes if runtime is not None]
+    if not active or dry:
+        return True
+    try:
+        current = _docker_daemon_identity()
+        recorded_identities = {runtime["daemon_identity"] for runtime in active}
+        if recorded_identities != {current}:
+            fail(f"write-adjacent oracle for {app_id}: Docker daemon identity "
+                 f"does not match every retired record ({sorted(recorded_identities)!r} "
+                 f"vs {current!r})")
+        nonces = {runtime["install_nonce"] for runtime in active}
+        # One Docker snapshot, then exact in-code post-filtering for the union.
+        # Sequential per-nonce queries leave an earlier nonce unguarded while
+        # the later one is checked.
+        remaining = [obj for obj in _enumerate_containers()
+                     if obj["labels"].get(_PACKAGE_LABEL) == app_id
+                     and obj["labels"].get(_NONCE_LABEL) in nonces]
+        if _docker_daemon_identity() != current:
+            fail(f"write-adjacent oracle for {app_id}: Docker daemon changed "
+                 "during the final snapshot")
+    except LedgerError as exc:
+        log(f"write-adjacent container label-set query failed: {exc}")
+        return False
+    if remaining:
+        log(f"write-adjacent container label-set is not empty "
+            f"({len(remaining)} present)")
+        return False
+    return True
 
 
 def parse_active_ports(raw: str | None, info: dict[str, Any]) -> set[tuple[str, int]]:
@@ -1642,6 +2195,17 @@ def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
             return False, scope
         try:
             _remove_plain_path(path, recursive=False)
+        except FileNotFoundError:
+            # `systemctl --user disable` removes a SYMLINKED unit file itself,
+            # so by the time we reach the unlink the path is legitimately gone.
+            # The lexists() guard at the top of this function runs BEFORE the
+            # disable and cannot see that. Counting it as a failure deadlocks
+            # the record: the teardown never completes, the record is kept, and
+            # every later run re-plans the same teardown and dies at the same
+            # unlink. The system branch below never had this — `sudo rm -f`
+            # tolerates absence. The postcondition is what matters, and it holds.
+            log(f"{path} was already gone (its disable removed it)")
+            return True, scope
         except OSError as exc:
             log(f"remove {path} failed: {exc}")
             return False, scope
@@ -1870,12 +2434,65 @@ def command_intent(store: dict[str, Any], info: dict[str, Any], app_id: str,
     record = _intent_record(app_id, package, store)
     entry_now = store["entries"].get(app_id) or {}
     old_intent = entry_now.get("intent")
+    committed_now = entry_now.get("committed")
+    runtime = record["container_runtime"]
+    old_runtime = old_intent.get("container_runtime") if old_intent is not None else None
+    committed_runtime = (committed_now.get("container_runtime")
+                         if committed_now is not None else None)
+    declarations = runtime["declarations"] if runtime is not None else []
+    retired_runtime = None
+    _check_container_claim_conflicts(store, app_id, declarations)
     result = copy.deepcopy(store)
     entry = result["entries"].setdefault(app_id, {})
     entry["intent"] = record
     # Gate before any destruction: a candidate the write gate would refuse
     # must fail before the stale cleanup below touches anything.
     _validate_store(result, ledger_path())
+    if not is_dry_run() and runtime is not None:
+        _require_container_daemon(runtime, f"container intent admission for {app_id}")
+        same_committed = (committed_runtime is not None
+                          and committed_runtime["install_nonce"] == runtime["install_nonce"])
+        if committed_runtime is not None and not same_committed:
+            fail(f"container-backed upgrade for {app_id} still has a committed "
+                 "runtime; remove it before recording a fresh nonce")
+        allowed_pairs: set[tuple[str, str]] = set()
+        if old_runtime is not None:
+            allowed_pairs.add((app_id, old_runtime["install_nonce"]))
+        if same_committed:
+            allowed_pairs.add((app_id, committed_runtime["install_nonce"]))
+        _check_live_container_admission(app_id, declarations,
+                                        allowed_pairs=allowed_pairs)
+        if same_committed:
+            # Prove the committed immutable set before stale-intent cleanup;
+            # a refusal discoverable from the candidate must precede mutation.
+            _capture_container_runtime(
+                app_id, runtime, committed_runtime,
+                allowed_pairs=({(app_id, old_runtime["install_nonce"])}
+                               if old_runtime is not None else set()))
+        # A crash intent is not silently overwritten. Unless it is the same
+        # committed nonce being reconciled, remove and prove its exact label
+        # set empty before a fresh intent can replace it.
+        if (old_runtime is not None
+                and (not same_committed
+                     or old_runtime["install_nonce"] != runtime["install_nonce"])):
+            old_plan = _prepare_container_teardown(app_id, old_runtime, False)
+            if not _execute_container_teardown(app_id, old_plan, False):
+                fail(f"stale container intent for {app_id} could not be torn down; "
+                     "record kept so a re-run can retry")
+            retired_runtime = old_runtime
+        if same_committed:
+            _capture_container_runtime(app_id, runtime, committed_runtime)
+        else:
+            _check_live_container_admission(app_id, declarations)
+    elif not is_dry_run() and old_runtime is not None:
+        if committed_runtime is not None:
+            fail(f"container-backed upgrade for {app_id} still has a committed "
+                 "runtime; remove it before clearing the declaration")
+        old_plan = _prepare_container_teardown(app_id, old_runtime, False)
+        if not _execute_container_teardown(app_id, old_plan, False):
+            fail(f"stale container intent for {app_id} could not be torn down; "
+                 "record kept so a re-run can retry")
+        retired_runtime = old_runtime
     if old_intent is not None and (
             old_intent.get("roots") != record["roots"]
             or old_intent.get("artifacts_declared") != record["artifacts_declared"]
@@ -1906,7 +2523,6 @@ def command_intent(store: dict[str, Any], info: dict[str, Any], app_id: str,
         # the caller's active-ports list keeps live mappings up.
         protected = {name: list(_intent_artifacts(record)[name])
                      for name in ARTIFACT_CLASSES}
-        committed_now = entry_now.get("committed")
         if committed_now is not None:
             committed_arts = _committed_artifacts(committed_now)
             for name in ARTIFACT_CLASSES:
@@ -1928,6 +2544,10 @@ def command_intent(store: dict[str, Any], info: dict[str, Any], app_id: str,
     if is_dry_run():
         log(f"[dry] would record intent {app_id}")
     else:
+        _require_container_daemon(runtime, f"container intent write for {app_id}")
+        if not _container_runtimes_are_empty(app_id, [retired_runtime], False):
+            fail(f"stale container intent for {app_id} reappeared before the "
+                 "replacement write; old record kept")
         write_store(result)
         log(f"recorded intent {app_id}")
     print(record["digest"])
@@ -1947,6 +2567,24 @@ def command_commit(store: dict[str, Any], info: dict[str, Any], app_id: str,
                     | _recorded_active_ports(store, app_id))
     new_artifacts = _intent_artifacts(intent)
     _check_commit_conflicts(store, app_id, new_artifacts)
+    intent_runtime = intent.get("container_runtime")
+    declarations = (intent_runtime["declarations"]
+                    if intent_runtime is not None else [])
+    _check_container_claim_conflicts(store, app_id, declarations)
+    old_committed = entry.get("committed")
+    old_committed_runtime = (old_committed.get("container_runtime")
+                             if old_committed is not None else None)
+    new_container_runtime = (intent_runtime if is_dry_run()
+                             else _capture_container_runtime(
+                                 app_id, intent_runtime, old_committed_runtime))
+    if is_dry_run() and intent_runtime is not None:
+        new_container_runtime = {
+            **copy.deepcopy(intent_runtime),
+            "objects": (copy.deepcopy(old_committed_runtime["objects"])
+                        if old_committed_runtime is not None
+                        and old_committed_runtime["install_nonce"]
+                        == intent_runtime["install_nonce"] else []),
+        }
     # A committed record's unit_scopes maps exactly the RECORDED units (the
     # D6 "expanded artifact list"), not every declared name — a declared
     # unit an installer never created (a conditional unit gated on a config
@@ -1977,13 +2615,13 @@ def command_commit(store: dict[str, Any], info: dict[str, Any], app_id: str,
         # vanish from the record teardown later reads.
         "capabilities": list(intent["capabilities"]),
         "artifacts": _copy_artifacts(new_artifacts),
+        "container_runtime": new_container_runtime,
     }
     result = copy.deepcopy(store)
     result["entries"][app_id] = {"committed": committed}
     # Validate the candidate BEFORE the destructive record diff: a store the
     # write gate would refuse must fail before anything is torn down.
     _validate_store(result, ledger_path())
-    old_committed = entry.get("committed")
     if old_committed is not None and not old_committed["lifecycle"]["deactivate"]:
         old_artifacts = _committed_artifacts(old_committed)
         diff = _artifact_difference(old_artifacts, new_artifacts)
@@ -2043,6 +2681,10 @@ def _run_deactivator(record: dict[str, Any], app_id: str, dry: bool) -> None:
     environment["AIRLOCK_ROOT"] = environment.get("AIRLOCK_ROOT") or str(Path(__file__).resolve().parent.parent)
     environment["AIRLOCK_APP_DIR"] = path
     environment["AIRLOCK_APP_ID"] = app_id
+    environment.pop("AIRLOCK_INSTALL_NONCE", None)
+    runtime = record.get("container_runtime")
+    if runtime is not None:
+        environment["AIRLOCK_INSTALL_NONCE"] = runtime["install_nonce"]
     try:
         result = subprocess.run(["bash", script], cwd=path, env=environment, check=False)
     except OSError as exc:
@@ -2071,13 +2713,22 @@ def command_remove(store: dict[str, Any], info: dict[str, Any], app_id: str,
             return 0
         intent_artifacts = _intent_artifacts(intent, for_teardown=True)
         _preflight_teardown_artifacts(intent_artifacts, intent["capabilities"])
-        if not teardown_artifacts(intent_artifacts, active_ports, dry,
-                                  intent["serve_mappings"], capabilities=intent["capabilities"]):
+        intent_container_plan = _prepare_container_teardown(
+            app_id, intent.get("container_runtime"), dry)
+        ok = _execute_container_teardown(app_id, intent_container_plan, dry)
+        ok = teardown_artifacts(intent_artifacts, active_ports, dry,
+                                intent["serve_mappings"],
+                                capabilities=intent["capabilities"]) and ok
+        if not ok:
             fail(f"teardown of intent {app_id} is incomplete (see above); "
                  "record kept so a re-run can retry")
         if dry:
             log(f"[dry] would drop intent {app_id}")
         else:
+            if not _container_runtimes_are_empty(
+                    app_id, [intent.get("container_runtime")], False):
+                fail(f"intent container set for {app_id} reappeared before the "
+                     "ledger write; record kept")
             write_store(_drop_entry(store, app_id))
             log(f"dropped intent {app_id}")
         return 0
@@ -2086,9 +2737,18 @@ def command_remove(store: dict[str, Any], info: dict[str, Any], app_id: str,
         return _refuse_remove(app_id)
 
     if for_upgrade and not committed["lifecycle"]["deactivate"]:
+        container_plan = _prepare_container_teardown(
+            app_id, committed.get("container_runtime"), dry)
+        if not _execute_container_teardown(app_id, container_plan, dry):
+            fail(f"container teardown for upgrade of {app_id} is incomplete; "
+                 "committed record kept so a re-run can retry")
         if dry:
             log(f"[dry] would remove committed record {app_id} for upgrade")
         else:
+            if not _container_runtimes_are_empty(
+                    app_id, [committed.get("container_runtime")], False):
+                fail(f"container set for upgrade of {app_id} reappeared before "
+                     "the ledger write; committed record kept")
             write_store(_drop_committed(store, app_id))
             log(f"removed committed record {app_id} for upgrade")
         return 0
@@ -2099,20 +2759,29 @@ def command_remove(store: dict[str, Any], info: dict[str, Any], app_id: str,
     # not be discovered after the first record has already mutated the box.
     committed_artifacts = _committed_artifacts(committed)
     _preflight_teardown_artifacts(committed_artifacts, committed["capabilities"])
+    committed_container_plan = _prepare_container_teardown(
+        app_id, committed.get("container_runtime"), dry)
     intent_artifacts = None
+    intent_container_plan = None
     if intent is not None and not for_upgrade:
         intent_artifacts = _intent_artifacts(intent, for_teardown=True)
         _preflight_teardown_artifacts(intent_artifacts, intent["capabilities"])
+        intent_container_plan = _prepare_container_teardown(
+            app_id, intent.get("container_runtime"), dry)
 
     if committed["lifecycle"]["deactivate"] and _deactivator_matches(committed, app_id):
         _run_deactivator(committed, app_id, dry)
+        ok = _execute_container_teardown(app_id, committed_container_plan, dry)
         ok = teardown_artifacts(committed_artifacts, active_ports, dry,
-                                committed["serve_mappings"], capabilities=committed["capabilities"])
+                                committed["serve_mappings"],
+                                capabilities=committed["capabilities"]) and ok
     else:
         prefix = "[dry] " if dry else ""
         log(f"{prefix}deactivator did not run for {app_id}; tearing down recorded artifacts")
+        ok = _execute_container_teardown(app_id, committed_container_plan, dry)
         ok = teardown_artifacts(committed_artifacts, active_ports, dry,
-                                committed["serve_mappings"], capabilities=committed["capabilities"])
+                                committed["serve_mappings"],
+                                capabilities=committed["capabilities"]) and ok
 
     if intent is not None and not for_upgrade:
         # Dedupe against committed (Minor E): the same (mode, listen) an
@@ -2120,14 +2789,22 @@ def command_remove(store: dict[str, Any], info: dict[str, Any], app_id: str,
         # one off, not two independent attempts from two separate calls.
         intent_mappings = _dedupe_mappings(committed["serve_mappings"], intent["serve_mappings"])
         assert intent_artifacts is not None
+        ok = _execute_container_teardown(app_id, intent_container_plan, dry) and ok
         ok = teardown_artifacts(intent_artifacts, active_ports, dry,
-                                intent_mappings, capabilities=intent["capabilities"]) and ok
+                                intent_mappings,
+                                capabilities=intent["capabilities"]) and ok
     if not ok:
         fail(f"removal of {app_id} is incomplete (see above); "
              "ledger record kept so a re-run can retry")
     if dry:
         log(f"[dry] would drop committed record {app_id}")
     else:
+        retired_runtimes = [committed.get("container_runtime")]
+        if not for_upgrade and intent is not None:
+            retired_runtimes.append(intent.get("container_runtime"))
+        if not _container_runtimes_are_empty(app_id, retired_runtimes, False):
+            fail(f"container set for {app_id} reappeared before the ledger "
+                 "write; record kept")
         result = _drop_committed(store, app_id) if for_upgrade else _drop_entry(store, app_id)
         write_store(result)
         log(f"dropped committed record {app_id}" if for_upgrade else f"dropped ledger entry {app_id}")
@@ -2159,6 +2836,12 @@ def command_teardown(store: dict[str, Any], info: dict[str, Any], app_id: str,
         _preflight_teardown_artifacts(committed_artifacts, committed["capabilities"])
     if intent_artifacts is not None:
         _preflight_teardown_artifacts(intent_artifacts, intent["capabilities"])
+    committed_container_plan = (_prepare_container_teardown(
+        app_id, committed.get("container_runtime"), dry)
+        if committed is not None else None)
+    intent_container_plan = (_prepare_container_teardown(
+        app_id, intent.get("container_runtime"), dry)
+        if intent is not None else None)
 
     log(f"{'[dry] ' if dry else ''}platform-performed, no deactivator ran for {app_id}")
     ok = True
@@ -2167,18 +2850,28 @@ def command_teardown(store: dict[str, Any], info: dict[str, Any], app_id: str,
                        else (intent["serve_mappings"] if intent is not None else {}))
     if committed is not None:
         assert committed_artifacts is not None
+        ok = _execute_container_teardown(app_id, committed_container_plan, dry) and ok
         ok = teardown_artifacts(committed_artifacts, active_ports, dry,
-                                committed["serve_mappings"], capabilities=committed["capabilities"]) and ok
+                                committed["serve_mappings"],
+                                capabilities=committed["capabilities"]) and ok
     if intent is not None:
         assert intent_artifacts is not None
+        ok = _execute_container_teardown(app_id, intent_container_plan, dry) and ok
         ok = teardown_artifacts(intent_artifacts, active_ports, dry,
-                                intent_mappings, capabilities=intent["capabilities"]) and ok
+                                intent_mappings,
+                                capabilities=intent["capabilities"]) and ok
     if not ok:
         fail(f"teardown of {app_id} is incomplete (see above); "
              "ledger entry kept so a re-run can retry")
     if dry:
         log(f"[dry] would drop ledger entry {app_id}")
     else:
+        retired_runtimes = [record.get("container_runtime")
+                            for record in (committed, intent)
+                            if record is not None]
+        if not _container_runtimes_are_empty(app_id, retired_runtimes, False):
+            fail(f"container set for {app_id} reappeared before the ledger "
+                 "write; entry kept")
         write_store(_drop_entry(store, app_id))
         log(f"dropped ledger entry {app_id}")
     return 0
@@ -2197,9 +2890,15 @@ def command_list(store: dict[str, Any]) -> int:
         record = committed or intent
         if committed is not None:
             artifact_count = sum(len(committed["artifacts"][name]) for name in ARTIFACT_CLASSES)
+            runtime = committed.get("container_runtime")
+            if runtime is not None:
+                artifact_count += len(runtime["objects"])
         else:
             artifact_count = sum(len(intent["artifacts_declared"][name]) for name in PATH_CLASSES)
             artifact_count += len(intent["serve_port_values"])
+            runtime = intent.get("container_runtime")
+            if runtime is not None:
+                artifact_count += len(runtime["declarations"])
         print(f"{app_id}\tstate={'+'.join(states)}\tpath={record['path']}"
               f"\tdigest={record['digest'][:12]}\tartifacts={artifact_count}")
     return 0

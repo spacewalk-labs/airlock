@@ -152,7 +152,7 @@ apps = ["publish"]            # same-box app ids; id-level, not capability-level
 
 [config]
 [[config.required]]            # keys the operator must set; explicit type, since
-name = "code_root"             # there is no default value to infer it from
+name = "api_token"             # there is no default value to infer it from
 type = "string"                # one of: string | integer | boolean
 [config.defaults]
 backend_port = 18900           # value doubles as the type declaration
@@ -232,7 +232,7 @@ absent-but-recorded app still owns until that record is removed. (The same id
 is exempt: replacing or shadow-upgrading an app is the D6 upgrade path.)
 Overlap is fatal at validate. That, not an id-derived naming rule, is the
 ownership boundary: real built-ins already own units their id does not prefix
-(markwand owns `airlock-markserv.service` and `airlock-filebrowser.service`),
+(fileview owns `airlock-fileview.service`),
 so ownership must be declared, and declared ownership must be exclusive. A
 declared `tile.icon` is staged by the platform to the webroot under
 `assets/apps/<id>/`, which the platform auto-records as that app's artifact —
@@ -397,7 +397,71 @@ Scripts receive `AIRLOCK_ROOT` (platform: `install/lib.sh`, `gate/`),
 with a defined cwd (`AIRLOCK_APP_DIR`). All eighteen built-in install/smoke
 scripts, the orchestrator loops, and `bin/airlock-smoke` migrate off
 `$HERE/../..` onto this ABI (child 2 carries the loop + lib; child 4 carries the
-per-app script migration). Installers stay idempotent and are re-run on every
+per-app script migration).
+
+**Amended for the apps/ cutover — the ABI is required, and it is now enforced.**
+The migration above left `$HERE/../..` in place as a fallback
+(`${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}`) for standalone invocation. That
+fallback is not a convenience, it is the coupling this contract exists to remove:
+`$0/../..` is the platform only while the package sits in the platform's own
+`apps/` tree, so after the cutover it resolves to the app repository and the
+script fails late — or, worse, succeeds against the wrong tree. `AIRLOCK_ROOT`
+therefore takes `:?` and every caller supplies it, test harnesses included.
+`$0`-relative **self**-location is untouched and remains correct: it names the
+package, which moves with the package, and is what `AIRLOCK_APP_DIR` falls back to.
+
+Three consequences, all now gated by `install/check-app-abi.sh` (controls in
+`install/test-app-abi.sh`, both run in CI):
+
+- **Only `install/lib.sh` and `gate/*` are readable platform paths.** A platform
+  internal must be exposed as a lib.sh function first — `airlock_resource_holder_pids`
+  was added for `apps/paseo`, which had been reading `install/resource-holder-pids.py`
+  by path.
+- **A package reaches its own files through `AIRLOCK_APP_DIR`, never `$ROOT/apps/<id>`.**
+  `apps/feedback/render.sh` was writing the latter into a systemd unit, which
+  would have broken on the first run after the cutover.
+- **The gate covers every shell file in the package, not just the lifecycle four.**
+  The first sweep fixed `install.sh`/`smoke.sh` and missed three auxiliary
+  installers (`dev-monitor/install-spool-hardening.sh`,
+  `dev-monitor/install-token-timer.sh`, `paseo/browse-host/install.sh`, the last
+  climbing three levels rather than two) carrying the same idiom. That miss is why
+  this is a standing gate and not a one-time migration. Shell is found by shebang
+  as well as by extension — two shipped app programs have neither
+  (`code-server/bin/airlock-code-server-slot`, `devterm/bin/devterm-shell`).
+
+**The gate is an allowlist, and that is not a stylistic choice.** Two rounds of
+adversarial review killed the blocklist version of it.
+
+Round one walked six spellings of one climb past a pattern written for the last
+spelling: a `cd` subshell, two chained `cd ..` steps, nested `dirname`, a
+`${VAR%/*/*}` suffix strip, `..` parked in a variable, and
+`$(dirname "$0")/../..`, whose inner `)` slipped through a `[^)]*` pattern.
+Banning the `..` segment outright failed in the other direction —
+`apps/orca/bin/verify-web-bundle.sh` climbs one level from `bin/` to reach its own
+`web-bundle/`, which is self-location and survives the cutover intact.
+
+Round two, against a rule that instead checked how the root was *assigned*, walked
+six more: `read -r ROOT`, `printf -v ROOT`, `declare`, an array element, an
+assignment tucked inside `if true; then … fi`, and — needing no variable at all —
+`. "$(cd "$HERE/../.." && pwd)/install/lib.sh"`. It also showed that an *accepted*
+within-package climb could be extended one level and escape
+(`P="$(cd "$HERE/../.." && pwd)"; . "$P/../install/lib.sh"`).
+
+The lesson is not that the next pattern would have been better. Shell has unbounded
+ways to spell a path, so no blocklist terminates. So the rule inverted: **there is
+exactly one accepted way to read the platform** — `"$ROOT/install/lib.sh"` or
+`"$ROOT/gate/…"`, where `ROOT` comes from `${AIRLOCK_ROOT:?…}` and is never
+rebound — and every other spelling is a violation by construction. All twelve
+evasions above are fixtures in `install/test-app-abi.sh` now, and a thirteenth is
+not a new hole, because it is not on the list.
+
+What the gate still cannot decide is stated in the file itself: a path assembled at
+runtime, a cwd-relative source, an indirect expansion. Those are covered from the
+other side by running the real script — `install/test-render-parity.sh` executes
+`apps/paseo/browse-host`'s nested installer with `AIRLOCK_ROOT` unset and asserts
+it refuses, then with `AIRLOCK_APP_DIR` polluted and asserts it still finds its own
+files. A static gate and a runtime probe fail differently, which is why there are
+both. Installers stay idempotent and are re-run on every
 reconcile, exactly as the orchestrator re-runs them today
 (`install/airlock-install.sh:88-96`) — the D6 digest exists to decide removal
 trust, never to skip an install. `deactivate.sh` removes units, serve mappings,
@@ -629,6 +693,111 @@ edits. nginx fragments stay app-written *for now* (the emitters in
 `gate/nginx-lib.sh` already cover the common shapes); a later child may promote
 the Home-Assistant-style "declare a port, the platform writes the ingress"
 pattern — OQ1, not a phase-1 requirement.
+
+### D9 — Containers are recorded runtime objects, not successful commands
+
+A container-backed package declares the namespace it owns in
+`[artifacts].containers`. Contract 1 accepts literal container names and one
+bounded pattern form: a non-empty literal prefix followed by a final `*`.
+Nothing else is a pattern; `/`, whitespace, option-like names, and wildcard
+characters anywhere but that final position are validation errors. Container
+claims participate in the same package-to-package and recorded-state
+disjointness check as the filesystem classes.
+
+```toml
+[artifacts]
+containers = ["airlock-notes-*"]
+```
+
+The Docker implementation uses two ownership labels:
+`io.airlock.package=<id>` and `io.airlock.install-nonce=<nonce>`. The platform
+generates a cryptographically random nonce for each fresh install, records it in
+intent, and makes it available to an installer as `AIRLOCK_INSTALL_NONCE` on
+that script's first `airlock_load <its-package-id>`; a container package must
+load its own config before its first runtime create. The platform passes the
+recorded nonce directly to a deactivator. Every container create must apply both
+labels. A same-digest
+reconcile reuses the
+committed nonce and admits only the committed full ids with their exact recorded
+names and labels. An upgrade removes and proves absence of the old set before it
+journals a fresh nonce. A desired intent left by a crash is first torn down by its
+recorded nonce; only after the exact-label set is proven empty may the platform
+replace that intent with a fresh one and retry. All other runtime objects whose
+names match the declared namespace and do not carry both labels for the active
+record are foreign collisions. The platform must never relabel, stop, or remove
+a foreign collision. An unrecorded object carrying both active-record labels is
+instead an unexpected owned object: it blocks lifecycle admission, but generic
+teardown must include it by nonce.
+
+Images, volumes, and networks do not become owned merely because a container
+uses them. Contract-1 container packages use only images already present by
+immutable digest (`docker run --pull=never`), bind mounts, `tmpfs`, and a built-in
+network mode; they must not pull/build images or create named volumes or
+networks. D4 permits arbitrary trusted lifecycle code, so this is a reviewed
+package obligation rather than a sandbox guarantee: shipped packages prove it
+with fake-runtime argument assertions and a real-runtime before/after inventory.
+A package needing to create one of those runtime objects requires a future
+explicit artifact class first. Operator data bind-mounted into a container is
+retained data and is never a container artifact.
+
+The D6 journal closes the crash window in two steps:
+
+1. Intent records the validated name declarations, package label, and fresh
+   install nonce before a lifecycle script may load it and create a container.
+2. Commit enumerates objects by exact package and nonce labels, then validates
+   every returned name against the declaration and records each full immutable
+   runtime id and name alongside the nonce. An object carrying only one label, a
+   namespace collision, or a nonce-owned object outside the declaration aborts
+   commit and keeps intent. The last case remains recoverable because teardown
+   enumerates the nonce, not only the declared names.
+
+This is store v6 (v5 already added the audit-event stream). Both record shapes
+gain an exact-shape `container_runtime`
+field: `null` for a package with no container declarations; otherwise intent
+stores `{runtime: "docker", daemon_identity, install_nonce, declarations}` and
+committed stores `{runtime: "docker", daemon_identity, install_nonce,
+declarations, objects: [{id, name}]}`. `daemon_identity` is
+`docker:<Engine.ID>` from `docker info --format '{{.ID}}'`; it is checked again
+at every runtime read or mutation. Direct and sudo-mediated clients may share
+one identity only when they reach that same engine. An unavailable or changed
+identity is UNKNOWN and retains the ledger record rather than interpreting the
+other daemon's empty namespace as absence.
+Stores v1-v5 read-normalize this field to `null`; as with the prior migrations,
+read-only commands do not write and the first mutation atomically rewrites the
+whole store as v6. A committed nonce therefore remains authoritative after its
+intent has been replaced.
+
+Removal is evidence-driven. The app-specific deactivator runs when D6 permits
+it, but is never the only removal path. Generic teardown takes the union of
+recorded immutable ids and every object found by the record's two exact labels,
+including nonce-owned objects outside the declaration. It lists by labels and
+post-filters the two exact label values in code; it does not trust Docker's name
+filter. Declared literal/prefix name semantics classify collisions and validate
+commit, but never exclude an exact-nonce object from teardown. Immediately
+before removal it inspects each full immutable id and requires the recorded id,
+package label, and nonce to agree; recorded objects must also retain their exact
+name. It passes that full id, never a name or prefix, to `docker rm -f`, then
+inspects that id again.
+
+Runtime queries have three results: PRESENT with full identity, ABSENT only for
+the runtime's specified object-not-found response, and UNKNOWN for every other
+error. An identity mismatch, UNKNOWN result, non-zero `rm`, or PRESENT
+post-check is a teardown failure and retains the record for retry; even when a
+non-zero `rm` is followed by ABSENT, that attempt fails and the next retry may
+discharge the now absent record without issuing another removal. After all
+per-id checks pass, teardown re-enumerates the exact package+nonce label set and
+requires it to be empty immediately before the ledger write. This final oracle
+catches an object created with a new id during removal. Namespace-matching
+objects with other or incomplete labels are never removed; they block install,
+but during teardown are only reported as collisions and do not prevent the
+package's proven-empty nonce record from dropping. Thus path loss, digest
+mismatch, and intent-only crash recovery have the same container cleanup
+guarantee as an ordinary configured deactivation.
+
+Contract 1's first container runtime is Docker. Supporting another runtime is a
+new contract decision, not an executable name hidden in per-box config: runtime
+identity, immutable object identity, filters, and absence errors must have one
+specified meaning before the ledger can trust them.
 
 ## 3. Fixture specifications
 
@@ -930,6 +1099,30 @@ a command. One predicate, two call sites: a printed `--adopt` line can
 never be refused for a reason detection could see. `airlock-config
 known-builtins` is the channel: shipped ids with parseable regular
 non-symlink manifests, hub/core excluded, shadowed builtins excluded.)*
+
+**F16 — Container intent, collision, and runtime-proven removal.** A fixture
+package declares `containers = ["airlock-t16-*"]`; intent records a fresh nonce,
+and its installer creates two Docker-fixture objects carrying the exact package
+and nonce labels. Assert: intent is durable before the first create; commit
+records the nonce and two full immutable ids; a normal config removal and a
+digest-mismatch/path-gone removal each leave exact id and two-label runtime
+queries ABSENT before the ledger entry disappears. Repeat from an intent-only
+crash after the first create and get the same result before a fresh-nonce retry;
+a same-digest reconcile instead reuses and admits exactly the committed set.
+Negative controls: (a) a matching name with no labels, one label, different
+labels, or the exact package label but another nonce is untouched, blocks
+install, and is diagnostic-only during removal; (b) runtime query failure, `rm`
+returning zero while the object remains, non-zero `rm` followed by absence, and
+immutable-id replacement each fail with the ledger entry retained; (c) an
+object with the exact two labels outside the declared namespace blocks commit
+but is still removed by nonce-driven teardown; (d) name-filter substring
+lookalikes never enter the candidate set; (e) a new same-nonce id appearing
+after per-id removal makes the final label-set oracle fail, then remains an
+unexpected owned teardown candidate rather than a foreign collision; (f) fake-runtime
+arguments plus a real-runtime inventory prove the package did not pull/build an
+image or create a named volume/network. The fixture driver is a stateful fake
+runtime so it runs in CI; the Notes app acceptance additionally exercises one
+real Docker install and asks Docker itself for post-deactivation absence.
 
 ## 4. Delivery
 

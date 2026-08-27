@@ -25,6 +25,12 @@ AIRLOCK_ROOT="$(cd "$_lib_here/.." && pwd)"
 # wrapper. It is not an admission switch: only the exact installer argv can
 # create it, and it disappears with that run.
 AIRLOCK_CONFIG_BIN="${AIRLOCK_CONFIG_BIN:-$AIRLOCK_ROOT/bin/airlock-config}"
+# The account tools stay two binaries rather than one with a `status` subcommand,
+# because devterm reaches them through two separate unit variables today and the
+# whole point of the re-homing is that its call sites do not change.
+AIRLOCK_ACCOUNTS_BIN="${AIRLOCK_ACCOUNTS_BIN:-$AIRLOCK_ROOT/bin/airlock-accounts}"
+AIRLOCK_ACCOUNTS_STATUS_BIN="${AIRLOCK_ACCOUNTS_STATUS_BIN:-$AIRLOCK_ROOT/bin/airlock-accounts-status}"
+AIRLOCK_SECRET_BIN="${AIRLOCK_SECRET_BIN:-$AIRLOCK_ROOT/bin/airlock-secret}"
 # shellcheck source=/dev/null
 . "$AIRLOCK_ROOT/install/preflight.sh"
 
@@ -130,6 +136,176 @@ airlock_run() {
   else
     "$@"
   fi
+}
+
+# airlock_resource_holder_pids <probe-args...> — the read-only holder probe as
+# part of the app ABI.
+#
+# The probe is a platform-internal script (install/resource-holder-pids.py) and
+# its path is NOT part of the D5 ABI, which names install/lib.sh and gate/ and
+# nothing else. An app that wants to re-measure a singleton after a handover —
+# apps/paseo does, to decide whether a released pidfile may be cleared — must
+# come through this function, because after the apps/ cutover a package cannot
+# reach into the platform tree by path at all.
+#
+# Prints one holder PID per line (possibly none) and returns non-zero when the
+# probe itself could not run; the caller owns the policy decision, exactly as it
+# does for the two internal call sites below.
+airlock_resource_holder_pids() {
+  [ "$#" -gt 0 ] || die "airlock_resource_holder_pids requires probe arguments"
+  require_cmd python3
+  python3 "$AIRLOCK_ROOT/install/resource-holder-pids.py" "$@"
+}
+
+# airlock_handover_user_resource KIND RESOURCE LABEL [OPTIONS] [OWN_UNIT ...]
+#
+# Find the actual same-user process that owns an exclusive resource, ask the
+# user manager which unit contains that PID, prove that it is the service's
+# MainPID, and stop only that measured unit.  --required-by also stops services
+# that systemd reports as directly requiring the measured provider (used when
+# handing over an X server and its declared consumer). --service-environment
+# ENV=VALUE permits a child PID only when both the process probe and its user
+# service declare that exact singleton environment (used for pidfile daemons).
+# --service-exec-prefix adds an application-declared exact argv-prefix proof;
+# pidfile children are also required to descend from that service's MainPID.
+# Legacy unit names are intentionally absent: old stacks used unrelated naming
+# schemes, so a guessed list is both incomplete and an authority escalation.
+# The optional OWN_UNIT names are the
+# candidate artifacts this installer itself owns; an already-running candidate
+# may keep its resource until the caller's ordinary restart transaction.
+
+airlock_handover_user_resource() {
+  local kind="${1:?resource kind required}" resource="${2:?resource required}" \
+        label="${3:?resource label required}"
+  shift 3
+  local include_required_by=0 expected_service_environment="" service_exec_prefix=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --required-by) include_required_by=1; shift ;;
+      --service-environment)
+        [ "$#" -ge 2 ] || die "--service-environment requires ENV=VALUE"
+        expected_service_environment="$2"; shift 2
+        ;;
+      --service-exec-prefix)
+        [ "$#" -ge 2 ] || die "--service-exec-prefix requires a value"
+        service_exec_prefix="$2"; shift 2
+        ;;
+      *) break ;;
+    esac
+  done
+  local -a own_units=("$@") stop_units=()
+  local -a probe_args=("$kind" "$resource")
+  local pids pid unit main_pid own seen required required_unit unit_environment unit_exec
+
+  if [ -n "$expected_service_environment" ]; then
+    [ "$kind" = pidfile ] \
+      || die "--service-environment is supported only for pidfile resources"
+    [ -n "$service_exec_prefix" ] \
+      || die "pidfile service handover requires --service-exec-prefix"
+    probe_args+=("$expected_service_environment")
+  elif [ -n "$service_exec_prefix" ]; then
+    die "--service-exec-prefix requires --service-environment"
+  fi
+
+  require_cmd python3 systemctl
+  if ! pids="$(python3 "$AIRLOCK_ROOT/install/resource-holder-pids.py" "${probe_args[@]}")"; then
+    die "cannot inspect holders of $label — no service was stopped"
+  fi
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    if ! unit="$(systemctl --user whoami "$pid" 2>/dev/null)"; then
+      [ -e "/proc/$pid" ] || continue  # holder exited between the two measurements
+      die "$label is held by PID $pid outside a loaded user unit — no service was stopped"
+    fi
+    case "$unit" in
+      *.service) ;;
+      *.scope)
+        die "$label is held by PID $pid in scope '$unit' — refusing to stop a whole scope from one member PID"
+        ;;
+      *)
+        die "$label is held by PID $pid in non-stoppable user unit '$unit' — no service was stopped"
+        ;;
+    esac
+
+    own=0
+    for seen in "${own_units[@]}"; do
+      [ "$unit" = "$seen" ] && own=1
+    done
+    [ "$own" = 0 ] || continue
+
+    if [ -n "$expected_service_environment" ]; then
+      if ! unit_environment="$(systemctl --user show "$unit" --property=Environment --value 2>/dev/null)" \
+         || ! python3 -c 'import shlex,sys; raise SystemExit(0 if sys.argv[1] in shlex.split(sys.argv[2]) else 1)' \
+              "$expected_service_environment" "$unit_environment"; then
+        die "$label PID $pid belongs to '$unit', but that service does not declare $expected_service_environment — refusing to stop it"
+      fi
+      if ! unit_exec="$(systemctl --user show "$unit" --property=ExecStart --value 2>/dev/null)" \
+         || ! python3 -c 'import re,shlex,sys; m=re.search(r"(?:^|; )argv\[\]=(.*?)(?: ;|$)",sys.argv[2]); want=shlex.split(sys.argv[1]); got=shlex.split(m.group(1)) if m else []; raise SystemExit(0 if want and got[:len(want)]==want else 1)' \
+              "$service_exec_prefix" "$unit_exec"; then
+        die "$label PID $pid belongs to '$unit', but that service ExecStart does not match the declared application signature — refusing to stop it"
+      fi
+    fi
+
+    if ! main_pid="$(systemctl --user show "$unit" --property=MainPID --value 2>/dev/null)" \
+       || [ "$main_pid" != "$pid" ]; then
+      [ -n "$expected_service_environment" ] \
+        || die "$label is held by child PID $pid in broad service '$unit' (MainPID ${main_pid:-unknown}) — refusing to stop the whole service"
+      python3 "$AIRLOCK_ROOT/install/resource-holder-pids.py" process-descendant "$pid" "$main_pid" \
+        || die "$label PID $pid is not a descendant of '$unit' MainPID ${main_pid:-unknown} — refusing to stop the whole service"
+      log "handover $label: child PID $pid has matching record, exact service ExecStart, MainPID ancestry, and process+service environment $expected_service_environment"
+    fi
+
+    seen=0
+    for own in "${stop_units[@]}"; do
+      [ "$unit" = "$own" ] && seen=1
+    done
+    [ "$seen" = 1 ] || stop_units+=("$unit")
+
+    if [ "$include_required_by" = 1 ]; then
+      if ! required="$(systemctl --user show "$unit" --property=RequiredBy --value 2>/dev/null)"; then
+        die "cannot inspect services requiring measured holder unit '$unit' for $label"
+      fi
+      for required_unit in $required; do
+        case "$required_unit" in
+          *.service) ;;
+          *) die "$label holder '$unit' has unsupported RequiredBy unit '$required_unit' — no service was stopped" ;;
+        esac
+        own=0
+        for seen in "${own_units[@]}"; do
+          [ "$required_unit" = "$seen" ] && own=1
+        done
+        [ "$own" = 0 ] || continue
+        seen=0
+        for own in "${stop_units[@]}"; do
+          [ "$required_unit" = "$own" ] && seen=1
+        done
+        [ "$seen" = 1 ] || stop_units+=("$required_unit")
+      done
+    fi
+  done <<<"$pids"
+
+  if [ "${#stop_units[@]}" -gt 0 ]; then
+    log "handover $label: stopping measured holder unit(s): ${stop_units[*]}"
+    systemctl --user stop "${stop_units[@]}" \
+      || die "failed to stop holder unit(s) for $label: ${stop_units[*]}"
+  fi
+
+  if ! pids="$(python3 "$AIRLOCK_ROOT/install/resource-holder-pids.py" "${probe_args[@]}")"; then
+    die "cannot verify release of $label after handover"
+  fi
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    if ! unit="$(systemctl --user whoami "$pid" 2>/dev/null)"; then
+      [ -e "/proc/$pid" ] || continue
+      die "$label is still held by PID $pid after handover"
+    fi
+    own=0
+    for seen in "${own_units[@]}"; do
+      [ "$unit" = "$seen" ] && own=1
+    done
+    [ "$own" = 1 ] || die "$label is still held by PID $pid in $unit after handover"
+  done <<<"$pids"
 }
 
 # airlock_quiet <cmd...> — quiet while it works, talkative when it does not.

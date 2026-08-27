@@ -28,10 +28,13 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_DIR/
-# AIRLOCK_APP_ID, falling back to $0-relative computation for a standalone
-# invocation (a test harness that runs this script directly).
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+# ABI (D5): the caller sets AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID and runs
+# this script with cwd = AIRLOCK_APP_DIR. AIRLOCK_ROOT is REQUIRED: the platform
+# root cannot be derived from $0, because "$0/../.." is only the platform when the
+# package happens to sit in the platform's own apps/ tree — the arrangement the
+# apps/ cutover ends. $0-relative self-location (this file's own directory) stays
+# fine and is what AIRLOCK_APP_DIR falls back to.
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 HERE="${AIRLOCK_APP_DIR:-$HERE}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-orca}"
 # shellcheck source=/dev/null
@@ -109,7 +112,7 @@ provision_runtime_deps() {
   # 64 KB pipe buffer) takes SIGPIPE, and `set -o pipefail` reports the pipeline as
   # failed. Measured 2026-08-07 on a box where libgtk-3-0t64 was installed and in
   # the cache: this guard said "missing", the reinstall was a no-op, and the check
-  # below said "libgtk-3 install failed". apps/markwand/smoke.sh:39 hit the same
+  # below said "libgtk-3 install failed". apps/fileview/smoke.sh:39 hit the same
   # race on a ~64 KB HTTP body and wrote it down; it did not reach here.
   local _libs; _libs="$(ldconfig -p 2>/dev/null || true)"
   if command -v Xvfb >/dev/null 2>&1 && [[ "$_libs" == *"libgtk-3.so.0"* ]]; then
@@ -246,6 +249,16 @@ airlock_run systemctl --user enable airlock-orca-xvfb.service airlock-orca.servi
 # live orca session (PTYs + browser panes are live-only and non-recoverable).
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] || [ "$need_restart" = 1 ] \
    || ! systemctl --user is-active --quiet airlock-orca.service; then
+  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+    # :59 is an exclusive singleton shared with older Orca stacks. Discover
+    # the pathname/abstract listeners from /proc, then map their MainPIDs back
+    # to actual user services. Their declared systemd RequiredBy consumers are
+    # stopped in the same transaction. The two names below are candidate
+    # artifacts we own, not guesses about legacy naming.
+    airlock_handover_user_resource x-display "$XDISP" "Orca X display :$XDISP" \
+      --required-by \
+      airlock-orca-xvfb.service airlock-orca.service
+  fi
   airlock_run systemctl --user restart airlock-orca-xvfb.service airlock-orca.service
 else
   log "orca unchanged and active — not restarting (preserves the live session)"

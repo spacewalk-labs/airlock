@@ -11,11 +11,14 @@
 # airlock.toml ([apps.dev-monitor]). Honors AIRLOCK_DRY_RUN=1.
 set -euo pipefail
 
-# ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_DIR/
-# AIRLOCK_APP_ID, falling back to $0-relative computation for a standalone
-# invocation (a test harness that runs this script directly).
+# ABI (D5): the caller sets AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID and runs
+# this script with cwd = AIRLOCK_APP_DIR. AIRLOCK_ROOT is REQUIRED: the platform
+# root cannot be derived from $0, because "$0/../.." is only the platform when the
+# package happens to sit in the platform's own apps/ tree — the arrangement the
+# apps/ cutover ends. $0-relative self-location (this file's own directory) stays
+# fine and is what AIRLOCK_APP_DIR falls back to.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 HERE="${AIRLOCK_APP_DIR:-$HERE}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-dev-monitor}"
 # shellcheck source=/dev/null
@@ -45,6 +48,17 @@ ROSTER_PATH="${AIRLOCK_DEV_MONITOR_ROSTER_PATH:-}"
 TOKEN_FRESHNESS="${AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS:-false}"
 TOKEN_WARN_HOURS="${AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS:-24}"
 TOKEN_STALE_HOURS="${AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS:-24}"
+# D5 hands the platform capability in. Pin its resolved absolute path before a unit
+# records it, matching devterm's P2a handoff: an app may validate a capability path but
+# must never reconstruct $ROOT/bin/... for itself.
+case "$AIRLOCK_ACCOUNTS_STATUS_BIN" in
+  /*) ;;
+  *) die "AIRLOCK_ACCOUNTS_STATUS_BIN must be an absolute D5 platform path" ;;
+esac
+[ -f "$AIRLOCK_ACCOUNTS_STATUS_BIN" ] && [ -x "$AIRLOCK_ACCOUNTS_STATUS_BIN" ] \
+  || die "AIRLOCK_ACCOUNTS_STATUS_BIN does not name an executable platform file"
+ACCOUNTS_STATUS_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+  "$AIRLOCK_ACCOUNTS_STATUS_BIN")"
 # Optional cutover bridge for existing producers/watchdogs. There is deliberately no
 # default: a public installer must not guess a box-specific legacy path. The operator names
 # the path in deployment config, and the generated file contains only four compatibility
@@ -306,13 +320,14 @@ else
   install -d "$UNIT_DIR"
   render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_hosts" "$DEVMON_ENV" \
     "$TOKEN_FRESHNESS" "$TOKEN_WARN_HOURS" "$TOKEN_STALE_HOURS" "$MESSAGES" \
+    "$ACCOUNTS_STATUS_BIN" \
     >"$UNIT_DIR/airlock-dev-monitor.service"
 fi
 # The card is on; the CHECKING is not. Said once at install time, because "the feature is
 # enabled" and "something is looking at your tokens on a schedule" are different facts and
 # the dashboard cannot tell them apart until the first snapshot exists.
 if [ "$TOKEN_FRESHNESS" = true ] && [ ! -f "$HOME/.config/systemd/user/airlock-token-freshness.timer" ]; then
-  log "NOTE: token_freshness is on, so the dashboard card and /api/tokens are live — but nothing checks on a schedule yet. Wire the timer with: bash $HERE/install-token-timer.sh"
+  log "NOTE: token_freshness is on, so the dashboard card and /api/tokens are live — but nothing checks on a schedule yet. Wire the timer with: AIRLOCK_ROOT=$ROOT AIRLOCK_APP_DIR=$HERE AIRLOCK_APP_ID=$AIRLOCK_APP_ID bash $HERE/install-token-timer.sh"
 fi
 airlock_run systemctl --user daemon-reload
 airlock_run systemctl --user enable airlock-dev-monitor.service

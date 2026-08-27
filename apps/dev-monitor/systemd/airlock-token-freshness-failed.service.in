@@ -6,5 +6,5 @@ Type=oneshot
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=DEV_MONITOR_SPOOL=@SPOOL@
 Environment=DEV_MONITOR_TOKEN_SNAPSHOT=@SNAPSHOT@
-WorkingDirectory=@REPO@
-ExecStart=/bin/bash @REPO@/apps/dev-monitor/token-freshness-alarm.sh
+WorkingDirectory=@APPDIR@
+ExecStart=/bin/bash @APPDIR@/token-freshness-alarm.sh

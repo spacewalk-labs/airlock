@@ -1,11 +1,12 @@
 # shellcheck shell=bash
 # apps/learning/render.sh — sourceable render library. Functions only, no
-# top-level execution, matching apps/markwand/render.sh and apps/publish/render.sh.
+# top-level execution, matching apps/fileview/render.sh and apps/publish/render.sh.
 
-# render_learning_unit_server LIBRARY PUBLISH_SHARE STATE_DIR PORT PROVIDER BACKEND_DIR UNIT_PATH
+# render_learning_unit_server LIBRARY PUBLISH_SHARE STATE_DIR PORT PROVIDER BACKEND_DIR UNIT_PATH ACCOUNTS_STATUS_BIN
 render_learning_unit_server() {
   local LIBRARY="$1" PUBLISH_SHARE="$2" STATE_DIR="$3" PORT="$4" PROVIDER="$5" BACKEND_DIR="$6"
   local UNIT_PATH="$7"
+  local ACCOUNTS_STATUS_BIN="$8"
   cat <<UNIT
 [Unit]
 Description=airlock learning — study library (127.0.0.1:${PORT}), behind the hub owner gate
@@ -25,6 +26,7 @@ Environment="AIRLOCK_LEARNING_LIBRARY=${LIBRARY}"
 Environment="AIRLOCK_LEARNING_LISTING=${PROVIDER}"
 Environment="AIRLOCK_LEARNING_SHARE_DIR=${PUBLISH_SHARE}"
 Environment="AIRLOCK_LEARNING_STATE_DIR=${STATE_DIR}"
+Environment="AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN=${ACCOUNTS_STATUS_BIN}"
 ExecStart=/usr/bin/python3 ${BACKEND_DIR}/airlock-learning.py
 Restart=on-failure
 RestartSec=3
@@ -34,10 +36,11 @@ WantedBy=default.target
 UNIT
 }
 
-# render_learning_unit_ingest LIBRARY STATE_DIR PROVIDER UNIT_PATH BACKEND_DIR UNSAFE_ENV
+# render_learning_unit_ingest LIBRARY STATE_DIR PROVIDER UNIT_PATH BACKEND_DIR UNSAFE_ENV ACCOUNTS_STATUS_BIN
 render_learning_unit_ingest() {
   local LIBRARY="$1" STATE_DIR="$2" PROVIDER="$3" UNIT_PATH="$4" BACKEND_DIR="$5"
   local UNSAFE_ENV="$6"
+  local ACCOUNTS_STATUS_BIN="$7"
   cat <<UNIT
 [Unit]
 Description=airlock learning ingest worker — one link at a time
@@ -59,6 +62,7 @@ Environment=PATH=${UNIT_PATH}
 Environment="AIRLOCK_LEARNING_LIBRARY=${LIBRARY}"
 Environment="AIRLOCK_LEARNING_STATE_DIR=${STATE_DIR}"
 Environment="AIRLOCK_LEARNING_AGENT=${PROVIDER}"
+Environment="AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN=${ACCOUNTS_STATUS_BIN}"
 ExecStart=/usr/bin/python3 ${BACKEND_DIR}/ingest_runner.py
 Restart=on-failure
 RestartSec=5

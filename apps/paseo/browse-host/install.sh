@@ -11,7 +11,10 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SELF_DIR/../../.." && pwd)"
+# Nested one level deeper than a lifecycle script, which is exactly why this may
+# not climb to the platform root: "../../.." is only the platform while the package
+# sits in the platform's apps/ tree. paseo/install.sh runs this with the ABI set.
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
 require_cmd node npm systemctl

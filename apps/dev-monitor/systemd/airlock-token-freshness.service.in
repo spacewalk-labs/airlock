@@ -1,6 +1,6 @@
 [Unit]
 Description=airlock — check how long the provider credentials on this box have left
-Documentation=file:@REPO@/apps/dev-monitor/README.md
+Documentation=file:@APPDIR@/README.md
 # A separate unit rather than a line in this one, for the reason live/systemd's weekly
 # verification records: a run that dies takes this ExecStart with it, and anything that
 # had to run inside it would die too. OnFailure= is started by systemd AFTER this unit
@@ -15,12 +15,13 @@ Type=oneshot
 # jobs that "worked by hand and did nothing on schedule" is why this line is here.
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=DEV_MONITOR_TOKEN_SNAPSHOT=@SNAPSHOT@
-WorkingDirectory=@REPO@
+Environment=AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN=@ACCOUNTSSTATUSBIN@
+WorkingDirectory=@APPDIR@
 # @SPOOLFLAG@ is either `--spool <dir>` or `--no-spool`, decided once at install time.
 # It is a FLAG rather than an environment variable because "this box has no message
 # console" has to be a statement the unit makes, not an empty value the script has to
 # interpret — an empty spool path would otherwise produce one journal complaint per tick.
-ExecStart=@PYTHON@ @REPO@/apps/dev-monitor/token-freshness.py --warn-hours @WARNHOURS@ --stale-hours @STALEHOURS@ @SPOOLFLAG@
+ExecStart=@PYTHON@ @APPDIR@/token-freshness.py --warn-hours @WARNHOURS@ --stale-hours @STALEHOURS@ @SPOOLFLAG@
 # Reading two small files and linking one into a spool. A minute is not an estimate of
 # how long it takes, it is the point past which something is wrong.
 TimeoutStartSec=60

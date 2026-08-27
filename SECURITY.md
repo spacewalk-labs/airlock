@@ -8,7 +8,7 @@ a caller gets remote code execution as the box owner.
 The rest of the suite sits one tier down, reachable by the configured
 **collaborators** as well — including read **and write** access to files. See
 [Two tiers, and what a collaborator actually gets](#two-tiers-and-what-a-collaborator-actually-gets)
-before you add a collaborator or point `code_root` anywhere wide.
+before you add a collaborator — fileview serves the whole account to them.
 
 An admitted package's `install.sh` runs arbitrary bash as the operator, including sudo (D4).
 A package that is admitted at all can therefore edit config, write system files and bind
@@ -91,61 +91,92 @@ The renderer emits two identity maps (`install/render-nginx.sh`):
 
 | Tier | Admits | Reaches |
 |---|---|---|
-| `$owner_ok` | `owner` only | Every app on its own https port: **devterm**, **code-server**, **orca**, **paseo** — shells, an IDE, and agent runners. |
-| `$hub_ok` | `owner` **+ `collaborators`** | The hub server and everything included into it from `hub-locations.d/` — today **markwand**, **publish**, **notepad**, **dev-monitor**, **feedback**. |
+| `$owner_ok` | `owner` only | Every app on its own https port: **devterm**, **code-server**, **orca**, **paseo** — shells, an IDE, and agent runners. Plus every hub-subpath app whose audience is `owner`: **learning**, and **fileview** by default. |
+| `$hub_ok` | `owner` **+ `collaborators`** | The hub server, and the subpath apps that **declare** `audience = "shared"` — today **publish**, **notepad**, **dev-monitor**, **feedback**. |
 
-The rule, not the list, is what holds: **anything the hub server can serve is
-collaborator-reachable** — a proxy fragment dropped into `hub-locations.d/`, *and*
-any file placed in the hub webroot, which `location /` serves directly (that is how
-notepad and the markwand/publish/dev-monitor frontends are delivered, with no
-fragment of their own). The gate is asserted once at the server level, so neither
-route can forget it — and neither can opt out of it.
+Two things decide reach, and both must say yes. The hub server gate (`$hub_ok`) is
+asserted once at the server level, so no app can forget it or opt out of it. Then
+each app **declares who it serves** in its manifest's `[audience]`, and an app that
+declares `owner` emits its own `$owner_ok` check inside its location — because
+being inside the hub server is not by itself a claim about audience.
 
-**Collaborators are not a read-only tier.** Two file surfaces come with `$hub_ok`:
+**Declaring nothing is not the same as declaring `shared`.** A manifest with no
+`[audience]` block resolves to `owner`, and `audience` is then not an operator-
+settable key at all: the only way to serve collaborators is to say so. This is
+deliberately fail-closed — reach used to be an accident of being inside the hub
+server, which meant a package could widen its own audience by omission.
 
-- **markwand → `[paths].code_root`.** markserv renders it; filebrowser **writes**
-  it. Everything under that root is in scope, dotfiles included — the viewer treats
-  `.env` as an ordinary editable file. There is **no exclusion mechanism** in
-  either upstream: no ignore list, and no rule that keeps a path out of reach.
+- **fileview → the whole filesystem, `owner` by default.** filebrowser runs with
+  `--root /` and serves it read **and write**. There is no root setting to point
+  somewhere narrower: `[paths].code_root` is retired (`bin/airlock-config`'s
+  `RETIRED_KEYS` says so and tells you to delete the line). **The boundary is the
+  unix account the user service runs as** — `/etc` and `/var/log` read, `/root`
+  does not, and everything the owner's own account can write is writable here. That
+  is why fileview declares `audience = "owner"`: a whole-filesystem read/write
+  surface is not something a box hands to a collaborator by inheriting the hub tier.
+  Setting `[apps.fileview] audience = "shared"` opens it, and everything below is
+  what you are accepting when you do.
 
-  One display detail is easy to misread as one. markserv's own directory listing
-  omits dot entries, so `.env` is not a link you can click *there*; it is served in
-  full on a direct URL, and the split-pane tree — built from filebrowser, not
-  markserv — lists it normally. Measured on the pinned versions (markserv 1.17.4,
-  filebrowser 2.63.18). Nothing is hidden from reach, only from one of two
-  listings; do not treat a missing row as an absent file.
+  **Nothing is hidden.** No ignore list, no dotfile rule, no exclusion mechanism.
+  `.env` lists, opens, edits and saves through exactly the same path as any other
+  file — that is deliberate, not an oversight, and `smoke.sh` asserts it on every
+  install. The one setting that could break it from outside our code is
+  filebrowser's own `hideDotfiles`, so the installer pins it false rather than
+  trusting the default.
 
-  Symlinks leaving the root are **asymmetric**, so do not reason about them as one
-  thing. filebrowser refuses them: it is pinned to a version with
-  `followExternalSymlinks`, the installer passes `--followExternalSymlinks=false`,
-  and that is also the upstream default — so the *editor* stays inside the root.
-  markserv has no equivalent setting and renders whatever a link points at, so the
-  *viewer* reads through it. A curated directory of symlinks is therefore a
-  convenience, not a boundary: it stops writes, and leaks reads. Since a read of
-  `~/.ssh/id_ed25519` is already the whole loss, treat the link target as exposed.
+  (The old note here about markserv's listing omitting dot entries is gone with
+  markserv. There is one listing now, and it shows everything.)
+
+  **Pseudo-filesystems are in the tree, and they read as empty.** `/proc`, `/sys` and
+  `/dev` list like any other directory — nothing is hidden — and a read of one of
+  their files comes back `200` with **zero bytes**: measured on filebrowser 2.63.4
+  against `/proc/self/environ`, `/proc/self/cmdline`, `/dev/zero` and `/dev/urandom`,
+  each of which reports size 0 and is served as such. So the two things you would
+  expect to go wrong here do not: a process's environment is not readable through the
+  viewer, and an endless device does not stream into the browser. The viewer caps
+  what it reads anyway — it streams and cancels at the limit rather than buffering
+  first — so a future version that did serve those bytes would still not be able to
+  fill a tab. This is stated because it is surprising in both directions, and it is a
+  measurement of a pinned version, not a guarantee about the next one.
+
+  Symlinks are no longer asymmetric, because there is no longer an inside to leave:
+  filebrowser is still pinned to a version with `followExternalSymlinks` and the
+  installer still passes `--followExternalSymlinks=false`, but with the root at `/`
+  every target is already in scope.
 - **publish → `[apps.publish].share_dir`** and the upload directory: collaborators
   can list, upload, and remove shared items.
 
 Consequences to plan around:
 
-- Setting `code_root` to `~` while `collaborators` is non-empty hands them
-  `~/.ssh`, `~/.config` (including the token `EnvironmentFile`s the installers
-  write), and every agent credential under the home directory — with write access,
-  which on a box whose owner runs what is in that tree is also an execution path.
-  `validate` warns about this case, but the check is a heuristic: it cannot see
-  through a bind mount, so silence is not a clearance.
-- Scope is further bounded by the service account's own Unix permissions —
-  markwand runs as a user service, so it reaches what that user reaches.
-- **Disabling an app does not retract it.** The orchestrator installs only enabled
-  apps, but nothing removes what a previous run left behind: the hub includes
-  `hub-locations.d/*.conf` by wildcard, systemd units stay enabled, and files
-  already in the hub webroot keep being served by `location /`. Removing
-  `[apps.markwand]` and later adding a collaborator therefore exposes the *old*
-  markwand to them; removing `[apps.notepad]` — which ships no fragment and no unit
-  at all, only `notepad/index.html` in the webroot — retracts nothing whatsoever.
-  Retracting an app is manual and has three parts: delete its
-  `hub-locations.d/*.conf`, `disable --now` its unit, and delete its directory
-  under the webroot. Then re-render.
+- **Opening fileview to a collaborator hands them the account.** With
+  `[apps.fileview] audience = "shared"` a collaborator reaches `~/.ssh`, `~/.config`
+  (including the token `EnvironmentFile`s the installers write), and every agent
+  credential under the home directory — with write access, which on a box whose
+  owner runs what is in that tree is also an execution path. The `owner` default
+  breaks this chain: it takes an explicit `audience = "shared"` to reach it. If that
+  is not what you mean, do not open fileview's audience.
+- **Scope is the service account, and only the service account.** fileview runs as a
+  `systemctl --user` unit with no `User=` of its own, so it reaches exactly what the
+  installing account reaches — the kernel draws that line and the app cannot express
+  it, so there is no setting to get wrong. Measured on one box: `~/.ssh/id_ed25519`
+  and `~/.claude/.credentials.json` are readable **and writable**; `/etc/passwd` is
+  readable; `/etc/shadow` and `/var/log/syslog` are not. If that reach is wrong for
+  a box, the lever is which account installs it — not a path, and not a config key.
+- **`~/.devterm-secrets` is no longer out of reach.** The secret drop used to be
+  described as "deliberately not under `code_root`". That sentence died with
+  `code_root`: the viewer reaches every directory the account reaches, so what
+  protects those files is their mode (`0700`/`0600`) and their TTL, and placement
+  protects nothing.
+- **Disabling an app does not retract it — but the ledger does.** The sentence that
+  stood here predates the installed-state ledger. Today `install/airlock-install.sh`
+  runs `bin/airlock-ledger plan` on every run, and a committed app whose package
+  changed or disappeared is replayed through its recorded deactivator and its
+  recorded artifact list. What is still true is the shape of the hazard for anything
+  the ledger never committed: the hub includes `hub-locations.d/*.conf` by wildcard,
+  systemd units stay enabled, and files already in the hub webroot keep being served
+  by `location /`. For those, retraction is manual and has three parts: delete the
+  `hub-locations.d/*.conf`, `disable --now` the unit, and delete the directory under
+  the webroot. Then re-render.
 
 ## The secret drop: what lands on disk, and when it goes away
 
@@ -166,22 +197,25 @@ It is **on by default** when devterm is enabled, so here is exactly what that me
 |---|---|
 | Where | `~/.devterm-secrets/<name>.txt` — the installing user's home |
 | Modes | directory `0700`, files `0600`, created that way (never widened afterwards) |
-| Lifetime | `[apps.devterm] secret_ttl_sec`, **default 1800s (30 min)** from the last write |
-| Who deletes it | a sweep task inside devterm-gate, every `min(60, ttl/4)` seconds — not only when someone opens the UI |
+| Lifetime | platform-owned, **1800s (30 min)** from the last write |
+| Who deletes it | the platform `airlock-secret sweep` user timer every minute, plus an opportunistic sweep on every CLI operation — independent of whether devterm is installed or running |
 | Cap | 64 live secrets, 64 KB per value |
 | Who can read the file | the box's own user — same as `~/.ssh` or `~/.aws/credentials` |
 
 Two boundaries worth stating plainly:
 
-- **It is deliberately not under `[paths].code_root`.** markwand serves that tree read
-  **and write** to the owner *and* every collaborator, so a secret written there would be
-  readable through a file viewer. `~/.devterm-secrets` is outside it.
+- **Its protection is the mode and the TTL, not its location.** fileview serves the
+  filesystem read **and write** to the owner *and* every collaborator, so there is no
+  directory a secret could be written to that a file viewer could not reach. This
+  bullet used to say the drop sits outside `code_root`; that stopped being true when
+  the viewer stopped having a root.
 - **An `export` outlives the file.** Once a value is exported into a shell it lives in
   that shell and every child process, regardless of the TTL. The UI says so at the point
   of the click; the TTL protects the file, not your environment.
 
-To turn it off entirely, keep the value out of the box: don't use the drop. If you want a
-shorter blast radius, lower `secret_ttl_sec`; the sweep interval follows it.
+To turn it off entirely, keep the value out of the box: don't use the drop. Delete a file
+sooner when its one use is complete; the platform timer is the lifetime floor, not a reason
+to retain it until the deadline.
 
 ## The message & action console: who can post, who can run
 

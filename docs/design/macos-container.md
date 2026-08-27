@@ -64,7 +64,7 @@ macOS host (Apple Silicon)
         ├── tailscaled            → this env joins the tailnet as its OWN node
         │     └── tailscale serve → https://airlock.<tailnet>.ts.net  (:443)
         ├── nginx                 → identity gate + reverse proxy (loopback)
-        └── app backends (all bind 127.0.0.1): devterm, markwand, publish,
+        └── app backends (all bind 127.0.0.1): devterm, fileview, publish,
               notepad, dev-monitor, code-server, paseo  [orca: opt-in, heavy]
 ```
 
@@ -89,7 +89,7 @@ Key properties preserved from the Linux design:
 **orca** is the only x86_64-only app left: no arm64 AppImage upstream, and
 `apps/orca/install.sh` refuses any other arch outright. The tools that were also
 x86_64-only when this was written now pin arm64 assets — code-server
-(`apps/code-server/install.sh`), filebrowser and ttyd (`apps/markwand/install.sh`,
+(`apps/code-server/install.sh`), filebrowser and ttyd (`apps/fileview/install.sh`,
 `apps/devterm/install.sh`). On Apple Silicon:
 
 - **Native arm64 — the default, and the verified path.** The setup script takes
@@ -114,7 +114,7 @@ x86_64-only when this was written now pin arm64 assets — code-server
 |---|---|---|
 | hub | ✅ | static + nginx; the entry point |
 | paseo | ✅ (cleanest) | pure Node; binds loopback; needs agent CLIs (claude/codex/gemini) on PATH |
-| markwand, publish, notepad, dev-monitor | ✅ | Node/Python backends, loopback |
+| fileview, publish, notepad, dev-monitor | ✅ | Go/Python backends, loopback |
 | devterm | ✅ | needs PTY (`/dev/pts`) — present in OrbStack |
 | code-server | ✅ (arm64 or amd64) | installer pins both assets |
 | **dev-monitor caveat** | ⚠️ | reports the **env's** view (its /proc, services), **not the Mac host**. Expected — it monitors the Airlock box, which is now the env. |
@@ -125,12 +125,12 @@ x86_64-only when this was written now pin arm64 assets — code-server
 Persist so a rebuild doesn't lose identity or work:
 
 - **Tailscale state** — `/var/lib/tailscale` (else you re-auth every boot).
-- **Your code** — mount the Mac dir you actually edit to the env's
-  `[paths].code_root`. In an OrbStack machine, Mac files are visible under
-  `/mnt/mac/Users/<you>/…`; point `code_root` there to edit real files. Mount a
-  project directory, not your Mac home: the guest sees only its own path, so the
-  `validate` warning about a wide `code_root` cannot see through the mount, and
-  everything under it is collaborator-writable (see `SECURITY.md`).
+- **Your code** — mount the Mac dir you actually edit into the env. In an
+  OrbStack machine, Mac files are visible under `/mnt/mac/Users/<you>/…` and the
+  tools reach them there; there is no path to configure (fileview serves the
+  guest's whole filesystem — see `SECURITY.md`). Mount a project directory rather
+  than your Mac home: whatever you mount is readable and writable by the owner
+  and every collaborator, and nothing in the guest can see far enough to warn you.
 - **`airlock.toml`** — the single source of site facts.
 - **App state / home** — `$HOME` (code-server config, paseo `~/.paseo`,
   filebrowser db, publish share dir, orca pairing).
@@ -155,7 +155,7 @@ Persist so a rebuild doesn't lose identity or work:
   **systemd as PID 1**, working `apt`/`sudo`, and the Mac fs mounted at `/mnt/mac`.
 - Base packages install: nginx, node 20, python 3.12, tailscale 1.98, nft, tmux.
 - The **stock installer runs end-to-end in `AIRLOCK_DRY_RUN=1`** for all 8 apps
-  (hub, devterm, markwand, publish, notepad, dev-monitor, code-server, paseo) —
+  (hub, devterm, fileview, publish, notepad, dev-monitor, code-server, paseo) —
   config validate, nginx render, per-app systemd `--user` units, `tailscale
   serve` mappings, and nginx fragments all produced correctly (`RC=0`).
 
@@ -183,6 +183,6 @@ avoids the emulation entirely; the drop-in is harmless there anyway.
 **Still NOT verified:** orca's Xvfb + nft path under emulation (highest risk —
 hence opt-in), and code-server (arm64 or amd64 — both assets pinned) end-to-end.
 
-**Recommended first run:** enable only hub + paseo + devterm + markwand +
+**Recommended first run:** enable only hub + paseo + devterm + fileview +
 publish + notepad + dev-monitor + code-server (orca off). Confirm the entry point
 and one agent app end-to-end, then decide whether orca is worth its cost.

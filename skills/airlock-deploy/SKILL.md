@@ -17,14 +17,15 @@ it only through `bin/airlock-config`.
    isn't `Running`, stop and tell the user to run `tailscale up`. Do NOT try to
    run Airlock behind another proxy — that is insecure-by-default (see SECURITY.md).
 2. **`airlock.toml` exists.** If only `airlock.toml.example` is present, copy it and
-   help the user fill in `[auth] owner`, `[paths] code_root`, and the app tables
+   help the user fill in `[auth] owner` and the app tables
    they want. A table's mere presence under `[apps.*]` enables that app.
-   `code_root` is required whenever `[apps.markwand]` is enabled, and is not a
-   free choice: everything under it is served read+write to the owner
-   **and every collaborator**. Ask before accepting a home directory, and read
-   `SECURITY.md` ("Two tiers") with the user if they are adding collaborators.
+   fileview has no path setting: it serves **the whole filesystem this box's user
+   account can reach**, read and write, to the owner **and every collaborator**.
+   A leftover `[paths] code_root` is a retired key — tell the user to delete the
+   line. Read `SECURITY.md` ("Two tiers") with the user before adding anyone to
+   `collaborators`.
 3. **Python ≥ 3.11** (for `tomllib`). Per-app extra prereqs are listed in each
-   `apps/<name>/README.md` (e.g. markwand needs node; paseo needs node ≥ 20).
+   `apps/<name>/README.md` (e.g. fileview needs node; paseo needs node ≥ 20).
 
 ## Deploy
 
@@ -58,7 +59,7 @@ and the separate-port apps → smokes every enabled app.
 ## Notes
 
 - Separate-port apps (devterm, code-server, orca, paseo) get their own
-  owner-only gate + `tailscale serve` port. Same-origin subpath apps (markwand,
+  owner-only gate + `tailscale serve` port. Same-origin subpath apps (fileview,
   publish, notepad, dev-monitor) live under the hub and inherit its single
   server-level identity gate.
 - Secrets (e.g. the optional publish external-target token) go in an

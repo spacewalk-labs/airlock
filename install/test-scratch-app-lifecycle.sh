@@ -35,11 +35,10 @@ cat >"$TMP/airlock.toml" <<'TOML'
 provider = "tailscale"
 owner = "me@example.com"
 [paths]
-code_root = "/srv/code"
 [apps.hub]
 [apps.devterm]
 [apps.code-server]
-[apps.markwand]
+[apps.fileview]
 [apps.publish]
 [apps.notepad]
 [apps.feedback]
@@ -58,17 +57,21 @@ cat >"$SHIM/curl" <<'SH'
 # Deterministic smoke endpoint fixture. The real smoke.sh entrypoints run, but
 # no request may leave this disposable HOME or reach a live Airlock service.
 set -u
-url="" headers="" write_code=0
+url="" headers="" write_code=0 method="" data=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -H|--header) headers="${headers}${2}"$'\n'; shift 2 ;;
     -w|--write-out) write_code=1; shift 2 ;;
+    -X|--request) method="$2"; shift 2 ;;
+    -d|--data|--data-binary|--data-raw) data="$2"; shift 2 ;;
     -o|--output|--max-time|--connect-time) shift 2 ;;
     -s|-S|--silent|--http1.1) shift ;;
     http://*|https://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
+[ -n "$method" ] || { [ -n "$data" ] && method=POST; }
+[ -n "$method" ] || method=GET
 printf 'curl\t%s\t%s\n' "${AIRLOCK_SMOKE_FIXTURE_APP:-?}" "$url" \
   >>"${AIRLOCK_SCRATCH_COMMAND_LOG:?}"
 
@@ -91,11 +94,48 @@ if [ "${AIRLOCK_SMOKE_FIXTURE_APP:-}" = code-server ] \
    && [ "$path" = /s/1/ ] && [[ "$headers" == *"Upgrade: websocket"* ]]; then
   status=101
 fi
+# fileview asks for more than a status code. Its smoke does a real round trip —
+# login, list a directory, read a file, save it, then read the bytes back OFF DISK
+# — and it pins two things a status-only shim cannot speak to: that a
+# percent-encoded awkward name (space, '#') survives the whole trip, and that
+# dotfiles are ordinary files (`--hideDotfiles` stayed false). A shim that just
+# printed the expected strings would turn both into a green meaning nothing, which
+# is worse than not running them. So this fixture behaves like a server instead:
+# it percent-decodes the request path and touches the ACTUAL temp directory the
+# smoke created, listing what is really there and writing what is really sent. A
+# regression that mangles the path or hides dotfiles fails here for the same
+# reason it would fail against filebrowser.
+#
+# What it does NOT pin, and the smoke does not either: app.js's encPath(). The
+# smoke builds its own URLs with rt_enc, so the client encoder is not in this
+# path — only the assumption that a correctly-encoded path round-trips.
+#
+# Before the rename this slot held markwand, whose smoke was status-only and
+# needed none of this. Extending the fixture is what let the transition devices go
+# without dropping the app's coverage.
+if [ "${AIRLOCK_SMOKE_FIXTURE_APP:-}" = fileview ]; then
+  case "$path" in
+    /fileview/api/*)
+      case "$headers" in
+        *X-Auth:*) status=200 ;;
+        *) [ "$path" = /fileview/api/login ] && status=200 || status=401 ;;
+      esac
+      ;;
+    /fileview/files|/fileview/files/*) status=404 ;;
+    /fileview/) : ;;
+    /fileview/*) status=404 ;;
+  esac
+fi
 if [ "${AIRLOCK_SMOKE_FIXTURE_FAIL_APP:-}" = "${AIRLOCK_SMOKE_FIXTURE_APP:-}" ]; then
   status=503
 fi
 
 if [ "$write_code" = 1 ]; then
+  if [ "${AIRLOCK_SMOKE_FIXTURE_APP:-}" = fileview ] && [ "$method" = PUT ] \
+     && [ "$status" = 200 ] && [[ "$path" == /fileview/api/resources/* ]]; then
+    fv_target=$(python3 -c 'import sys,urllib.parse as u;print(u.unquote(sys.argv[1]))' "${path#/fileview/api/resources}")
+    if [ -f "$fv_target" ]; then printf '%s' "$data" >"$fv_target"; else status=404; fi
+  fi
   printf '%s' "$status"
   exit 0
 fi
@@ -105,8 +145,34 @@ case "${AIRLOCK_SMOKE_FIXTURE_APP:-}:$path:$headers" in
   feedback:/api/health:*) printf '%s\n' '{"enabled":false,"intake":false,"mail":false}' ;;
   publish:/publish/api/list:*|publish:/api/list:*) printf '%s\n' '{"ok":true}' ;;
   publish:/api/health:*) printf '%s\n' '{"public_enabled":false}' ;;
-  markwand:/markwand/:*nobody@example.com*) printf '%s\n' "This isn't your Airlock" ;;
-  markwand:/markwand/:*) printf '%s\n' '<script src="/__mw/highlight.min.js"></script>' ;;
+  fileview:/fileview/:*nobody@example.com*) printf '%s\n' "This isn't your Airlock" ;;
+  fileview:/fileview/:*) printf '%s\n' '<script src="/__fv/highlight.min.js"></script>' ;;
+  fileview:/fileview/api/login:*) printf '%s' 'fixture-token' ;;
+  fileview:/fileview/api/resources/*)
+    python3 - "${path#/fileview/api/resources}" <<'FV'
+import json, os, sys, urllib.parse
+target = urllib.parse.unquote(sys.argv[1]).rstrip("/") or "/"
+try:
+    names = sorted(os.listdir(target))
+except OSError:
+    print("{}"); raise SystemExit(0)
+# Compact separators on purpose: filebrowser emits `"name":".env"` with no space,
+# and the smoke matches that literal to prove --hideDotfiles stayed false.
+print(json.dumps({"path": target, "items": [
+    {"name": n, "size": os.path.getsize(os.path.join(target, n)), "isDir": os.path.isdir(os.path.join(target, n))}
+    for n in names]}, separators=(",", ":")))
+FV
+    ;;
+  fileview:/fileview/api/raw/*)
+    python3 - "${path#/fileview/api/raw}" <<'FV'
+import sys, urllib.parse
+target = urllib.parse.unquote(sys.argv[1].split("?", 1)[0])
+try:
+    sys.stdout.write(open(target, encoding="utf-8").read())
+except OSError:
+    sys.stdout.write("")
+FV
+    ;;
   *) printf '%s\n' '{}' ;;
 esac
 SH
@@ -127,7 +193,7 @@ else
   sed 's/^/    /' "$TMP/orch.log" | tail -40
 fi
 
-apps=(devterm code-server markwand publish notepad feedback dev-monitor paseo)
+apps=(devterm code-server fileview publish notepad feedback dev-monitor paseo)
 for app in "${apps[@]}"; do
   if grep -Fq "would install packaged app: $app from $APPS_ROOT/apps/$app" "$TMP/orch.log"; then
     ok "orchestrator resolved $app from airlock-apps"

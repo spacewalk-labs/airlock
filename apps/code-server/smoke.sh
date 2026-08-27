@@ -3,10 +3,14 @@
 # Covers the owner gate, per-slot routing (/s/1/), a real WebSocket handshake,
 # the slot manager API (/api/list), and that the shell embeds the return widget.
 set -uo pipefail
-# ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_ID,
-# falling back to $0-relative computation for a standalone invocation.
+# ABI (D5): the caller sets AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID and runs
+# this script with cwd = AIRLOCK_APP_DIR. AIRLOCK_ROOT is REQUIRED: the platform
+# root cannot be derived from $0, because "$0/../.." is only the platform when the
+# package happens to sit in the platform's own apps/ tree — the arrangement the
+# apps/ cutover ends. $0-relative self-location (this file's own directory) stays
+# fine and is what AIRLOCK_APP_DIR falls back to.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-code-server}"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"

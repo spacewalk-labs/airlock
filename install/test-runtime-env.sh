@@ -234,7 +234,6 @@ OUT="$(AIRLOCK_CONFIG="$shipcfg" AIRLOCK_SHIPPED_APPS_ROOT="$SHIP" AIRLOCK_TEST_
 # ---- the shipped tree ----
 allcfg="$TMP/all.toml"
 { printf '[site]\nname = "S"\n\n[auth]\nprovider = "tailscale"\nowner = "o@example.com"\n\n'
-  printf '[paths]\ncode_root = "%s"\n\n' "$TMP"
   printf '[apps.hub]\n'
   for a in "$ROOT"/apps/*/; do printf '[apps.%s]\n' "$(basename "$a")"; done
 } > "$allcfg"

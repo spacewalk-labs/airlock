@@ -28,6 +28,9 @@ provider = "auto"
 # resolved value under the distinct runtime name AIRLOCK_LEARNING_LISTING.
 [config]
 runtime_env = [
+  # D5 handoff: the installer receives the platform export and renames it into this
+  # package's namespace before either unit starts. The app never derives $ROOT/bin.
+  "AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN",
   # The resolved value of the `provider` knob. A distinct name because a name is a
   # config key or a runtime var, never both — the same split `listing_provider`
   # already carries as AIRLOCK_LEARNING_LISTING.

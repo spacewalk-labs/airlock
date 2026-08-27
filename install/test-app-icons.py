@@ -4,7 +4,7 @@
     python3 install/test-app-icons.py
 
 An app used to be able to ship with no favicon at all (publish did), with someone
-else's (markwand pointed at the hub's porthole), or with a hand-drawn one that
+else's (fileview pointed at the hub's porthole), or with a hand-drawn one that
 stopped matching its tile the moment the sprite changed (devterm, code-server,
 notepad, dev-monitor all did). None of that failed anything, because nothing
 looked. bin/gen-app-icons.py made the tile the source; this is what makes a new

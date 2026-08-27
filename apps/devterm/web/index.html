@@ -24,6 +24,9 @@ window.__DEVTERM = %%DEVTERM_CONFIG%%;
 <link rel="stylesheet" href="vendor/xterm.css">
 <link rel="stylesheet" href="popup.css"><!-- account popup surface, shared with panel.html -->
 <style>
+  /* Symbol-only fallback for shell prompts and icon-aware file listings. */
+  @font-face { font-family: 'Symbols Nerd Font Mono'; font-weight: 400; font-style: normal; font-display: swap;
+               src: url('vendor/symbols-nerd-font-mono.woff2') format('woff2'); }
   html, body { height: 100%; margin: 0; background: #181b24; overflow: hidden;
                -webkit-text-size-adjust: 100%; }
   /* Browser default subpixel antialiasing renders glyphs heavier; grayscale keeps them thin. */

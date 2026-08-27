@@ -41,3 +41,5 @@ wt/
 
 # 선택 스킬 배선 산출물 — 이름만 skills.conf 에 커밋한다
 .claude/skills/
+# browser-driven verification runs (playwright MCP) drop artifacts here
+.playwright-mcp/

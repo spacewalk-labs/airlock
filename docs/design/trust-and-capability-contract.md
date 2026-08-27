@@ -59,7 +59,7 @@ It stops working for three reasons, all of which the store makes load-bearing:
 A store distributes packages as downloads. A download lands outside `apps/` by definition, so
 it is `explicit` by definition, so devterm and orca cannot be store-distributed. Measured, by
 forcing each of the four apps the owner named as public through the validator as an explicit
-package: devterm and orca are fatal, **markwand and paseo are `ok: config valid`**.
+package: devterm and orca are fatal, **fileview and paseo are `ok: config valid`**.
 
 ---
 

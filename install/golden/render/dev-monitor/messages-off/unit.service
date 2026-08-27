@@ -11,6 +11,7 @@ Environment=AIRLOCK_DEV_MONITOR_CORS_HOSTS=box.example.ts.net,box
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS=false
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS=24
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS=24
+Environment=AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN=/opt/example/airlock/bin/airlock-accounts-status
 # '-' = optional: with messages off the file is absent by design, and the backend
 # then serves observability only. Secrets stay in this 0600 file, out of the unit.
 EnvironmentFile=-/home/example/.config/airlock/dev-monitor.env

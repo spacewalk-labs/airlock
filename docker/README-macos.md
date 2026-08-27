@@ -10,7 +10,7 @@ Full rationale and the OS-coupling map: [`../docs/design/macos-container.md`](..
 > **Status:** a **full real install now passes end-to-end on an arm64 machine**
 > (Apple Silicon Mac mini, M2, 8 GB — 2026-07-26): downloads + `tailscale up`/`serve`
 > + the gate, with **all app smokes green** (owner=200, non-owner=403) for
-> hub/devterm/markwand/publish/notepad/dev-monitor/paseo. **arm64 is the default** —
+> hub/devterm/fileview/publish/notepad/dev-monitor/paseo. **arm64 is the default** —
 > the setup script now takes the Mac's own architecture, and prints which one it picked.
 > Two arch caveats found in that run:
 > - **amd64/Rosetta is not recommended.** It installs, but the installer's
@@ -51,11 +51,11 @@ $EDITOR airlock.toml
 ```
 In `airlock.toml`:
 - set `[auth].owner` to your Tailscale login (e.g. `you@example.com`);
-- set `[paths].code_root` to the code you want the tools to edit — inside the
-  machine your Mac files appear under `/mnt/mac/Users/<you>/…`, so e.g.
-  `code_root = "/mnt/mac/Users/<you>/code"`. Name a project directory, not a home
-  directory: everything under it is served read+write to the owner and
-  every collaborator ([SECURITY.md](../SECURITY.md#two-tiers-and-what-a-collaborator-actually-gets));
+- there is **no code directory to set**: fileview serves the machine's whole
+  filesystem, and your Mac files appear inside it under `/mnt/mac/Users/<you>/…`.
+  What that means before you add anyone to `collaborators`: they get read **and
+  write** on everything this machine's user account can reach
+  ([SECURITY.md](../SECURITY.md#two-tiers-and-what-a-collaborator-actually-gets));
 - for the **first run, leave `[apps.orca]` out** (it's the heaviest app — Xvfb,
   nft, x86_64). Add it later once the rest works.
 
@@ -136,7 +136,7 @@ fragile to test blind — **Path A is recommended.**
 
 ```bash
 cp docker/airlock.env.example docker/airlock.env   # fill in TS_AUTHKEY
-cp airlock.toml.example airlock.toml               # owner, apps, code_root=/code
+cp airlock.toml.example airlock.toml               # owner, apps
 # point your real code dir in at /code:
 export AIRLOCK_CODE_DIR="$HOME/code"
 docker compose -f docker/docker-compose.yml up -d --build
@@ -162,7 +162,7 @@ docker restart airlock
   the architecture it used and whether you chose it or it was detected.
 - **orca** is x86_64-only (no arm64 build) and heavy — leave it out of an arm64
   machine. **`code-server` runs on arm64** (installer takes the `linux-arm64`
-  asset). The arm64 set that installs and smokes clean is: hub, devterm, markwand,
+  asset). The arm64 set that installs and smokes clean is: hub, devterm, fileview,
   publish, notepad, dev-monitor, paseo, code-server.
 - **Secrets:** `docker/airlock.env` and `airlock.toml` are gitignored. Keep your
   `TS_AUTHKEY` out of logs and commits.

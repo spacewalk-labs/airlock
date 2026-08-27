@@ -41,7 +41,7 @@ grep -q '^Environment=PATH=' "$S" \
 grep -q '^TimeoutStartSec=' "$S" \
   && ok "the service has a timeout — a hung check must not hold the slot forever" \
   || bad "the service has no TimeoutStartSec"
-grep -q '^WorkingDirectory=@REPO@' "$F" \
+grep -q '^WorkingDirectory=@APPDIR@' "$F" \
   && ok "the alarm unit has a WorkingDirectory" \
   || bad "the alarm unit has no WorkingDirectory"
 for f in "$S" "$T" "$F"; do
@@ -59,9 +59,10 @@ ok "every unit template is still a template (nothing site-specific is committed)
 # The check the installer performs at wiring time, performed here against the same sed
 # so a template that grows a placeholder nobody substitutes is caught before the box is.
 render() {
-  sed -e "s|@REPO@|/opt/example/airlock|g" -e "s|@SPOOLFLAG@|--spool /tmp/spool|g" \
+  sed -e "s|@APPDIR@|/opt/example/airlock/apps/dev-monitor|g" -e "s|@SPOOLFLAG@|--spool /tmp/spool|g" \
       -e "s|@SPOOL@|/tmp/spool|g" \
       -e "s|@SNAPSHOT@|/tmp/token-freshness.json|g" -e "s|@PYTHON@|/usr/bin/python3|g" \
+      -e "s|@ACCOUNTSSTATUSBIN@|/opt/example/airlock/bin/airlock-accounts-status|g" \
       -e "s|@WARNHOURS@|24|g" -e "s|@STALEHOURS@|24|g" -e "s|@ONCALENDAR@|00/12:00:00|g" \
       "$1" > "$2"
 }
@@ -75,6 +76,10 @@ for f in "$S" "$T" "$F"; do
   fi
 done
 [ "$left" = 0 ] && ok "substitution leaves no @PLACEHOLDER@ in any rendered unit"
+grep -q '^Environment=AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN=/opt/example/airlock/bin/airlock-accounts-status$' \
+  "$TMP/airlock-token-freshness.service" \
+  && ok "the timer receives the platform status CLI under the package-owned runtime name" \
+  || bad "the timer does not carry the D5 account-status handoff"
 
 # A positive control: the assertion above only means something if it can fail.
 printf '[Unit]\nDescription=x @NOTSUBSTITUTED@\n' > "$TMP/control.service"
@@ -105,24 +110,43 @@ else
 fi
 
 # ---------------------------------------------------------------- the installer
+# Every invocation goes through the D5 app ABI, because running an app script
+# without it is fatal by design (install/check-app-abi.sh) — and a refusal suite
+# that omits it passes every case for the wrong reason. That is not hypothetical:
+# the threshold check below did exactly that until the ABI became required, so it
+# now asserts the MESSAGE and not just a non-zero exit.
+APPDIR="$ROOT/apps/dev-monitor"
+run_timer() {
+  (cd "$APPDIR" \
+     && AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$APPDIR" AIRLOCK_APP_ID=dev-monitor \
+        bash ./install-token-timer.sh "$@" 2>&1)
+}
+
 # It must refuse the states that make a timer fail forever.
-out="$(cd "$ROOT" && bash apps/dev-monitor/install-token-timer.sh --warn-hours nope 2>&1)"; rc=$?
-[ "$rc" != 0 ] \
+out="$(run_timer --warn-hours nope)"; rc=$?
+{ [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'warn-hours must be a positive integer'; } \
   && ok "install-token-timer refuses a non-numeric threshold" \
-  || bad "install-token-timer accepted --warn-hours nope"
+  || bad "install-token-timer accepted --warn-hours nope (rc=$rc): $out"
 if [ -f "$ROOT/.git" ]; then
-  out="$(cd "$ROOT" && bash apps/dev-monitor/install-token-timer.sh 2>&1)"
+  out="$(run_timer)"
   printf '%s' "$out" | grep -q 'worktree' \
     && ok "install-token-timer refuses a git worktree (it gets reclaimed, and then the job fails on every tick)" \
     || bad "install-token-timer did not refuse a worktree: $out"
 else
   # A permanent clone: prove the spool refusal instead, which is the other way this
   # timer can be wired into silence.
-  out="$(cd "$ROOT" && bash apps/dev-monitor/install-token-timer.sh --spool "$TMP/absent-spool" 2>&1)"
+  out="$(run_timer --spool "$TMP/absent-spool")"
   printf '%s' "$out" | grep -q 'spool not found' \
     && ok "install-token-timer refuses to wire a timer whose loud channel does not exist" \
     || bad "install-token-timer accepted a missing spool: $out"
 fi
+
+# The ABI itself is load-bearing here: without AIRLOCK_ROOT this script cannot find
+# install/lib.sh, and it must say so rather than guess a root from $0.
+out="$(cd "$APPDIR" && bash ./install-token-timer.sh 2>&1)"; rc=$?
+{ [ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'AIRLOCK_ROOT'; } \
+  && ok "install-token-timer refuses to run without the D5 ABI instead of deriving a root from \$0" \
+  || bad "install-token-timer ran without AIRLOCK_ROOT (rc=$rc): $out"
 
 # ---------------------------------------------------------------- the declarations
 # The config keys the unit and the installer read must be DECLARED, or airlock-config

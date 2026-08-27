@@ -13,8 +13,12 @@ lang = "C.UTF-8"
 accounts = false
 xai = false
 remote_hosts = ""
-secret_ttl_sec = 1800
-# empty = use the account tools bundled with the devterm app
+# These keys now override platform-owned AIRLOCK_ACCOUNTS_BIN and
+# AIRLOCK_ACCOUNTS_STATUS_BIN; empty means use those platform defaults. They cannot use
+# [config.deprecated]: airlock-config requires `replacement` to name a different scalar
+# key declared by this same package, and no honest app-local replacement exists. Keeping
+# both keys working preserves validation for existing operator configs while moving the
+# default implementation out of the app.
 claude_switch = ""
 claude_status = ""
 fleet_store = ""
@@ -72,14 +76,12 @@ fix = "su -c 'apt-get update && apt-get install -y sudo'"
 note = "Privileged ingress setup"
 
 # Appendix: two user units, one servers.d fragment, ttyd + the devterm shell
-# wrapper + the account-switch tools (claude-switch when accounts=true;
-# claude-status when accounts=true or xai=true, same "declared unconditionally so
-# the ledger can reclaim it if it exists" reasoning as publish's mode-gated
-# fragment) + the web client's staged share dir. That share dir also holds
-# lib/bin_discovery.py, the shared binary-lookup module the two account tools
-# import — they are installed to ~/.local/bin as standalone files and cannot
-# reach the copy in the repo, so it is staged inside the directory the ledger
-# already owns rather than declared as a fourth entry. Deliberately NOT declared
+# wrapper + the account-tool compatibility shims (fresh claude-switch when accounts=true;
+# fresh claude-status when accounts=true or xai=true; either existing path is replaced
+# even after its feature is disabled). Both stay declared unconditionally because D6
+# record-diff would otherwise delete the terminal paths on upgrade. The real account
+# tools are platform binaries; the shims bake their resolved absolute paths at install
+# time. The web client's staged share dir follows. Deliberately NOT declared
 # (retained operator data): ~/.config/airlock-devterm/tabs.json (user tabs).
 # serve_ports/[serve.https]: HTTPS only. D-DEVTERM-9900 retired the
 # plaintext 9900 mapping (board 0ff93d05). Live close is a later step.

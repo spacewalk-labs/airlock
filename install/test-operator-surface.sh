@@ -5,9 +5,9 @@
 # points every writable platform root at scratch, and PATH-shims all service
 # commands.
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -1361,8 +1361,8 @@ else
   failure_detail "$ordinary_flag_hits"
 fi
 
-# Store v5 is closed and its timestamp/receipt fields are real types, while
-# every historical top-level shape remains readable and normalizes to v5.
+# Store v6 is closed and its timestamp/receipt fields are real types, while
+# every historical top-level shape remains readable and normalizes to v6.
 if python3 - "$LEDGER" <<'PY'
 import importlib.machinery
 import importlib.util
@@ -1376,7 +1376,9 @@ loader.exec_module(module)
 path = Path("fixture-ledger.json")
 for version in range(1, 5):
     normalized = module._validate_store({"version": version, "entries": {}}, path)
-    assert normalized == {"version": 5, "entries": {}, "events": []}
+    assert normalized == {"version": 6, "entries": {}, "events": []}
+normalized_v5 = module._validate_store({"version": 5, "entries": {}, "events": []}, path)
+assert normalized_v5 == {"version": 6, "entries": {}, "events": []}
 event = {
     "type": "package-lock-override",
     "package_id": "honestpkg",
@@ -1386,23 +1388,24 @@ event = {
     "recorded_at": "2026-08-13T02:01:24Z",
     "receipt_sha256": "3" * 64,
 }
-module._validate_store({"version": 5, "entries": {}, "events": [event]}, path)
+module._validate_store({"version": 6, "entries": {}, "events": [event]}, path)
 invalid = [
+    {"version": 6, "entries": {}},
+    {"version": 6, "entries": {}, "events": [], "extra": True},
     {"version": 5, "entries": {}},
-    {"version": 5, "entries": {}, "events": [], "extra": True},
     {"version": 4, "entries": {}, "events": []},
-    {"version": 5, "entries": {}, "events": [{**event, "recorded_at": "garbageZ"}]},
-    {"version": 5, "entries": {}, "events": [{**event, "receipt_sha256": "short"}]},
+    {"version": 6, "entries": {}, "events": [{**event, "recorded_at": "garbageZ"}]},
+    {"version": 6, "entries": {}, "events": [{**event, "receipt_sha256": "short"}]},
 ]
 for candidate in invalid:
     try:
         module._validate_store(candidate, path)
     except module.LedgerError:
         continue
-    raise AssertionError(f"accepted invalid v5 store: {candidate!r}")
+    raise AssertionError(f"accepted invalid v6 store: {candidate!r}")
 PY
 then
-  ok "honesty: v1-v4 normalize and v5 audit schema is closed"
+  ok "honesty: v1-v5 normalize and v6 audit schema is closed"
 else
   bad "honesty: ledger version and audit-event shapes stay fail-closed"
 fi

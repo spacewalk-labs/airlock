@@ -128,8 +128,9 @@ the Apache-2.0 license that covers the rest of Airlock.
 The browse-host sidecar carries one more AGPL derivative outside this directory:
 **`../browse-host/bin/patch-web-ui.js`** (`SPDX-License-Identifier:
 AGPL-3.0-only`). Its always-on `--subagent-stream` group fixes the provider-child
-subscription boundary; its optional `--browse` group contains the three live-panel
-edits. Both share fail-loud state classification, syntax gating, and content-hash
+subscription boundary and sets the fresh-install font-size defaults (ui 18 / code 14
+instead of upstream's 16 / 12 — a device that already saved settings keeps its own);
+its optional `--browse` group contains the three live-panel edits. Both share fail-loud state classification, syntax gating, and content-hash
 cache busting. Everything else under `../browse-host/` is an independent Apache-2.0 sidecar.
 
 ## Why the rest of Airlock can stay Apache-2.0

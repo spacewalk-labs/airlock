@@ -7,13 +7,18 @@ id = "paseo"
 # operator config. TASKS_MAX is a genuine knob, deliberately left here rather than
 # promoted: it is read as a raw string with its own default, and declaring it as a
 # config key would export it and change what the installer sees. MEM_CAP_BYTES is a
-# test seam the source marks as not a supported knob (install.sh:99-104).
-# ALLOW_UNBACKED_MEM is compared against the literal `1` (install.sh:126), so
+# test seam the source marks as not a supported knob (install.sh, "Resource backstop" block).
+# ALLOW_UNBACKED_MEM is compared against the literal `1` (install.sh, "Resource backstop" block), so
 # declaring it as a bool would export "true" and silently stop matching.
+# UISTATE_DIR is a test seam, not a knob: the ui-state backend derives its state
+# directory from XDG in production and the unit never sets this, so declaring it as
+# a config key would export a value the installer would then have to keep in sync
+# with a path nobody configures. Its offline test sets it to a tmpdir.
 runtime_env = [
   "AIRLOCK_PASEO_ALLOW_UNBACKED_MEM",
   "AIRLOCK_PASEO_MEM_CAP_BYTES",
   "AIRLOCK_PASEO_TASKS_MAX",
+  "AIRLOCK_PASEO_UISTATE_DIR",
 ]
 
 [config.defaults]
@@ -22,6 +27,10 @@ gate_port = 19951
 backend_port = 19952
 browse = false
 browse_ws_port = 19953
+# Loopback home for the web-UI state paseo otherwise keeps per browser (the
+# sidebar's project/workspace order). Proxied by this app's own gate under
+# /airlock-ui-state/, never tailscale-served, so it is not a serve_ports entry.
+uistate_port = 19954
 # empty = the installer's own pinned version wins. A value here OVERRIDES
 # that pin, so it must default to "" — a real version string would silently
 # freeze every box on this release.
@@ -100,7 +109,8 @@ note = "Privileged ingress setup"
 # (if present) to put an nvm-managed node/npm on PATH; it is not something
 # this app installs or owns.
 [artifacts]
-units = ["airlock-paseo.service", "airlock-paseo-browse-host.service"]
+units = ["airlock-paseo.service", "airlock-paseo-browse-host.service",
+         "airlock-paseo-uistate.service"]
 fragments = ["servers.d/paseo.conf", "paseo/"]
 files = ["~/.npm-global/lib/node_modules/@getpaseo/cli/",
          "~/.npm-global/bin/paseo",

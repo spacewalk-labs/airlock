@@ -1,0 +1,15 @@
+[Unit]
+Description=airlock devterm — ttyd PTY backend (127.0.0.1:19912)
+After=network.target
+
+[Service]
+Environment=LANG=C.UTF-8
+Environment=LC_CTYPE=C.UTF-8
+# -a: pass ?arg= to the shell as its session name; -W: writable; -P 2: fast dead-conn detect
+ExecStart=WDIR/home/.local/bin/ttyd -i 127.0.0.1 -p 19912 -P 2 -W -a -t fontSize=15 %h/.local/bin/devterm-shell
+KillMode=process
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

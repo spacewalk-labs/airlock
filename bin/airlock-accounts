@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+"""airlock-accounts — log in to Claude Code accounts and switch between them, no browser.
+
+How it works (all of this is measured against the live CLI, not guessed):
+  - Claude Code reads one file: ~/.claude/.credentials.json ("live").
+  - accessToken lives ~8h; the refreshToken *rotates* on every refresh (the old value
+    dies instantly). So a switch must save the current account back to its pool slot
+    (preserving the newest tokens) before overwriting live.
+  - Switching = copy the target account's creds from the pool into live, refreshing
+    directly (POST /v1/oauth/token) if the token is about to expire. `claude --continue`
+    then resumes the same conversation on the new account.
+  - A browser is needed exactly once per account (to seed the pool). Switching after
+    that is browser-free.
+
+Layout:
+  ~/.claude/.credentials.json     live file that Claude Code reads
+  ~/.claude-accounts/<name>.json  per-account pool entry, chmod 600
+  ~/.claude-accounts/.active      name of the currently active account
+
+One credential lineage = one refresher. Do not copy the same account's pool file to
+another machine (log in on each). Secret values are never printed — only identity,
+expiry and health.
+"""
+import base64, hashlib, json, os, stat, sys, time, shutil, subprocess, tempfile
+import urllib.request, urllib.error, urllib.parse
+
+HOME = os.path.expanduser("~")
+LIVE = os.path.join(HOME, ".claude", ".credentials.json")
+POOL = os.path.join(HOME, ".claude-accounts")
+ACTIVE = os.path.join(POOL, ".active")
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+CODEX_AUTH = os.path.join(CODEX_HOME, "auth.json")
+CODEX_AUTH_BAK = CODEX_AUTH + ".pre-relogin"
+
+# Shared binary discovery lives beside this platform CLI. Keeping the runtime
+# module with its consumers makes the checkout directly executable and avoids
+# any dependency on an app artifact directory.
+import bin_discovery  # noqa: E402
+
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TOKEN_ENDPOINTS = [
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+]
+PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile"
+USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+AUTHORIZE_ENDPOINT = "https://claude.com/cai/oauth/authorize"
+REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+# Exactly the scopes `claude` itself requests. Trimming them yields a token Claude
+# Code cannot use.
+SCOPES = ("org:create_api_key user:profile user:inference user:sessions:claude_code "
+          "user:mcp_servers user:file_upload")
+PENDING = os.path.join(POOL, ".login-pending.json")
+REFRESH_IF_WITHIN_SEC = 30 * 60   # pre-refresh on switch if the token expires this soon
+
+
+# ---------- helpers ----------
+
+def die(msg, code=1):
+    print(f"  ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _claude_bin():
+    """Absolute path to the `claude` CLI, or die saying where we looked.
+
+    The two places this is used spawned "claude" by name and left resolution to
+    PATH. From a login shell that works; from anything the gate spawns it does not,
+    because a systemd --user unit's PATH has none of the directories a node CLI
+    installs into — and execvp's own failure is a bare "No such file or directory"
+    that reads as a missing conversation rather than a missing binary."""
+    path, diag = bin_discovery.find_bin("claude")
+    if path is None:
+        die(bin_discovery.not_found_message("claude", diag))
+    return path
+
+
+def _ensure_pool():
+    os.makedirs(POOL, exist_ok=True)
+    # Avoid a metadata write on every read-only `list`: the live pool is commonly on a
+    # read-only view inside verification sandboxes, and chmod(0700) still fails there
+    # even when the directory is already exactly 0700. Repair an unsafe mode when one
+    # exists; leave a correct directory untouched.
+    if stat.S_IMODE(os.stat(POOL).st_mode) != 0o700:
+        os.chmod(POOL, 0o700)
+
+
+def _load(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_atomic(path, obj, mode=0o600):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def _oauth(creds):
+    return creds.get("claudeAiOauth", {})
+
+
+def _get_active():
+    try:
+        return open(ACTIVE).read().strip() or None
+    except OSError:
+        return None
+
+
+def _set_active(name):
+    with open(ACTIVE + ".tmp", "w") as f:      # plain name, not a secret
+        f.write(name)
+    os.replace(ACTIVE + ".tmp", ACTIVE)
+
+
+def _pool_path(name):
+    if not name or "/" in name or name.startswith("."):
+        die(f"invalid account name: {name!r}")
+    return os.path.join(POOL, name + ".json")
+
+
+def _fmt_expiry(ms):
+    if not ms:
+        return "?"
+    dt = time.gmtime(ms / 1000)
+    rel = (ms / 1000) - time.time()
+    tag = f"{rel/3600:+.1f}h" if abs(rel) < 48 * 3600 else f"{rel/86400:+.1f}d"
+    return f"{time.strftime('%m-%d %H:%MZ', dt)} ({tag})"
+
+
+def _at_valid(o):
+    return o.get("expiresAt", 0) / 1000 > time.time()
+
+
+def _b64u(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+# ---------- OAuth refresh ----------
+
+def refresh_creds(creds, quiet=False):
+    """Refresh a credential blob. Returns (creds|None, kind):
+      (creds, None)       success
+      (None, "auth")      the server *rejected* the refreshToken — only a re-login
+                          revives it (expired / logged out / rotated elsewhere).
+      (None, "transient") network, 5xx, 429 — retrying later works.
+
+    Keeping those apart is the whole point: collapsing them into one "failed" marks
+    healthy accounts dead on a momentary outage."""
+    o = _oauth(creds)
+    rt = o.get("refreshToken")
+    if not rt:
+        return None, "auth"
+    body = json.dumps({"grant_type": "refresh_token", "refresh_token": rt,
+                       "client_id": CLIENT_ID}).encode()
+    kind, last, resp = "transient", "?", None
+    for url in TOKEN_ENDPOINTS:
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json",
+                                              "Accept": "application/json",
+                                              "User-Agent": "claude-cli/2.1"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resp = json.loads(r.read())
+            break
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}: {e.read()[:160].decode('utf-8','replace')}"
+            if e.code in (400, 401):
+                # 400 invalid_grant / 401 = the server rejected this refreshToken: a
+                # verdict, not a hiccup. Stop here — asking the fallback endpoint would
+                # let its unrelated answer (console.anthropic.com currently 404s)
+                # overwrite the verdict with "transient" and hide a dead account.
+                kind = "auth"
+                break
+            kind = "transient"
+        except Exception as e:
+            last = str(e)
+            kind = "transient"
+    if resp is None:
+        if not quiet:
+            print(f"  warn: refresh failed ({last}) — this account may need a re-login",
+                  file=sys.stderr)
+        return None, kind
+    o["accessToken"] = resp["access_token"]
+    if resp.get("refresh_token"):
+        o["refreshToken"] = resp["refresh_token"]
+    if resp.get("expires_in"):
+        o["expiresAt"] = int((time.time() + resp["expires_in"]) * 1000)
+    if resp.get("refresh_token_expires_in"):
+        o["refreshTokenExpiresAt"] = int((time.time() + resp["refresh_token_expires_in"]) * 1000)
+    return creds, None
+
+
+# ---------- identity ----------
+
+def _profile(token, timeout=8):
+    """GET /api/oauth/profile (read-only, no rotation) -> {email, org_type} or None."""
+    if not token:
+        return None
+    h = {"Authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
+         "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/1.0"}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(PROFILE_ENDPOINT, headers=h),
+                                    timeout=timeout) as r:
+            j = json.load(r)
+    except Exception:
+        return None
+    a, o = j.get("account") or {}, j.get("organization") or {}
+    return {"email": a.get("email"), "org_type": o.get("organization_type")}
+
+
+def _identity(token):
+    """Token -> who it belongs to. Nobody names accounts by hand: the name is derived
+    from the id (email) plus org kind, because the same email can belong to both a
+    team and a personal org."""
+    p = _profile(token)
+    if not p or not p.get("email"):
+        return None
+    kind = "team" if p.get("org_type") == "claude_team" else "personal"
+    return {"email": p["email"], "org": p.get("org_type"), "kind": kind,
+            "name": f"{p['email']} ({kind})"}
+
+
+def _store_account(creds, fallback_name=None, set_active=False):
+    """Write creds to the pool under the identity-derived name, recording identity in
+    _meta."""
+    ident = _identity(_oauth(creds).get("accessToken", ""))
+    if ident:
+        name = ident["name"]
+        creds = dict(creds)
+        creds["_meta"] = {"email": ident["email"], "org": ident["org"], "kind": ident["kind"]}
+        # Backfill the subscription type: the authorization_code response carries no
+        # organization, so it would otherwise show as "?" in the list. The profile
+        # already told us authoritatively.
+        o = _oauth(creds)
+        if not o.get("subscriptionType") or o["subscriptionType"] == "?":
+            o["subscriptionType"] = (ident["org"] or "").replace("claude_", "") or "?"
+    elif fallback_name:
+        name = fallback_name
+        print("  warn: identity lookup failed (token expired?) — using the fallback name; "
+              "fix it later with 'relabel'", file=sys.stderr)
+    else:
+        die("identity lookup failed (token expired?) — cannot derive a name")
+    _save_atomic(_pool_path(name), creds)
+    if set_active:
+        _set_active(name)
+    return name
+
+
+# ---------- login (link + code: the headless path devterm uses) ----------
+
+def cmd_login_url():
+    """Issue just the login link (PKCE). The verifier stays on this box; the user only
+    approves in a browser and hands the code back to `login-code`. No TUI, no naming."""
+    _ensure_pool()
+    verifier = _b64u(os.urandom(32))
+    state = _b64u(os.urandom(32))
+    challenge = _b64u(hashlib.sha256(verifier.encode()).digest())
+    q = urllib.parse.urlencode({
+        "code": "true", "client_id": CLIENT_ID, "response_type": "code",
+        "redirect_uri": REDIRECT_URI, "scope": SCOPES,
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": state})
+    _save_atomic(PENDING, {"verifier": verifier, "state": state, "ts": time.time()})
+    print(AUTHORIZE_ENDPOINT + "?" + q)
+
+
+def cmd_login_code(pasted):
+    """Exchange the browser's approval code (code#state) for tokens -> stored in the
+    pool under the logged-in id."""
+    _ensure_pool()
+    try:
+        pend = _load(PENDING)
+    except Exception:
+        die("no login is pending — run 'airlock-accounts login-url' first")
+    if time.time() - pend.get("ts", 0) > 900:
+        die("that login link is stale (over 15 min) — get a fresh one with 'login-url'")
+    code = pasted.strip()
+    state = pend["state"]
+    if "#" in code:                       # the browser hands back <code>#<state>
+        code, state = code.split("#", 1)
+    body = json.dumps({"grant_type": "authorization_code", "code": code, "state": state,
+                       "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI,
+                       "code_verifier": pend["verifier"]}).encode()
+    req = urllib.request.Request(TOKEN_ENDPOINTS[0], data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json",
+                                          "User-Agent": "claude-cli/2.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        die(f"token exchange failed (HTTP {e.code}): {e.read()[:200].decode('utf-8','replace')}\n"
+            "     the code is single-use and short-lived — get a new link with 'login-url'.")
+    except Exception as e:
+        die(f"token exchange failed: {e}")
+    org = (resp.get("organization") or {}).get("organization_type", "")
+    creds = {"claudeAiOauth": {
+        "accessToken": resp["access_token"],
+        "refreshToken": resp.get("refresh_token"),
+        "expiresAt": int((time.time() + resp.get("expires_in", 28800)) * 1000),
+        "scopes": (resp.get("scope") or SCOPES).split(),
+        "subscriptionType": org.replace("claude_", "") or "?",
+    }}
+    if resp.get("refresh_token_expires_in"):
+        creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
+            (time.time() + resp["refresh_token_expires_in"]) * 1000)
+    first = _get_active() is None
+    n = _store_account(creds, set_active=first)
+    try:
+        os.remove(PENDING)
+    except OSError:
+        pass
+    if first:
+        print(f"  registered '{n}' (first account -> active)")
+    elif _refresh_live_if_same(n, creds):
+        print(f"  renewed '{n}' — it is the account in use, so live was replaced too.")
+        print("    (running sessions are unaffected; the next `claude` start picks it up)")
+    else:
+        print(f"  registered '{n}' (active unchanged)")
+
+
+def _refresh_live_if_same(name, creds):
+    """If the account just registered is the one currently live, move live onto the new
+    lineage — that makes "re-login" also mean "renew".
+
+    Why it matters: refreshToken expiry does not slide (measured — refreshing does not
+    add a second). Re-login is the only way to extend it, so seeding only the pool while
+    leaving live alone renews nothing for the person actually using it.
+
+    A *different* account is never touched — silently changing which account someone is
+    using is an accident, not a feature.
+
+    Do not route this through _switch_core: its save-back would overwrite the freshly
+    issued pool entry with the old live creds (especially when .active has drifted)."""
+    if not os.path.isfile(LIVE):
+        return False
+    try:
+        live_ident = _identity(_oauth(_load(LIVE)).get("accessToken", ""))
+    except Exception:
+        return False
+    if not live_ident:
+        print("  warn: could not identify live (token expired?) — skipping the swap. "
+              f"If needed: airlock-accounts swap {name!r}", file=sys.stderr)
+        return False
+    if live_ident["name"] != name:
+        return False                      # different account: leave it alone
+    shutil.copy2(LIVE, LIVE + ".switch-bak")
+    os.chmod(LIVE + ".switch-bak", 0o600)
+    _save_atomic(LIVE, creds)
+    _set_active(name)
+    return True
+
+
+# ---------- login (other seeding paths) ----------
+
+def cmd_login(name=None, extra=()):
+    """Add an account by logging in inside an isolated temp config dir, then store it in
+    the pool. live is never touched, and the account is named from the id you log in as."""
+    _ensure_pool()
+    tmp = tempfile.mkdtemp(prefix=".login-", dir=POOL)
+    try:
+        print("  Adding an account in an isolated session (live account untouched).")
+        print("    1. in the session that opens: /login -> approve in the browser")
+        print("       (headless: paste the printed URL into any browser)")
+        print("    2. /exit (or Ctrl+C) when logged in")
+        print("    -> it is stored in the pool under the id you logged in as.\n")
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": tmp}
+        subprocess.run([_claude_bin(), *extra], env=env)   # inherits the tty
+        src = os.path.join(tmp, ".credentials.json")
+        if not os.path.isfile(src):
+            die("login did not complete (no credentials). Try `airlock-accounts login` again.")
+        creds = _load(src)
+        if "claudeAiOauth" not in creds:
+            die("the login result is not in OAuth form.")
+        first = _get_active() is None
+        n = _store_account(creds, fallback_name=name, set_active=first)
+        tail = " (pool was empty -> set active)" if first else " (active unchanged)"
+        print(f"\n  stored '{n}' in the pool.{tail}")
+        print("     check: airlock-accounts list   |   switch: the Claude icon in devterm")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_add(name=None):
+    """Snapshot the current live credential into the pool and mark it active."""
+    _ensure_pool()
+    if not os.path.isfile(LIVE):
+        die(f"no live credential: {LIVE} (log in with `claude` first)")
+    creds = _load(LIVE)
+    if "claudeAiOauth" not in creds:
+        die("the live file is not in OAuth form")
+    n = _store_account(creds, fallback_name=name, set_active=True)
+    print(f"  stored '{n}' in the pool and set it active. (health/usage: list --usage)")
+
+
+def cmd_import(config_dir, name=None):
+    """Import creds from a dir logged in via CLAUDE_CONFIG_DIR (live untouched)."""
+    _ensure_pool()
+    src = os.path.join(os.path.expanduser(config_dir), ".credentials.json")
+    if not os.path.isfile(src):
+        die(f"{src} not found (did you log in with CLAUDE_CONFIG_DIR={config_dir}?)")
+    creds = _load(src)
+    if "claudeAiOauth" not in creds:
+        die("the source file is not in OAuth form")
+    n = _store_account(creds, fallback_name=name)
+    print(f"  imported '{config_dir}' -> pool '{n}' (active unchanged).")
+
+
+def cmd_relabel():
+    """Rename every pool entry to its identity-derived name and fill in _meta —
+    migration for hand-picked names and identity drift."""
+    _ensure_pool()
+    active = _get_active()
+    for old in _pool_names():
+        full = _load(_pool_path(old))
+        ident = _identity(_oauth(full).get("accessToken", ""))
+        if not ident:
+            print(f"  warn: {old}: identity lookup failed (token expired?) — skipped")
+            continue
+        new = ident["name"]
+        full["_meta"] = {"email": ident["email"], "org": ident["org"], "kind": ident["kind"]}
+        # Two old names can map to the same identity (e.g. a slot re-created under a
+        # newer naming scheme). Renaming blindly would overwrite the surviving slot with
+        # whichever file happens to be processed last — possibly the stale lineage, which
+        # silently downgrades the credential in use. Keep the fresher refreshToken.
+        if new != old and os.path.isfile(_pool_path(new)):
+            def _rt(c):
+                return _oauth(c).get("refreshTokenExpiresAt", 0)
+            if _rt(_load(_pool_path(new))) >= _rt(full):
+                os.remove(_pool_path(old))
+                print(f"  {old}  ->  dropped (a fresher '{new}' already exists)")
+                if active == old:
+                    _set_active(new); active = new
+                continue
+        _save_atomic(_pool_path(new), full)
+        if new != old:
+            os.remove(_pool_path(old))
+            if active == old:
+                _set_active(new); active = new
+            print(f"  {old}  ->  {new}")
+        else:
+            print(f"  {new}  (unchanged)")
+    print(f"\n  active = {_get_active()}")
+
+
+# ---------- listing ----------
+
+def _pool_names():
+    """Account names in the pool. Dotfiles (.active, .login-pending.json) are internal."""
+    return sorted(f[:-5] for f in os.listdir(POOL)
+                  if f.endswith(".json") and not f.startswith("."))
+
+
+def _usage(token, timeout=8):
+    """GET /api/oauth/usage (read-only, costs no quota) -> 5h/7d utilization %.
+    Only the percentages and reset times are emitted — never spend or dollar fields.
+
+    A 429 here is a *throttle on this API*, not an exhausted account: a fully spent
+    account still answers 200 with utilization=100. Judge exhaustion by utilization
+    only; treat 429 as an error and fall back to the cached value."""
+    if not token:
+        return {"err": "no token"}
+    h = {"Authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
+         "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/1.0"}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(USAGE_ENDPOINT, headers=h),
+                                    timeout=timeout) as r:
+            j = json.load(r)
+    except urllib.error.HTTPError as e:
+        return {"err": "throttled (429)" if e.code == 429 else f"HTTP {e.code}", "code": e.code}
+    except Exception as e:
+        return {"err": type(e).__name__}
+
+    def pct(o):
+        return round(o["utilization"]) if isinstance(o, dict) and o.get("utilization") is not None else None
+    fh, sd = j.get("five_hour") or {}, j.get("seven_day") or {}
+    return {"use5h": pct(fh), "use7d": pct(sd),
+            "reset5h": fh.get("resets_at"), "reset7d": sd.get("resets_at")}
+
+
+def _account_infos(with_usage=False):
+    """Structured pool listing (no secrets)."""
+    _ensure_pool()
+    active = _get_active()
+    infos = []
+    for n in _pool_names():
+        full = _load(_pool_path(n))
+        o, meta = _oauth(full), (full.get("_meta") or {})
+        info = {
+            "name": n,
+            "email": meta.get("email"),   # display uses the real id, not a nickname
+            "kind": meta.get("kind"),     # personal / team
+            "active": n == active,
+            "sub": o.get("subscriptionType", "?"),
+            "atValid": _at_valid(o),
+            # rtValid answers "can we switch to it without a re-login?"
+            "rtValid": (o.get("refreshTokenExpiresAt", 0) / 1000 > time.time()),
+            "atExpiry": o.get("expiresAt"),
+            "rtExpiry": o.get("refreshTokenExpiresAt"),
+        }
+        if with_usage:
+            info["usage"] = _usage(o.get("accessToken", ""))
+        infos.append(info)
+    # Health from refreshToken expiry — decidable without any API call. The 401-based
+    # verdict is the airlock-accounts-status probe's job.
+    now = time.time()
+    for info in infos:
+        info["health"] = ({"state": "dead", "since": now,
+                           "reason": "refreshToken expired — re-login required"}
+                          if not info["rtValid"] else {"state": "ok"})
+    return infos
+
+
+def cmd_list(as_json=False, with_usage=False):
+    infos = _account_infos(with_usage)
+    if as_json:
+        print(json.dumps({"active": _get_active(), "accounts": infos}, ensure_ascii=False))
+        return
+    if not infos:
+        print("  (pool is empty — add one with 'airlock-accounts login')")
+        return
+    w = max(14, min(40, max(len(i["name"]) for i in infos) + 2))
+    uhdr = f"{'5h/7d':<12}" if with_usage else ""
+    print(f"  {'':2}{'account (id)':<{w}}{'accessToken':<22}{'refreshToken expiry':<22}{uhdr}")
+    for i in infos:
+        mark = ">" if i["active"] else " "
+        atv = "DEAD " if i["health"]["state"] == "dead" else ("valid " if i["atValid"] else "expired")
+        us = ""
+        if with_usage:
+            u = i.get("usage") or {}
+            if u.get("use5h") is not None:
+                us = f"{u['use5h']}%/{u['use7d']}%"
+            elif u.get("err"):
+                us = f"?({u['err']})"
+            else:
+                us = "-"
+        print(f"  {mark} {i['name']:<{w}}{atv+' '+_fmt_expiry(i['atExpiry']):<22}"
+              f"{_fmt_expiry(i['rtExpiry']):<22}{us}")
+        if i["health"]["state"] == "dead":
+            print(f"    -> {i['health'].get('reason','')} — 'airlock-accounts login-url' revives this slot")
+    print(f"\n  > = active. live={LIVE}")
+
+
+# ---------- removal ----------
+
+def cmd_prune(yes=False):
+    """Remove dead slots, only when explicitly asked. Never automatic:
+    (1) a death verdict can be wrong, and deleting on a transient failure destroys a
+        healthy credential, (2) a re-login revives the same slot anyway (name = id), so
+        there is little to gain, (3) pool deletion is irreversible.
+    Dead accounts are already excluded from switching and show their reason in the UI."""
+    _ensure_pool()
+    dead = [i for i in _account_infos() if i["health"]["state"] == "dead"]
+    if not dead:
+        print("  no dead accounts."); return
+    for i in dead:
+        print(f"  dead: {i['name']} — {i['health'].get('reason','')}")
+    if not yes:
+        print("\n  to actually delete: airlock-accounts prune --yes")
+        print("  (a re-login revives them, so you can leave them be)")
+        return
+    for i in dead:
+        if i["active"]:
+            print(f"  skip {i['name']}: it is active (switch to another account first)"); continue
+        os.remove(_pool_path(i["name"]))
+        print(f"  removed {i['name']}")
+
+
+def cmd_remove(name, yes=False):
+    """Remove one slot *by name*, regardless of health — for the case prune cannot see:
+    a cancelled subscription whose refreshTokenExpiresAt is still in the future, so it
+    looks healthy while the server rejects it.
+
+    Irreversible (the pool file is deleted), but since name = id, a re-login recreates
+    the same slot; all you lose is the current token lineage, which the re-login
+    replaces anyway. The active account is refused — swap away first, or .active ends
+    up pointing at a slot that no longer exists."""
+    _ensure_pool()
+    path = _pool_path(name)                 # blocks path escape (/ and leading .)
+    if not os.path.isfile(path):
+        die(f"'{name}' is not in the pool. Check 'airlock-accounts list'")
+    if _get_active() == name:
+        die(f"'{name}' is active — switch to another account before removing it")
+    if not yes:
+        print(f"  would remove: {name}")
+        print("  to actually delete: airlock-accounts remove <name> --yes")
+        print("  (a re-login recreates the same slot)")
+        return
+    os.remove(path)
+    print(f"  removed '{name}' from the pool (a re-login recreates it)")
+
+
+# ---------- switching ----------
+
+def _saveback():
+    """Save the current live creds back into *their own* slot (mandatory, because
+    tokens rotate).
+
+    Do not trust .active blindly: if someone runs plain `claude` -> /login outside
+    airlock-accounts, live changes while .active still names the old account (drift).
+    Writing live into the .active slot then destroys a different account's tokens
+    (observed in practice). So ask live who it is and store it there."""
+    if not os.path.isfile(LIVE):
+        return
+    try:
+        creds = _load(LIVE)
+    except Exception as e:
+        print(f"  warn: cannot read live ({e}) — skipping save-back", file=sys.stderr)
+        return
+    active = _get_active()
+    ident = _identity(_oauth(creds).get("accessToken", ""))
+    if ident:
+        target = ident["name"]
+        if active and target != active:
+            print(f"  warn: live is '{target}', not the active '{active}' "
+                  "(logged in outside airlock-accounts?) — saving to the correct slot",
+                  file=sys.stderr)
+        creds = dict(creds)
+        creds["_meta"] = {"email": ident["email"], "org": ident["org"], "kind": ident["kind"]}
+    elif active:
+        target = active   # identity lookup failed (offline/expired) -> old behaviour
+        print("  warn: cannot identify live — saving back to the active slot", file=sys.stderr)
+    else:
+        return
+    try:
+        _save_atomic(_pool_path(target), creds)
+        print(f"  save-back: preserved the newest tokens for '{target}'")
+    except Exception as e:
+        print(f"  warn: save-back failed ({e}) — continuing", file=sys.stderr)
+
+
+def _switch_core(name):
+    _ensure_pool()
+    target = _pool_path(name)
+    if not os.path.isfile(target):
+        die(f"'{name}' is not in the pool. Check 'airlock-accounts list'")
+    # 1) save the current account back (rotation-safe)
+    if _get_active() != name:
+        _saveback()
+    # 2) load the target, refreshing directly if it is about to expire
+    creds = _load(target)
+    o = _oauth(creds)
+    if o.get("expiresAt", 0) / 1000 <= time.time() + REFRESH_IF_WITHIN_SEC:
+        print(f"  '{name}' accessToken near expiry -> refreshing")
+        refreshed, _kind = refresh_creds(creds)
+        if refreshed:
+            creds = refreshed
+            _save_atomic(target, creds)  # keep the pool in step with the rotation
+        elif not _at_valid(o):
+            die(f"'{name}': refresh failed and the accessToken is expired — re-login "
+                "required ('airlock-accounts login-url')")
+    # 3) back live up, then replace it atomically
+    if os.path.isfile(LIVE):
+        shutil.copy2(LIVE, LIVE + ".switch-bak")
+        os.chmod(LIVE + ".switch-bak", 0o600)
+    os.makedirs(os.path.dirname(LIVE), exist_ok=True)
+    _save_atomic(LIVE, creds)
+    _set_active(name)
+    print(f"  active account -> '{name}' (no browser needed)")
+
+
+def cmd_to(name, extra):
+    """Switch, then resume the same conversation with `claude --continue`."""
+    _switch_core(name)
+    print("  continuing with claude --continue…\n")
+    os.execv(_claude_bin(), ["claude", "--continue", *extra])
+
+
+def cmd_swap(name):
+    """Switch only, without re-launching — what the devterm button and scripts use."""
+    _switch_core(name)
+    print("  (not re-launched. The next `claude` run uses this account.)")
+
+
+# ---------- Codex re-login preservation ----------
+
+def cmd_codex_auth(action, as_json=False):
+    """Preserve Codex's single-account login across an abandoned device-auth flow.
+
+    `codex login --device-auth` removes auth.json before the user has approved the
+    replacement. The browser surface that starts that flow therefore needs two small
+    lifecycle operations, but it must not learn the credential path or receive any
+    credential material. Keep the historical copy2/move semantics here: P2b is an
+    ownership move, not a rewrite of the login state machine.
+    """
+    if action == "backup":
+        backed_up = False
+        if os.path.isfile(CODEX_AUTH):
+            shutil.copy2(CODEX_AUTH, CODEX_AUTH_BAK)
+            backed_up = True
+        result = {"ok": True, "backedUp": backed_up}
+    elif action == "restore":
+        restored = False
+        if os.path.isfile(CODEX_AUTH_BAK):
+            shutil.move(CODEX_AUTH_BAK, CODEX_AUTH)
+            restored = True
+        result = {"ok": True, "restored": restored}
+    elif action == "generation":
+        # Consumers only need a change detector so an in-flight usage result from the
+        # previous login cannot be committed after auth.json is replaced. Keep both
+        # path knowledge and the stat here; nanosecond mtime is metadata, not credential
+        # material, and an absent login has an explicit shape instead of an exception.
+        try:
+            generation = os.stat(CODEX_AUTH).st_mtime_ns
+        except FileNotFoundError:
+            generation = None
+        except OSError:
+            print("Codex auth generation could not be read", file=sys.stderr)
+            return 1
+        result = {"ok": True, "present": generation is not None,
+                  "generation": generation}
+    else:
+        print("codex-auth action must be backup, restore or generation", file=sys.stderr)
+        return 2
+    if as_json:
+        json.dump(result, sys.stdout)
+        print()
+    else:
+        print("backed up" if result.get("backedUp") else
+              "restored" if result.get("restored") else "no saved login")
+    return 0
+
+
+USAGE = """airlock-accounts — switch Claude accounts without a browser
+Accounts are not named by hand: the name is the id you log in as, "email (personal|team)".
+
+Register an account (browser needed once per account):
+  airlock-accounts login-url                issue the login link only (devterm uses this)
+  airlock-accounts login-code <code#state>  finish with the code from the browser
+  airlock-accounts login                    (alternative) log in in a temp terminal session
+  airlock-accounts add                      store the current live account in the pool (+active)
+  airlock-accounts import <cfgdir>          import an account logged in via CLAUDE_CONFIG_DIR
+  airlock-accounts relabel                  rename old hand-picked names to id-based ones
+
+Switch / inspect:
+  airlock-accounts list [--json] [--usage]  accounts + health (+ 5h/7d utilization)
+  airlock-accounts to <name> [-- args...]   switch, then claude --continue
+  airlock-accounts swap <name>              switch only (no re-launch; buttons/scripts)
+  airlock-accounts prune [--yes]            remove all dead slots (explicit only)
+  airlock-accounts remove <name> [--yes]    remove one slot by name (active is refused)
+
+Platform lifecycle (called through the D5 ABI; never emits credential values):
+  airlock-accounts codex-auth backup [--json]
+  airlock-accounts codex-auth restore [--json]
+  airlock-accounts codex-auth generation [--json]"""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE); return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "login":                        cmd_login(None, rest)
+    elif cmd == "add":                        cmd_add(rest[0] if rest else None)
+    elif cmd == "import" and rest:            cmd_import(rest[0], rest[1] if len(rest) > 1 else None)
+    elif cmd == "relabel":                    cmd_relabel()
+    elif cmd == "prune":                      cmd_prune("--yes" in rest)
+    elif cmd == "remove":
+        target = next((a for a in rest if not a.startswith("-")), None)
+        if not target:
+            print(USAGE, file=sys.stderr); return 2
+        cmd_remove(target, "--yes" in rest)
+    elif cmd == "login-url":                  cmd_login_url()
+    elif cmd == "login-code" and rest:        cmd_login_code(rest[0])
+    elif cmd == "list":                       cmd_list("--json" in rest, "--usage" in rest)
+    elif cmd == "to" and rest:
+        extra = rest[1:]
+        if extra and extra[0] == "--":
+            extra = extra[1:]
+        cmd_to(rest[0], extra)
+    elif cmd == "swap" and len(rest) == 1:    cmd_swap(rest[0])
+    elif cmd == "codex-auth" and rest:
+        return cmd_codex_auth(rest[0], "--json" in rest[1:])
+    else:
+        print(USAGE, file=sys.stderr); return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

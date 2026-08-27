@@ -19,13 +19,15 @@
 **못 읽으면 진행 표시를 잃을 뿐 판정은 멀쩡하다** — 그 경계가 이 파일의 설계다.
 
 로그인 판정에 대해 정직하게: 실행해 보지 않고 "로그인됐다" 를 확신할 방법은 없다. 여기서
-보는 것은 **자격 파일의 존재**라는 힌트뿐이고, 힌트가 없어도 실행은 막지 않는다. 힌트는
-여러 CLI 가 깔린 박스에서 **어느 것을 먼저 쓸지 고르는 데만** 쓴다.
+보는 것은 플랫폼이 돌려준 **사용 가능한 로그인 boolean**이라는 힌트뿐이고, 힌트가 없어도
+실행은 막지 않는다. 힌트는 여러 CLI 가 깔린 박스에서 **어느 것을 먼저 쓸지 고르는 데만**
+쓴다. 이 앱은 제공자 자격 파일의 경로나 형식을 알지 못한다.
 """
 
 import json
 import os
 import shutil
+import subprocess
 
 # 🔴 구독이 아니라 종량 과금으로 돌 뻔하게 만드는 환경 변수 전부. 자식은 환경을 통째로
 #    상속하므로 여기서 막지 않으면 조용히 과금된다. 유닛의 `UnsetEnvironment` 와 별개인
@@ -56,8 +58,6 @@ class Provider:
     id = ""
     label = ""
     command = ""
-    # 로그인 흔적. 있으면 우선 고르고, 없어도 막지 않는다.
-    credential_paths = ()
     # 스킬을 심는 자리 (홈 기준 상대경로).
     skill_root = ""
 
@@ -88,17 +88,35 @@ class Provider:
         return f"AIRLOCK_LEARNING_{self.id.upper()}_BIN"
 
     def has_credentials(self, env=None):
-        """자격 파일이 있나. HOME 을 모르면 **모른다고 답한다.**
+        """플랫폼이 이 제공자에 사용 가능한 로그인이 있다고 답했나.
 
-        예전에는 HOME 이 없으면 `expanduser("~")` 로 내려앉았다 — 그러면 건네준 환경과
-        무관하게 진짜 홈을 들여다본다. 힌트일 뿐이라 위험하진 않지만, 격리해서 부른
-        쪽에게 거짓말하는 코드는 시험도 거짓말하게 만든다.
+        호출 실패·초과 출력·잘못된 JSON은 모두 힌트 없음으로 축소한다. 힌트는 자동 선택
+        순서만 바꾸므로, 이 경계의 실패 때문에 설치된 CLI 자체를 막아서는 안 된다. stderr와
+        원문 stdout은 로그에 싣지 않는다 — 플랫폼 계약은 boolean 외 자격 정보를 주지 않는다.
         """
         env = env if env is not None else os.environ
-        home = env.get("HOME")
-        if not home:
+        binary = (env.get("AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN") or "").strip()
+        if not binary:
             return False
-        return any(os.path.exists(os.path.join(home, rel)) for rel in self.credential_paths)
+        try:
+            proc = subprocess.run(
+                [binary, "login-state", "--json"], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if proc.returncode != 0 or len(proc.stdout) > 64 * 1024:
+            return False
+        try:
+            payload = json.loads(proc.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return False
+        providers = payload.get("providers") if isinstance(payload, dict) else None
+        return (isinstance(payload, dict)
+                and type(payload.get("schema_version")) is int
+                and payload.get("schema_version") == 1
+                and isinstance(providers, dict)
+                and providers.get(self.id) is True)
 
     def build_argv(self, binary, prompt):
         raise NotImplementedError
@@ -129,7 +147,6 @@ class ClaudeProvider(Provider):
     id = "claude"
     label = "Claude Code"
     command = "claude"
-    credential_paths = (".claude/.credentials.json", ".claude.json")
     skill_root = ".claude/skills"
 
     def build_argv(self, binary, prompt):
@@ -236,7 +253,6 @@ class CodexProvider(Provider):
     id = "codex"
     label = "Codex CLI"
     command = "codex"
-    credential_paths = (".codex/auth.json",)
     skill_root = ".agents/skills"
 
     def build_argv(self, binary, prompt):

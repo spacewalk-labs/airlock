@@ -39,7 +39,8 @@ AIRLOCK_RENDER_DIR="$RENDER" \
 AIRLOCK_TS_FQDN=box.example.test \
 DEV_MONITOR_SLACK_WEBHOOK=https://hooks.example.test/existing \
 HOME="$TMP/home" \
-bash "$ROOT/apps/dev-monitor/install.sh" >/dev/null 2>&1
+AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
+  bash "$ROOT/apps/dev-monitor/install.sh" >/dev/null 2>&1
 
 unit="$RENDER/units/airlock-dev-monitor.service"
 env_file="$RENDER/files/dev-monitor.env"
@@ -74,7 +75,8 @@ if output=$(AIRLOCK_CONFIG="$TMP/config-symlink.toml" AIRLOCK_DRY_RUN=1 \
     AIRLOCK_RENDER_DIR="$TMP/render-symlink" \
     AIRLOCK_TS_FQDN=box.example.test \
     DEV_MONITOR_SLACK_WEBHOOK=https://hooks.example.test/existing \
-    HOME="$TMP/home" bash "$ROOT/apps/dev-monitor/install.sh" 2>&1); then
+    HOME="$TMP/home" AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
+  bash "$ROOT/apps/dev-monitor/install.sh" 2>&1); then
   echo 'compatibility env symlink unexpectedly accepted' >&2
   exit 1
 fi
@@ -86,7 +88,8 @@ if output=$(AIRLOCK_CONFIG="$TMP/config-alias.toml" AIRLOCK_DRY_RUN=1 \
     AIRLOCK_RENDER_DIR="$TMP/render-alias" \
     AIRLOCK_TS_FQDN=box.example.test \
     DEV_MONITOR_SLACK_WEBHOOK=https://hooks.example.test/existing \
-    HOME="$TMP/home" bash "$ROOT/apps/dev-monitor/install.sh" 2>&1); then
+    HOME="$TMP/home" AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
+  bash "$ROOT/apps/dev-monitor/install.sh" 2>&1); then
   echo 'canonical env alias unexpectedly accepted as compatibility path' >&2
   exit 1
 fi
@@ -98,7 +101,8 @@ printf 'stale\n' >"$TMP/render-off/files/dev-monitor-compat.env"
 AIRLOCK_CONFIG="$TMP/config-off.toml" AIRLOCK_DRY_RUN=1 \
 AIRLOCK_RENDER_DIR="$TMP/render-off" \
 AIRLOCK_TS_FQDN=box.example.test \
-HOME="$TMP/home" bash "$ROOT/apps/dev-monitor/install.sh" >/dev/null 2>&1
+HOME="$TMP/home" AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
+  bash "$ROOT/apps/dev-monitor/install.sh" >/dev/null 2>&1
 [ ! -e "$TMP/render-off/files/dev-monitor-compat.env" ]
 
 echo 'dev-monitor cutover config: ok'

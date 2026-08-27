@@ -1,0 +1,26 @@
+[Unit]
+Description=airlock filebrowser — file API for the viewer (127.0.0.1:19501)
+After=network.target
+
+[Service]
+Type=simple
+# The state directory this app owns. It used to be %h/.config/filebrowser, which
+# the installer stopped creating when the database moved — systemd fails CHDIR
+# before ExecStart, so on a box with no leftover filebrowser directory the service
+# never started at all. Boxes that had one hid the bug.
+WorkingDirectory=%h/.config/airlock-fileview
+# --root /: the tree is the filesystem. There is no configured boundary any more —
+# what bounds this is the unix account the user service runs as (see SECURITY.md).
+# --disableTypeDetectionByHeader: without it, building a directory listing OPENS
+# every file whose MIME the extension does not settle, to read its first bytes.
+# Measured with strace on the pinned binary — one listing of three extension-less
+# files: 3 opens with detection on, 0 with this flag, 0 with it off in the stored
+# config (so the flag does override the config). Under --root / that is a listing of
+# /dev opening device nodes. The viewer decides how to render by extension anyway,
+# so the server-side sniff buys nothing and costs that.
+ExecStart=/home/example/.local/bin/filebrowser --database /home/example/.config/filebrowser/fb.db --root / --address 127.0.0.1 --port 19501 --followExternalSymlinks=false --disableTypeDetectionByHeader
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

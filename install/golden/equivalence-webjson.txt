@@ -16,6 +16,7 @@
       "port": 443
     },
     "notepad": {
+      "audience": "shared",
       "packaged": true,
       "source_class": "shipped",
       "tile": {
@@ -27,6 +28,7 @@
       }
     },
     "publish": {
+      "audience": "shared",
       "packaged": true,
       "source_class": "shipped",
       "tile": {

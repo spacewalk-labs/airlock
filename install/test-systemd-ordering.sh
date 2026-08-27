@@ -224,7 +224,7 @@ UNIT_PATH="/home/example/.npm-global/bin:/home/example/.local/bin:/usr/local/bin
 HOME_VAL="/home/example"; FQDN="box.example.ts.net"; HTTPS_PORT=19700
 PASEO_BIN="/home/example/.npm-global/bin/paseo"; BACKEND_PORT=19701
 PY="/usr/bin/python3"; STALE_PID_GUARD="$APP/paseo-clear-stale-pid.py"
-PASEO_UNIT_TEXT="$(render_paseo_unit "$UNIT_PATH" "$HOME_VAL" "$FQDN" "$HTTPS_PORT" "$PASEO_BIN" "$BACKEND_PORT" "$PY" "$STALE_PID_GUARD" "14G" "12G" 24576)"
+PASEO_UNIT_TEXT="$(render_paseo_unit "$UNIT_PATH" "$HOME_VAL" "$FQDN" "$HTTPS_PORT" "$PASEO_BIN" "$BACKEND_PORT" "$PY" "$STALE_PID_GUARD" "22528M" "20480M" 24576)"
 ingest_unit user "airlock-paseo.service" "$PASEO_UNIT_TEXT"
 
 BROWSE_HOST_UNIT_TEXT="$(extract_browse_host_unit)"
@@ -267,10 +267,12 @@ DEVTERM_GATE_ENV="Environment=PATH=/home/example/.local/bin:/home/example/.npm-g
 "
 ingest_unit user "airlock-devterm-gate.service" "$(render_devterm_unit_gate 19301 "$DEVTERM_GATE_ENV" "$PY" "$APP/backend/devterm-gate.py")"
 
-# ---- markwand ----
-APP="$ROOT/apps/markwand"; . "$APP/render.sh"
-ingest_unit user "airlock-markserv.service" "$(render_markwand_unit_markserv "/home/example/code" 19400 "/home/example/.local/bin/markserv")"
-ingest_unit user "airlock-filebrowser.service" "$(render_markwand_unit_filebrowser "/home/example/code" 19401 "/home/example/.local/bin/filebrowser" "/home/example/.config/filebrowser/filebrowser.db")"
+# ---- fileview ----
+# One unit now: markserv is gone and its renderer with it. This used to ingest
+# two, and to assert that the markserv unit carried a runtime PATH — a check that
+# only ever existed because a `#!/usr/bin/env node` script needed one.
+APP="$ROOT/apps/fileview"; . "$APP/render.sh"
+ingest_unit user "airlock-fileview.service" "$(render_fileview_unit_filebrowser 19401 "/home/example/.local/bin/filebrowser" "/home/example/.config/airlock-fileview/fb.db")"
 
 # ---- feedback ----
 APP="$ROOT/apps/feedback"; . "$APP/render.sh"

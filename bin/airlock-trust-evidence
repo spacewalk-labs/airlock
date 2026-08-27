@@ -22,7 +22,7 @@ sys.dont_write_bytecode = True
 SCHEMAS = (
     ("config_schema", 2, "schemas/trust/config-v2.json"),
     ("capability_schema", 1, "schemas/trust/capability-v1.json"),
-    ("ledger_schema", 5, "schemas/trust/ledger-v5.json"),
+    ("ledger_schema", 6, "schemas/trust/ledger-v6.json"),
 )
 SUITES = (
     ("operator-trust-surface", "install/test-operator-surface.sh", 71),

@@ -37,10 +37,13 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_DIR/
-# AIRLOCK_APP_ID, falling back to $0-relative computation for a standalone
-# invocation (a test harness that runs this script directly).
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+# ABI (D5): the caller sets AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID and runs
+# this script with cwd = AIRLOCK_APP_DIR. AIRLOCK_ROOT is REQUIRED: the platform
+# root cannot be derived from $0, because "$0/../.." is only the platform when the
+# package happens to sit in the platform's own apps/ tree — the arrangement the
+# apps/ cutover ends. $0-relative self-location (this file's own directory) stays
+# fine and is what AIRLOCK_APP_DIR falls back to.
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 HERE="${AIRLOCK_APP_DIR:-$HERE}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-paseo}"
 # shellcheck source=/dev/null
@@ -67,93 +70,111 @@ CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
 # route to the gate and run browse-host/install.sh at the end (warn-only).
 BROWSE="${AIRLOCK_PASEO_BROWSE:-false}"
 BROWSE_WS_PORT="${AIRLOCK_PASEO_BROWSE_WS_PORT:-19953}"
+UISTATE_PORT="${AIRLOCK_PASEO_UISTATE_PORT:?}"
 
-# ---- Resource backstop: a tier table, not a formula ----
-# The unit once carried a flat MemoryMax=8G with no MemoryHigh, which is a silent
-# ceiling on a big box and most of the machine on a small one. That was replaced by
-# a derivation — cap minus max(4GiB, 15%) — and the derivation was wrong in the other
-# direction: it treated MemoryMax as if it were a reservation. MemoryMax is a ceiling
-# the unit must never cross, not memory set aside; idle paseo is ~440M.
+# ---- Resource backstop: a share of the box, not a fixed number ----
+# The unit once carried a flat MemoryMax=8G with no MemoryHigh — a silent ceiling on a
+# big box and most of the machine on a small one. Then a derivation, `cap - max(4GiB,
+# 15%)`, which read MemoryMax as if it were a reservation and cut an 8GiB box to 4G/3G.
+# Then a named tier table (5.5G/5G, 14G/12G above 16 GiB), which fixed the small box and
+# broke the large one: a 72 GiB dev box got the same 14G ceiling as a 16 GiB laptop.
 #
-# Owner decisions, 2026-08-16 → 2026-08-17, from measurement on an 8GiB box:
+# Owner decision, 2026-08-22: size it in PROPORTION to what the box was given.
 #
-#   any box        MemoryMax=5.5G  MemoryHigh=5G   ← the standard
-#   cap >= 16 GiB  MemoryMax=14G   MemoryHigh=12G
+#   MemoryMax  = 11/16 of the box   (68.75%)
+#   MemoryHigh = 10/16 of the box   (62.50%)
 #
-# 5.5G is the standard because the students' machines are 8GB and the point of the cap
-# is to stop a runaway session tree, not to ration a healthy one. An earlier round of
-# this table used 6.5G/6G and REFUSED below 8 GiB. The refusal is gone (owner,
-# 2026-08-17): a guest that reports a little under its own name — an 8GB machine shows
-# ~7.6 GiB, and a hypervisor guest can show less again — was getting turned away at
-# install time over an accounting detail, which is a worse failure than a cap that is
-# generous. 5.5G leaves room on an 8GB box without depending on how the guest counts.
+# The two fractions are not invented — they are the owner's measured 8GiB case read as
+# ratios. 5.5 GiB of 8 is exactly 11/16, and 5 GiB of 8 is exactly 10/16, so a student's
+# 8GB machine still lands on 5632M/5120M, the numbers this was validated at, while a
+# 72 GiB dev box gets 49.5G/45G instead of the same 14G a laptop got.
 #
-# When the box is smaller than the tier the cap still gets written, and the installer
-# says so loudly: a MemoryMax above the box is inert, not a lie, and refusing to
-# install over it helps nobody. AIRLOCK_PASEO_ALLOW_UNBACKED_MEM=1 remains as a plain
-# opt-out for an operator who wants no unit-level memory backstop at all.
+# What the proportion also deletes: there is no tier edge left to fall off, and no "the
+# ceiling is bigger than the box" case — a share of the box is inside the box by
+# construction, so the ceiling always means something and there is nothing to warn about.
+# The whole refuse/warn apparatus that grew around fixed numbers is gone with them.
+# (Keeping that literally true took one extra clamp below: rounding the cap UP before
+# taking the share would otherwise overshoot on a sub-GiB box. A review caught it.)
 #
-# MemoryHigh sits below MemoryMax as the throttle band, so pressure shows up as a
-# slowdown first (render.sh) — it does not make reaching MemoryMax impossible.
+# MemoryMax is a ceiling the unit must never cross, not memory set aside for it — idle
+# paseo is ~440M. MemoryHigh sits below it as the throttle band, so pressure shows up as
+# a slowdown first (render.sh); it does not make reaching MemoryMax impossible.
+# AIRLOCK_PASEO_ALLOW_UNBACKED_MEM=1 remains a plain opt-out for an operator who wants no
+# unit-level memory backstop at all.
 #
 # Cap detection: cgroup memory.max first (a container's own limit — /proc/meminfo leaks
-# the host's total inside LXC and would over-size the tier), MemTotal as the fallback.
+# the host's total inside LXC and would over-size the share), MemTotal as the fallback.
 # AIRLOCK_PASEO_MEM_CAP_BYTES is a test seam: every suite that runs this installer pins
 # it so no test depends on the RAM of whichever box ran it (install/test-render-parity.sh
 # gates that a suite cannot forget). It is not a supported knob.
+# The seam is checked BEFORE the fallback, and a bad value is fatal rather than ignored.
+# `AIRLOCK_PASEO_MEM_CAP_BYTES=32GiB` — a units typo, not an unreasonable thing to write —
+# used to fall through to /proc/meminfo silently, so a suite that believed it had pinned
+# the RAM was reading the runner's instead: the one outcome the pin exists to prevent.
+# Only a suite or an operator ever sets this, so nothing is inconvenienced by strictness.
+case "${AIRLOCK_PASEO_MEM_CAP_BYTES:-0}" in
+  *[!0-9]*) die "AIRLOCK_PASEO_MEM_CAP_BYTES must be a plain byte count, got: ${AIRLOCK_PASEO_MEM_CAP_BYTES}" ;;
+esac
 _cap="${AIRLOCK_PASEO_MEM_CAP_BYTES:-$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)}"
 case "$_cap" in ''|max|*[!0-9]*) _cap=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) * 1024 )) ;; esac
-# Round to the nearest GiB, do not floor. The 16 GiB edge is a real edge — a machine
+# Round the cap to the nearest GiB before taking the share, do not floor. A machine
 # reports less memory than its own name (kernel and firmware reserve, iGPU carve-out,
-# crashkernel=), so a real 16GB box shows ~15.55 GiB and flooring would drop it to the
-# standard tier, a 2.5x cut it did not ask for.
+# crashkernel=), so a real 8GB box shows ~7.6 GiB. Taking the share off the raw figure
+# would hand it 5.2G — close to the validated 5.5G but not it, and the same drift on
+# every size. Rounding first makes the published numbers exact for a box that reports
+# within 512 MiB of its name — the usual case (a "16GB" box reports ~15.55 GiB) but not
+# a guarantee: a machine giving up more than that to firmware lands a GiB lower and gets
+# the share for that GiB. The install log names the figure it used, so the answer is
+# readable rather than surprising.
 # Divide before adding: `(_cap + 512MiB)` overflows a signed 64-bit int near the
-# cgroup-v1 unlimited sentinel (9223372036854771712) and would produce a NEGATIVE tier.
+# cgroup-v1 unlimited sentinel (9223372036854771712) and would produce a NEGATIVE share.
 # The v2 `max` sentinel is caught by the `case` above, but the arithmetic should not
 # depend on that.
 _cap_gib=$(( _cap / 1073741824 ))
 if [ $(( _cap % 1073741824 )) -ge 536870912 ]; then _cap_gib=$(( _cap_gib + 1 )); fi
+# Under 512 MiB the rounded cap is 0 and the share would be `MemoryMax=0M`, which systemd
+# accepts and which stops the unit dead. Floor the rounded cap at 1 GiB.
+[ "$_cap_gib" -ge 1 ] || _cap_gib=1
+# Rendered in MiB, not GiB, because the share is exact in MiB for every cap and is not
+# always a whole GiB (a 3 GiB box gets 2112M = 2.0625 GiB). One integer expression, no
+# decimal formatting, and nothing downstream has to parse a fraction. 1024*11 and
+# 1024*10 are both divisible by 16, so the division is exact — no truncation anywhere.
+_memmax_mib=$(( _cap_gib * 1024 * 11 / 16 ))
+_memhigh_mib=$(( _cap_gib * 1024 * 10 / 16 ))
+# ...but never above the box itself. Rounding UP is what makes the published numbers
+# exact, and on a sub-GiB box it is also what would hand a 600 MiB machine a 704M
+# ceiling — above the box, which is precisely the case this design claims to have made
+# impossible. Below a whole GiB, take the share off the raw figure instead.
+_cap_mib=$(( _cap / 1048576 ))
+if [ "$_memmax_mib" -gt "$_cap_mib" ]; then
+  _memmax_mib=$(( _cap_mib * 11 / 16 ))
+  _memhigh_mib=$(( _cap_mib * 10 / 16 ))
+fi
+# Under ~3 MiB both shares round to the same number, or to 0, and MemoryHigh must stay
+# strictly below MemoryMax for the throttle band to exist at all. Nothing real is this
+# small — this is the seam's floor, not a policy.
+if [ "$_memmax_mib" -lt 3 ]; then _memmax_mib=2; _memhigh_mib=1; fi
 # The pids backstop defaults to the box maximum (owner decision, 2026-08-07):
 # `infinity` on the unit defers to the enclosing user slice, which is the real
 # ceiling and differs per box. A finite value here puts a unit-level backstop
 # back — see the comment above TasksMax in render.sh for what that trades.
 PASEO_TASKSMAX="${AIRLOCK_PASEO_TASKS_MAX:-infinity}"
-# The opt-out is now only an opt-out — it is not the escape hatch from a refusal,
-# because there is no refusal. It renders `infinity` rather than a number, because
-# "no memory backstop" is what is true. TasksMax is unaffected by the memory decision,
-# but note that it defaults to infinity too, so an opted-out box has no unit-level
-# backstop of either kind — only the enclosing user slice.
 if [ "${AIRLOCK_PASEO_ALLOW_UNBACKED_MEM:-0}" = 1 ]; then
+  # The opt-out renders `infinity` rather than a number, because "no memory backstop" is
+  # what is true. TasksMax is unaffected by the memory decision, but note that it
+  # defaults to infinity too, so an opted-out box has no unit-level backstop of either
+  # kind — only the enclosing user slice.
   log "WARNING: paseo memory backstop disabled by explicit override AIRLOCK_PASEO_ALLOW_UNBACKED_MEM=1 \
 — this unit gets no memory limit at all: cap=${_cap} bytes (~${_cap_gib} GiB); rendering \
 MemoryMax=infinity and MemoryHigh=infinity. TasksMax=${PASEO_TASKSMAX} — with the default that \
 leaves the enclosing user slice as the only limit of any kind on this unit."
   PASEO_MEMMAX=infinity
   PASEO_MEMHIGH=infinity
-elif [ "$_cap_gib" -ge 16 ]; then
-  PASEO_MEMMAX=14G
-  PASEO_MEMHIGH=12G
-  log "paseo memory tier: cap=${_cap} bytes (~${_cap_gib} GiB) -> MemoryMax=${PASEO_MEMMAX} MemoryHigh=${PASEO_MEMHIGH}"
 else
-  PASEO_MEMMAX=5.5G
-  PASEO_MEMHIGH=5G
-  log "paseo memory tier: cap=${_cap} bytes (~${_cap_gib} GiB) -> MemoryMax=${PASEO_MEMMAX} MemoryHigh=${PASEO_MEMHIGH}"
-  # The MiB form of the ceiling, DERIVED from the string the unit gets rather than
-  # written out a second time. It used to be a separate `_std_memmax_mib=5632`, and a
-  # review proved that channel: six mutations of that constant and its comparison —
-  # including one that made the warning fire on every box — all left the suite green,
-  # because nothing asserted the warning was ABSENT above the tier. The tests now pin
-  # both sides at the exact byte; deriving the number removes the drift as well.
-  _memmax_mib="$(awk -v s="$PASEO_MEMMAX" 'BEGIN{
-    u = substr(s, length(s), 1); n = substr(s, 1, length(s) - 1)
-    printf "%d", n * (u == "G" ? 1024 : 1)
-  }')"
-  if [ "$(( _cap / 1048576 ))" -lt "$_memmax_mib" ]; then
-    log "WARNING: this box is smaller than the standard paseo memory tier: cap=${_cap} bytes \
-(~${_cap_gib} GiB) < MemoryMax=${PASEO_MEMMAX}. The unit still gets that ceiling, but it sits above \
-the box, so it will never be the thing that stops a runaway — the kernel OOM killer will be. \
-Install proceeds (owner decision, 2026-08-17: do not refuse over this)."
-  fi
+  PASEO_MEMMAX="${_memmax_mib}M"
+  PASEO_MEMHIGH="${_memhigh_mib}M"
+  log "paseo memory share: cap=${_cap} bytes (~${_cap_gib} GiB) -> MemoryMax=${PASEO_MEMMAX} \
+(11/16) MemoryHigh=${PASEO_MEMHIGH} (10/16)"
 fi
 
 PASEO_PKG="@getpaseo/cli"
@@ -165,6 +186,22 @@ PASEO_VER="${AIRLOCK_PASEO_VERSION:-0.2.5}"
 # resolve here, so per-box node locations never need to be hardcoded.
 airlock_load_nvm
 require_cmd node npm systemctl tailscale python3 ss sudo
+
+# Contain a failed/activating candidate left by an older Restart=always unit
+# before performing any install work. This is the candidate's own stable name,
+# not a guessed legacy name; a healthy active candidate is left untouched until
+# the normal change-aware restart transaction below.
+if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+  candidate_state="$(systemctl --user show airlock-paseo.service \
+    --property=ActiveState --value 2>/dev/null || true)"
+  case "$candidate_state" in
+    activating|failed)
+      log "containing unhealthy airlock-paseo.service before singleton handover (state=$candidate_state)"
+      systemctl --user stop airlock-paseo.service \
+        || die "failed to contain unhealthy airlock-paseo.service"
+      ;;
+  esac
+fi
 
 # The paseo daemon (and its node-pty) require node >= 20; node 18 fails at npm
 # engine + runtime. Block older boxes explicitly (no silent failure).
@@ -241,10 +278,34 @@ NPM_ROOT="$PASEO_PREFIX/lib/node_modules"
 PASEO_BIN="$NPM_GBIN/paseo"
 export PATH="$NPM_GBIN:$PATH"
 
-# ExecStartPre stale-pidfile guard (apps/paseo/paseo-clear-stale-pid.py) — see that
-# script's header. In-repo path, same convention as devterm's GATE_PY.
+# Installer-side stale-pidfile guard (apps/paseo/paseo-clear-stale-pid.py). It is
+# invoked once only after the measured PASEO_HOME owner has handed over; it must
+# not be embedded in the candidate unit's retry path.
 STALE_PID_GUARD="$HERE/paseo-clear-stale-pid.py"
+PASEO_HOME_DIR="$HOME/.paseo"
+PASEO_PIDFILE="$PASEO_HOME_DIR/paseo.pid"
 PY="$(command -v python3)"
+
+# Establish the singleton cutline before npm or any bundle patch can mutate the
+# shared prefix used by a legacy daemon. An already-running Airlock candidate is
+# explicitly recognized as our own and left alive; every other proven holder is
+# stopped by measured PID -> systemd ownership, never by a legacy unit name.
+if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+  airlock_handover_user_resource pidfile "$PASEO_PIDFILE" \
+    "Paseo singleton in $PASEO_HOME_DIR" \
+    --service-environment "PASEO_HOME=$PASEO_HOME_DIR" \
+    --service-exec-prefix "$PASEO_BIN daemon start --foreground --no-relay --web-ui --listen" \
+    airlock-paseo.service
+  remaining_paseo_pid="$(airlock_resource_holder_pids pidfile \
+    "$PASEO_PIDFILE" "PASEO_HOME=$PASEO_HOME_DIR")" \
+    || die "cannot verify Paseo singleton state after handover"
+  if [ -z "$remaining_paseo_pid" ]; then
+    "$PY" "$STALE_PID_GUARD" --after-handover "$PASEO_PIDFILE" \
+      || die "failed to clear released Paseo pidfile $PASEO_PIDFILE"
+  else
+    log "Paseo singleton remains with the active Airlock candidate; preserving it until change-aware restart"
+  fi
+fi
 
 # Unit PATH — npm global bin + provider CLI locations (claude=~/.local/bin,
 # codex=~/.npm-global/bin) + node bin + system. The daemon spawns provider CLIs
@@ -597,14 +658,16 @@ fi
 
 # --- 2g. credential key preservation (idempotent) ---
 # The quota fetchers refresh the OAuth token when the usage API answers 401/403 and
-# write it back through a zod z.object — which STRIPS unknown keys at every level. So
-# the write-back does not update the credential file, it replaces it with the four
-# fields the schema names. ~/.claude/.credentials.json loses claudeAiOauth.expiresAt /
-# refreshTokenExpiresAt / scopes and the top-level _meta block (email/org/kind) our
-# account switcher reads; ~/.codex/auth.json loses tokens.id_token and the top-level
-# auth_mode / OPENAI_API_KEY / last_refresh (the field that says whether a green Codex
-# panel is backed by a live token). Both write paths sit inside a bare `catch {}`, so
-# the loss is silent — the next reader just finds a record with holes in it.
+# write it back through a zod z.object — which STRIPS unknown keys at every level. The
+# Claude half now has a named counterparty: schemas/credentials/pool-record-v1.json is
+# the platform contract for ~/.claude-accounts records, and
+# install/test-paseo-patch-drift.sh pins every known field plus the open-object rule with
+# deletion controls. A projected write would violate that contract by silently dropping
+# claudeAiOauth expiry/scopes fields, _meta identity, or a future provider field. Codex's
+# live auth file is not a platform-owned pool record, but the same upstream write path
+# would still erase tokens.id_token and top-level auth_mode / OPENAI_API_KEY /
+# last_refresh, including the liveness signal consumed by platform status. Both writes
+# sit inside a bare `catch {}`, so the next reader merely finds a record with holes.
 # The patch merges the refreshed token fields into the object parsed from disk instead
 # of into zod's output. Data preservation only: refresh timing is untouched.
 CREDPRESERVE_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/credential-key-preservation.mjs"
@@ -695,6 +758,20 @@ else
   log "paseo unchanged and active — not restarting (preserves live sessions)"
 fi
 
+# --- 4b. ui-state backend (loopback; cross-device sidebar order) ---
+# Its own unit rather than a job inside the daemon's: paseo is upstream code we
+# patch, not code we run, and restarting it drops live agent sessions. This one is
+# ours, holds no sessions, and can restart freely — so the two lifecycles stay apart.
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -z "${AIRLOCK_RENDER_DIR:-}" ]; then
+  log "[dry] write $UNIT_DIR/airlock-paseo-uistate.service (127.0.0.1:${UISTATE_PORT})"
+else
+  install -d "$UNIT_DIR"
+  render_paseo_uistate_unit "$UISTATE_PORT" > "$UNIT_DIR/airlock-paseo-uistate.service"
+fi
+airlock_run systemctl --user daemon-reload
+airlock_run systemctl --user enable airlock-paseo-uistate.service
+airlock_run systemctl --user restart airlock-paseo-uistate.service
+
 # Give the backend a bounded window to bind before the orchestrator renders nginx
 # and smokes, so smoke doesn't race a still-booting daemon. Non-fatal: the
 # orchestrator's smoke is the real gate.
@@ -759,7 +836,7 @@ fi
 # server-level), so the guard MUST be repeated there — without it the stream
 # WS would be an unauthenticated hole.
 render_paseo_nginx "$GATE_PORT" "$BACKEND_PORT" "$FQDN" "$HTTPS_PORT" "$WIDGET" "$WIDGET_MENU_ATTRS" \
-  "$BROWSE" "$BROWSE_WS_PORT" "$ICON_LOC_BODY" > "$frag"
+  "$BROWSE" "$BROWSE_WS_PORT" "$ICON_LOC_BODY" "$UISTATE_PORT" > "$frag"
 log "wrote nginx fragment: $frag${BROWSE:+ (browse=$BROWSE)}"
 
 # --- 6. tailscale serve (https only — the web UI wants a secure context) ---

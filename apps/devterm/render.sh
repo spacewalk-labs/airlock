@@ -10,6 +10,19 @@
 # render_devterm_nginx is a thin wrapper around those calls — included for a
 # single P1b write-site swap.
 
+# render_devterm_exec_shim RESOLVED_ABSOLUTE_TARGET
+# The installer writes this to a same-directory temporary file and atomically renames
+# it over the legacy terminal command. shlex.quote keeps unusual but valid absolute
+# paths safe without leaving an AIRLOCK_* variable for an interactive shell to resolve.
+render_devterm_exec_shim() {
+  python3 - "$1" <<'PY'
+import shlex
+import sys
+print("#!/bin/sh")
+print('exec %s "$@"' % shlex.quote(sys.argv[1]))
+PY
+}
+
 # render_devterm_unit_ttyd DEVTERM_LANG TTYD_PORT TTYD_BIN FONT_SIZE
 render_devterm_unit_ttyd() {
   local DEVTERM_LANG="$1" TTYD_PORT="$2" TTYD_BIN="$3" FONT_SIZE="$4"

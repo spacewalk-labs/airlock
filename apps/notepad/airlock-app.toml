@@ -37,3 +37,9 @@ sub = "clipboard"
 cat = "docs"
 path = "/notepad/"
 glyph = "app-notepad"
+
+# D7. Shared: a scratchpad served from the hub webroot with no file surface of
+# its own beyond what publish already exposes.
+[audience]
+supported = ["shared", "owner"]
+default = "shared"

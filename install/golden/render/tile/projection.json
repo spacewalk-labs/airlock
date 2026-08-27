@@ -21,12 +21,12 @@
     "glyph": "app-devterm",
     "brand": null
   },
-  "markwand": {
-    "label": "Markwand",
-    "sub": "docs viewer + editor",
+  "fileview": {
+    "label": "File Viewer",
+    "sub": "directory viewer + editor",
     "cat": "docs",
-    "path": "/markwand/",
-    "glyph": "app-markwand",
+    "path": "/fileview/",
+    "glyph": "app-fileview",
     "brand": null
   },
   "notepad": {

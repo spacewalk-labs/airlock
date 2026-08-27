@@ -12,11 +12,14 @@
 # configured. Config from airlock.toml. Honors AIRLOCK_DRY_RUN=1.
 set -euo pipefail
 
-# ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_DIR/
-# AIRLOCK_APP_ID, falling back to $0-relative computation for a standalone
-# invocation (a test harness that runs this script directly).
+# ABI (D5): the caller sets AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID and runs
+# this script with cwd = AIRLOCK_APP_DIR. AIRLOCK_ROOT is REQUIRED: the platform
+# root cannot be derived from $0, because "$0/../.." is only the platform when the
+# package happens to sit in the platform's own apps/ tree — the arrangement the
+# apps/ cutover ends. $0-relative self-location (this file's own directory) stays
+# fine and is what AIRLOCK_APP_DIR falls back to.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 HERE="${AIRLOCK_APP_DIR:-$HERE}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-publish}"
 # shellcheck source=/dev/null
@@ -157,11 +160,19 @@ fi
 
 # --- 1. directories ---
 mkdir_nginx_path() {
-  local path="${1%/}" elevated="${2:-no}" ancestor parent mode
+  local path="${1%/}" elevated="${2:-no}" ancestor parent mode probe=""
+  # Which chmod lines this function emits depends on which ancestors ALREADY
+  # exist — host state, not tree state. A dry run may therefore pin the
+  # existence probes to a scratch root (install/test-equivalence.sh does:
+  # unpinned, its transcript gained or lost the `chmod o+x /opt/airlock`
+  # line with the box it ran on). Real runs always probe the live path —
+  # the guard is AIRLOCK_DRY_RUN itself, so a stray variable cannot make a
+  # real install chmod against imagined state.
+  [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && probe="${AIRLOCK_DRY_RUN_FSROOT:-}"
   local -a created=()
   [ -n "$path" ] || path=/
   ancestor="$path"
-  while [ ! -d "$ancestor" ]; do
+  while [ ! -d "$probe$ancestor" ]; do
     created+=("$ancestor")
     parent="${ancestor%/*}"
     [ "$parent" != "$ancestor" ] || break

@@ -1,0 +1,75 @@
+contract = 1
+id = "fileview"
+
+# One key. There is no scope setting: filebrowser runs with `--root /` and the
+# tree is the filesystem, which is why `[paths].code_root` was retired rather
+# than replaced (see bin/airlock-config's RETIRED_KEYS and SECURITY.md).
+[config.defaults]
+filebrowser_port = 19921
+
+
+# fileview serves the whole filesystem read+write (filebrowser --root /), so it is
+# owner-only unless the operator explicitly opens it. Same policy markwand carried —
+# default owner, shared is an opt-in — kept because fileview replaced markwand and the
+# surface, if anything, is broader. #249: an app that declares no [audience] fails
+# closed to owner; this states it rather than relying on that default.
+[audience]
+supported = ["owner", "shared"]
+default = "owner"
+
+[[prerequisites]]
+command = "curl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y curl"
+note = "Release download"
+
+[[prerequisites]]
+command = "sha256sum"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y coreutils"
+note = "Release verification"
+
+[[prerequisites]]
+command = "tar"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y tar"
+note = "Release extraction"
+
+[[prerequisites]]
+command = "systemctl"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y systemd"
+note = "User services"
+
+[[prerequisites]]
+command = "python3"
+predicate = "major-gte"
+expected = "3.11"
+fix = "sudo apt-get update && sudo apt-get install -y python3"
+note = "Singleton resource ownership probe"
+
+# Appendix: one user unit, one hub-locations fragment, the __fv/ static asset
+# directory (claimed as one directory the way every other webroot dir claim
+# works), the filebrowser binary, and this app's own filebrowser state directory.
+# That last one used to be excluded as "retained data" when it lived at
+# ~/.config/filebrowser/fb.db — it holds no user data (noauth, no users, no
+# shares), so the exclusion was buying nothing and teardown left a stale db
+# carrying the old baseURL. No serve_ports: the port is proxied by the hub's own
+# nginx, never tailscale-served directly.
+[artifacts]
+units = ["airlock-fileview.service"]
+fragments = ["hub-locations.d/fileview.conf"]
+webroot = ["__fv/"]
+files = ["~/.local/bin/filebrowser", "~/.config/airlock-fileview/"]
+
+# From hub/index.html's APPS table (fileview row).
+[tile]
+label = "File Viewer"
+sub = "directory viewer + editor"
+cat = "docs"
+path = "/fileview/"
+glyph = "app-fileview"

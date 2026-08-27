@@ -93,8 +93,8 @@ assert capability_schema["grantable_capabilities"] == sorted(config.GRANTABLE_CA
 assert capability_schema["elevated_capabilities"] == sorted(config.ELEVATED_CAPABILITIES)
 assert capability_schema["surface_classifications"] == dict(sorted(config.SURFACE_CLASSIFICATIONS.items()))
 
-assert ledger_schema["version"] == ledger.LEDGER_VERSION
-assert ledger_schema["supported_versions"] == [1, 2, 3, 4, ledger.LEDGER_VERSION]
+assert ledger_schema["version"] == 5
+assert ledger_schema["supported_versions"] == [1, 2, 3, 4, 5]
 assert ledger_schema["artifact_classes"] == list(ledger.ARTIFACT_CLASSES)
 assert ledger_schema["capabilities"] == list(ledger.CAPABILITIES)
 assert ledger_schema["lifecycle_keys"] == list(ledger.LIFECYCLE_KEYS)
@@ -107,6 +107,53 @@ then
   ok "canonical contract-index bytes match selected runtime constants and v5 record shapes"
 else
   bad "contract-index/runtime parity"
+fi
+
+# v5 remains a historical index; v6 is the current runtime contract and adds
+# container_runtime without weakening or deleting any v5 shape assertion above.
+if python3 - "$ROOT" <<'PY'
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+
+def load(path, name):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+path = root / "schemas/trust/ledger-v6.json"
+raw = path.read_bytes()
+schema = json.loads(raw)
+assert raw == (json.dumps(schema, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+ledger = load(root / "bin/airlock-ledger", "airlock_ledger_v6_schema_test")
+evidence = load(root / "bin/airlock-trust-evidence", "airlock_trust_evidence_v6_test")
+assert schema["scope"] == "public-contract-index"
+assert schema["version"] == ledger.LEDGER_VERSION == 6
+assert schema["supported_versions"] == [1, 2, 3, 4, 5, 6]
+assert schema["artifact_classes"] == list(ledger.ARTIFACT_CLASSES)
+assert schema["capabilities"] == list(ledger.CAPABILITIES)
+assert schema["lifecycle_keys"] == list(ledger.LIFECYCLE_KEYS)
+assert schema["audit_event_fields"] == list(ledger.AUDIT_EVENT_FIELDS)
+assert set(schema["intent_record_fields"]) == set(ledger.INTENT_RECORD_FIELDS_V6)
+assert set(schema["committed_record_fields"]) == set(ledger.COMMITTED_RECORD_FIELDS_V6)
+assert schema["container_runtime_intent_fields"] == list(ledger.CONTAINER_RUNTIME_INTENT_FIELDS)
+assert schema["container_runtime_committed_fields"] == list(ledger.CONTAINER_RUNTIME_COMMITTED_FIELDS)
+assert schema["container_object_fields"] == list(ledger.CONTAINER_OBJECT_FIELDS)
+assert schema["store_fields"] == list(ledger.STORE_FIELDS_V6)
+assert ("ledger_schema", 6, "schemas/trust/ledger-v6.json") in evidence.SCHEMAS
+PY
+then
+  ok "v6 contract index adds container runtime fields and is the evidence current pin"
+else
+  bad "v6 contract-index/runtime parity"
 fi
 
 # Exercise candidate binding and suite orchestration in a tiny committed checkout.

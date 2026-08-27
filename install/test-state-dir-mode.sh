@@ -42,7 +42,6 @@ name = "Mode Test"
 provider = "tailscale"
 owner = "me@example.com"
 [paths]
-code_root = "/tmp/code-root-mode-test"
 [apps.hub]
 TOML
 

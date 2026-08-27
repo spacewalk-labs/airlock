@@ -14,9 +14,9 @@
 # CI never saw it because CI never runs a live smoke. This suite is the cheap
 # stand-in: it asserts the property directly rather than the symptom.
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -89,7 +89,7 @@ while IFS= read -r f; do
         *)   bad "$rel does not set errexit ($decl) — it used to inherit it from the library" ;;
       esac ;;
   esac
-# Match a real source line, not a mention: apps/markwand/render.sh names the
+# Match a real source line, not a mention: apps/fileview/render.sh names the
 # library in a comment and is not a consumer, which this scan happily reported as
 # a violation until the pattern was anchored.
 done < <(grep -rlE '^[[:space:]]*(\.|source)[[:space:]].*install/lib\.sh' --include='*.sh' \
@@ -146,7 +146,10 @@ case "$loud_out" in
 esac
 
 # And the call sites actually use it — a helper nothing calls fixes nothing.
-for f in apps/markwand/install.sh apps/paseo/install.sh; do
+# fileview dropped off this list when markserv (its only npm dependency) was
+# deleted: it runs no npm at all now, so requiring airlock_quiet of it would be
+# asserting a call that has nothing to wrap.
+for f in apps/paseo/install.sh; do
   if grep -q 'airlock_quiet' "$ROOT/$f" && ! grep -qE 'npm (install|i) .*>/dev/null' "$ROOT/$f"; then
     ok "$f runs npm through airlock_quiet"
   else
@@ -206,26 +209,27 @@ PROBE
 grep -q 'airlock_cmd_dirs node' "$ROOT/apps/paseo/install.sh" \
   && ok "apps/paseo/install.sh derives its unit PATH from airlock_cmd_dirs" \
   || bad "apps/paseo/install.sh no longer derives node's directory"
-grep -q 'airlock_cmd_dirs node' "$ROOT/apps/markwand/install.sh" \
-  && ok "apps/markwand/install.sh derives its unit PATH from airlock_cmd_dirs" \
-  || bad "apps/markwand/install.sh no longer derives node's directory"
-grep -q 'Environment=PATH=${UNIT_PATH}' "$ROOT/apps/markwand/render.sh" \
-  && ok "the markserv unit takes its PATH from the installer" \
-  || bad "the markserv unit hardcodes a PATH again"
+# fileview used to have the same requirement (markserv was `#!/usr/bin/env node`).
+# markserv is gone and fileview's only unit runs a static Go binary by absolute
+# path, so there is no node directory to derive — assert the requirement is really
+# absent rather than leaving a check that would pass by accident.
+grep -q 'Environment=PATH=' "$ROOT/apps/fileview/render.sh" \
+  && bad "apps/fileview/render.sh grew a unit PATH again — derive it, do not hardcode" \
+  || ok "fileview's unit needs no PATH (its ExecStart is an absolute static binary)"
 
 # ---- 5. no `big-producer | grep -q` under pipefail ----
 # `producer | grep -q needle` looks like a membership test and is a race whenever the
 # producer writes more than the 64 KB pipe buffer: grep -q exits at the match, the
 # producer takes SIGPIPE, and `set -o pipefail` reports the pipeline as FAILED — so
 # the test says "absent" exactly when the thing is present, intermittently, by output
-# size. apps/markwand/smoke.sh:39 hit it on an HTTP body and wrote it down; orca then
+# size. apps/fileview/smoke.sh:39 hit it on an HTTP body and wrote it down; orca then
 # hit it on `ldconfig -p` and spent two full installs claiming "libgtk-3 install
 # failed" on a box where libgtk-3 was installed.
 #
 # Producers listed here are the ones known to exceed a pipe buffer. Small, bounded
 # producers (`--version`, `airlock_config apps`, `ss -ltn`) are left alone
 # deliberately — banning the shape outright would be noise, and noise is how the
-# markwand note stayed a local curiosity instead of a rule.
+# fileview note stayed a local curiosity instead of a rule.
 big_producers='ldconfig -p'
 raced=0
 while IFS= read -r prod; do
@@ -252,7 +256,7 @@ EOF
 # anything visible in the code. `curl <endpoint> | grep -q` is therefore always
 # the racing shape — it just waits for the box to accumulate enough rows.
 #
-# apps/markwand/smoke.sh met it first and fixed it by capturing the body and
+# apps/fileview/smoke.sh met it first and fixed it by capturing the body and
 # matching in-shell. apps/publish/smoke.sh had two of them left over (the list
 # endpoint and the backend health probe): a publish install with a few hundred
 # shared files would have started reporting `okjson=no` on a working box, which

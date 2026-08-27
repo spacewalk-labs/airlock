@@ -29,7 +29,10 @@ spool_writer_user = "fixture-writer"
 spool_writer_group = "fixture-writers"
 TOML
 
+# The D5 app ABI is required, not optional: this entry point may not derive the
+# platform root from its own location (install/check-app-abi.sh).
 AIRLOCK_CONFIG="$CFG" AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$RENDER" \
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
   bash "$ROOT/apps/dev-monitor/install-spool-hardening.sh"
 nft_file="$RENDER/etc-airlock/dev-monitor-spool.nft"
 unit_file="$RENDER/etc-systemd-system/airlock-dev-monitor-spool-firewall.service"

@@ -91,3 +91,11 @@ sub = "static publish"
 cat = "docs"
 path = "/publish/"
 glyph = "app-publish"
+
+# D7. Shared: publishing is the collaborator-facing surface by design, and this
+# only writes the configured share_dir. Collaborators can list, upload, and
+# remove shared items — stated here rather than inherited from being inside the
+# hub server.
+[audience]
+supported = ["shared", "owner"]
+default = "shared"

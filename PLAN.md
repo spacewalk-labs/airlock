@@ -50,15 +50,19 @@ and `:8443/` = 200. Live test found + fixed: (1) installer sudo for /etc paths,
       + smoke. Offline integration 6/6 (hub+devterm nginx -t together). DONE.
       NOTE: uses ttyd built-in client; custom mobile xterm client = later enhancement.
       **Milestone 1 reached: hub + devterm installable from airlock.toml alone.**
-- [x] **T6 — markwand.** `apps/markwand/` — markserv viewer (npm, v1.17.4) + filebrowser
-      editor (sha-pinned v2.63.18) behind the hub, served as same-origin subpaths
-      (`/markwand/`, `/markwand/edit/`) with MIT static assets (tokens/enhance/editor/
-      edit-button) injected via sub_filter from the hub webroot (`/__mw/`).
-      **LIVE-VERIFIED** on `test-airlock` over the tailnet: viewer renders code_root,
-      editor loads, asset injection present, identity injected, gate closes for
-      non-owners (wrong-owner page). Established the **same-origin subpath pattern**
-      (`emit_subpath_location` + `hub-locations.d`). NOTE: v1 = markserv viewer +
-      filebrowser editor; the rich split-pane multitype viewer = later enhancement.
+- [x] **T6 — fileview** (shipped as `markwand`; renamed 2026-08-23). As BUILT here:
+      markserv viewer (npm, v1.17.4) + filebrowser editor (sha-pinned v2.63.18)
+      behind the hub at `/markwand/` and `/markwand/edit/`, with MIT static assets
+      (tokens/enhance/editor/edit-button) injected via sub_filter from the hub
+      webroot. **LIVE-VERIFIED** on `test-airlock` over the tailnet: viewer renders
+      code_root, editor loads, asset injection present, identity injected, gate
+      closes for non-owners (wrong-owner page). Established the **same-origin subpath
+      pattern** (`emit_subpath_location` + `hub-locations.d`).
+      ⚠️ **None of that shape survives.** markserv, the sub_filter injection, the
+      injected scripts, filebrowser's own UI and `[paths].code_root` were all deleted
+      in the fileview rework — see [`docs/design/fileview.md`](docs/design/fileview.md)
+      for what runs now. This entry is left as the record of what T6 delivered, not
+      as a description of the app.
       **Gate model refactor (applies to all subpath apps): the hub now gates at the
       SERVER level (single `if ($hub_ok = 0) { return 403; }` chokepoint) instead of
       per-location — a per-location `if` + `try_files`/proxy is fragile and each app
@@ -120,7 +124,7 @@ and `:8443/` = 200. Live test found + fixed: (1) installer sudo for /etc paths,
       verify) and `skills/airlock-doctor/SKILL.md` (top-down gate/nginx/backend
       diagnosis) + a `wiki/README.md` starter knowledge base (wiki-less OK).
 - [x] **T13 — release gate.** README/NOTICE reconciled to what v1 actually ships
-      (aspirational xterm/hljs/orca-web-patches entries removed; markwand assets +
+      (aspirational xterm/hljs/orca-web-patches entries removed; fileview assets +
       paseo AGPL split documented). `bin/airlock-smoke` (standalone all-app gate
       check). Full AGPL-3.0 text vendored at `apps/paseo/patches/LICENSE`. PII guard
       passes over the whole repo (CI pattern, 0 hits). **Fresh-box E2E DONE**: all 8

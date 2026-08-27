@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, 'backend'))
 import devmon_tokens as T          # noqa: E402
+import devmon_accounts as ACCOUNTS  # noqa: E402
 
 
 def _publisher():
@@ -101,8 +102,6 @@ def main(argv=None):
                     help='dev-monitor spool directory (default: $DEV_MONITOR_SPOOL)')
     ap.add_argument('--snapshot', default=None,
                     help='where to write the verdict (default: the state directory)')
-    ap.add_argument('--claude-credentials', default=None)
-    ap.add_argument('--codex-auth', default=None)
     ap.add_argument('--no-spool', action='store_true',
                     help='snapshot only — the dashboard card still works, nothing is published')
     ap.add_argument('--quiet', action='store_true')
@@ -111,8 +110,9 @@ def main(argv=None):
         ap.error('--warn-hours and --stale-hours must be at least 1')
 
     now = datetime.now(timezone.utc)
-    snap = T.check_all(now=now, warn_hours=a.warn_hours, stale_hours=a.stale_hours,
-                       claude_path=a.claude_credentials, codex_path=a.codex_auth)
+    raw, source_error = ACCOUNTS.raw_deadlines()
+    snap = T.check_all(raw, now=now, warn_hours=a.warn_hours, stale_hours=a.stale_hours)
+    snap['source_error'] = source_error
     snapshot = a.snapshot or T.snapshot_path()
 
     # --- 1. the snapshot, which is the run's actual job ---
@@ -127,6 +127,15 @@ def main(argv=None):
         for v in snap['providers']:
             print('%-8s %-14s %s' % (v['provider'], v['status'], v['detail']))
         print('snapshot: %s' % snapshot)
+
+    # A valid platform payload may honestly say both providers are missing; that is a
+    # successful check whose verdict is unknown. Failure to obtain the payload is the
+    # watchdog itself failing. Preserve the unknown snapshot above, then fail loudly so
+    # OnFailure= remains truthful rather than turning a broken ABI into a green timer.
+    if source_error:
+        sys.stderr.write('token-freshness: platform account metadata unavailable (%s)\n'
+                         % source_error)
+        return 1
 
     # --- 2. tell the operator, through the console that already exists ---
     if a.no_spool:

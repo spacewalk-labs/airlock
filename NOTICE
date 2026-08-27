@@ -17,12 +17,11 @@ Component         Upstream                          License       How obtained
 ttyd (devterm)    github.com/tsl0922/ttyd           MIT           binary downloaded at install (sha-pinned)
 xterm.js (devterm) github.com/xtermjs/xterm.js      MIT           vendored in apps/devterm/web/vendor/ (xterm 5.x + fit/unicode11/web-links addons)
 code-server       github.com/coder/code-server      MIT           tarball downloaded at install (sha-pinned)
-markserv          npm: markserv                     MIT           npm at install
 filebrowser       github.com/filebrowser/filebrowser Apache-2.0   binary downloaded at install (sha-pinned)
-markwand assets   github.com/givepro91/markwand     MIT           vendored in apps/markwand/static/ (tokens/enhance/editor/edit-button)
-highlight.js      github.com/highlightjs/highlight.js BSD-3-Clause vendored in apps/markwand/static/vendor/highlight.min.js (v11.11.1)
-marked            github.com/markedjs/marked        MIT           vendored in apps/markwand/static/vendor/marked.min.js (v15.0.12)
-DOMPurify         github.com/cure53/DOMPurify       Apache-2.0 OR MPL-2.0  vendored in apps/markwand/static/vendor/purify.min.js (v3.4.8)
+Markwand (styles) github.com/givepro91/markwand     MIT           adapted in apps/fileview/static/tokens.css (prose/callout CSS structure; colours are Airlock's)
+highlight.js      github.com/highlightjs/highlight.js BSD-3-Clause vendored in apps/fileview/static/vendor/highlight.min.js (v11.11.1)
+marked            github.com/markedjs/marked        MIT           vendored in apps/fileview/static/vendor/marked.min.js (v15.0.12)
+DOMPurify         github.com/cure53/DOMPurify       Apache-2.0 OR MPL-2.0  vendored in apps/fileview/static/vendor/purify.min.js (v3.4.8)
 orca (ADE)        github.com/stablyai/orca          MIT           AppImage downloaded at install (sha-pinned)
 orca web client   github.com/stablyai/orca          MIT           vendored BUILT dist in apps/orca/web-bundle/dist/ (patched; redistributed)
 paseo (CLI)       github.com/getpaseo/paseo         AGPL-3.0      npm i @getpaseo/cli at install (not redistributed)
@@ -58,9 +57,9 @@ Notes
   sidecar is an independent program (no paseo imports) and is Apache-2.0. The full
   AGPL-3.0 text is vendored at apps/paseo/patches/LICENSE. This is NOT legal advice.
 - Vendored (redistributed) libraries: unlike the downloaded binaries above, the
-  markwand viewer's client-side libraries — highlight.js (BSD-3-Clause), marked
+  fileview viewer's client-side libraries — highlight.js (BSD-3-Clause), marked
   (MIT), and DOMPurify (Apache-2.0 OR MPL-2.0) — ARE redistributed in this repo
-  under apps/markwand/static/vendor/. Each minified file retains its own upstream
+  under apps/fileview/static/vendor/. Each minified file retains its own upstream
   license header. They are self-hosted so the viewer loads no external CDN.
 - Brand icons: apps/orca/orca.png and apps/paseo/paseo.png (both moved
   in-app with their app-package-contract migrations — child 4 P2b — and

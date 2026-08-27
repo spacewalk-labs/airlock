@@ -21,7 +21,7 @@
 # Offline: reads the repo's own manifests. No network, no machine, no config written.
 set -uo pipefail
 # install/test-render-parity.sh gates that every suite whose text mentions an app
-# installer pins the RAM the paseo installer picks its memory tier from. The gate is a
+# installer pins the RAM the paseo installer takes its memory share from. The gate is a
 # deliberately coarse text scan — it does not reason about WHICH app a path resolves to
 # — so suites that never install paseo carry the pin anyway and it sits inert. Cheaper
 # than a gate that tries to be clever about which mention counts.
@@ -192,7 +192,6 @@ name = "Test"
 provider = "tailscale"
 owner = "me@example.com"
 [paths]
-code_root = "~/code"
 [apps.hub]
 [apps.devterm]
 TOML

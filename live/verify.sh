@@ -35,13 +35,12 @@
 #   AIRLOCK_LIVE_IMAGE      image to launch (default ubuntu:24.04)
 #   AIRLOCK_LIVE_POOL       storage pool (default: the host's default)
 #   AIRLOCK_LIVE_MEM        memory limit (default 8GiB) — 8 GiB is not arbitrary: it is
-#                           what the students' machines have, so it is the configuration
-#                           paseo's standard 5.5G/5G tier is sized for, and what the
-#                           2026-08-07 defects surfaced on. Below 5.5 GiB — the standard
-#                           tier itself, not a round number — the container sits under its
-#                           own ceiling: the install still succeeds (no refusal since
-#                           2026-08-17) and warns, but the cap stops meaning anything, so a
-#                           run there verifies less than it looks like.
+#                           what the students' machines have, and it is the size paseo's
+#                           memory share was validated at (11/16 of 8 GiB = 5632M), and
+#                           what the 2026-08-07 defects surfaced on. Since the backstop is
+#                           a SHARE (2026-08-22) rather than a fixed number, a smaller
+#                           container is not refused and not degraded — it simply verifies
+#                           a smaller share than the students will get.
 #   AIRLOCK_LIVE_CPU        cpu limit (default 4)
 #   AIRLOCK_LIVE_DISK       root disk size (default 30GiB)
 #   AIRLOCK_LIVE_SOAK       seconds between the two unit readings (default 60)

@@ -22,7 +22,7 @@ with `Connection: close` (one request per connection = one identity check); a
 WebSocket upgrade dedicates its connection.
 
 Everything site-specific comes from the environment (set by the installer from
-airlock.toml). Optional features (Claude account pool, Codex login, the markwand
+airlock.toml). Optional features (Claude account pool, Codex login, the fileview
 file-open, the Orca worktree sidebar) are gated on config + tool presence and
 degrade to a clean "disabled" response when their dependencies are absent.
 
@@ -32,12 +32,12 @@ Env:
   DEVTERM_LISTEN_HOST/PORT this gate's loopback bind (default 127.0.0.1:19913)
   DEVTERM_TTYD_HOST/PORT   ttyd backend (default 127.0.0.1:19912)
   DEVTERM_WEB              web root to serve (the custom client)
-  AIRLOCK_CODE_ROOT        code root for the markwand file-open (optional)
-  DEVTERM_MARKWAND         "true" to enable the terminal file-path -> markwand link
+  DEVTERM_FILEVIEW         "true" to enable the terminal file-path -> fileview link
   DEVTERM_ACCOUNTS         "true" to enable the Claude account pool UI
-  DEVTERM_CLAUDE_SWITCH    path to the claude-switch CLI (the installer points this at
-                           apps/devterm/bin/claude-switch unless overridden)
-  DEVTERM_CLAUDE_STATUS    path to the claude-status probe (likewise)
+  DEVTERM_ACCOUNTS_BIN     platform account CLI (credential lifecycle/generation)
+  DEVTERM_SECRET_BIN       platform secret-drop CLI (store/lifetime/metadata)
+  DEVTERM_CLAUDE_SWITCH    path to the platform airlock-accounts CLI
+  DEVTERM_CLAUDE_STATUS    path to the platform airlock-accounts-status probe
   DEVTERM_FLEET_STORE      path to a shared usage store file (optional)
   DEVTERM_FLEET_STORE_URL  URL of a shared usage store (optional, no default host)
   DEVTERM_ORCA_SHIM        path to the Orca CLI shim (optional; worktree sidebar)
@@ -54,6 +54,7 @@ import shlex
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -69,22 +70,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bin_discovery  # noqa: E402
 
 
-def _account_tool(env_name, command):
-    """Resolve an optional bundled account helper.
+def _account_tool(env_name):
+    """Return the platform tool path handed in through the rendered unit.
 
-    The installer normally writes an explicit path into the unit. Keep that path
-    authoritative when present, but recover from a partially rendered/manual unit by
-    finding the helper shipped beside this backend (or an installed trusted command).
-    Feature flags still decide whether any caller uses the result.
+    Account features are optional, but their platform dependency is not optional once
+    enabled. Falling back to an app sibling or PATH would let a stale pre-move copy run
+    after ownership changed. Refuse the broken unit at import time instead, with the
+    missing ABI bridge named explicitly.
     """
     configured = os.environ.get(env_name, "").strip()
-    if configured:
-        return os.path.expanduser(configured)
-    bundled = os.path.realpath(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "bin", command))
-    if os.path.isfile(bundled):
-        return bundled
-    return bin_discovery.find_bin(command)[0] or ""
+    if not configured:
+        raise RuntimeError(f"{env_name} is required when its devterm account feature is enabled")
+    return os.path.expanduser(configured)
 
 
 ALLOW = {s.strip().lower() for s in os.environ.get("AIRLOCK_OWNER", "").split(",") if s.strip()}
@@ -98,14 +95,20 @@ TTYD_PORT = int(os.environ.get("DEVTERM_TTYD_PORT", "19912"))
 WEB_ROOT = os.path.realpath(os.environ.get("DEVTERM_WEB", os.path.expanduser("~/.local/share/airlock-devterm/web")))
 
 # ---- optional feature config (all degrade to disabled when unset/absent) ----
-CODE_ROOT = os.path.realpath(os.path.expanduser(os.environ["AIRLOCK_CODE_ROOT"])) \
-    if os.environ.get("AIRLOCK_CODE_ROOT") else ""
-MARKWAND = os.environ.get("DEVTERM_MARKWAND", "false").lower() == "true" and bool(CODE_ROOT)
+FILEVIEW = os.environ.get("DEVTERM_FILEVIEW", "false").lower() == "true"
 ACCOUNTS = os.environ.get("DEVTERM_ACCOUNTS", "false").lower() == "true"
 XAI = os.environ.get("DEVTERM_XAI", "false").lower() == "true"
-CLAUDE_SWITCH = _account_tool("DEVTERM_CLAUDE_SWITCH", "claude-switch") if ACCOUNTS else ""
-CLAUDE_STATUS = _account_tool("DEVTERM_CLAUDE_STATUS", "claude-status") \
+CLAUDE_SWITCH = _account_tool("DEVTERM_CLAUDE_SWITCH") if ACCOUNTS else ""
+CLAUDE_STATUS = _account_tool("DEVTERM_CLAUDE_STATUS") \
     if (ACCOUNTS or XAI) else ""
+# Credential lifecycle must bypass the deprecated claude_switch compatibility
+# override: an operator-supplied legacy tool is allowed to implement the old account
+# verbs, but it cannot be assumed to implement the platform-only Codex preservation
+# verb added in P2b. The installer therefore hands the platform binary in separately.
+PLATFORM_ACCOUNTS = os.environ.get("DEVTERM_ACCOUNTS_BIN", "").strip()
+# No sibling/PATH fallback: after the ownership move either the D5 hand-in is present or
+# the relay fails visibly. Finding a stale app copy would be a silent split-brain store.
+PLATFORM_SECRET = os.environ.get("DEVTERM_SECRET_BIN", "").strip()
 # A shared usage store used to annotate the account pool with utilization. Both are
 # optional; no host is hardcoded. Left empty => the account list still works, just
 # without usage numbers.
@@ -143,6 +146,7 @@ _live_usage_cache = {"at": 0.0, "payload": None}
 _acct_cache_generation = 0
 _codex_usage_cache = {"valueAt": 0.0, "lastTryAt": 0.0,
                       "payload": None, "authMtime": None, "task": None}
+_CODEX_AUTH_GENERATION_UNAVAILABLE = object()
 
 # Claude Code session logs (used to reconstruct conversation text for the copy
 # modal when the pane is running `claude`; degrades to screen capture otherwise).
@@ -153,8 +157,6 @@ MAX_BODY = 210 * 1024 * 1024         # inbound body cap — accommodates a 200MB
 IDENT_HEADER = os.environ.get("AIRLOCK_IDENTITY_HEADER", "").strip().lower().encode("latin1")
 TTYD_PATHS = (b"/ws", b"/token")
 CODEX_LOGIN_OUT = os.path.expanduser("~/.codex/.relogin-capture.out")     # codex device-auth output capture
-CODEX_AUTH = os.path.expanduser("~/.codex/auth.json")                     # Codex single-account credential
-CODEX_AUTH_BAK = os.path.expanduser("~/.codex/auth.json.pre-relogin")     # backup taken before re-login (restore on cancel)
 DEVTERM_STATE_DIR = os.path.expanduser("~/.local/share/airlock-devterm/state")
 XAI_LOGIN_OUT = os.path.join(DEVTERM_STATE_DIR, "xai-login.out")
 _xai_login_process = None
@@ -169,19 +171,17 @@ UPLOAD_TTL_SEC = 24 * 3600
 UPLOAD_MAX_BYTES = 12 * 1024 * 1024           # image save cap (paste/annotate — canvas-encoded, so far smaller in practice)
 FILE_MAX_BYTES = 200 * 1024 * 1024            # file upload save cap (arbitrary binary). ~/uploads has a 24h TTL so no disk creep
 
-# ---- secret drop — an owner-only, short-lived store kept apart from ~/uploads ----
-# The value is typed into a modal and written to a file here; what leaves is the PATH,
-# never the value. An agent (or a shell) reads it by path when it needs it, which keeps
-# the secret out of chat scrollback, terminal history and any log.
-# Deliberately NOT under code_root: markwand serves that tree read+write, so a secret
-# there would be readable through a viewer. Directory is 0700, files 0600, TTL-swept.
-SECRETS = os.path.expanduser("~/.devterm-secrets")
-SECRET_TTL_SEC = int(os.environ.get("DEVTERM_SECRET_TTL", "1800"))     # 30 min default
-SECRET_SWEEP_SEC = min(60, max(1, SECRET_TTL_SEC // 4))
-SECRET_MAX_BYTES = 64 * 1024                  # UTF-8 cap after normalization
-SECRET_BODY_MAX = 96 * 1024                   # request-body cap for the secret JSON
-SECRET_MAX_FILES = 64                         # stops forgotten secrets accumulating
-_RE_SECRET_NAME = re.compile(r"^(?!\.)[A-Za-z0-9._-]{1,48}\Z")
+# ---- secret drop HTTP relay -------------------------------------------------
+# The platform CLI owns the store, validation, modes, atomicity, cap and lifetime. This
+# app still owns the HTTP boundary: Content-Type, body size and same-origin refusal are
+# meaningful only here. A divergent guard refuses visibly; a divergent store silently
+# leaves a value alive or world-readable, which is why only the latter consolidates.
+SECRET_BODY_MAX = 96 * 1024
+_SECRET_ERRORS = {
+    "invalid name", "value required", "value not encodable", "value too large",
+    "secret limit reached", "secret storage failed", "secret deletion failed",
+    "secret configuration failed", "secret operation failed", "usage",
+}
 
 # ---- tab prefs (order / hidden / color / theme) stored server-side so any device
 #      or browser sees the same layout. Owner is singular, so one file. ----
@@ -478,110 +478,6 @@ async def _serve_static(path, cw):
     await cw.drain()
 
 
-def _log_secret_sweep_error(exc):
-    # Only the exception type: the message can carry a path or a filename, and a secret
-    # value must never reach a log either.
-    print("devterm secret sweep failed: " + type(exc).__name__, file=sys.stderr, flush=True)
-
-
-def _sweep_secrets():
-    """Delete expired secrets and orphaned temp files, whether or not anyone asked."""
-    if os.path.islink(SECRETS):
-        _log_secret_sweep_error(OSError("secret directory is a symlink"))
-        return
-    if not os.path.isdir(SECRETS):
-        return
-    try:
-        names = os.listdir(SECRETS)
-    except OSError as e:
-        _log_secret_sweep_error(e)
-        return
-    cutoff = time.time() - SECRET_TTL_SEC
-    for name in names:
-        if not name.endswith((".tmp", ".txt")):
-            continue
-        full = os.path.join(SECRETS, name)
-        try:
-            if name.endswith(".tmp"):
-                if os.path.isfile(full) or os.path.islink(full):
-                    os.unlink(full)
-                continue
-            secret_name = name[:-4]
-            if not _RE_SECRET_NAME.fullmatch(secret_name):
-                continue
-            if (os.path.isfile(full) and not os.path.islink(full)
-                    and os.path.getmtime(full) < cutoff):
-                os.unlink(full)
-        except OSError as e:
-            _log_secret_sweep_error(e)
-
-
-async def _secret_sweep_loop():
-    while True:
-        await asyncio.sleep(SECRET_SWEEP_SEC)
-        try:
-            _sweep_secrets()
-        except Exception as e:
-            # One exception must not kill the periodic task — that task IS the TTL.
-            _log_secret_sweep_error(e)
-
-
-def _store_secret(name, raw):
-    """Write the secret to a fresh inode, then replace. -> (ok, "limit"|"io"|None)."""
-    if os.path.islink(SECRETS):
-        return False, "io"
-    try:
-        os.makedirs(SECRETS, mode=0o700, exist_ok=True)
-        os.chmod(SECRETS, 0o700)
-        final = os.path.join(SECRETS, name + ".txt")
-        current = 0
-        now = time.time()
-        for entry in os.listdir(SECRETS):
-            if entry.endswith(".tmp") or not entry.endswith(".txt"):
-                continue
-            entry_name = entry[:-4]
-            if not _RE_SECRET_NAME.fullmatch(entry_name):
-                continue
-            ep = os.path.join(SECRETS, entry)
-            if (os.path.isfile(ep) and not os.path.islink(ep)
-                    and os.path.getmtime(ep) + SECRET_TTL_SEC > now):
-                current += 1
-        if current >= SECRET_MAX_FILES and not os.path.lexists(final):
-            return False, "limit"
-    except OSError:
-        return False, "io"
-
-    tmp = os.path.join(SECRETS, "." + name + "." + str(os.getpid()) + ".tmp")
-    fd = None
-    tmp_created = False
-    try:
-        # O_EXCL|O_NOFOLLOW + 0600 from creation: never widen an existing file's mode and
-        # never follow a symlink someone left in the way.
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        tmp_created = True
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            fd = None
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, os.path.join(SECRETS, name + ".txt"))
-        tmp_created = False
-        return True, None
-    except OSError:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if tmp_created:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        return False, "io"
-
-
 def _secret_origin_ok(headers):
     """Same-origin guard for the secret endpoints.
 
@@ -601,16 +497,91 @@ def _secret_origin_ok(headers):
     return bool(host) and same
 
 
-def _secret_remain(name):
+def _secret_payload(command, payload, expected_name=None):
+    """Validate and rebuild CLI output before it crosses the HTTP boundary.
+
+    stdout is a platform contract, not a response body to reflect blindly. Rebuilding
+    the bounded metadata shape means a future CLI regression cannot add a value field
+    and turn this relay into an exfiltration path.
+    """
+    if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
+        return None
+    if payload["ok"] is False:
+        error = payload.get("error")
+        if error not in _SECRET_ERRORS:
+            error = "secret operation failed"
+        return {"ok": False, "error": error}
+    if command == "put":
+        if payload.get("name") != expected_name or not isinstance(payload.get("path"), str) \
+                or type(payload.get("ttl_sec")) is not int \
+                or type(payload.get("remain_sec")) is not int:
+            return None
+        return {key: payload[key] for key in ("ok", "name", "path", "ttl_sec", "remain_sec")}
+    if command == "del":
+        if payload.get("name") != expected_name:
+            return None
+        return {"ok": True, "name": expected_name}
+    if command == "list":
+        if type(payload.get("ttl_sec")) is not int or not isinstance(payload.get("secrets"), list):
+            return None
+        items = []
+        for item in payload["secrets"]:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str) \
+                    or not isinstance(item.get("path"), str) \
+                    or type(item.get("bytes")) is not int \
+                    or type(item.get("remain_sec")) is not int:
+                return None
+            items.append({key: item[key] for key in ("name", "path", "bytes", "remain_sec")})
+        return {"ok": True, "secrets": items, "ttl_sec": payload["ttl_sec"]}
+    return None
+
+
+async def _secret_cli(command, name=None, raw=None):
+    """Run one platform secret operation; the value is the subprocess stdin only."""
+    if not PLATFORM_SECRET:
+        return {"ok": False, "error": "secret operation failed"}
+    argv = [PLATFORM_SECRET, command]
+    if name is not None:
+        argv.extend(("--", name))
+    proc = None
     try:
-        return max(0, math.ceil(os.path.getmtime(os.path.join(SECRETS, name + ".txt"))
-                                + SECRET_TTL_SEC - time.time()))
-    except OSError:
-        return SECRET_TTL_SEC
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE if raw is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(raw), timeout=10)
+    except asyncio.TimeoutError:
+        if proc is not None:
+            proc.kill()
+            await proc.wait()
+        return {"ok": False, "error": "secret operation failed"}
+    except (FileNotFoundError, OSError):
+        return {"ok": False, "error": "secret operation failed"}
+    try:
+        decoded = json.loads((out or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {"ok": False, "error": "secret operation failed"}
+    payload = _secret_payload(command, decoded, expected_name=name)
+    if payload is None or (proc.returncode == 0) != payload.get("ok"):
+        return {"ok": False, "error": "secret operation failed"}
+    return payload
+
+
+def _secret_status(payload):
+    if payload.get("ok"):
+        return b"200 OK"
+    if payload.get("error") == "value too large":
+        return b"413 Payload Too Large"
+    if payload.get("error") in {
+            "invalid name", "value required", "value not encodable", "secret limit reached"}:
+        return b"400 Bad Request"
+    return b"500 Internal Server Error"
 
 
 async def _serve_secret_put(cr, headers, leftover, cw):
-    """Store a normalized secret atomically and answer with the path, never the value."""
+    """HTTP guard + stdin-only relay. Storage and value normalization are platform-owned."""
     if headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower() != b"application/json":
         await _send_json(cw, b"415 Unsupported Media Type",
                          {"ok": False, "error": "Content-Type must be application/json"})
@@ -628,38 +599,19 @@ async def _serve_secret_put(cr, headers, leftover, cw):
     d = await _read_json_body(cr, headers, leftover, limit=SECRET_BODY_MAX)
     name = d.get("name") if d is not None else None
     value = d.get("value") if d is not None else None
-    if not isinstance(name, str) or not _RE_SECRET_NAME.fullmatch(name):
+    if not isinstance(name, str):
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "invalid name"})
         return
     if not isinstance(value, str):
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "value required"})
         return
-    # Normalize newlines and strip: a value pasted from a browser or an email arrives with
-    # CRLF or trailing whitespace, and `export X=$(cat file)` would carry it into the env.
-    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not normalized:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "value required"})
-        return
-    normalized += "\n"
     try:
-        raw = normalized.encode("utf-8")
+        raw = value.encode("utf-8")
     except UnicodeEncodeError:
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "value not encodable"})
         return
-    if len(raw) > SECRET_MAX_BYTES:
-        await _send_json(cw, b"413 Payload Too Large", {"ok": False, "error": "value too large"})
-        return
-    _sweep_secrets()
-    ok, reason = _store_secret(name, raw)
-    if not ok:
-        status = b"400 Bad Request" if reason == "limit" else b"500 Internal Server Error"
-        error = "secret limit reached" if reason == "limit" else "secret storage failed"
-        await _send_json(cw, status, {"ok": False, "error": error})
-        return
-    await _send_json(cw, b"200 OK", {"ok": True, "name": name,
-                                    "path": "~/.devterm-secrets/" + name + ".txt",
-                                    "ttl_sec": SECRET_TTL_SEC,
-                                    "remain_sec": _secret_remain(name)})
+    payload = await _secret_cli("put", name=name, raw=raw)
+    await _send_json(cw, _secret_status(payload), payload)
 
 
 async def _serve_secret_list(headers, cw):
@@ -667,38 +619,8 @@ async def _serve_secret_list(headers, cw):
     if not _secret_origin_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
-    _sweep_secrets()
-    if os.path.islink(SECRETS):
-        await _send_json(cw, b"500 Internal Server Error", {"ok": False, "error": "secret storage failed"})
-        return
-    if not os.path.lexists(SECRETS):
-        await _send_json(cw, b"200 OK", {"ok": True, "secrets": [], "ttl_sec": SECRET_TTL_SEC})
-        return
-    if not os.path.isdir(SECRETS):
-        await _send_json(cw, b"500 Internal Server Error", {"ok": False, "error": "secret storage failed"})
-        return
-    try:
-        now = time.time()
-        items = []
-        for filename in os.listdir(SECRETS):
-            if not filename.endswith(".txt"):
-                continue
-            name = filename[:-4]
-            if not _RE_SECRET_NAME.fullmatch(name):
-                continue
-            full = os.path.join(SECRETS, filename)
-            if os.path.islink(full) or not os.path.isfile(full):
-                continue
-            remain = max(0, math.ceil(os.path.getmtime(full) + SECRET_TTL_SEC - now))
-            if remain <= 0:
-                continue
-            items.append({"name": name, "path": "~/.devterm-secrets/" + filename,
-                          "bytes": os.path.getsize(full), "remain_sec": remain})
-        items.sort(key=lambda item: item["name"])
-    except OSError:
-        await _send_json(cw, b"500 Internal Server Error", {"ok": False, "error": "secret storage failed"})
-        return
-    await _send_json(cw, b"200 OK", {"ok": True, "secrets": items, "ttl_sec": SECRET_TTL_SEC})
+    payload = await _secret_cli("list")
+    await _send_json(cw, _secret_status(payload), payload)
 
 
 async def _serve_secret_del(cr, headers, leftover, cw):
@@ -720,20 +642,11 @@ async def _serve_secret_del(cr, headers, leftover, cw):
         return
     d = await _read_json_body(cr, headers, leftover, limit=SECRET_BODY_MAX)
     name = d.get("name") if d is not None else None
-    if not isinstance(name, str) or not _RE_SECRET_NAME.fullmatch(name):
+    if not isinstance(name, str):
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "invalid name"})
         return
-    if os.path.islink(SECRETS):
-        await _send_json(cw, b"500 Internal Server Error", {"ok": False, "error": "secret storage failed"})
-        return
-    try:
-        os.unlink(os.path.join(SECRETS, name + ".txt"))
-    except FileNotFoundError:
-        pass
-    except OSError:
-        await _send_json(cw, b"500 Internal Server Error", {"ok": False, "error": "secret deletion failed"})
-        return
-    await _send_json(cw, b"200 OK", {"ok": True, "name": name})
+    payload = await _secret_cli("del", name=name)
+    await _send_json(cw, _secret_status(payload), payload)
 
 
 def _cleanup_old_uploads():
@@ -1168,21 +1081,18 @@ async def _serve_list_dir(cr, headers, leftover, cw):
     await _send_json(cw, b"200 OK", payload)
 
 
-# ---- terminal file-path click -> open in markwand (/markwand/...) — optional ----
-def _map_to_code(realpath):
-    """absolute realpath (file) -> markserv-relative '<code symlink>/<rest>'. None if outside code_root."""
-    if not CODE_ROOT or not realpath or not os.path.isfile(realpath):
+# ---- terminal file-path click -> open in fileview — optional ----
+def _map_to_viewer(realpath):
+    """absolute realpath -> the same path, if it is a file. None otherwise.
+
+    This used to walk code_root's entries to express the file as a path relative to
+    whichever symlink contained it, and returned None for anything outside. fileview
+    serves the filesystem now (filebrowser --root /), so a file's absolute path IS
+    its address and "outside" no longer names anything.
+    """
+    if not realpath or not os.path.isfile(realpath):
         return None
-    try:
-        entries = os.listdir(CODE_ROOT)
-    except OSError:
-        return None
-    for entry in entries:
-        base = os.path.realpath(os.path.join(CODE_ROOT, entry))
-        if realpath == base or realpath.startswith(base + os.sep):
-            rel = os.path.relpath(realpath, base)
-            return entry + "/" + rel.replace(os.sep, "/")
-    return None
+    return realpath
 
 
 async def _pane_prop(session, fmt):
@@ -1333,12 +1243,14 @@ def _claude_log_window(cwd, visible, above=150, below=3, fallback=250):
     return "\n".join(rows[-fallback:])
 
 
-def _mw(rel):
-    return "/markwand/" + urllib.parse.quote(rel)
+def _mw(path):
+    # ?path=<urlencoded absolute path> — the viewer's own deep-link shape. Encoded
+    # whole (quote with no safe chars) so a name containing '#', '?' or '%' survives.
+    return "/fileview/?path=" + urllib.parse.quote(path, safe="")
 
 
 async def _find_map(root, flag, pat):
-    """find -L <root> <flag> <pat> -> [{rel, mtime}] (markserv-relative + mtime).
+    """find -L <root> <flag> <pat> -> [{rel, mtime}] (absolute path + mtime).
     Depth / time / count limited; heavy dirs pruned so broad searches stay fast."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1353,7 +1265,7 @@ async def _find_map(root, flag, pat):
     hits, seen = [], set()
     for line in out.decode("utf-8", "replace").splitlines():
         real = os.path.realpath(line)
-        rel = _map_to_code(real)
+        rel = _map_to_viewer(real)
         if rel and rel not in seen:
             seen.add(rel)
             try:
@@ -1387,9 +1299,9 @@ async def _repo_parent(cwd):
     return parent
 
 
-async def _resolve_to_markwand(p, session):
-    """Clicked file path -> markwand URL. absolute / ~ / session-pane-cwd-relative ->
-    map into code_root. Relative paths are searched under the session cwd (the working
+async def _resolve_to_fileview(p, session):
+    """Clicked file path -> fileview URL. absolute / ~ / session-pane-cwd-relative
+    resolve directly. Relative paths are searched under the session cwd (the working
     repo). Several matches -> newest-first candidate list (client picks)."""
     if not p:
         return {"ok": False, "reason": "empty"}
@@ -1403,7 +1315,7 @@ async def _resolve_to_markwand(p, session):
     elif cwd:
         cands.append(os.path.join(cwd, p))
     for c in cands:
-        rel = _map_to_code(os.path.realpath(c))
+        rel = _map_to_viewer(os.path.realpath(c))
         if rel:
             return {"ok": True, "url": _mw(rel), "rel": rel}
     # search fallback — under cwd (current repo) first (fast); if empty, widen one
@@ -1423,9 +1335,9 @@ async def _resolve_to_markwand(p, session):
         hits.sort(key=lambda h: h["mtime"], reverse=True)                  # newest first
         return {"ok": False, "reason": "ambiguous", "count": len(hits),
                 "hits": [{"rel": h["rel"], "url": _mw(h["rel"])} for h in hits[:20]]}
-    # subdivide notfound so the client can show 'why'
-    if cands and any(os.path.exists(os.path.realpath(c)) for c in cands):
-        return {"ok": False, "reason": "outside_code", "path": p}          # exists but outside code_root (markwand root)
+    # subdivide notfound so the client can show 'why'. The old 'outside_code' branch
+    # is gone with the boundary it reported: a path that exists is now openable, so
+    # a candidate that resolved would already have returned above.
     if not cwd and not (p.startswith("~") or p.startswith("/")):
         return {"ok": False, "reason": "no_cwd", "path": p}                # relative but the session pane cwd was unreadable
     return {"ok": False, "reason": "notfound",
@@ -1433,13 +1345,13 @@ async def _resolve_to_markwand(p, session):
 
 
 async def _serve_resolve(head, cw):
-    if not MARKWAND:
+    if not FILEVIEW:
         await _send_json(cw, b"200 OK", {"ok": False, "reason": "disabled"})
         return
     params = urllib.parse.parse_qs(_request_query(head).decode("latin1"))
     p = (params.get("path") or [""])[0]
     session = (params.get("session") or [""])[0]
-    await _send_json(cw, b"200 OK", await _resolve_to_markwand(p, session))
+    await _send_json(cw, b"200 OK", await _resolve_to_fileview(p, session))
 
 
 # ---- pane layout (equal horizontal width etc) ----
@@ -1648,8 +1560,9 @@ async def _serve_upload_file(cr, headers, leftover, cw):
 
 # ============================ optional: Claude account pool ============================
 # All of the following degrade to a clean "disabled" response unless DEVTERM_ACCOUNTS
-# is true and the claude-switch / claude-status tools are present (installed from
-# apps/devterm/bin by default; DEVTERM_CLAUDE_* can point elsewhere).
+# is true and the configured platform account tools are present. A missing configured
+# file remains a runtime-disabled dependency; a missing unit variable is a broken ABI
+# bridge and fails at import above rather than falling back to stale app code.
 
 def _accounts_enabled():
     return ACCOUNTS and CLAUDE_SWITCH and os.path.isfile(CLAUDE_SWITCH)
@@ -1995,6 +1908,36 @@ async def _serve_acct_switch(cr, headers, leftover, cw):
     await _send_json(cw, b"200 OK" if payload.get("ok") else b"400 Bad Request", payload)
 
 
+async def _codex_auth_lifecycle(action):
+    """Run one platform-owned Codex preservation action.
+
+    Only the action result crosses back into devterm. stdout/stderr are deliberately
+    not reflected into an HTTP response: the platform contract emits booleans only,
+    and a future regression must not turn arbitrary process output into a credential
+    exfiltration path.
+    """
+    if not PLATFORM_ACCOUNTS:
+        return None, "platform accounts tool is not wired"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            PLATFORM_ACCOUNTS, "codex-auth", action, "--json",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _err = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return None, "platform accounts operation failed"
+    if proc.returncode != 0:
+        return None, "platform accounts operation failed"
+    try:
+        payload = json.loads((out or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "platform accounts operation returned invalid JSON"
+    key = "backedUp" if action == "backup" else "restored"
+    if not isinstance(payload, dict) or payload.get("ok") is not True \
+            or not isinstance(payload.get(key), bool):
+        return None, "platform accounts operation returned an invalid shape"
+    return payload[key], None
+
+
 async def _serve_codex_login_start(cw):
     """Codex re-login 1/2 — run `codex login --device-auth` and capture URL + code.
 
@@ -2009,11 +1952,13 @@ async def _serve_codex_login_start(cw):
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": _codex_missing_error()})
         return
     _invalidate_codex_usage_cache()   # login wipes auth.json: cached numbers are void
-    try:
-        if os.path.isfile(CODEX_AUTH):
-            shutil.copy2(CODEX_AUTH, CODEX_AUTH_BAK)
-    except OSError:
-        pass
+    # Fail closed before Codex gets a chance to erase auth.json. An absent old login is
+    # a successful `backedUp=false`; an invocation or copy failure is different and must
+    # not turn a re-login attempt into silent credential loss.
+    _backed_up, backup_error = await _codex_auth_lifecycle("backup")
+    if backup_error:
+        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": backup_error})
+        return
     try:
         k = await asyncio.create_subprocess_exec(
             "pkill", "-f", "codex login",
@@ -2062,9 +2007,9 @@ async def _serve_codex_login_start(cw):
 async def _serve_codex_login_cancel(cw):
     """Codex re-login cancel — stop the pending device-auth and restore the backed-up
     auth.json. Re-login logs out immediately, so this undoes an abandoned attempt."""
-    if not _codex_available():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": _codex_missing_error()})
-        return
+    # Restoration belongs to the saved login, not to the current Codex executable.
+    # The binary can disappear after login starts; cancellation must still recover the
+    # previous auth file. pkill is best-effort and restore is always attempted.
     try:
         k = await asyncio.create_subprocess_exec(
             "pkill", "-f", "codex login",
@@ -2072,15 +2017,12 @@ async def _serve_codex_login_cancel(cw):
         await k.wait()
     except (FileNotFoundError, OSError):
         pass
-    restored = False
-    try:
-        if os.path.isfile(CODEX_AUTH_BAK):
-            shutil.move(CODEX_AUTH_BAK, CODEX_AUTH)
-            restored = True
-            _invalidate_codex_usage_cache()
-    except OSError as e:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": f"restore failed: {e}"})
+    restored, restore_error = await _codex_auth_lifecycle("restore")
+    if restore_error:
+        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": restore_error})
         return
+    if restored:
+        _invalidate_codex_usage_cache()
     await _send_json(cw, b"200 OK", {"ok": True, "restored": restored})
 
 
@@ -2122,8 +2064,8 @@ async def _serve_xai_status(cw):
                           "reason": "xAI status probe failed",
                           "loginState": _xai_login_state()})
         return
-    # claude-status is part of this app today, but keep the HTTP boundary an allowlist:
-    # a custom/older probe must never be able to smuggle credential fields through.
+    # The platform probe is outside this app's HTTP trust boundary, so keep the response
+    # an allowlist: a custom/older probe must never smuggle credential fields through.
     payload = {"enabled": True, "state": result["state"],
                "loginState": _xai_login_state()}
     if (result["state"] in {"ok", "expired"}
@@ -2691,10 +2633,35 @@ def _claude_usage_state_save(result):
 # served under the new identity.
 
 def _codex_auth_mtime():
+    """Return login generation, absence, or a distinct unavailable sentinel.
+
+    Absence is a valid generation (`None`). Transport failure is not: treating two
+    failures as the same generation could let an in-flight result cross a login change.
+    """
+    if not PLATFORM_ACCOUNTS:
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
     try:
-        return os.path.getmtime(CODEX_AUTH)
-    except OSError:
+        proc = subprocess.run(
+            [PLATFORM_ACCOUNTS, "codex-auth", "generation", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    if proc.returncode != 0 or len(proc.stdout) > 4096:
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    try:
+        payload = json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    if (not isinstance(payload, dict) or payload.get("ok") is not True
+            or not isinstance(payload.get("present"), bool)):
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    generation = payload.get("generation")
+    if not payload["present"]:
         return None
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    return generation
 
 
 def _codex_observed_at(value_at):
@@ -2720,8 +2687,10 @@ def _codex_usage_state_save():
     value_at = _codex_usage_cache.get("valueAt", 0.0)
     if not _codex_has_usage_value(payload) or value_at <= 0:
         return False
-    record = {"payload": payload, "valueAt": value_at,
-              "authMtime": _codex_usage_cache.get("authMtime")}
+    auth_mtime = _codex_usage_cache.get("authMtime")
+    if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
+        return False
+    record = {"payload": payload, "valueAt": value_at, "authMtime": auth_mtime}
     try:
         os.makedirs(CODEX_USAGE_STATE_DIR, exist_ok=True)
         tmp = CODEX_USAGE_STATE + ".tmp"
@@ -2763,6 +2732,8 @@ def _codex_usage_state_load():
     if not _codex_has_usage_value(payload) or value_at is None or value_at <= 0:
         return False
     auth_mtime = _codex_auth_mtime()
+    if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
+        return False
     if record.get("authMtime") != auth_mtime:
         try:
             os.remove(source)          # a different login wrote it; its numbers are void
@@ -2827,9 +2798,12 @@ async def _codex_usage_refresh(auth_mtime):
 
         # A login/logout (or a newer refresh) invalidated this task: do not attribute
         # the previous account's numbers to the current one.
-        if (_codex_usage_cache.get("task") is not current_task
+        current_auth_mtime = _codex_auth_mtime()
+        if (auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE
+                or current_auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE
+                or _codex_usage_cache.get("task") is not current_task
                 or _codex_usage_cache.get("authMtime") != auth_mtime
-                or _codex_auth_mtime() != auth_mtime):
+                or current_auth_mtime != auth_mtime):
             return
         now = time.time()
         result_error = result.get("err") if isinstance(result, dict) else None
@@ -2907,6 +2881,13 @@ async def _codex_usage_cached(force=False, wait=False, wait_valued=False,
     retried_after_cancel = False
     while True:
         auth_mtime = _codex_auth_mtime()
+        if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
+            task = _codex_usage_cache.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+            _codex_usage_cache.update(valueAt=0.0, lastTryAt=0.0, payload=None,
+                                      authMtime=auth_mtime, task=None)
+            return _codex_pending_payload("auth-generation-unavailable")
         if auth_mtime != _codex_usage_cache.get("authMtime"):
             _invalidate_codex_usage_cache()
             auth_mtime = _codex_usage_cache["authMtime"]
@@ -2940,6 +2921,8 @@ async def _codex_usage_cached(force=False, wait=False, wait_valued=False,
                 if _codex_usage_cache.get("task") is task:
                     _invalidate_codex_usage_cache()
                 auth_mtime = _codex_auth_mtime()
+                if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
+                    return _codex_pending_payload("auth-generation-unavailable")
                 if auth_mtime != _codex_usage_cache.get("authMtime"):
                     _invalidate_codex_usage_cache()
                     auth_mtime = _codex_usage_cache["authMtime"]
@@ -3246,9 +3229,6 @@ async def main():
     if not ALLOW:
         sys.stderr.write("devterm-gate: warning: AIRLOCK_OWNER unset — no owner "
                          "allowed, all requests 403 (fail-closed)\n")
-    # The TTL is this task, not a promise in the docs: expired secrets are removed even
-    # if nobody ever calls an endpoint again.
-    asyncio.create_task(_secret_sweep_loop())
     # Before the first request, so the first panel opened after a restart shows the last
     # known Codex numbers instead of waiting out a probe on a blank row.
     if _codex_usage_state_load():
@@ -3267,8 +3247,8 @@ async def main():
     where = ", ".join(str(s.getsockname()) for s in server.sockets)
     print(f"devterm-gate on {where} -> ttyd {TTYD_HOST}:{TTYD_PORT}; web={WEB_ROOT}; "
           f"accounts={_accounts_enabled()}; xai={_xai_enabled()}; "
-          f"markwand={MARKWAND}; orca={bool(ORCA_SHIM)}; "
-          f"secret_ttl={SECRET_TTL_SEC}s", flush=True)
+          f"fileview={FILEVIEW}; orca={bool(ORCA_SHIM)}; "
+          f"secret_cli={bool(PLATFORM_SECRET)}", flush=True)
     try:
         async with server:
             if signal_wait:

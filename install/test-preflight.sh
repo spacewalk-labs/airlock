@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -184,9 +184,10 @@ AIRLOCK_CONFIG="$ASSEMBLED_PREREQS_CFG" python3 "$ROOT/bin/airlock-config" prere
     bad "could not assemble the F11 prerequisites inventory for the drift oracles"
   }
 
-# Constraints merge only across enabled owners. Paseo needs node >=20, but
-# Markwand only needs node present; a disabled Paseo must not tighten Markwand.
-MW="$TMP/markwand-bin"; mkdir -p "$MW"
+# Constraints merge only across enabled owners. Paseo needs node >=20; fileview
+# needs no node at all since markserv was deleted, so a disabled Paseo must not
+# leave a node constraint standing for an app that never asked for one.
+MW="$TMP/fileview-bin"; mkdir -p "$MW"
 add_runtime_tools "$MW"
 while IFS= read -r cmd; do make_stub "$MW" "$cmd"; done \
   < <(awk -F '\t' 'NF >= 2 {print $2}' "$ASSEMBLED_PREREQS" | sort -u)
@@ -197,21 +198,20 @@ cat >"$MW/node" <<'STUB'
 case "${1:-}" in -p) echo 18 ;; *) echo v18.0.0 ;; esac
 STUB
 chmod +x "$MW/node"
-cat >"$TMP/markwand.toml" <<'TOML'
+cat >"$TMP/fileview.toml" <<'TOML'
 [auth]
 provider = "tailscale"
 owner = "me@example.com"
 [paths]
-code_root = "/srv/code"
 [apps.hub]
-[apps.markwand]
+[apps.fileview]
 TOML
-markwand_rc=0
-run_preflight "$TMP/markwand.toml" "$MW" --quiet >/dev/null 2>&1 || markwand_rc=$?
-if [ "$markwand_rc" = 0 ]; then
+fileview_rc=0
+run_preflight "$TMP/fileview.toml" "$MW" --quiet >/dev/null 2>&1 || fileview_rc=$?
+if [ "$fileview_rc" = 0 ]; then
   ok "disabled app version constraints do not leak into enabled apps"
 else
-  bad "disabled Paseo tightened Markwand's node requirement"
+  bad "disabled Paseo tightened File Viewer's node requirement"
 fi
 
 # Paseo's nvm hook (child-4 P2b STEP 3): install/preflight.sh:203-209

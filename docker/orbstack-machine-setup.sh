@@ -187,7 +187,7 @@ inroot bash -lc '
   apt-get update -qq
   apt-get install -y --no-install-recommends \
     nginx curl ca-certificates tar gnupg git python3 tmux nftables sudo
-  # Node 20+ (paseo/markwand). NodeSource keeps npm current; skip if node>=20 present.
+  # Node 20+ (paseo). NodeSource keeps npm current; skip if node>=20 present.
   if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed "s/v//;s/\..*//")" -lt 20 ]; then
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
@@ -281,7 +281,7 @@ inmc test -f "$MC_REPO/install/airlock-install.sh" \
 
 if ! inmc test -f "$MC_REPO/airlock.toml"; then
   die "airlock.toml not found. Copy airlock.toml.example -> airlock.toml and fill it in
-       (set owner, code_root; recommend leaving [apps.orca] out for the first run).
+       (set owner; recommend leaving [apps.orca] out for the first run).
        See docs/design/macos-container.md §8."
 fi
 

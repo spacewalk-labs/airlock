@@ -1,12 +1,29 @@
 # dev-monitor
 
-Per-box observability — CPU, memory, services, network, storage, top processes and recent
-unit logs — served as a same-origin subpath under the hub at `/monitor/`. No agent, no
+Per-box observability — CPU, memory, services, scheduled jobs, network, storage, top
+processes and recent unit logs — served as a same-origin subpath under the hub at `/monitor/`. No agent, no
 `psutil`: the backend reads `/proc` and shells out to `systemctl`/`journalctl`, so it runs
 in a minimal container. Observability is visible to the owner and collaborators.
 
 Optionally it also carries an **owner-only message and action console** (`messages = true`,
 default off). That half is described below; if you leave it off, everything below is inert.
+
+## Scheduled jobs
+
+The **Cron** tab is the absorbed cron-console: one screen for systemd user/system timers,
+the owner's crontab, `/etc/crontab`, `/etc/cron.d`, run-parts directories, and the current
+boot's cron journal evidence. Failed, late, unavailable and reboot-unsafe are separate
+verdicts; a source that cannot be read stays in `sources[]` and on screen instead of
+silently becoming “no jobs”. The collector is part of this backend—there is no sidecar
+unit, second port, nginx fragment or separate app package.
+
+When the owner console is enabled, the owner may run, temporarily pause, or resume a
+**currently observed user timer**. Every action re-measures the live user-timer allowlist
+and uses argv-only `systemctl --user`; system timers and cron files remain read-only.
+Writes reuse the existing console boundary (ingress owner identity + nginx-injected proxy
+secret + same-origin JSON POST). Pause is `stop`, not `disable`, so a restart restores the
+configured schedule. With `messages = false`, scheduled-job health stays visible and its
+write controls fail closed with the other owner-only routes.
 
 ## The message and action console
 
@@ -209,7 +226,9 @@ a half-configured install is visible to a script and not only in the boot log.
 ```
 python3 backend/test_devmon.py                     # 209 offline checks, no install required
 python3 test-backend.py                            # the backend's own half, incl. credential freshness
-bash ../../install/test-token-freshness-timer.sh   # the timer templates, substitution and installer refusals
+bash "$AIRLOCK_ROOT"/install/test-token-freshness-timer.sh  # timer templates, substitution, installer refusals
+#   (that suite lives in the PLATFORM checkout, not in this package — after the
+#    apps/ split there is no ../.. that reaches it)
 ```
 
 Covers validation, dedup, coalescing, crash recovery, urgency promotion, read≠notified,

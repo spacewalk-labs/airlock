@@ -239,6 +239,10 @@ done
 # ===========================================================================
 APP="$ROOT/apps/dev-monitor"
 . "$APP/render.sh"
+# Direct renderer cases do not source install/lib.sh, so hand in the same D5 value
+# explicitly. An empty golden would prove only that the line exists, not that the
+# platform path survives the package-local rename.
+AIRLOCK_ACCOUNTS_STATUS_BIN="/opt/example/airlock/bin/airlock-accounts-status"
 # The env-file renderer gets its own secret-empty golden. A non-empty webhook or
 # proxy secret in a committed golden would turn a fixture into a credential copy.
 f="$(out_file)"; render_to "$f" render_dev_monitor_env \
@@ -319,14 +323,14 @@ for SET in accounts-off accounts-on; do
   PY="/usr/bin/python3"; GATE_PY="$APP/backend/devterm-gate.py"
   WEB_ROOT="/home/example/.local/share/airlock-devterm/web"
   IDENTITY_HEADER="Tailscale-User-Login"; AIRLOCK_OWNER="owner@example.com"
-  CODE_ROOT=""; MARKWAND=false; REMOTE_HOSTS=""; SECRET_TTL=1800; ORCA_SHIM=""
+  CODE_ROOT=""; FILEVIEW=false; REMOTE_HOSTS=""; ORCA_SHIM=""
   XAI=false
   REV="deadbeefcafe"
   CANON="https://box.example.ts.net:${GATE_PORT}"
 
   # Mirrors install.sh's add_env() construction — the derived gate_env block
   # is not itself a heredoc, so it is reproduced here rather than extracted.
-  # The unit PATH is pinned rather than measured, same reason as markwand/paseo
+  # The unit PATH is pinned rather than measured, same reason as fileview/paseo
   # above: install.sh derives the node slot from airlock_cmd_dirs, and a real node
   # dir would make the golden depend on whichever box ran the suite. The
   # installer-path fixture below is where the derived value is checked.
@@ -339,8 +343,8 @@ for SET in accounts-off accounts-on; do
     accounts-off) ACCOUNTS=false ;;
     accounts-on)
       ACCOUNTS=true
-      CLAUDE_SWITCH="/home/example/.local/bin/claude-switch"
-      CLAUDE_STATUS="/home/example/.local/bin/claude-status"
+      CLAUDE_SWITCH="$ROOT/bin/airlock-accounts"
+      CLAUDE_STATUS="$ROOT/bin/airlock-accounts-status"
       FLEET_STORE=""; FLEET_STORE_URL=""
       ;;
   esac
@@ -353,15 +357,16 @@ for SET in accounts-off accounts-on; do
   add_env AIRLOCK_IDENTITY_HEADER "$IDENTITY_HEADER"
   add_env AIRLOCK_OWNER "$AIRLOCK_OWNER"
   add_env AIRLOCK_CODE_ROOT "$CODE_ROOT"
-  add_env DEVTERM_MARKWAND "$MARKWAND"
+  add_env DEVTERM_FILEVIEW "$FILEVIEW"
   add_env DEVTERM_ACCOUNTS "$ACCOUNTS"
   add_env DEVTERM_XAI "$XAI"
   add_env DEVTERM_REMOTE_HOSTS "$REMOTE_HOSTS"
-  add_env DEVTERM_SECRET_TTL "$SECRET_TTL"
   add_env DEVTERM_ORCA_SHIM "$ORCA_SHIM"
+  add_env DEVTERM_ACCOUNTS_BIN "$ROOT/bin/airlock-accounts"
+  add_env DEVTERM_SECRET_BIN "$ROOT/bin/airlock-secret"
   if [ "$ACCOUNTS" = true ]; then
-    add_env DEVTERM_CLAUDE_SWITCH "$CLAUDE_SWITCH"
     add_env DEVTERM_CLAUDE_STATUS "$CLAUDE_STATUS"
+    add_env DEVTERM_CLAUDE_SWITCH "$CLAUDE_SWITCH"
     add_env DEVTERM_FLEET_STORE "$FLEET_STORE"
     add_env DEVTERM_FLEET_STORE_URL "$FLEET_STORE_URL"
   fi
@@ -371,6 +376,13 @@ for SET in accounts-off accounts-on; do
 
   f="$(out_file)"; render_to "$f" render_devterm_unit_gate "$BACKEND_PORT" "$gate_env" "$PY" "$GATE_PY"
   golden_check_file "devterm/$SET/unit-gate.service" "$f"
+
+  if [ "$ACCOUNTS" = true ]; then
+    f="$(out_file)"; render_to "$f" render_devterm_exec_shim "$CLAUDE_SWITCH"
+    golden_check_file "devterm/$SET/shim-claude-switch" "$f"
+    f="$(out_file)"; render_to "$f" render_devterm_exec_shim "$CLAUDE_STATUS"
+    golden_check_file "devterm/$SET/shim-claude-status" "$f"
+  fi
 
   f="$(out_file)"; render_to "$f" render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$REDIRECT_PORT" "$CANON"
   golden_check_file "devterm/$SET/nginx.conf" "$f"
@@ -406,28 +418,21 @@ for SET in bare full; do
 done
 
 # ===========================================================================
-# markwand — apps/markwand/render.sh
-# No structural branch: CODE_ROOT/MS_PORT/FB_PORT are values only. One set.
+# fileview — apps/fileview/render.sh
+# No structural branch: FB_PORT is a value only. One set.
 # ===========================================================================
-APP="$ROOT/apps/markwand"
+APP="$ROOT/apps/fileview"
 . "$APP/render.sh"
 SET=default
-CODE_ROOT="/home/example/code"; MS_PORT=19500; FB_PORT=19501
-MS_BIN="/home/example/.local/bin/markserv"; FB_BIN="/home/example/.local/bin/filebrowser"
+FB_PORT=19501
+FB_BIN="/home/example/.local/bin/filebrowser"
 FB_DB="/home/example/.config/filebrowser/fb.db"
 
-# The unit PATH is pinned here, not measured: this dual-render exists to compare
-# the template against the installer, and a real node dir would make the golden
-# depend on whichever box ran the suite.
-f="$(out_file)"; render_to "$f" render_markwand_unit_markserv "$CODE_ROOT" "$MS_PORT" "$MS_BIN" \
-  "%h/.local/bin:NODE_BIN:/usr/local/bin:/usr/bin:/bin"
-golden_check_file "markwand/$SET/unit-markserv.service" "$f"
+f="$(out_file)"; render_to "$f" render_fileview_unit_filebrowser "$FB_PORT" "$FB_BIN" "$FB_DB"
+golden_check_file "fileview/$SET/unit.service" "$f"
 
-f="$(out_file)"; render_to "$f" render_markwand_unit_filebrowser "$CODE_ROOT" "$FB_PORT" "$FB_BIN" "$FB_DB"
-golden_check_file "markwand/$SET/unit-filebrowser.service" "$f"
-
-f="$(out_file)"; render_to "$f" render_markwand_nginx "$MS_PORT" "$FB_PORT"
-golden_check_file "markwand/$SET/nginx.conf" "$f"
+f="$(out_file)"; render_to "$f" render_fileview_nginx "$FB_PORT"
+golden_check_file "fileview/$SET/nginx.conf" "$f"
 
 # ===========================================================================
 # orca — apps/orca/render.sh
@@ -497,10 +502,10 @@ UNIT_PATH="/home/example/.npm-global/bin:/home/example/.local/bin:/usr/local/bin
 HOME_VAL="/home/example"; FQDN="box.example.ts.net"; HTTPS_PORT=19700
 PASEO_BIN="/home/example/.npm-global/bin/paseo"; BACKEND_PORT=19701
 PY="/usr/bin/python3"; STALE_PID_GUARD="$APP/paseo-clear-stale-pid.py"
-# Fixed fixture values: the real numbers come from install.sh's RAM tier, but the
+# Fixed fixture values: the real numbers are the installer's share of the box, but the
 # renderer must stay a pure function of its args for the golden to be stable.
-# These are what a 32GiB box gets — the >=16 GiB tier.
-MEMMAX="14G"; MEMHIGH="12G"; TASKSMAX=infinity
+# These are what a 32GiB box gets — 11/16 and 10/16 of 32 GiB.
+MEMMAX="22528M"; MEMHIGH="20480M"; TASKSMAX=infinity
 
 f="$(out_file)"; render_to "$f" render_paseo_unit "$UNIT_PATH" "$HOME_VAL" "$FQDN" "$HTTPS_PORT" "$PASEO_BIN" "$BACKEND_PORT" \
   "$PY" "$STALE_PID_GUARD" "$MEMMAX" "$MEMHIGH" "$TASKSMAX"
@@ -524,6 +529,7 @@ golden_check_file "paseo/snap-override/unit.service" "$f"
 
 GATE_PORT=19702; WIDGET="/opt/airlock/hub/assets/airlock-return.js"
 BROWSE_WS_PORT=19953
+UISTATE_PORT=19954
 CONFD_FIXTURE="/etc/airlock/nginx"
 
 for SET in browse-off browse-on icon-on icon-on-variants no-widget-menu; do
@@ -546,7 +552,7 @@ $(cat "$f")"
       ;;
     no-widget-menu) WIDGET_MENU_ATTRS="" ;;
   esac
-  f="$(out_file)"; render_to "$f" render_paseo_nginx "$GATE_PORT" "$BACKEND_PORT" "$FQDN" "$HTTPS_PORT" "$WIDGET" "$WIDGET_MENU_ATTRS" "$BROWSE" "$BROWSE_WS_PORT" "$ICON_LOC_BODY"
+  f="$(out_file)"; render_to "$f" render_paseo_nginx "$GATE_PORT" "$BACKEND_PORT" "$FQDN" "$HTTPS_PORT" "$WIDGET" "$WIDGET_MENU_ATTRS" "$BROWSE" "$BROWSE_WS_PORT" "$ICON_LOC_BODY" "$UISTATE_PORT"
   golden_check_file "paseo/$SET/nginx.conf" "$f"
   # icon-on / icon-on-variants: assert the splice did NOT merge into the
   # following line (the exact byte pattern round 2 found: a location block's
@@ -644,14 +650,13 @@ provider = "tailscale"
 owner = "owner@example.com"
 
 [paths]
-code_root = "$NGTMP/code"
 
 [apps.hub]
 [apps.code-server]
 [apps.dev-monitor]
 [apps.devterm]
 [apps.feedback]
-[apps.markwand]
+[apps.fileview]
 [apps.notepad]
 [apps.orca]
 [apps.paseo]
@@ -692,14 +697,13 @@ provider = "tailscale"
 owner = "owner@example.com"
 
 [paths]
-code_root = "$TLTMP/code"
 
 [apps.hub]
 [apps.code-server]
 [apps.dev-monitor]
 [apps.devterm]
 [apps.feedback]
-[apps.markwand]
+[apps.fileview]
 [apps.notepad]
 [apps.orca]
 [apps.paseo]
@@ -761,7 +765,7 @@ fi
 # single real run of install.sh and compared against its own golden.
 # ===========================================================================
 run_installer_path() {
-  local app="$1" extra_toml="$2"; shift 2
+  local app="$1" extra_toml="$2" app_toml="$3" golden_set="$4"; shift 4
   local WDIR CFG out rc=0
   WDIR="$(mktemp -d)"
   mkdir -p "$WDIR/home" "$WDIR/render" "$WDIR/code" "$WDIR/shim"
@@ -770,6 +774,7 @@ run_installer_path() {
     printf '[site]\nname = "RenderParity"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n\n'
     printf '%s\n' "$extra_toml"
     printf '[apps.%s]\n' "$app"
+    [ -z "$app_toml" ] || printf '%s\n' "$app_toml"
   } > "$CFG"
   # Shim any prerequisite command missing on this box (mirrors
   # install/test-equivalence.sh) — a dry run never executes the shimmed
@@ -789,6 +794,11 @@ run_installer_path() {
            AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$WDIR/render" \
            AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368 \
            PATH="$WDIR/shim:$PATH"
+    # The D5 ABI, exported the way the orchestrator exports it. It is required,
+    # not optional: an app may not derive the platform root from its own location
+    # (install/check-app-abi.sh), because after the apps/ cutover that derivation
+    # points at the app repository instead of the platform.
+    export AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/$app" AIRLOCK_APP_ID="$app"
     bash "$ROOT/apps/$app/install.sh" 2>&1
   )" || rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -810,8 +820,8 @@ run_installer_path() {
     # CONFD-derived path — e.g. code-server's slot-gate "root" line — and
     # CONFD is redirected under AIRLOCK_RENDER_DIR=$WDIR/render here, so the
     # raw artifact is not reproducible run to run without this).
-    # $TMP (this suite's own top-level scratch dir) also leaks into markwand's
-    # unit — code_root is passed in via extra_toml as "$TMP/code" — so it must
+    # $TMP (this suite's own top-level scratch dir) also leaks into fileview's
+    # unit — so it must
     # be normalised too, not just $WDIR, or the golden is non-reproducible run
     # to run.
     local wdirnorm; wdirnorm="$(out_file).wdirnorm"
@@ -833,10 +843,9 @@ run_installer_path() {
     # red in CI). The node slot is always the first `:<dir>:` occurrence, so
     # a colon-anchored first-match hits it and leaves the base entries literal.
     #
-    # Scoped by CONTENT rather than by app name since 2026-08-07: markwand's markserv
-    # unit derives its PATH now too (it is a `#!/usr/bin/env node` script and used to
-    # carry a hardcoded PATH with no node dir on it at all), so "paseo only" stopped
-    # being the right boundary. An artifact that has no `Environment=PATH=` line
+    # Scoped by CONTENT rather than by app name since 2026-08-07, when fileview's
+    # markserv unit also derived its PATH. markserv is gone, but the content test is
+    # still the right boundary. An artifact that has no `Environment=PATH=` line
     # cannot be the one embedding a node dir, and that is exactly the set the comment
     # above says must not be touched.
     local _node_sed=()
@@ -846,16 +855,16 @@ run_installer_path() {
     fi
     sed -e "s|$WDIR|WDIR|g" -e "s|$TMP|TMP|g" "${_node_sed[@]}" \
       "$WDIR/render/$artifact_rel" > "$wdirnorm"
-    golden_check_file "$app/installer-path/$golden_name" "$wdirnorm"
+    golden_check_file "$app/$golden_set/$golden_name" "$wdirnorm"
   done
   rm -rf "$WDIR"
 }
 
-run_installer_path code-server "" \
+run_installer_path code-server "" "" installer-path \
   "confd/servers.d/code-server.conf" "nginx.conf" \
   "units/airlock-code-server@.service" "unit-slot.service" \
   "units/airlock-code-server-manager.service" "unit-manager.service"
-run_installer_path dev-monitor "" \
+run_installer_path dev-monitor "" "" installer-path \
   "confd/hub-locations.d/dev-monitor.conf" "nginx.conf" \
   "units/airlock-dev-monitor.service" "unit.service"
 
@@ -880,6 +889,7 @@ run_devmon_webhook_case() {
       DEVMON_FIXTURE_URGENT="urgent-fixture" \
       DEVMON_FIXTURE_ROUTINE="routine-fixture" \
       DEVMON_FIXTURE_ALIAS="alias-fixture"
+    AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
     bash "$ROOT/apps/dev-monitor/install.sh" 2>&1
   )" || rc=$?
   envf="$WDIR/render/files/dev-monitor.env"
@@ -942,10 +952,12 @@ EOF
 printf 'DEV_MONITOR_PROXY_SECRET=fixture-proxy-only\n' > "$DMOFF/home/.config/airlock/dev-monitor.env"
 HOME="$DMOFF/home" AIRLOCK_CONFIG="$DMOFF/on.toml" AIRLOCK_TS_FQDN=box.example.ts.net \
   AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$DMOFF/render" \
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
   bash "$ROOT/apps/dev-monitor/install.sh" >/dev/null 2>&1
 sed 's/messages = true/messages = false/' "$DMOFF/on.toml" > "$DMOFF/off.toml"
 HOME="$DMOFF/home" AIRLOCK_CONFIG="$DMOFF/off.toml" AIRLOCK_TS_FQDN=box.example.ts.net \
   AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$DMOFF/render" \
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
   bash "$ROOT/apps/dev-monitor/install.sh" >/dev/null 2>&1
 if [ ! -e "$DMOFF/render/files/dev-monitor.env" ]; then
   ok "dev-monitor messages off removes captured env"
@@ -964,6 +976,7 @@ for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_e
   } > "$DMBAD/airlock.toml"
   dm_out="$(HOME="$DMBAD/home" AIRLOCK_CONFIG="$DMBAD/airlock.toml" \
     AIRLOCK_TS_FQDN=box.example.ts.net AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$DMBAD/render" \
+    AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
     bash "$ROOT/apps/dev-monitor/install.sh" 2>&1)"; dm_rc=$?
   if [ "$dm_rc" -ne 0 ] && printf '%s\n' "$dm_out" | grep -q 'config values must not contain newlines' \
       && ! printf '%s\n' "$dm_out" | grep -q 'BAD'; then
@@ -984,6 +997,7 @@ for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_e
   dm_out="$(HOME="$DMBAD/home" AIRLOCK_CONFIG="$DMBAD/airlock.toml" \
     AIRLOCK_TS_FQDN=box.example.ts.net AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$DMBAD/render" \
     DEVMON_BAD_VALUE=$'secret-canary\nINJECTED=1' \
+    AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
     bash "$ROOT/apps/dev-monitor/install.sh" 2>&1)"; dm_rc=$?
   if [ "$dm_rc" -ne 0 ] && printf '%s\n' "$dm_out" | grep -q 'resolved Slack webhook values must not contain newlines' \
       && ! printf '%s\n' "$dm_out" | grep -Eq 'secret-canary|INJECTED'; then
@@ -993,33 +1007,121 @@ for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_e
   fi
   rm -rf "$DMBAD"
 done
-run_installer_path devterm "" \
+run_installer_path devterm "" "accounts = true" installer-path \
   "confd/servers.d/devterm.conf" "nginx.conf" \
   "units/airlock-devterm.service" "unit-ttyd.service" \
   "units/airlock-devterm-gate.service" "unit-gate.service"
-run_installer_path feedback "" \
+run_installer_path devterm "" "xai = true" installer-path-xai-only \
+  "confd/servers.d/devterm.conf" "nginx.conf" \
+  "units/airlock-devterm.service" "unit-ttyd.service" \
+  "units/airlock-devterm-gate.service" "unit-gate.service"
+
+# The installer-path oracle above must stay dry-run because it captures rendered
+# system artifacts. That branch intentionally stops before mktemp/chmod/mv, however,
+# so it cannot prove the P2a upgrade invariant: an already-installed credential writer
+# is replaced atomically even after its feature is disabled, and a failed replacement
+# leaves the old path intact. These full installer runs are non-dry but hermetic: HOME,
+# nginx config and every service command are redirected below $TMP; ttyd is preseeded
+# so there is no download, and no host service or $HOME path is touched.
+run_devterm_shim_install() {
+  local case_dir="$1" app_toml="$2" fail_mv="${3:-false}" out rc=0 cmd
+  mkdir -p "$case_dir/home/.local/bin" "$case_dir/confd" "$case_dir/shim"
+  printf '#!/bin/sh\nexit 0\n' > "$case_dir/home/.local/bin/ttyd"
+  chmod 755 "$case_dir/home/.local/bin/ttyd"
+  for cmd in systemctl tailscale sudo tmux; do
+    printf '#!/bin/sh\nexit 0\n' > "$case_dir/shim/$cmd"
+    chmod 755 "$case_dir/shim/$cmd"
+  done
+  if [ "$fail_mv" = true ]; then
+    printf '#!/bin/sh\nexit 73\n' > "$case_dir/shim/mv"
+    chmod 755 "$case_dir/shim/mv"
+  fi
+  {
+    printf '[site]\nname = "RenderParity"\n\n'
+    printf '[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n\n'
+    printf '[apps.devterm]\n%s\n' "$app_toml"
+  } > "$case_dir/airlock.toml"
+  out="$(
+    HOME="$case_dir/home" AIRLOCK_CONFIG="$case_dir/airlock.toml" \
+      AIRLOCK_TS_FQDN=box.example.ts.net AIRLOCK_CONFD="$case_dir/confd" \
+      TTYD_BIN="$case_dir/home/.local/bin/ttyd" \
+      AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/devterm" AIRLOCK_APP_ID=devterm \
+      PATH="$case_dir/shim:$PATH" bash "$ROOT/apps/devterm/install.sh" 2>&1
+  )" || rc=$?
+  printf '%s\n' "$rc" > "$case_dir/rc"
+  printf '%s\n' "$out" > "$case_dir/out"
+}
+
+SHIM_EXPECT_SWITCH="$(out_file)"
+SHIM_EXPECT_STATUS="$(out_file)"
+render_devterm_exec_shim "$ROOT/bin/airlock-accounts" > "$SHIM_EXPECT_SWITCH"
+render_devterm_exec_shim "$ROOT/bin/airlock-accounts-status" > "$SHIM_EXPECT_STATUS"
+
+SHIM_UPGRADE="$TMP/devterm-shim-upgrade-off"
+mkdir -p "$SHIM_UPGRADE/home/.local/bin"
+printf '#!/bin/sh\nprintf stale-switch\\n\n' > "$SHIM_UPGRADE/home/.local/bin/claude-switch"
+printf '#!/bin/sh\nprintf stale-status\\n\n' > "$SHIM_UPGRADE/home/.local/bin/claude-status"
+run_devterm_shim_install "$SHIM_UPGRADE" $'accounts = false\nxai = false'
+if [ "$(cat "$SHIM_UPGRADE/rc")" = 0 ] \
+   && cmp -s "$SHIM_EXPECT_SWITCH" "$SHIM_UPGRADE/home/.local/bin/claude-switch" \
+   && cmp -s "$SHIM_EXPECT_STATUS" "$SHIM_UPGRADE/home/.local/bin/claude-status" \
+   && [ "$(stat -c %a "$SHIM_UPGRADE/home/.local/bin/claude-switch")" = 755 ] \
+   && [ "$(stat -c %a "$SHIM_UPGRADE/home/.local/bin/claude-status")" = 755 ]; then
+  ok "devterm upgrade replaces disabled-feature credential writers with executable platform shims"
+else
+  bad "devterm upgrade left a stale disabled-feature credential writer or wrong shim mode"
+  tail -25 "$SHIM_UPGRADE/out" | sed 's/^/    /'
+fi
+
+SHIM_XAI="$TMP/devterm-shim-xai-only"
+run_devterm_shim_install "$SHIM_XAI" $'accounts = false\nxai = true'
+if [ "$(cat "$SHIM_XAI/rc")" = 0 ] \
+   && [ ! -e "$SHIM_XAI/home/.local/bin/claude-switch" ] \
+   && cmp -s "$SHIM_EXPECT_STATUS" "$SHIM_XAI/home/.local/bin/claude-status"; then
+  ok "devterm xAI-only install creates only the platform status shim"
+else
+  bad "devterm xAI-only install produced the wrong compatibility shims"
+  tail -25 "$SHIM_XAI/out" | sed 's/^/    /'
+fi
+
+SHIM_FAILURE="$TMP/devterm-shim-failed-replace"
+mkdir -p "$SHIM_FAILURE/home/.local/bin"
+printf '#!/bin/sh\nprintf preserve-me\\n\n' > "$SHIM_FAILURE/home/.local/bin/claude-switch"
+cp "$SHIM_FAILURE/home/.local/bin/claude-switch" "$SHIM_FAILURE/sentinel"
+run_devterm_shim_install "$SHIM_FAILURE" $'accounts = false\nxai = false' true
+if [ "$(cat "$SHIM_FAILURE/rc")" -ne 0 ] \
+   && cmp -s "$SHIM_FAILURE/sentinel" "$SHIM_FAILURE/home/.local/bin/claude-switch" \
+   && ! find "$SHIM_FAILURE/home/.local/bin" -maxdepth 1 -name 'claude-switch.tmp.*' -print -quit | grep -q .; then
+  ok "devterm failed atomic shim replace preserves the installed credential path"
+else
+  bad "devterm failed atomic shim replace changed the installed path or leaked a temp file"
+  tail -25 "$SHIM_FAILURE/out" | sed 's/^/    /'
+fi
+
+run_installer_path feedback "" "" installer-path \
   "confd/hub-locations.d/feedback.conf" "nginx.conf" \
   "units/airlock-feedback.service" "unit.service"
-run_installer_path markwand "$(printf '[paths]\ncode_root = "%s/code"\n' "$TMP")" \
-  "confd/hub-locations.d/markwand.conf" "nginx.conf" \
-  "units/airlock-markserv.service" "unit-markserv.service" \
-  "units/airlock-filebrowser.service" "unit-filebrowser.service"
-run_installer_path orca "" \
+run_installer_path fileview "" "" installer-path \
+  "confd/hub-locations.d/fileview.conf" "nginx.conf" \
+  "units/airlock-fileview.service" "unit.service"
+run_installer_path orca "" "" installer-path \
   "confd/servers.d/orca.conf" "nginx.conf" \
   "units/airlock-orca-xvfb.service" "unit-xvfb.service" \
   "units/airlock-orca.service" "unit-serve.service" \
   "bin/airlock-orca-reap" "reap.sh" \
   "etc-airlock/orca-loopback.nft" "nft.conf" \
   "etc-systemd-system/airlock-orca-firewall.service" "unit-firewall.service"
-run_installer_path paseo "" \
+run_installer_path paseo "" "" installer-path \
   "confd/servers.d/paseo.conf" "nginx.conf" \
   "units/airlock-paseo.service" "unit.service"
 
-# paseo memory boundary cases — exercise the real installer tier table at every
-# requested cap, including both sides of the 16GiB tier edge (15/16) and boxes smaller
-# than the standard tier itself. These assert the named tier values, not just an
-# ordering invariant: a tier table whose numbers are only checked for `high < max`
-# would pass with any pair of numbers, which is exactly what it must not do.
+# paseo memory cases — exercise the real installer's proportional sizing from tiny to
+# huge. The expectation is COMPUTED here from the same ratio the installer uses, so the
+# assertion is "11/16 and 10/16 of the rounded cap", not a list of remembered numbers.
+# Neither half alone would be enough: an ordering check (`high < max`) passes with any
+# pair of numbers, and a fixed expected pair passes with any ratio. With the
+# non-whole-GiB caps below, the ratio, the rounding and the rendering are each pinned
+# separately.
 size_to_mib() {
   awk -v s="$1" 'BEGIN{
     if (s !~ /^[0-9]+(\.[0-9]+)?[GM]$/) { print "NaN"; exit }
@@ -1034,7 +1136,13 @@ size_to_mib() {
 # ceil and round-to-nearest are indistinguishable — the tier TABLE would be covered
 # while the tier SELECTION was not (measured: deleting the rounding left this suite
 # fully green).
+# Every call bumps this and the tail of the block asserts the total. Without it,
+# DELETING cases is invisible: shrinking the cap loop from thirteen entries to one left
+# the suite fully green, and the same shape once removed the `finite` branch entirely.
+# A coverage suite that cannot notice its own coverage disappearing is not one.
+paseo_mem_cases_run=0
 paseo_memory_case() {
+  paseo_mem_cases_run=$(( paseo_mem_cases_run + 1 ))
   local cap_gib="$1" mode="$2" tasks_override="${3:-}" raw_bytes="${4:-}"
   local cap_bytes WDIR CFG out rc=0 unit max high
   local expect_max expect_high
@@ -1043,9 +1151,11 @@ paseo_memory_case() {
   fi
   local tag="${cap_gib}GiB"
   [ -n "$raw_bytes" ] && tag="${raw_bytes}B (rounds to ${cap_gib}GiB)"
-  if [ "$cap_gib" -ge 16 ]; then expect_max=14G; expect_high=12G
-  else expect_max=5.5G; expect_high=5G
-  fi
+  # Deliberately NOT a copy of the installer's expression: spelled as MiB-per-GiB so a
+  # mutation of either numerator in install.sh shows up here as a mismatch instead of
+  # being mirrored into the expectation.
+  expect_max="$(( cap_gib * 704 ))M"   # 704 MiB = 11/16 GiB
+  expect_high="$(( cap_gib * 640 ))M"  # 640 MiB = 10/16 GiB
   WDIR="$(mktemp -d)"
   mkdir -p "$WDIR/home" "$WDIR/render" "$WDIR/shim"
   CFG="$WDIR/airlock.toml"
@@ -1075,34 +1185,42 @@ paseo_memory_case() {
     else
       unset AIRLOCK_PASEO_TASKS_MAX
     fi
+    AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/paseo" AIRLOCK_APP_ID=paseo \
     bash "$ROOT/apps/paseo/install.sh" 2>&1
   )" || rc=$?
 
   case "$mode" in
-    too-small)
-      # Owner decision 2026-08-17: a box smaller than the standard tier is NOT refused.
-      # The cap is still written (above the box it is inert, not a lie) and the
-      # installer says so. Both halves are asserted here, because dropping the warning
-      # would leave an inert ceiling that reads like a working one.
+    share-only)
+      # Sub-GiB boxes: the installer clamps the share to the raw cap, so the exact number
+      # is not `cap_gib * 704`. Asserting the PROPERTY instead of mirroring the clamp
+      # keeps this a test rather than a second copy of the code.
       unit="$WDIR/render/units/airlock-paseo.service"
       if [ "$rc" -ne 0 ] || [ ! -f "$unit" ]; then
-        bad "paseo memory ${tag}: a box below the standard tier was refused — the refusal was removed"
-        printf '%s\n' "$out" | tail -10 | sed 's/^/    /'
-      elif ! grep -qx "MemoryMax=${expect_max}" "$unit" || ! grep -qx "MemoryHigh=${expect_high}" "$unit"; then
-        bad "paseo memory ${tag}: wrong tier below the standard tier (want ${expect_max}/${expect_high})"
-        grep -E '^(Memory(Max|High)|TasksMax)=' "$unit" | sed 's/^/    /'
-      elif ! grep -qF "WARNING: this box is smaller than the standard paseo memory tier" <<<"$out" \
-           || ! grep -qF "cap=${cap_bytes} bytes (~${cap_gib} GiB)" <<<"$out"; then
-        bad "paseo memory ${tag}: installed an inert ceiling without saying the box is smaller than it"
-        printf '%s\n' "$out" | tail -10 | sed 's/^/    /'
+        bad "paseo memory ${tag}: install failed (rc=$rc) or unit missing"
+        printf '%s\n' "$out" | tail -15 | sed 's/^/    /'
       else
-        ok "paseo memory ${tag}: below the standard tier — installs anyway, writes ${expect_max}/${expect_high}, and says the ceiling sits above the box"
+        max="$(sed -n 's/^MemoryMax=\(.*\)$/\1/p' "$unit")"
+        high="$(sed -n 's/^MemoryHigh=\(.*\)$/\1/p' "$unit")"
+        local max_mib high_mib
+        max_mib="$(size_to_mib "$max")"; high_mib="$(size_to_mib "$high")"
+        if [ "$max_mib" = NaN ] || [ "$high_mib" = NaN ]; then
+          bad "paseo memory ${tag}: unit did not render a finite size systemd can parse"
+          grep -E '^Memory(Max|High)=' "$unit" | sed 's/^/    /'
+        elif [ "$max_mib" -lt 1 ]; then
+          bad "paseo memory ${tag}: rendered a zero ceiling (MemoryMax=${max}) — the unit would not start"
+        elif [ "$high_mib" -ge "$max_mib" ]; then
+          bad "paseo memory ${tag}: invariant failed (MemoryHigh=${high} not below MemoryMax=${max})"
+        elif [ "$cap_bytes" -ge 1048576 ] && [ "$max_mib" -gt $(( cap_bytes / 1048576 )) ]; then
+          bad "paseo memory ${tag}: the ceiling is bigger than the box (MemoryMax=${max} > ${cap_bytes} bytes)"
+        else
+          ok "paseo memory ${tag}: sub-GiB box gets a non-zero share inside its own box (${max}/${high})"
+        fi
       fi
       ;;
     finite)
       unit="$WDIR/render/units/airlock-paseo.service"
       if [ "$rc" -ne 0 ] || [ ! -f "$unit" ]; then
-        bad "paseo memory ${tag}: finite install failed (rc=$rc) or unit missing"
+        bad "paseo memory ${tag}: install failed (rc=$rc) or unit missing"
         printf '%s\n' "$out" | tail -15 | sed 's/^/    /'
       else
         max="$(sed -n 's/^MemoryMax=\(.*\)$/\1/p' "$unit")"
@@ -1110,29 +1228,32 @@ paseo_memory_case() {
         local max_mib high_mib
         max_mib="$(size_to_mib "$max")"; high_mib="$(size_to_mib "$high")"
         if [ "$max" != "$expect_max" ] || [ "$high" != "$expect_high" ]; then
-          bad "paseo memory ${tag}: wrong tier (got MemoryMax=${max} MemoryHigh=${high}, want ${expect_max}/${expect_high})"
+          bad "paseo memory ${tag}: wrong share (got MemoryMax=${max} MemoryHigh=${high}, want ${expect_max}/${expect_high})"
           grep -E '^(Memory(Max|High)|TasksMax)=' "$unit" | sed 's/^/    /'
         elif [ "$max_mib" = NaN ] || [ "$high_mib" = NaN ]; then
           bad "paseo memory ${tag}: unit did not render a finite size systemd can parse"
           grep -E '^(Memory(Max|High)|TasksMax)=' "$unit" | sed 's/^/    /'
         elif [ "$high_mib" -ge "$max_mib" ]; then
-          # `max <= cap` used to be checked here too. It cannot fail by construction —
-          # the tier values are fixed and every finite case is at or above them — and a
-          # review proved it: deleting the clause left the suite green, as did the guard
-          # added to "scope" it. A check that cannot fail reads like a live one, so it is
-          # gone. What it was reaching for is the too-small case below, which asserts the
-          # ceiling-above-the-box warning fires, and this branch asserts it does not.
           bad "paseo memory ${tag}: invariant failed (MemoryHigh=${high} not below MemoryMax=${max})"
+        elif [ "$max_mib" -gt $(( cap_bytes / 1048576 )) ]; then
+          # Against the RAW cap, not the rounded one. Compared against the rounded cap
+          # this was dominated by the equality check above and could only fire when the
+          # EXPECTATION was wrong — a review proved that vacuous, twice. Against the raw
+          # cap it asserts the installer's "never above the box" clamp is doing its job.
+          bad "paseo memory ${tag}: the ceiling is bigger than the box (MemoryMax=${max} > ${cap_bytes} bytes)"
         elif ! grep -qx 'TasksMax=infinity' "$unit"; then
           bad "paseo memory ${tag}: TasksMax is not the box maximum"
           grep -E '^TasksMax=' "$unit" | sed 's/^/    /'
-        elif grep -qF "WARNING: this box is smaller than the standard paseo memory tier" <<<"$out"; then
-          # The box is at or above the tier, so the ceiling is real and the warning must
-          # NOT fire. Without this, a threshold that fires on every box passes (measured).
-          bad "paseo memory ${tag}: warned that the ceiling sits above the box, but the box is at or above the tier"
-          printf '%s\n' "$out" | tail -6 | sed 's/^/    /'
+        elif ! grep -qF "paseo memory share: cap=${cap_bytes} bytes" <<<"$out" \
+             || ! grep -qF "MemoryMax=${expect_max} (11/16) MemoryHigh=${expect_high} (10/16)" <<<"$out"; then
+          # The install log must name the same numbers the unit got, and name the ratio
+          # it used. That log line is the only operator-visible explanation of why this
+          # box got this share; a unit that is right while the log says something else
+          # sends the next person looking in the wrong place.
+          bad "paseo memory ${tag}: the install log does not report the share it wrote"
+          printf '%s\n' "$out" | grep -i 'memory' | tail -4 | sed 's/^/    /'
         else
-          ok "paseo memory ${tag}: tier ${expect_max}/${expect_high}, MemoryHigh < MemoryMax, no too-small warning, TasksMax at the box maximum"
+          ok "paseo memory ${tag}: share ${expect_max}/${expect_high} = 11/16 and 10/16 of ${cap_gib}GiB, MemoryHigh < MemoryMax <= the raw cap, logged under 'paseo memory share:', TasksMax at the box maximum"
         fi
       fi
       ;;
@@ -1172,43 +1293,102 @@ paseo_memory_case() {
         ok "paseo TasksMax override: a finite pids backstop is still available on request"
       fi
       ;;
+    *)
+      # Not decoration: an unknown mode used to fall through `case` silently, so a case
+      # that asserted nothing looked exactly like a case that passed. That happened —
+      # a bad edit removed the `finite` branch and thirteen caps went unchecked, with
+      # only the total count to notice it by.
+      bad "paseo memory ${tag}: unknown mode '${mode}' — the case asserted nothing"
+      ;;
   esac
   rm -rf "$WDIR"
 }
 
 paseo_memory_case 8 tasks-override 4096
-for cap_gib in 1 2 4 6 7 8 12 15 16 32; do
-  if [ "$cap_gib" -lt 6 ]; then
-    # Smaller than the 5.5G standard tier: installs anyway, loudly. (6 GiB and up the
-    # tier fits, so those go through the ordinary finite path.)
-    paseo_memory_case "$cap_gib" too-small
-    paseo_memory_case "$cap_gib" unbacked
-  else
-    paseo_memory_case "$cap_gib" finite
-  fi
+# Every cap gets the same treatment now — there is no tier to fall either side of, so
+# the range is what matters: three orders of magnitude, and the ratio must hold at all
+# of them. 1 GiB is the floor clamp; 72 is this repo's own dev box, the size that broke
+# the fixed-tier design.
+for cap_gib in 1 2 3 4 6 7 8 12 15 16 32 64 72; do
+  paseo_memory_case "$cap_gib" finite
 done
+# The opt-out still renders infinity, on a small box and a large one alike.
+paseo_memory_case 2  unbacked
+paseo_memory_case 64 unbacked
 # Rounding cases — caps that are NOT whole GiB, which is what every real box reports.
-# The only tier edge left is 16 GiB, so that is where rounding has to be right: a real
-# 16GB box shows ~15.55 GiB and must NOT be dropped to the standard tier.
-paseo_memory_case 16 finite "" 16696685363   # 15.55 GiB, a real "16GB" box -> 16-tier
-paseo_memory_case 15 finite "" 16535624090   # 15.40 GiB, just under        -> standard
-# The 512 MiB slack the rounding buys, asserted from both sides at the exact byte.
-# Without these two, shifting the constant by one or swapping -ge for -gt survives:
-# no other case has a remainder anywhere near 536870912.
+# Without these, floor / ceil / round-to-nearest are indistinguishable: every whole-GiB
+# cap above rounds to itself. A real machine reports under its own name, and rounding
+# first is what makes the published numbers exact (7.63 GiB -> 8 -> 5632M = 5.5 GiB,
+# the figure this was validated at; flooring would hand it 4928M).
+paseo_memory_case 8  finite "" 8192650117    #  7.63 GiB, a real "8GB" box  -> 8
+paseo_memory_case 7  finite "" 8042326261    #  7.49 GiB, just under        -> 7
+paseo_memory_case 16 finite "" 16696685363   # 15.55 GiB, a real "16GB" box -> 16
+paseo_memory_case 15 finite "" 16535624090   # 15.40 GiB, just under        -> 15
+# The 512 MiB rounding edge, asserted from both sides at the exact byte. Without these
+# two, shifting the constant by one or swapping -ge for -gt survives: no other case has
+# a remainder anywhere near 536870912.
 paseo_memory_case 16 finite "" 16642998272   # 15 GiB + exactly 512 MiB -> rounds up
 paseo_memory_case 15 finite "" 16642998271   # one byte less            -> rounds down
-# The too-small warning threshold, pinned at the exact byte from both sides. The
-# threshold is the standard tier itself (5.5 GiB = 5632 MiB), NOT a round GiB, so no
-# whole-GiB case can sit on it. Without these two, six mutations of the threshold and
-# its comparison survived green — including one that fired the warning on every box.
-paseo_memory_case 6 finite    "" 5905580032  # exactly 5.5 GiB -> ceiling fits, no warning
-paseo_memory_case 5 too-small "" 5905580031  # one byte less   -> ceiling above the box
+# Sub-GiB boxes. Two things must hold and neither is a remembered number: the share
+# never renders `MemoryMax=0M` (which systemd accepts and which stops the unit dead),
+# and it never sits above the box it is a share of. Rounding the cap UP is what would
+# break the second, so these are the cases that hold the installer's clamp in place.
+paseo_memory_case 1 share-only "" 536870911  # 0.4999 GiB — rounds up, must be clamped
+paseo_memory_case 1 share-only "" 629145600  # 600 MiB
+paseo_memory_case 1 share-only "" 1          # 1 byte — the seam's floor
+# A malformed seam value must be fatal, not ignored. `AIRLOCK_PASEO_MEM_CAP_BYTES=32GiB`
+# is a units typo anyone could write, and it used to fall through to /proc/meminfo
+# silently — so a suite that believed it had pinned the RAM was reading the runner's,
+# which is the single outcome the pin gate exists to prevent. Nothing else in this file
+# can catch that: every other case passes a well-formed number, so removing the
+# strictness leaves them all green (measured).
+paseo_bad_seam_case() {
+  local val="$1" WDIR CFG out rc=0
+  WDIR="$(mktemp -d)"; mkdir -p "$WDIR/home" "$WDIR/render" "$WDIR/shim"
+  CFG="$WDIR/airlock.toml"
+  {
+    printf '[site]\nname = "RenderParity"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n\n'
+    printf '[apps.paseo]\n'
+  } > "$CFG"
+  while IFS= read -r cmd; do
+    [ -n "$cmd" ] || continue
+    command -v "$cmd" >/dev/null 2>&1 || { printf '#!/bin/sh\nexit 0\n' > "$WDIR/shim/$cmd"; chmod +x "$WDIR/shim/$cmd"; }
+  done <<<"$ALL_PREREQ_CMDS"
+  out="$(
+    export HOME="$WDIR/home" AIRLOCK_CONFIG="$CFG" AIRLOCK_TS_FQDN="box.example.ts.net" \
+           AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$WDIR/render" \
+           AIRLOCK_PASEO_MEM_CAP_BYTES="$val" PATH="$WDIR/shim:$PATH"
+    unset AIRLOCK_PASEO_ALLOW_UNBACKED_MEM AIRLOCK_PASEO_TASKS_MAX
+    AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/paseo" AIRLOCK_APP_ID=paseo \
+    bash "$ROOT/apps/paseo/install.sh" 2>&1
+  )" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    bad "paseo memory seam '${val}': a malformed pin was accepted — the installer read this box's RAM instead"
+  elif ! grep -qF "AIRLOCK_PASEO_MEM_CAP_BYTES must be a plain byte count" <<<"$out"; then
+    bad "paseo memory seam '${val}': refused, but without saying the value was the problem"
+    printf '%s\n' "$out" | tail -6 | sed 's/^/    /'
+  else
+    ok "paseo memory seam '${val}': a malformed pin is fatal and names itself"
+  fi
+  rm -rf "$WDIR"
+}
+paseo_bad_seam_case '32GiB'      # the units typo
+paseo_bad_seam_case '8589934592 ' # a stray trailing space
+paseo_bad_seam_case 'max'        # the cgroup sentinel, which is NOT a valid pin
+
+# The number of cases above is asserted, because deleting cases is otherwise invisible:
+# shrinking the cap loop from thirteen entries to one left this suite fully green.
+paseo_mem_cases_expected=25
+if [ "$paseo_mem_cases_run" -ne "$paseo_mem_cases_expected" ]; then
+  bad "paseo memory coverage: ${paseo_mem_cases_run} cases ran, ${paseo_mem_cases_expected} expected — cases were added or removed without updating the count"
+else
+  ok "paseo memory coverage: all ${paseo_mem_cases_expected} declared cases ran"
+fi
 
 # Gate: a suite that runs the real installer must pin the RAM the paseo sizing block
-# reads, or its result depends on the RAM of whichever box ran it — the goldens bake in
-# a tier, and a suite straddling the 16 GiB edge flips between 14G/12G and 5.5G/5G for
-# reasons that have nothing to do with what it tests. (An intermediate design refused
-# below 8 GiB, which made this urgent; the refusal is gone, the pin is still right.)
+# reads, or its result depends on the RAM of whichever box ran it: the backstop is a
+# SHARE of the box, so unpinned, every runner writes a different MemoryMax and the
+# goldens bake in whichever the runner happened to have.
 #
 # Two things the naive version of this gate got wrong, both found by review:
 #   - It matched the literal `apps/paseo/install.sh`, so the dynamic idiom this very
@@ -1242,7 +1422,11 @@ for _suite in "$HERE"/test-*.sh; do
   grep -qE 'apps/[^/[:space:]"]*/install\.sh|airlock-install\.sh' \
     < <(grep -vE '^[[:space:]]*#' "$_suite") || continue
   paseo_pin_scanned=$(( paseo_pin_scanned + 1 ))
-  grep -q 'AIRLOCK_PASEO_MEM_CAP_BYTES' "$_suite" || paseo_pin_unpinned+=("$(basename "$_suite")")
+  # Comments stripped on THIS side too. They were not, so replacing a suite's real
+  # export with a comment that merely mentions the variable passed the gate — the same
+  # "a comment satisfies the check" defect the matcher above was already fixed for.
+  grep -q 'AIRLOCK_PASEO_MEM_CAP_BYTES' \
+    < <(grep -vE '^[[:space:]]*#' "$_suite") || paseo_pin_unpinned+=("$(basename "$_suite")")
 done
 # Positive control on the scan itself: if the match expression ever stops matching,
 # the loop would report "all pinned" while having looked at nothing.
@@ -1254,46 +1438,69 @@ else
   ok "paseo RAM pin gate: all ${paseo_pin_scanned} suites whose text names a real app installer (comments stripped, dynamic app segment included) pin the RAM it sizes from"
 fi
 
-run_installer_path publish "" \
+run_installer_path publish "" "" installer-path \
   "confd/hub-locations.d/publish.conf" "nginx.conf" \
   "units/airlock-publish.service" "unit-service.service" \
   "units/airlock-publish-cleanup.service" "unit-cleanup.service" \
   "units/airlock-publish-cleanup.timer" "unit-timer.timer"
 
 # ===========================================================================
-# paseo nested-installer ABI (child-4 P2b STEP 3): the browse-host sidecar
+# paseo nested-installer ABI: the browse-host sidecar
 # (apps/paseo/browse-host/install.sh) is invoked as a NESTED bash subprocess
 # from paseo's own install.sh (`bash "$BROWSE_INSTALL"`, only reached when
-# browse=true — off by default, so run_installer_path above never exercises
-# it). Now that paseo is a packaged/shipped app, the orchestrator sets
-# AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID in the environment paseo's
-# install.sh (and everything it execs) inherits — the nested script must NOT
-# pick those up and resolve the wrong root. It doesn't: it computes its own
-# ROOT from ${BASH_SOURCE[0]} (apps/paseo/browse-host/install.sh:13-14),
-# ignoring inherited env entirely. Proven by running the REAL script (not an
-# extracted copy — BASH_SOURCE only reflects reality for a script executed as
-# a real file) with AIRLOCK_ROOT/AIRLOCK_APP_DIR deliberately POLLUTED to a
-# scratch path a packaged run's environment could plausibly carry, and node
-# withheld from PATH so it fails at its own `require_cmd node npm systemctl`
-# (line 17 — the first thing it does after sourcing $ROOT/install/lib.sh) —
-# reached only if ROOT/lib.sh resolved correctly first. A wrong ROOT would
-# instead die sourcing a nonexistent install/lib.sh, a distinguishable bash
-# error ("No such file or directory"), never reaching require_cmd at all.
+# browse=true — off by default, so run_installer_path above never exercises it).
+#
+# It has to split two questions that used to be answered by one climb:
+#
+#   which platform?  -> AIRLOCK_ROOT, inherited from the packaged parent. It is
+#                       the same platform, so inheriting is correct — and it is
+#                       now the ONLY answer, because "../../.." is the platform
+#                       only while the package sits in the platform's apps/ tree.
+#   which files are  -> ${BASH_SOURCE[0]}, this sidecar's own directory. That
+#   mine?               must NOT come from the inherited AIRLOCK_APP_DIR, which
+#                       names paseo's package root, not this subdirectory.
+#
+# This fixture used to assert the opposite for the first question — that the
+# script ignores the inherited AIRLOCK_ROOT and computes its own by climbing.
+# That pinned the legacy arrangement in place: it passed only because the
+# package was inside the platform, which is exactly what the cutover ends.
+#
+# Both legs run the REAL script (not an extracted copy — BASH_SOURCE only
+# reflects reality for a script executed as a real file), with node withheld
+# from PATH so a correct run fails at its own `require_cmd node npm systemctl`,
+# the first thing it does after sourcing $ROOT/install/lib.sh. Reaching
+# require_cmd is the evidence that lib.sh resolved; a wrong root instead dies
+# sourcing a nonexistent install/lib.sh, a distinguishable bash error.
 BH_INSTALL="$ROOT/apps/paseo/browse-host/install.sh"
 BH_NOPATH="$TMP/paseo-nested-abi-nonode-path"; mkdir -p "$BH_NOPATH"
 for c in bash sh grep sed cat mktemp dirname basename readlink; do
   [ -n "$(command -v "$c" 2>/dev/null)" ] && ln -sf "$(command -v "$c")" "$BH_NOPATH/$c" 2>/dev/null
 done
+
+# Leg 1 — the platform comes from the inherited AIRLOCK_ROOT, and a POLLUTED
+# AIRLOCK_APP_DIR does not displace the sidecar's own BASH_SOURCE location.
 BH_ERR="$(
-  AIRLOCK_ROOT="$TMP/not-the-real-root" AIRLOCK_APP_DIR="$TMP/not-the-real-app-dir" \
-    PATH="$BH_NOPATH" bash "$BH_INSTALL" 2>&1 >/dev/null
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$TMP/not-the-real-app-dir" \
+    AIRLOCK_APP_ID=paseo PATH="$BH_NOPATH" bash "$BH_INSTALL" 2>&1 >/dev/null
 )"; BH_RC=$?
 if [ "$BH_RC" -eq 0 ]; then
   bad "paseo nested ABI: browse-host/install.sh exited 0 with node withheld from PATH (expected it to refuse)"
 elif grep -qF 'required command not found: node' <<<"$BH_ERR"; then
-  ok "paseo nested ABI: browse-host/install.sh resolves its OWN root from \${BASH_SOURCE[0]} (sourced lib.sh and reached require_cmd), unaffected by a packaged parent's inherited AIRLOCK_ROOT/AIRLOCK_APP_DIR"
+  ok "paseo nested ABI: browse-host/install.sh takes the platform from the inherited AIRLOCK_ROOT and its own files from \${BASH_SOURCE[0]}, unaffected by a polluted AIRLOCK_APP_DIR"
 else
-  bad "paseo nested ABI: browse-host/install.sh failed for the wrong reason (never reached require_cmd — ROOT likely resolved wrong): $BH_ERR"
+  bad "paseo nested ABI: browse-host/install.sh failed for the wrong reason (never reached require_cmd — ROOT resolved wrong): $BH_ERR"
+fi
+
+# Leg 2 — with no AIRLOCK_ROOT it must REFUSE rather than climb out of itself.
+# Without this leg, leg 1 would still pass if the script went back to climbing:
+# inside this repository the climb and the inherited root are the same path, and
+# that coincidence is the whole reason the legacy shape survived unnoticed.
+BH_ERR2="$(env -u AIRLOCK_ROOT -u AIRLOCK_APP_DIR -u AIRLOCK_APP_ID \
+  PATH="$BH_NOPATH" bash "$BH_INSTALL" 2>&1 >/dev/null)"; BH_RC2=$?
+if [ "$BH_RC2" -ne 0 ] && grep -qF 'AIRLOCK_ROOT' <<<"$BH_ERR2"; then
+  ok "paseo nested ABI: browse-host/install.sh refuses to run without AIRLOCK_ROOT instead of climbing \"../../..\" to a root it cannot have after the cutover"
+else
+  bad "paseo nested ABI: browse-host/install.sh ran (or failed for another reason) without AIRLOCK_ROOT (rc=$BH_RC2): $BH_ERR2"
 fi
 
 # ===========================================================================
@@ -1345,6 +1552,7 @@ gd_out="$(
          AIRLOCK_RENDER_DIR="$GDTMP/render" AIRLOCK_TEST_SUDO_LOG="$GDTMP/sudo.log" \
          AIRLOCK_TEST_SYSTEMCTL_LOG="$GDTMP/systemctl.log" PATH="$GDTMP/shim:$PATH"
   unset AIRLOCK_DRY_RUN
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/feedback" AIRLOCK_APP_ID=feedback \
   bash "$ROOT/apps/feedback/install.sh" 2>&1
 )"; gd_rc=$?
 if [ "$gd_rc" -eq 0 ]; then
@@ -1380,6 +1588,7 @@ EOF
 (
   export HOME="$RDTMP/home" AIRLOCK_CONFIG="$RDCFG" AIRLOCK_TS_FQDN="box.example.ts.net" \
          AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$RDTMP/render"
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/feedback" AIRLOCK_APP_ID=feedback \
   bash "$ROOT/apps/feedback/install.sh"
 ) > "$RDTMP/install.log" 2>&1
 rc=$?
@@ -1422,6 +1631,7 @@ EOF
   export HOME="$PDTMP/home" AIRLOCK_CONFIG="$PDCFG" AIRLOCK_TS_FQDN="box.example.ts.net" \
          AIRLOCK_CONFD="$PDTMP/confd" AIRLOCK_DRY_RUN=1
   unset AIRLOCK_RENDER_DIR
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/feedback" AIRLOCK_APP_ID=feedback \
   bash "$ROOT/apps/feedback/install.sh"
 ) > "$PDTMP/install.log" 2>&1
 pd_rc=$?
@@ -1486,6 +1696,7 @@ od_out="$(
          AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$ODTMP/render" \
          AIRLOCK_TEST_SUDO_LOG="$ODTMP/sudo.log" AIRLOCK_TEST_SYSTEMCTL_LOG="$ODTMP/systemctl.log" \
          PATH="$ODTMP/shim:$PATH"
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/orca" AIRLOCK_APP_ID=orca \
   bash "$ROOT/apps/orca/install.sh" 2>&1
 )"; od_rc=$?
 if [ "$od_rc" -ne 0 ]; then

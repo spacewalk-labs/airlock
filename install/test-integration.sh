@@ -2,9 +2,9 @@
 # Integration: run the REAL orchestrator (dry) to install all enabled separate-port
 # apps, then render the full nginx site and validate with `nginx -t`. No live services.
 set -uo pipefail
-# Pin the RAM the paseo installer picks its memory tier from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: unpinned, a suite straddling
-# the 16 GiB tier edge flips between 14G/12G and 5.5G/5G, and the goldens bake in
+# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
+# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH
 # app a dynamic path resolves to, so suites that only run other apps carry it too; the
@@ -25,14 +25,10 @@ cat >"$TMP/airlock.toml" <<'TOML'
 provider = "tailscale"
 owner = "me@example.com"
 collaborators = ["friend@example.com"]
-[paths]
-# markwand refuses to be installed without this: it is the read+write file surface
-# the collaborator above receives.
-code_root = "/srv/code"
 [apps.hub]
 [apps.devterm]
 [apps.code-server]
-[apps.markwand]
+[apps.fileview]
 [apps.publish]
 [apps.notepad]
 [apps.dev-monitor]
@@ -91,6 +87,7 @@ publish_probe() {
   local config="$1" confd="$2"
   HOME="$PUBLISH_PROBE_HOME" AIRLOCK_CONFIG="$config" AIRLOCK_CONFD="$confd" \
     AIRLOCK_WEBROOT="$confd/web" AIRLOCK_DRY_RUN=1 \
+    AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
     bash "$ROOT/apps/publish/install.sh"
 }
 
@@ -206,6 +203,7 @@ publish_umask_rc=0
 publish_umask_out="$(HOME="$PUBLISH_REAL_HOME" AIRLOCK_CONFIG="$TMP/publish-umask.toml" \
   AIRLOCK_CONFD="$TMP/publish-umask-confd" AIRLOCK_WEBROOT="$TMP/publish-umask-web" \
   AIRLOCK_DRY_RUN=0 PATH="$PUBLISH_REAL_SHIM:$PATH" \
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
   bash -c 'umask 077; exec bash "$1"' _ "$ROOT/apps/publish/install.sh" 2>&1)" || publish_umask_rc=$?
 umask_middle_mode="$(stat -c '%a' "$PUBLISH_PROBE_ROOT/existing/new" 2>/dev/null || true)"
 umask_existing_mode="$(stat -c '%a' "$PUBLISH_PROBE_ROOT/existing" 2>/dev/null || true)"
@@ -271,7 +269,9 @@ TOML
 mkdir -p "$PUBLISH_PROBE_ROOT/smoke-share"
 smoke_local_rc=0
 smoke_local_out="$(HOME="$PUBLISH_PROBE_HOME" AIRLOCK_CONFIG="$TMP/publish-smoke-local.toml" \
-  PATH="$PUBLISH_SMOKE_SHIM:$PATH" bash "$ROOT/apps/publish/smoke.sh" 2>&1)" || smoke_local_rc=$?
+  PATH="$PUBLISH_SMOKE_SHIM:$PATH" \
+  AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
+  bash "$ROOT/apps/publish/smoke.sh" 2>&1)" || smoke_local_rc=$?
 case "$smoke_local_rc:$smoke_local_out" in
   0:*"local-public=ok"*) ok "publish smoke: mode normalization checks LOCAL as local" ;;
   *) bad "publish smoke: LOCAL mode was treated as remote or smoke failed"; printf '%s\n' "$smoke_local_out" | sed 's/^/    /' ;;
@@ -416,7 +416,6 @@ cat >"$CLEAN/airlock.toml" <<'TOML'
 provider = "tailscale"
 owner = "me@example.com"
 [paths]
-code_root = "/srv/code"
 [apps.hub]
 [apps.paseo]
 TOML
@@ -663,10 +662,10 @@ else
   ok "devterm fragment has no 301"
 fi
 
-# markwand is a same-origin subpath: fragment lands in hub-locations.d and is
+# fileview is a same-origin subpath: fragment lands in hub-locations.d and is
 # gated by the hub's single server-level chokepoint (asserted on $SITE below).
-MWFRAG="$AIRLOCK_CONFD/hub-locations.d/markwand.conf"
-[ -f "$MWFRAG" ] && ok "markwand fragment written" || bad "markwand fragment missing"
+MWFRAG="$AIRLOCK_CONFD/hub-locations.d/fileview.conf"
+[ -f "$MWFRAG" ] && ok "fileview fragment written" || bad "fileview fragment missing"
 [ -f "$AIRLOCK_CONFD/hub-locations.d/publish.conf" ] && ok "publish fragment written" || bad "publish fragment missing"
 [ ! -e "$AIRLOCK_CONFD/public-includes.d/publish-gated.conf" ] && ok "remote publish does not write gated fragment" || bad "remote publish wrote gated fragment"
 [ -f "$AIRLOCK_CONFD/hub-locations.d/dev-monitor.conf" ] && ok "dev-monitor fragment written" || bad "dev-monitor fragment missing"
@@ -690,10 +689,21 @@ if command -v nginx >/dev/null 2>&1; then
     echo "$SITE"; echo "}"
   } >"$TMP/nginx.conf"
   if nginx -t -c "$TMP/nginx.conf" -p "$TMP" >/dev/null 2>&1; then
-    ok "nginx -t: hub + devterm + code-server + markwand + publish + dev-monitor all valid"
+    ok "nginx -t: hub + devterm + code-server + fileview + publish + dev-monitor all valid"
   else
     bad "nginx -t invalid"; nginx -t -c "$TMP/nginx.conf" -p "$TMP" 2>&1 | sed 's/^/    /'
   fi
 else echo "skip nginx -t"; fi
+
+# A dry orchestrator run cannot exercise singleton handover: by design it skips
+# every systemctl stop and DB migration. Run the hermetic non-dry fixture here
+# behind its own scratch HOME and command shims so CI covers the measured legacy
+# filebrowser lock and Orca X59 destruction regressions without touching a daemon.
+if bash "$ROOT/install/test-legacy-singleton-handover.sh" >"$TMP/legacy-handover.log" 2>&1; then
+  ok "legacy singleton handover regression suite"
+else
+  bad "legacy singleton handover regression suite"
+  sed 's/^/    /' "$TMP/legacy-handover.log"
+fi
 
 echo "---"; echo "passed=$pass failed=$fail"; [ "$fail" -eq 0 ]

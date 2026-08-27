@@ -8,18 +8,24 @@ Description=airlock-orca-xvfb — dedicated virtual display (:59) for Orca ADE
 # boot-log signature. network.target matches every other non-dependent app
 # unit in this repo and carries no such back-edge.
 After=network.target
+StartLimitIntervalSec=30
+StartLimitBurst=3
 
 [Service]
 Type=simple
-# Clear a stale lock/socket for our own display (:59) before Xvfb recreates it.
-ExecStartPre=-/bin/sh -c 'rm -f /tmp/.X59-lock /tmp/.X11-unix/X59'
+# Never unlink this display's lock/socket here. ExecStartPre runs again on every
+# failed restart, and a competing legacy X server may still own both resources.
+# The installer hands over the measured owner before start; a race or stale file
+# therefore makes Xvfb fail loudly without damaging the other runtime.
 # -extension GLX: on boxes with NVIDIA userspace EGL/GBM libs, Xvfb SIGSEGVs while
 #   loading libEGL_nvidia during GLX init (no real GPU in a container). orca renders
 #   with LIBGL_ALWAYS_SOFTWARE so it never needs server GLX -> disabling it is safe.
 ExecStart=/usr/bin/Xvfb :59 -screen 0 1280x1024x24 -nolisten tcp -extension GLX
 # active != socket-ready -> poll for the socket (up to ~10s) so orca's After holds.
 ExecStartPost=/bin/sh -c 'for _ in $(seq 1 100); do [ -S /tmp/.X11-unix/X59 ] && exit 0; sleep 0.1; done; exit 1'
-Restart=always
+# Resource conflicts exit nonzero and must not loop; abnormal termination such
+# as the measured NVIDIA/GLX SIGSEGV may still recover.
+Restart=on-abnormal
 RestartSec=2
 
 [Install]

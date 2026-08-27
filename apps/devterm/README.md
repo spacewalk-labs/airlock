@@ -38,12 +38,13 @@ browser --https--> tailscale serve :https_port --(identity)--> nginx owner-gate
   a Claude Code account from the browser, keep several accounts in a pool, switch
   between them, and manage the box's Codex login — all from the account popup.
 
-  The Claude side ships with airlock: `bin/claude-switch` (login + pool + switch) and
-  `bin/claude-status` (read-only identity/health probe) are installed to
-  `~/.local/bin/` when `accounts = true`, and are usable from the terminal too. Set
-  `claude_switch` / `claude_status` only to point at your own build. The Codex half
-  needs the `codex` CLI. When the feature is off or a tool is missing, the UI is hidden
-  and the endpoints return a clean "disabled".
+  The platform provides `bin/airlock-accounts` (login + pool + switch) and
+  `bin/airlock-accounts-status` (identity/health probe). devterm keeps installing
+  `~/.local/bin/claude-switch` and `claude-status` as compatibility shims, so both
+  commands remain usable from the terminal. Set `claude_switch` / `claude_status` only
+  to point the gate at your own build; otherwise it uses the platform tools. The Codex
+  half needs the `codex` CLI. When the feature is off or a configured tool is missing,
+  the UI is hidden and the endpoints return a clean "disabled".
 
   Login is headless — no callback port, no browser on the box: the popup issues a PKCE
   login link (`claude-switch login-url`, verifier stays server-side), you approve in any
@@ -61,9 +62,8 @@ browser --https--> tailscale serve :https_port --(identity)--> nginx owner-gate
   expiry reach the browser; access and refresh tokens never do. A past access-token
   expiry means OpenCode will refresh it on use, not that the sign-in is dead. This is
   labelled **OpenCode xAI** because Orca uses a separate `~/.grok/auth.json` login.
-- **markwand file-open**: click a file path in the terminal to open it in markwand.
-  Turns on automatically when `[apps.markwand]` is enabled and `[paths].code_root`
-  is set.
+- **fileview file-open**: click a file path in the terminal to open it in fileview.
+  Turns on automatically when `[apps.fileview]` is enabled.
 - **Orca worktree sidebar** (`orca_shim`): an experimental layout showing Orca's
   worktrees with per-worktree agent launchers. Needs the Orca CLI shim; falls back to
   the top-tab layout otherwise.

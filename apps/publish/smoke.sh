@@ -2,10 +2,14 @@
 # publish smoke — against a live install (after orchestrator render + reload).
 # Same-origin subpath, so the gate under test is the HUB nginx server.
 set -uo pipefail
-# ABI (D5): prefer the orchestrator-supplied AIRLOCK_ROOT/AIRLOCK_APP_ID,
-# falling back to $0-relative computation for a standalone invocation.
+# ABI (D5): the caller sets AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID and runs
+# this script with cwd = AIRLOCK_APP_DIR. AIRLOCK_ROOT is REQUIRED: the platform
+# root cannot be derived from $0, because "$0/../.." is only the platform when the
+# package happens to sit in the platform's own apps/ tree — the arrangement the
+# apps/ cutover ends. $0-relative self-location (this file's own directory) stays
+# fine and is what AIRLOCK_APP_DIR falls back to.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="${AIRLOCK_ROOT:-$(cd "$HERE/../.." && pwd)}"
+ROOT="${AIRLOCK_ROOT:?required by the D5 app ABI: run this through install/airlock-install.sh (or bin/airlock-smoke), or set AIRLOCK_ROOT/AIRLOCK_APP_DIR/AIRLOCK_APP_ID yourself. There is deliberately no \$0-relative fallback — this package does not have to live inside the platform tree.}"
 AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-publish}"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
@@ -28,8 +32,8 @@ c_no=$(code                                    "http://127.0.0.1:${HUB}/publish/
 # Captured and matched in-shell, never `curl | grep -q`: grep -q closes the pipe
 # at the first match, curl takes SIGPIPE, and under `set -o pipefail` the pipeline
 # reports FAILURE — so okjson would read `no` exactly when the answer is yes, and
-# only on the boxes whose list is big enough to fill a pipe buffer. markwand hit
-# this on an HTTP body and wrote it down (apps/markwand/smoke.sh:37-41); orca hit
+# only on the boxes whose list is big enough to fill a pipe buffer. fileview hit
+# this on an HTTP body and wrote it down (apps/fileview/smoke.sh:37-41); orca hit
 # it again on `ldconfig -p` and lost two installs to it. A list endpoint has no
 # code-visible bound on its size at all, which is what makes it the same shape.
 list_body="$(curl -s --max-time 6 -H "${HDR}: ${OWNER}" "http://127.0.0.1:${HUB}/publish/api/list")"
