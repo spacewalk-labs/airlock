@@ -201,6 +201,11 @@ const SUBAGENT_STREAM_PATCHES = [
     // has no other use for. Measured on two boxes the same day: the browse box had the
     // edit, the browse-less one did not, same paseo build. It belongs here, where every
     // box gets it.
+    // `(pointer: coarse)` is the right query, MEASURED on the reporting device rather
+    // than assumed: an iPad Pro (1366x1024) WITH the Magic Keyboard attached answers
+    // pointer:coarse=true, any-pointer:fine=false, hover:none=true — iPadOS does not
+    // report the trackpad as a pointing device at all, so `any-pointer` would widen the
+    // gate without fixing anything here (2026-09-01).
     name: "project-actions-coarse-pointer",
     find: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l,',
     repl: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches,',

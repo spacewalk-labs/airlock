@@ -462,16 +462,35 @@ def main():
 if __name__ == "__main__":
     main()
 PY
+  # 🔴 This stub OPENS THE TARGET THE WAY THE REAL TOOL DOES, and that is its whole
+  # job here. bin/airlock-config's install-snapshot uses O_WRONLY|O_TRUNC|O_NOFOLLOW
+  # and deliberately NO O_CREAT, so the caller must supply an already-created private
+  # regular file; refusing to create is what stops it becoming a general write
+  # primitive. This stub used to write_bytes() instead, which CREATES — so it accepted
+  # a caller the real tool rejects, and bin/airlock-update shipped a path that passed a
+  # never-created name and died fail-closed on every real box (2026-09-01, reproduced
+  # 100%) while this suite stayed green. A stub looser than the contract it stands in
+  # for tests the stub, not the caller.
   cat >"$d/bin/airlock-config" <<'PY'
 #!/usr/bin/env python3
-import hashlib, json, os, pathlib, shutil, sys
+import hashlib, json, os, pathlib, stat, sys
 if sys.argv[1:2] != ["install-snapshot"] or len(sys.argv) != 3:
     raise SystemExit(2)
 source = pathlib.Path(os.environ.get("AIRLOCK_CONFIG", "airlock.toml")).resolve()
 target = pathlib.Path(sys.argv[2])
 data = source.read_bytes()
-target.write_bytes(data)
-target.chmod(0o600)
+try:
+    flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(target, flags)
+    with os.fdopen(fd, "wb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            sys.stderr.write("fixture: install snapshot target is not a regular non-symlink file\n")
+            raise SystemExit(2)
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(data)
+except OSError as exc:
+    sys.stderr.write("fixture: cannot freeze install config -> %s: %s\n" % (target, exc))
+    raise SystemExit(2)
 print(json.dumps({"config_path": str(source), "sha256": hashlib.sha256(data).hexdigest()}))
 PY
   if [ "$version" = new ]; then

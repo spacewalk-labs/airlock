@@ -279,6 +279,23 @@ PY
   local rollback_ready=0 config_receipt="" config_path="" rollback_state_dir="" status_rc=0
   if [ "$do_install" = 1 ] && [ -f bin/airlock-status ]; then
     say "업데이트 전 상태를 확인하는 중…"
+    # 🔴 The CALLER creates this file. `airlock-config install-snapshot` opens it with
+    # O_WRONLY|O_TRUNC|O_NOFOLLOW and deliberately WITHOUT O_CREAT, so that it can never
+    # become a general write primitive — it freezes bytes into a file you already own and
+    # refuses everything else. Its two other callers honour that (install/airlock-install.sh
+    # uses `mktemp`, bin/airlock-backup uses `touch(mode=0o600)`); this one passed a path
+    # inside a `mktemp -d` directory that nothing had ever created, so `os.open` raised
+    # ENOENT and EVERY real update died here, fail-closed, before changing anything.
+    # Only real ones: --dry-run returns above this block and --no-install never enters it,
+    # which is the whole reason it reached a release (measured 2026-09-01, reproduced 100%).
+    #
+    # `set -C` is the point of the subshell, not tidiness: it opens with O_EXCL, so a path
+    # that already exists as ANYTHING — including a symlink someone raced into place — fails
+    # here instead of being followed. That is the same refusal O_NOFOLLOW makes on the callee
+    # side, kept on this side too rather than assumed from the 0700 mktemp directory.
+    # `umask 077` gives it 0600 from birth instead of widening then narrowing.
+    ( umask 077; set -C; : >"$scratch/config.snapshot" ) \
+      || die "업데이트 전 설정을 담을 파일을 만들지 못했습니다: $scratch/config.snapshot"
     config_receipt="$(python3 bin/airlock-config install-snapshot "$scratch/config.snapshot")" \
       || die "업데이트 전 설정을 고정하지 못했습니다"
     config_path="$(printf '%s' "$config_receipt" \
