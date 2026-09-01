@@ -112,6 +112,18 @@ location /publish/files/ {
     autoindex on;
     add_header Cache-Control "no-cache" always;
 }
+# Shared document assets at the ROOT path. Documents published into the share dir
+# reference their stylesheet and script as ROOT-ABSOLUTE URLs under /_assets/ — that
+# is the publishing convention, and thousands of already-published documents encode it.
+# Without this location the hub has no /_assets/ route, so the request falls through to
+# the SPA index and the browser receives HTML where it asked for CSS. It is a 200, so no
+# link checker catches it; the only symptom is that every document renders unstyled
+# (measured 2026-09-02: 69,276 bytes of hub HTML in place of a 61,486-byte stylesheet).
+# The directory itself is an operator-created symlink inside the share dir.
+location /_assets/ {
+    alias @@SHARE@@/_assets/;
+    add_header Cache-Control "no-cache" always;
+}
 NGINX
 }
 

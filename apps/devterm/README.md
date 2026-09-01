@@ -48,7 +48,9 @@ browser --https--> tailscale serve :https_port --(identity)--> nginx owner-gate
 
   Login is headless — no callback port, no browser on the box: the popup issues a PKCE
   login link (`claude-switch login-url`, verifier stays server-side), you approve in any
-  browser, and paste the returned code back (`login-code`). Credentials live in
+  browser, and paste the returned code back (`login-code`). The gate sends that one-time
+  value to the platform CLI over protected stdin, never process argv or an environment
+  variable. Credentials live in
   `~/.claude-accounts/<id>.json` (mode 600); the active one is copied into
   `~/.claude/.credentials.json`, which is what Claude Code reads. Accounts are named
   after the id you log in as — `email (personal|team)` — so a re-login always revives

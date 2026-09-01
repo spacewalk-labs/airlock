@@ -17,7 +17,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 JS="$ROOT/hub/assets/airlock-return.js"
-PANEL="$ROOT/apps/devterm/web/panel.html"
+PANEL="$ROOT/hub/assets/accounts/panel.html"
 
 command -v node >/dev/null 2>&1 \
   || { echo "FAIL frontend-namespace: node is required (the widget is JS)"; exit 1; }
@@ -39,6 +39,26 @@ grep -qF 'var LEGACY_SLOT = "#swk-airlock-slot";'         "$JS" || bad "the lega
 grep -qF 'var LEGACY_POS_KEY = "swk:airlock-btn-pos-v1";' "$JS" || bad "the legacy position key is gone"
 grep -qF "window.parent.postMessage('swk-panel-close', '*');" "$PANEL" \
   || bad "panel.html no longer emits the legacy close message (an old parent stops closing)"
+
+# ---- ACCT_OWN: three hosts, one panel ----
+# The return widget, the hub's identity pill and devterm's own page must open the SAME
+# account panel — that is what "promoted, not copied" means, and it is a property no
+# single file's test can see. All three are asserted here because the URL is built
+# independently in two places and loaded by a third, and a drift in any one of them is
+# a second implementation nobody decided to create.
+HUB="$ROOT/hub/index.html"
+DEVTERM_INDEX="$ROOT/apps/devterm/web/index.html"
+grep -qF 'frame.src = panelBase + "panel.html?p=" + which + "&embed=1";' "$JS" \
+  || bad "the return widget no longer opens panel.html?p=<which>&embed=1"
+grep -qF 'frame.src = base + "panel.html?p=accounts&embed=1";' "$HUB" \
+  || bad "the hub pill no longer opens the same panel.html the widget does"
+# devterm loads the aliased platform file, not a copy of its own. `src="accounts.js"`
+# resolves to /accounts.js from the gate's root page, which is the alias.
+grep -qF '<script src="accounts.js"></script>' "$DEVTERM_INDEX" \
+  || bad "devterm no longer loads the platform account list"
+[ -e "$ROOT/apps/devterm/web/accounts.js" ] || [ -e "$ROOT/apps/devterm/web/panel.html" ] \
+  && bad "devterm has a second copy of the account panel again" || true
+[ "$fail" = 0 ] && ok "widget, hub pill and devterm all open one account panel"
 
 # ---- wiring: the rules are called, not merely defined ----
 grep -qF 'if (document.getElementById(ID) || document.getElementById(LEGACY_ID)) return;' "$JS" \

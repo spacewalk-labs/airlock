@@ -183,7 +183,17 @@ export AIRLOCK_CONFD="$TMP/confd"
 export AIRLOCK_WEBROOT="$TMP/web"
 export AIRLOCK_DRY_RUN=1
 export AIRLOCK_TS_FQDN="box.example.ts.net"
-export AIRLOCK_SHIPPED_APPS_ROOT="$APPS_ROOT/apps"
+apps=(devterm code-server fileview publish notepad feedback dev-monitor paseo)
+# This suite deliberately excludes orca because external packages receive no
+# bundle-only system-unit/rooted-artifact grants. Project only the configured
+# eight packages into the scratch shipped root; pointing at the entire checkout
+# made the stated exclusion false as soon as airlock-apps synced orca's manifest.
+SCRATCH_SHIPPED_ROOT="$TMP/shipped-apps"
+mkdir -p "$SCRATCH_SHIPPED_ROOT"
+for app in "${apps[@]}"; do
+  cp -a "$APPS_ROOT/apps/$app" "$SCRATCH_SHIPPED_ROOT/$app"
+done
+export AIRLOCK_SHIPPED_APPS_ROOT="$SCRATCH_SHIPPED_ROOT"
 export AIRLOCK_SCRATCH_COMMAND_LOG="$TMP/commands.log"
 
 if HOME="$HOME" bash "$ROOT/install/airlock-install.sh" >"$TMP/orch.log" 2>&1; then
@@ -193,9 +203,8 @@ else
   sed 's/^/    /' "$TMP/orch.log" | tail -40
 fi
 
-apps=(devterm code-server fileview publish notepad feedback dev-monitor paseo)
 for app in "${apps[@]}"; do
-  if grep -Fq "would install packaged app: $app from $APPS_ROOT/apps/$app" "$TMP/orch.log"; then
+  if grep -Fq "would install packaged app: $app from $SCRATCH_SHIPPED_ROOT/$app" "$TMP/orch.log"; then
     ok "orchestrator resolved $app from airlock-apps"
   else
     bad "orchestrator did not resolve $app from airlock-apps"

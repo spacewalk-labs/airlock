@@ -12,11 +12,29 @@ Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS=false
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS=24
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS=24
 Environment=AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN=/opt/example/airlock/bin/airlock-accounts-status
-# '-' = optional: with messages off the file is absent by design, and the backend
-# then serves observability only. Secrets stay in this 0600 file, out of the unit.
+Environment=AIRLOCK_AGENT_PROVIDER=
+Environment=AIRLOCK_AGENT_BIN=
+# This 0600 file always carries the update owner's ingress gate. With messages on it
+# also carries the optional spool/action configuration; secrets never enter the unit.
 EnvironmentFile=-/home/example/.config/airlock/dev-monitor.env
 ExecStart=/usr/bin/python3 ROOT/apps/dev-monitor/backend/airlock-dev-monitor.py
-Restart=on-failure
+# always, not on-failure. On 2026-08-27 this backend exited with status 0 on its
+# own -- no crash, no stop command -- and on-failure does not restart a clean
+# exit, so it simply stayed down. It was down 5h13m before a human noticed, and
+# in that window 39 spooled messages (32 of them urgent, from six producers)
+# reached nobody: the collector is what drains new/, so nothing it would have
+# alerted about was even queued for delivery.
+#
+# A daemon whose whole job is to notice silence must not be able to leave
+# quietly. Restart=always also covers the exit reason we never identified,
+# which is
+# the point: the restart policy should not depend on our having diagnosed it.
+#
+# The crash-loop this could mask is caught from outside now: a backend that
+# keeps dying does not drain the spool either, and the host's own dead-man
+# check reports a new/ that stops emptying. Restart policy and that check are
+# a pair; neither is sufficient alone.
+Restart=always
 RestartSec=3
 
 [Install]

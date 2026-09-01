@@ -70,6 +70,7 @@ STUB
 cat >"$SHIM/systemctl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$AIRLOCK_TEST_TMP/systemctl.log"
+case "$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left airlock-update-detect.timer airlock-update-detect.service' ;; esac
 exit 0
 STUB
 cat >"$SHIM/loginctl" <<'STUB'

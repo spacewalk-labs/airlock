@@ -80,6 +80,12 @@ mkpkg() {   # mkpkg <dir> <manifest-config-body> [file-contents]
     printf 'fix = "it is already there"\nnote = "shell"\n'
   } > "$d/airlock-app.toml"
   printf '#!/usr/bin/env bash\n%s\n' "$content" > "$d/install.sh"
+  # These fixtures exercise runtime_env/strict-scan behavior, not dead port
+  # declarations. When the manifest carries the conventional fixture port,
+  # make its platform read explicit so the port-ownership gate is satisfied.
+  if grep -q '^port = ' "$d/airlock-app.toml"; then
+    printf 'fixture_port="${AIRLOCK_PROBE_PORT:?}"\ntest "$fixture_port" -gt 0\n' >> "$d/install.sh"
+  fi
   printf '#!/usr/bin/env bash\n' > "$d/smoke.sh"
 }
 
@@ -111,7 +117,7 @@ d="$TMP/p2"; mkpkg "$d" '[config]
 runtime_env = ["AIRLOCK_PROBE_WRITTEN"]
 
 [config.defaults]
-port = 1234' 'echo "$AIRLOCK_PROBE_WRITTEN"; echo "$AIRLOCK_PROBE_SOMETHINGELSE"'
+value = 1234' 'echo "$AIRLOCK_PROBE_WRITTEN"; echo "$AIRLOCK_PROBE_SOMETHINGELSE"'
 run "$(mkcfg "$d")"
 printf '%s' "$OUT" | grep -q 'AIRLOCK_PROBE_SOMETHINGELSE' \
   && ok "declaring one name does not excuse the next one" \
@@ -124,17 +130,17 @@ d="$TMP/p3"; mkpkg "$d" '[config]
 runtime_env = ["AIRLOCK_OTHERAPP_THING"]
 
 [config.defaults]
-port = 1234'
+value = 1234'
 run "$(mkcfg "$d")"
 [ "$RC" != 0 ] && printf '%s' "$OUT" | grep -q "own prefix" \
   && ok "a package cannot declare another package's variable" \
   || bad "a foreign-prefixed runtime_env entry was accepted: $OUT"
 
 d="$TMP/p4"; mkpkg "$d" '[config]
-runtime_env = ["AIRLOCK_PROBE_PORT"]
+runtime_env = ["AIRLOCK_PROBE_VALUE"]
 
 [config.defaults]
-port = 1234'
+value = 1234'
 run "$(mkcfg "$d")"
 [ "$RC" != 0 ] && printf '%s' "$OUT" | grep -q "collides" \
   && ok "a name cannot be both a config key and a runtime variable" \
@@ -144,7 +150,7 @@ d="$TMP/p5"; mkpkg "$d" '[config]
 runtime_env = ["AIRLOCK_PROBE_A", "AIRLOCK_PROBE_A"]
 
 [config.defaults]
-port = 1234'
+value = 1234'
 run "$(mkcfg "$d")"
 [ "$RC" != 0 ] && printf '%s' "$OUT" | grep -q "twice" \
   && ok "a duplicate entry is refused" \
@@ -154,7 +160,7 @@ d="$TMP/p6"; mkpkg "$d" '[config]
 runtime_env = ["AIRLOCK_PROBE_lowercase"]
 
 [config.defaults]
-port = 1234'
+value = 1234'
 run "$(mkcfg "$d")"
 [ "$RC" != 0 ] && ok "a name that is not a valid env var is refused" \
   || bad "a malformed runtime_env entry was accepted: $OUT"
@@ -163,7 +169,7 @@ d="$TMP/p7"; mkpkg "$d" '[config]
 runtime_env = "AIRLOCK_PROBE_A"
 
 [config.defaults]
-port = 1234'
+value = 1234'
 run "$(mkcfg "$d")"
 [ "$RC" != 0 ] && ok "runtime_env must be an array, not a bare string" \
   || bad "a scalar runtime_env was accepted: $OUT"
@@ -175,7 +181,7 @@ d="$TMP/p8"; mkpkg "$d" '[config]
 runtime_env = ["AIRLOCK_PROBE_GHOST"]
 
 [config.defaults]
-port = 1234' 'airlock_config get apps.probe.ghost'
+value = 1234' 'airlock_config get apps.probe.ghost'
 run "$(mkcfg "$d")"
 printf '%s' "$OUT" | grep -q 'reads apps.probe.ghost' \
   && ok "runtime_env does NOT excuse a literal 'airlock_config get' of the same name" \
@@ -183,7 +189,7 @@ printf '%s' "$OUT" | grep -q 'reads apps.probe.ghost' \
 
 # ---- strict mode ----
 d="$TMP/p9"; mkpkg "$d" '[config.defaults]
-port = 1234' 'echo "$AIRLOCK_PROBE_UNDECLARED"'
+value = 1234' 'echo "$AIRLOCK_PROBE_UNDECLARED"'
 run "$(mkcfg "$d")"
 [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q 'AIRLOCK_PROBE_UNDECLARED' \
   && ok "an EXTERNAL package with an undeclared reference warns and passes" \
@@ -197,7 +203,7 @@ run "$(mkcfg "$d")" AIRLOCK_STRICT_CONFIG_SCAN=1
 # not depend on breaking a real app.
 SHIP="$TMP/ship"; mkdir -p "$SHIP"
 mkpkg "$SHIP/probe" '[config.defaults]
-port = 1234' 'echo "$AIRLOCK_PROBE_UNDECLARED"'
+value = 1234' 'echo "$AIRLOCK_PROBE_UNDECLARED"'
 sed -i 's/^id = "probe"/id = "probe"/' "$SHIP/probe/airlock-app.toml"
 shipcfg="$TMP/shipcfg.toml"
 printf '[site]\nname = "P"\n\n[auth]\nprovider = "tailscale"\nowner = "o@example.com"\n\n[apps.hub]\n[apps.probe]\n' > "$shipcfg"
@@ -225,7 +231,7 @@ OUT="$(AIRLOCK_CONFIG="$shipcfg" AIRLOCK_SHIPPED_APPS_ROOT="$SHIP" AIRLOCK_TEST_
 # records eleven rounds of trying to become a shell parser; promoting a finding it
 # cannot decide would be that mistake with a fatal exit attached.
 mkpkg "$SHIP/probe" '[config.defaults]
-port = 1234' 'k=port; airlock_config get "apps.probe.$k"'
+value = 1234' 'k=value; airlock_config get "apps.probe.$k"'
 OUT="$(AIRLOCK_CONFIG="$shipcfg" AIRLOCK_SHIPPED_APPS_ROOT="$SHIP" AIRLOCK_TEST_BUNDLE_ROOT="$SHIP" AIRLOCK_STRICT_CONFIG_SCAN=1 python3 "$CFG" validate 2>&1)"; RC=$?
 [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q 'at runtime' \
   && ok "a runtime-built key stays a warning even under strict" \

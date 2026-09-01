@@ -1,0 +1,35 @@
+airlock-code-server-manager.service        loaded    active     running       airlock code-server slot manager API (127.0.0.1:19932)
+airlock-code-server@1.service              loaded    active     running       airlock code-server slot 1 — browser IDE engine
+airlock-devterm-gate.service               loaded    active     running       airlock devterm-gate — custom client + API, proxies to ttyd (127.0.0.1:19913)
+airlock-devterm.service                    loaded    active     running       airlock devterm — ttyd PTY backend (127.0.0.1:19912)
+airlock-feedback.service                   loaded    active     running       airlock feedback — suggestion-box relay (127.0.0.1:19924)
+airlock-fileview.service                   loaded    active     running       airlock filebrowser — file API for the viewer (127.0.0.1:19921)
+airlock-learning-ingest.service            loaded    active     running       airlock learning ingest worker — one link at a time
+airlock-learning.service                   loaded    active     running       airlock learning — study library (127.0.0.1:18832), behind the hub owner gate
+airlock-live-failed.service                loaded    inactive   dead          airlock — the weekly verification failed, say so
+airlock-live-verify.service                loaded    inactive   dead          airlock — weekly full-tree install on a disposable container
+airlock-orca-xvfb.service                  loaded    active     running       airlock-orca-xvfb — dedicated virtual display (:59) for Orca ADE
+airlock-orca.service                       loaded    active     running       airlock-orca — Orca ADE headless serve (behind the 127.0.0.1 owner gate)
+airlock-paseo-uistate.service              loaded    active     running       airlock paseo ui-state — cross-device web-UI state (127.0.0.1:19954)
+airlock-paseo.service                      loaded    active     running       airlock-paseo — Paseo daemon (coding-agent orchestration + web UI) behind the owner gate
+airlock-publish-cleanup.service            loaded    inactive   dead          airlock publish — uploads TTL sweep (24h) + public snapshot expiry
+airlock-publish.service                    loaded    active     running       airlock publish — static-share manager + uploads (127.0.0.1:19922)
+airlock-secret-sweep.service               loaded    inactive   dead          airlock — expire platform secret-drop files
+airlock-token-freshness-failed.service     loaded    inactive   dead          airlock — the credential freshness check failed, say so
+airlock-token-freshness.service            loaded    inactive   dead          airlock — check how long the provider credentials on this box have left
+claude-fleet-usage.service                 loaded    activating start   start claude-fleet 사용량 수집 — 계정별 순차(1초 스태거) → 중앙 기록
+dbus.service                               loaded    active     running       D-Bus User Message Bus
+devhub-vault-sync-failed@josh-note.service loaded    inactive   dead          vault josh-note 동기화 정지 알림
+devhub-vault-sync@josh-note.service        loaded    inactive   dead          vault josh-note 양방향 동기화 (이 박스 <-> origin)
+dirmngr.service                            loaded    inactive   dead          GnuPG network certificate management daemon
+docker.service                             not-found inactive   dead          docker.service
+gpg-agent.service                          loaded    active     running       GnuPG cryptographic agent and passphrase cache
+keyboxd.service                            loaded    inactive   dead          GnuPG public key management service
+launchpadlib-cache-clean.service           loaded    inactive   dead          Clean up old files in the Launchpadlib cache
+learning-manager.service                   loaded    active     running       learning-manager loopback API
+pk-debconf-helper.service                  loaded    inactive   dead          debconf communication service
+skill-wiring-check.service                 loaded    failed     failed        스킬 정본 → 박스 배선 주기점검 (조용한 미배선 회귀 감지)
+slides-manager.service                     loaded    active     running       slides-manager loopback gallery API
+snapd.session-agent.service                loaded    inactive   dead          snapd user session agent
+tailscaled.service                         not-found inactive   dead          tailscaled.service
+wiki-manager.service                       loaded    active     running       wiki-manager loopback API

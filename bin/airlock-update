@@ -5,6 +5,7 @@
 #   bash bin/airlock-update              # update ~/workspace/airlock (or this checkout)
 #   bash bin/airlock-update --dry-run    # show what would change; change nothing
 #   bash bin/airlock-update --no-install # replace the files, skip the reinstall
+#   bash bin/airlock-update --rollback   # restore the last failed update
 #   bash bin/airlock-update --machine m  # name the Linux machine instead of detecting it
 #
 # It also runs with no checkout in hand, which is how the FIRST update happens — the
@@ -51,11 +52,13 @@ main() {
   # this has to recognise were installed by code that no longer exists here.
   local MACHINE_MARKER=/opt/airlock/hub
 
-  local dry=0 do_install=1 machine=""
+  local dry=0 do_install=1 rollback=0 machine=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --dry-run)    dry=1 ;;
+    --dry-run)    dry=1 ;;
+    --json)       AIRLOCK_UPDATE_JSON=1 ;;
       --no-install) do_install=0 ;;
+      --rollback)   rollback=1 ;;
       --machine)    shift; [ $# -gt 0 ] || die "--machine 뒤에 머신 이름이 필요합니다"; machine="$1" ;;
       --machine=*)  machine="${1#--machine=}" ;;
       -h|--help)    usage; return 0 ;;
@@ -63,6 +66,12 @@ main() {
     esac
     shift
   done
+  if [ "$rollback" = 1 ] && { [ "$dry" = 1 ] || [ "$do_install" = 0 ]; }; then
+    die "--rollback 은 --dry-run 또는 --no-install 과 함께 쓸 수 없습니다"
+  fi
+  if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && [ "$dry" != 1 ]; then
+    die "--json 은 --dry-run 과 함께만 쓸 수 있습니다"
+  fi
 
   local ROOT=""
   if [ -n "${AIRLOCK_DIR:-}" ]; then
@@ -88,7 +97,14 @@ main() {
     || die "git 이 없습니다. 맥이면 터미널에서 'xcode-select --install' 을 한 번 실행하세요."
 
   cd "$ROOT" || die "$ROOT 로 들어가지 못했습니다"
+  trap release_update_mutex EXIT
   say "대상: $ROOT"
+
+  if [ "$rollback" = 1 ]; then
+    [ -d .git ] || die "되돌릴 업데이트 기록이 없습니다 (.git 없음)"
+    rollback_update "$ROOT" "$machine" "$MACHINE_MARKER"
+    return $?
+  fi
 
   # ---------------------------------------------------------------- 1) 저장소
   #
@@ -99,7 +115,7 @@ main() {
   # to keep correct.
   local scratch; scratch="$(mktemp -d)"
   # shellcheck disable=SC2064   # $scratch must expand now, not at trap time
-  trap "rm -rf '$scratch'" EXIT
+  trap "release_update_mutex; rm -rf '$scratch'" EXIT
   if [ ! -d .git ]; then
     if [ "$dry" = 1 ]; then
       # A preview must not create a repository in someone's directory, but every
@@ -120,6 +136,16 @@ main() {
       git add -A || die "현재 상태를 기록하지 못했습니다"
       commit_or_die "airlock-update: 업데이트 전 상태"
     fi
+  fi
+
+  local git_dir recovery_dir
+  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" \
+    || die "git 메타데이터 경로를 읽지 못했습니다"
+  acquire_update_mutex "$git_dir"
+  recovery_dir="$git_dir/airlock-update-rollback"
+  if [ "$dry" != 1 ] && [ -e "$recovery_dir" ]; then
+    die "끝나지 않은 업데이트 복구 기록이 있습니다.
+       먼저 되돌리십시오:  AIRLOCK_DIR=\"$ROOT\" bash \"$recovery_dir/airlock-update\" --rollback"
   fi
 
   # ---------------------------------------------------------------- 2) 배포본 받기
@@ -200,6 +226,16 @@ EOF
 
   if [ "$dry" = 1 ]; then
     say "[미리보기] 여기까지입니다. 아무것도 바꾸지 않았습니다."
+    if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
+      python3 - "$changed" "$new" <<'PY'
+import json
+import sys
+
+changed, ref = sys.argv[1:]
+print(json.dumps({"available": int(changed) > 0,
+                  "changedCount": int(changed), "ref": ref}, separators=(",", ":")))
+PY
+    fi
     return 0
   fi
 
@@ -233,6 +269,55 @@ EOF
   local before=""
   git rev-parse --verify -q HEAD >/dev/null 2>&1 && before="$(git rev-parse HEAD)"
 
+  # ---------------------------------------------------------------- 5b) 복구 기준점
+  #
+  # A tree revision alone is not a healthy-box snapshot.  The previous version did
+  # print one, but reset + a failing old installer merely trades one mixed box for a
+  # different mixed box.  Arm rollback only from a status run that inspected every
+  # check (rc 0, never rc 3), and freeze the exact config + installed-state records
+  # that the old installer will converge from.
+  local rollback_ready=0 config_receipt="" config_path="" rollback_state_dir="" status_rc=0
+  if [ "$do_install" = 1 ] && [ -f bin/airlock-status ]; then
+    say "업데이트 전 상태를 확인하는 중…"
+    config_receipt="$(python3 bin/airlock-config install-snapshot "$scratch/config.snapshot")" \
+      || die "업데이트 전 설정을 고정하지 못했습니다"
+    config_path="$(printf '%s' "$config_receipt" \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["config_path"])')" \
+      || die "고정한 설정 경로를 읽지 못했습니다"
+    case "$config_path" in *$'\n'*|*$'\r'*) die "설정 경로에 줄바꿈이 있어 안전하게 기록할 수 없습니다" ;; esac
+    snapshot_box_state "$ROOT" "$machine" "$scratch" \
+      || die "업데이트 전 설치 상태를 보존하지 못했습니다"
+    rollback_state_dir="$(cat "$scratch/state-dir")" \
+      || die "고정한 설치 상태 경로를 읽지 못했습니다"
+    box_status "$ROOT" "$machine" "$rollback_state_dir" "$config_path" \
+      >"$scratch/status-before.json"; status_rc=$?
+    [ "$status_rc" = 0 ] \
+      || die "업데이트 전 상태가 완전히 확인되지 않아 설치를 시작하지 않습니다 (airlock-status rc=$status_rc).
+       rc=3 도 정상으로 보지 않습니다. 위 상태 출력을 해결한 뒤 다시 실행하세요."
+    box_state_matches "$ROOT" "$machine" "$scratch" \
+      || die "업데이트 전 상태 확인 중 설치 기록이 달라져 시작하지 않습니다 — 다른 Airlock 실행이 끝난 뒤 다시 시도하세요."
+    if [ -f "${BASH_SOURCE[0]:-}" ]; then
+      cp "${BASH_SOURCE[0]}" "$scratch/airlock-update" \
+        || die "복구 명령을 보존하지 못했습니다"
+    else
+      git show "$new:bin/airlock-update" >"$scratch/airlock-update" \
+        || die "복구 명령을 배포본에서 보존하지 못했습니다"
+    fi
+    chmod 0600 "$scratch/airlock-update" || die "복구 명령을 보호하지 못했습니다"
+    rollback_ready=1
+  elif [ "$do_install" = 1 ]; then
+    say "주의: 이 설치본에는 bin/airlock-status 가 없어 자동 롤백 기준점을 만들 수 없습니다."
+  fi
+
+  # Put the recovery record in place BEFORE changing the checkout.  Until the new
+  # revision is known its phase is deliberately not auto-runnable: an interruption
+  # leaves an explicit, inspectable record and a pinned before commit instead of a
+  # mixed checkout with no explanation of how it got there.
+  if [ "$rollback_ready" = 1 ]; then
+    arm_recovery "$recovery_dir" "$scratch" "$before" \
+      "$config_path" "$(platform)" "$machine"
+  fi
+
   # ---------------------------------------------------------------- 6) 덮어쓰기
   #
   # `-- .` writes every path the release carries and touches nothing else, so files the
@@ -242,8 +327,13 @@ EOF
   # examples/app-package/airlock.toml, which is why the at-risk pass above exists.
   say "파일을 배포본으로 맞추는 중… (중간에 멈추면 git reset --hard HEAD 로 되돌립니다)"
   git checkout "$new" -- . || die "파일을 바꾸지 못했습니다 (아무것도 안 바뀌었을 수 있습니다)"
-  git add -A || true
-  commit_or_warn "airlock-update: 배포본 ${new:0:12} 으로 갱신"
+  git add -A || die "배포본 파일을 기록 대상으로 올리지 못했습니다"
+  commit_release_or_die "airlock-update: 배포본 ${new:0:12} 으로 갱신" "$before" "$ROOT"
+  local after="" update_rc=0
+  after="$(git rev-parse HEAD)" || die "갱신 뒤 revision 을 읽지 못했습니다"
+  if [ "$rollback_ready" = 1 ]; then
+    activate_recovery "$recovery_dir" "$after"
+  fi
   say "갱신했습니다."
   [ -n "$before" ] && say "되돌리려면:  git -C \"$ROOT\" reset --hard $before"
 
@@ -258,22 +348,70 @@ EOF
   # for the checkout because that is what it actually restores.
   if [ "$(platform)" != Darwin ]; then
     say "설치기를 다시 돌립니다…"
-    bash install/airlock-install.sh
-    return $?
+    AIRLOCK_CONFIG="$config_path" bash install/airlock-install.sh || update_rc=$?
+  else
+    say "설치기를 다시 돌립니다 (머신: $machine)…"
+    say "설치 중 경고가 여러 줄 나올 수 있습니다 — 마지막의 Entrance 주소가 나오면 성공입니다."
+    AIRLOCK_MACHINE="$machine" bash docker/orbstack-machine-setup.sh || update_rc=$?
   fi
-  say "설치기를 다시 돌립니다 (머신: $machine)…"
-  say "설치 중 경고가 여러 줄 나올 수 있습니다 — 마지막의 Entrance 주소가 나오면 성공입니다."
-  AIRLOCK_MACHINE="$machine" bash docker/orbstack-machine-setup.sh
+
+  if [ "$rollback_ready" != 1 ]; then
+    return "$update_rc"
+  fi
+
+  if [ "$update_rc" != 0 ]; then
+    if capture_failed_state "$ROOT" "$machine" "$recovery_dir"; then
+      printf '%s\n' failed >"$recovery_dir/phase"
+    else
+      printf '%s\n' failed-unbound >"$recovery_dir/phase"
+    fi
+    box_status "$ROOT" "$machine" "$rollback_state_dir" "$config_path" \
+      >"$recovery_dir/status-after-failure.json" 2>/dev/null || true
+    record_update_event "$git_dir" update-failed "$before" "$after" "$update_rc"
+    say "설치가 실패했습니다 (rc=$update_rc). 이전 상태는 보존돼 있습니다."
+    say "되돌리기:  AIRLOCK_DIR=\"$ROOT\" bash \"$recovery_dir/airlock-update\" --rollback"
+    return "$update_rc"
+  fi
+
+  box_status "$ROOT" "$machine" "$rollback_state_dir" "$config_path" \
+    >"$recovery_dir/status-after.json"; status_rc=$?
+  if [ "$status_rc" != 0 ]; then
+    if capture_failed_state "$ROOT" "$machine" "$recovery_dir"; then
+      printf '%s\n' failed >"$recovery_dir/phase"
+    else
+      printf '%s\n' failed-unbound >"$recovery_dir/phase"
+    fi
+    record_update_event "$git_dir" update-status-failed "$before" "$after" "$status_rc"
+    say "설치는 끝났지만 상태 검증이 통과하지 못했습니다 (airlock-status rc=$status_rc)."
+    say "rc=3 은 확인하지 못한 항목이 있으므로 성공이 아닙니다."
+    say "되돌리기:  AIRLOCK_DIR=\"$ROOT\" bash \"$recovery_dir/airlock-update\" --rollback"
+    return "$status_rc"
+  fi
+
+  record_update_event "$git_dir" update-ok "$before" "$after" 0
+  git update-ref -d refs/airlock-update/rollback "$before" \
+    || die "성공한 업데이트의 복구용 Git ref 를 정리하지 못했습니다"
+  rm -rf -- "$recovery_dir"
+  say "업데이트 뒤 상태도 정상입니다 (airlock-status rc=0)."
+  return 0
 }
 
-say()  { printf '\033[1;36m[airlock-update]\033[0m %s\n' "$*"; }
+say()  {
+  if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
+    printf '[airlock-update] %s\n' "$*" >&2
+  else
+    printf '\033[1;36m[airlock-update]\033[0m %s\n' "$*"
+  fi
+}
 die()  { printf '\033[1;31m[airlock-update] 중단:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() { printf '%s\n' \
   "airlock-update — 이미 깔린 Airlock 을 최신 배포본으로 갱신합니다." \
   "  bash bin/airlock-update              # 갱신하고 설치기까지 다시 돌립니다" \
   "  bash bin/airlock-update --dry-run    # 무엇이 바뀌는지만 보여 줍니다" \
+  "  bash bin/airlock-update --dry-run --json # 감지기용 JSON 요약만 출력" \
   "  bash bin/airlock-update --no-install # 파일만 갱신하고 설치기는 건너뜁니다" \
+  "  bash bin/airlock-update --rollback   # 마지막으로 실패한 갱신을 되돌립니다" \
   "  bash bin/airlock-update --machine m  # 리눅스 머신 이름을 직접 지정합니다" \
   "  AIRLOCK_DIR=/경로 를 앞에 붙이면 그 폴더를 갱신합니다."; }
 
@@ -286,6 +424,539 @@ is_checkout() {
   [ -f "$1/bin/airlock-config" ] \
     && [ -f "$1/install/airlock-install.sh" ] \
     && [ -f "$1/docker/orbstack-machine-setup.sh" ]
+}
+
+# Serialize the whole updater without a host `flock` dependency (macOS does not ship
+# util-linux flock) and without an inherited lock fd that a lifecycle background
+# process could keep forever.  The keeper locks the existing git directory itself,
+# so even --dry-run shares the mutex without creating a file in the checkout or .git.
+acquire_update_mutex() { # <absolute-git-dir>
+  local git_dir="$1" ready keeper status="" spins=0
+  ready="$(mktemp)" || die "업데이트 잠금 응답 파일을 만들지 못했습니다"
+  rm -f -- "$ready"
+  python3 - "$git_dir" "$ready" "$$" <<'PY' >/dev/null 2>&1 &
+import fcntl, os, pathlib, sys, time
+
+git_dir, ready, parent_raw = sys.argv[1:]
+parent = int(parent_raw)
+try:
+    descriptor = os.open(git_dir, os.O_RDONLY)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    pathlib.Path(ready).write_text("busy", encoding="ascii")
+    raise SystemExit(0)
+except Exception as exc:
+    pathlib.Path(ready).write_text(f"error:{exc}", encoding="utf-8")
+    raise SystemExit(0)
+pathlib.Path(ready).write_text("ok", encoding="ascii")
+while os.getppid() == parent:
+    try:
+        os.kill(parent, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.1)
+PY
+  keeper=$!
+  while [ ! -f "$ready" ] && kill -0 "$keeper" 2>/dev/null; do
+    spins=$((spins + 1))
+    [ "$spins" -lt 1000 ] || break
+    sleep 0.01
+  done
+  [ ! -f "$ready" ] || status="$(cat "$ready")"
+  rm -f -- "$ready"
+  case "$status" in
+    ok) AIRLOCK_UPDATE_KEEPER_PID="$keeper"; return 0 ;;
+    busy) wait "$keeper" 2>/dev/null || true
+      die "다른 airlock-update 또는 rollback 이 진행 중입니다 — 끝난 뒤 다시 시도하세요" ;;
+    *) kill "$keeper" 2>/dev/null || true
+      wait "$keeper" 2>/dev/null || true
+      die "업데이트 실행 잠금을 잡지 못했습니다${status:+ ($status)}" ;;
+  esac
+}
+
+release_update_mutex() {
+  local keeper="${AIRLOCK_UPDATE_KEEPER_PID:-}"
+  [ -n "$keeper" ] || return 0
+  AIRLOCK_UPDATE_KEEPER_PID=""
+  kill "$keeper" 2>/dev/null || true
+  wait "$keeper" 2>/dev/null || true
+}
+
+# Run the status surface against the box that the installer actually changes.  On a
+# Mac the checkout is shared into OrbStack, but the services/state live inside the
+# machine; asking macOS would be a clean answer about the wrong computer.
+box_status() { # box_status <checkout> <machine> [state-dir config-path]
+  local root="$1" machine="$2" state_dir="${3-}" config_path="${4-}"
+  if [ "$(platform)" != Darwin ]; then
+    if [ $# -ge 4 ]; then
+      (cd "$root" && AIRLOCK_STATE_DIR="$state_dir" AIRLOCK_CONFIG="$config_path" \
+        python3 bin/airlock-status --json)
+    else
+      (cd "$root" && python3 bin/airlock-status --json)
+    fi
+    return $?
+  fi
+  # shellcheck disable=SC2016 # $1 expands inside the remote bash, not here.
+  if [ $# -ge 4 ]; then
+    orb -m "$machine" env "AIRLOCK_STATE_DIR=$state_dir" \
+      "AIRLOCK_CONFIG=/mnt/mac$config_path" \
+      bash -c 'cd "$1" && python3 bin/airlock-status --json' \
+      airlock-status "/mnt/mac$root"
+  else
+    orb -m "$machine" bash -c 'cd "$1" && python3 bin/airlock-status --json' \
+      airlock-status "/mnt/mac$root"
+  fi
+}
+
+snapshot_regular() { # snapshot_regular <source> <snapshot-dir> <name>
+  local source="$1" out="$2" name="$3"
+  if [ -L "$source" ] || { [ -e "$source" ] && [ ! -f "$source" ]; }; then
+    die "복구 기준 파일이 일반 파일이 아닙니다: $source"
+  fi
+  if [ -f "$source" ]; then
+    cp -- "$source" "$out/$name" || die "복구 기준 파일을 복사하지 못했습니다: $source"
+    chmod 0600 "$out/$name" || die "복구 기준 파일을 보호하지 못했습니다: $name"
+    printf '%s\n' present >"$out/$name.state"
+  else
+    printf '%s\n' absent >"$out/$name.state"
+  fi
+}
+
+snapshot_remote_state() { # snapshot_remote_state <machine> <state-dir> <out>
+  local machine="$1" state_dir="$2" out="$3"
+  # One remote process holds the writer lock while it copies BOTH records.  A tar
+  # stream brings the private snapshot back without assuming the host's mktemp path
+  # is mounted into the machine.
+  orb -m "$machine" env "AIRLOCK_STATE_DIR=$state_dir" bash -s -- "$state_dir" <<'SNAPSHOT_REMOTE' \
+    | tar -C "$out" -xf - || die "OrbStack 머신의 설치 상태를 일관되게 보존하지 못했습니다"
+set -euo pipefail
+state_dir=$1
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+snapshot_one() {
+  source=$1; name=$2
+  [ ! -L "$source" ] && { [ ! -e "$source" ] || [ -f "$source" ]; } || exit 41
+  if [ -f "$source" ]; then
+    cp -- "$source" "$tmp/$name"
+    chmod 0600 "$tmp/$name"
+    printf '%s\n' present >"$tmp/$name.state"
+  else
+    printf '%s\n' absent >"$tmp/$name.state"
+  fi
+}
+if [ -d "$state_dir" ]; then
+  lock="$state_dir/app-ledger.lock"
+  [ ! -L "$lock" ] && { [ ! -e "$lock" ] || [ -f "$lock" ]; } || exit 41
+  exec 9>>"$lock"
+  flock -n 9 || exit 42
+fi
+snapshot_one "$state_dir/app-ledger.json" app-ledger.json
+snapshot_one "$state_dir/plaintext-retirement.json" plaintext-retirement.json
+tar -C "$tmp" -cf - .
+SNAPSHOT_REMOTE
+}
+
+snapshot_box_state() { # snapshot_box_state <root> <machine> <out> [state-dir]
+  local root="$1" machine="$2" out="$3" state_dir
+  if [ "$(platform)" = Darwin ]; then
+    if [ $# -ge 4 ]; then
+      state_dir="$4"
+    else
+      # shellcheck disable=SC2016 # HOME/AIRLOCK_STATE_DIR belong to the machine.
+      state_dir="$(orb -m "$machine" sh -c 'printf %s "${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}"')" \
+        || die "OrbStack 머신의 Airlock 상태 경로를 읽지 못했습니다"
+    fi
+    [ -n "$state_dir" ] || die "OrbStack 머신의 Airlock 상태 경로가 비었습니다"
+    case "$state_dir" in /*) ;; *) die "OrbStack 머신의 Airlock 상태 경로가 절대 경로가 아닙니다: $state_dir" ;; esac
+    case "$state_dir" in *$'\n'*|*$'\r'*) die "Airlock 상태 경로에 줄바꿈이 있어 안전하게 기록할 수 없습니다" ;; esac
+    printf '%s' "$state_dir" >"$out/state-dir"
+    snapshot_remote_state "$machine" "$state_dir" "$out" || return 1
+  else
+    state_dir="${4-${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}}"
+    case "$state_dir" in /*) ;; *) die "Airlock 상태 경로가 절대 경로가 아닙니다: $state_dir" ;; esac
+    case "$state_dir" in *$'\n'*|*$'\r'*) die "Airlock 상태 경로에 줄바꿈이 있어 안전하게 기록할 수 없습니다" ;; esac
+    printf '%s' "$state_dir" >"$out/state-dir"
+    if [ -d "$state_dir" ]; then
+      # The installer and ledger tool use this same lock.  One lock spans both
+      # records so a snapshot cannot pair a ledger from one install with a
+      # retirement record from another.
+      (cd "$root" && \
+        validate_target_shape "$state_dir/app-ledger.lock" && \
+        exec 9>>"$state_dir/app-ledger.lock" && \
+        flock -n 9 && \
+        snapshot_regular "$state_dir/app-ledger.json" "$out" app-ledger.json && \
+        snapshot_regular "$state_dir/plaintext-retirement.json" "$out" plaintext-retirement.json) \
+        || return 1
+    else
+      snapshot_regular "$state_dir/app-ledger.json" "$out" app-ledger.json || return 1
+      snapshot_regular "$state_dir/plaintext-retirement.json" "$out" plaintext-retirement.json || return 1
+    fi
+  fi
+  snapshot_regular "$root/airlock.lock" "$out" airlock.lock || return 1
+}
+
+snapshot_hash() { git hash-object --stdin <"$1"; }
+
+capture_failed_state() { # <root> <machine> <recovery-dir>
+  local root="$1" machine="$2" dir="$3" state_dir name
+  local failed="$dir/failed"
+  state_dir="$(cat "$dir/state-dir")" || return 1
+  mkdir -m 0700 "$failed" || return 1
+  if ! (snapshot_box_state "$root" "$machine" "$failed" "$state_dir"); then
+    return 1
+  fi
+  for name in app-ledger.json plaintext-retirement.json airlock.lock; do
+    if [ "$(cat "$failed/$name.state")" = present ]; then
+      snapshot_hash "$failed/$name" >"$failed/$name.sha256" || return 1
+    fi
+  done
+  chmod 0600 "$failed"/* || return 1
+}
+
+box_state_matches() { # <root> <machine> <expected-dir>
+  local root="$1" machine="$2" expected="$3" current name state state_dir
+  current="$(mktemp -d)" || return 1
+  state_dir="$(cat "$expected/state-dir")" || { rm -rf -- "$current"; return 1; }
+  if ! (snapshot_box_state "$root" "$machine" "$current" "$state_dir"); then
+    rm -rf -- "$current"
+    return 1
+  fi
+  if ! cmp -s "$expected/state-dir" "$current/state-dir"; then
+    rm -rf -- "$current"
+    return 1
+  fi
+  for name in app-ledger.json plaintext-retirement.json airlock.lock; do
+    if ! cmp -s "$expected/$name.state" "$current/$name.state"; then
+      rm -rf -- "$current"
+      return 1
+    fi
+    state="$(cat "$expected/$name.state")"
+    if [ "$state" = present ] && ! cmp -s "$expected/$name" "$current/$name"; then
+      rm -rf -- "$current"
+      return 1
+    fi
+  done
+  rm -rf -- "$current"
+}
+
+arm_recovery() { # <dir> <scratch> <before> <config-path> <platform> <machine>
+  local dir="$1" scratch="$2" before="$3" config="$4" os="$5" machine="$6" name staged
+  staged="$(mktemp -d "$dir.prepare.XXXXXX")" \
+    || die "복구 기록 준비 디렉터리를 만들지 못했습니다: $dir"
+  for name in status-before.json config.snapshot state-dir \
+              app-ledger.json.state plaintext-retirement.json.state airlock.lock.state \
+              airlock-update; do
+    cp -- "$scratch/$name" "$staged/$name" || die "복구 기록을 보존하지 못했습니다: $name"
+  done
+  for name in app-ledger.json plaintext-retirement.json airlock.lock; do
+    if [ "$(cat "$scratch/$name.state")" = present ]; then
+      cp -- "$scratch/$name" "$staged/$name" || die "복구 기준을 보존하지 못했습니다: $name"
+      snapshot_hash "$staged/$name" >"$staged/$name.sha256"
+    fi
+  done
+  printf '%s' "$before" >"$staged/before"
+  : >"$staged/after"
+  printf '%s' "$config" >"$staged/config-path"
+  printf '%s' "$os" >"$staged/platform"
+  printf '%s' "$machine" >"$staged/machine"
+  printf '%s' "$$" >"$staged/pid"
+  snapshot_hash "$staged/config.snapshot" >"$staged/config.snapshot.sha256"
+  for name in before config-path platform machine state-dir; do
+    snapshot_hash "$staged/$name" >"$staged/$name.sha256"
+  done
+  printf '%s\n' checkout-pending >"$staged/phase"
+  chmod 0600 "$staged"/* || die "복구 기록 권한을 좁히지 못했습니다"
+  git update-ref refs/airlock-update/rollback "$before" \
+    || die "업데이트 전 Git 객체를 복구용으로 고정하지 못했습니다"
+  if ! mv -- "$staged" "$dir"; then
+    git update-ref -d refs/airlock-update/rollback "$before" >/dev/null 2>&1 || true
+    die "완성한 복구 기록을 제자리에 두지 못했습니다: $dir"
+  fi
+}
+
+activate_recovery() { # <dir> <after>
+  local dir="$1" after="$2" tmp
+  tmp="$dir/after.tmp.$$"
+  printf '%s' "$after" >"$tmp" || die "실패 업데이트 revision 을 복구 기록에 쓰지 못했습니다"
+  chmod 0600 "$tmp" || die "실패 업데이트 revision 기록 권한을 좁히지 못했습니다"
+  mv -f -- "$tmp" "$dir/after" || die "실패 업데이트 revision 을 원자적으로 고정하지 못했습니다"
+  snapshot_hash "$dir/after" >"$dir/after.sha256" \
+    || die "실패 업데이트 revision 해시를 고정하지 못했습니다"
+  chmod 0600 "$dir/after.sha256" || die "실패 업데이트 revision 해시 권한을 좁히지 못했습니다"
+  tmp="$dir/phase.tmp.$$"
+  printf '%s\n' installing >"$tmp" || die "복구 기록 단계를 쓰지 못했습니다"
+  chmod 0600 "$tmp" || die "복구 기록 단계 권한을 좁히지 못했습니다"
+  mv -f -- "$tmp" "$dir/phase" || die "복구 기록 단계를 원자적으로 바꾸지 못했습니다"
+}
+
+record_update_event() { # <git-dir> <event> <before> <after> <rc>
+  local git_dir="$1" event="$2" before="$3" after="$4" rc="$5"
+  printf '%s\t%s\tbefore=%s\tafter=%s\trc=%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$event" "$before" "$after" "$rc" \
+    >>"$git_dir/airlock-update.log"
+}
+
+validate_snapshot() { # <dir> <name>
+  local dir="$1" name="$2" state expected actual
+  if [ ! -f "$dir/$name.state" ] || [ -L "$dir/$name.state" ]; then
+    die "복구 기록이 불완전합니다: $name.state"
+  fi
+  state="$(cat "$dir/$name.state")"
+  case "$state" in
+    absent) [ ! -e "$dir/$name" ] || die "없어야 할 복구 기준 파일이 생겼습니다: $name" ;;
+    present)
+      if [ ! -f "$dir/$name" ] || [ -L "$dir/$name" ] || [ ! -f "$dir/$name.sha256" ]; then
+        die "복구 기준 파일이 불완전합니다: $name"
+      fi
+      expected="$(cat "$dir/$name.sha256")"; actual="$(snapshot_hash "$dir/$name")"
+      [ "$actual" = "$expected" ] || die "복구 기준 파일 해시가 달라졌습니다: $name" ;;
+    *) die "복구 기준 파일 상태가 잘못됐습니다: $name ($state)" ;;
+  esac
+}
+
+validate_target_shape() { # <path>
+  local path="$1"
+  [ ! -L "$path" ] || die "되돌릴 대상이 symlink 로 바뀌었습니다: $path"
+  { [ ! -e "$path" ] || [ -f "$path" ]; } \
+    || die "되돌릴 대상이 일반 파일이 아닙니다: $path"
+}
+
+# Remove every artifact the CURRENT ledger knows before restoring the old ledger.
+# The order comes from the ledger's own dependency graph; alphabetical teardown can
+# remove a dependency while its consumer is still live.  One flock covers teardown
+# AND both old-state restores; releasing it between those operations lets another
+# installer write a legitimate new ledger that rollback would then overwrite.
+teardown_and_restore_box_state() { # <root> <machine> <state-dir> <snapshot-dir> <failed-dir>
+  local root="$1" machine="$2" state_dir="$3" snapshot_dir="$4" failed_dir="$5"
+  local box_root="$root"
+  [ "$(platform)" != Darwin ] || box_root="/mnt/mac$root"
+  if [ "$(platform)" = Darwin ]; then
+    orb -m "$machine" env "AIRLOCK_STATE_DIR=$state_dir" bash -s -- \
+      "$box_root" "$state_dir" "/mnt/mac$snapshot_dir" "/mnt/mac$failed_dir" <<'ROLLBACK_TEARDOWN'
+set -euo pipefail
+root=$1; state_dir=$2; snapshot_dir=$3; failed_dir=$4; ledger="$state_dir/app-ledger.json"
+[ ! -L "$ledger" ] && { [ ! -e "$ledger" ] || [ -f "$ledger" ]; } || exit 41
+mkdir -p "$state_dir"
+exec 9>>"$state_dir/app-ledger.lock"
+flock -n 9 || { echo "another airlock run holds the ledger lock" >&2; exit 42; }
+[ "$(cat "$failed_dir/state-dir")" = "$state_dir" ] || exit 43
+matches_failed() {
+  name=$1; target=$2; state=$(cat "$failed_dir/$name.state")
+  [ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || exit 41
+  if [ "$state" = absent ]; then [ ! -e "$target" ]; return; fi
+  [ "$state" = present ] && [ -f "$target" ] && cmp -s "$failed_dir/$name" "$target"
+}
+matches_failed app-ledger.json "$ledger" || exit 44
+matches_failed plaintext-retirement.json "$state_dir/plaintext-retirement.json" || exit 44
+matches_failed airlock.lock "$root/airlock.lock" || exit 44
+if [ -f "$ledger" ]; then
+  order="$(python3 - "$root/bin/airlock-ledger" <<'PY'
+from importlib.machinery import SourceFileLoader
+import sys
+sys.dont_write_bytecode = True
+m = SourceFileLoader("_airlock_rollback_ledger", sys.argv[1]).load_module()
+s = m.load_store()
+print("\n".join(m._removal_order(s, list(s["entries"]))))
+PY
+)"
+  while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    printf '{}\n' | python3 "$root/bin/airlock-ledger" teardown "$app"
+  done <<<"$order"
+fi
+restore_one() {
+  name=$1; target=$2; state_file="$snapshot_dir/$name.state"
+  [ -f "$state_file" ] && [ ! -L "$state_file" ] || exit 43
+  [ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || exit 41
+  state=$(cat "$state_file")
+  if [ "$state" = absent ]; then rm -f -- "$target"; return; fi
+  [ "$state" = present ] && [ -f "$snapshot_dir/$name" ] && [ ! -L "$snapshot_dir/$name" ] || exit 43
+  tmp="$target.airlock-rollback.$$"
+  cp -- "$snapshot_dir/$name" "$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$target"
+}
+restore_one app-ledger.json "$state_dir/app-ledger.json"
+restore_one plaintext-retirement.json "$state_dir/plaintext-retirement.json"
+restore_one airlock.lock "$root/airlock.lock"
+ROLLBACK_TEARDOWN
+  else
+    (cd "$root" && AIRLOCK_STATE_DIR="$state_dir" bash -s -- \
+      "$box_root" "$state_dir" "$snapshot_dir" "$failed_dir" <<'ROLLBACK_TEARDOWN'
+set -euo pipefail
+root=$1; state_dir=$2; snapshot_dir=$3; failed_dir=$4; ledger="$state_dir/app-ledger.json"
+[ ! -L "$ledger" ] && { [ ! -e "$ledger" ] || [ -f "$ledger" ]; } || exit 41
+mkdir -p "$state_dir"
+exec 9>>"$state_dir/app-ledger.lock"
+flock -n 9 || { echo "another airlock run holds the ledger lock" >&2; exit 42; }
+[ "$(cat "$failed_dir/state-dir")" = "$state_dir" ] || exit 43
+matches_failed() {
+  name=$1; target=$2; state=$(cat "$failed_dir/$name.state")
+  [ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || exit 41
+  if [ "$state" = absent ]; then [ ! -e "$target" ]; return; fi
+  [ "$state" = present ] && [ -f "$target" ] && cmp -s "$failed_dir/$name" "$target"
+}
+matches_failed app-ledger.json "$ledger" || exit 44
+matches_failed plaintext-retirement.json "$state_dir/plaintext-retirement.json" || exit 44
+matches_failed airlock.lock "$root/airlock.lock" || exit 44
+if [ -f "$ledger" ]; then
+  order="$(python3 - "$root/bin/airlock-ledger" <<'PY'
+from importlib.machinery import SourceFileLoader
+import sys
+sys.dont_write_bytecode = True
+m = SourceFileLoader("_airlock_rollback_ledger", sys.argv[1]).load_module()
+s = m.load_store()
+print("\n".join(m._removal_order(s, list(s["entries"]))))
+PY
+)"
+  while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    printf '{}\n' | python3 "$root/bin/airlock-ledger" teardown "$app"
+  done <<<"$order"
+fi
+restore_one() {
+  name=$1; target=$2; state_file="$snapshot_dir/$name.state"
+  [ -f "$state_file" ] && [ ! -L "$state_file" ] || exit 43
+  [ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || exit 41
+  state=$(cat "$state_file")
+  if [ "$state" = absent ]; then rm -f -- "$target"; return; fi
+  [ "$state" = present ] && [ -f "$snapshot_dir/$name" ] && [ ! -L "$snapshot_dir/$name" ] || exit 43
+  tmp="$target.airlock-rollback.$$"
+  cp -- "$snapshot_dir/$name" "$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$target"
+}
+restore_one app-ledger.json "$state_dir/app-ledger.json"
+restore_one plaintext-retirement.json "$state_dir/plaintext-retirement.json"
+restore_one airlock.lock "$root/airlock.lock"
+ROLLBACK_TEARDOWN
+    )
+  fi
+}
+
+rollback_update() { # <root> <machine-option> <machine-marker>
+  local root="$1" requested_machine="$2" marker="$3" git_dir dir phase before after
+  local saved_platform saved_machine machine head parent dirty config_path state_dir rc=0
+  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" \
+    || die "git 메타데이터 경로를 읽지 못했습니다"
+  acquire_update_mutex "$git_dir"
+  dir="$git_dir/airlock-update-rollback"
+  if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+    die "되돌릴 실패 업데이트 기록이 없습니다"
+  fi
+  for f in phase before before.sha256 after after.sha256 config-path config-path.sha256 \
+           config.snapshot config.snapshot.sha256 platform platform.sha256 machine machine.sha256 \
+           state-dir state-dir.sha256 \
+           airlock-update status-before.json; do
+    if [ ! -f "$dir/$f" ] || [ -L "$dir/$f" ]; then
+      die "복구 기록이 불완전합니다: $f"
+    fi
+  done
+  phase="$(cat "$dir/phase")"; before="$(cat "$dir/before")"; after="$(cat "$dir/after")"
+  saved_platform="$(cat "$dir/platform")"; saved_machine="$(cat "$dir/machine")"
+  config_path="$(cat "$dir/config-path")"; state_dir="$(cat "$dir/state-dir")"
+  for f in before after config-path platform machine state-dir; do
+    [ "$(snapshot_hash "$dir/$f")" = "$(cat "$dir/$f.sha256")" ] \
+      || die "복구 기록의 metadata가 달라졌습니다: $f"
+  done
+  case "$state_dir" in /*) ;; *) die "복구 기록의 설치 상태 경로가 절대 경로가 아닙니다: $state_dir" ;; esac
+  case "$phase" in
+    failed|rollback-failed) ;;
+    failed-unbound) die "실패 직후 설치 상태를 고정하지 못해 자동 롤백하지 않습니다" ;;
+    installing) die "업데이트가 설치 중 끊겼지만 실패 직후 상태를 고정하지 못해 자동 롤백하지 않습니다" ;;
+    *) die "롤백 자체가 '$phase' 단계에서 끊겨 자동 재개하지 않습니다 — 기록을 보존한 채 수동 점검이 필요합니다" ;;
+  esac
+  [ "$(platform)" = "$saved_platform" ] \
+    || die "업데이트한 플랫폼($saved_platform)과 지금 플랫폼($(platform))이 다릅니다"
+  machine="$saved_machine"
+  if [ "$saved_platform" = Darwin ]; then
+    [ -z "$requested_machine" ] || [ "$requested_machine" = "$saved_machine" ] \
+      || die "업데이트 기록의 머신은 '$saved_machine' 입니다. '$requested_machine' 으로 바꿔 되돌리지 않습니다"
+    machine="$(resolve_machine "$saved_machine" "$marker")" || return 1
+  elif [ -n "$requested_machine" ]; then
+    die "리눅스에서 기록하지 않은 --machine 을 붙여 되돌리지 않습니다"
+  fi
+  case "$before:$after" in
+    *[!0-9a-f:]*|:*|*:) die "복구 기록의 Git revision 이 잘못됐습니다" ;;
+  esac
+  git cat-file -e "$before^{commit}" 2>/dev/null || die "업데이트 전 Git 객체가 없습니다: $before"
+  git cat-file -e "$after^{commit}" 2>/dev/null || die "실패 업데이트 Git 객체가 없습니다: $after"
+  if [ "$before" != "$after" ]; then
+    parent="$(git rev-parse "$after^")" || die "실패 업데이트의 부모 revision 을 읽지 못했습니다"
+    [ "$parent" = "$before" ] || die "실패 업데이트가 기록된 이전 revision 바로 위에 있지 않습니다"
+  fi
+  head="$(git rev-parse HEAD)" || die "현재 revision 을 읽지 못했습니다"
+  case "$phase:$head" in
+    failed:"$after"|rollback-failed:"$before") ;;
+    *) die "현재 HEAD($head)가 복구 기록의 안전한 지점과 다릅니다" ;;
+  esac
+  dirty="$(git status --porcelain --untracked-files=all)" \
+    || die "작업트리 변경 여부를 확인하지 못했습니다"
+  [ -z "$dirty" ] || die "업데이트 뒤 별도 작업트리 변경이 있어 자동으로 지우지 않습니다:
+$dirty"
+  validate_snapshot "$dir" app-ledger.json
+  validate_snapshot "$dir" plaintext-retirement.json
+  validate_snapshot "$dir" airlock.lock
+  [ "$(snapshot_hash "$dir/config.snapshot")" = "$(cat "$dir/config.snapshot.sha256")" ] \
+    || die "보존한 airlock.toml 기준점의 해시가 달라졌습니다"
+  if [ ! -f "$config_path" ] || [ -L "$config_path" ]; then
+    die "업데이트 전 설정 경로가 일반 파일이 아니어서 되돌리지 않습니다: $config_path"
+  fi
+  cmp -s "$config_path" "$dir/config.snapshot" \
+    || die "airlock.toml 의 정확한 bytes 가 업데이트 전과 달라져 자동으로 되돌리지 않습니다"
+
+  if [ "$head" = "$after" ]; then
+    if [ ! -d "$dir/failed" ] || [ -L "$dir/failed" ]; then
+      die "실패 직후 설치 상태 기록이 없습니다"
+    fi
+    if [ ! -f "$dir/failed/state-dir" ] || [ -L "$dir/failed/state-dir" ] \
+       || ! cmp -s "$dir/state-dir" "$dir/failed/state-dir"; then
+      die "실패 직후 설치 상태 경로 기록이 기준점과 다릅니다"
+    fi
+    validate_snapshot "$dir/failed" app-ledger.json
+    validate_snapshot "$dir/failed" plaintext-retirement.json
+    validate_snapshot "$dir/failed" airlock.lock
+    printf '%s\n' tearing-down >"$dir/phase"
+    teardown_and_restore_box_state "$root" "$machine" "$state_dir" "$dir" "$dir/failed" \
+      || die "실패 직후 상태가 달라졌거나 현재 설치 흔적 정리·이전 상태 복원을 끝내지 못했습니다"
+    printf '%s\n' resetting-checkout >"$dir/phase"
+    GIT_REFLOG_ACTION="airlock-update rollback $after -> $before" git reset --hard "$before" \
+      || die "업데이트 전 checkout 으로 돌아가지 못했습니다"
+  fi
+
+  printf '%s' "$$" >"$dir/pid"
+  printf '%s\n' rollback-installing >"$dir/phase"
+  say "이전 설치기를 다시 적용하는 중…"
+  if [ "$saved_platform" = Darwin ]; then
+    orb -m "$machine" env "AIRLOCK_CONFIG=/mnt/mac$config_path" "AIRLOCK_STATE_DIR=$state_dir" \
+      bash "/mnt/mac$root/install/airlock-install.sh" || rc=$?
+  else
+    (cd "$root" && AIRLOCK_CONFIG="$config_path" AIRLOCK_STATE_DIR="$state_dir" \
+      bash install/airlock-install.sh) || rc=$?
+  fi
+  if [ "$rc" != 0 ]; then
+    printf '%s\n' rollback-failed >"$dir/phase"
+    record_update_event "$git_dir" rollback-install-failed "$before" "$after" "$rc"
+    say "checkout 과 상태 기록은 이전 것으로 돌렸지만 이전 설치기 재적용이 실패했습니다 (rc=$rc)."
+    say "다시 시도:  AIRLOCK_DIR=\"$root\" bash \"$dir/airlock-update\" --rollback"
+    return "$rc"
+  fi
+  box_status "$root" "$machine" "$state_dir" "$config_path" \
+    >"$dir/status-after-rollback.json"; rc=$?
+  if [ "$rc" != 0 ]; then
+    printf '%s\n' rollback-failed >"$dir/phase"
+    record_update_event "$git_dir" rollback-status-failed "$before" "$after" "$rc"
+    say "이전 설치기는 적용됐지만 복구 상태 검증은 통과하지 못했습니다 (airlock-status rc=$rc)."
+    [ "$rc" != 3 ] || say "rc=3 은 실패가 없더라도 확인 못 한 항목이 있어 성공이 아닙니다."
+    return "$rc"
+  fi
+  record_update_event "$git_dir" rollback-ok "$before" "$after" 0
+  git update-ref -d refs/airlock-update/rollback "$before" \
+    || die "복구용 Git ref 를 정리하지 못했습니다"
+  rm -rf -- "$dir"
+  say "업데이트 전 checkout 과 Airlock 관리 상태로 되돌렸고, 상태 검증도 통과했습니다 (airlock-status rc=0)."
+  say "범위: 앱 데이터·OS 패키지·OrbStack 머신 자체는 박스 백업 대상이며 이 롤백이 되감지 않습니다."
+  return 0
 }
 
 # A safety commit that FAILED must never be reported as one. `|| true` here is how an
@@ -320,9 +991,17 @@ commit_or_die() {
        흔한 원인은 커밋 서명(commit.gpgsign)이나 pre-commit 훅입니다."
   fi
 }
-commit_or_warn() {
-  git -c user.name=airlock -c user.email=airlock@localhost -c commit.gpgsign=false \
-      commit -q --no-verify -m "$1" >/dev/null 2>&1 || true
+commit_release_or_die() {
+  local message="$1" before="$2" root="$3" out
+  if ! out="$(git -c user.name=airlock -c user.email=airlock@localhost \
+                  -c commit.gpgsign=false \
+                  commit -q --no-verify -m "$message" 2>&1)"; then
+    case "$out" in *"nothing to commit"*|*"nothing added"*) return 0 ;; esac
+    die "배포본 checkout 을 Git revision 으로 기록하지 못해 설치기를 실행하지 않습니다.
+       이 revision 이 없으면 자동 롤백의 현재 지점을 증명할 수 없습니다.
+       checkout 복원: git -C \"$root\" reset --hard $before
+       git 이 한 말: ${out}"
+  fi
 }
 
 # Names, not just a count: "바뀔 파일 3 개" is not something an operator can check.
@@ -331,8 +1010,13 @@ report_list() {
   local total shown
   total="$(printf '%s' "$1" | grep -c .)"
   shown=12
-  printf '%s' "$1" | grep . | head -"$shown" | sed 's/^/         /'
-  [ "$total" -gt "$shown" ] && printf '         … 그리고 %s 개 더\n' "$((total - shown))"
+  if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
+    printf '%s' "$1" | grep . | head -"$shown" | sed 's/^/         /' >&2
+    [ "$total" -gt "$shown" ] && printf '         … 그리고 %s 개 더\n' "$((total - shown))" >&2
+  else
+    printf '%s' "$1" | grep . | head -"$shown" | sed 's/^/         /'
+    [ "$total" -gt "$shown" ] && printf '         … 그리고 %s 개 더\n' "$((total - shown))"
+  fi
   return 0
 }
 

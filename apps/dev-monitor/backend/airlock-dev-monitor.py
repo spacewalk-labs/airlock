@@ -22,21 +22,26 @@ import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# The owner ingress gate is smaller than the optional message/action console: update
+# detection needs it even on a box that intentionally has no message spool.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import devmon_owner
+except ImportError:
+    devmon_owner = None
+
 # Message/action console modules live beside this backend. Import defensively so
 # a deployment without them still provides the observability endpoints.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import devmon_messages as MSG
     import devmon_spool
-    import devmon_owner
     import devmon_slack
     import devmon_email
     import action_runner
-    _MESSAGES_AVAILABLE = True
+    _MESSAGES_AVAILABLE = devmon_owner is not None
 except ImportError:
     MSG = None
     devmon_spool = None
-    devmon_owner = None
     devmon_slack = None
     devmon_email = None
     action_runner = None
@@ -50,6 +55,26 @@ try:
 except ImportError:
     TOKENS = None
     TOKEN_ACCOUNTS = None
+
+try:
+    import devmon_updates as UPDATES
+except ImportError:
+    UPDATES = None
+
+# Update EXECUTION is imported separately from update DETECTION so an older tree that
+# has the collector but not the runner degrades to a read-only panel instead of 500s.
+try:
+    import devmon_update_exec as UPDATE_EXEC
+except ImportError:
+    UPDATE_EXEC = None
+
+# Harness execution — the settings panel's 하네스 section. Imported on its own for the
+# same reason as the two above: a tree that has update detection but not this module
+# must show the harness rows it can read and simply offer no button, rather than 500.
+try:
+    import devmon_harness as HARNESS
+except ImportError:
+    HARNESS = None
 
 # Cron health is core observability, independent of the optional message console.
 try:
@@ -92,7 +117,21 @@ CORS_HOSTS = frozenset(
 # Message feature config, loaded by _start_messages. None keeps owner routes
 # unavailable without touching the optional modules.
 OWNER_CONFIG = None
+UPDATES_OWNER_CONFIG = None
 EXEC_CONFIG = None
+# Update execution keeps its own paths. It cannot borrow EXEC_CONFIG's: those live
+# under the message console's database directory, which the installer creates only when
+# `messages = true`, and this path has to work on a box that never enabled it.
+UPDATE_EXEC_CONFIG = None
+_UPDATE_RUN_LOCK = threading.Lock()
+# The harness upgrade keeps its own record and its own lock. A Codex CLI upgrade and
+# `bin/airlock-update` share no failure and no mutex, so neither may block or report
+# over the other (devmon_harness, "Why it does NOT reuse the update run record").
+HARNESS_EXEC_CONFIG = None
+_HARNESS_RUN_LOCK = threading.Lock()
+# The collector the update timer runs. The 하네스 section's '지금 점검' asks for one
+# more run of exactly this unit; nothing else on these routes starts a unit.
+UPDATE_DETECT_UNIT = 'airlock-update-detect.service'
 _MESSAGES_STATE = 'off'
 # The two lanes with a liveness probe and a watchdog. Email is deliberately not one of them:
 # a probe proves a lane by sending through it, and a mail probe on a timer is a scheduled
@@ -284,51 +323,257 @@ def disk_info(path='/'):
 
 # ---- services ----
 # System services are queried by fixed name (they need sudo to change, so they
-# are shown read-only). User services are discovered dynamically so the panel
-# adapts to whichever airlock apps are installed on this box.
+# are shown read-only). User observation is broader than restart authority: private
+# apps and timer jobs must remain visible, while writes stay restricted to Airlock.
 SYSTEM_SERVICES = ['nginx', 'ssh', 'tailscaled']
 SELF_SERVICE = 'airlock-dev-monitor'
+SERVICE_SHOW_PROPERTIES = (
+    'Id', 'Type', 'LoadState', 'ActiveState', 'SubState', 'Result', 'NRestarts',
+    'ExecMainStatus', 'UnitFileState', 'ActiveEnterTimestamp',
+)
+SERVICE_COMMAND_TIMEOUT = 1
+
+
+def _service_command(cmd, allowed_nonzero=()):
+    """Bound a service-panel probe and retain stdout even with a non-zero status."""
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=SERVICE_COMMAND_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return '', 'collection failed'
+    if proc.returncode != 0:
+        if proc.returncode in allowed_nonzero and proc.stdout.strip():
+            return proc.stdout, None
+        return proc.stdout, 'collection failed'
+    return proc.stdout, None
+
+
+def _observed_user_inventory():
+    """Meaningful concrete user services plus collection health."""
+    commands = [
+        ['systemctl', '--user', 'list-unit-files', '--no-legend', '--type=service'],
+        ['systemctl', '--user', 'list-units', '--all', '--no-legend', '--plain',
+         '--type=service'],
+        ['systemctl', '--user', 'list-timers', '--all', '--no-legend', '--plain'],
+    ]
+    units = []
+    failed = False
+    for index, command in enumerate(commands):
+        output, error = _service_command(command)
+        failed = failed or bool(error)
+        for line in output.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            if index == 2:
+                # list-timers' final column is the activated service unit.
+                name = parts[-1]
+                include = name.endswith('.service')
+            else:
+                # Older systemctl can still prefix a failed unit with a bullet despite
+                # --plain/--no-legend. Do not lose a failed template instance here.
+                if parts[0] == '●' and len(parts) > 1:
+                    parts = parts[1:]
+                name = parts[0]
+                state = parts[1] if index == 0 and len(parts) > 1 else ''
+                active = parts[2] if index == 1 and len(parts) > 2 else ''
+                include = (name.startswith('airlock-')
+                           or state in ('enabled', 'enabled-runtime')
+                           or active == 'failed')
+            if include and name.endswith('.service') and '@.' not in name:
+                units.append(name[:-len('.service')])
+    return sorted(set(units)), ('inventory collection failed' if failed else None)
+
+
+def _airlock_user_inventory():
+    """Original Airlock-only discovery, kept separate from broad observation."""
+    commands = [
+        ['systemctl', '--user', 'list-unit-files', '--no-legend', '--type=service'],
+        ['systemctl', '--user', 'list-units', '--all', '--no-legend', '--plain',
+         '--type=service', 'airlock-*'],
+    ]
+    units = []
+    failed = False
+    for command in commands:
+        output, error = _service_command(command)
+        failed = failed or bool(error)
+        for line in output.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            name = parts[1] if parts[0] == '●' and len(parts) > 1 else parts[0]
+            if (name.startswith('airlock-') and name.endswith('.service')
+                    and '@.' not in name):
+                units.append(name[:-len('.service')])
+    return sorted(set(units)), ('inventory collection failed' if failed else None)
 
 
 def _airlock_user_units():
-    """Names of installed airlock-* systemd --user services (no .service suffix)."""
-    out = run(['systemctl', '--user', 'list-unit-files', '--no-legend', '--type=service'])
-    units = []
-    for line in out.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        name = parts[0]
-        if name.startswith('airlock-') and name.endswith('.service'):
-            units.append(name[:-len('.service')])
-    return sorted(set(units))
+    """Restart allowlist: complete original discovery plus canonical systemd Id."""
+    candidates, error = _airlock_user_inventory()
+    if error or not candidates:
+        return []
+    raw, error = _systemctl_show(candidates, 'user')
+    if error:
+        return []
+    canonical = set()
+    for block in _show_blocks(raw):
+        props = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+        unit_id = props.get('Id', '')
+        if unit_id.endswith('.service'):
+            canonical.add(unit_id[:-len('.service')])
+    # An alias resolves to a different Id and receives no write authority. This also
+    # prevents an airlock-* alias from bypassing SELF_SERVICE exclusion.
+    return [name for name in candidates if name in canonical]
+
+
+def _systemctl_show(names, scope):
+    if isinstance(names, str):
+        names = [names]
+    if not names:
+        return '', None
+    cmd = ['systemctl']
+    if scope == 'user':
+        cmd.append('--user')
+    cmd.extend([
+        'show', '--no-pager',
+        '--property=' + ','.join(SERVICE_SHOW_PROPERTIES), '--', *names,
+    ])
+    # `systemctl show` returns rc=3 for useful inactive-unit output. Inventory commands
+    # do not: partial stdout with non-zero must remain fail-visible.
+    return _service_command(cmd, allowed_nonzero=(3,))
+
+
+def _show_blocks(raw):
+    blocks = []
+    current = []
+    for line in raw.splitlines():
+        if not line.strip():
+            if current:
+                blocks.append('\n'.join(current))
+                current = []
+        else:
+            current.append(line)
+    if current:
+        blocks.append('\n'.join(current))
+    return blocks
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _service_from_show(name, scope, raw, collection_error=None):
+    props = {}
+    for line in raw.splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            props[key] = value
+
+    service_type = props.get('Type', '')
+    load_state = props.get('LoadState', '')
+    active_state = props.get('ActiveState', '')
+    sub_state = props.get('SubState', '')
+    result = props.get('Result', '')
+    n_restarts = _as_int(props.get('NRestarts'))
+    exec_main_status = _as_int(props.get('ExecMainStatus'))
+    unit_file_state = props.get('UnitFileState', '')
+
+    attention = False
+    reason = ''
+    required = ('LoadState', 'ActiveState', 'SubState', 'Result', 'NRestarts')
+    if collection_error or any(key not in props for key in required):
+        attention, reason = True, 'health collection failed'
+    elif load_state != 'loaded':
+        attention, reason = True, 'LoadState=' + (load_state or 'unknown')
+    elif active_state == 'failed' or sub_state == 'failed':
+        reason = 'failed'
+        if result:
+            reason += ': Result=' + result
+        if exec_main_status not in (None, 0):
+            reason += ', ExecMainStatus=' + str(exec_main_status)
+        attention = True
+    elif result and result != 'success':
+        attention, reason = True, 'Result=' + result
+    elif sub_state == 'auto-restart':
+        attention, reason = True, 'SubState=auto-restart'
+    elif n_restarts is None:
+        attention, reason = True, 'NRestarts unavailable'
+    elif n_restarts > 0:
+        attention, reason = True, 'NRestarts=' + str(n_restarts)
+    elif (service_type != 'oneshot' and active_state == 'inactive'
+          and unit_file_state in ('enabled', 'enabled-runtime')):
+        attention, reason = True, 'enabled service is inactive/' + (sub_state or 'unknown')
+
+    return {
+        'name': name,
+        'scope': scope,
+        # Compatibility for clients deployed before typed systemd health.
+        'state': active_state or 'unknown',
+        'uptime': uptime_from_timestamp(props.get('ActiveEnterTimestamp', '')),
+        'type': service_type,
+        'load_state': load_state or 'unknown',
+        'active_state': active_state or 'unknown',
+        'sub_state': sub_state or 'unknown',
+        'result': result or 'unknown',
+        'n_restarts': n_restarts,
+        'exec_main_status': exec_main_status,
+        'unit_file_state': unit_file_state or 'unknown',
+        'attention': attention,
+        'attention_reason': reason,
+        # A synchronous restart from inside this service kills both the request
+        # handler and its systemctl child before either can report success.
+        # Observation never grants mutation. svc_info adds the explicit Airlock-only
+        # allowlist after classification; direct/failed/system rows remain read-only.
+        'action_allowed': False,
+    }
+
+
+def _service_group_info(names, scope):
+    """Resolve a scope in one bounded systemctl call, keyed by systemd's own Id."""
+    raw, error = _systemctl_show(names, scope)
+    if error:
+        return [_service_from_show(name, scope, '', error) for name in names]
+    by_name = {}
+    for block in _show_blocks(raw):
+        props = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+        unit_id = props.get('Id', '')
+        if unit_id.endswith('.service'):
+            by_name[unit_id[:-len('.service')]] = block
+    return [
+        _service_from_show(
+            name, scope, by_name.get(name, ''),
+            None if name in by_name else 'collection failed')
+        for name in names
+    ]
 
 
 def svc_info():
-    out = []
-    for name in _airlock_user_units():
-        state = run(['systemctl', '--user', 'is-active', name]) or 'unknown'
-        since_raw = run(['systemctl', '--user', 'show', name, '-p', 'ActiveEnterTimestamp', '--value'])
-        out.append({
-            'name': name,
-            'scope': 'user',
-            'state': state,
-            'uptime': uptime_from_timestamp(since_raw),
-            # A synchronous restart from inside this service kills both the request
-            # handler and its systemctl child before either can report success.
-            'action_allowed': name != SELF_SERVICE,
-        })
-    for name in SYSTEM_SERVICES:
-        state = run(['systemctl', 'is-active', name]) or 'unknown'
-        since_raw = run(['systemctl', 'show', name, '-p', 'ActiveEnterTimestamp', '--value'])
-        out.append({
-            'name': name,
-            'scope': 'system',
-            'state': state,
-            'uptime': uptime_from_timestamp(since_raw),
-            'action_allowed': False,
-        })
+    user_units, inventory_error = _observed_user_inventory()
+    out = _service_group_info(user_units, 'user')
+    restartable = set(_airlock_user_units())
+    for item in out:
+        item['action_allowed'] = (item['name'] in restartable
+                                  and item['name'] != SELF_SERVICE)
+    if inventory_error:
+        item = _service_from_show(
+            'airlock-user-inventory', 'user', '', inventory_error)
+        item['action_allowed'] = False
+        out.append(item)
+    out.extend(_service_group_info(SYSTEM_SERVICES, 'system'))
     return out
+
+
+def _services_payload(services=None):
+    services = svc_info() if services is None else services
+    return {
+        'services': services,
+        'attention_count': sum(1 for item in services if item.get('attention')),
+    }
 
 
 def restart_svc(name):
@@ -777,7 +1022,7 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         if path in ('/api/services', '/services'):
-            self._json(200, {'services': svc_info()})
+            self._json(200, _services_payload())
             return
         if path in ('/api/network', '/network'):
             self._json(200, network_info())
@@ -870,7 +1115,39 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return devmon_owner.require_owner(self, OWNER_CONFIG)
 
+    def _updates_owner_ready(self):
+        """Updates keep their owner gate when messages are deliberately off."""
+        if UPDATES_OWNER_CONFIG is None:
+            self._json(404, {'ok': False, 'error': 'update detection owner gate not enabled'})
+            return False
+        return devmon_owner.require_owner(self, UPDATES_OWNER_CONFIG)
+
     def _handle_owner_get(self, path, qs):
+        if path == '/api/owner/updates':
+            # The update collector is optional in an already-installed older tree.
+            # Return 404, never an empty list: an empty answer would look current while
+            # no daily observation is actually running.
+            if UPDATES is None:
+                self._json(404, {'ok': False, 'error': 'update detection not enabled'})
+                return
+            if not self._updates_owner_ready():
+                return
+            snapshot = UPDATES.read_snapshot()
+            if snapshot is None:
+                self._json(404, {'ok': False, 'error': 'update detection has no snapshot'})
+                return
+            self._json(200, snapshot)
+            return
+        if path == '/api/owner/updates/run':
+            if not self._updates_owner_ready():
+                return
+            self._owner_update_run()
+            return
+        if path == '/api/owner/harness/run':
+            if not self._updates_owner_ready():
+                return
+            self._owner_harness_run()
+            return
         if not self._owner_ready():
             return
         if path == '/api/owner/messages/preview':
@@ -918,6 +1195,18 @@ class Handler(BaseHTTPRequestHandler):
         # Validate origin, content type, and size before reading an untrusted body.
         if not devmon_owner.check_mutating(self):
             return
+        # Ahead of the message console's gate on purpose: update execution is owner-only
+        # but not message-only, exactly as update detection has been since #291.
+        if path == '/api/owner/updates/execute':
+            if not self._updates_owner_ready():
+                return
+            self._owner_update_execute(self._read_body())
+            return
+        if path == '/api/owner/harness/execute':
+            if not self._updates_owner_ready():
+                return
+            self._owner_harness_execute(self._read_body())
+            return
         if not self._owner_ready():
             return
         body = self._read_body()
@@ -960,6 +1249,214 @@ class Handler(BaseHTTPRequestHandler):
                 self._owner_view(self._seg(parts[4]))
                 return
         self._json(404, {'ok': False, 'error': f'unknown owner path: {path}'})
+
+    # ---- update execution (owner gate, no message console) ----
+    def _owner_update_run(self):
+        """Report the last update run plus whether ANY updater holds the mutex.
+
+        `busy` is deliberately three-valued. `null` means the question could not be
+        measured on this box, and answering `false` there would be the exact absence
+        claim ("nothing is running") that the panel has no evidence for.
+        """
+        cfg = UPDATE_EXEC_CONFIG
+        if cfg is None:
+            self._json(404, {'ok': False, 'error': 'update execution not enabled'})
+            return
+        self._json(200, {
+            'ok': True,
+            'busy': UPDATE_EXEC.updater_busy(cfg['root']),
+            'run': UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir'])),
+        })
+
+    @staticmethod
+    def _pending_app_ids():
+        """App ids the current snapshot says are pending a plain reinstall.
+
+        🔴 `lock-mismatch` rows are excluded, and this is the server-side half of owner
+        decision LOCK_UI_V1: an external package whose source digest moved needs its lock
+        re-approved, that is a terminal procedure, and the panel offers review only. The
+        button being absent is presentation; this is the boundary.
+        """
+        snapshot = UPDATES.read_snapshot() if UPDATES is not None else None
+        apps = (snapshot or {}).get('apps')
+        if not isinstance(apps, list):
+            return set()
+        return {a.get('id') for a in apps
+                if isinstance(a, dict) and a.get('action') == 'upgrade'}
+
+    def _owner_update_execute(self, body):
+        """Validate a closed enum, then launch `bin/airlock-update` in a tmux window."""
+        cfg = UPDATE_EXEC_CONFIG
+        if cfg is None:
+            self._json(404, {'ok': False, 'error': 'update execution not enabled'})
+            return
+        action = body.get('action') if isinstance(body, dict) else None
+        app_id = body.get('id') if isinstance(body, dict) else None
+        if action == 'platform':
+            app_id = None
+        elif action == 'app':
+            if not isinstance(app_id, str) or not UPDATE_EXEC.APP_ID.match(app_id):
+                self._json(400, {'ok': False, 'error': 'bad_app_id'})
+                return
+            if app_id not in self._pending_app_ids():
+                # Either the snapshot never listed it, or it is a lock-mismatch row.
+                self._json(409, {'ok': False, 'error': 'app_not_pending'})
+                return
+        else:
+            self._json(400, {'ok': False, 'error': 'bad_action'})
+            return
+        with _UPDATE_RUN_LOCK:
+            record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
+            if UPDATE_EXEC.active(record):
+                self._json(409, {'ok': False, 'error': 'run_active',
+                                 'run_id': record.get('runId')})
+                return
+            # Only a measured `True` blocks. An unmeasurable lock must not take the
+            # button away — the updater's own mutex refuses a second run regardless,
+            # and that refusal is visible in the pane and in the run's exit code.
+            if UPDATE_EXEC.updater_busy(cfg['root']) is True:
+                self._json(409, {'ok': False, 'error': 'updater_busy'})
+                return
+            run_id = UPDATE_EXEC.new_run_id()
+            try:
+                UPDATE_EXEC.ensure_dirs(cfg['dir'])
+                UPDATE_EXEC.sweep_plans(cfg['dir'])
+                # Written BEFORE the window exists so a click is never invisible: if the
+                # launch dies here, the panel shows a failed run instead of nothing.
+                UPDATE_EXEC.write_record(
+                    cfg['dir'], UPDATE_EXEC.start_record(run_id, action, app_id))
+            except OSError as exc:
+                sys.stderr.write(f'[update-exec] run record write failed: {exc}\n')
+                self._json(500, {'ok': False, 'error': 'state_unwritable'})
+                return
+            plan = UPDATE_EXEC.build_plan(cfg['root'], cfg['dir'], run_id, action, app_id)
+            outcome, _target = _launch_run(run_id, plan, cfg, run_id)
+        if outcome != 'ok':
+            self._fail_update_record(cfg, run_id, outcome)
+            self._json(503 if outcome == 'ambiguous' else 500,
+                       {'ok': False, 'error': 'launch_failed', 'outcome': outcome})
+            return
+        self._json(200, {'ok': True, 'run_id': run_id, 'action': action, 'id': app_id})
+
+    @staticmethod
+    def _fail_update_record(cfg, run_id, outcome):
+        """Close out a run that never got a window, so nothing waits on the grace timer."""
+        record = UPDATE_EXEC.read_record(cfg['dir'])
+        if not record or record.get('runId') != run_id:
+            return                      # superseded already; not ours to rewrite
+        record['status'] = 'failed'
+        record['endedAt'] = UPDATE_EXEC.now_iso()
+        record['note'] = ('실행 창을 만들지 못했습니다 (%s) — tmux 가 설치돼 있는지 '
+                          '확인하십시오. 아무것도 실행되지 않았습니다.' % outcome
+                          if outcome == 'nowindow' else
+                          '실행 창 생성 결과를 확인하지 못했습니다 (%s) — 터미널에서 '
+                          'tmux 세션을 확인하십시오.' % outcome)
+        try:
+            UPDATE_EXEC.write_record(cfg['dir'], record)
+        except OSError as exc:
+            sys.stderr.write(f'[update-exec] failure record write failed: {exc}\n')
+
+    # ---- harness section (same owner gate, its own run record) ----
+    def _owner_harness_run(self):
+        """Report the last harness upgrade run.
+
+        No `busy` field, and its absence is the point: unlike `bin/airlock-update` an
+        npm global install takes no cross-process mutex, so there is no second updater
+        to measure and nothing to claim about one.
+        """
+        if HARNESS is None or HARNESS_EXEC_CONFIG is None:
+            self._json(404, {'ok': False, 'error': 'harness execution not enabled'})
+            return
+        cfg = HARNESS_EXEC_CONFIG
+        self._json(200, {'ok': True,
+                         'run': HARNESS.observed(HARNESS.read_record(cfg['dir']))})
+
+    def _start_detection(self):
+        """Ask the existing detection oneshot to measure again, now.
+
+        `--no-block`, because a collection runs `airlock-update --dry-run`, an
+        `npm view` and the hook check: a blocking start would hold this request open
+        for a minute and the browser would call that a failure. The panel watches
+        `checkedAt` in the snapshot instead, which is the fact it actually needs.
+
+        One hardcoded unit name, not a caller-supplied one: this is the same collector
+        the timer runs, and a route that could start an arbitrary unit would be a
+        different feature with a different gate.
+        """
+        try:
+            subprocess.check_call(
+                ['systemctl', '--user', 'start', '--no-block', '--',
+                 UPDATE_DETECT_UNIT], timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            self._json(504, {'ok': False, 'error': 'recheck_timeout'})
+            return
+        except (OSError, subprocess.CalledProcessError):
+            # Overwhelmingly "the timer was never installed on this box", which is a
+            # real state (install/airlock-update-timer.sh is a separate step) and not
+            # something the panel should retry into.
+            self._json(409, {'ok': False, 'error': 'recheck_unavailable'})
+            return
+        self._json(200, {'ok': True, 'action': 'recheck', 'unit': UPDATE_DETECT_UNIT})
+
+    def _owner_harness_execute(self, body):
+        """Validate a closed enum, then either re-measure or launch the one upgrade."""
+        action = body.get('action') if isinstance(body, dict) else None
+        if action == 'recheck':
+            if UPDATES is None:
+                self._json(404, {'ok': False, 'error': 'update detection not enabled'})
+                return
+            self._start_detection()
+            return
+        if action not in (HARNESS.ACTIONS if HARNESS else ()):
+            self._json(400, {'ok': False, 'error': 'bad_action'})
+            return
+        cfg = HARNESS_EXEC_CONFIG
+        if cfg is None:
+            self._json(404, {'ok': False, 'error': 'harness execution not enabled'})
+            return
+        with _HARNESS_RUN_LOCK:
+            record = HARNESS.observed(HARNESS.read_record(cfg['dir']))
+            if HARNESS.active(record):
+                self._json(409, {'ok': False, 'error': 'run_active',
+                                 'run_id': record.get('runId')})
+                return
+            run_id = UPDATE_EXEC.new_run_id()
+            try:
+                UPDATE_EXEC.ensure_dirs(cfg['dir'])
+                UPDATE_EXEC.sweep_plans(cfg['dir'])
+                # Written BEFORE the window exists so a click is never invisible.
+                UPDATE_EXEC.write_record(cfg['dir'], HARNESS.start_record(run_id, action))
+            except OSError as exc:
+                sys.stderr.write(f'[harness-exec] run record write failed: {exc}\n')
+                self._json(500, {'ok': False, 'error': 'state_unwritable'})
+                return
+            plan = HARNESS.build_plan(cfg['root'], cfg['dir'], run_id, action)
+            outcome, _target = _launch_run(run_id, plan, cfg, run_id)
+        if outcome != 'ok':
+            self._fail_harness_record(cfg, run_id, outcome)
+            self._json(503 if outcome == 'ambiguous' else 500,
+                       {'ok': False, 'error': 'launch_failed', 'outcome': outcome})
+            return
+        self._json(200, {'ok': True, 'run_id': run_id, 'action': action})
+
+    @staticmethod
+    def _fail_harness_record(cfg, run_id, outcome):
+        """Close out a run that never got a window, so nothing waits on the grace timer."""
+        record = UPDATE_EXEC.read_record(cfg['dir'])
+        if not record or record.get('runId') != run_id:
+            return                      # superseded already; not ours to rewrite
+        record['status'] = 'failed'
+        record['endedAt'] = UPDATE_EXEC.now_iso()
+        record['note'] = ('실행 창을 만들지 못했습니다 (%s) — tmux 가 설치돼 있는지 '
+                          '확인하십시오. 아무것도 실행되지 않았습니다.' % outcome
+                          if outcome == 'nowindow' else
+                          '실행 창 생성 결과를 확인하지 못했습니다 (%s) — 터미널에서 '
+                          'tmux 세션을 확인하십시오.' % outcome)
+        try:
+            UPDATE_EXEC.write_record(cfg['dir'], record)
+        except OSError as exc:
+            sys.stderr.write(f'[harness-exec] failure record write failed: {exc}\n')
 
     def _owner_plan(self, card_id):
         res = MSG.issue_approval(card_id, EXEC_CONFIG)
@@ -1144,9 +1641,16 @@ def _reap_view_sessions():
             sys.stderr.write(f'[view] orphan view kill failed session={name}\n')
 
 
-def _launch_run(run_id, plan):
-    """Persist a plan then launch its runner in a new tmux window."""
-    cfg = EXEC_CONFIG
+def _launch_run(run_id, plan, cfg=None, window_name=None):
+    """Persist a plan then launch its runner in a new tmux window.
+
+    `cfg`/`window_name` are parameters rather than globals because two features launch
+    runs now — approved action cards and the settings panel's update button — and they
+    keep different state directories. Everything below (the tmux absence check, the
+    exclusive plan write, the ambiguity contract) is identical for both, so it is one
+    function with two callers rather than two copies to keep in step.
+    """
+    cfg = cfg or EXEC_CONFIG
     # Checked before anything is written: with no tmux there is no window and nothing
     # started, which is a DEFINITE answer, not an ambiguous one. Saying so lets the
     # caller release the card lock instead of holding it for a run that cannot exist.
@@ -1156,6 +1660,7 @@ def _launch_run(run_id, plan):
         return ('nowindow', None)
     plan_out = dict(plan)
     plan_out['cwd_root'] = cfg['cwd_root']
+    plan_out['agent'] = cfg['agent']            # server-controlled, like cwd_root — never from the card
     plan_file = os.path.join(cfg['plan_dir'], run_id + '.json')
     try:
         fd = os.open(plan_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1167,7 +1672,7 @@ def _launch_run(run_id, plan):
     command = ' '.join(shlex.quote(item) for item in [
         'python3', cfg['runner'], run_id, plan_file, cfg['sentinel_dir'],
     ])
-    window_name = MSG.run_window_name(run_id)
+    window_name = window_name or MSG.run_window_name(run_id)
     session, cwd = cfg['session'], plan['cwd']
     with _TMUX_LOCK:
         has_session = _tmux_has_session(session) == 0
@@ -1487,6 +1992,10 @@ def _build_exec_config():
         # an unset key, and canonical_plan reads a falsy root as 'no bound at all'.
         'cwd_root': os.environ.get('DEV_MONITOR_CWD_ROOT') or HOME,
         'session': os.environ.get('DEV_MONITOR_EXEC_SESSION', 'devmon-exec'),
+        # Carried to the runner through the PLAN, never the environment: a tmux window
+        # inherits the tmux SERVER's env, not ours. Resolution happens there (action_runner).
+        'agent': {'provider': os.environ.get('AIRLOCK_AGENT_PROVIDER', ''),
+                  'select_bin': os.environ.get('AIRLOCK_AGENT_BIN', '')},
         'runner': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'action_runner.py'),
         'plan_dir': plan_dir,
         'sentinel_dir': sentinel_dir,
@@ -1677,6 +2186,84 @@ def _start_messages():
           f"roster={'configured' if MSG.roster_path() else 'unconfigured'}", flush=True)
 
 
+def _start_updates_owner_gate():
+    """Load the minimal ingress gate independently of the message spool feature."""
+    global UPDATES_OWNER_CONFIG
+    if UPDATES is None or devmon_owner is None:
+        return
+    try:
+        UPDATES_OWNER_CONFIG = devmon_owner.load_gate_config()
+    except devmon_owner.ConfigError as exc:
+        sys.stderr.write(f'[airlock-dev-monitor] updates owner gate disabled: {exc}\n')
+
+
+def _start_update_exec():
+    """Resolve where update runs keep their state. Never fatal.
+
+    Split from the gate above so the two failures stay distinguishable: a box can have
+    a working owner gate and an unwritable state directory, and in that case the panel
+    must still show what is available to update — it just cannot start one.
+    """
+    global UPDATE_EXEC_CONFIG
+    if UPDATE_EXEC is None or UPDATES_OWNER_CONFIG is None:
+        return
+    try:
+        root = UPDATE_EXEC.default_root()
+        directory = UPDATE_EXEC.default_dir()
+        UPDATE_EXEC.ensure_dirs(directory)
+    except OSError as exc:
+        sys.stderr.write('[airlock-dev-monitor] update execution disabled '
+                         f'(state directory unusable: {exc})\n')
+        return
+    UPDATE_EXEC_CONFIG = {
+        'root': root,
+        'dir': directory,
+        # The runner's own contract: it needs a plan file, a sentinel directory and a
+        # place to be. It shares the action console's tmux session name so there is one
+        # session to attach to, whether or not that console is enabled.
+        'plan_dir': str(UPDATE_EXEC.plan_dir(directory)),
+        'sentinel_dir': str(UPDATE_EXEC.sentinel_dir(directory)),
+        'session': os.environ.get('DEV_MONITOR_EXEC_SESSION', 'devmon-exec'),
+        'runner': os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'action_runner.py'),
+        # exec mode reaches neither: the plan carries an absolute argv and its own root.
+        'cwd_root': str(root),
+        'agent': {},
+    }
+
+
+def _start_harness_exec():
+    """Resolve where harness runs keep their state. Never fatal, like update exec.
+
+    Split from _start_update_exec for the reason the two records are split: a box can
+    run platform updates from the panel and still have no way to upgrade the Codex CLI
+    (or the other way around), and the panel has to be able to say which.
+    """
+    global HARNESS_EXEC_CONFIG
+    if HARNESS is None or UPDATE_EXEC is None or UPDATES_OWNER_CONFIG is None:
+        return
+    try:
+        root = UPDATE_EXEC.default_root()
+        directory = HARNESS.default_dir()
+        UPDATE_EXEC.ensure_dirs(directory)
+    except OSError as exc:
+        sys.stderr.write('[airlock-dev-monitor] harness execution disabled '
+                         f'(state directory unusable: {exc})\n')
+        return
+    HARNESS_EXEC_CONFIG = {
+        'root': root,
+        'dir': directory,
+        'plan_dir': str(UPDATE_EXEC.plan_dir(directory)),
+        'sentinel_dir': str(UPDATE_EXEC.sentinel_dir(directory)),
+        # The same tmux session as the other two runners: one session to attach to.
+        'session': os.environ.get('DEV_MONITOR_EXEC_SESSION', 'devmon-exec'),
+        'runner': os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'action_runner.py'),
+        'cwd_root': str(root),
+        'agent': {},
+    }
+
+
 def main():
     os.makedirs(_STATE_DIR, exist_ok=True)
     # first sampling — the next call onward is accurate
@@ -1684,6 +2271,9 @@ def main():
     history_trim()
     threading.Thread(target=history_sampler, daemon=True, name='history_sampler').start()
     threading.Thread(target=_top_sampler, daemon=True, name='top_sampler').start()
+    _start_updates_owner_gate()
+    _start_update_exec()
+    _start_harness_exec()
     _start_messages()
     print(f'[airlock-dev-monitor] listen=127.0.0.1:{PORT} messages={_messages_state()} '
           f'message_lanes={json.dumps(_message_lanes_health(), sort_keys=True)}', flush=True)

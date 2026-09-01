@@ -64,7 +64,11 @@ ALIASES = os.path.join(STATIC, "tokens.css")
 RATCHET = {
     "code-server": {"hex": 32, "emoji": 1},
     "dev-monitor": {"hex": 49, "emoji": 37},
-    "devterm":     {"hex": 294, "emoji": 95},
+    # 2026-09-01 (ACCT_OWN): 294/95 -> 283/62. Nothing was restyled — the account
+    # panel moved to hub/assets/accounts/ (platform asset), taking its colours and
+    # emoji with it. This gate walks apps/ only, so that file is now unwatched;
+    # banking the drop at least keeps devterm's own ceiling tight.
+    "devterm":     {"hex": 283, "emoji": 62},
     "learning":    {"hex": 22, "emoji": 75},
     "notepad":     {"hex": 26, "emoji": 10},
     # #247 로 합류. 도구가 --ratchet 으로 낸 값 그대로이며 0/0 이라 이 앱은

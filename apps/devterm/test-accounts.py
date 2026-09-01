@@ -14,7 +14,7 @@ What it pins down, because these are the parts that fail quietly:
     graded crit instead of passing for a healthy login;
   - that no identity ever appears in the alert payload.
 """
-import asyncio, contextlib, copy, importlib.machinery, importlib.util, inspect, io, json, os, shutil, stat, subprocess, sys, tempfile, time, types
+import asyncio, contextlib, copy, importlib.machinery, importlib.util, inspect, io, json, os, shutil, stat, subprocess, sys, tempfile, time, types, urllib.error
 os.environ.setdefault("AIRLOCK_OWNER", "owner@example.com")
 spec = importlib.util.spec_from_file_location("gate", "apps/devterm/backend/devterm-gate.py")
 g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
@@ -153,102 +153,230 @@ finally:
     shutil.rmtree(_codex_override_tmp, ignore_errors=True)
 
 
+# ACCT_OWN: the device-auth driver itself is platform-owned now. The ordering rule the
+# gate used to carry — back the old login up BEFORE codex is allowed to erase it — is
+# asserted here, against the platform CLI, with a real spawn: a recorded call order can
+# stay green while the two steps race, and this cannot.
+_relogin_tmp = tempfile.mkdtemp(prefix="platform-codex-relogin-")
+_saved_relogin = (ac.CODEX_AUTH, ac.CODEX_AUTH_BAK, ac.CODEX_LOGIN_OUT,
+                  ac.CODEX_CAPTURE_INTERVAL, ac._codex_bin, ac.shutil.copy2)
+try:
+    ac.CODEX_AUTH = os.path.join(_relogin_tmp, "auth.json")
+    ac.CODEX_AUTH_BAK = ac.CODEX_AUTH + ".pre-relogin"
+    ac.CODEX_LOGIN_OUT = os.path.join(_relogin_tmp, "capture.out")
+    ac.CODEX_CAPTURE_INTERVAL = 0.02
+    _fake_codex = os.path.join(_relogin_tmp, "codex")
+    # The fake reports what it can SEE at the moment it runs. If the backup had not
+    # happened yet, it says so in the capture and the assertion below fails.
+    with open(_fake_codex, "w") as f:
+        f.write("#!/bin/sh\n"
+                'test -f "$BAK" && echo BACKUP_PRESENT || echo BACKUP_MISSING\n'
+                'touch "$SPAWNED"\n'
+                "printf 'open \\033[1mhttps://auth.openai.com/codex/device?f=1\\033[0m\\n'\n"
+                "printf 'code: WXYZ-98765\\n'\n")
+    os.chmod(_fake_codex, 0o755)
+    _spawn_marker = os.path.join(_relogin_tmp, "spawned")
+    os.environ["BAK"], os.environ["SPAWNED"] = ac.CODEX_AUTH_BAK, _spawn_marker
+    ac._codex_bin = lambda: _fake_codex
+    _relogin_marker = b'{"fixture":"previous-login-no-secret"}\n'
+    with open(ac.CODEX_AUTH, "wb") as f:
+        f.write(_relogin_marker)
+    _start = ac._codex_login_start()
+    _capture = open(ac.CODEX_LOGIN_OUT, encoding="utf-8", errors="replace").read()
+    check("platform device-auth captures the pairing URL and code",
+          _start.get("ok") is True and _start.get("code") == "WXYZ-98765"
+          and _start.get("url") == "https://auth.openai.com/codex/device?f=1")
+    check("platform device-auth backs the old login up before codex can erase it",
+          "BACKUP_PRESENT" in _capture and "BACKUP_MISSING" not in _capture)
+    # Cancel must recover the exact previous bytes, and must not need the executable:
+    # codex can be uninstalled between starting a login and abandoning it.
+    with open(ac.CODEX_AUTH, "wb") as f:
+        f.write(b'{"fixture":"replacement"}\n')
+    ac._codex_bin = lambda: None
+    _cancel = ac._codex_login_cancel()
+    with open(ac.CODEX_AUTH, "rb") as f:
+        _cancelled_bytes = f.read()
+    check("platform cancel restores the previous login without the executable",
+          _cancel == {"ok": True, "restored": True} and _cancelled_bytes == _relogin_marker)
+
+    # Fail closed: a backup that cannot be written must stop the flow before codex runs,
+    # because codex wipes auth.json first and there would be nothing to come back to.
+    os.unlink(_spawn_marker)
+    ac._codex_bin = lambda: _fake_codex
+    def _refuse_copy(*_a, **_k):
+        raise OSError(13, "Permission denied")
+    ac.shutil.copy2 = _refuse_copy
+    _failed_start = ac._codex_login_start()
+    check("platform device-auth fails closed before spawn when the backup fails",
+          _failed_start.get("ok") is False and not os.path.exists(_spawn_marker)
+          and "Permission denied" in _failed_start.get("error", ""))
+finally:
+    (ac.CODEX_AUTH, ac.CODEX_AUTH_BAK, ac.CODEX_LOGIN_OUT,
+     ac.CODEX_CAPTURE_INTERVAL, ac._codex_bin, ac.shutil.copy2) = _saved_relogin
+    os.environ.pop("BAK", None); os.environ.pop("SPAWNED", None)
+    shutil.rmtree(_relogin_tmp, ignore_errors=True)
+
+# No codex on the box is a readable answer, not a crash — and `--json` still exits 0 so a
+# caller can tell "the operation could not run" from "the tool itself broke".
+_saved_missing_bin = ac._codex_bin
+try:
+    ac._codex_bin = lambda: None
+    _missing_out = io.StringIO()
+    with contextlib.redirect_stdout(_missing_out):
+        _missing_rc = ac.cmd_codex_auth("logout", as_json=True)
+    _missing_json = json.loads(_missing_out.getvalue())
+    check("a missing codex is a reason, not a non-zero exit",
+          _missing_rc == 0 and _missing_json.get("ok") is False
+          and "codex not found" in _missing_json.get("error", ""))
+finally:
+    ac._codex_bin = _saved_missing_bin
+
+
 async def _codex_relogin_handler_contract():
-    """The ownership move must not reorder backup/start or break cancel restore."""
-    saved = (g._codex_bin, g._codex_available, g._codex_auth_lifecycle,
-             g._send_json, g._invalidate_codex_usage_cache,
-             g.asyncio.create_subprocess_exec, g.asyncio.sleep, g.CODEX_LOGIN_OUT)
-    capture_dir = tempfile.mkdtemp(prefix="codex-relogin-handler-")
+    """devterm is the CALLER now: every Codex credential verb goes to the platform
+    tool, and codex itself is never spawned from this process."""
+    saved = (g._codex_auth_call, g._send_json, g._invalidate_codex_usage_cache,
+             g.asyncio.create_subprocess_exec)
     events, sent = [], []
 
-    class Proc:
-        returncode = 0
-        async def wait(self):
-            return 0
-
-    async def lifecycle(action):
+    async def call(action, _timeout):
         events.append(action)
-        return (True, None)
-
-    async def spawn(*args, **_kwargs):
-        events.append(tuple(args))
-        return Proc()
+        if action == "login-start":
+            return {"ok": True, "url": "https://auth.openai.com/codex/device",
+                    "code": "ABCD-1234"}, None
+        return {"ok": True, "restored": True}, None
 
     async def send(_cw, status, payload, **_kwargs):
         sent.append((status, payload))
 
-    async def no_sleep(_seconds):
-        return None
+    async def spawn(*args, **_kwargs):
+        raise AssertionError("devterm must not spawn codex itself: " + repr(args))
 
     try:
-        g._codex_bin = lambda: "/fake/codex"
-        # Cancellation recovery must not depend on the executable still existing.
-        g._codex_available = lambda: False
-        g._codex_auth_lifecycle = lifecycle
+        g._codex_auth_call = call
         g._send_json = send
         g._invalidate_codex_usage_cache = lambda: events.append("invalidate")
         g.asyncio.create_subprocess_exec = spawn
-        g.asyncio.sleep = no_sleep
-        g.CODEX_LOGIN_OUT = os.path.join(capture_dir, "capture.out")
         await g._serve_codex_login_start(None)
-        start_events = list(events)
+        start = (list(events), list(sent))
         events.clear(); sent.clear()
         await g._serve_codex_login_cancel(None)
-        return start_events, list(events), list(sent)
+        cancel = (list(events), list(sent))
+        events.clear(); sent.clear()
+        await g._serve_codex_logout(None)
+        return start, cancel, (list(events), list(sent))
     finally:
-        (g._codex_bin, g._codex_available, g._codex_auth_lifecycle,
-         g._send_json, g._invalidate_codex_usage_cache,
-         g.asyncio.create_subprocess_exec, g.asyncio.sleep, g.CODEX_LOGIN_OUT) = saved
-        shutil.rmtree(capture_dir, ignore_errors=True)
+        (g._codex_auth_call, g._send_json, g._invalidate_codex_usage_cache,
+         g.asyncio.create_subprocess_exec) = saved
 
 
-_start_events, _cancel_events, _cancel_sent = asyncio.run(_codex_relogin_handler_contract())
-check("Codex re-login awaits platform backup before pkill and device-auth spawn",
-      "backup" in _start_events
-      and next(i for i, event in enumerate(_start_events)
-               if isinstance(event, tuple) and event[:2] == ("pkill", "-f"))
-          > _start_events.index("backup")
-      and next(i for i, event in enumerate(_start_events)
-               if isinstance(event, tuple)
-               and event[:3] == ("/fake/codex", "login", "--device-auth"))
-          > _start_events.index("backup"))
-check("Codex cancel restores through the platform and invalidates the old usage cache",
-      _cancel_events[-2:] == ["restore", "invalidate"]
-      and _cancel_sent == [(b"200 OK", {"ok": True, "restored": True})])
+_relogin_start, _relogin_cancel, _relogin_logout = asyncio.run(_codex_relogin_handler_contract())
+check("Codex re-login start delegates to the platform and returns only URL + code",
+      _relogin_start[0] == ["invalidate", "login-start"]
+      and _relogin_start[1] == [(b"200 OK", {"ok": True, "code": "ABCD-1234",
+                                             "url": "https://auth.openai.com/codex/device"})])
+check("Codex cancel delegates to the platform and invalidates the old usage cache",
+      _relogin_cancel[0] == ["login-cancel", "invalidate"]
+      and _relogin_cancel[1] == [(b"200 OK", {"ok": True, "restored": True})])
+check("Codex logout delegates to the platform and invalidates the old usage cache",
+      _relogin_logout[0] == ["logout", "invalidate"]
+      and _relogin_logout[1] == [(b"200 OK", {"ok": True})])
 
 
-async def _codex_backup_failure_contract():
-    saved = (g._codex_bin, g._codex_auth_lifecycle, g._send_json,
-             g.asyncio.create_subprocess_exec)
-    spawned, sent = [], []
+async def _codex_platform_failure_contract():
+    """A platform-side failure reaches the panel as its own message, not as a blank
+    400 and not as codex's raw output."""
+    saved = (g._codex_auth_call, g._send_json, g._invalidate_codex_usage_cache)
+    sent = []
 
-    async def lifecycle(_action):
-        return None, "platform accounts operation failed"
-
-    async def spawn(*args, **_kwargs):
-        spawned.append(args)
-        raise AssertionError("Codex must not launch after backup failure")
+    async def call(_action, _timeout):
+        return None, "codex not found (not installed, or installed outside ...)"
 
     async def send(_cw, status, payload, **_kwargs):
         sent.append((status, payload))
 
     try:
-        g._codex_bin = lambda: "/fake/codex"
-        g._codex_auth_lifecycle = lifecycle
+        g._codex_auth_call = call
         g._send_json = send
-        g.asyncio.create_subprocess_exec = spawn
+        g._invalidate_codex_usage_cache = lambda: None
         await g._serve_codex_login_start(None)
-        return spawned, sent
+        await g._serve_codex_logout(None)
+        return list(sent)
     finally:
-        (g._codex_bin, g._codex_auth_lifecycle, g._send_json,
-         g.asyncio.create_subprocess_exec) = saved
+        (g._codex_auth_call, g._send_json, g._invalidate_codex_usage_cache) = saved
 
 
-_backup_failure_spawned, _backup_failure_sent = asyncio.run(_codex_backup_failure_contract())
-check("Codex re-login fails closed before spawn when platform backup fails",
-      not _backup_failure_spawned
-      and _backup_failure_sent == [(b"400 Bad Request", {
-          "ok": False, "error": "platform accounts operation failed"})])
+_platform_failures = asyncio.run(_codex_platform_failure_contract())
+check("a platform Codex failure is reported with its own reason",
+      _platform_failures == [
+          (b"400 Bad Request", {"ok": False,
+                                "error": "codex not found (not installed, or installed outside ...)"}),
+          (b"400 Bad Request", {"ok": False,
+                                "error": "codex not found (not installed, or installed outside ...)"})])
+
+# End to end across the ownership boundary, with no fakes between the two halves:
+# devterm's endpoint spawns the REAL bin/airlock-accounts, which spawns a fake codex,
+# and the pairing code comes back out of the HTTP payload. The unit tests above pin the
+# two sides separately; only this one fails if the ABI between them drifts — a renamed
+# verb, a changed JSON key, a --json exit status that stops meaning "the tool ran".
+async def _codex_relogin_end_to_end():
+    tmp = tempfile.mkdtemp(prefix="codex-relogin-e2e-")
+    saved_env = dict(os.environ)
+    saved = (g.PLATFORM_ACCOUNTS, g._send_json, g._invalidate_codex_usage_cache)
+    sent = []
+
+    async def send(_cw, status, payload, **_kwargs):
+        sent.append((status, payload))
+
+    try:
+        os.makedirs(os.path.join(tmp, "bin"))
+        os.makedirs(os.path.join(tmp, "codex"))
+        fake = os.path.join(tmp, "bin", "codex")
+        with open(fake, "w") as f:
+            # Real codex removes the live login the moment device-auth starts, before
+            # the user has approved a replacement. The fixture has to do that too, or
+            # the recovery assertion below would pass without recovering anything.
+            f.write("#!/bin/sh\n"
+                    'rm -f "$CODEX_HOME/auth.json"\n'
+                    "printf 'Sign in: https://auth.openai.com/codex/device?e=1\\n'\n"
+                    "printf 'Code: QRST-5678\\n'\n"
+                    "exec sleep 30\n")
+        os.chmod(fake, 0o755)
+        auth = os.path.join(tmp, "codex", "auth.json")
+        marker = b'{"fixture":"e2e-previous-login"}\n'
+        with open(auth, "wb") as f:
+            f.write(marker)
+        os.environ.update(HOME=os.path.join(tmp, "home"),
+                          CODEX_HOME=os.path.join(tmp, "codex"),
+                          PATH=os.path.join(tmp, "bin") + ":/usr/bin:/bin")
+        g.PLATFORM_ACCOUNTS = os.path.abspath("bin/airlock-accounts")
+        g._send_json = send
+        g._invalidate_codex_usage_cache = lambda: None
+        await g._serve_codex_login_start(None)
+        started = os.path.exists(auth)
+        await g._serve_codex_login_cancel(None)
+        with open(auth, "rb") as f:
+            recovered = f.read()
+        return list(sent), started, recovered == marker
+    finally:
+        (g.PLATFORM_ACCOUNTS, g._send_json, g._invalidate_codex_usage_cache) = saved
+        os.environ.clear(); os.environ.update(saved_env)
+        subprocess.run(["pkill", "-f", os.path.join(tmp, "bin", "codex")],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+_e2e_sent, _e2e_wiped, _e2e_recovered = asyncio.run(_codex_relogin_end_to_end())
+check("start -> cancel completes through the platform path and hands back the code",
+      len(_e2e_sent) == 2
+      and _e2e_sent[0] == (b"200 OK", {"ok": True, "code": "QRST-5678",
+                                       "url": "https://auth.openai.com/codex/device?e=1"})
+      and _e2e_sent[1] == (b"200 OK", {"ok": True, "restored": True}))
+# The reason the backup exists at all: codex removes the live login as it starts, and
+# cancel is the only thing that puts it back. If the fixture ever stopped wiping it,
+# the recovery assertion below would pass without recovering anything.
+check("the fixture really did leave the box logged out mid-flow", not _e2e_wiped)
+check("cancel puts the exact previous login back", _e2e_recovered)
 
 # A rendered/manual unit may carry the feature flag but omit the platform path. After
 # the ownership move there is deliberately no app sibling or PATH fallback: starting
@@ -990,6 +1118,308 @@ async def _codex_identity_case():
 
 asyncio.run(_codex_identity_case())
 
+
+# OAuth approval codes are one-time credentials. The browser sends one in an HTTP body;
+# from that point to the platform CLI it must stay off argv and cross only protected stdin.
+async def _login_code_transport_case():
+    saved_create = g.asyncio.create_subprocess_exec
+    captured = {}
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self, input_bytes=None):
+            captured["input"] = input_bytes
+            return b"registered\n", b""
+
+    async def create(*argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["stdin"] = kwargs.get("stdin")
+        return Proc()
+
+    try:
+        g.asyncio.create_subprocess_exec = create
+        try:
+            result = await g._claude_switch(
+                ["login-code"], stdin_bytes=b"oauth-transport-sentinel")
+        except TypeError as exc:
+            return {"error": str(exc)}
+        captured["result"] = result
+        return captured
+    finally:
+        g.asyncio.create_subprocess_exec = saved_create
+
+
+login_transport = asyncio.run(_login_code_transport_case())
+check("OAuth code crosses the subprocess boundary only through stdin",
+      login_transport.get("argv") == [g.CLAUDE_SWITCH, "login-code"]
+      and login_transport.get("stdin") is asyncio.subprocess.PIPE
+      and login_transport.get("input") == b"oauth-transport-sentinel"
+      and "oauth-transport-sentinel" not in " ".join(login_transport.get("argv", [])))
+
+
+class _ProtectedLoginInput:
+    def __init__(self, raw):
+        self.buffer = io.BytesIO(raw)
+
+    def isatty(self):
+        return False
+
+
+_saved_login_handler, _saved_login_stdin = ac.cmd_login_code, ac.sys.stdin
+_login_dispatch = []
+try:
+    ac.cmd_login_code = lambda code: _login_dispatch.append(code)
+    ac.sys.stdin = _ProtectedLoginInput(b"oauth-stdin-sentinel#state")
+    safe_login_rc = ac.main(["login-code"])
+    argv_err = io.StringIO()
+    with contextlib.redirect_stderr(argv_err):
+        argv_login_rcs = (
+            ac.main(["login-code", "oauth-argv-sentinel"]),
+            ac.main(["login-code", "oauth sentinel"]),
+            ac.main(["login-code", "x" * (ac.LOGIN_CODE_MAX_BYTES + 1)]),
+            ac.main(["login-code", "one", "two"]),
+        )
+    transport_out = io.StringIO()
+    with contextlib.redirect_stdout(transport_out):
+        transport_rc = ac.main(["login-code-transport"])
+finally:
+    ac.cmd_login_code, ac.sys.stdin = _saved_login_handler, _saved_login_stdin
+
+check("platform login-code reads protected stdin with no secret argv",
+      safe_login_rc == 0 and _login_dispatch[0] == "oauth-stdin-sentinel#state")
+check("platform login-code rejects every argv form without dispatch",
+      argv_login_rcs == (2, 2, 2, 2) and len(_login_dispatch) == 1
+      and "protected stdin only" in argv_err.getvalue()
+      and "oauth-argv-sentinel" not in argv_err.getvalue()
+      and "oauth sentinel" not in argv_err.getvalue())
+check("platform advertises the side-effect-free stdin transport capability",
+      transport_rc == 0 and transport_out.getvalue().strip() == "stdin-v1")
+
+
+# Materialize the committed DevTerm golden exactly as the installer does: substitute
+# its ROOT placeholder and chmod the result. This is the real fleet path
+# claude-switch -> platform CLI, not another hand-written wrapper fixture.
+_shim_tmp = tempfile.mkdtemp(prefix="devterm-claude-switch-shim-")
+try:
+    _golden = open(
+        "install/golden/render/devterm/accounts-on/shim-claude-switch",
+        encoding="utf-8").read()
+    _shim = os.path.join(_shim_tmp, "claude-switch")
+    with open(_shim, "w", encoding="utf-8") as f:
+        f.write(_golden.replace("ROOT", os.path.abspath(".")))
+    os.chmod(_shim, 0o755)
+    _shim_env = dict(os.environ, HOME=_shim_tmp, PYTHONDONTWRITEBYTECODE="1")
+    _shim_cap = subprocess.run(
+        [_shim, "login-code-transport"], env=_shim_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+    _shim_stdin_code = "oauth-shim-stdin-sentinel#state"
+    _shim_stdin = subprocess.run(
+        [_shim, "login-code"], input=_shim_stdin_code, env=_shim_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+    _shim_argv_code = "oauth-shim-argv-sentinel#state"
+    _shim_legacy = subprocess.run(
+        [_shim, "login-code", _shim_argv_code], input="", env=_shim_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+
+    # The same committed shim with a capture callee proves the shell boundary itself
+    # leaves the secret in stdin. The real-parser cases above prove the other half.
+    _capture_root = os.path.join(_shim_tmp, "capture-root")
+    os.makedirs(os.path.join(_capture_root, "bin"))
+    _capture_callee = os.path.join(_capture_root, "bin", "airlock-accounts")
+    with open(_capture_callee, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nprintf '%s\\n' \"$#\" \"$1\"\nIFS= read -r code\nprintf '%s\\n' \"$code\"\n")
+    os.chmod(_capture_callee, 0o755)
+    _capture_shim = os.path.join(_shim_tmp, "claude-switch-capture")
+    with open(_capture_shim, "w", encoding="utf-8") as f:
+        f.write(_golden.replace("ROOT", _capture_root))
+    os.chmod(_capture_shim, 0o755)
+    _captured_shim = subprocess.run(
+        [_capture_shim, "login-code"], input=_shim_stdin_code + "\n", env=_shim_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+finally:
+    shutil.rmtree(_shim_tmp, ignore_errors=True)
+
+check("rendered claude-switch shim preserves the stdin-v1 capability",
+      _shim_cap.returncode == 0 and _shim_cap.stdout.strip() == "stdin-v1"
+      and not _shim_cap.stderr)
+check("rendered claude-switch shim carries stdin into the real platform parser",
+      _shim_stdin.returncode == 1 and "no login is pending" in _shim_stdin.stderr
+      and _shim_stdin_code not in _shim_stdin.stdout + _shim_stdin.stderr)
+check("rendered claude-switch shim keeps the code out of the callee argv boundary",
+      _captured_shim.returncode == 0
+      and _captured_shim.stdout.splitlines() == ["1", "login-code", _shim_stdin_code])
+check("rendered claude-switch shim rejects argv before login processing",
+      _shim_legacy.returncode == 2 and "protected stdin only" in _shim_legacy.stderr
+      and _shim_argv_code not in _shim_legacy.stdout + _shim_legacy.stderr)
+
+
+# Claim the old PKCE flow before exchange. A new login-url arriving after that atomic
+# rename must survive; the old flow must no longer be replayable from PENDING.
+_claim_tmp = tempfile.mkdtemp(prefix="accounts-pkce-claim-")
+_saved_pending, _saved_replace = ac.PENDING, ac.os.replace
+try:
+    ac.PENDING = os.path.join(_claim_tmp, ".login-pending.json")
+    _old_flow = {"verifier": "old", "state": "old", "ts": time.time()}
+    _new_flow = {"verifier": "new", "state": "new", "ts": time.time()}
+    ac._save_atomic(ac.PENDING, _old_flow)
+
+    def _replace_then_new(src, dst):
+        _saved_replace(src, dst)
+        ac.os.replace = _saved_replace
+        try:
+            ac._save_atomic(ac.PENDING, _new_flow)
+        finally:
+            ac.os.replace = _replace_then_new
+
+    ac.os.replace = _replace_then_new
+    _claimed_old = ac._claim_pending_login()
+    ac.os.replace = _saved_replace
+    _claimed_new = ac._claim_pending_login()
+finally:
+    ac.PENDING, ac.os.replace = _saved_pending, _saved_replace
+    shutil.rmtree(_claim_tmp, ignore_errors=True)
+
+check("PKCE pending flow is atomically claimed without deleting a newer flow",
+      _claimed_old == _old_flow and _claimed_new == _new_flow)
+
+
+# A token endpoint is outside this trust boundary. Even if it reflects the submitted
+# code in an HTTP body or exception string, neither the CLI nor the browser response may
+# carry that one-time credential back out.
+_saved_login_exchange = ac._ensure_pool, ac._claim_pending_login, ac.urllib.request.urlopen
+_exchange_code = "oauth-reflection-sentinel#state"
+_exchange_errors = []
+try:
+    ac._ensure_pool = lambda: None
+    ac._claim_pending_login = lambda: {
+        "verifier": "verifier", "state": "state", "ts": time.time()}
+    for exchange_error in (
+        urllib.error.HTTPError("https://token.invalid", 400, "bad", {},
+                               io.BytesIO(_exchange_code.encode("utf-8"))),
+        RuntimeError("transport reflected " + _exchange_code),
+    ):
+        ac.urllib.request.urlopen = lambda *_args, _error=exchange_error, **_kwargs: (
+            _ for _ in ()).throw(_error)
+        exchange_stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(exchange_stderr):
+                ac.cmd_login_code(_exchange_code)
+        except SystemExit as exc:
+            _exchange_errors.append((exc.code, exchange_stderr.getvalue()))
+finally:
+    ac._ensure_pool, ac._claim_pending_login, ac.urllib.request.urlopen = _saved_login_exchange
+
+check("token exchange failures cannot reflect the OAuth code to CLI stderr",
+      len(_exchange_errors) == 2
+      and all(rc == 1 and _exchange_code not in stderr
+              for rc, stderr in _exchange_errors))
+
+
+async def _acct_login_reflection_case():
+    saved_accounts_enabled = g._accounts_enabled
+    saved_read_json = g._read_json_body
+    saved_claude_switch = g._claude_switch
+    saved_send_json = g._send_json
+    sent = {}
+    try:
+        g._accounts_enabled = lambda: True
+
+        async def read_json(_cr, _headers, _leftover, limit=None):
+            return {"code": _exchange_code}
+
+        async def login_code(_args, stdin_bytes=None):
+            return True, "upstream reflected " + _exchange_code, ""
+
+        async def send_json(_cw, status, payload, **_kwargs):
+            sent.update(status=status, payload=payload)
+
+        g._read_json_body = read_json
+        g._claude_switch = login_code
+        g._send_json = send_json
+        await g._serve_acct_login_code(
+            None, {b"content-type": b"application/json"}, b"", None)
+        return sent
+    finally:
+        g._accounts_enabled = saved_accounts_enabled
+        g._read_json_body = saved_read_json
+        g._claude_switch = saved_claude_switch
+        g._send_json = saved_send_json
+
+
+login_reflection = asyncio.run(_acct_login_reflection_case())
+check("DevTerm never returns reflected OAuth code output to the browser",
+      login_reflection.get("status") == b"200 OK"
+      and _exchange_code not in json.dumps(login_reflection.get("payload", {})))
+
+
+async def _acct_login_http_boundary_case(headers, code):
+    saved_accounts_enabled = g._accounts_enabled
+    saved_read_json = g._read_json_body
+    saved_claude_switch = g._claude_switch
+    saved_send_json = g._send_json
+    sent, child = {}, []
+    try:
+        g._accounts_enabled = lambda: True
+
+        async def read_json(_cr, _headers, _leftover, limit=None):
+            sent["limit"] = limit
+            return {"code": code}
+
+        async def login_code(_args, stdin_bytes=None):
+            child.append(stdin_bytes)
+            return True, "ok", ""
+
+        async def send_json(_cw, status, payload, **_kwargs):
+            sent.update(status=status, payload=payload)
+
+        g._read_json_body = read_json
+        g._claude_switch = login_code
+        g._send_json = send_json
+        await g._serve_acct_login_code(None, headers, b"", None)
+        return sent, child
+    finally:
+        g._accounts_enabled = saved_accounts_enabled
+        g._read_json_body = saved_read_json
+        g._claude_switch = saved_claude_switch
+        g._send_json = saved_send_json
+
+
+_cross_origin, _cross_child = asyncio.run(_acct_login_http_boundary_case(
+    {b"content-type": b"application/json", b"host": b"box.test",
+     b"origin": b"https://evil.test"}, "safe-code"))
+_wrong_type, _type_child = asyncio.run(_acct_login_http_boundary_case(
+    {b"content-type": b"text/plain"}, "safe-code"))
+_wide_code, _wide_child = asyncio.run(_acct_login_http_boundary_case(
+    {b"content-type": b"application/json"}, "é" * 400))
+check("DevTerm login-code refuses cross-origin and form-compatible writes before dispatch",
+      _cross_origin.get("status") == b"403 Forbidden" and not _cross_child
+      and _wrong_type.get("status") == b"415 Unsupported Media Type" and not _type_child)
+check("DevTerm login-code applies a narrow body cap and a 400-byte UTF-8 code cap",
+      _wide_code.get("limit") == g.LOGIN_CODE_BODY_MAX
+      and _wide_code.get("status") == b"400 Bad Request" and not _wide_child)
+
+
+async def _narrow_reader_cap_case():
+    class Reader:
+        called = False
+
+        async def read(self, _size):
+            self.called = True
+            raise AssertionError("oversized credential body must be rejected before reading")
+
+    reader = Reader()
+    body = await g._read_json_body(
+        reader, {b"content-length": str(g.LOGIN_CODE_BODY_MAX + 1).encode()}, b"",
+        limit=g.LOGIN_CODE_BODY_MAX)
+    return body, reader.called
+
+
+_oversized_body, _oversized_read = asyncio.run(_narrow_reader_cap_case())
+check("DevTerm login-code rejects an oversized Content-Length before buffering its body",
+      _oversized_body is None and not _oversized_read)
+
+
 # Verification #4: a successful account login invalidates both derived account caches
 # before the success response is sent.
 async def _acct_login_success_case():
@@ -1001,13 +1431,15 @@ async def _acct_login_success_case():
     saved_live = dict(g._live_usage_cache)
     saved_generation = g._acct_cache_generation
     sent = {}
+    login_call = {}
     try:
         g._accounts_enabled = lambda: True
 
-        async def read_json(_cr, _headers, _leftover):
+        async def read_json(_cr, _headers, _leftover, limit=None):
             return {"code": "one-time-code"}
 
-        async def login_code(_args):
+        async def login_code(args, stdin_bytes=None):
+            login_call.update(args=args, stdin_bytes=stdin_bytes)
             return True, "registered", ""
 
         async def send_json(_cw, status, payload, **_kwargs):
@@ -1018,9 +1450,10 @@ async def _acct_login_success_case():
         g._send_json = send_json
         g._acct_alert_cache.update(at=time.time(), payload={"level": "crit"})
         g._live_usage_cache.update(at=time.time(), payload={"use5h": 99})
-        await g._serve_acct_login_code(None, {}, b"", None)
+        await g._serve_acct_login_code(
+            None, {b"content-type": b"application/json"}, b"", None)
         return sent, (g._acct_alert_cache["at"], g._acct_alert_cache["payload"]), \
-            (g._live_usage_cache["at"], g._live_usage_cache["payload"])
+            (g._live_usage_cache["at"], g._live_usage_cache["payload"]), login_call
     finally:
         g._accounts_enabled = saved_accounts_enabled
         g._read_json_body = saved_read_json
@@ -1031,11 +1464,14 @@ async def _acct_login_success_case():
         g._acct_cache_generation = saved_generation
 
 
-login_sent, login_alert_cache, login_live_cache = asyncio.run(_acct_login_success_case())
+login_sent, login_alert_cache, login_live_cache, login_call = asyncio.run(_acct_login_success_case())
 check("successful account login invalidates derived caches",
       login_sent.get("payload", {}).get("ok") is True
       and login_alert_cache == (0.0, None)
       and login_live_cache == (0.0, None))
+check("account login handler keeps the OAuth code out of subprocess argv",
+      login_call == {"args": ["login-code"],
+                     "stdin_bytes": b"one-time-code"})
 
 
 async def _acct_login_inflight_case():
@@ -1056,10 +1492,10 @@ async def _acct_login_inflight_case():
     try:
         g._accounts_enabled = lambda: True
 
-        async def read_json(_cr, _headers, _leftover):
+        async def read_json(_cr, _headers, _leftover, limit=None):
             return {"code": "one-time-code"}
 
-        async def login_code(_args):
+        async def login_code(_args, stdin_bytes=None):
             return True, "registered", ""
 
         async def account_list():
@@ -1090,7 +1526,8 @@ async def _acct_login_inflight_case():
 
         alert_task = asyncio.create_task(g._serve_acct_alert({}, None))
         await first_started.wait()
-        await g._serve_acct_login_code(None, {}, b"", None)
+        await g._serve_acct_login_code(
+            None, {b"content-type": b"application/json"}, b"", None)
         release_first.set()
         await alert_task
         payload = sent[-1]
@@ -1669,10 +2106,13 @@ try:
     os.environ.update(HOME=_disc_home, PATH="")
     os.environ.pop("CODEX_BIN", None)
     os.environ.pop("CODEX_EXTRA_BIN_DIRS", None)
+    # The resolver moved with the driver (ACCT_OWN): the platform CLI is what has to
+    # find codex now, and the gate no longer looks for it at all.
     check("no codex anywhere -> None, never a path that was not verified",
-          g._codex_bin() is None)
-    check("...so the feature reports itself unavailable", g._codex_available() is False)
-    _msg = g._codex_missing_error()
+          ac._codex_bin() is None)
+    check("...and the gate has stopped resolving codex itself",
+          not hasattr(g, "_codex_bin"))
+    _msg = ac._codex_missing_error()
     check("the refusal names the command", "codex" in _msg)
     check("the refusal says where it looked", "searched" in _msg and "PATH(" in _msg)
     # The old text was the bare string "codex not available", which sent every
@@ -1685,10 +2125,9 @@ try:
     _fnm = os.path.join(_disc_home, ".local/share/fnm/aliases/default/bin/codex")
     _mkbin(_fnm)
     check("codex under a node version manager is found with an empty PATH",
-          g._codex_bin() == _fnm)
-    check("...and what is returned is really executable", os.access(g._codex_bin(), os.X_OK))
-    check("...so the endpoints stop refusing", g._codex_available() is True)
-    check("platform status resolves the same binary as the gate (one contract, one module)",
+          ac._codex_bin() == _fnm)
+    check("...and what is returned is really executable", os.access(ac._codex_bin(), os.X_OK))
+    check("platform status resolves the same binary as the account CLI (one module)",
           cs._codex_bin() == _fnm)
 finally:
     os.environ.clear(); os.environ.update(_disc_saved)

@@ -90,7 +90,10 @@ MemoryHigh=20480M
 # its own, so 'pids.events' on the unit will never show 'max' climbing — the
 # slice's will instead. AIRLOCK_PASEO_TASKS_MAX puts a finite one back.
 TasksMax=infinity
-NoNewPrivileges=yes
+# NoNewPrivileges is deliberately OFF for this unit.
+# This unit is the parent of the operator's agent sessions, and the directive
+# is inherited by every child — it would remove sudo and setgid from their shell.
+NoNewPrivileges=no
 
 [Install]
 WantedBy=default.target

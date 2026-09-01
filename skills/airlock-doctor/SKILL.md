@@ -9,6 +9,23 @@ Diagnose an Airlock install on the current box. Work top-down along the request
 path: `tailscale serve → nginx gate → app backend`. Report cause, impact, and the
 next concrete action — never a bare "it's broken".
 
+## 0. Ask once, first
+
+```bash
+python3 bin/airlock-status              # human summary
+python3 bin/airlock-status --json       # the same run, for another program
+```
+
+It walks this whole page's read-only probes in one pass — config, install
+record, ingress, gate, units, app backends — and exits `0` all clear, `3`
+nothing failed but something could not be checked, `1` something failed. Start
+here and let it point at the section below that matters; the sections are for
+going deeper, not for finding out where to look.
+
+`3` is not a pass. Every check reports every run, and one that could not run
+says `unchecked` rather than disappearing — so a short green report cannot
+happen. Read the `----` lines before calling a box healthy.
+
 ## 1. Ingress (Tailscale)
 
 ```bash

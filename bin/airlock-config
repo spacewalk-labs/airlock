@@ -52,6 +52,7 @@ Requires Python >= 3.11 (tomllib).
 """
 from __future__ import annotations
 
+import ast
 import copy
 import contextlib
 import datetime as dt
@@ -83,6 +84,17 @@ except ModuleNotFoundError:  # pragma: no cover
 # See SECURITY.md.
 PROVIDER_HEADER = {"tailscale": "Tailscale-User-Login"}
 
+# [agent].provider — which agent CLI a PLATFORM tool runs (dev-monitor's approved
+# actions today). The VOCABULARY is not written here: it is read from
+# bin/agent_provider.py, the module that also decides what `auto` means. A copy of
+# the list in this file would let validate accept a value the selector rejects, or
+# refuse one it handles, and neither side would know.
+#
+# The DEFAULT is `claude`, not `auto`, and that is a compatibility statement rather
+# than a preference: the action runner had `claude` written into its argv, so a box
+# that never sets this key has to keep running claude. Choosing `auto` is an act.
+AGENT_PROVIDER_DEFAULT = "claude"
+
 # Set only by the exact process argv parsed in main().  This is deliberately
 # not read from the environment: an exported switch would remain active for
 # later commands and turn an exceptional, package-scoped act into ambient
@@ -112,6 +124,16 @@ APP_DEFAULTS: dict[str, dict] = {
 # Accepted in ANY app table (not a default: they carry no value when absent).
 COMMON_APP_KEYS = frozenset({"external"})
 
+
+def _is_port_config_key(key: str) -> bool:
+    """Return whether a scalar config key names a locally owned TCP port.
+
+    Most packages use ``*_port``. Older external packages used the bare
+    ``port`` spelling; excluding it let a listener disappear from the global
+    ownership pool while still looking declared in its manifest.
+    """
+    return key == "port" or key.endswith("_port")
+
 # The non-app sections are closed vocabularies: v1 reads exactly these keys and
 # nothing else, so anything else in them is a typo. `[auth]` earns the check on its
 # own — a mistyped `collaborators` leaves the operator believing they granted (or
@@ -123,6 +145,11 @@ CLOSED_SECTIONS: dict[str, frozenset] = {
     "auth":     frozenset({"provider", "owner", "collaborators"}),
     "paths":    frozenset({"wiki"}),
     "branding": frozenset({"product", "icon_ring"}),
+    # [agent] is a PLATFORM table, deliberately not [apps.<something>].provider: the
+    # tool it steers today (dev-monitor's approved actions) is one consumer of a fact
+    # about the box, and the next one must not have to restate it. An app that owns a
+    # provider key of its own keeps winning inside that app — see airlock.toml.example.
+    "agent":    frozenset({"provider"}),
 }
 
 CONFIG_ABI_VERSION = 2
@@ -506,6 +533,35 @@ def _ledger_module():
     return mod
 
 
+_AGENT_MODULE = None
+
+
+def _agent_module():
+    """bin/agent_provider.py loaded as a module, for the same reason as the ledger
+    above: the accepted values of `[agent].provider` are defined by the code that
+    acts on them, and validate reads that definition rather than restating it."""
+    global _AGENT_MODULE
+    if _AGENT_MODULE is not None:
+        return _AGENT_MODULE
+    import importlib.util
+    path = Path(__file__).resolve().parent / "agent_provider.py"
+    spec = importlib.util.spec_from_file_location("_airlock_agent_provider", path)
+    mod = importlib.util.module_from_spec(spec)
+    prior = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True   # a validator must not write __pycache__
+    try:
+        spec.loader.exec_module(mod)
+    except OSError as e:
+        die(f"cannot load the agent-provider module beside this tool: {path} ({e}).\n"
+            "  The accepted values of [agent].provider are defined there, so a "
+            "missing or unreadable one is a broken install — not an empty "
+            "vocabulary. Restore bin/agent_provider.py next to bin/airlock-config.")
+    finally:
+        sys.dont_write_bytecode = prior
+    _AGENT_MODULE = mod
+    return mod
+
+
 def die(msg: str, code: int = 1) -> "None":
     sys.stderr.write(f"airlock-config: {msg}\n")
     sys.exit(code)
@@ -667,6 +723,10 @@ def resolved(cfg: dict) -> dict:
     for k in ("wiki",):
         if paths.get(k):
             paths[k] = str(_expanduser(str(paths[k]), f"paths.{k}"))
+    # The platform default joins the same merge the app defaults do, so `get`, `env`
+    # and `json` all report the value that will actually be used. A key whose default
+    # only exists inside the consumer cannot be read off the box before it runs.
+    out.setdefault("agent", {}).setdefault("provider", AGENT_PROVIDER_DEFAULT)
     return out
 
 
@@ -687,6 +747,7 @@ def cmd_validate(cfg: dict) -> "None":
     owner = auth.get("owner", "")
     if not isinstance(owner, str) or "@" not in owner:
         die(f"auth.owner must be a login (email-like); got {owner!r}")
+    _validate_agent(cfg)
     apps = cfg.get("apps", {})
     if "hub" not in apps:
         die("[apps.hub] is required (the entrance)")
@@ -719,18 +780,36 @@ def cmd_validate(cfg: dict) -> "None":
     _read_ledger()          # F9a: a corrupt ledger fails validate, loudly
     packages_resolved(cfg)  # D1/D2: serve values, port spans, disjointness
     app_order(cfg)          # D3/F5: missing dep and cycles surface at validate
-    # AIRLOCK_STRICT_CONFIG_SCAN=1 promotes the scan's LITERAL findings to fatal,
-    # for shipped packages only. It is off by default and on in CI: an operator
-    # validating their own config should not be blocked by a lint about a package
-    # they did not write, and an external package author should not be blocked at
-    # all (see _scan_config_reads).
+    # AIRLOCK_STRICT_CONFIG_SCAN=1 promotes undeclared LITERAL references to
+    # fatal for shipped packages. It is off by default and on in CI. A dead
+    # port declaration is independently fatal for every package: otherwise
+    # the value checked for global uniqueness can differ from the listener.
     strict_scan = os.environ.get("AIRLOCK_STRICT_CONFIG_SCAN") == "1"
     for pid, spec in specs.items():   # F12: declared vs actually-read keys
+        port_scalars, port_tables = _port_contract_keys(spec)
         _scan_config_reads(pid, Path(spec["dir"]), spec["schema"],
-                           spec["audience"],
+                           spec["audience"], port_scalars, port_tables,
                            strict=(strict_scan and
                                    "strict-config-scan" in spec["certifications"]))
     print("ok: config valid")
+
+
+def _validate_agent(cfg: dict) -> "None":
+    """`[agent].provider` names a CLI the selector knows, or the install stops here.
+
+    Fail-closed rather than "unknown falls back to auto", because the fallback is
+    invisible: the config would read as codex and the box would run claude with
+    nothing anywhere saying which one it picked. agent_provider.select() carries the
+    same refusal at runtime for a value that reaches it some other way — this check
+    is the one that reaches the operator while they are still editing the file.
+    """
+    value = (cfg.get("agent") or {}).get("provider", AGENT_PROVIDER_DEFAULT)
+    choices = _agent_module().CHOICES
+    if value not in choices:
+        die(f"agent.provider must be one of {sorted(choices)}; got {value!r}.\n"
+            "  auto = pick an installed CLI, preferring one with a login on this box; "
+            "the others pin it. The model is never part of this — each CLI picks its "
+            "own (owner decision 5).")
 
 
 def _validate_shape(cfg: dict) -> "None":
@@ -925,7 +1004,7 @@ def _expanduser(raw: str, where: str) -> Path:
 
 
 def _validate_ports(cfg: dict) -> "None":
-    """Every *_port across enabled apps must be a distinct, valid port.
+    """Every port/``*_port`` across enabled apps must be distinct and valid.
 
     Not cosmetic: two nginx `server`s on one loopback port both match
     `server_name _`, so nginx silently keeps the FIRST and drops the second. If a
@@ -935,10 +1014,17 @@ def _validate_ports(cfg: dict) -> "None":
     at validate time instead.
     """
     seen: dict = {}
-    for app, table in sorted(resolved(cfg).get("apps", {}).items()):
+    resolved_apps = resolved(cfg).get("apps", {})
+    for app, table in sorted(resolved_apps.items()):
+        port_values = []
         for key, val in sorted((table or {}).items()):
-            if not key.endswith("_port"):
-                continue
+            if isinstance(val, dict):
+                port_values.extend((f"{key}.{leaf}", nested)
+                                   for leaf, nested in sorted(val.items())
+                                   if _is_port_config_key(leaf))
+            elif _is_port_config_key(key):
+                port_values.append((key, val))
+        for key, val in port_values:
             if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 65535:
                 die(f"apps.{app}.{key} must be a port number 1-65535 (got {val!r})")
             if val in seen:
@@ -955,12 +1041,38 @@ def _validate_ports(cfg: dict) -> "None":
             if val == 443:
                 die(f"packages.{pid} serve key {key!r} claims port 443 — the "
                     "platform's TLS entrypoint is never an app's serve port.")
-            if key.endswith("_port"):
+            if _is_port_config_key(key):
                 continue   # already swept above as apps.{pid}.{key}
             if val in seen:
                 die(f"port {val} is used twice: apps.{seen[val]} and "
                     f"packages.{pid} serve key {key!r}. Ports must be unique.")
             seen[val] = f"{pid}.{key} (serve)"
+        # Explicit manifest semantics can make an arbitrary config key a real
+        # listener/target even when its name is not port-shaped. The read gate
+        # below already treats these as ownership inputs; the uniqueness pool
+        # must use the identical key set or a package can prove it read a
+        # target while still hiding that target's actual port from collision
+        # checks.
+        semantic_keys = {
+            mapping["target_key"] for mapping in pkg["serve"].values()
+        }
+        semantic_keys.update(pkg["plaintext_redirect"])
+        semantic_keys.update(pkg["plaintext_redirect"].values())
+        app_table = resolved_apps.get(pid) or {}
+        for key in sorted(semantic_keys):
+            if _is_port_config_key(key) or key in pkg["artifacts"]["serve_ports"]:
+                continue   # already swept above under this app/key
+            val = app_table.get(key)
+            if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 65535:
+                die(f"packages.{pid} semantic port key {key!r} is {val!r}, "
+                    "not a port number 1-65535.")
+            if val == 443:
+                die(f"packages.{pid} semantic port key {key!r} claims port 443 — "
+                    "the platform's TLS entrypoint is never an app's port.")
+            if val in seen:
+                die(f"port {val} is used twice: apps.{seen[val]} and "
+                    f"packages.{pid} semantic port key {key!r}. Ports must be unique.")
+            seen[val] = f"{pid}.{key} (semantic)"
         # Declared port spans: ports base..base+count-1 ALL enter the global
         # uniqueness pool, not just the declared scalar (D2). The base scalar
         # itself may already be in the pool under this app's own key — that
@@ -2120,17 +2232,235 @@ def _in_comment_line(text: str, pos: int) -> bool:
     return False
 
 
+def _python_env_reads(text: str) -> set[str]:
+    """Return literal environment names read by Python syntax, not prose.
+
+    Port ownership is fail-closed, so a name in a docstring or an inert string
+    cannot count.  Recognise the ordinary stdlib spellings and leave unusual
+    wrappers to the package's shell renderer (or to an explicit config get).
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    reads: set[str] = set()
+
+    def _literal(node):
+        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+    def _is_environ(node) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+            and node.attr == "environ"
+        ) or (isinstance(node, ast.Name) and node.id == "environ")
+
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load)
+                and _is_environ(node.value)):
+            name = _literal(node.slice)
+            if name is not None:
+                reads.add(name)
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        is_getenv = (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "os"
+            and func.attr == "getenv"
+        ) or (isinstance(func, ast.Name) and func.id == "getenv")
+        is_environ_get = (
+            isinstance(func, ast.Attribute)
+            and func.attr == "get"
+            and _is_environ(func.value)
+        )
+        if is_getenv or is_environ_get:
+            name = _literal(node.args[0])
+            if name is not None:
+                reads.add(name)
+    return reads
+
+
+def _in_shell_heredoc(text: str, start: int) -> bool:
+    """Whether start lies in a simple shell heredoc body.
+
+    The admitted port grammar is deliberately small; recognising the ordinary
+    `<<EOF`, quoted delimiter, and `<<-EOF` forms is sufficient to reject data
+    lines that merely resemble assignments.  An ambiguous delimiter fails
+    closed because the caller then sees no admitted read.
+    """
+    pending = []
+    opener_re = re.compile(
+        r"(?<!<)<<(-?)(?!<)\s*(?:\\([A-Za-z0-9_.-]+)"
+        r"|(['\"])([A-Za-z0-9_.-]+)\3|([A-Za-z0-9_.-]+))"
+    )
+    offset = 0
+    for line in text[:start].splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            candidate = body.lstrip("\t") if strip_tabs else body
+            if candidate == delimiter:
+                pending.pop(0)
+            offset += len(line)
+            continue
+        for match in opener_re.finditer(body):
+            if _in_comment_line(text, offset + match.start()):
+                break
+            delimiter = match.group(2) or match.group(4) or match.group(5)
+            pending.append((delimiter, match.group(1) == "-"))
+        offset += len(line)
+    return bool(pending)
+
+
+def _shell_expands_env(text: str, start: int, end: int, full: str) -> bool:
+    """Whether this token is an admitted shell expansion of the env name.
+
+    A package may assign the platform value locally or pass it straight to a
+    renderer/installer's port-shaped option. Both consume the value. Keeping
+    command arguments limited to --port/--*-port avoids turning arbitrary
+    logging/prose arguments into listener-ownership evidence. Escaped,
+    single-quoted, and heredoc text stays inert; discard-only commands are
+    rejected separately by _consumes_port_read.
+    """
+    if text[start:end] != full or _in_shell_heredoc(text, start):
+        return False
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    if line_end < 0:
+        line_end = len(text)
+    line = text[line_start:line_end].replace("\x00", "")
+    expansion = r"\$\{?" + re.escape(full) + r"(?::[-+?][^}]*)?\}?"
+    if re.fullmatch(  # noqa: regex-anchor - runtime composition, fullmatch
+        r"\s*(?:(?:local|export|readonly)\s+)?[A-Za-z_][A-Za-z0-9_]*="
+        r"\s*\"?" + expansion + r"\"?\s*(?:#.*)?",
+        line,
+    ) is not None:
+        return True
+
+    if start >= 2 and text[start - 2:start] == "${":
+        expansion_start = start - 2
+        close = text.find("}", end)
+        if close < 0 or re.fullmatch(r"(?::[-+?][^}]*)?", text[end:close]) is None:
+            return False
+        expansion_end = close + 1
+    elif start >= 1 and text[start - 1] == "$":
+        expansion_start = start - 1
+        expansion_end = end
+    else:
+        return False
+
+    quote = None
+    quote_start = None
+    escaped = False
+    prefix = text[line_start:expansion_start]
+    for i, char in enumerate(prefix):
+        if char == "\x00":
+            continue  # a normalised backslash-newline is removed by the shell
+        if quote == "'":
+            if char == "'":
+                quote = None
+                quote_start = None
+            continue
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"':
+            if char == "\\" and (i + 1 == len(prefix)
+                    or prefix[i + 1] in '$`"\\'):
+                escaped = True
+            elif char == '"':
+                quote = None
+                quote_start = None
+            continue
+        if char == "\\":
+            escaped = True
+        elif char in "'\"":
+            quote = char
+            quote_start = i
+    if quote == "'" or escaped or (quote == '"' and quote_start != len(prefix) - 1):
+        return False
+    option_prefix = prefix.replace("\x00", " ")
+    return re.search(
+        r"(?:^|[\s;&|()])--(?:[A-Za-z0-9]+-)*port(?:=|\s+)\"?\Z",
+        option_prefix,
+    ) is not None and (
+        (quote == '"' and text[expansion_end:expansion_end + 1] == '"'
+         and (expansion_end + 1 == len(text)
+              or text[expansion_end + 1] in " \t\n\x00;&|()<>"))
+        or (quote is None and (expansion_end == len(text)
+            or text[expansion_end] in " \t\n\x00;&|()<>"))
+    )
+
+
+def _shell_assignment_runs_get(text: str, start: int, end: int) -> bool:
+    """Whether the matched get is the sole assigned command substitution."""
+    if _in_shell_heredoc(text, start):
+        return False
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    if line_end < 0:
+        line_end = len(text)
+    prefix = text[line_start:start].replace("\x00", "")
+    suffix = text[end:line_end].replace("\x00", "")
+    return (
+        re.fullmatch(
+            r"\s*(?:(?:local|export|readonly)\s+)?[A-Za-z_][A-Za-z0-9_]*="
+            r"\s*\"?\$\(\s*",
+            prefix,
+        ) is not None
+        and re.fullmatch(r"\s*\)\"?\s*(?:#.*)?", suffix) is not None
+    )
+
+
 def _line_of(text: str, pos: int) -> int:
     """1-based line number, counting the NUL placeholders that stand in for
     normalised shell line continuations (see the scanner below)."""
     return text.count("\n", 0, pos) + text.count("\x00", 0, pos) + 1
 
 
+def _port_contract_keys(spec: dict) -> tuple[set[str], set[tuple[str, str]]]:
+    """Config scalars that the package must consume to own its listeners.
+
+    The name convention catches ordinary loopback listeners. Explicit serve,
+    redirect, and span declarations are semantic claims even when their keys
+    use arbitrary names. The platform itself consumes HTTPS/redirect LISTEN
+    keys, so those stay in global uniqueness validation but do not require a
+    fake package read. Their TARGET keys remain package-owned and fail closed.
+    """
+    schema = spec["schema"]
+    declared = set(schema["required"]) | set(schema["defaults"])
+    scalar_keys = {key for key in declared if _is_port_config_key(key)}
+    scalar_keys.update(spec["artifacts"]["serve_ports"])
+    scalar_keys.update(mapping["target_key"] for mapping in spec["serve"].values())
+    scalar_keys.update(spec["plaintext_redirect"])
+    scalar_keys.update(spec["plaintext_redirect"].values())
+    for span in schema["port_spans"]:
+        scalar_keys.update((span["base"], span["count"]))
+    table_keys = {(table, leaf) for table, leaves in schema["tables"].items()
+                  for leaf in leaves if _is_port_config_key(leaf)}
+    package_targets = {mapping["target_key"] for mapping in spec["serve"].values()}
+    package_targets.update(spec["plaintext_redirect"].values())
+    platform_listens = set(spec["serve"])
+    platform_listens.update(spec["plaintext_redirect"])
+    # A key may be the platform listen for one mapping and the package target
+    # for another. Target ownership wins; only listen/public-only keys are
+    # exempt from package-read proof.
+    scalar_keys.difference_update(platform_listens - package_targets)
+    return scalar_keys, table_keys
+
+
 def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
+                       port_contract_keys: set[str],
+                       port_contract_table_keys: set[tuple[str, str]],
                        strict: bool = False) -> "None":
     """F12: compare the manifest's declared key space with the reads the
-    package's own files actually contain, and REPORT — every finding here is
-    a warning.
+    package's own files actually contain, and report findings. Port
+    declarations are the narrow fail-closed exception: if the package never
+    consumes one through the admitted syntax, the value in the ownership pool
+    need not be the value its runtime binds.
 
     That is a deliberate narrowing (ADR F12 amendment). Making it fatal
     requires the scan to decide, reliably, which text in a package is a call
@@ -2169,6 +2499,110 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
     def _hard(msg: str) -> None:
         hard.append(msg)
         _warn(pid, msg)
+
+    def _consumes_port_read(text: str, start: int, end: int) -> bool:
+        """Reject syntactically explicit discard-only port references.
+
+        F12 is intentionally not a shell/data-flow interpreter, but two forms
+        have no possible runtime effect and must not satisfy a listener
+        ownership proof: the shell no-op builtin and a discarded config-get.
+        Keeping this check narrow makes its fail-closed boundary auditable.
+        """
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        if line_end < 0:
+            line_end = len(text)
+        logical_line = text[line_start:line_end].replace("\x00", " ")
+        # A no-op may be wrapped, be the second command on a line, or live in
+        # a shell branch (`command : "$PORT"`, `x=1; : "$PORT"`,
+        # `if : "$PORT"`). Inspect the command segment that CONTAINS this
+        # read; a `true` in an earlier condition must not invalidate a later
+        # real assignment on the same line.
+        before_read = logical_line[:max(0, start - line_start)]
+        line = logical_line.strip()
+
+        def _wrapped_noop(prefix: str) -> bool:
+            """Recognise direct/path-qualified true and nested env wrappers."""
+            def _command_name(word: str) -> str:
+                return word.rsplit("/", 1)[-1]
+
+            option = re.search(
+                r"(?:^|\s)--(?:[A-Za-z0-9]+-)*port(?:=|\s+)\"?\$\{?\Z",
+                prefix,
+            )
+            if option is None:
+                return False
+            command = re.split(
+                r"(?:;|&&|\|\||\||\bthen\b|\bdo\b|\belse\b|[(){}])",
+                prefix[:option.start()],
+            )[-1].strip()
+            try:
+                words = shlex.split(command)
+            except ValueError:
+                return False
+            while words and words[0] in {"if", "elif", "while", "until", "!"}:
+                words.pop(0)
+            while words and re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) is not None:
+                words.pop(0)
+            if words[:1] and words[0] in {"command", "builtin"}:
+                words.pop(0)
+            while words and _command_name(words[0]) == "env":
+                words.pop(0)
+                options = True
+                while words:
+                    word = words[0]
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word):
+                        words.pop(0)
+                        continue
+                    if options and word == "--":
+                        words.pop(0)
+                        options = False
+                        continue
+                    if not options or not word.startswith("-"):
+                        break
+                    words.pop(0)
+                    split_value = None
+                    if word in {"-u", "--unset", "-C", "--chdir",
+                                "-S", "--split-string", "-a", "--argv0"}:
+                        if not words:
+                            return False
+                        value = words.pop(0)
+                        if word in {"-S", "--split-string"}:
+                            split_value = value
+                    elif word.startswith("-S") and word != "-S":
+                        split_value = word[2:]
+                    elif word.startswith("--split-string="):
+                        split_value = word.split("=", 1)[1]
+                    if split_value is not None:
+                        try:
+                            words[:0] = shlex.split(split_value)
+                        except ValueError:
+                            return False
+                while words and re.fullmatch(
+                        r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) is not None:
+                    words.pop(0)
+            return bool(words) and (
+                words[0] == ":" or _command_name(words[0]) == "true"
+            )
+
+        if _wrapped_noop(before_read):
+            return False
+        if re.search(
+            r"(?:^|(?:;|&&|\|\||\||\(|\{|\)|\bthen\b|\bdo\b|\belse\b)\s*)"
+            r"(?:(?:if|elif|while|until|!)\s+)?"
+            r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
+            r"(?:(?:command|builtin)\s+)?"
+            r"(?::|true)(?=\s|\Z)[^;&|]*\Z",
+            before_read,
+        ):
+            return False
+        if re.search(
+            r"\bairlock[-_]config\b.*\bget\b.*(?:>\s*/dev/null|\|\s*(?::|true)(?:\s|\Z))",
+            line,
+        ):
+            return False
+        return True
 
     scalar_declared = set(schema["required"]) | set(schema["defaults"])
     # Names the installer WRITES rather than reads. Declared, so the scan can tell
@@ -2223,6 +2657,7 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
     prefix = f"apps.{pid}."
     env_re = re.compile(r"\bAIRLOCK_" + re.escape(envid) + r"_([A-Z0-9_]+)\b")  # noqa: regex-anchor
     read_scalars, read_tables = set(), set()
+    port_read_scalars, port_read_tables = set(), set()
     for dirpath, dirnames, filenames in os.walk(pdir, followlinks=False):
         if Path(dirpath) == pdir:
             # docs/ is excluded at the PACKAGE ROOT only — a nested docs
@@ -2253,6 +2688,7 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
                 text = fp.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 continue   # binary (or vanished): skipped by spec
+            raw_text = text
             # A shell line continuation would split a call site across the
             # single-line get pattern — normalise it away first, keeping a
             # NUL placeholder so the line counter below stays accurate
@@ -2260,6 +2696,25 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
             # per preceding continuation).
             text = text.replace("\\\n", "\x00")
             where = str(fp.relative_to(pdir))
+            port_runtime_site = (
+                not fname.startswith(".")
+                and (
+                    bool(st.st_mode & 0o111)
+                    or fp.suffix in {
+                        ".sh", ".py", ".service", ".in", ".conf", ".js", ".mjs",
+                        ".cjs", ".ts", ".tsx", ".go", ".rs", ".rb", ".php",
+                        ".lua", ".pl",
+                    }
+                )
+            )
+            first_line = raw_text.split("\n", 1)[0]
+            shell_runtime_site = (
+                fp.suffix == ".sh"
+                or (bool(st.st_mode & 0o111)
+                    and first_line.startswith("#!")
+                    and re.search(r"\b(?:ba|da|k|z)?sh\b", first_line) is not None)
+            )
+            python_env_reads = _python_env_reads(raw_text) if fp.suffix == ".py" else set()
             for m in get_re.finditer(text):
                 if not any(ch in " \t\n" for ch in m.group(1)):
                     continue   # only a splice: `get\<newline>apps…` is one word
@@ -2285,6 +2740,10 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
                 elif len(chain) == 1:
                     if chain[0] in scalar_declared | common_ok:
                         read_scalars.add(chain[0])
+                        if (port_runtime_site and shell_runtime_site
+                                and _shell_assignment_runs_get(text, m.start(), _end)
+                                and _consumes_port_read(text, m.start(), _end)):
+                            port_read_scalars.add(chain[0])
                     else:
                         _hard(f"{where}:{line} reads apps.{pid}."
                               f"{chain[0]}, which the manifest does not "
@@ -2292,6 +2751,10 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
                               "it in [config])")
                 elif len(chain) == 2 and tuple(chain) in table_declared:
                     read_tables.add(tuple(chain))
+                    if (port_runtime_site and shell_runtime_site
+                            and _shell_assignment_runs_get(text, m.start(), _end)
+                            and _consumes_port_read(text, m.start(), _end)):
+                        port_read_tables.add(tuple(chain))
                 else:
                     _hard(f"{where}:{line} reads apps.{pid}."
                           f"{'.'.join(chain)}, which the manifest does "
@@ -2308,6 +2771,14 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
                 key = m.group(1).lower()
                 if key in scalar_declared | common_ok:
                     read_scalars.add(key)
+                    full_is_read = (
+                        (shell_runtime_site
+                         and _shell_expands_env(text, m.start(), m.end(), full))
+                        or (fp.suffix == ".py" and full in python_env_reads)
+                    )
+                    if (port_runtime_site and full_is_read
+                            and _consumes_port_read(text, m.start(), m.end())):
+                        port_read_scalars.add(key)
                 else:
                     line = _line_of(text, m.start())
                     _hard(f"{where}:{line} references AIRLOCK_{envid}_"
@@ -2315,10 +2786,12 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
                           "key nor a declared [config].runtime_env name (the export "
                           "will not exist)")
     # Strict mode covers SHIPPED packages only, and only these literal findings.
-    # An external package keeps today's advisory behaviour: this must never block
-    # somebody else's install over a lint whose own docstring records eleven rounds
-    # of trying to become a shell parser. Declared-but-unread keys stay a warning
-    # too — a dead declaration is untidy, not broken.
+    # An external package keeps today's advisory behaviour for undeclared reads:
+    # this must never block somebody else's install over a lint whose own docstring
+    # records eleven rounds of trying to become a shell parser. Declared-but-unread
+    # non-port keys stay a warning too. Port keys are different: an unprovable read
+    # means the platform cannot prove that its globally unique value is the listener
+    # value, so they fail closed for every package even outside strict mode.
     if strict and hard:
         die(f"package '{pid}': {len(hard)} literal reference(s) to names this "
             "manifest does not declare (strict scan). Each is listed above. "
@@ -2326,7 +2799,22 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
             "variable rather than reading it — list the full env-var name in "
             "[config].runtime_env.")
 
-    unread = sorted(scalar_declared - read_scalars)
+    unread_scalars = scalar_declared - read_scalars
+    unread_port_contract = sorted(
+        (scalar_declared - port_read_scalars) & port_contract_keys
+    )
+    unread_port_contract += sorted(
+        f"{table}.{leaf}" for table, leaf
+        in (table_declared - port_read_tables) & port_contract_table_keys)
+    if unread_port_contract:
+        die(f"package '{pid}' declares port-ownership config key(s) its files "
+            "never read: " + ", ".join(unread_port_contract)
+            + ". Airlock can enforce global port ownership only when runtime-bearing "
+              "code assigns a shell expansion/config-get, passes an expansion to "
+              "--port/--*-port, or performs a Python environment Load; inert "
+              "strings, overwrites, shell no-ops, and discarded gets do not count.")
+
+    unread = sorted(unread_scalars)
     unread += sorted(f"{t}.{leaf}" for (t, leaf) in table_declared - read_tables)
     if unread:
         sys.stderr.write(f"airlock-config: warning: package '{pid}' declares "
@@ -4330,6 +4818,10 @@ def cmd_env(cfg: dict, app: str, lifecycle: bool = True) -> "None":
         "AIRLOCK_OWNER": auth.get("owner", ""),
         "AIRLOCK_COLLABORATORS": ",".join(collaborators),
         "AIRLOCK_WIKI": paths.get("wiki", ""),
+        # Platform, not per-app: it rides in `common` so any installer that wires an
+        # agent-running tool reads the same value, without a manifest key of its own.
+        "AIRLOCK_AGENT_PROVIDER": r.get("agent", {}).get("provider",
+                                                         AGENT_PROVIDER_DEFAULT),
     }
     # D9: the ledger writes a container intent before lifecycle code runs.
     # Read that authoritative nonce on the installer's first airlock_load;

@@ -286,6 +286,15 @@ case "$command" in
     printf '%s\n' "$name" > "$MOCK_STATE/name"
     printf '%s\n' "$marker" > "$MOCK_STATE/marker"
     [ "${MOCK_LAUNCH_SUCCESS:-0}" = 1 ] && exit 0
+    case "${MOCK_LAUNCH_STDERR_MODE:-text}" in
+      text) printf '%s\n' "$MOCK_LAUNCH_ERROR" >&2 ;;
+      empty) ;;
+      multiline-large)
+        printf 'first line must be discarded\n' >&2
+        printf '%1500s\n' 'middle' >&2
+        printf 'FINAL-LXD-DIAGNOSTIC\n' >&2
+        ;;
+    esac
     exit 1
     ;;
   "lxc config get "*" user.airlock_live_owner_nonce")
@@ -312,6 +321,7 @@ chmod +x "$MOCK_BIN/ssh"
 
 run_launch_cleanup_case() {
   local name="$1" foreign="$2" launch_success="$3" swap_marker="$4"
+  local stderr_mode="${5:-text}" launch_error="fixture launch diagnostic: $name"
   local state results key rc result
   state="$TMP/$name-state"
   results="$TMP/$name-results"
@@ -322,6 +332,7 @@ run_launch_cleanup_case() {
   rc=0
   PATH="$MOCK_BIN:$PATH" MOCK_STATE="$state" MOCK_FOREIGN_MARKER="$foreign" \
     MOCK_LAUNCH_SUCCESS="$launch_success" MOCK_SWAP_MARKER_ON_STAGE="$swap_marker" \
+    MOCK_LAUNCH_STDERR_MODE="$stderr_mode" MOCK_LAUNCH_ERROR="$launch_error" \
     AIRLOCK_LIVE_SSH=fixture-host AIRLOCK_LIVE_OWNER=fixture-owner \
     AIRLOCK_LIVE_TSKEY_FILE="$key" AIRLOCK_LIVE_RESULT_DIR="$results" \
     AIRLOCK_LIVE_PUBLISH=none AIRLOCK_LIVE_ALLOW_DIRTY=1 \
@@ -344,6 +355,30 @@ run_launch_cleanup_case() {
 run_launch_cleanup_case owned-launch 0 0 0
 run_launch_cleanup_case foreign-launch 1 0 0
 run_launch_cleanup_case swapped-after-launch 0 1 1
+run_launch_cleanup_case empty-stderr-launch 0 0 0 empty
+run_launch_cleanup_case bounded-stderr-launch 0 0 0 multiline-large
+
+if grep -q 'fixture launch diagnostic: owned-launch' "$TMP/owned-launch.err" \
+    && grep -q 'fixture launch diagnostic: foreign-launch' "$TMP/foreign-launch.err"; then
+  ok "failed launch keeps the LXD diagnostic in the operator-visible error"
+else
+  bad "failed launch discarded or hard-coded the LXD diagnostic"
+fi
+
+if grep -q '^\[live\] FATAL: lxc launch failed$' "$TMP/empty-stderr-launch.err"; then
+  ok "failed launch with empty stderr keeps the generic fallback"
+else
+  bad "empty launch stderr produced no clean generic fallback"
+fi
+
+fatal_line="$(grep '^\[live\] FATAL: lxc launch failed' "$TMP/bounded-stderr-launch.err")"
+if printf '%s' "$fatal_line" | grep -q 'FINAL-LXD-DIAGNOSTIC' \
+    && [ "${#fatal_line}" -le 1250 ] \
+    && ! printf '%s' "$fatal_line" | grep -q 'first line must be discarded'; then
+  ok "multiline launch stderr is flattened and capture-bounded before logging"
+else
+  bad "multiline/large launch stderr was not tail-bounded to one useful line (length=${#fatal_line})"
+fi
 
 echo "---"
 echo "passed=$pass failed=$fail"

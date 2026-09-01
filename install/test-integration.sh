@@ -662,6 +662,39 @@ else
   ok "devterm fragment has no 301"
 fi
 
+# ACCT_OWN: the subscription account panel is a PLATFORM asset that this gate serves.
+# Two facts have to hold together, and nginx -t can see neither of them.
+#   1. it is aliased out of the webroot, so there is one deployed copy rather than a
+#      devterm duplicate that drifts from the hub's;
+#   2. each alias location carries its OWN owner guard — an nginx `if` covers only the
+#      location it is written in, so `location /`'s guard does not reach these two, and
+#      without this the panel would be served to any collaborator who knew the port.
+for _loc in /panel.html /accounts.js; do
+  _blk="$(awk -v want="location = $_loc {" '
+    index($0, want) { inside = 1 } inside { print } inside && /^    }$/ { exit }
+  ' "$DTFRAG" 2>/dev/null)"
+  case "$_blk" in
+    *"alias "*"/assets/accounts/"*) ok "devterm aliases $_loc from the platform webroot" ;;
+    *) bad "devterm does not serve $_loc from the platform account panel" ;;
+  esac
+  case "$_blk" in
+    *'if ($owner_ok = 0) { return 403; }'*) ok "devterm $_loc carries its own owner guard" ;;
+    *) bad "devterm $_loc has no owner guard of its own (location / does not cover it)" ;;
+  esac
+done
+# The other half of "one copy": devterm must not install its own alongside. Asserted
+# against what THIS RUN's installer said it would install, not against files on the box
+# — the first version of this check read the real $HOME and passed only because the box
+# it was written on had no Airlock deployed. On a box that does, it read the previous
+# release's files and failed a tree that was correct. A test that consults live box
+# state is measuring the box, not the change.
+if grep -q '\[dry\] install web/ ->.*+ ui.js/popup.css)' "$TMP/orch.log" 2>/dev/null; then
+  ok "devterm installs no second copy of the account panel"
+else
+  bad "devterm's web install no longer matches '+ ui.js/popup.css' (a copy of the panel is back, or the line moved)"
+  grep -n 'install web/ ->' "$TMP/orch.log" 2>/dev/null | sed 's/^/    /'
+fi
+
 # fileview is a same-origin subpath: fragment lands in hub-locations.d and is
 # gated by the hub's single server-level chokepoint (asserted on $SITE below).
 MWFRAG="$AIRLOCK_CONFD/hub-locations.d/fileview.conf"

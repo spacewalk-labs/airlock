@@ -10,6 +10,7 @@ a card forever. Those are exactly the places a bug is invisible until someone is
 
 No install, no network, no tmux required.
 """
+import contextlib
 import importlib.machinery
 import importlib.util
 import io
@@ -19,16 +20,20 @@ import shutil
 import sys
 import tempfile
 import subprocess
+import time
 import types
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.path.join(HERE, 'backend')
 sys.path.insert(0, BACKEND)
 import action_runner
 import devmon_cron
+import devmon_update_exec as UPX
+import devmon_harness as HARNESS
 
 
 def _load_backend():
@@ -470,16 +475,333 @@ class ApprovalSiblingTest(_ExecBase):
                          {'ok': False, 'error': 'nonce_used'})
 
 
+class ServiceHealthTest(unittest.TestCase):
+    HEALTHY_DAEMON = '''Type=simple
+Result=success
+NRestarts=0
+ExecMainStatus=0
+Id=airlock-learning.service
+LoadState=loaded
+ActiveState=active
+SubState=running
+UnitFileState=enabled
+ActiveEnterTimestamp=
+'''
+    SUCCESSFUL_ONESHOT = '''Type=oneshot
+Result=success
+NRestarts=0
+ExecMainStatus=0
+Id=claude-fleet-usage.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+UnitFileState=static
+ActiveEnterTimestamp=
+'''
+    FAILED_ONESHOT = '''Type=oneshot
+Result=exit-code
+NRestarts=0
+ExecMainStatus=1
+Id=skill-wiring-check.service
+LoadState=loaded
+ActiveState=failed
+SubState=failed
+UnitFileState=static
+ActiveEnterTimestamp=
+'''
+    DISABLED_DAEMON = '''Type=notify
+Result=success
+NRestarts=0
+ExecMainStatus=0
+Id=ssh.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+UnitFileState=disabled
+ActiveEnterTimestamp=
+'''
+
+    def test_actual_success_and_failure_controls(self):
+        healthy = DM._service_from_show('airlock-learning', 'user', self.HEALTHY_DAEMON)
+        completed = DM._service_from_show(
+            'claude-fleet-usage', 'user', self.SUCCESSFUL_ONESHOT)
+        failed = DM._service_from_show('skill-wiring-check', 'user', self.FAILED_ONESHOT)
+        disabled = DM._service_from_show('ssh', 'system', self.DISABLED_DAEMON)
+
+        self.assertFalse(healthy['attention'])
+        self.assertFalse(completed['attention'], 'successful inactive oneshot is healthy')
+        self.assertTrue(failed['attention'])
+        self.assertIn('exit-code', failed['attention_reason'])
+        self.assertFalse(disabled['attention'], 'disabled inactive daemon is intentional')
+        self.assertEqual(completed['active_state'], 'inactive')
+        self.assertEqual(completed['sub_state'], 'dead')
+        self.assertEqual(completed['n_restarts'], 0)
+
+    def test_restart_count_alerts_even_after_service_is_active_again(self):
+        restarted = self.HEALTHY_DAEMON.replace('NRestarts=0', 'NRestarts=31780')
+        item = DM._service_from_show('airlock-learning', 'user', restarted)
+        self.assertTrue(item['attention'])
+        self.assertIn('31780', item['attention_reason'])
+
+    def test_nonzero_systemctl_status_does_not_discard_typed_output(self):
+        saved_run = DM.subprocess.run
+        calls = []
+        try:
+            DM.subprocess.run = lambda argv, **kwargs: (
+                calls.append((argv, kwargs)) or
+                types.SimpleNamespace(returncode=3, stdout=self.SUCCESSFUL_ONESHOT))
+            raw, error = DM._systemctl_show('claude-fleet-usage', 'user')
+        finally:
+            DM.subprocess.run = saved_run
+        self.assertIsNone(error)
+        self.assertIn('ActiveState=inactive', raw)
+        self.assertEqual(calls[0][0][0:2], ['systemctl', '--user'])
+        self.assertEqual(calls[0][1]['stderr'], DM.subprocess.DEVNULL)
+        self.assertEqual(calls[0][1]['timeout'], 1)
+
+    def test_rc1_partial_show_is_failure_and_cannot_grant_restart(self):
+        saved_run = DM.subprocess.run
+        saved_inventory = DM._airlock_user_inventory
+        try:
+            DM._airlock_user_inventory = lambda: (['airlock-alpha'], None)
+            DM.subprocess.run = lambda _argv, **_kwargs: types.SimpleNamespace(
+                returncode=1, stdout='Id=airlock-alpha.service\n')
+            self.assertEqual(DM._airlock_user_units(), [])
+        finally:
+            DM.subprocess.run = saved_run
+            DM._airlock_user_inventory = saved_inventory
+
+    def test_systemctl_timeout_is_typed_collection_failure(self):
+        saved_run = DM.subprocess.run
+        try:
+            DM.subprocess.run = lambda argv, **kwargs: (_ for _ in ()).throw(
+                DM.subprocess.TimeoutExpired(argv, kwargs['timeout']))
+            raw, error = DM._systemctl_show(['airlock-learning'], 'user')
+        finally:
+            DM.subprocess.run = saved_run
+        self.assertEqual(raw, '')
+        self.assertEqual(error, 'collection failed')
+
+    def test_missing_and_enabled_inactive_units_alert(self):
+        missing = self.DISABLED_DAEMON.replace('LoadState=loaded', 'LoadState=not-found')
+        enabled = self.DISABLED_DAEMON.replace('UnitFileState=disabled',
+                                               'UnitFileState=enabled')
+        self.assertTrue(DM._service_from_show('missing', 'user', missing)['attention'])
+        self.assertTrue(DM._service_from_show('expected-daemon', 'user', enabled)['attention'])
+
+    def test_actual_inventory_shape_excludes_template_and_includes_live_instance(self):
+        saved_command = DM._service_command
+        unit_files = '''airlock-code-server-manager.service enabled enabled
+airlock-code-server@.service indirect enabled
+airlock-learning.service enabled enabled
+'''
+        loaded = '''  airlock-code-server-manager.service loaded active running manager
+● airlock-code-server@1.service loaded failed failed slot one
+  airlock-learning.service loaded active running learning
+'''
+        calls = []
+        try:
+            DM._service_command = lambda argv: (
+                calls.append(argv) or
+                (loaded if 'list-units' in argv else unit_files, None))
+            units, error = DM._observed_user_inventory()
+        finally:
+            DM._service_command = saved_command
+        self.assertIsNone(error)
+        self.assertNotIn('airlock-code-server@', units)
+        self.assertIn('airlock-code-server@1', units)
+        self.assertIn('airlock-learning', units)
+        self.assertIn('--plain', next(argv for argv in calls if 'list-units' in argv))
+
+    def test_live_box_inventory_reaches_enabled_timer_and_failed_non_airlock_units(self):
+        """Replay verbatim public-safe rows from the live systemctl outputs."""
+        fixture = os.path.join(
+            HERE, '..', '..', 'install', 'fixtures',
+            'dev-monitor-service-inventory-live-20260831')
+        with open(os.path.join(fixture, 'unit-files.txt'), encoding='utf-8') as f:
+            unit_files = f.read()
+        with open(os.path.join(fixture, 'loaded.txt'), encoding='utf-8') as f:
+            loaded = f.read()
+        with open(os.path.join(fixture, 'timers.txt'), encoding='utf-8') as f:
+            timers = f.read()
+        saved_command = DM._service_command
+        saved_show = DM._systemctl_show
+        calls = []
+        try:
+            def command(argv):
+                calls.append(argv)
+                if 'list-unit-files' in argv:
+                    return unit_files, None
+                if 'list-timers' in argv:
+                    return timers, None
+                return loaded, None
+
+            DM._service_command = command
+            units, error = DM._observed_user_inventory()
+
+            def show(names, _scope):
+                blocks = []
+                for name in names:
+                    if name == 'skill-wiring-check':
+                        blocks.append(self.FAILED_ONESHOT)
+                    else:
+                        blocks.append(self.HEALTHY_DAEMON.replace(
+                            'Id=airlock-learning.service', 'Id=' + name + '.service'))
+                return '\n\n'.join(blocks), None
+
+            DM._systemctl_show = show
+            services = DM.svc_info()
+        finally:
+            DM._service_command = saved_command
+            DM._systemctl_show = saved_show
+
+        self.assertIsNone(error)
+        self.assertIn('airlock-code-server@1', units)
+        self.assertIn('learning-manager', units)
+        self.assertIn('session-migration', units)
+        self.assertIn('claude-fleet-usage', units)
+        self.assertIn('skill-wiring-check', units)
+        self.assertIn('wiki-secret-audit', units)
+        self.assertNotIn('dbus', units)
+        self.assertNotIn('gpg-agent', units)
+        self.assertNotIn('airlock-code-server@', units)
+        self.assertTrue(any('list-timers' in argv for argv in calls))
+        by_name = {item['name']: item for item in services}
+        self.assertTrue(by_name['skill-wiring-check']['attention'])
+        self.assertIn('Result=exit-code',
+                      by_name['skill-wiring-check']['attention_reason'])
+        self.assertFalse(by_name['skill-wiring-check']['action_allowed'])
+        self.assertFalse(by_name['learning-manager']['attention'])
+        self.assertFalse(by_name['learning-manager']['action_allowed'])
+        self.assertTrue(by_name['airlock-learning']['action_allowed'])
+        self.assertEqual(DM._services_payload(services)['attention_count'], 1)
+
+    def test_each_broad_inventory_source_contributes_independently(self):
+        saved_command = DM._service_command
+        outputs = {
+            'list-unit-files': '''runtime-only.service enabled-runtime enabled
+healthy-static.service static -
+''',
+            'list-units': '''failed-without-timer.service loaded failed failed failed job
+healthy-static.service loaded inactive dead incidental helper
+''',
+            'list-timers': '''- - - - timer-only.timer timer-only.service
+''',
+        }
+        try:
+            DM._service_command = lambda argv: (
+                next(value for key, value in outputs.items() if key in argv), None)
+            units, error = DM._observed_user_inventory()
+        finally:
+            DM._service_command = saved_command
+        self.assertIsNone(error)
+        self.assertEqual(units, ['failed-without-timer', 'runtime-only', 'timer-only'])
+
+    def test_partial_nonzero_inventory_output_is_fail_visible(self):
+        saved_run = DM.subprocess.run
+        try:
+            DM.subprocess.run = lambda _argv, **_kwargs: types.SimpleNamespace(
+                returncode=1, stdout='learning-manager.service enabled enabled\n')
+            raw, error = DM._service_command(
+                ['systemctl', '--user', 'list-unit-files', '--type=service'])
+        finally:
+            DM.subprocess.run = saved_run
+        self.assertIn('learning-manager.service', raw)
+        self.assertEqual(error, 'collection failed')
+
+    def test_partial_and_total_inventory_failure_are_visible(self):
+        saved_command = DM._service_command
+        unit_files = 'airlock-learning.service enabled enabled\n'
+        try:
+            DM._service_command = lambda argv: (
+                ('', 'collection failed') if 'list-units' in argv else (unit_files, None))
+            units, error = DM._observed_user_inventory()
+            self.assertEqual(units, ['airlock-learning'])
+            self.assertEqual(error, 'inventory collection failed')
+
+            DM._service_command = lambda _argv: ('', 'collection failed')
+            units, error = DM._observed_user_inventory()
+            self.assertEqual(units, [])
+            self.assertEqual(error, 'inventory collection failed')
+        finally:
+            DM._service_command = saved_command
+
+    def test_inventory_failure_becomes_an_attention_row(self):
+        saved_inventory = DM._observed_user_inventory
+        saved_show = DM._systemctl_show
+
+        def show(names, _scope):
+            blocks = []
+            for name in names:
+                blocks.append(self.HEALTHY_DAEMON.replace(
+                    'Id=airlock-learning.service', 'Id=' + name + '.service'))
+            return '\n\n'.join(blocks), None
+
+        try:
+            DM._observed_user_inventory = lambda: ([], 'inventory collection failed')
+            DM._systemctl_show = show
+            services = DM.svc_info()
+        finally:
+            DM._observed_user_inventory = saved_inventory
+            DM._systemctl_show = saved_show
+        inventory = next(item for item in services
+                         if item['name'] == 'airlock-user-inventory')
+        self.assertTrue(inventory['attention'])
+        self.assertFalse(inventory['action_allowed'])
+
+    def test_health_collection_is_one_batch_per_nonempty_scope(self):
+        saved_show = DM._systemctl_show
+        calls = []
+
+        def show(names, scope):
+            calls.append((list(names), scope))
+            blocks = [self.HEALTHY_DAEMON.replace(
+                'Id=airlock-learning.service', 'Id=' + name + '.service')
+                      for name in names]
+            return '\n\n'.join(blocks), None
+
+        try:
+            DM._systemctl_show = show
+            rows = DM._service_group_info(['airlock-one', 'airlock-two'], 'user')
+        finally:
+            DM._systemctl_show = saved_show
+        self.assertEqual(calls, [(['airlock-one', 'airlock-two'], 'user')])
+        self.assertEqual([row['name'] for row in rows], ['airlock-one', 'airlock-two'])
+        self.assertTrue(all(not row['attention'] for row in rows))
+
+    def test_payload_counts_attention_without_messages(self):
+        rows = [
+            {'name': 'ok', 'attention': False},
+            {'name': 'restart', 'attention': True},
+            {'name': 'failed', 'attention': True},
+        ]
+        self.assertEqual(DM._services_payload(rows),
+                         {'services': rows, 'attention_count': 2})
+
+    def test_service_panel_orders_attention_before_healthy_rows(self):
+        with open(os.path.join(HERE, 'frontend', 'dev-monitor.html'), encoding='utf-8') as f:
+            frontend = f.read()
+        sort = frontend.index('Number(Boolean(b.attention))')
+        render = frontend.index("svcs.forEach(function (s)", sort)
+        self.assertLess(sort, render)
+
+
 class ServiceRestartTest(unittest.TestCase):
     def setUp(self):
         self.saved_units = DM._airlock_user_units
+        self.saved_inventory = DM._airlock_user_inventory
+        self.saved_observed = DM._observed_user_inventory
         self.saved_check_call = DM.subprocess.check_call
         self.saved_run = DM.run
+        self.saved_show = DM._systemctl_show
 
     def tearDown(self):
         DM._airlock_user_units = self.saved_units
+        DM._airlock_user_inventory = self.saved_inventory
+        DM._observed_user_inventory = self.saved_observed
         DM.subprocess.check_call = self.saved_check_call
         DM.run = self.saved_run
+        DM._systemctl_show = self.saved_show
 
     def test_only_discovered_user_units_are_restartable_with_shell_free_argv(self):
         DM._airlock_user_units = lambda: ['airlock-alpha']
@@ -493,7 +815,8 @@ class ServiceRestartTest(unittest.TestCase):
     def test_system_service_and_forged_name_are_refused_before_subprocess(self):
         DM._airlock_user_units = lambda: ['airlock-alpha', 'airlock-dev-monitor']
         DM.subprocess.check_call = lambda *a, **k: self.fail('subprocess must not run')
-        for name in ('nginx', 'airlock-dev-monitor', 'airlock-alpha; reboot', '', None):
+        for name in ('nginx', 'learning-manager', 'skill-wiring-check',
+                     'airlock-dev-monitor', 'airlock-alpha; reboot', '', None):
             self.assertEqual(DM.restart_svc(name),
                              (False, 'service restart is not allowed'))
 
@@ -503,16 +826,56 @@ class ServiceRestartTest(unittest.TestCase):
             DM.subprocess.TimeoutExpired(a[0], k.get('timeout')))
         self.assertEqual(DM.restart_svc('airlock-alpha'), (False, 'restart timeout'))
 
-    def test_service_inventory_marks_user_only_as_actionable(self):
+    def test_service_inventory_keeps_observed_non_airlock_units_read_only(self):
         DM._airlock_user_units = lambda: ['airlock-alpha', 'airlock-dev-monitor']
-        DM.run = lambda argv, timeout=3: 'active' if 'is-active' in argv else ''
+        DM._observed_user_inventory = lambda: (
+            ['airlock-alpha', 'airlock-dev-monitor', 'learning-manager'], None)
+        DM._systemctl_show = lambda names, _scope: ('\n\n'.join(
+            ServiceHealthTest.HEALTHY_DAEMON.replace(
+                'Id=airlock-learning.service', 'Id=' + name + '.service')
+            for name in names), None)
         services = DM.svc_info()
         user = next(item for item in services if item['name'] == 'airlock-alpha')
         own = next(item for item in services if item['name'] == 'airlock-dev-monitor')
+        private = next(item for item in services if item['name'] == 'learning-manager')
         system = next(item for item in services if item['name'] == 'nginx')
         self.assertTrue(user['action_allowed'])
         self.assertFalse(own['action_allowed'])
+        self.assertFalse(private['action_allowed'])
         self.assertFalse(system['action_allowed'])
+
+    def test_restart_allowlist_requires_canonical_id_and_rejects_aliases(self):
+        DM._airlock_user_inventory = lambda: (
+            ['airlock-alpha', 'airlock-bridge', 'airlock-self-alias'], None)
+        DM._systemctl_show = lambda _names, _scope: ('''
+Id=airlock-alpha.service
+
+Id=learning-manager.service
+
+Id=airlock-dev-monitor.service
+''', None)
+        self.assertEqual(DM._airlock_user_units(), ['airlock-alpha'])
+
+    def test_timer_only_airlock_name_is_observed_but_never_restartable(self):
+        saved_command = DM._service_command
+        saved_show = DM._systemctl_show
+        try:
+            def command(argv):
+                if 'list-timers' in argv:
+                    return '- - - - airlock-ghost.timer airlock-ghost.service\n', None
+                return '', None
+
+            DM._service_command = command
+            DM._systemctl_show = lambda names, _scope: ('\n\n'.join(
+                ServiceHealthTest.HEALTHY_DAEMON.replace(
+                    'Id=airlock-learning.service', 'Id=' + name + '.service')
+                for name in names), None)
+            services = DM.svc_info()
+        finally:
+            DM._service_command = saved_command
+            DM._systemctl_show = saved_show
+        ghost = next(item for item in services if item['name'] == 'airlock-ghost')
+        self.assertFalse(ghost['action_allowed'])
 
 
 class CronReadOnlyTest(unittest.TestCase):
@@ -575,6 +938,7 @@ class OwnerRouteTest(unittest.TestCase):
         MSG.init_db(os.path.join(root, 'messages.db'))
         DM.OWNER_CONFIG = {'owner': 'me@example.test', 'secret': 's3cr3t',
                            'spool': root, 'db': os.path.join(root, 'messages.db')}
+        DM.UPDATES_OWNER_CONFIG = {'owner': 'me@example.test', 'secret': 's3cr3t'}
         DM.EXEC_CONFIG = {
             'cwd_root': root, 'session': 'devmon-test',
             'runner': os.path.join(BACKEND, 'action_runner.py'),
@@ -601,6 +965,7 @@ class OwnerRouteTest(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
         DM.OWNER_CONFIG = None
+        DM.UPDATES_OWNER_CONFIG = None
         DM.EXEC_CONFIG = None
         MSG._local.__dict__.clear()
         MSG._DB_PATH = None
@@ -620,14 +985,20 @@ class OwnerRouteTest(unittest.TestCase):
         conn.close()
         return r.status, json.loads(data or b'{}')
 
-    def _get(self, path):
+    def _get(self, path, headers=None):
         import http.client
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
-        conn.request('GET', path)
+        conn.request('GET', path, headers=headers or {})
         r = conn.getresponse()
         data = r.read()
         conn.close()
         return r.status, json.loads(data or b'{}')
+
+    def _owner_get(self, path):
+        return self._get(path, {
+            'X-Devmon-Owner': 'me@example.test',
+            'X-Devmon-Proxy-Secret': 's3cr3t',
+        })
 
     def test_percent_encoded_card_id_reaches_the_card(self):
         # What the browser actually sends. Before the fix this answered 404/card_not_found
@@ -705,6 +1076,267 @@ class OwnerRouteTest(unittest.TestCase):
             self.assertEqual((status, payload.get('jobs')), (200, []), payload)
         finally:
             DM.CRON.snapshot = saved
+
+    def test_updates_are_owner_scoped_and_keep_the_collector_contract(self):
+        saved = DM.UPDATES
+        try:
+            class Snapshot:
+                @staticmethod
+                def read_snapshot():
+                    return {
+                        'checkedAt': '2026-09-01T00:00:00Z',
+                        'platform': {'available': True, 'changedCount': 2, 'ref': 'main'},
+                        'apps': [{'id': 'notes', 'action': 'upgrade', 'sourceClass': 'shipped'}],
+                        'harness': {'codex': None, 'hooksDrift': True, 'skillsWired': 0},
+                    }
+
+            DM.UPDATES = Snapshot
+            status, payload = self._owner_get('/api/owner/updates')
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload['platform']['changedCount'], 2)
+            self.assertEqual(payload['apps'][0]['action'], 'upgrade')
+            status, _ = self._get('/api/owner/updates')
+            self.assertEqual(status, 403)
+        finally:
+            DM.UPDATES = saved
+
+    def test_updates_keep_their_owner_gate_when_messages_are_off(self):
+        """The settings panel is useful on observability-only boxes too."""
+        saved_updates, saved_messages = DM.UPDATES, DM.OWNER_CONFIG
+        try:
+            class Snapshot:
+                @staticmethod
+                def read_snapshot():
+                    return {
+                        'checkedAt': '2026-09-01T00:00:00Z',
+                        'platform': None, 'apps': [],
+                        'harness': {'codex': None, 'hooksDrift': False, 'skillsWired': 0},
+                    }
+
+            DM.UPDATES = Snapshot
+            DM.OWNER_CONFIG = None
+            status, payload = self._owner_get('/api/owner/updates')
+            self.assertEqual((status, payload['checkedAt']), (200, '2026-09-01T00:00:00Z'))
+            status, payload = self._owner_get('/api/owner/messages/preview')
+            self.assertEqual((status, payload['error']), (404, 'messages feature not enabled'))
+        finally:
+            DM.UPDATES, DM.OWNER_CONFIG = saved_updates, saved_messages
+
+    def test_updates_return_404_until_a_complete_snapshot_exists(self):
+        saved = DM.UPDATES
+        try:
+            class Empty:
+                @staticmethod
+                def read_snapshot():
+                    return None
+
+            DM.UPDATES = Empty
+            status, payload = self._owner_get('/api/owner/updates')
+            self.assertEqual(status, 404, payload)
+            self.assertIn('snapshot', payload['error'])
+        finally:
+            DM.UPDATES = saved
+
+    def test_updates_return_404_when_the_collector_module_is_absent(self):
+        saved = DM.UPDATES
+        try:
+            DM.UPDATES = None
+            status, payload = self._owner_get('/api/owner/updates')
+            self.assertEqual(status, 404, payload)
+            self.assertIn('not enabled', payload['error'])
+        finally:
+            DM.UPDATES = saved
+
+
+class UpdatesCollectorTest(unittest.TestCase):
+    """The timer reads existing engines; these pin the translation, not a second plan."""
+
+    def setUp(self):
+        self.updates = DM.UPDATES
+        self.saved_run = self.updates._run
+        self.saved_find_bin = self.updates.bin_discovery.find_bin
+        self.saved_first_line = self.updates._first_line
+
+    def tearDown(self):
+        self.updates._run = self.saved_run
+        self.updates.bin_discovery.find_bin = self.saved_find_bin
+        self.updates._first_line = self.saved_first_line
+
+    def _stub_clis(self, versions):
+        """Route every CLI probe through a fixture. Returns (find_calls, argv_calls)."""
+        find_calls, command_calls = [], []
+
+        def find_bin(command):
+            find_calls.append(command)
+            return '/fixture/home/.local/bin/' + command, {
+                'searched': 1, 'path': '/usr/bin', 'rejected': []}
+
+        def first_line(argv, **_kwargs):
+            command_calls.append(argv)
+            for name, line in versions.items():
+                if argv == ['/fixture/home/.local/bin/' + name, '--version']:
+                    return line
+            if argv[:3] == ['npm', 'view', '@openai/codex']:
+                return versions.get('npm')
+            return 'claude-hook-wiring: ok'
+
+        self.updates.bin_discovery.find_bin = find_bin
+        self.updates._first_line = first_line
+        return find_calls, command_calls
+
+    def test_harness_resolves_clis_outside_the_service_path(self):
+        """The collector must run the discovered absolute binaries, not bare names."""
+        find_calls, command_calls = self._stub_clis(
+            {'codex': 'codex-cli 0.144.4', 'claude': '2.1.257 (Claude Code)',
+             'npm': '0.152.0'})
+        harness = self.updates._harness()
+        self.assertEqual(find_calls, ['codex', 'claude'])
+        self.assertIn(['/fixture/home/.local/bin/codex', '--version'], command_calls)
+        self.assertIn(['/fixture/home/.local/bin/claude', '--version'], command_calls)
+
+    def test_harness_compares_versions_and_not_version_lines(self):
+        """The regression this exists for, measured on a live snapshot 2026-09-01.
+
+        `codex --version` prints "codex-cli 0.144.4" and `npm view` prints "0.152.0",
+        so comparing the raw lines answered "outdated" for a STRUCTURAL reason: the
+        strings could never be equal no matter what was installed, and the badge would
+        have kept counting 1 after a successful upgrade — the exact click this card
+        arms. Both sides are reduced to the version itself.
+        """
+        self._stub_clis({'codex': 'codex-cli 0.144.4', 'claude': '2.1.257 (Claude Code)',
+                         'npm': '0.152.0'})
+        harness = self.updates._harness()
+        self.assertEqual(harness['codex'], {'installed': '0.144.4', 'latest': '0.152.0'})
+        self.assertEqual(harness['claude'], {'installed': '2.1.257'})
+
+        # The positive control: an up-to-date box has to read as up to date, which the
+        # old comparison could not do for any input at all.
+        self._stub_clis({'codex': 'codex-cli 0.152.0', 'claude': '2.1.257 (Claude Code)',
+                         'npm': '0.152.0'})
+        current = self.updates._harness()
+        self.assertEqual(current['codex']['installed'], current['codex']['latest'])
+
+    def test_harness_reports_an_unreadable_version_as_absent(self):
+        """A line with no version in it is 'we could not read it', never a version.
+
+        Returning the raw line would put it into the panel's comparison, where an
+        unreadable reading would render as an upgrade offer from nonsense to a number.
+        """
+        self._stub_clis({'codex': 'command not found', 'claude': '', 'npm': None})
+        harness = self.updates._harness()
+        self.assertIsNone(harness['codex'])
+        self.assertIsNone(harness['claude'])
+
+    def test_harness_counts_skill_roots_separately(self):
+        """Per agent, never one total: the two roots belong to two different agents.
+
+        A skill wired for Claude Code and missing for the Codex CLI raises no error
+        anywhere — it simply never triggers for that agent — so a summed count is the
+        one shape that cannot show it.
+        """
+        self._stub_clis({'codex': 'codex-cli 0.152.0', 'npm': '0.152.0'})
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_root = Path(tmp) / 'claude'
+            codex_root = Path(tmp) / 'codex'
+            for root, names in ((claude_root, ('alpha', 'beta', 'gamma')),
+                                (codex_root, ('alpha',))):
+                for name in names:
+                    (root / name).mkdir(parents=True)
+                    (root / name / 'SKILL.md').write_text('name: %s\n' % name)
+            # A directory with no SKILL.md is not a skill and must not be counted.
+            (claude_root / 'notaskill').mkdir()
+            saved = self.updates._skill_roots
+            self.updates._skill_roots = lambda: (claude_root, codex_root)
+            try:
+                harness = self.updates._harness()
+            finally:
+                self.updates._skill_roots = saved
+        self.assertEqual(harness['skills']['claude'], 3)
+        self.assertEqual(harness['skills']['codex'], 1)
+        # 🔴 Counts only, no verdict about the difference. Measured on a live box
+        # 2026-09-01: of the 8 names Claude had and the Codex CLI did not, 2 were
+        # opt-in canon (no wiring obligation) and 6 were local copies with no canon
+        # at all. Which names a root is OWED is a judgment about the canon, and the
+        # collector does not read the canon.
+        self.assertNotIn('onlyClaude', harness['skills'])
+        # The old total keeps its old meaning so an older reader is not broken by
+        # the split that was added beside it.
+        self.assertEqual(harness['skillsWired'], 4)
+
+    def test_platform_and_plan_become_the_public_contract(self):
+        calls = []
+        package_info = {'packages': {
+            'notes': {'source_class': 'shipped'},
+            'external': {'source_class': 'explicit'},
+        }}
+        package_info_text = json.dumps(package_info)
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[1].endswith('airlock-update'):
+                return types.SimpleNamespace(returncode=0,
+                                             stdout='{"available":true,"changedCount":2,"ref":"main"}\n',
+                                             stderr='')
+            if argv[1].endswith('airlock-config'):
+                return types.SimpleNamespace(returncode=0, stderr='', stdout=package_info_text)
+            if argv[1].endswith('airlock-ledger'):
+                self.assertEqual(kwargs['input_text'], package_info_text)
+                return types.SimpleNamespace(returncode=0, stderr='',
+                                             stdout='reinstall\tnotes\nupgrade-diff\tnotes\nupgrade-deactivate\texternal\n')
+            self.fail('unexpected command: %r' % (argv,))
+
+        self.updates._run = run
+        root = Path('/fixture')
+        self.assertEqual(self.updates._platform(root),
+                         {'available': True, 'changedCount': 2, 'ref': 'main'})
+        self.assertEqual(self.updates._apps(root), [
+            {'id': 'external', 'action': 'upgrade', 'sourceClass': 'explicit'},
+            {'id': 'notes', 'action': 'upgrade', 'sourceClass': 'shipped'},
+        ])
+
+    def test_explicit_lock_refusal_is_display_only_lock_mismatch(self):
+        self.updates._run = lambda _argv, **_kwargs: types.SimpleNamespace(
+            returncode=2, stdout='', stderr="package 'third-party': package lock digest mismatch\n")
+        self.assertEqual(self.updates._apps(Path('/fixture')), [
+            {'id': 'third-party', 'action': 'lock-mismatch', 'sourceClass': 'explicit'},
+        ])
+
+    def test_partial_or_malformed_snapshot_is_never_served(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'updates.json'
+            self.updates.write_snapshot(path, {'checkedAt': '2026-09-01T00:00:00Z'})
+            self.assertIsNone(self.updates.read_snapshot(path))
+            path.write_text('{not-json', encoding='utf-8')
+            self.assertIsNone(self.updates.read_snapshot(path))
+            self.updates.write_snapshot(path, {
+                'checkedAt': '2026-09-01T00:00:00Z',
+                'platform': {'available': True, 'changedCount': True, 'ref': 'a' * 40},
+                'apps': [], 'harness': {'codex': None, 'hooksDrift': False, 'skillsWired': True},
+            })
+            self.assertIsNone(self.updates.read_snapshot(path))
+
+    def test_collection_failure_leaves_the_last_complete_snapshot_byte_for_byte(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'updates.json'
+            old = {'checkedAt': '2026-09-01T00:00:00Z',
+                   'platform': {'available': False, 'changedCount': 0, 'ref': 'a' * 40},
+                   'apps': [],
+                   'harness': {'codex': None, 'hooksDrift': False, 'skillsWired': 2}}
+            self.updates.write_snapshot(path, old)
+            original = path.read_bytes()
+            saved_platform, saved_apps, saved_harness = (self.updates._platform,
+                                                          self.updates._apps,
+                                                          self.updates._harness)
+            try:
+                self.updates._platform = lambda _root: (_ for _ in ()).throw(RuntimeError('fetch failed'))
+                self.updates._apps = lambda _root: self.fail('must stop after platform failure')
+                self.updates._harness = lambda: self.fail('must stop after platform failure')
+                with self.assertRaisesRegex(RuntimeError, 'fetch failed'):
+                    self.updates.collect(Path('/fixture'), path)
+            finally:
+                self.updates._platform, self.updates._apps, self.updates._harness = (
+                    saved_platform, saved_apps, saved_harness)
+            self.assertEqual(path.read_bytes(), original)
 
 
 import devmon_tokens as TOK  # noqa: E402  (imported here to sit with its own tests)
@@ -1129,6 +1761,856 @@ class TokenTimerCliTest(TokenFixtureMixin, unittest.TestCase):
         self.assertEqual(0, cli.main(['--snapshot', os.path.join(self.tmp.name, 's.json'),
                                       '--spool', spool, '--quiet']))
         self.assertEqual(len(os.listdir(os.path.join(spool, 'new'))), 1)
+
+
+@contextlib.contextmanager
+def live_wrapper():
+    """A real, running process whose cmdline looks like the update wrapper's.
+
+    devmon_update_exec.pid_alive matches on the command line, not on a bare signal
+    probe, so a test that wants "the wrapper is alive" has to produce a process that
+    would actually match. The extra argv element is the module name — the same token
+    that appears in the real argv the backend builds.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(30)', 'devmon_update_exec.py'])
+    # Popen returns after the fork, and until the exec completes the child still shows
+    # THIS process's command line. Yielding there made the assertion flaky (4 of 6 runs
+    # measured, 2026-09-01) in the direction that hides a bug: the wrapper reads as
+    # dead. Read /proc directly rather than calling pid_alive, so the helper does not
+    # wait on the function the test is about to measure.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            if b'devmon_update_exec' in Path('/proc/%d/cmdline' % proc.pid).read_bytes():
+                break
+        except OSError:
+            pass
+        time.sleep(0.02)
+    else:
+        proc.kill()
+        proc.wait()
+        raise unittest.SkipTest('could not observe a child command line on this box')
+    try:
+        yield proc.pid
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+class UpdateExecModuleTest(unittest.TestCase):
+    """devmon_update_exec on its own: the lock probe, liveness, argv and recovery.
+
+    Every assertion here is about a claim the panel makes to a person, so the ones
+    that matter most are the negative ones — "nothing is running", "there is nothing
+    to roll back" — measured rather than assumed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name) / 'update-run'
+        UPX.ensure_dirs(self.dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    # ---- the updater's mutex ------------------------------------------------
+    def _repo(self):
+        root = Path(self.tmp.name) / 'checkout'
+        root.mkdir()
+        rc = subprocess.call(['git', 'init', '-q', str(root)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if rc != 0:
+            self.skipTest('git is not available')
+        return root
+
+    def test_the_lock_probe_has_a_positive_control(self):
+        """The whole point of the probe is to be able to say 'busy'. Prove it can.
+
+        Without this the free/busy answer is untestable in the direction that matters:
+        a probe that always answered False would pass every other assertion here.
+        """
+        import fcntl
+        root = self._repo()
+        self.assertIs(UPX.updater_busy(root), False)         # control: free
+        git = UPX.git_dir(root)
+        self.assertIsNotNone(git)
+        descriptor = os.open(str(git), os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIs(UPX.updater_busy(root), True)      # the same lock airlock-update takes
+        finally:
+            os.close(descriptor)
+        self.assertIs(UPX.updater_busy(root), False)         # and it clears
+
+    def test_the_probe_never_takes_the_lock_it_measures(self):
+        """A probe that acquired the mutex would kill a real update started one tick later."""
+        import fcntl
+        root = self._repo()
+        for _ in range(5):
+            UPX.updater_busy(root)
+        git = UPX.git_dir(root)
+        descriptor = os.open(str(git), os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if we held it
+        finally:
+            os.close(descriptor)
+
+    def test_a_directory_that_is_not_a_checkout_is_not_busy(self):
+        self.assertIs(UPX.updater_busy(Path(self.tmp.name) / 'nowhere'), False)
+
+    # ---- liveness -----------------------------------------------------------
+    def test_a_record_with_no_pid_is_starting_then_interrupted(self):
+        record = UPX.start_record('r1', 'platform', None)
+        self.assertEqual(UPX.observed(record)['status'], 'starting')
+        stale = dict(record, startedAt='2020-01-01T00:00:00Z')
+        self.assertEqual(UPX.observed(stale)['status'], 'interrupted')
+
+    def test_a_dead_pid_resolves_to_interrupted_and_a_live_one_does_not(self):
+        record = dict(UPX.start_record('r1', 'platform', None), status='running')
+        # pid 1 exists and is very much alive — and is not this wrapper. That is the
+        # pid-reuse case, and the reason liveness is checked by cmdline rather than by
+        # a bare kill(pid, 0): after a reboot the recorded pid belongs to something else.
+        self.assertEqual(UPX.observed(dict(record, pid=1))['status'], 'interrupted')
+        # This very process is alive too, and also is not the wrapper.
+        self.assertEqual(UPX.observed(dict(record, pid=os.getpid()))['status'],
+                         'interrupted')
+        with live_wrapper() as pid:
+            self.assertEqual(UPX.observed(dict(record, pid=pid))['status'], 'running')
+
+    def test_a_terminal_record_is_returned_unchanged(self):
+        record = dict(UPX.start_record('r1', 'platform', None),
+                      status='done', exitCode=0, pid=1)
+        self.assertEqual(UPX.observed(record), record)
+
+    # ---- the plan -----------------------------------------------------------
+    def test_the_app_id_is_recorded_but_never_placed_on_a_command_line(self):
+        """Both buttons run the same command; the id is provenance, not an argument."""
+        plan = UPX.build_plan(Path('/opt/airlock'), self.dir, 'r1', 'app', 'notes')
+        self.assertNotIn('notes', ' '.join(plan['exec'][:1]))
+        self.assertIn('--app', plan['exec'])
+        self.assertTrue(os.path.isabs(plan['exec'][0]))
+        self.assertEqual(plan['cwd'], plan['cwd_root'])
+
+    def test_the_plan_pins_cwd_and_its_root_to_the_checkout(self):
+        plan = UPX.build_plan(Path('/opt/airlock'), self.dir, 'r1', 'platform', None)
+        self.assertEqual((plan['cwd'], plan['cwd_root']), ('/opt/airlock', '/opt/airlock'))
+        self.assertNotIn('--app', plan['exec'])
+
+    # ---- the record ---------------------------------------------------------
+    def test_a_truncated_record_is_not_a_run(self):
+        UPX.run_path(self.dir).write_text('{"runId": ')
+        self.assertIsNone(UPX.read_record(self.dir))
+
+    def test_a_superseded_wrapper_refuses_to_write_over_the_live_record(self):
+        UPX.write_record(self.dir, UPX.start_record('current', 'platform', None))
+        with self.assertRaises(SystemExit):
+            UPX._claim(self.dir, 'older')
+        self.assertEqual(UPX.read_record(self.dir)['runId'], 'current')
+
+    # ---- summaries and recovery --------------------------------------------
+    def _fake_status(self, body, code=0):
+        root = Path(self.tmp.name) / 'fakeroot'
+        (root / 'bin').mkdir(parents=True, exist_ok=True)
+        (root / 'bin' / 'airlock-status').write_text(
+            'import sys\nsys.stdout.write(%r)\nsys.exit(%d)\n' % (body, code))
+        return root
+
+    def test_a_status_summary_carries_the_revision_and_only_the_problems(self):
+        document = json.dumps({
+            'verdict': 'warn', 'exit_code': 0,
+            'counts': {'ok': 13, 'warn': 1, 'fail': 0, 'unchecked': 0},
+            'checks': [{'id': 'install.revision', 'status': 'ok', 'detail': 'abc123'},
+                       {'id': 'units.active', 'status': 'warn', 'detail': 'one unit is old'},
+                       {'id': 'gate.owner', 'status': 'ok', 'detail': 'fine'}],
+        })
+        got = UPX.status_summary(self._fake_status(document))
+        self.assertEqual((got['rc'], got['verdict'], got['revision']), (0, 'warn', 'abc123'))
+        self.assertEqual([p['id'] for p in got['problems']], ['units.active'])
+
+    def test_a_status_tool_that_says_nothing_useful_is_a_value_not_a_crash(self):
+        got = UPX.status_summary(self._fake_status('not json at all', code=2))
+        self.assertEqual(got['rc'], 2)
+        self.assertIn('JSON', got['error'])
+        missing = UPX.status_summary(Path(self.tmp.name) / 'absent')
+        self.assertEqual(missing['rc'], 127)
+
+    def test_recovery_is_offered_only_where_the_updater_armed_it(self):
+        root = self._repo()
+        unarmed = UPX.recovery_hint(root)
+        self.assertIs(unarmed['available'], False)
+        self.assertIn('--rollback', unarmed['command'])
+        self.assertIn('reason', unarmed)
+        armed_dir = UPX.git_dir(root) / 'airlock-update-rollback'
+        armed_dir.mkdir(parents=True)
+        (armed_dir / 'airlock-update').write_text('#!/usr/bin/env bash\n')
+        armed = UPX.recovery_hint(root)
+        self.assertIs(armed['available'], True)
+        self.assertIn(str(armed_dir / 'airlock-update'), armed['command'])
+        self.assertIn('--rollback', armed['command'])
+
+
+class UpdateExecRouteTest(unittest.TestCase):
+    """The two new owner routes, driven through the real handler."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server, threading
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.tmp.name) / 'checkout'
+        (cls.root / 'bin').mkdir(parents=True)
+        cls.dir = Path(cls.tmp.name) / 'update-run'
+        DM.UPDATES_OWNER_CONFIG = {'owner': 'me@example.test', 'secret': 's3cr3t'}
+        DM.UPDATE_EXEC_CONFIG = {
+            'root': cls.root, 'dir': cls.dir,
+            'plan_dir': str(UPX.plan_dir(cls.dir)),
+            'sentinel_dir': str(UPX.sentinel_dir(cls.dir)),
+            'session': 'devmon-test', 'cwd_root': str(cls.root), 'agent': {},
+            'runner': os.path.join(BACKEND, 'action_runner.py'),
+        }
+        UPX.ensure_dirs(cls.dir)
+        cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), DM.Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        DM.UPDATES_OWNER_CONFIG = None
+        DM.UPDATE_EXEC_CONFIG = None
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.launched = []
+        self._launch = DM._launch_run
+        DM._launch_run = lambda run_id, plan, cfg=None, name=None: (
+            self.launched.append((run_id, plan, cfg, name)) or ('ok', '1:@7'))
+        self._updates = DM.UPDATES
+        DM.UPDATES = self._snapshot([{'id': 'notes', 'action': 'upgrade',
+                                      'sourceClass': 'shipped'},
+                                     {'id': 'orca', 'action': 'lock-mismatch',
+                                      'sourceClass': 'explicit'}])
+        try:
+            UPX.run_path(self.dir).unlink()
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        DM._launch_run = self._launch
+        DM.UPDATES = self._updates
+
+    @staticmethod
+    def _snapshot(apps):
+        class Snapshot:
+            @staticmethod
+            def read_snapshot():
+                return {'checkedAt': '2026-09-01T00:00:00Z', 'platform': None,
+                        'apps': apps,
+                        'harness': {'codex': None, 'hooksDrift': False, 'skillsWired': 0}}
+        return Snapshot
+
+    def _req(self, method, path, body=None, owner=True, origin=True):
+        import http.client
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        headers = {'Content-Type': 'application/json'}
+        if owner:
+            headers['X-Devmon-Owner'] = 'me@example.test'
+            headers['X-Devmon-Proxy-Secret'] = 's3cr3t'
+        if origin:
+            headers['Origin'] = 'http://127.0.0.1:%d' % self.port
+        conn.request(method, path, body=body, headers=headers)
+        r = conn.getresponse()
+        data = r.read()
+        conn.close()
+        return r.status, json.loads(data or b'{}')
+
+    def _execute(self, payload, **kw):
+        return self._req('POST', '/api/owner/updates/execute',
+                         body=json.dumps(payload).encode(), **kw)
+
+    # ---- the gate -----------------------------------------------------------
+    def test_execution_is_reachable_on_a_box_with_the_message_console_off(self):
+        """The reason this route exists at all — `messages = false` is the default.
+
+        Before this, the panel showed an update it could not start: detection came
+        through the split owner gate (#291) and execution was still behind the message
+        console's, so on a default box the button was a 404.
+        """
+        saved = DM.OWNER_CONFIG
+        DM.OWNER_CONFIG = None
+        try:
+            status, payload = self._req('GET', '/api/owner/updates/run')
+            self.assertEqual(status, 200, payload)
+            status, payload = self._execute({'action': 'platform'})
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(len(self.launched), 1)
+        finally:
+            DM.OWNER_CONFIG = saved
+
+    def test_a_stranger_reaches_neither_route(self):
+        self.assertEqual(self._req('GET', '/api/owner/updates/run', owner=False)[0], 403)
+        self.assertEqual(self._execute({'action': 'platform'}, owner=False)[0], 403)
+
+    def test_a_cross_origin_post_is_refused_before_the_body_is_read(self):
+        self.assertEqual(self._execute({'action': 'platform'}, origin=False)[0], 403)
+
+    def test_both_routes_404_when_execution_is_not_configured(self):
+        saved = DM.UPDATE_EXEC_CONFIG
+        DM.UPDATE_EXEC_CONFIG = None
+        try:
+            self.assertEqual(self._req('GET', '/api/owner/updates/run')[0], 404)
+            self.assertEqual(self._execute({'action': 'platform'})[0], 404)
+        finally:
+            DM.UPDATE_EXEC_CONFIG = saved
+
+    # ---- what may be asked for ---------------------------------------------
+    def test_the_platform_action_launches_the_updater(self):
+        status, payload = self._execute({'action': 'platform'})
+        self.assertEqual(status, 200, payload)
+        run_id, plan, cfg, name = self.launched[0]
+        self.assertEqual(name, run_id)
+        self.assertEqual(plan['cwd'], str(self.root))
+        self.assertTrue(plan['exec'][1].endswith('devmon_update_exec.py'))
+        self.assertEqual(UPX.read_record(self.dir)['runId'], run_id)
+
+    def test_a_pending_app_launches_the_same_command_and_records_which_row(self):
+        status, payload = self._execute({'action': 'app', 'id': 'notes'})
+        self.assertEqual(status, 200, payload)
+        record = UPX.read_record(self.dir)
+        self.assertEqual((record['action'], record['appId']), ('app', 'notes'))
+
+    def test_a_lock_mismatch_app_cannot_be_executed(self):
+        """🔴 Owner decision LOCK_UI_V1, enforced server-side and not only by a
+        disabled button: re-approving a package lock is a terminal procedure."""
+        status, payload = self._execute({'action': 'app', 'id': 'orca'})
+        self.assertEqual((status, payload['error']), (409, 'app_not_pending'))
+        self.assertEqual(self.launched, [])
+
+    def test_an_app_the_snapshot_never_listed_is_refused(self):
+        status, payload = self._execute({'action': 'app', 'id': 'invented'})
+        self.assertEqual((status, payload['error']), (409, 'app_not_pending'))
+
+    def test_a_malformed_app_id_is_refused_before_the_snapshot_is_consulted(self):
+        for bad in ('../../etc', 'Notes', '', 'a' * 40, None, 5):
+            status, payload = self._execute({'action': 'app', 'id': bad})
+            self.assertEqual((status, payload['error']), (400, 'bad_app_id'), bad)
+        self.assertEqual(self.launched, [])
+
+    def test_an_unknown_action_runs_nothing(self):
+        for body in ({'action': 'review'}, {'action': 'harness:codex'}, {}, {'action': None}):
+            status, payload = self._execute(body)
+            self.assertEqual((status, payload['error']), (400, 'bad_action'), body)
+        self.assertEqual(self.launched, [])
+
+    # ---- one at a time ------------------------------------------------------
+    def test_a_live_run_refuses_a_second_launch(self):
+        with live_wrapper() as pid:
+            UPX.write_record(self.dir, dict(UPX.start_record('live', 'platform', None),
+                                            status='running', pid=pid))
+            status, payload = self._execute({'action': 'platform'})
+            self.assertEqual((status, payload['error']), (409, 'run_active'))
+            self.assertEqual(self.launched, [])
+
+    def test_a_dead_run_does_not_block_forever(self):
+        record = dict(UPX.start_record('dead', 'platform', None), status='running', pid=1)
+        UPX.write_record(self.dir, record)
+        self.assertEqual(self._execute({'action': 'platform'})[0], 200)
+
+    def test_a_held_updater_mutex_refuses_a_launch(self):
+        saved = UPX.updater_busy
+        UPX.updater_busy = lambda root: True
+        try:
+            status, payload = self._execute({'action': 'platform'})
+            self.assertEqual((status, payload['error']), (409, 'updater_busy'))
+            self.assertEqual(self.launched, [])
+        finally:
+            UPX.updater_busy = saved
+
+    def test_an_unmeasurable_mutex_does_not_take_the_button_away(self):
+        """`None` is 'we could not look'. Treating it as 'held' would disable the one
+        control on a box whose /proc is unavailable, for no measured reason."""
+        saved = UPX.updater_busy
+        UPX.updater_busy = lambda root: None
+        try:
+            self.assertEqual(self._execute({'action': 'platform'})[0], 200)
+        finally:
+            UPX.updater_busy = saved
+
+    # ---- a launch that never produced a window ------------------------------
+    def test_a_failed_launch_closes_its_own_record(self):
+        DM._launch_run = lambda *a, **k: ('nowindow', None)
+        status, payload = self._execute({'action': 'platform'})
+        self.assertEqual((status, payload['error']), (500, 'launch_failed'))
+        record = UPX.read_record(self.dir)
+        self.assertEqual(record['status'], 'failed')
+        self.assertIn('tmux', record['note'])
+        # And the next attempt is not blocked by the corpse of the last one.
+        DM._launch_run = lambda run_id, plan, cfg=None, name=None: ('ok', '1:@7')
+        self.assertEqual(self._execute({'action': 'platform'})[0], 200)
+
+    def test_an_ambiguous_launch_is_a_503_and_says_so_in_the_record(self):
+        DM._launch_run = lambda *a, **k: ('ambiguous', None)
+        status, _ = self._execute({'action': 'platform'})
+        self.assertEqual(status, 503)
+        self.assertEqual(UPX.read_record(self.dir)['status'], 'failed')
+
+    # ---- reading the state --------------------------------------------------
+    def test_the_run_route_reports_liveness_rather_than_the_last_written_status(self):
+        UPX.write_record(self.dir, dict(UPX.start_record('gone', 'platform', None),
+                                        status='running', pid=1))
+        status, payload = self._req('GET', '/api/owner/updates/run')
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['run']['status'], 'interrupted')
+        self.assertIn('busy', payload)
+
+    def test_the_run_route_answers_with_no_run_at_all(self):
+        status, payload = self._req('GET', '/api/owner/updates/run')
+        self.assertEqual((status, payload['run']), (200, None))
+
+
+class UpdateExecEndToEndTest(unittest.TestCase):
+    """The wrapper, run as the process the tmux window really starts.
+
+    Everything above this in the file is the backend's view of a run. This is the run:
+    a scratch checkout, a real subprocess, and the record a person's panel then reads.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / 'checkout'
+        (self.root / 'bin').mkdir(parents=True)
+        if subprocess.call(['git', 'init', '-q', str(self.root)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+            self.skipTest('git is not available')
+        self.dir = Path(self.tmp.name) / 'update-run'
+        UPX.ensure_dirs(self.dir)
+        self.counter = Path(self.tmp.name) / 'revision'
+        self.counter.write_text('rev-before')
+        # `airlock-status` is invoked through the interpreter, `airlock-update` through
+        # bash — the same two spellings the real ones use, so the stand-ins exercise the
+        # real invocation and not a friendlier one.
+        (self.root / 'bin' / 'airlock-status').write_text(
+            'import json, pathlib, sys\n'
+            'rev = pathlib.Path(%r).read_text()\n'
+            'print(json.dumps({"verdict": "ok", "exit_code": 0,\n'
+            '  "counts": {"ok": 14, "warn": 0, "fail": 0, "unchecked": 0},\n'
+            '  "checks": [{"id": "install.revision", "status": "ok", "detail": rev}]}))\n'
+            % str(self.counter))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _updater(self, body):
+        (self.root / 'bin' / 'airlock-update').write_text('#!/usr/bin/env bash\n' + body)
+
+    def _run(self, run_id='e2e', action='platform', app_id=None):
+        UPX.write_record(self.dir, UPX.start_record(run_id, action, app_id))
+        proc = subprocess.run(
+            UPX.build_exec_argv(self.root, self.dir, run_id, action, app_id),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        return proc, UPX.read_record(self.dir)
+
+    def test_a_successful_run_records_the_before_and_after_status_and_the_new_revision(self):
+        """The card's success condition, measured: rc=0, and install.revision moved."""
+        self._updater('printf rev-after > %r\nexit 0\n' % str(self.counter))
+        proc, record = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((record['status'], record['exitCode']), ('done', 0))
+        self.assertEqual(record['before']['rc'], 0)
+        self.assertEqual(record['after']['rc'], 0)
+        self.assertEqual(record['before']['revision'], 'rev-before')
+        self.assertEqual(record['after']['revision'], 'rev-after')
+        self.assertIsNone(record['recovery'])
+        self.assertIsNotNone(record['endedAt'])
+
+    def test_a_failing_run_carries_the_rollback_command_the_updater_armed(self):
+        """The card's second requirement: a failure has to name its recovery."""
+        armed = UPX.git_dir(self.root) / 'airlock-update-rollback'
+        armed.mkdir(parents=True)
+        (armed / 'airlock-update').write_text('#!/usr/bin/env bash\n')
+        self._updater('echo "설치가 실패했습니다" >&2\nexit 1\n')
+        proc, record = self._run()
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual((record['status'], record['exitCode']), ('failed', 1))
+        self.assertIs(record['recovery']['available'], True)
+        self.assertIn('--rollback', record['recovery']['command'])
+        self.assertIn(str(armed / 'airlock-update'), record['recovery']['command'])
+        # The after-status is still taken: a failed update leaves a box in some state,
+        # and "what is it now" is the first thing the panel is asked.
+        self.assertEqual(record['after']['rc'], 0)
+
+    def test_a_failure_before_the_updater_armed_recovery_says_so(self):
+        self._updater('exit 1\n')
+        _proc, record = self._run()
+        self.assertIs(record['recovery']['available'], False)
+        self.assertIn('기준점', record['recovery']['reason'])
+
+    def test_an_updater_that_cannot_run_is_a_recorded_failure_not_a_traceback(self):
+        proc, record = self._run()                     # no bin/airlock-update at all
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(record['status'], 'failed')
+        self.assertIsNotNone(record['after'])
+
+    def test_a_superseded_wrapper_exits_without_touching_the_live_record(self):
+        UPX.write_record(self.dir, dict(UPX.start_record('newer', 'platform', None),
+                                        status='running', pid=4242))
+        self._updater('exit 0\n')
+        proc = subprocess.run(UPX.build_exec_argv(self.root, self.dir, 'older', 'platform', None),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              timeout=60)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('superseded', proc.stderr)
+        record = UPX.read_record(self.dir)
+        self.assertEqual((record['runId'], record['status']), ('newer', 'running'))
+
+    def test_the_run_is_visible_as_running_while_it_runs(self):
+        """The panel's 'in progress' line is a real observation, not an optimistic guess."""
+        gate = Path(self.tmp.name) / 'gate'
+        self._updater('while [ ! -e %r ]; do sleep 0.05; done\nexit 0\n' % str(gate))
+        UPX.write_record(self.dir, UPX.start_record('slow', 'platform', None))
+        proc = subprocess.Popen(
+            UPX.build_exec_argv(self.root, self.dir, 'slow', 'platform', None),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 60
+            seen = None
+            while time.monotonic() < deadline:
+                record = UPX.read_record(self.dir)
+                if record and record.get('before') is not None:
+                    seen = UPX.observed(record)
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(seen, 'the wrapper never reached its running state')
+            self.assertEqual(seen['status'], 'running')
+            self.assertEqual(seen['pid'], proc.pid)
+        finally:
+            gate.write_text('go')
+            proc.wait(timeout=60)
+        self.assertEqual(UPX.read_record(self.dir)['status'], 'done')
+
+
+class UpdateExecThroughTmuxTest(unittest.TestCase):
+    """The whole chain the owner's click really takes: plan file -> action_runner -> tmux.
+
+    Skipped where tmux is absent, which is the honest answer rather than a green run
+    that measured nothing: the same absence makes the feature itself unavailable, and
+    the backend answers `launch_failed` for it (asserted in UpdateExecRouteTest).
+    """
+
+    def setUp(self):
+        if shutil.which('tmux') is None:
+            self.skipTest('tmux is not installed')
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / 'checkout'
+        (self.root / 'bin').mkdir(parents=True)
+        (self.root / 'bin' / 'airlock-status').write_text(
+            'import json\nprint(json.dumps({"verdict": "ok", "exit_code": 0,\n'
+            '  "counts": {"ok": 1, "warn": 0, "fail": 0, "unchecked": 0},\n'
+            '  "checks": [{"id": "install.revision", "status": "ok", "detail": "abc"}]}))\n')
+        (self.root / 'bin' / 'airlock-update').write_text('#!/usr/bin/env bash\nexit 0\n')
+        self.dir = Path(self.tmp.name) / 'update-run'
+        UPX.ensure_dirs(self.dir)
+        self.session = 'devmon-e2e-%d' % os.getpid()
+
+    def tearDown(self):
+        subprocess.call(['tmux', 'kill-session', '-t', self.session],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.tmp.cleanup()
+
+    def test_a_plan_launched_the_real_way_finishes_and_leaves_a_terminal_record(self):
+        cfg = {'root': self.root, 'dir': self.dir,
+               'plan_dir': str(UPX.plan_dir(self.dir)),
+               'sentinel_dir': str(UPX.sentinel_dir(self.dir)),
+               'session': self.session, 'cwd_root': str(self.root), 'agent': {},
+               'runner': os.path.join(BACKEND, 'action_runner.py')}
+        run_id = 'tmux-e2e'
+        UPX.write_record(self.dir, UPX.start_record(run_id, 'platform', None))
+        plan = UPX.build_plan(self.root, self.dir, run_id, 'platform', None)
+        outcome, target = DM._launch_run(run_id, plan, cfg, run_id)
+        self.assertEqual(outcome, 'ok', target)
+        # Waits for the AFTER reading, not merely for a terminal status: the wrapper
+        # publishes the exit code first and the after-status a moment later, so that a
+        # panel refreshing in between still learns the run ended. (The panel tolerates
+        # that gap — airlockUpdRunLine guards on `run.after` — but a test that stopped
+        # at the status would race it and read `after: null`.)
+        deadline = time.monotonic() + 120
+        record = None
+        while time.monotonic() < deadline:
+            record = UPX.read_record(self.dir)
+            if record and record.get('status') in ('done', 'failed') \
+                    and record.get('after') is not None:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(record)
+        self.assertEqual(record['status'], 'done', record)
+        self.assertEqual(record['exitCode'], 0)
+        self.assertEqual(record['after']['revision'], 'abc')
+        # action_runner's own completion signal, on the same run.
+        self.assertTrue((UPX.sentinel_dir(self.dir) / (run_id + '.done')).exists())
+
+
+
+
+class HarnessRouteTest(unittest.TestCase):
+    """The 하네스 section's two routes: what may be pressed, and what may not.
+
+    Deliberately a separate fixture from UpdateExecRouteTest, mirroring the split in
+    the code itself: a Codex CLI upgrade and `bin/airlock-update` share no mutex, no
+    record and no failure, and a test that shared one would stop being able to show it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server, threading
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.tmp.name) / 'checkout'
+        (cls.root / 'bin').mkdir(parents=True)
+        cls.dir = Path(cls.tmp.name) / 'harness-run'
+        DM.UPDATES_OWNER_CONFIG = {'owner': 'me@example.test', 'secret': 's3cr3t'}
+        DM.HARNESS_EXEC_CONFIG = {
+            'root': cls.root, 'dir': cls.dir,
+            'plan_dir': str(UPX.plan_dir(cls.dir)),
+            'sentinel_dir': str(UPX.sentinel_dir(cls.dir)),
+            'session': 'devmon-test', 'cwd_root': str(cls.root), 'agent': {},
+            'runner': os.path.join(BACKEND, 'action_runner.py'),
+        }
+        UPX.ensure_dirs(cls.dir)
+        cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), DM.Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        DM.UPDATES_OWNER_CONFIG = None
+        DM.HARNESS_EXEC_CONFIG = None
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.launched = []
+        self._launch = DM._launch_run
+        DM._launch_run = lambda run_id, plan, cfg=None, name=None: (
+            self.launched.append((run_id, plan, cfg, name)) or ('ok', '1:@7'))
+        self.started = []
+        self._check_call = DM.subprocess.check_call
+        DM.subprocess.check_call = lambda argv, **kw: self.started.append(argv)
+        try:
+            UPX.run_path(self.dir).unlink()
+        except FileNotFoundError:
+            pass
+
+    def tearDown(self):
+        DM._launch_run = self._launch
+        DM.subprocess.check_call = self._check_call
+
+    def _req(self, method, path, body=None, owner=True, origin=True):
+        import http.client
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        headers = {'Content-Type': 'application/json'}
+        if owner:
+            headers['X-Devmon-Owner'] = 'me@example.test'
+            headers['X-Devmon-Proxy-Secret'] = 's3cr3t'
+        if origin:
+            headers['Origin'] = 'http://127.0.0.1:%d' % self.port
+        conn.request(method, path, body=body, headers=headers)
+        r = conn.getresponse()
+        data = r.read()
+        conn.close()
+        return r.status, json.loads(data or b'{}')
+
+    def _execute(self, payload, **kw):
+        return self._req('POST', '/api/owner/harness/execute',
+                         body=json.dumps(payload).encode(), **kw)
+
+    # ---- the gate -----------------------------------------------------------
+    def test_the_routes_work_with_the_message_console_off(self):
+        """`messages = false` is the default, and the harness section is not a console
+        feature: it hangs off the update detection gate, exactly as execution does."""
+        saved = DM.OWNER_CONFIG
+        DM.OWNER_CONFIG = None
+        try:
+            self.assertEqual(self._req('GET', '/api/owner/harness/run')[0], 200)
+            self.assertEqual(self._execute({'action': 'codex'})[0], 200)
+        finally:
+            DM.OWNER_CONFIG = saved
+
+    def test_a_stranger_reaches_neither_route(self):
+        self.assertEqual(self._req('GET', '/api/owner/harness/run', owner=False)[0], 403)
+        self.assertEqual(self._execute({'action': 'codex'}, owner=False)[0], 403)
+
+    def test_a_cross_origin_post_is_refused_before_the_body_is_read(self):
+        self.assertEqual(self._execute({'action': 'codex'}, origin=False)[0], 403)
+
+    def test_both_routes_404_when_harness_execution_is_not_configured(self):
+        saved = DM.HARNESS_EXEC_CONFIG
+        DM.HARNESS_EXEC_CONFIG = None
+        try:
+            self.assertEqual(self._req('GET', '/api/owner/harness/run')[0], 404)
+            self.assertEqual(self._execute({'action': 'codex'})[0], 404)
+        finally:
+            DM.HARNESS_EXEC_CONFIG = saved
+
+    # ---- what may be asked for ---------------------------------------------
+    def test_the_codex_action_launches_the_harness_wrapper(self):
+        status, payload = self._execute({'action': 'codex'})
+        self.assertEqual(status, 200, payload)
+        run_id, plan, cfg, name = self.launched[0]
+        self.assertEqual(name, run_id)
+        self.assertTrue(plan['exec'][1].endswith('devmon_harness.py'))
+        record = UPX.read_record(self.dir)
+        self.assertEqual((record['runId'], record['action'], record['status']),
+                         (run_id, 'codex', 'starting'))
+
+    def test_the_hook_layer_has_no_action_at_all(self):
+        """🔴 Owner decision HARNESS_V1, enforced server-side and not only by the
+        absence of a button: reconciling a hook is a reviewed procedure, so there is
+        no action name that reaches this route for it."""
+        for action in ('hooks', 'harness:hooks', 'provision', 'skills'):
+            status, payload = self._execute({'action': action})
+            self.assertEqual((status, payload['error']), (400, 'bad_action'), action)
+        self.assertEqual(self.launched, [])
+
+    def test_a_second_run_is_refused_while_one_is_in_flight(self):
+        self.assertEqual(self._execute({'action': 'codex'})[0], 200)
+        status, payload = self._execute({'action': 'codex'})
+        self.assertEqual((status, payload['error']), (409, 'run_active'))
+        self.assertEqual(len(self.launched), 1)
+
+    def test_an_update_in_flight_does_not_block_a_codex_upgrade(self):
+        """The two runs are independent, and the server must not invent a link.
+
+        `bin/airlock-update` holds a git mutex and restarts this backend; npm does
+        neither. Refusing here would be a refusal on evidence about a different run.
+        """
+        saved = DM.UPDATE_EXEC_CONFIG
+        DM.UPDATE_EXEC_CONFIG = {
+            'root': self.root, 'dir': self.dir,
+            'plan_dir': str(UPX.plan_dir(self.dir)),
+            'sentinel_dir': str(UPX.sentinel_dir(self.dir)),
+            'session': 'devmon-test', 'cwd_root': str(self.root), 'agent': {},
+            'runner': os.path.join(BACKEND, 'action_runner.py'),
+        }
+        try:
+            UPX.write_record(self.dir, dict(UPX.start_record('upd-x', 'platform', None),
+                                            pid=os.getpid(), status='running'))
+            status, payload = self._execute({'action': 'codex'})
+        finally:
+            DM.UPDATE_EXEC_CONFIG = saved
+        self.assertEqual(status, 200, payload)
+
+    # ---- 지금 점검 ----------------------------------------------------------
+    def test_recheck_starts_the_detection_oneshot_without_blocking_on_it(self):
+        """A collection runs airlock-update --dry-run, npm view and the hook check.
+        A blocking start would hold the request open for a minute and the browser
+        would call that a failure, so the panel watches `checkedAt` instead."""
+        saved = DM.UPDATES
+        DM.UPDATES = types.SimpleNamespace(read_snapshot=lambda: None)
+        try:
+            status, payload = self._execute({'action': 'recheck'})
+        finally:
+            DM.UPDATES = saved
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['unit'], 'airlock-update-detect.service')
+        self.assertEqual(self.started, [['systemctl', '--user', 'start', '--no-block',
+                                         '--', 'airlock-update-detect.service']])
+        self.assertEqual(self.launched, [])            # no window, no run record
+
+    def test_recheck_names_the_one_unit_and_takes_no_name_from_the_caller(self):
+        saved = DM.UPDATES
+        DM.UPDATES = types.SimpleNamespace(read_snapshot=lambda: None)
+        try:
+            self._execute({'action': 'recheck', 'unit': 'anything-else.service'})
+        finally:
+            DM.UPDATES = saved
+        self.assertEqual(self.started[0][-1], 'airlock-update-detect.service')
+
+    def test_recheck_says_so_when_the_detection_timer_was_never_installed(self):
+        """A real state of a working box (the timer is a separate install step), and
+        it must read as that rather than as a fault to retry into."""
+        def refuse(argv, **kw):
+            raise subprocess.CalledProcessError(5, argv)
+        saved, DM.subprocess.check_call = DM.subprocess.check_call, refuse
+        saved_updates, DM.UPDATES = DM.UPDATES, types.SimpleNamespace(read_snapshot=lambda: None)
+        try:
+            status, payload = self._execute({'action': 'recheck'})
+        finally:
+            DM.subprocess.check_call = saved
+            DM.UPDATES = saved_updates
+        self.assertEqual((status, payload['error']), (409, 'recheck_unavailable'))
+
+
+class HarnessWrapperTest(unittest.TestCase):
+    """The wrapper's own contract: it reports what `codex --version` says afterwards."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        UPX.ensure_dirs(self.dir)
+        self.saved = (HARNESS.upgrade_argv, HARNESS.codex_summary, HARNESS.subprocess.call)
+
+    def tearDown(self):
+        (HARNESS.upgrade_argv, HARNESS.codex_summary, HARNESS.subprocess.call) = self.saved
+        self.tmp.cleanup()
+
+    def _run(self, versions, exit_code=0):
+        """versions: the installed reading before and after the upgrade call."""
+        seen = iter(versions)
+        HARNESS.codex_summary = lambda: {'installed': next(seen), 'latest': '0.152.0'}
+        HARNESS.upgrade_argv = lambda: ['npm', 'install', '-g', '@openai/codex@latest']
+        HARNESS.subprocess.call = lambda argv, **kw: exit_code
+        UPX.write_record(self.dir, HARNESS.start_record('h-1', 'codex'))
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = HARNESS.main(['--dir', str(self.dir), '--run', 'h-1', '--action', 'codex'])
+        return code, UPX.read_record(self.dir)
+
+    def test_a_successful_upgrade_records_the_version_it_moved_to(self):
+        code, record = self._run(['0.144.4', '0.152.0'])
+        self.assertEqual((code, record['status']), (0, 'done'))
+        self.assertEqual((record['before']['installed'], record['after']['installed']),
+                         ('0.144.4', '0.152.0'))
+        self.assertEqual(record['note'], '')
+
+    def test_npm_succeeding_without_the_version_moving_is_not_a_success(self):
+        """🔴 The claim is "codex --version is now current", not "npm was happy".
+
+        npm returns 0 having installed into a prefix this box does not resolve, and
+        reading the exit code alone would report that as a completed upgrade to a
+        person whose codex did not change.
+        """
+        code, record = self._run(['0.144.4', '0.144.4'])
+        self.assertEqual((code, record['status']), (0, 'done'))
+        self.assertIn('그대로', record['note'])
+
+    def test_a_missing_npm_is_reported_and_nothing_is_run(self):
+        HARNESS.codex_summary = lambda: {'installed': '0.144.4', 'latest': '0.152.0'}
+        HARNESS.upgrade_argv = lambda: None
+        ran = []
+        HARNESS.subprocess.call = lambda argv, **kw: ran.append(argv) or 0
+        UPX.write_record(self.dir, HARNESS.start_record('h-2', 'codex'))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = HARNESS.main(['--dir', str(self.dir), '--run', 'h-2', '--action', 'codex'])
+        record = UPX.read_record(self.dir)
+        self.assertEqual((code, record['status'], ran), (127, 'failed', []))
+        self.assertIn('npm', record['note'])
+
+    def test_the_wrapper_refuses_to_write_over_another_launch(self):
+        UPX.write_record(self.dir, HARNESS.start_record('h-other', 'codex'))
+        with self.assertRaises(SystemExit):
+            HARNESS.main(['--dir', str(self.dir), '--run', 'h-1', '--action', 'codex'])
+        self.assertEqual(UPX.read_record(self.dir)['runId'], 'h-other')
+
+    def test_liveness_asks_about_this_wrapper_and_not_the_update_one(self):
+        """Both wrappers share the record format, so `observed()` has to ask about the
+        right process: a stale pid that now belongs to the OTHER wrapper is still a
+        dead run of this one."""
+        record = dict(HARNESS.start_record('h-3', 'codex'), pid=os.getpid(),
+                      status='running')
+        self.assertEqual(HARNESS.observed(record)['status'], 'interrupted')
+        self.assertEqual(UPX.observed(dict(record), b'python')['status'], 'running')
 
 
 if __name__ == '__main__':

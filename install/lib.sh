@@ -31,6 +31,9 @@ AIRLOCK_CONFIG_BIN="${AIRLOCK_CONFIG_BIN:-$AIRLOCK_ROOT/bin/airlock-config}"
 AIRLOCK_ACCOUNTS_BIN="${AIRLOCK_ACCOUNTS_BIN:-$AIRLOCK_ROOT/bin/airlock-accounts}"
 AIRLOCK_ACCOUNTS_STATUS_BIN="${AIRLOCK_ACCOUNTS_STATUS_BIN:-$AIRLOCK_ROOT/bin/airlock-accounts-status}"
 AIRLOCK_SECRET_BIN="${AIRLOCK_SECRET_BIN:-$AIRLOCK_ROOT/bin/airlock-secret}"
+# Answers "which agent CLI does this box run" for a tool that cannot import the
+# platform's Python — it resolves [agent].provider, including what `auto` means.
+AIRLOCK_AGENT_BIN="${AIRLOCK_AGENT_BIN:-$AIRLOCK_ROOT/bin/airlock-agent}"
 # shellcheck source=/dev/null
 . "$AIRLOCK_ROOT/install/preflight.sh"
 

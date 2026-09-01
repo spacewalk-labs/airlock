@@ -24,10 +24,31 @@
 쓴다. 이 앱은 제공자 자격 파일의 경로나 형식을 알지 못한다.
 """
 
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
+
+# 플랫폼 모듈. **어느 CLI 를 고르나** 하는 판단은 이제 이 앱의 것이 아니라 플랫폼의 것이다
+# (`bin/agent_provider.py`, 여기 vendored 사본). 이 앱과 dev-monitor 의 액션 러너가 같은
+# 질문에 따로 답하던 시절, codex 만 로그인된 박스에서 한쪽은 돌고 한쪽은 rc=127 로 죽었다.
+#
+# 🔴 아래 `select()` 가 내는 **문구는 사용자 화면에 그대로 나간다.** 플랫폼 모듈이 그 문구를
+#    축자로 들고 있는 이유이고, 옮기면서 한 글자도 바꾸지 않은 이유다.
+#
+# 설치가 backend/ 에 복사하므로 sys.path 가 아니라 파일 경로로 읽는다 — 이 백엔드의 다른
+# 모듈(`ingest_runner.py` -> `providers.py`)이 이미 쓰는 방식이다.
+_AGENT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_provider.py")
+_AGENT_SPEC = importlib.util.spec_from_file_location("learning_agent_provider", _AGENT_PATH)
+AGENT = importlib.util.module_from_spec(_AGENT_SPEC)
+_AGENT_SPEC.loader.exec_module(AGENT)
+
+# 이 앱이 잃는 것을 말하는 마지막 수단 메시지. 플랫폼 기본 문구("CLI 를 찾지 못했습니다")는
+# 적재가 막혔다는 것만 말하고, 폴더를 열어 보고 공유하는 절반은 멀쩡하다는 것을 말하지 못한다.
+NOTHING_FOUND = ("적재를 돌릴 에이전트 CLI 를 찾지 못했습니다 — {names} 중 하나가 로그인되어 "
+                 "있어야 링크를 문서로 만들 수 있습니다. 폴더를 열어 보고 공유하는 것은 "
+                 "그대로 됩니다{note}")
 
 # 🔴 구독이 아니라 종량 과금으로 돌 뻔하게 만드는 환경 변수 전부. 자식은 환경을 통째로
 #    상속하므로 여기서 막지 않으면 조용히 과금된다. 유닛의 `UnsetEnvironment` 와 별개인
@@ -292,6 +313,18 @@ def by_id(provider_id):
     return None
 
 
+# 플랫폼이 아는 제공자마다 이 앱의 어댑터가 있어야 한다. 플랫폼에 세 번째 CLI 가 붙는
+# 날, 이 파일이 그대로면 `select()` 는 어댑터 자리에 None 을 받아 **한참 뒤 엉뚱한 곳**
+# 에서 죽는다. 임포트 시점에 말하는 편이 싸다.
+_UNADAPTED = [p.id for p in AGENT.PROVIDERS if by_id(p.id) is None]
+if _UNADAPTED:
+    raise RuntimeError(
+        "플랫폼이 아는 제공자에 이 앱의 어댑터가 없습니다: %s. "
+        "agent_provider.PROVIDERS 에 맞춰 이 파일에 어댑터를 추가하십시오 "
+        "(build_argv·log_bytes·skill_root 는 앱마다 다르므로 플랫폼이 대신 못 합니다)."
+        % ", ".join(_UNADAPTED))
+
+
 def streams_json(provider):
     """그 CLI 의 표준출력이 JSON 이벤트인가. 아니면 평문 그대로 로그로 간다."""
     return getattr(provider, "streams_json", True)
@@ -312,43 +345,21 @@ def select(preference="auto", env=None):
 
     고르는 순서는 하나뿐이다 — **자격 흔적이 있는 것 먼저.** 여러 CLI 가 깔린 박스에서
     로그인 안 된 쪽을 골라 40분 뒤에 실패하는 것이 가장 나쁜 결과이기 때문이다.
+
+    그 순서를 정하는 것은 이제 플랫폼(`AGENT.select`)이고, 이 함수가 하는 일은 **증거를
+    대는 것** 하나다. 증거가 앱마다 다르기 때문이다 — 플랫폼은 `bin_discovery` 로 유닛의
+    빈약한 PATH 를 우회하고, 이 앱은 설치가 조립한 PATH 와 `AIRLOCK_LEARNING_*_BIN`
+    비상구를 본다(위 `probe`). 판단은 하나, 증거는 둘.
+
+    🔴 `probe` 를 한 번에 (실행파일, 자격힌트) 둘 다로 넘기는 것이 계약이다. 나눠 넘기면
+    자격 조회(`has_credentials`)가 제공자마다 두 번 돌고, "깔려 있다" 와 "로그인돼 있다"
+    가 서로 다른 순간의 측정이 된다.
     """
     env = env if env is not None else os.environ
-    known = ("auto",) + tuple(p.id for p in PROVIDERS)
-    requested = str(preference or "auto").strip().lower()
-    note = ""
-    if requested not in known:
-        # 조용히 auto 로 바꾸지 않는다 — 오타 하나로 다른 CLI 가 돌고 있는데 로그는
-        # 아무 말도 안 하는 것이 이 자리에서 가장 나쁜 결과다.
-        note = f" (설정의 provider 값 {requested!r} 을 모릅니다 — auto 로 봤습니다)"
-        requested = "auto"
-    preference = requested
-
-    if preference != "auto":
-        provider = by_id(preference)
-        binary, _hint = provider.probe(env)
-        if binary:
-            return provider, binary, f"{provider.label} (설정에서 고정){note}"
-        return None, None, (
-            f"{provider.label}({provider.command})를 찾지 못했습니다 — 설정이 이 제공자로 "
-            f"고정되어 있습니다. 설치하거나 provider 를 auto 로 되돌리십시오{note}")
-
-    found = []
-    for provider in PROVIDERS:
-        binary, hint = provider.probe(env)
-        if binary:
-            found.append((provider, binary, hint))
-    for provider, binary, hint in found:
-        if hint:
-            return provider, binary, f"{provider.label} (로그인 흔적 있음){note}"
-    if found:
-        provider, binary, _hint = found[0]
-        return provider, binary, (
-            f"{provider.label} (설치되어 있지만 로그인 흔적을 찾지 못했습니다 — 그래도 실행합니다){note}")
-    names = ", ".join(p.command for p in PROVIDERS)
-    return None, None, (
-        f"적재를 돌릴 에이전트 CLI 를 찾지 못했습니다 — {names} 중 하나가 로그인되어 "
-        f"있어야 링크를 문서로 만들 수 있습니다. 폴더를 열어 보고 공유하는 것은 그대로 됩니다{note}")
+    chosen = AGENT.select(preference, lambda provider: by_id(provider.id).probe(env),
+                          nothing_found=NOTHING_FOUND)
+    return (by_id(chosen.provider.id) if chosen.provider else None,
+            chosen.binary, chosen.reason)
 
 
 if __name__ == "__main__":

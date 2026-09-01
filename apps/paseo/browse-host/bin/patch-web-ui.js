@@ -9,12 +9,14 @@
 //   node bin/patch-web-ui.js <web-ui-dir> <companion-js-path>  # legacy --browse
 //
 // The always-on general group (CLI flag `--subagent-stream`, kept for callers that
-// predate it carrying a second edit) does two things: it makes a visible
-// provider-subagent panel subscribe to its parent agent's timeline, it moves the
-// fresh-install font-size defaults to 18 (ui) / 14 (code), and it points the sidebar
-// order store at the airlock ui-state backend so the order follows the owner across
-// devices instead of living in one browser. The optional browse group applies
-// THREE minimal, verified-unique edits so the self-hosted web runtime can open
+// predate it carrying more than one edit) applies FIVE edits every box wants: a
+// visible provider-subagent panel subscribes to its parent agent's timeline; the
+// fresh-install font-size defaults move to 18 (ui) / 14 (code); the sidebar order
+// store points at the airlock ui-state backend so the order follows the owner across
+// devices instead of living in one browser; a device that cannot hover is treated as
+// compact for the tooltip gate; and a coarse pointer gets the project row's trailing
+// actions without having to manufacture a hover first. The optional browse group
+// applies THREE minimal, verified-unique edits so the self-hosted web runtime can open
 // live browser panels:
 //   1+2. un-gate the "New browser" button callbacks (vo/Wo) on web;
 //   3.   mark the BrowserPane container with data-paseo-* so the companion mounts.
@@ -33,35 +35,87 @@ const childProcess = require("node:child_process");
 
 // SHA-256 of the ORIGINAL (unpatched) bundle we derived anchors against.
 const PINNED_SHA = "435dff4ee752a352ee81ff1eae02338163455b2f7e9b605f1ef30967007ce28c";
-const GENERAL_ONLY_SHA = "670b7048aaac21d29a04e4a7e44fcee049c65d81b98ded03fad71b79e8afadba";
-// SHA-256 of the fully patched browse group (all FOUR anchors). Until 2026-08-21
-// the fourth (coarse-pointer) edit shipped only from the reference box's own tree,
-// so this hash was the one labelled "legacy" here — the bytes did not change, the
-// owner of the fourth anchor did.
-const BROWSE_ONLY_SHA = "769e57f5fbdc31a9a8bbcf32ee8de6602c61f1705102f7e7ff5d9ebbd733117a";
-const COMBINED_SHA = "f89ae3ae99905c0c1e1c8e6090e0e44dcd10fd8043c80338aa1792704fcb0e67";
-// The transitional shape: a box installed by an earlier revision of THIS patcher
-// carries the first three browse edits and not the fourth. It is a state we must
-// recognise (not refuse) so such a box gains the fourth anchor on the next install
-// instead of failing the SHA pin. Retire these two once no box reports them.
-const THREE_ANCHOR_BROWSE_ONLY_SHA = "8a31b87021fc2e0b70b8b2009fd7bf19bd9da89f4ae0c86af2353ae5e1bcb6b9";
-const THREE_ANCHOR_COMBINED_SHA = "9f5c599500b78a69b8771ff3df7cb05dc58982354d4b22df24d9072182cf65bb";
-// The general group grew a second anchor (appearance-default-font-sizes) the same
-// way the browse group grew its fourth: a box installed by an earlier revision of
-// this patcher carries only `provider-subagent-visible-parent`, which now reads as
-// "partial". These three name the bytes of that shape so such a box is recognised
-// and completed on the next install instead of refused. Retire them once no box
-// reports them.
-const ONE_ANCHOR_GENERAL_ONLY_SHA = "6cc40f4d39f1bd9a65234c360b134ee6342afd2ac877586e3f61ee35d81a6eff";
-const ONE_ANCHOR_GENERAL_COMBINED_SHA = "c74929516273d623698ab4646a5ffa826af35edfc714e0997e1ef4581eb5dfe2";
-const ONE_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA = "fa7c2470a1040b886125c5a58ed53b87e0c222b3b6a73f3a81588d502f75540f";
-// ...and the same again for the group's SECOND revision (subagent-stream +
-// font-size defaults, no shared sidebar storage): every box installed between
-// #254 and #255 carries this shape. Both revisions read as "partial", which is
-// why each browse shape accepts a PAIR of hashes rather than one.
-const TWO_ANCHOR_GENERAL_ONLY_SHA = "c0e1972ed7be9fff2df9d4c1fb9c90ba4dc39fd412a522d98ae3776fb0741de6";
-const TWO_ANCHOR_GENERAL_COMBINED_SHA = "67646ec71d1e64db703b1b0d5277dc1898501b73ab67b048884c6b578e704549";
-const TWO_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA = "7702c7e018ebadbaef91d40440c3e898ac419bb417b2bf9494924c6be6ee0164";
+// Every bundle shape the fleet is known to carry: the pinned upstream bundle plus a
+// SUBSET of this file's edits, keyed by exactly which edits it holds.
+//
+// Two things put a box on an older subset. A group GROWS an anchor (this happened
+// three times to the general group and once to browse), and an edit MOVES between
+// groups — `project-actions-coarse-pointer` did, when it stopped riding on the
+// optional browse group and joined the always-on one. Either way the box must be
+// RECOGNISED and completed on the next install rather than refused, and a subset
+// nobody ever shipped must still be refused. That is why this is a table of shapes
+// and not "any subset goes": the SHA pin still names what upstream's bytes are.
+//
+// Each sha256 covers the whole bundle and was re-derived from the pristine bundle by
+// applying exactly the listed edits — order-independent, the eight sites are disjoint:
+//   npm pack @getpaseo/server@0.2.5 && tar xzf getpaseo-server-0.2.5.tgz
+//   # apply the subset to package/dist/server/web-ui/_expo/static/js/web/index-*.js
+const KNOWN_BUNDLE_SHAPES = [
+  { sha: PINNED_SHA, edits: [] },
+
+  // --- the always-on general group, one era per row (browse never applied) ---
+  { sha: "6cc40f4d39f1bd9a65234c360b134ee6342afd2ac877586e3f61ee35d81a6eff",
+    edits: ["provider-subagent-visible-parent"] },
+  { sha: "c0e1972ed7be9fff2df9d4c1fb9c90ba4dc39fd412a522d98ae3776fb0741de6",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes"] },
+  { sha: "670b7048aaac21d29a04e4a7e44fcee049c65d81b98ded03fad71b79e8afadba",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage"] },
+  // The shape every browse-less box carried before the coarse-pointer edit moved in.
+  { sha: "702134b78675e2323e094db041086c53f70020f19aa0b1bc32492d2cb2cebaea",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage", "tooltip-hover-none-is-compact"] },
+  // ...and the shape this revision installs there instead: the tablet "+" fix no
+  // longer costs a 150MB chromium download to receive.
+  { sha: "6a6acb81ced1dfd6982f19e0c5f0c7fa80fea7738ef4f4def28dbe6eb1ca064e",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
+            "project-actions-coarse-pointer"] },
+
+  // --- the same eras again on a box that also runs the browse group ---
+  // `project-actions-coarse-pointer` shipped FROM the browse group until this
+  // revision, so every pre-move browse box already holds it: that is why it appears
+  // beside a general group that is otherwise one, two, three or four edits old.
+  { sha: "8a31b87021fc2e0b70b8b2009fd7bf19bd9da89f4ae0c86af2353ae5e1bcb6b9",
+    edits: ["new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+  { sha: "769e57f5fbdc31a9a8bbcf32ee8de6602c61f1705102f7e7ff5d9ebbd733117a",
+    edits: ["new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
+            "project-actions-coarse-pointer"] },
+  { sha: "fa7c2470a1040b886125c5a58ed53b87e0c222b3b6a73f3a81588d502f75540f",
+    edits: ["provider-subagent-visible-parent",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+  { sha: "c74929516273d623698ab4646a5ffa826af35edfc714e0997e1ef4581eb5dfe2",
+    edits: ["provider-subagent-visible-parent",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
+            "project-actions-coarse-pointer"] },
+  { sha: "7702c7e018ebadbaef91d40440c3e898ac419bb417b2bf9494924c6be6ee0164",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+  { sha: "67646ec71d1e64db703b1b0d5277dc1898501b73ab67b048884c6b578e704549",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
+            "project-actions-coarse-pointer"] },
+  { sha: "9f5c599500b78a69b8771ff3df7cb05dc58982354d4b22df24d9072182cf65bb",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+  { sha: "f89ae3ae99905c0c1e1c8e6090e0e44dcd10fd8043c80338aa1792704fcb0e67",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
+            "project-actions-coarse-pointer"] },
+  { sha: "0d175c93d202803e17ea539ab4ce17fd109004fb062141ffa72d2e0e6bbbd82a",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+  // Fully patched: identical bytes before and after the move, because the move
+  // changed which group owns an edit and not which edits the bundle carries.
+  { sha: "32719926ca9df3ce3600cd11aef9c4d7ceb1d5ee9a36e9b8e64310eca301aabd",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
+            "project-actions-coarse-pointer"] },
+];
 const PINNED_VERSION = "@getpaseo/cli@0.2.5 (index-55db56b9)";
 
 // Each anchor MUST occur exactly once in the pinned bundle (verified).
@@ -83,18 +137,6 @@ const BROWSE_PATCHES = [
     name: "browserpane-marker",
     find: '{style:u.container,children:[S,_,I]})',
     repl: '{style:u.container,dataSet:{paseoBrowserId:w,paseoWorkspaceId:f.workspaceId,paseoServerId:f.serverId},children:[S,_,I]})',
-  },
-  {
-    // Project row trailing actions ("+" new worktree, kebab menu). Stock shows them
-    // on `isHovered || isNative || isMobileBreakpoint`, and the compact breakpoint is
-    // under 720px. A tablet is wide enough to miss the breakpoint and has no hover, so
-    // the first tap is spent manufacturing one (and it selects the project instead).
-    // Any coarse pointer gets them unconditionally; a phone already qualifies via the
-    // breakpoint, so this only changes touch tablets and desktop-width touch screens.
-    // Upstream has not fixed it: `(pointer: coarse)` occurs 0x in the 0.2.5 bundle.
-    name: "project-actions-coarse-pointer",
-    find: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l,',
-    repl: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches,',
   },
 ];
 const SUBAGENT_STREAM_PATCHES = [
@@ -128,6 +170,40 @@ const SUBAGENT_STREAM_PATCHES = [
     name: "sidebar-order-shared-storage",
     find: '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>o.default),partialize:',
     repl: '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e);return{getItem:async e=>{try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok)return await t.text()}catch(t){}return l.getItem(e)},setItem:async(e,t)=>{await l.setItem(e,t);try{await fetch(u(e),{method:"PUT",headers:{"content-type":"application/json"},body:t})}catch(n){}},removeItem:async e=>{await l.removeItem(e);try{await fetch(u(e),{method:"DELETE"})}catch(t){}}}})(o.default))),partialize:',
+  },
+  {
+    // Tooltips are gated on useIsCompactFormFactor() — the xs/sm breakpoint — and a
+    // phone in landscape is ~850px wide, so it does not qualify: hover tooltips stay
+    // enabled and iOS Safari's synthesized mouseover opens one on a tap. Nothing then
+    // closes it (the trigger's own press is what dismisses it, and the tap that opened
+    // it landed on a neighbour), so the tooltip parks over the composer and swallows
+    // the send control. Reported from a phone, 2026-08-28.
+    // A device that cannot hover is treated as compact for this gate only, which is
+    // the branch upstream already wrote for phones: `enabled` becomes enabledOnMobile
+    // (false at all but two call sites) and the two that opt in switch to open-on-tap.
+    // Desktop is untouched — the media query is false there. `(hover: none)` occurs 0x
+    // in the 0.2.5 bundle, so upstream has not fixed this.
+    name: "tooltip-hover-none-is-compact",
+    find: "const[E,S]=j(C),P=(0,y.useIsCompactFormFactor)(),z=P?w:v;",
+    repl: 'const[E,S]=j(C),P=(0,y.useIsCompactFormFactor)()||"undefined"!=typeof window&&!0===window.matchMedia?.("(hover: none)")?.matches,z=P?w:v;',
+  },
+  {
+    // Project row trailing actions ("+" new worktree, kebab menu). Stock shows them
+    // on `isHovered || isNative || isMobileBreakpoint`, and the compact breakpoint is
+    // under 720px. A tablet is wide enough to miss the breakpoint and has no hover, so
+    // the first tap is spent manufacturing one (and it selects the project instead).
+    // Any coarse pointer gets them unconditionally; a phone already qualifies via the
+    // breakpoint, so this only changes touch tablets and desktop-width touch screens.
+    // Upstream has not fixed it: `(pointer: coarse)` occurs 0x in the 0.2.5 bundle.
+    // Shipped from the OPTIONAL browse group until 2026-09-01, which made a touch fix
+    // conditional on an unrelated feature: a box with `browse = false` — the default —
+    // silently never received it, and reaching it cost a ~150MB chromium download it
+    // has no other use for. Measured on two boxes the same day: the browse box had the
+    // edit, the browse-less one did not, same paseo build. It belongs here, where every
+    // box gets it.
+    name: "project-actions-coarse-pointer",
+    find: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l,',
+    repl: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches,',
   },
 ];
 const GROUPS = {
@@ -186,27 +262,30 @@ function patchedName(src) {
 // real PINNED_SHA default below. Keeping the SHA check in this core is important: the
 // fixture test proves the anchor checks, while the CLI still refuses an unrecognised
 // pristine @getpaseo bundle.
+// Returns { state, applied } — `applied` names the group's edits this bundle already
+// carries, which is what identifies its shape below. Group state alone cannot: two
+// different subsets of the same group both read "partial".
 function patchGroupState(src, name, patches) {
   let oldCount = 0;
-  let newCount = 0;
+  const applied = [];
   for (const patch of patches) {
     const oldOccurrences = occurrences(src, patch.find);
     const newOccurrences = occurrences(src, patch.repl);
     if (oldOccurrences === 1 && newOccurrences === 0) oldCount++;
-    else if (oldOccurrences === 0 && newOccurrences === 1) newCount++;
+    else if (oldOccurrences === 0 && newOccurrences === 1) applied.push(patch.name);
     else {
       throw new Error(`bundle half/ambiguous ${name} patch: ${patch.name} old=${oldOccurrences} new=${newOccurrences} — refusing`);
     }
   }
-  if (oldCount === patches.length) return "unpatched";
-  if (newCount === patches.length) return "patched";
+  if (oldCount === patches.length) return { state: "unpatched", applied };
+  if (applied.length === patches.length) return { state: "patched", applied };
   // Every patch in the group answered unambiguously, but they disagree: some are
   // applied and some are not. That is what a box installed by an earlier revision
   // of this patcher looks like after the group grows an anchor, so it is a state
   // rather than a fault. It is NOT waved through — the caller still has to match a
   // named SHA for it, and "partial" never takes the already-patched early return,
   // so the missing replacements get applied.
-  return "partial";
+  return { state: "partial", applied };
 }
 
 function normalizePatchOptions(expectedShaOrOptions) {
@@ -226,25 +305,20 @@ function normalizePatchOptions(expectedShaOrOptions) {
   };
 }
 
-function productionShasForStates(states) {
-  const general = states["subagent-stream"];
-  const browse = states.browse;
-  if (general === "unpatched" && browse === "unpatched") return [PINNED_SHA];
-  if (general === "patched" && browse === "unpatched") return [GENERAL_ONLY_SHA];
-  if (general === "unpatched" && browse === "patched") return [BROWSE_ONLY_SHA];
-  if (general === "patched" && browse === "patched") return [COMBINED_SHA];
-  if (general === "unpatched" && browse === "partial") return [THREE_ANCHOR_BROWSE_ONLY_SHA];
-  if (general === "patched" && browse === "partial") return [THREE_ANCHOR_COMBINED_SHA];
-  if (general === "partial" && browse === "unpatched") {
-    return [ONE_ANCHOR_GENERAL_ONLY_SHA, TWO_ANCHOR_GENERAL_ONLY_SHA];
-  }
-  if (general === "partial" && browse === "patched") {
-    return [ONE_ANCHOR_GENERAL_COMBINED_SHA, TWO_ANCHOR_GENERAL_COMBINED_SHA];
-  }
-  if (general === "partial" && browse === "partial") {
-    return [ONE_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA, TWO_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA];
-  }
-  throw new Error(`unsupported patch state: general=${general} browse=${browse}`);
+// The bundle's shape is the SET of our edits it carries, across BOTH groups — not the
+// per-group state, which cannot tell two different partial subsets apart. Exactly one
+// known shape may hold that set; anything else is a bundle we did not ship and the
+// caller refuses it on the SHA below. Returns [] (not a throw) for an unknown set so
+// the refusal stays one message, naming the bytes as well as the shape.
+function productionShasForEdits(appliedEdits) {
+  // A SET, so both sides are deduplicated as well as sorted. Production visits each
+  // patch once and cannot repeat a name, but the argument is a plain list and the
+  // lookup's whole contract is set equality: a repeated name matching nothing would
+  // read as "unknown bundle" and refuse a box for a reason that is not about bytes.
+  const key = (edits) => [...new Set(edits)].sort().join("|");
+  const want = key(appliedEdits);
+  const shape = KNOWN_BUNDLE_SHAPES.find((candidate) => key(candidate.edits) === want);
+  return shape ? [shape.sha] : [];
 }
 
 // Match and replace one independent group without touching the filesystem.
@@ -252,9 +326,12 @@ function productionShasForStates(states) {
 function patchBundleContent(src, expectedShaOrOptions = PINNED_SHA) {
   const options = normalizePatchOptions(expectedShaOrOptions);
   const states = {};
+  const applied = [];
   for (const [name, patches] of Object.entries(GROUPS)) {
     if (name !== options.mode && !options.validateOtherGroups) continue;
-    states[name] = patchGroupState(src, name, patches);
+    const group = patchGroupState(src, name, patches);
+    states[name] = group.state;
+    applied.push(...group.applied);
   }
   // Historical pure-function tests pass the pristine fixture SHA again on the
   // idempotence call. Preserve that seam only when other-group validation was
@@ -264,11 +341,14 @@ function patchBundleContent(src, expectedShaOrOptions = PINNED_SHA) {
     return { source: src, alreadyPatched: true, mode: options.mode, states };
   }
   const sha = crypto.createHash("sha256").update(src).digest("hex");
-  const acceptedShas = options.acceptedShas ?? productionShasForStates(states);
+  const acceptedShas = options.acceptedShas ?? productionShasForEdits(applied);
   if (!acceptedShas.includes(sha)) {
-    throw new Error(`bundle SHA mismatch — got ${sha}, accepted ${acceptedShas.join(",")} (${PINNED_VERSION}).\n` +
+    const accepted = acceptedShas.length
+      ? acceptedShas.join(",")
+      : `none — no known bundle shape holds exactly [${[...applied].sort().join(", ")}]`;
+    throw new Error(`bundle SHA mismatch — got ${sha}, accepted ${accepted} (${PINNED_VERSION}).\n` +
         `  The @getpaseo/cli web-ui bundle is not a recognised state for ${options.mode}. ` +
-        `Re-derive the anchors and state hashes, then re-run. Refusing to modify it.`);
+        `Re-derive the anchors and shape hashes, then re-run. Refusing to modify it.`);
   }
   if (states[options.mode] === "patched") {
     return { source: src, alreadyPatched: true, mode: options.mode, states };
@@ -435,22 +515,12 @@ function main() {
 
 module.exports = {
   BROWSE_PATCHES,
-  BROWSE_ONLY_SHA,
-  COMBINED_SHA,
-  GENERAL_ONLY_SHA,
+  KNOWN_BUNDLE_SHAPES,
   PINNED_SHA,
-  THREE_ANCHOR_BROWSE_ONLY_SHA,
-  THREE_ANCHOR_COMBINED_SHA,
-  ONE_ANCHOR_GENERAL_ONLY_SHA,
-  ONE_ANCHOR_GENERAL_COMBINED_SHA,
-  ONE_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA,
-  TWO_ANCHOR_GENERAL_ONLY_SHA,
-  TWO_ANCHOR_GENERAL_COMBINED_SHA,
-  TWO_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA,
   SUBAGENT_STREAM_PATCHES,
   patchBundleContent,
   patchedName,
-  productionShasForStates,
+  productionShasForEdits,
 };
 
 if (require.main === module) main();

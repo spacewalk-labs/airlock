@@ -28,7 +28,7 @@ SUITES = (
     ("operator-trust-surface", "install/test-operator-surface.sh", 71),
     ("builtin-capability-migration", "install/test-builtin-migration.sh", 181),
     ("ledger-system-unit-boundary", "install/test-ledger-system-unit.sh", 7),
-    ("live-verdict-boundary", "install/test-live-verdict.sh", 39),
+    ("live-verdict-boundary", "install/test-live-verdict.sh", 44),
 )
 ALLOWED_SUITE_SKIPS = {
     "builtin-capability-migration": (

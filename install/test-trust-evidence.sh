@@ -177,7 +177,7 @@ make_fake_suite() {
 make_fake_suite "$REPO/install/test-operator-surface.sh" 71
 make_fake_suite "$REPO/install/test-builtin-migration.sh" 181
 make_fake_suite "$REPO/install/test-ledger-system-unit.sh" 7
-make_fake_suite "$REPO/install/test-live-verdict.sh" 39
+make_fake_suite "$REPO/install/test-live-verdict.sh" 44
 
 git -C "$REPO" init -q
 git -C "$REPO" config user.name test
@@ -209,7 +209,7 @@ import json,os,sys
 d=json.load(sys.stdin)
 assert d["candidate_sha"] == os.environ["SHA"]
 assert d["result"] == "passed"
-assert [row["passed"] for row in d["suites"]] == [71, 181, 7, 39]
+assert [row["passed"] for row in d["suites"]] == [71, 181, 7, 44]
 assert [row["skipped"] for row in d["suites"]] == [0, 0, 0, 0]
 ' <<<"$suite_a"; then
   ok "offline suite result is deterministic and candidate-bound"

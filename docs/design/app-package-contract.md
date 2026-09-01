@@ -961,7 +961,8 @@ tree for config reads — `airlock_config get apps.<id>.<key>` call sites and
 `bin/airlock-config:452-453`: id upper-cased, `-` flattened to `_`) — and
 compare the found key set
 with the manifest's allowed set, both directions: a key read but not declared
-**fails**; a key declared but never referenced **warns**. The mechanical
+is reported (and fails for a shipped strict-scan package); a key declared but
+never referenced warns, except for a port key as described below. The mechanical
 whole-table env export (`bin/airlock-config:452`, `install/lib.sh:41`) does not
 count as a read — otherwise nothing could ever warn. Dynamically constructed
 key names are a stated limitation of the scan; that is why the undeclared
@@ -1009,17 +1010,60 @@ packages only**, and only for **fully literal** references. External packages ke
 today's advisory behaviour: this must never block somebody else's install over a
 lint whose own history is eleven rounds of failing to become a shell parser. A
 dynamically built key stays a warning under strict for the same reason, and a
-declared-but-unread key stays a warning because it is untidy, not broken. CI sets
-the variable; nothing else does.
+declared-but-unread non-port key stays a warning because it is untidy, not broken.
+CI sets the variable; nothing else does.
+
+**Port-ownership amendment (2026-08-30).** A private package declared
+`port = 18832`, but its unit and ingress independently hard-coded 18832. The newer
+`learning.backend_port` legitimately owned the same number. Validation passed for
+two separate reasons: the global sweep recognised only names ending in `_port`,
+and F12 treated the dead bare `port` declaration as advisory. The losing service
+then restarted indefinitely.
+
+Port declarations are therefore the narrow fail-closed exception to F12's advisory
+rule. Both the exact key `port` and names ending in `_port` enter the same global
+uniqueness pool, including leaves under `[config.tables]`. The read gate also covers
+keys that have port semantics by explicit
+manifest declaration: `artifacts.serve_ports`, `serve.https` targets, both sides of
+`plaintext_redirect`, and a `config.port_spans` base and count. A package declaring
+one of those ownership inputs must contain a canonical shell variable assignment
+whose RHS expands `AIRLOCK_<ID>_<KEY>`, an active expansion passed to a
+port-shaped command option (`--port` or `--*-port`, including a shell-continued
+logical line), a Python AST environment `Load`, or a canonical shell assignment
+whose command substitution runs
+`airlock_config get apps.<id>.<key>`; otherwise validation fails for shipped
+and external packages, independent of strict mode. A dynamic read is not proof here:
+if the platform cannot prove which declared value governs the listener set, it cannot
+honestly claim global port ownership. Non-port dead declarations retain the
+warning-only behavior above.
+
+For this fatal subset, documentation, dotfiles, and inert data files are not runtime
+read evidence; the literal consumption must appear in executable/package runtime
+source. A token in a Python docstring/inert/store expression, an arbitrary shell
+argument, quoted heredoc, escaped expansion, or single-quoted string is not evidence.
+Port-shaped command options are admitted because packages commonly pass a platform
+value straight to their renderer or installer without an intermediate assignment.
+This is a syntactic admission proof, not a general program-semantics proof.
+A shell no-op (`: "${AIRLOCK_…_PORT}"` or `true --port "${AIRLOCK_…_PORT}"`)
+and an `airlock_config get` whose output
+is explicitly discarded are also not consumption evidence: both can be added without
+changing any rendered/runtime value, which would recreate the incident's escape hatch.
+Package CI must additionally bind its concrete unit/backend/ingress artifacts to the
+same declaration and exercise mutations that change the runtime port after assignment.
+Keys used as the listen side of `[serve.https]` or the public side of
+`[plaintext_redirect]` are different: the platform itself renders those listeners.
+They remain in the global uniqueness pool, but do not require a meaningless package
+read. Their target-side keys are package-owned and retain the fatal consumption gate.
 
 Be precise about what is and is not enforced as a result. An undeclared read
 usually surfaces on its own — `airlock-config get apps.<id>.<undeclared>`
 exits non-zero with `key not found` — but a package that suppresses the
 failure (`… 2>/dev/null || true`, which this repo's own `feedback` and
 `publish` installers use) sees an empty value, and the platform cannot
-distinguish that from a legitimately empty one. So in stage 3 F12 is an
-**advisory lint for the package author**, not enforcement of the declaration
-contract. The operator's side stays enforced: an unknown key in `[apps.X]` is
+distinguish that from a legitimately empty one. So in stage 3 general F12
+findings remain an **advisory lint for the package author**; the port-ownership
+exception above enforces the part of the declaration contract required for
+listener uniqueness. The operator's side stays enforced: an unknown key in `[apps.X]` is
 fatal against the manifest schema, which is where config typos live. The
 reader still expands what the shell expands for free (quotes, backslash
 escapes, splices) so a warning names the key that would really be read;
@@ -1030,8 +1074,9 @@ reintroduced against a known corpus rather than against arbitrary shell.
 (Amended in child 4 — the revisit's conclusion: the fatal direction is NOT
 reintroduced. The in-tree corpus is now manifest-declared, but the lint
 still cannot parse arbitrary shell, and the child-3 counter-example rounds
-apply to in-tree scripts equally. F12 stays advisory; what IS enforced is
-the manifest schema itself — an unknown key in `[apps.X]` is fatal.)
+apply to in-tree scripts equally. General F12 findings stay advisory; the later
+port-ownership amendment is the narrow exception. The manifest schema itself also
+remains enforced — an unknown key in `[apps.X]` is fatal.)
 
 **F13 — Built-in equivalence gate (stage 4).** Defined so it is actually
 measurable — `install/test-integration.sh` runs dry-run only (`:33,65`) and

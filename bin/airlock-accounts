@@ -21,7 +21,7 @@ One credential lineage = one refresher. Do not copy the same account's pool file
 another machine (log in on each). Secret values are never printed — only identity,
 expiry and health.
 """
-import base64, hashlib, json, os, stat, sys, time, shutil, subprocess, tempfile
+import base64, hashlib, json, os, re, stat, sys, time, shutil, subprocess, tempfile
 import urllib.request, urllib.error, urllib.parse
 
 HOME = os.path.expanduser("~")
@@ -31,6 +31,20 @@ ACTIVE = os.path.join(POOL, ".active")
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
 CODEX_AUTH = os.path.join(CODEX_HOME, "auth.json")
 CODEX_AUTH_BAK = CODEX_AUTH + ".pre-relogin"
+# Where `codex login --device-auth` output is captured while we scrape the pairing
+# URL and code out of it. It sits beside auth.json because it belongs to the same
+# login attempt and dies with it; nothing here is a credential (the device code is
+# useless without the browser approval it asks for).
+CODEX_LOGIN_OUT = os.path.join(CODEX_HOME, ".relogin-capture.out")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_CODEX_DEVICE_URL_RE = re.compile(r"https://\S*openai\.com/codex/device\S*")
+_CODEX_DEVICE_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b")
+CODEX_DEVICE_URL_FALLBACK = "https://auth.openai.com/codex/device"
+# 20 x 0.5s. Measured against the live CLI: the code appears in well under a
+# second, and the ceiling only exists so a hung `codex` cannot hold the caller.
+CODEX_CAPTURE_TRIES = 20
+CODEX_CAPTURE_INTERVAL = 0.5
+CODEX_LOGOUT_TIMEOUT = 20
 
 # Shared binary discovery lives beside this platform CLI. Keeping the runtime
 # module with its consumers makes the checkout directly executable and avoids
@@ -52,6 +66,7 @@ SCOPES = ("org:create_api_key user:profile user:inference user:sessions:claude_c
           "user:mcp_servers user:file_upload")
 PENDING = os.path.join(POOL, ".login-pending.json")
 REFRESH_IF_WITHIN_SEC = 30 * 60   # pre-refresh on switch if the token expires this soon
+LOGIN_CODE_MAX_BYTES = 400
 
 
 # ---------- helpers ----------
@@ -251,6 +266,22 @@ def _store_account(creds, fallback_name=None, set_active=False):
 
 # ---------- login (link + code: the headless path devterm uses) ----------
 
+def _read_login_code_stdin():
+    """Read one approval code from a pipe, never argv/env or an echoing terminal."""
+    if sys.stdin.isatty():
+        raise ValueError("login-code requires protected stdin (the DevTerm account popup handles this)")
+    raw = sys.stdin.buffer.read(LOGIN_CODE_MAX_BYTES + 1)
+    if not raw or len(raw) > LOGIN_CODE_MAX_BYTES:
+        raise ValueError("login-code stdin is empty or too large")
+    try:
+        code = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("login-code stdin is not valid UTF-8") from exc
+    if any(ch.isspace() for ch in code):
+        raise ValueError("login-code stdin contains whitespace")
+    return code
+
+
 def cmd_login_url():
     """Issue just the login link (PKCE). The verifier stays on this box; the user only
     approves in a browser and hands the code back to `login-code`. No TUI, no naming."""
@@ -266,14 +297,34 @@ def cmd_login_url():
     print(AUTHORIZE_ENDPOINT + "?" + q)
 
 
+def _claim_pending_login():
+    """Atomically consume one PKCE flow before its one-time code can be exchanged.
+
+    The uniquely named claim keeps a concurrently-created *new* login flow at PENDING
+    intact.  Unlink after loading: once an exchange has started, an ambiguous timeout
+    must require a new link rather than permit replay of the same code.
+    """
+    claim = f"{PENDING}.claim-{os.getpid()}-{_b64u(os.urandom(6))}"
+    try:
+        os.replace(PENDING, claim)
+    except OSError:
+        die("no login is pending — run 'airlock-accounts login-url' first")
+    try:
+        return _load(claim)
+    except Exception:
+        die("no login is pending — run 'airlock-accounts login-url' first")
+    finally:
+        try:
+            os.remove(claim)
+        except OSError:
+            pass
+
+
 def cmd_login_code(pasted):
     """Exchange the browser's approval code (code#state) for tokens -> stored in the
     pool under the logged-in id."""
     _ensure_pool()
-    try:
-        pend = _load(PENDING)
-    except Exception:
-        die("no login is pending — run 'airlock-accounts login-url' first")
+    pend = _claim_pending_login()
     if time.time() - pend.get("ts", 0) > 900:
         die("that login link is stale (over 15 min) — get a fresh one with 'login-url'")
     code = pasted.strip()
@@ -291,10 +342,11 @@ def cmd_login_code(pasted):
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.loads(r.read())
     except urllib.error.HTTPError as e:
-        die(f"token exchange failed (HTTP {e.code}): {e.read()[:200].decode('utf-8','replace')}\n"
+        die(f"token exchange failed (HTTP {e.code})\n"
             "     the code is single-use and short-lived — get a new link with 'login-url'.")
-    except Exception as e:
-        die(f"token exchange failed: {e}")
+    except Exception:
+        die("token exchange failed\n"
+            "     the code is single-use and short-lived — get a new link with 'login-url'.")
     org = (resp.get("organization") or {}).get("organization_type", "")
     creds = {"claudeAiOauth": {
         "accessToken": resp["access_token"],
@@ -308,10 +360,6 @@ def cmd_login_code(pasted):
             (time.time() + resp["refresh_token_expires_in"]) * 1000)
     first = _get_active() is None
     n = _store_account(creds, set_active=first)
-    try:
-        os.remove(PENDING)
-    except OSError:
-        pass
     if first:
         print(f"  registered '{n}' (first account -> active)")
     elif _refresh_live_if_same(n, creds):
@@ -674,29 +722,167 @@ def cmd_swap(name):
     print("  (not re-launched. The next `claude` run uses this account.)")
 
 
+# ---------- Codex login driver (device-auth) ----------
+#
+# Promoted out of apps/devterm/backend/devterm-gate.py (ACCT_OWN, 2026-09-01). The
+# browser surface that offers "re-login" is an app's; deciding what a Codex login DOES
+# to this box's credentials is the platform's, and it was the last piece of credential
+# writing still living in an app. The state machine below is the one that was there —
+# the move is a re-homing, not a rewrite.
+#
+# Nothing here ever returns credential material. What crosses back is the pairing URL
+# and the device code the user must type into a browser; both are useless without the
+# approval they ask for, and both are already on the user's screen.
+
+
+def _codex_bin():
+    """Absolute path to the codex executable, or None when this box has none.
+
+    PATH is not usable here: this runs from a systemd --user unit's environment, which
+    carries none of the directories a node CLI installs into. The candidate list and the
+    trust rules are the shared ones (bin_discovery)."""
+    return bin_discovery.find_bin("codex")[0]
+
+
+def _codex_missing_error():
+    """Names what was searched and what to do about it, rather than "codex not available"."""
+    return bin_discovery.not_found_message("codex", bin_discovery.find_bin("codex")[1])
+
+
+def _codex_kill_pending_login():
+    """Best-effort: stop a device-auth flow left running by an earlier attempt.
+
+    Failure is not an error. A missing pkill, or no process to kill, both mean the same
+    thing for what follows — there is no pending login of ours in the way."""
+    try:
+        subprocess.run(["pkill", "-f", "codex login"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _codex_login_start():
+    """Start `codex login --device-auth` and capture the pairing URL + code.
+
+    device-auth needs no callback port: the user opens the link in any browser and types
+    the code. codex wipes auth.json the moment it starts, so the previous login is backed
+    up FIRST and a failure to back it up aborts before codex gets the chance — turning a
+    re-login attempt into silent credential loss is the one outcome that has no recovery.
+    An abandoned attempt is undone by `codex-auth login-cancel`.
+    """
+    binary = _codex_bin()
+    if binary is None:
+        return {"ok": False, "error": _codex_missing_error()}
+    # Fail closed before codex can erase auth.json. An absent old login is a successful
+    # backedUp=false; a copy failure is different and must stop here.
+    try:
+        backup = _codex_auth_backup()
+    except OSError as exc:
+        return {"ok": False, "error": f"could not preserve the current Codex login: {exc.strerror or exc}"}
+    _codex_kill_pending_login()
+    try:
+        outf = open(CODEX_LOGIN_OUT, "w")
+    except OSError as exc:
+        return {"ok": False, "error": f"could not open the Codex login capture file: {exc.strerror or exc}"}
+    try:
+        with outf:
+            subprocess.Popen(
+                [binary, "login", "--device-auth"],
+                stdout=outf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True, env={**os.environ, "BROWSER": "true"})
+    except (FileNotFoundError, OSError) as exc:
+        return {"ok": False, "error": f"codex launch failed: {exc}"}
+    url, code = None, None
+    for _ in range(CODEX_CAPTURE_TRIES):
+        time.sleep(CODEX_CAPTURE_INTERVAL)
+        try:
+            with open(CODEX_LOGIN_OUT, encoding="utf-8", errors="replace") as f:
+                txt = _ANSI_RE.sub("", f.read())
+        except OSError:
+            txt = ""
+        mu = _CODEX_DEVICE_URL_RE.search(txt)
+        mc = _CODEX_DEVICE_CODE_RE.search(txt)
+        if mu:
+            url = mu.group(0)
+        if mc:
+            code = mc.group(1)
+        if code:      # the code is the essential part — the URL has a fixed fallback
+            break
+    if not code:
+        return {"ok": False,
+                "error": "failed to capture codex device-auth code (codex missing/error)"}
+    return {"ok": True, "url": url or CODEX_DEVICE_URL_FALLBACK, "code": code,
+            "backedUp": backup}
+
+
+def _codex_login_cancel():
+    """Abandon a pending device-auth and put the previous login back.
+
+    Restoration belongs to the saved file, not to the current codex executable: the
+    binary can disappear after the login starts, and cancelling must still recover.
+    """
+    _codex_kill_pending_login()
+    try:
+        restored = _codex_auth_restore()
+    except OSError as exc:
+        return {"ok": False,
+                "error": f"could not restore the previous Codex login: {exc.strerror or exc}"}
+    return {"ok": True, "restored": restored}
+
+
+def _codex_logout():
+    """`codex logout` removes auth.json. Codex is single-account, so this is
+    "remove account"; a login-start reconnects."""
+    binary = _codex_bin()
+    if binary is None:
+        return {"ok": False, "error": _codex_missing_error()}
+    try:
+        proc = subprocess.run([binary, "logout"], capture_output=True,
+                              timeout=CODEX_LOGOUT_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "codex logout timed out"}
+    except (FileNotFoundError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+    if proc.returncode == 0:
+        return {"ok": True}
+    # Same 200-char truncation the gate applied before the move. codex's own logout
+    # diagnostics are not credential material, and dropping them would leave a failed
+    # logout with nothing on screen but "false".
+    detail = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:200]
+    return {"ok": False, "error": detail}
+
+
 # ---------- Codex re-login preservation ----------
 
+def _codex_auth_backup():
+    """Copy the current Codex login aside. Returns whether there was one to copy."""
+    if not os.path.isfile(CODEX_AUTH):
+        return False
+    shutil.copy2(CODEX_AUTH, CODEX_AUTH_BAK)
+    return True
+
+
+def _codex_auth_restore():
+    """Move a backed-up Codex login back into place. Returns whether one existed."""
+    if not os.path.isfile(CODEX_AUTH_BAK):
+        return False
+    shutil.move(CODEX_AUTH_BAK, CODEX_AUTH)
+    return True
+
+
 def cmd_codex_auth(action, as_json=False):
-    """Preserve Codex's single-account login across an abandoned device-auth flow.
+    """Codex single-account credential lifecycle — the platform side of a re-login.
 
     `codex login --device-auth` removes auth.json before the user has approved the
-    replacement. The browser surface that starts that flow therefore needs two small
-    lifecycle operations, but it must not learn the credential path or receive any
-    credential material. Keep the historical copy2/move semantics here: P2b is an
-    ownership move, not a rewrite of the login state machine.
+    replacement. The browser surface that starts that flow needs the lifecycle
+    operations below, but it must not learn the credential path or receive any
+    credential material. Keep the historical copy2/move semantics here: the ownership
+    moves, the login state machine does not.
     """
     if action == "backup":
-        backed_up = False
-        if os.path.isfile(CODEX_AUTH):
-            shutil.copy2(CODEX_AUTH, CODEX_AUTH_BAK)
-            backed_up = True
-        result = {"ok": True, "backedUp": backed_up}
+        result = {"ok": True, "backedUp": _codex_auth_backup()}
     elif action == "restore":
-        restored = False
-        if os.path.isfile(CODEX_AUTH_BAK):
-            shutil.move(CODEX_AUTH_BAK, CODEX_AUTH)
-            restored = True
-        result = {"ok": True, "restored": restored}
+        result = {"ok": True, "restored": _codex_auth_restore()}
     elif action == "generation":
         # Consumers only need a change detector so an in-flight usage result from the
         # previous login cannot be committed after auth.json is replaced. Keep both
@@ -711,16 +897,38 @@ def cmd_codex_auth(action, as_json=False):
             return 1
         result = {"ok": True, "present": generation is not None,
                   "generation": generation}
+    elif action == "login-start":
+        result = _codex_login_start()
+    elif action == "login-cancel":
+        result = _codex_login_cancel()
+    elif action == "logout":
+        result = _codex_logout()
     else:
-        print("codex-auth action must be backup, restore or generation", file=sys.stderr)
+        print("codex-auth action must be backup, restore, generation, login-start, "
+              "login-cancel or logout", file=sys.stderr)
         return 2
     if as_json:
+        # JSON is the machine ABI: `ok` carries whether the OPERATION succeeded, and the
+        # exit status carries whether the TOOL ran. Collapsing the two would make a
+        # readable "no codex on this box" indistinguishable from a crashed CLI, and the
+        # caller would have to guess which of the two it was holding.
         json.dump(result, sys.stdout)
         print()
+        return 0
+    if not result.get("ok"):
+        # The three login verbs can fail for reasons a person can act on (no codex on
+        # this box, a capture that never produced a code). Printing "no saved login"
+        # for those was the shape this branch had before they existed.
+        print(f"  ERROR: {result.get('error') or 'failed'}", file=sys.stderr)
+    elif action == "login-start":
+        # The code is what the user types; the URL is where. Neither is a secret.
+        print(f"  open {result['url']} and enter {result['code']}")
+    elif action == "logout":
+        print("logged out")
     else:
         print("backed up" if result.get("backedUp") else
               "restored" if result.get("restored") else "no saved login")
-    return 0
+    return 0 if result.get("ok") else 1
 
 
 USAGE = """airlock-accounts — switch Claude accounts without a browser
@@ -728,7 +936,7 @@ Accounts are not named by hand: the name is the id you log in as, "email (person
 
 Register an account (browser needed once per account):
   airlock-accounts login-url                issue the login link only (devterm uses this)
-  airlock-accounts login-code <code#state>  finish with the code from the browser
+  airlock-accounts login-code               finish with code on protected stdin (devterm uses this)
   airlock-accounts login                    (alternative) log in in a temp terminal session
   airlock-accounts add                      store the current live account in the pool (+active)
   airlock-accounts import <cfgdir>          import an account logged in via CLAUDE_CONFIG_DIR
@@ -744,7 +952,10 @@ Switch / inspect:
 Platform lifecycle (called through the D5 ABI; never emits credential values):
   airlock-accounts codex-auth backup [--json]
   airlock-accounts codex-auth restore [--json]
-  airlock-accounts codex-auth generation [--json]"""
+  airlock-accounts codex-auth generation [--json]
+  airlock-accounts codex-auth login-start [--json]    device-auth: capture URL + code
+  airlock-accounts codex-auth login-cancel [--json]   abandon it, put the old login back
+  airlock-accounts codex-auth logout [--json]         remove this box's Codex login"""
 
 
 def main(argv):
@@ -762,7 +973,21 @@ def main(argv):
             print(USAGE, file=sys.stderr); return 2
         cmd_remove(target, "--yes" in rest)
     elif cmd == "login-url":                  cmd_login_url()
-    elif cmd == "login-code" and rest:        cmd_login_code(rest[0])
+    elif cmd == "login-code-transport":
+        if rest:
+            print(USAGE, file=sys.stderr); return 2
+        print("stdin-v1")
+    elif cmd == "login-code":
+        if rest:
+            print("airlock-accounts: login-code accepts protected stdin only; refusing argv input",
+                  file=sys.stderr)
+            return 2
+        try:
+            pasted = _read_login_code_stdin()
+        except ValueError as exc:
+            print(f"airlock-accounts: {exc}", file=sys.stderr)
+            return 2
+        cmd_login_code(pasted)
     elif cmd == "list":                       cmd_list("--json" in rest, "--usage" in rest)
     elif cmd == "to" and rest:
         extra = rest[1:]

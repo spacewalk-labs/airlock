@@ -1,0 +1,827 @@
+#!/usr/bin/env python3
+"""airlock-status — one question, two answers: is this box OK?
+
+Until now, answering that meant typing a handful of separate commands
+(skills/airlock-doctor/SKILL.md walks nine read-only probes down the request
+path) and reading nine human paragraphs. Nothing produced a form another
+program could consume, so every caller that wanted a verdict had to re-derive
+one from prose.
+
+    python3 bin/airlock-status          # the human summary
+    python3 bin/airlock-status --json   # the same run, as a document (v1)
+
+Not marked executable, and invoked through python3 like bin/airlock-config
+beside it: policy/airlock-cutline reserves `000000 -> 100755` under bin/ for
+paths the catalog names one by one, and adding a new one there is a governance
+change, not a status-surface change.
+
+Both describe ONE run of the SAME probes. --json does not check less, and it
+does not check more.
+
+Exit status — the same three-valued contract bin/airlock-smoke uses, for the
+same reason (bin/airlock-smoke:12-18, install/lib.sh:556-560):
+
+    0  every check ran and none failed
+    3  nothing failed, but at least one check COULD NOT BE RUN
+    1  at least one check failed
+    2  airlock-status itself could not produce a report (bad usage, or a bug)
+
+2 is separate on purpose: "this tool broke" is not "your box is broken", and
+letting an unhandled exception fall out as 1 would make the two the same.
+
+3 is deliberately not 0. "I did not look" and "I looked and it was fine" are
+different results, and a surface that folds the first into the second is how a
+green report in front of a dead box happens.
+
+WHY THE ROSTER IS FIXED
+-----------------------
+Every run emits every check id in CHECKS, always, in that order. A probe that
+cannot run emits `unchecked` with the reason; it never disappears from the
+report. This is structural, not stylistic. bin/airlock-smoke's false success
+(measured 2026-08-29, docs/worklog/2026-08-29-live-check-emulation-and-live-drift.md)
+is the shape it forecloses: `airlock_config validate` failed, `airlock_config
+apps` then yielded nothing, zero apps were checked, and the run reported "all 0
+app smoke(s) passed" with rc=0. An empty result set had become a pass. Here an
+empty inventory cannot be silent — apps.enabled fails on it, and the checks that
+depended on it say `unchecked`, so the run cannot exit 0.
+
+This tool is READ-ONLY. It mutates nothing, takes no ledger lock, and needs no
+privilege beyond what the probes themselves need.
+"""
+
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_BIN = ROOT / "bin" / "airlock-config"
+LIB_SH = ROOT / "install" / "lib.sh"
+
+OK, WARN, FAIL, UNCHECKED = "ok", "warn", "fail", "unchecked"
+
+# The roster. (id, section, title) — the machine contract, pinned by
+# install/test-status-surface.sh. Sections follow the request path the doctor
+# skill walks (ingress -> gate -> units -> apps), preceded by what the box was
+# told to be (config) and what was actually put on it (install).
+CHECKS = (
+    ("config.validate",  "config",  "airlock.toml parses and passes validate"),
+    ("config.owner",     "config",  "the gate has an owner identity to compare against"),
+    ("install.ledger",   "install", "the install ledger is readable"),
+    ("install.drift",    "install", "every enabled app is committed in the ledger"),
+    ("install.revision", "install", "the checkout revision this box is running"),
+    ("ingress.backend",  "ingress", "tailscaled is up"),
+    ("ingress.serve",    "ingress", "every declared serve mapping is live"),
+    ("ingress.entrance", "ingress", "the entrance URL answers on this box"),
+    ("gate.owner",       "gate",    "the owner identity is let through the hub gate"),
+    ("gate.stranger",    "gate",    "a stranger identity is denied"),
+    ("gate.anonymous",   "gate",    "a request with no identity header is denied"),
+    ("units.active",     "units",   "every unit the ledger committed is healthy"),
+    ("apps.enabled",     "apps",    "the enabled app inventory is readable and non-empty"),
+    ("apps.backends",    "apps",    "the loopback ports Airlock binds are listening"),
+)
+CHECK_IDS = tuple(c[0] for c in CHECKS)
+TITLES = {c[0]: c[2] for c in CHECKS}
+SECTIONS = {c[0]: c[1] for c in CHECKS}
+
+# There is NO key-name rule for "this port is a loopback listener". `*_port` is
+# the config layer's grammar for "a port number", not for "a socket Airlock
+# binds": apps/dev-monitor/airlock-app.toml:42 declares `smtp_port = 587`, a
+# REMOTE submission port, and apps/notes/airlock-app.toml:15 declares
+# `editor_port_base`, the anchor of a span rather than one listener. Probing
+# either on 127.0.0.1 would fail a healthy box.
+#
+# So apps.backends probes only the ports the PLATFORM binds on loopback, each of
+# which some install path names as a target: the hub's own nginx port
+# (install/airlock-install.sh:484), every serve mapping's `target`
+# (install/lib.sh:398), and every plaintext row's redirect target
+# (install/lib.sh:709). Ports an app declares for its own use are reported as
+# not probed rather than guessed at — the number is in the check's detail.
+
+# What a live hub answers at / behind its gate. Same whitelist install/lib.sh:626
+# uses, and for the same reason: `tailscale serve` and nginx both answer with
+# their OWN status (404/500) when the mapping or the backend is gone.
+GATE_ALLOW_CODES = ("200", "301", "302")
+GATE_DENY_CODE = "403"
+
+
+class Report:
+    """Collects one verdict per roster id. Refuses to be silently incomplete."""
+
+    def __init__(self):
+        self._results = {}
+
+    def record(self, check_id, status, detail, next_action=""):
+        """Write a verdict. A later writer WINS.
+
+        An earlier draft kept the first writer instead, so a probe that recorded
+        `ok` and then discovered a failure on the same id had the failure
+        silently dropped and the run exited 3 with an `ok` line in front of a
+        real fault. Overwriting is the safe direction: the last writer is the
+        one that knows the most.
+        """
+        if check_id not in TITLES:
+            raise KeyError(f"airlock-status: {check_id!r} is not in CHECKS")
+        if status not in (OK, WARN, FAIL, UNCHECKED):
+            raise ValueError(f"airlock-status: bad status {status!r}")
+        self._results[check_id] = {
+            "id": check_id,
+            "section": SECTIONS[check_id],
+            "status": status,
+            "title": TITLES[check_id],
+            "detail": detail,
+            "next": next_action,
+        }
+
+    def fill_unchecked(self, reason, next_action=""):
+        """Mark every check that has not reported yet. Never overwrites."""
+        for check_id in CHECK_IDS:
+            if check_id not in self._results:
+                self.record(check_id, UNCHECKED, reason, next_action)
+
+    def checks(self):
+        missing = [c for c in CHECK_IDS if c not in self._results]
+        if missing:
+            # Never reachable by design; if it ever is, say so instead of
+            # emitting a short report that looks complete.
+            raise AssertionError(
+                "airlock-status: checks did not report: " + ", ".join(missing))
+        return [self._results[c] for c in CHECK_IDS]
+
+
+# rc values this module invents for "the command did not produce a verdict".
+# They are the shell's own conventions, so a reader already knows them.
+RC_TIMEOUT = 124
+RC_NOT_RUNNABLE = 127
+RC_UNRUNNABLE = (RC_TIMEOUT, RC_NOT_RUNNABLE)
+
+
+def run(argv, timeout=30, stdin_text=None, env=None):
+    """Run a command. Returns (rc, stdout, stderr).
+
+    Every way of not running is a return value, not an exception: a missing
+    binary, a timeout, a permission error, a broken pipe. A traceback escaping
+    from here would exit 1, which is this tool's "your box has a fault" — the
+    two must never be confusable. Output is decoded with errors="replace" for
+    the same reason: a backend that emits a stray byte is not a status verdict.
+    """
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=timeout,
+                              input=stdin_text.encode() if stdin_text else None,
+                              env=env)
+    except FileNotFoundError:
+        return RC_NOT_RUNNABLE, "", f"{argv[0]}: not installed"
+    except subprocess.TimeoutExpired:
+        return RC_TIMEOUT, "", f"{argv[0]}: timed out after {timeout}s"
+    except OSError as exc:
+        return RC_NOT_RUNNABLE, "", f"{argv[0]}: could not be run ({exc})"
+    return (proc.returncode,
+            proc.stdout.decode("utf-8", "replace"),
+            proc.stderr.decode("utf-8", "replace"))
+
+
+def config(*args, timeout=60):
+    return run([sys.executable, str(CONFIG_BIN), *args], timeout=timeout)
+
+
+def first_line(text):
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
+def last_lines(text, count=3):
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return " / ".join(lines[-count:])
+
+
+def parse_env_block(text):
+    """`airlock-config env <app>` emits KEY=VALUE / KEY='value' lines."""
+    out = {}
+    for line in (text or "").splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or not key.strip():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1]
+        out[key.strip()] = value
+    return out
+
+
+def port_is_listening(port, timeout=2.0):
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def http_code(url, header=None, timeout=10):
+    """The status code for one request, or "" if curl could not produce one."""
+    argv = ["curl", "-s", "-o", os.devnull, "-w", "%{http_code}",
+            "--max-time", str(timeout)]
+    if header:
+        argv += ["-H", header]
+    argv.append(url)
+    rc, out, _ = run(argv, timeout=timeout + 5)
+    code = (out or "").strip()
+    if rc != 0 or not code or code == "000":
+        return ""
+    return code
+
+
+# ---------------------------------------------------------------- checks ----
+
+def check_config(rep):
+    rc, out, err = config("validate")
+    if rc in RC_UNRUNNABLE:
+        rep.record("config.validate", UNCHECKED,
+                   f"airlock-config could not be run: {last_lines(err)}",
+                   "Check that python3 and bin/airlock-config are both present.")
+        return None
+    if rc != 0:
+        rep.record("config.validate", FAIL,
+                   f"airlock-config validate exited {rc}: {last_lines(err or out)}",
+                   "Fix airlock.toml, then re-run `airlock-config validate`.")
+        return None
+    valid_note = first_line(out) or "config valid"
+
+    # Only record `ok` once the config has actually RESOLVED. Writing it before
+    # this point and correcting it afterwards is how a real failure gets left
+    # behind an `ok` line — record() now overwrites, but not recording early at
+    # all is the simpler guarantee.
+    rc, out, err = config("json")
+    if rc != 0:
+        rep.record("config.validate", FAIL,
+                   f"validate passed but `airlock-config json` exited {rc}: {last_lines(err)}",
+                   "Report this: validate and json disagree about the same file.")
+        return None
+    try:
+        resolved = json.loads(out)
+    except json.JSONDecodeError as exc:
+        rep.record("config.validate", FAIL,
+                   f"`airlock-config json` did not emit JSON: {exc}",
+                   "Report this: validate passed on a config that will not resolve.")
+        return None
+    rep.record("config.validate", OK, valid_note)
+
+    rc, env_out, err = config("env", "hub")
+    env = parse_env_block(env_out) if rc == 0 else {}
+    owner = env.get("AIRLOCK_OWNER") or (resolved.get("auth") or {}).get("owner") or ""
+    if owner:
+        rep.record("config.owner", OK, f"owner = {owner}")
+    else:
+        rep.record("config.owner", FAIL,
+                   "no [auth] owner is configured — the gate has nothing to compare against",
+                   "Set `owner` under [auth] in airlock.toml and re-run the installer.")
+    return {"resolved": resolved, "env": env, "owner": owner}
+
+
+def state_dir():
+    override = os.environ.get("AIRLOCK_STATE_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "state" / "airlock"
+
+
+def check_install(rep, cfg, enabled):
+    ledger_path = state_dir() / "app-ledger.json"
+    committed = None
+    if not ledger_path.exists():
+        rep.record("install.ledger", FAIL,
+                   f"no ledger at {ledger_path} — nothing records what is installed here",
+                   "Run install/airlock-install.sh; a box with apps and no ledger is unmanaged.")
+    else:
+        try:
+            store = json.loads(ledger_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            rep.record("install.ledger", FAIL,
+                       f"{ledger_path} is unreadable: {exc}",
+                       "The ledger is the record of what to remove; restore it before installing again.")
+        else:
+            entries = store.get("entries") or {}
+            committed = {app: rec for app, rec in entries.items()
+                         if isinstance(rec, dict) and rec.get("committed")}
+            rep.record("install.ledger", OK,
+                       f"ledger v{store.get('version')} at {ledger_path}, "
+                       f"{len(committed)} committed, {len(entries)} tracked")
+
+    if committed is None:
+        rep.record("install.drift", UNCHECKED,
+                   "the ledger could not be read, so config and install cannot be compared")
+    elif enabled is None:
+        rep.record("install.drift", UNCHECKED,
+                   "the enabled app list could not be read, so drift cannot be measured")
+    else:
+        # hub is the platform itself, never a ledger package.
+        want = {a for a in enabled if a != "hub"}
+        have = set(committed)
+        missing = sorted(want - have)
+        extra = sorted(have - want)
+        if missing:
+            rep.record("install.drift", FAIL,
+                       "enabled but not installed: " + ", ".join(missing),
+                       "Run install/airlock-install.sh to install the apps the config asks for.")
+        elif extra:
+            rep.record("install.drift", WARN,
+                       "installed but no longer enabled: " + ", ".join(extra),
+                       "Run `airlock-teardown <app>` for each, or re-enable it in airlock.toml.")
+        else:
+            rep.record("install.drift", OK,
+                       f"config and ledger agree on {len(want)} app(s)")
+
+    if not (ROOT / ".git").exists():
+        rep.record("install.revision", UNCHECKED,
+                   f"{ROOT} is not a git checkout, so there is no revision to report",
+                   "`airlock-update` makes it one; until then the installed revision is unrecorded.")
+        return
+    rc, out, err = run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], timeout=15)
+    if rc != 0:
+        rep.record("install.revision", UNCHECKED,
+                   f"git could not read the revision: {last_lines(err) or rc}")
+        return
+    head = out.strip()
+    # The ledger records package digests, not a revision or a date
+    # (bin/airlock-ledger:62-66) — the checkout is the only revision record there is.
+    rc_d, dirty, err_d = run(["git", "-C", str(ROOT), "status", "--porcelain"], timeout=30)
+    if rc_d != 0:
+        rep.record("install.revision", UNCHECKED,
+                   f"{head}, but whether the tree matches it is unknown "
+                   f"(`git status` exited {rc_d}: {last_lines(err_d) or 'no output'})")
+    elif dirty.strip():
+        rep.record("install.revision", WARN,
+                   f"{head} (+{len(dirty.strip().splitlines())} uncommitted change(s))",
+                   "This box is not running exactly what the revision says.")
+    else:
+        rep.record("install.revision", OK, head)
+
+
+def tailscale_status():
+    rc, out, err = run(["tailscale", "status", "--json"], timeout=20)
+    if rc != 0:
+        return None, last_lines(err) or f"tailscale status --json exited {rc}"
+    try:
+        return json.loads(out), ""
+    except json.JSONDecodeError as exc:
+        return None, f"tailscale status --json did not emit JSON: {exc}"
+
+
+def mappings(cfg):
+    """What the install is supposed to have mapped, from the config alone.
+
+    Returns {"listens": {tailnet port}, "targets": {loopback port}, "why": str}.
+    `why` is empty when the picture is complete and names the producer that
+    failed when it is not — a partial answer here would make ingress.serve
+    compare against a list with holes in it and call the survivors healthy.
+    """
+    listens, targets, why = set(), set(), ""
+    hub = ((cfg["resolved"].get("apps") or {}).get("hub") or {})
+    # install/airlock-install.sh:484 — the hub's own mapping, https -> nginx.
+    if hub.get("https_port"):
+        listens.add(str(hub["https_port"]))
+    if hub.get("nginx_port"):
+        targets.add(str(hub["nginx_port"]))
+
+    rc, out, err = config("package-info")
+    if rc != 0:
+        why = f"`airlock-config package-info` exited {rc}: {last_lines(err) or 'no output'}"
+    else:
+        try:
+            packages = (json.loads(out).get("packages") or {})
+        except json.JSONDecodeError as exc:
+            packages, why = {}, f"`airlock-config package-info` did not emit JSON: {exc}"
+        for spec in packages.values():
+            for mapping in (spec.get("serve_mappings") or {}).values():
+                if mapping.get("listen"):
+                    listens.add(str(mapping["listen"]))
+                if mapping.get("target"):
+                    targets.add(str(mapping["target"]))
+
+    rc, out, err = config("plaintext")
+    if rc != 0:
+        why = why or f"`airlock-config plaintext` exited {rc}: {last_lines(err) or 'no output'}"
+    else:
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split("\t")]
+            if len(parts) >= 2 and parts[1]:
+                listens.add(parts[1])
+            if len(parts) >= 3 and parts[2]:
+                targets.add(parts[2])
+    return {"listens": listens, "targets": targets, "why": why}
+
+
+def check_ingress(rep, cfg, facts):
+    status, why = tailscale_status()
+    if status is None:
+        rep.record("ingress.backend", UNCHECKED, why,
+                   "Install tailscale, or start tailscaled, then re-run.")
+    else:
+        state = status.get("BackendState") or "unknown"
+        health = "; ".join(status.get("Health") or [])
+        if state != "Running":
+            rep.record("ingress.backend", FAIL,
+                       f"BackendState = {state}",
+                       "Run `tailscale up`; nothing in front of the gate works until it is Running.")
+        elif health:
+            rep.record("ingress.backend", WARN,
+                       f"BackendState = Running, but tailscaled reports: {health}")
+        else:
+            rep.record("ingress.backend", OK, "BackendState = Running")
+
+    if status is None:
+        rep.record("ingress.serve", UNCHECKED,
+                   "tailscale status is unreadable, so serve mappings cannot be compared")
+    else:
+        rc, out, err = run(["tailscale", "serve", "status", "--json"], timeout=20)
+        live = None
+        if rc == 0:
+            try:
+                live = set((json.loads(out).get("TCP") or {}))
+            except json.JSONDecodeError:
+                live = None
+        if live is None:
+            rep.record("ingress.serve", UNCHECKED,
+                       f"`tailscale serve status --json` gave nothing readable: "
+                       f"{last_lines(err) or 'exit ' + str(rc)}")
+        elif facts["why"]:
+            # A partial list of expected mappings would let a missing one pass
+            # as "not declared". Say the list is incomplete instead.
+            rep.record("ingress.serve", UNCHECKED,
+                       "the list of declared mappings is incomplete — " + facts["why"])
+        else:
+            want = facts["listens"]
+            gone = sorted(want - live, key=int)
+            if not want:
+                rep.record("ingress.serve", UNCHECKED,
+                           "the config declares no serve mapping to check")
+            elif gone:
+                rep.record("ingress.serve", FAIL,
+                           "declared but not served: " + ", ".join(gone),
+                           "Re-run install/airlock-install.sh; it replays every serve mapping.")
+            else:
+                rep.record("ingress.serve", OK,
+                           f"all {len(want)} declared mapping(s) are live")
+
+    # The entrance probe is install/lib.sh's own airlock_serve_check, not a
+    # reimplementation: its 0/1/2 contract IS this tool's ok/fail/unchecked, and
+    # its comment (install/lib.sh:538-561) is the reasoning for both. Reuse keeps
+    # one definition of "the frontend answered".
+    rc, out, err = run(["bash", "-c",
+                        f'. {LIB_SH!s} >/dev/null 2>&1; airlock_serve_check'],
+                       timeout=90)
+    detail = last_lines(err or out) or f"airlock_serve_check exited {rc}"
+    if rc == 0:
+        rep.record("ingress.entrance", OK, detail)
+    elif rc in RC_UNRUNNABLE:
+        rep.record("ingress.entrance", UNCHECKED,
+                   f"the entrance probe could not be run: {detail}")
+    elif rc == 2:
+        rep.record("ingress.entrance", UNCHECKED, detail,
+                   "Open the entrance URL from another device — that is the check this box cannot run.")
+    else:
+        rep.record("ingress.entrance", FAIL, detail,
+                   "Check `sudo tailscale serve status` and `systemctl status nginx`.")
+
+
+def check_gate(rep, cfg):
+    hub = ((cfg["resolved"].get("apps") or {}).get("hub") or {})
+    port = hub.get("nginx_port")
+    header = cfg["env"].get("AIRLOCK_IDENTITY_HEADER") or "Tailscale-User-Login"
+    owner = cfg["owner"]
+    gate_ids = ("gate.owner", "gate.stranger", "gate.anonymous")
+
+    if not port:
+        for cid in gate_ids:
+            rep.record(cid, UNCHECKED, "apps.hub.nginx_port is not configured")
+        return
+    if not owner:
+        for cid in gate_ids:
+            rep.record(cid, UNCHECKED, "no owner is configured, so allow and deny are undefined")
+        return
+    if not shutil.which("curl"):
+        for cid in gate_ids:
+            rep.record(cid, UNCHECKED, "curl is not installed, so the gate cannot be probed here")
+        return
+
+    url = f"http://127.0.0.1:{port}/"
+    probes = (
+        ("gate.owner", f"{header}: {owner}", GATE_ALLOW_CODES,
+         "the owner login in airlock.toml does not match what the gate sees — "
+         "compare it with `curl -s " + url + "whoami`"),
+        ("gate.stranger", f"{header}: nobody@example.invalid", (GATE_DENY_CODE,),
+         "GATE HOLE: an identity that is not the owner was not denied. Stop and fix "
+         "this before anything else — see skills/airlock-doctor/SKILL.md section 2."),
+        ("gate.anonymous", None, (GATE_DENY_CODE,),
+         "GATE HOLE: a request with no identity header was not denied. Stop and fix "
+         "this before anything else — see skills/airlock-doctor/SKILL.md section 2."),
+    )
+    for cid, header_arg, want, remedy in probes:
+        code = http_code(url, header_arg)
+        if not code:
+            rep.record(cid, UNCHECKED,
+                       f"{url} did not answer, so the gate's verdict is unknown",
+                       "Check `systemctl status nginx` — the gate is not up to be tested.")
+        elif code in want:
+            rep.record(cid, OK, f"HTTP {code}")
+        else:
+            rep.record(cid, FAIL, f"HTTP {code}, expected {'/'.join(want)}", remedy)
+
+
+UNIT_SHOW_PROPERTIES = (
+    "LoadState", "Type", "ActiveState", "SubState", "Result", "ExecMainStatus",
+)
+
+
+def parse_unit_properties(text):
+    props = {}
+    for line in (text or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key:
+            props[key] = value.strip()
+    return props
+
+
+def unit_health(unit, props):
+    """Return (healthy|None, reason) from one `systemctl show` snapshot.
+
+    None means the snapshot cannot support a verdict. Timer/socket units do not
+    expose service-only Type/ExecMainStatus, so those keys become required only
+    for the inactive service case where they decide whether this is a completed
+    oneshot or a dead daemon.
+    """
+    required = ("LoadState", "ActiveState", "SubState", "Result")
+    missing = [key for key in required if key not in props]
+    if missing:
+        return None, "missing properties: " + ", ".join(missing)
+
+    load = props["LoadState"]
+    active = props["ActiveState"]
+    sub = props["SubState"]
+    result = props["Result"]
+    if load != "loaded":
+        return False, f"LoadState={load}"
+    if result not in ("", "success"):
+        return False, f"Result={result} ActiveState={active} SubState={sub}"
+    if sub == "failed":
+        return False, f"ActiveState={active} SubState=failed Result={result or '<empty>'}"
+    if active == "active":
+        return True, f"ActiveState={active} SubState={sub}"
+
+    if unit.endswith(".service"):
+        service_missing = [key for key in ("Type", "ExecMainStatus") if key not in props]
+        if service_missing:
+            return None, "missing properties: " + ", ".join(service_missing)
+        if props["Type"] == "oneshot":
+            status = props["ExecMainStatus"]
+            if (active == "activating" and sub in ("start-pre", "start", "start-post")
+                    and status in ("", "0")):
+                return True, f"Type=oneshot ActiveState={active} SubState={sub}"
+            if (active == "inactive" and sub == "dead" and result == "success"
+                    and status == "0"):
+                return True, "Type=oneshot ActiveState=inactive SubState=dead Result=success"
+
+    return False, f"ActiveState={active} SubState={sub} Result={result or '<empty>'}"
+
+
+def check_units(rep):
+    ledger_path = state_dir() / "app-ledger.json"
+    try:
+        store = json.loads(ledger_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        rep.record("units.active", UNCHECKED,
+                   "the ledger could not be read, so there is no list of units to check")
+        return
+    wanted = set()       # (unit name, scope)
+    templates = set()
+    for app, rec in (store.get("entries") or {}).items():
+        record = (rec or {}).get("committed") or {}
+        # artifacts.units holds the PATHS the installer placed; unit_scopes is
+        # keyed by the bare name (bin/airlock-ledger commit writes both).
+        scopes = record.get("unit_scopes") or {}
+        for path in ((record.get("artifacts") or {}).get("units") or []):
+            unit = os.path.basename(path)
+            if unit.endswith("@.service"):
+                # A template is not an instance. Which instances the installer
+                # started is not in the ledger (apps/code-server/install.sh:140
+                # starts airlock-code-server@1.service and records the template),
+                # so this cannot be checked from here — and is named rather than
+                # dropped, because a silently narrowed check is the whole defect
+                # class this tool exists to remove.
+                templates.add(unit)
+                continue
+            wanted.add((unit, scopes.get(unit, "user")))
+    if not wanted and not templates:
+        rep.record("units.active", UNCHECKED,
+                   "the ledger commits no units, so there is nothing to check")
+        return
+    if not shutil.which("systemctl"):
+        rep.record("units.active", UNCHECKED, "systemctl is not installed")
+        return
+    down, unknown = [], []
+    for unit, scope in sorted(wanted):
+        argv = (["systemctl"] + (["--user"] if scope != "system" else [])
+                + ["show", unit, "--no-pager"]
+                + ["--property=" + key for key in UNIT_SHOW_PROPERTIES])
+        rc, out, err = run(argv, timeout=20)
+        if rc in RC_UNRUNNABLE:
+            unknown.append(f"{unit} ({last_lines(err) or 'exit ' + str(rc)})")
+            continue
+        if rc != 0:
+            unknown.append(f"{unit} ({last_lines(err or out) or 'exit ' + str(rc)})")
+            continue
+        healthy, reason = unit_health(unit, parse_unit_properties(out))
+        if healthy is None:
+            unknown.append(f"{unit} ({reason})")
+        elif not healthy:
+            down.append(f"{unit} ({scope}: {reason})")
+    template_note = ""
+    if templates:
+        template_note = ("; not covered: " + ", ".join(sorted(templates))
+                         + " — the ledger records the template, not which instances run")
+    if down:
+        rep.record("units.active", FAIL, "not active: " + ", ".join(down) + template_note,
+                   "Read `journalctl --user -u <unit> -n 50 --no-pager` for the first one.")
+    elif unknown:
+        rep.record("units.active", UNCHECKED,
+                   "systemctl gave no answer for: " + ", ".join(unknown) + template_note)
+    elif templates:
+        rep.record("units.active", WARN,
+                   f"{len(wanted)} committed unit(s) are healthy{template_note}",
+                   "Check the instances by hand: systemctl --user list-units 'airlock-*@*'")
+    else:
+        rep.record("units.active", OK, f"all {len(wanted)} committed unit(s) are healthy")
+
+
+def check_apps(rep, cfg, enabled, facts):
+    if enabled is None:
+        rep.record("apps.enabled", FAIL,
+                   "`airlock-config apps` did not produce an inventory — "
+                   "an unreadable inventory is not an empty one",
+                   "Run `airlock-config validate` and fix what it reports.")
+        rep.record("apps.backends", UNCHECKED,
+                   "there is no app inventory, so no backend was probed")
+        return
+    real = [a for a in enabled if a != "hub"]
+    if not real:
+        # This is the bin/airlock-smoke false-success shape (rc=0 after zero apps).
+        # Zero apps is a real answer to "what is enabled", and it is not health.
+        rep.record("apps.enabled", FAIL,
+                   "no app is enabled beyond the hub — nothing here has been verified working",
+                   "Add apps under [apps.*] in airlock.toml, or accept that this box serves only a hub.")
+    else:
+        rep.record("apps.enabled", OK, f"{len(real)} app(s) enabled: " + ", ".join(real))
+
+    if facts["why"]:
+        rep.record("apps.backends", UNCHECKED,
+                   "the list of loopback targets is incomplete — " + facts["why"])
+        return
+    targets = facts["targets"]
+    if not targets:
+        rep.record("apps.backends", UNCHECKED,
+                   "the config names no loopback target, so nothing was probed")
+        return
+
+    # Everything an app declares as a port that is neither a loopback target nor
+    # a tailnet listen (ingress.serve has those) is the app's own business, not
+    # a socket the platform promises to bind — see the note near the top. Name
+    # them, so the narrowing is visible rather than merely true.
+    apps_cfg = (cfg["resolved"].get("apps") or {})
+    covered = targets | facts["listens"]
+    unprobed = sorted(
+        f"{app}.{key}={value}"
+        for app in (enabled or [])
+        for key, value in (apps_cfg.get(app) or {}).items()
+        if key.endswith("_port") and isinstance(value, int)
+        and not isinstance(value, bool) and str(value) not in covered
+    )
+    scope = f"{len(targets)} loopback target(s)"
+    if unprobed:
+        scope += f"; not probed: {', '.join(unprobed)}"
+
+    dead = sorted((p for p in targets if not port_is_listening(p)), key=int)
+    if dead:
+        rep.record("apps.backends", FAIL,
+                   "nothing listening on: " + ", ".join(dead) + f" (of {scope})",
+                   "Check `systemctl --user status 'airlock-*'` — a gate or backend is down.")
+    else:
+        rep.record("apps.backends", OK, f"all of {scope} are listening")
+
+
+# ---------------------------------------------------------------- output ----
+
+def verdict_of(checks):
+    if any(c["status"] == FAIL for c in checks):
+        return "fail", 1
+    if any(c["status"] == UNCHECKED for c in checks):
+        return "incomplete", 3
+    return "ok", 0
+
+
+MARK = {OK: "ok  ", WARN: "warn", FAIL: "FAIL", UNCHECKED: "----"}
+
+
+def render_human(doc, stream):
+    w = stream.write
+    w(f"Airlock status — {doc['host']} · {doc['generated_at']}\n")
+    section = None
+    for check in doc["checks"]:
+        if check["section"] != section:
+            section = check["section"]
+            w(f"\n{section}\n")
+        w(f"  {MARK[check['status']]}  {check['title']}\n")
+        w(f"        {check['detail']}\n")
+        if check["next"] and check["status"] in (WARN, FAIL, UNCHECKED):
+            w(f"        -> {check['next']}\n")
+    counts = doc["counts"]
+    w("\n---\n")
+    w(f"verdict: {doc['verdict'].upper()} — "
+      f"{counts['ok']} ok, {counts['warn']} warn, "
+      f"{counts['fail']} failed, {counts['unchecked']} not checked\n")
+    if doc["verdict"] == "incomplete":
+        w("Nothing failed, but the run is not a clean bill of health: the '----' "
+          "lines above were not checked.\n")
+    for check in doc["checks"]:
+        if check["status"] == FAIL and check["next"]:
+            w(f"next: {check['next']}\n")
+            break
+
+
+def main(argv):
+    as_json = False
+    for arg in argv[1:]:
+        if arg == "--json":
+            as_json = True
+        elif arg in ("-h", "--help"):
+            sys.stdout.write(__doc__)
+            return 0
+        else:
+            sys.stderr.write(f"usage: airlock-status [--json]\n")
+            return 2
+
+    rep = Report()
+    cfg = check_config(rep)
+    if cfg is not None:
+        rc, out, _ = config("apps")
+        enabled = [a.strip() for a in out.splitlines() if a.strip()] if rc == 0 else None
+        facts = mappings(cfg)
+        check_install(rep, cfg, enabled)
+        check_ingress(rep, cfg, facts)
+        check_gate(rep, cfg)
+        check_units(rep)
+        check_apps(rep, cfg, enabled, facts)
+    # Everything above the config reads it. Say so on every line that has not
+    # reported rather than dropping those lines: a short report is
+    # indistinguishable from a clean one, which is the defect this forecloses.
+    rep.fill_unchecked(
+        "the config could not be resolved, so nothing downstream was checked",
+        "Fix airlock.toml first — every check below reads it.")
+
+    checks = rep.checks()
+    verdict, code = verdict_of(checks)
+    doc = {
+        "schema_version": SCHEMA_VERSION,
+        "tool": "airlock-status",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "host": socket.gethostname(),
+        "root": str(ROOT),
+        "verdict": verdict,
+        "exit_code": code,
+        "counts": {
+            OK: sum(1 for c in checks if c["status"] == OK),
+            WARN: sum(1 for c in checks if c["status"] == WARN),
+            FAIL: sum(1 for c in checks if c["status"] == FAIL),
+            UNCHECKED: sum(1 for c in checks if c["status"] == UNCHECKED),
+        },
+        "checks": checks,
+    }
+    if as_json:
+        json.dump(doc, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        render_human(doc, sys.stdout)
+    return code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.stderr.write("airlock-status: interrupted — no verdict was produced\n")
+        sys.exit(2)
+    except Exception:                       # noqa: BLE001 - see below
+        # Exit 2, not 1. 1 is this tool's "your box has a fault"; a crash here
+        # is "this tool has a fault", and a traceback falling out unhandled
+        # would exit 1 and make the two indistinguishable. The traceback still
+        # goes to stderr, because a crash nobody can read is worse.
+        import traceback
+        traceback.print_exc()
+        sys.stderr.write("airlock-status: crashed — no verdict was produced (exit 2)\n")
+        sys.exit(2)

@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""devmon_owner — the owner gate for the message and action axes.
+"""devmon_owner — the owner gate for owner-scoped dev-monitor APIs.
 
 Three layers, and only the middle one is a boundary: nginx blocks first, THIS module is the
 authorization boundary, and the frontend merely displays. Every request re-checks two
 things — that it came through nginx (the proxy secret, which only nginx injects) and who
 the ingress says is asking (the owner header).
 
-Fail-closed on configuration: a PARTIALLY configured message feature raises rather than
-running with a hole, because "I set three of the four env vars" must not silently become
-"the gate is off". Nothing configured at all is a different case — the feature is simply
-not deployed and the monitor keeps serving observability.
+Fail-closed on configuration: a PARTIALLY configured gate raises rather than running with a
+hole. Nothing configured at all is a different case — its optional consumer is simply not
+deployed and the monitor keeps serving observability.
 
 Mutating requests are authenticated BEFORE the body is read, and are additionally checked
 for same-origin, JSON content type and size.
@@ -20,6 +19,7 @@ import os
 # The message feature needs all of these, or none of them.
 _REQUIRED = ('DEV_MONITOR_OWNER', 'DEV_MONITOR_PROXY_SECRET',
              'DEV_MONITOR_SPOOL', 'DEV_MONITOR_DB')
+_GATE_REQUIRED = ('DEV_MONITOR_OWNER', 'DEV_MONITOR_PROXY_SECRET')
 
 MAX_BODY = 64 * 1024                    # cap for an owner POST body
 
@@ -44,6 +44,25 @@ def load_config():
         'spool': present['DEV_MONITOR_SPOOL'],
         'db': present['DEV_MONITOR_DB'],
     }
+
+
+def load_gate_config():
+    """-> the owner/proxy gate, or None when its consumer is not installed.
+
+    Updates are owner-scoped even when the optional message spool is off.  Keep its
+    two-value ingress gate separate from the message feature's all-or-nothing spool
+    configuration: accepting one without the other would make a direct loopback
+    request look like an owner request.
+    """
+    present = {k: os.environ.get(k, '').strip() for k in _GATE_REQUIRED}
+    have = [k for k, v in present.items() if v]
+    if not have:
+        return None
+    if len(have) != len(_GATE_REQUIRED):
+        missing = [k for k in _GATE_REQUIRED if not present[k]]
+        raise ConfigError('owner gate is partially configured (fail-closed) — missing: %s'
+                          % ', '.join(missing))
+    return {'owner': present['DEV_MONITOR_OWNER'], 'secret': present['DEV_MONITOR_PROXY_SECRET']}
 
 
 def require_owner(handler, config):

@@ -1,0 +1,10 @@
+[Unit]
+Description=airlock — collect the daily update snapshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@AIRLOCK_ROOT@
+ExecStart=@PYTHON@ @AIRLOCK_ROOT@/apps/dev-monitor/backend/devmon_updates.py collect --root @AIRLOCK_ROOT@ --state @STATE@
+TimeoutStartSec=180

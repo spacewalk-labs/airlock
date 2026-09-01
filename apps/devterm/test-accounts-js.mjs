@@ -3,7 +3,10 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const source = fs.readFileSync(new URL('./web/accounts.js', import.meta.url), 'utf8');
+// accounts.js is a platform asset (ACCT_OWN, 2026-09-01); this test stays here
+// because the other half of what it pins down is devterm's own app.js.
+const source = fs.readFileSync(
+  new URL('../../hub/assets/accounts/accounts.js', import.meta.url), 'utf8');
 const appSource = fs.readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
 const failures = [];
 

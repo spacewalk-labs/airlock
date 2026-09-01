@@ -164,7 +164,9 @@ golden_check_file() {
   local rel="$1" srcfile="$2" path norm
   path="$GOLDEN/$rel"
   norm="$(out_file).norm"
-  sed "s|$ROOT|ROOT|g" "$srcfile" > "$norm"
+  sed -e "s|$ROOT|ROOT|g" \
+      -e 's|proxy_set_header X-Devmon-Proxy-Secret "[^"]\+";|proxy_set_header X-Devmon-Proxy-Secret "DEVMON_SECRET";|' \
+      "$srcfile" > "$norm"
   if [ "$MODE" = "--regen" ]; then
     # The golden learned defect 5 because --regen is a `cp`. Whatever the renderer
     # emitted became the expected answer, including the three words it had just
@@ -279,19 +281,17 @@ for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
   BACKEND_PORT=19200; IDENTITY_HEADER="Tailscale-User-Login"
   DEVMON_ENV="/home/example/.config/airlock/dev-monitor.env"
   cors_hosts="box.example.ts.net,box"
+  hdr_var="$(printf '%s' "${IDENTITY_HEADER//-/_}" | tr '[:upper:]' '[:lower:]')"
+  DEVMON_SECRET="deadbeefcafef00d"
   TOKEN_ARGS=()
   case "$SET" in
-    messages-off) MESSAGES=false; hdr_var=""; DEVMON_SECRET=""; owner_location="" ;;
+    messages-off) MESSAGES=false; owner_location="" ;;
     messages-on)
       MESSAGES=true
-      hdr_var="$(printf '%s' "${IDENTITY_HEADER//-/_}" | tr '[:upper:]' '[:lower:]')"
-      DEVMON_SECRET="deadbeefcafef00d"
       ;;
-    messages-off-no-cors) MESSAGES=false; hdr_var=""; DEVMON_SECRET=""; owner_location=""; cors_hosts="" ;;
+    messages-off-no-cors) MESSAGES=false; owner_location=""; cors_hosts="" ;;
     token-freshness-on)
       MESSAGES=true
-      hdr_var="$(printf '%s' "${IDENTITY_HEADER//-/_}" | tr '[:upper:]' '[:lower:]')"
-      DEVMON_SECRET="deadbeefcafef00d"
       TOKEN_ARGS=(true 6 12)
       ;;
   esac
@@ -304,7 +304,17 @@ for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
     owner_location="$(cat "$f")"
   fi
 
-  f="$(out_file)"; render_to "$f" render_dev_monitor_nginx "$BACKEND_PORT" "$owner_location"
+  f="$(out_file)"; render_to "$f" render_dev_monitor_owner_location \
+    "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" '= /monitor/api/owner/updates'
+  updates_location="$(cat "$f")"
+  f="$(out_file)"; render_to "$f" render_dev_monitor_owner_location \
+    "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" '/monitor/api/owner/updates/'
+  updates_location="$updates_location$(cat "$f")"
+  f="$(out_file)"; render_to "$f" render_dev_monitor_owner_location \
+    "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" '/monitor/api/owner/harness/'
+  updates_location="$updates_location$(cat "$f")"
+  f="$(out_file)"; render_to "$f" render_dev_monitor_nginx \
+    "$BACKEND_PORT" "$updates_location" "$owner_location"
   golden_check_file "dev-monitor/$SET/nginx.conf" "$f"
 done
 
@@ -312,8 +322,8 @@ done
 # devterm — apps/devterm/render.sh
 # Branch: ACCOUNTS (true vs false) adds four Environment= lines (claude
 # switch/status, fleet store) to the gate unit's gate_env block. The nginx
-# fragment is unaffected by ACCOUNTS (composed via emit_owner_gate/
-# emit_https_redirect only). Sets: accounts-off, accounts-on.
+# fragment is unaffected by ACCOUNTS (composed via emit_owner_gate plus the
+# platform account-panel alias block). Sets: accounts-off, accounts-on.
 # ===========================================================================
 APP="$ROOT/apps/devterm"
 . "$APP/render.sh"
@@ -327,6 +337,7 @@ for SET in accounts-off accounts-on; do
   XAI=false
   REV="deadbeefcafe"
   CANON="https://box.example.ts.net:${GATE_PORT}"
+  ACCOUNT_PANEL_DIR="/opt/airlock/hub/assets/accounts"
 
   # Mirrors install.sh's add_env() construction — the derived gate_env block
   # is not itself a heredoc, so it is reproduced here rather than extracted.
@@ -384,7 +395,10 @@ for SET in accounts-off accounts-on; do
     golden_check_file "devterm/$SET/shim-claude-status" "$f"
   fi
 
-  f="$(out_file)"; render_to "$f" render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$REDIRECT_PORT" "$CANON"
+  # Arg 3 is the platform account-panel directory (ACCT_OWN). It used to be the
+  # retired redirect port, which the function ignored; it does not ignore this one, so
+  # the fixture names a webroot path rather than leaving a port to be read as one.
+  f="$(out_file)"; render_to "$f" render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR"
   golden_check_file "devterm/$SET/nginx.conf" "$f"
 done
 
@@ -939,7 +953,8 @@ run_devmon_webhook_case x-R-A unset set set alias-fixture routine-fixture
 run_devmon_webhook_case x-x-A unset unset set alias-fixture ""
 run_devmon_webhook_case Umissing-x-A missing unset set "" ""
 
-# The capture must disappear when messages is turned off, just as the real file does.
+# Turning messages off removes its spool/action values but retains the two-value updates
+# owner gate. Otherwise the daily snapshot would exist with no authenticated read path.
 DMOFF="$(mktemp -d)"; mkdir -p "$DMOFF/home/.config/airlock" "$DMOFF/render"
 printf 'stale\n' > "$DMOFF/render/files-placeholder" 2>/dev/null || true
 cat > "$DMOFF/on.toml" <<'EOF'
@@ -959,10 +974,13 @@ HOME="$DMOFF/home" AIRLOCK_CONFIG="$DMOFF/off.toml" AIRLOCK_TS_FQDN=box.example.
   AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$DMOFF/render" \
   AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
   bash "$ROOT/apps/dev-monitor/install.sh" >/dev/null 2>&1
-if [ ! -e "$DMOFF/render/files/dev-monitor.env" ]; then
-  ok "dev-monitor messages off removes captured env"
+if [ "$(cat "$DMOFF/render/files/dev-monitor.env")" = "$(printf '%s\n' \
+  '# generated owner gate for dev-monitor updates' \
+  'DEV_MONITOR_OWNER=owner@example.com' \
+  'DEV_MONITOR_PROXY_SECRET=fixture-proxy-only')" ]; then
+  ok "dev-monitor messages off retains only the updates owner gate"
 else
-  bad "dev-monitor messages off left captured env"
+  bad "dev-monitor messages off kept message configuration or lost updates gate"
 fi
 rm -rf "$DMOFF"
 

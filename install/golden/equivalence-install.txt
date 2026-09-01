@@ -12,6 +12,10 @@ ok: config valid
 [airlock] [dry] render platform secret units into TMP/home/.config/systemd/user
 [dry] systemctl --user daemon-reload
 [dry] systemctl --user enable --now airlock-secret-sweep.timer
+[airlock] installing platform update detector timer
+[airlock] [dry] render platform update detector units into TMP/home/.config/systemd/user
+[dry] systemctl --user daemon-reload
+[dry] systemctl --user enable --now airlock-update-detect.timer
 [airlock] [dry] installing packaged app: publish (ROOT/apps/publish) (shipped app — dry run executes)
 [dry] sudo mkdir -p /opt/airlock/share
 [dry] sudo chmod 755 /opt/airlock/share
@@ -33,7 +37,7 @@ ok: config valid
 [airlock] [dry] installing packaged app: devterm (ROOT/apps/devterm) (shipped app — dry run executes)
 [airlock] [dry] download+verify ttyd 1.7.7 -> TMP/home/.local/bin/ttyd
 [dry] install -D -m755 ROOT/apps/devterm/bin/devterm-shell TMP/home/.local/bin/devterm-shell
-[airlock] [dry] install web/ -> TMP/home/.local/share/airlock-devterm/web (index.html config={"accounts":false,"xai":false,"fileview":false,"orca":false}, + ui.js/popup.css/panel.html)
+[airlock] [dry] install web/ -> TMP/home/.local/share/airlock-devterm/web (index.html config={"accounts":false,"xai":false,"fileview":false,"orca":false}, + ui.js/popup.css)
 [airlock] [dry] write TMP/home/.config/systemd/user/airlock-devterm.service (ttyd -i 127.0.0.1 -p 19912)
 [airlock] [dry] write TMP/home/.config/systemd/user/airlock-devterm-gate.service (127.0.0.1:19913; accounts=false xai=false fileview=false orca=false)
 [dry] systemctl --user daemon-reload

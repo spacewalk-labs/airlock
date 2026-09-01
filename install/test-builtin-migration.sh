@@ -55,6 +55,7 @@ STUB
 cat >"$SHIM/systemctl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$AIRLOCK_TEST_TMP/systemctl.log"
+case "$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left airlock-update-detect.timer airlock-update-detect.service' ;; esac
 exit 0
 STUB
 cat >"$SHIM/tailscale" <<'STUB'
@@ -2309,10 +2310,23 @@ n1_pc="$PKGROOT/n1-pc"
 mkpkg "$n1_pc" n1-pc 'contract = 1' 'id = "n1-pc"' \
   '[config.defaults]' 'pub = 16970' 'red = 16971' \
   '[plaintext_redirect]' 'pub = "red"'
+cat >"$n1_pc/install.sh" <<'EOF'
+#!/bin/sh
+pub="$(airlock_config get apps.n1-pc.pub)"
+red="$(airlock_config get apps.n1-pc.red)"
+test "$pub" -ne "$red"
+EOF
+chmod +x "$n1_pc/install.sh"
 n1_pd="$PKGROOT/n1-pd"
 mkpkg "$n1_pd" n1-pd 'contract = 1' 'id = "n1-pd"' \
   '[config.defaults]' 'listen = 16980' \
   '[artifacts]' 'serve_ports = ["listen"]'
+cat >"$n1_pd/install.sh" <<'EOF'
+#!/bin/sh
+listen="$(airlock_config get apps.n1-pd.listen)"
+test "$listen" -gt 0
+EOF
+chmod +x "$n1_pd/install.sh"
 cfg_n1cd="$CFGROOT/n1-cd.toml"
 { base_config; printf '[apps.n1-pc]\n[apps.n1-pd]\n'; } >"$cfg_n1cd"
 out_n1cd="$(run "$cfg_n1cd" validate 2>&1)"; rc_n1cd=$?

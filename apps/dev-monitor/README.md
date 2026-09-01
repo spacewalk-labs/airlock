@@ -5,6 +5,18 @@ processes and recent unit logs — served as a same-origin subpath under the hub
 `psutil`: the backend reads `/proc` and shells out to `systemctl`/`journalctl`, so it runs
 in a minimal container. Observability is visible to the owner and collaborators.
 
+The Services section reads typed systemd state including result, substate and restart
+count. A failure, non-zero restart count, missing unit, or enabled inactive daemon raises
+the System badge and opens that otherwise-collapsed section. Successful completed
+`oneshot` jobs and intentionally disabled inactive services remain healthy controls. This
+path is local and always on; it does not depend on the optional message console.
+
+The user-service inventory includes concrete `airlock-*` units, enabled services,
+timer-targeted services, and loaded failures. It deliberately omits healthy incidental
+static/generated helpers. Observation is not restart authority: only concrete `airlock-*`
+units rediscovered through the original Airlock-only sources and confirmed by canonical systemd
+`Id` receive a restart action; aliases, timer-only names, and dev-monitor itself remain excluded.
+
 Optionally it also carries an **owner-only message and action console** (`messages = true`,
 default off). That half is described below; if you leave it off, everything below is inert.
 

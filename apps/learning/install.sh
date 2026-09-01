@@ -131,6 +131,11 @@ else
   install -m644 "$HERE/backend/ingest_runner.py"    "$APP_DIR_LOCAL/backend/ingest_runner.py"
   install -m644 "$HERE/backend/save_document.py"   "$APP_DIR_LOCAL/backend/save_document.py"
   install -m644 "$HERE/backend/providers.py"       "$APP_DIR_LOCAL/backend/providers.py"
+  # 플랫폼 선택 규칙의 vendored 사본. providers.py 가 **파일 경로로** 읽으므로 같은
+  # 디렉터리에 있어야 한다 — 빠뜨리면 백엔드가 임포트에서 죽고, 그때는 "적재가 안 된다"
+  # 가 아니라 앱 전체가 안 뜬다. bin/agent_provider.py 와 바이트 동일성은
+  # install/test-agent-provider.sh 가 잡는다.
+  install -m644 "$HERE/backend/agent_provider.py"  "$APP_DIR_LOCAL/backend/agent_provider.py"
   install -d "$APP_DIR_LOCAL/skill"
   install -m644 "$HERE/skill/SKILL.md"             "$APP_DIR_LOCAL/skill/SKILL.md"
   install -m644 "$HERE/skill/transcript.py"        "$APP_DIR_LOCAL/skill/transcript.py"

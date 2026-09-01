@@ -154,9 +154,9 @@ CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
 
 MAX_HEAD = 64 * 1024
 MAX_BODY = 210 * 1024 * 1024         # inbound body cap — accommodates a 200MB raw file upload plus headroom
+LOGIN_CODE_BODY_MAX = 1024            # one <=400-byte code plus small JSON framing
 IDENT_HEADER = os.environ.get("AIRLOCK_IDENTITY_HEADER", "").strip().lower().encode("latin1")
 TTYD_PATHS = (b"/ws", b"/token")
-CODEX_LOGIN_OUT = os.path.expanduser("~/.codex/.relogin-capture.out")     # codex device-auth output capture
 DEVTERM_STATE_DIR = os.path.expanduser("~/.local/share/airlock-devterm/state")
 XAI_LOGIN_OUT = os.path.join(DEVTERM_STATE_DIR, "xai-login.out")
 _xai_login_process = None
@@ -742,13 +742,13 @@ def _save_uploaded_file(raw, orig_name):
     return _store_upload(raw, "file", _safe_ext(orig_name), _RE_UPLOAD_FILE)
 
 
-async def _read_body(reader, headers, leftover):
+async def _read_body(reader, headers, leftover, limit=MAX_BODY):
     """Read Content-Length bytes of body (incl. leftover). None if over cap / short."""
     try:
         clen = int(headers.get(b"content-length", b"0"))
     except ValueError:
         return None
-    if clen <= 0 or clen > MAX_BODY:
+    if clen <= 0 or clen > limit:
         return None
     buf = bytearray(leftover)
     while len(buf) < clen:
@@ -763,7 +763,7 @@ async def _read_body(reader, headers, leftover):
 
 async def _read_json_body(cr, headers, leftover, limit=MAX_BODY):
     """body -> JSON dict. None on missing/short/over-cap/non-JSON/non-dict (caller decides meaning)."""
-    body = await _read_body(cr, headers, leftover)
+    body = await _read_body(cr, headers, leftover, limit=limit)
     if body is None or len(body) > limit:
         return None
     try:
@@ -1618,32 +1618,6 @@ def _claude_store_entry(store, email, kind):
     return best or {}
 
 
-def _codex_bin():
-    """Absolute path to the codex executable, or None when this box has none.
-
-    This used to be `which("codex") or ~/.npm-global/bin/codex`. Both halves were
-    wrong for the same reason: a systemd --user unit's PATH carries none of the
-    directories node CLIs actually land in, so `which` reports a working install as
-    missing — and the hardcoded fallback then named one innocent path as if it were
-    the cause, on a box whose codex lives under a version manager. The candidate
-    list, the trust rules and the not-found contract are the shared ones
-    (bin_discovery, vendored next to this file). Never returns an unverified path."""
-    return bin_discovery.find_bin("codex")[0]
-
-
-def _codex_available():
-    return _codex_bin() is not None
-
-
-def _codex_missing_error():
-    """The `error` string the codex endpoints answer with when there is no binary.
-
-    "codex not available" said nothing about why, so the only way to find out was to
-    ssh in. This names what was searched and what to do about it — same JSON key,
-    longer value."""
-    return bin_discovery.not_found_message("codex", bin_discovery.find_bin("codex")[1])
-
-
 def _opencode_bin():
     return bin_discovery.find_bin("opencode")[0]
 
@@ -1908,13 +1882,18 @@ async def _serve_acct_switch(cr, headers, leftover, cw):
     await _send_json(cw, b"200 OK" if payload.get("ok") else b"400 Bad Request", payload)
 
 
-async def _codex_auth_lifecycle(action):
-    """Run one platform-owned Codex preservation action.
+async def _codex_auth_call(action, timeout):
+    """Run one platform-owned Codex credential action and return its JSON payload.
 
-    Only the action result crosses back into devterm. stdout/stderr are deliberately
-    not reflected into an HTTP response: the platform contract emits booleans only,
-    and a future regression must not turn arbitrary process output into a credential
-    exfiltration path.
+    Every Codex credential operation — preserve, restore, log in, log out — belongs to
+    `airlock-accounts codex-auth` (ACCT_OWN, 2026-09-01). devterm is the caller: it owns
+    the button, not the decision about what the button does to this box's login.
+
+    Only the platform tool's own JSON crosses back. Its stdout is parsed, never
+    forwarded, and codex's stdout/stderr never reaches devterm at all — a future
+    regression must not be able to turn arbitrary process output into a credential
+    exfiltration path. `ok: false` with an `error` string is an operation that failed
+    for a reason a person can act on; a non-zero exit is the tool itself failing.
     """
     if not PLATFORM_ACCOUNTS:
         return None, "platform accounts tool is not wired"
@@ -1922,7 +1901,7 @@ async def _codex_auth_lifecycle(action):
         proc = await asyncio.create_subprocess_exec(
             PLATFORM_ACCOUNTS, "codex-auth", action, "--json",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, _err = await asyncio.wait_for(proc.communicate(), timeout=10)
+        out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (asyncio.TimeoutError, FileNotFoundError, OSError):
         return None, "platform accounts operation failed"
     if proc.returncode != 0:
@@ -1931,95 +1910,62 @@ async def _codex_auth_lifecycle(action):
         payload = json.loads((out or b"").decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return None, "platform accounts operation returned invalid JSON"
+    if not isinstance(payload, dict):
+        return None, "platform accounts operation returned an invalid shape"
+    if payload.get("ok") is not True:
+        # The platform CLI's own message (no codex on this box, no code captured).
+        # Bounded and type-checked here so a malformed payload cannot inject a body.
+        detail = payload.get("error")
+        return None, detail[:400] if isinstance(detail, str) and detail else \
+            "platform accounts operation failed"
+    return payload, None
+
+
+async def _codex_auth_lifecycle(action):
+    """backup / restore — the two that answer with a single boolean."""
+    payload, error = await _codex_auth_call(action, 10)
+    if error:
+        return None, error
     key = "backedUp" if action == "backup" else "restored"
-    if not isinstance(payload, dict) or payload.get("ok") is not True \
-            or not isinstance(payload.get(key), bool):
+    if not isinstance(payload.get(key), bool):
         return None, "platform accounts operation returned an invalid shape"
     return payload[key], None
 
 
 async def _serve_codex_login_start(cw):
-    """Codex re-login 1/2 — run `codex login --device-auth` and capture URL + code.
+    """Codex re-login 1/2 — ask the platform to start `codex login --device-auth`.
 
-    device-auth needs no port-forward/callback — the user opens the link in any
-    browser and enters the code. codex login wipes auth.json immediately, so we back
-    it up first and restore via /codex-login-cancel if the flow is abandoned."""
-    # Resolved once and passed to exec below: _codex_bin() can now return None, and a
-    # separate availability check followed by a second lookup is a race with an
-    # uninstall that would reach create_subprocess_exec with None.
-    binary = _codex_bin()
-    if binary is None:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": _codex_missing_error()})
-        return
+    device-auth needs no port-forward/callback: the user opens the link in any browser
+    and enters the code. The backup-before-wipe rule, the capture and the timing all
+    live in `airlock-accounts codex-auth login-start`; this endpoint hands its two
+    display strings to the panel and nothing else.
+    """
     _invalidate_codex_usage_cache()   # login wipes auth.json: cached numbers are void
-    # Fail closed before Codex gets a chance to erase auth.json. An absent old login is
-    # a successful `backedUp=false`; an invocation or copy failure is different and must
-    # not turn a re-login attempt into silent credential loss.
-    _backed_up, backup_error = await _codex_auth_lifecycle("backup")
-    if backup_error:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": backup_error})
+    # The capture polls for up to ~10s inside the platform CLI, so this wait has to
+    # clear that ceiling; too short would report a failure for a login that started.
+    payload, error = await _codex_auth_call("login-start", 30)
+    if error:
+        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": error})
         return
-    try:
-        k = await asyncio.create_subprocess_exec(
-            "pkill", "-f", "codex login",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        await k.wait()
-    except (FileNotFoundError, OSError):
-        pass
-    try:
-        open(CODEX_LOGIN_OUT, "w").close()
-    except OSError:
-        pass
-    try:
-        outf = open(CODEX_LOGIN_OUT, "w")
-        await asyncio.create_subprocess_exec(
-            binary, "login", "--device-auth",
-            stdout=outf, stderr=asyncio.subprocess.STDOUT,
-            stdin=asyncio.subprocess.DEVNULL, start_new_session=True,
-            env={**os.environ, "BROWSER": "true"})
-        outf.close()
-    except (FileNotFoundError, OSError) as e:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": f"codex launch failed: {e}"})
-        return
-    url, code = None, None
-    for _ in range(20):
-        await asyncio.sleep(0.5)
-        try:
-            txt = _ANSI_RE.sub("", open(CODEX_LOGIN_OUT, encoding="utf-8", errors="replace").read())
-        except OSError:
-            txt = ""
-        mu = re.search(r"https://\S*openai\.com/codex/device\S*", txt)
-        mc = re.search(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b", txt)
-        if mu:
-            url = mu.group(0)
-        if mc:
-            code = mc.group(1)
-        if code:                       # the code is the essential part — the URL is a fixed fallback
-            break
-    if code:
-        await _send_json(cw, b"200 OK",
-                         {"ok": True, "url": url or "https://auth.openai.com/codex/device", "code": code})
-    else:
+    url, code = payload.get("url"), payload.get("code")
+    if not isinstance(url, str) or not isinstance(code, str) or not code:
         await _send_json(cw, b"400 Bad Request",
-                         {"ok": False, "error": "failed to capture codex device-auth code (codex missing/error)"})
+                         {"ok": False, "error": "platform accounts operation returned an invalid shape"})
+        return
+    await _send_json(cw, b"200 OK", {"ok": True, "url": url, "code": code})
 
 
 async def _serve_codex_login_cancel(cw):
-    """Codex re-login cancel — stop the pending device-auth and restore the backed-up
-    auth.json. Re-login logs out immediately, so this undoes an abandoned attempt."""
-    # Restoration belongs to the saved login, not to the current Codex executable.
-    # The binary can disappear after login starts; cancellation must still recover the
-    # previous auth file. pkill is best-effort and restore is always attempted.
-    try:
-        k = await asyncio.create_subprocess_exec(
-            "pkill", "-f", "codex login",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        await k.wait()
-    except (FileNotFoundError, OSError):
-        pass
-    restored, restore_error = await _codex_auth_lifecycle("restore")
-    if restore_error:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": restore_error})
+    """Codex re-login cancel — stop the pending device-auth and restore the previous
+    login. Re-login logs out immediately, so this undoes an abandoned attempt."""
+    payload, error = await _codex_auth_call("login-cancel", 15)
+    if error:
+        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": error})
+        return
+    restored = payload.get("restored")
+    if not isinstance(restored, bool):
+        await _send_json(cw, b"400 Bad Request",
+                         {"ok": False, "error": "platform accounts operation returned an invalid shape"})
         return
     if restored:
         _invalidate_codex_usage_cache()
@@ -2027,28 +1973,14 @@ async def _serve_codex_login_cancel(cw):
 
 
 async def _serve_codex_logout(cw):
-    """Codex logout — `codex logout` removes auth.json. Codex is single-account, so
-    this is 'remove account'; the re-login button reconnects."""
-    binary = _codex_bin()          # resolved once — see _serve_codex_login_start
-    if binary is None:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": _codex_missing_error()})
+    """Codex logout — removes auth.json. Codex is single-account, so this is
+    'remove account'; the re-login button reconnects."""
+    _payload, error = await _codex_auth_call("logout", 30)
+    if error:
+        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": error})
         return
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            binary, "logout",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=20)
-        ok = proc.returncode == 0
-        if ok:
-            _invalidate_codex_usage_cache()
-        payload = {"ok": ok}
-        if not ok:
-            payload["error"] = (err or out or b"").decode("utf-8", "replace")[:200]
-    except (FileNotFoundError, OSError) as e:
-        payload = {"ok": False, "error": str(e)}
-    except asyncio.TimeoutError:
-        payload = {"ok": False, "error": "codex logout timed out"}
-    await _send_json(cw, b"200 OK" if payload.get("ok") else b"400 Bad Request", payload)
+    _invalidate_codex_usage_cache()
+    await _send_json(cw, b"200 OK", {"ok": True})
 
 
 async def _serve_xai_status(cw):
@@ -2372,16 +2304,21 @@ async def _serve_acct_remove(cr, headers, leftover, cw):
     await _send_json(cw, b"200 OK" if payload.get("ok") else b"400 Bad Request", payload)
 
 
-async def _claude_switch(args, timeout=40):
+async def _claude_switch(args, timeout=40, stdin_bytes=None):
     """Run a claude-switch subcommand -> (ok, stdout, stderr). Secrets never appear in
-    stdout (login-url = URL / login-code = a status string only)."""
+    stdout (login-url = URL / login-code = a status string only). A login code crosses
+    this process boundary only through stdin, never argv or the environment."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            *([CLAUDE_SWITCH] + args), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            *([CLAUDE_SWITCH] + args),
+            stdin=(asyncio.subprocess.PIPE if stdin_bytes is not None
+                   else asyncio.subprocess.DEVNULL),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     except (FileNotFoundError, OSError) as e:
         return False, "", str(e)
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        communicate = proc.communicate() if stdin_bytes is None else proc.communicate(stdin_bytes)
+        out, err = await asyncio.wait_for(communicate, timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill(); await proc.wait()
         return False, "", "timed out"
@@ -3052,17 +2989,36 @@ async def _serve_acct_login_code(cr, headers, leftover, cw):
     if not _accounts_enabled():
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "accounts disabled"})
         return
-    d = await _read_json_body(cr, headers, leftover) or {}
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "forbidden origin"})
+        return
+    content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
+    if content_type != b"application/json":
+        await _send_json(cw, b"415 Unsupported Media Type",
+                         {"ok": False, "error": "application/json required"})
+        return
+    d = await _read_json_body(cr, headers, leftover, limit=LOGIN_CODE_BODY_MAX) or {}
     code = (d.get("code") or "").strip()
-    if not code or len(code) > 400 or any(c.isspace() for c in code):
+    try:
+        code_bytes = code.encode("utf-8")
+    except (AttributeError, UnicodeEncodeError):
+        code_bytes = b""
+    if (not code_bytes or len(code_bytes) > 400
+            or any(c.isspace() for c in code)):
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "not a code"})
         return
-    ok, out, err = await _claude_switch(["login-code", code])
+    ok, out, err = await _claude_switch(
+        ["login-code"], stdin_bytes=code_bytes)
     if ok:
         _invalidate_acct_caches()
-        await _send_json(cw, b"200 OK", {"ok": True, "msg": out.strip() or "registered"})
+        # The target is a credential processor, not a trusted response formatter. It
+        # may reflect the submitted code even on rc=0, so return only a fixed message.
+        await _send_json(cw, b"200 OK", {"ok": True, "msg": "registered"})
     else:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": (err or out or "registration failed")[:300]})
+        # The token endpoint is untrusted and may reflect the submitted one-time code in
+        # its error body. Keep all subprocess output behind this credential boundary.
+        await _send_json(cw, b"400 Bad Request",
+                         {"ok": False, "error": "registration failed — request a new login link"})
 
 
 async def handle(cr, cw):

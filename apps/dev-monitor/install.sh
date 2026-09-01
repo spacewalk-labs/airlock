@@ -59,6 +59,53 @@ esac
   || die "AIRLOCK_ACCOUNTS_STATUS_BIN does not name an executable platform file"
 ACCOUNTS_STATUS_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
   "$AIRLOCK_ACCOUNTS_STATUS_BIN")"
+# The box-wide default agent, and the second D5 capability that resolves it. Same handoff
+# rule as above: this app validates the path it is given and never rebuilds $ROOT/bin/... .
+#
+# The value itself is NOT validated here against a list of names. airlock-config already
+# refuses an unknown [agent].provider at validate time, and a second copy of the vocabulary
+# in this file would go stale the day a third CLI is added — the failure would be an install
+# that refuses a value the platform accepts, which reads as a broken installer.
+AGENT_PROVIDER="${AIRLOCK_AGENT_PROVIDER:-}"
+# Both values land on `Environment=` lines in a unit file, where a newline is a new
+# directive. The orchestrator runs `airlock-config validate` first and that refuses a
+# provider outside auto/claude/codex, so this is the second lock and not the first —
+# but an app installer run on its own must not be able to write a unit nobody wrote.
+# Same guard this file already applies to the resolved Slack and SMTP values below.
+#
+# Newline only, and that is the whole list on purpose. Measured on systemd 255, 2026-09-01,
+# because two reviewers disagreed about the backslash and neither had run it:
+#
+#   Environment=A=val\        -> systemctl show -p Environment
+#   Environment=B=second         Environment=A=val Environment=B=second
+#
+# The trailing backslash DOES join the two physical lines (systemd.syntax line continuation
+# applies to unit directives, not only to EnvironmentFile), but the joined line is still one
+# `Environment=` directive — so the worst it does is swallow the next assignment, which now
+# surfaces as the loud half-configured case in action_runner.resolve_agent() rather than as a
+# silent wrong CLI. A raw newline is different in kind, and that is the one blocked here:
+#
+#   Environment=A=val
+#   ExecStartPre=/bin/echo INJECTED
+#                             -> ExecStartPre={ path=/bin/echo ; argv[]=/bin/echo INJECTED ; … }
+#
+# A space or a `%` stays inside the value the same way it does for the existing
+# ACCOUNTS_STATUS_BIN and cors_hosts lines. Only a newline can start a new DIRECTIVE.
+for _pair in "agent.provider:$AGENT_PROVIDER" "AIRLOCK_AGENT_BIN:$AIRLOCK_AGENT_BIN"; do
+  case "${_pair#*:}" in
+    *[$'\n\r']*) die "resolved ${_pair%%:*} must not contain newlines — it is written onto a systemd Environment= line" ;;
+  esac
+done
+case "$AIRLOCK_AGENT_BIN" in
+  /*) ;;
+  *) die "AIRLOCK_AGENT_BIN must be an absolute D5 platform path" ;;
+esac
+# Readable, not executable: bin/airlock-agent is mode 100644 by design and every caller
+# spawns python3 for it, the same way install/lib.sh spawns bin/airlock-config.
+[ -f "$AIRLOCK_AGENT_BIN" ] && [ -r "$AIRLOCK_AGENT_BIN" ] \
+  || die "AIRLOCK_AGENT_BIN does not name a readable platform file"
+AGENT_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+  "$AIRLOCK_AGENT_BIN")"
 # Optional cutover bridge for existing producers/watchdogs. There is deliberately no
 # default: a public installer must not guess a box-specific legacy path. The operator names
 # the path in deployment config, and the generated file contains only four compatibility
@@ -186,10 +233,10 @@ else
   log "WARN: tailnet FQDN unresolved — the unread badge is reachable only from a short-name origin"
 fi
 
-# --- 0. message/action console state (only when messages = true) ---
-# Four env vars are all-or-nothing (devmon_owner fails closed on a partial set), so
-# they are written as one file and the file is REMOVED when the feature is off —
-# leaving a stale env behind would quietly re-enable the console on the next restart.
+# --- 0. owner gate + optional message/action console state ---
+# The update API always needs its two-value owner gate; the message feature additionally
+# needs spool/DB state. The same 0600 file carries the full set when messages=true and
+# only the gate when false, so turning messages off cannot also turn off updates.
 #
 # The proxy secret is what proves a request came through nginx rather than straight to
 # the loopback port. A real install rotates it: nginx and the unit are rewritten in the
@@ -207,14 +254,12 @@ fi
 # approved by the owner in the console, and the approved plan is hash-pinned, before
 # anything runs. See SECURITY.md.
 DEVMON_SECRET=""
-if [ "$MESSAGES" = true ]; then
-  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -r "$DEVMON_ENV" ]; then
-    DEVMON_SECRET="$(sed -n 's/^DEV_MONITOR_PROXY_SECRET=//p' "$DEVMON_ENV" | head -1)"
-  fi
-  # Nothing to reuse (no env file yet, or it is unreadable): mint one. Safe on a dry run
-  # only because the fragment write below will not overwrite an existing file.
-  [ -n "$DEVMON_SECRET" ] || DEVMON_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -r "$DEVMON_ENV" ]; then
+  DEVMON_SECRET="$(sed -n 's/^DEV_MONITOR_PROXY_SECRET=//p' "$DEVMON_ENV" | head -1)"
 fi
+# Nothing to reuse (no env file yet, or it is unreadable): mint one. Safe on a dry run
+# only because the fragment write below will not overwrite an existing file.
+[ -n "$DEVMON_SECRET" ] || DEVMON_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 SLACK_WEBHOOK_URGENT=""
 SLACK_WEBHOOK_ROUTINE=""
 if [ "$MESSAGES" = true ]; then
@@ -298,7 +343,9 @@ if [ "$MESSAGES" = true ]; then
     fi
   fi
 elif [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
-  rm -f "$DEVMON_ENV_OUTPUT"
+  install -d -m 700 "$(dirname "$DEVMON_ENV_OUTPUT")"
+  ( umask 077; render_dev_monitor_owner_env "$OWNER" "$DEVMON_SECRET" >"$DEVMON_ENV_OUTPUT" )
+  chmod 600 "$DEVMON_ENV_OUTPUT"
   [ -z "$COMPAT_ENV_OUTPUT" ] || rm -f "$COMPAT_ENV_OUTPUT"
   # Turning the console off does not reach into a run that is already going. Killing
   # someone's in-flight work to honour a config change would be worse than leaving it —
@@ -320,7 +367,7 @@ else
   install -d "$UNIT_DIR"
   render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_hosts" "$DEVMON_ENV" \
     "$TOKEN_FRESHNESS" "$TOKEN_WARN_HOURS" "$TOKEN_STALE_HOURS" "$MESSAGES" \
-    "$ACCOUNTS_STATUS_BIN" \
+    "$ACCOUNTS_STATUS_BIN" "$AGENT_PROVIDER" "$AGENT_BIN" \
     >"$UNIT_DIR/airlock-dev-monitor.service"
 fi
 # The card is on; the CHECKING is not. Said once at install time, because "the feature is
@@ -349,19 +396,27 @@ fi
 frag="$CONFD/hub-locations.d/dev-monitor.conf"
 install -d "$CONFD/hub-locations.d"
 
-# Owner-only routes for the message/action console. This location exists ONLY when the
-# console is enabled: with it absent, an owner request falls through to the general
-# /monitor/api/ location, which blanks the identity headers, so the backend sees an
-# unauthenticated request and 404s the feature. Fail-closed by construction.
+# The updates endpoints are owner-only regardless of whether messages are enabled. Three
+# locations, each scoped to one branch so a future message route cannot accidentally
+# inherit their gate: an exact match for the snapshot itself, a prefix for the execution
+# routes under it (/run, /execute), and the same prefix for the settings panel's harness
+# section, which shares this gate and nothing else (devmon_harness). Each prefix is
+# longer than the /monitor/api/ observability location and than the message console's
+# /monitor/api/owner/ location, so nginx's longest-prefix rule keeps the owner gate on
+# all three whether or not the console is installed.
+# Message/action routes keep their existing conditional prefix location below.
 #
 # Both X-Devmon-* headers are set here, which is also what makes a client-supplied copy
 # of them harmless — proxy_set_header REPLACES whatever the browser sent. The owner is
 # taken from the ingress-injected identity header (never from the request body), and the
 # secret proves the request came through nginx rather than straight to the loopback port.
+hdr_var="$(printf '%s' "${IDENTITY_HEADER//-/_}" | tr '[:upper:]' '[:lower:]')"
+updates_location="$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" \
+  '= /monitor/api/owner/updates')$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" \
+  "$DEVMON_SECRET" '/monitor/api/owner/updates/')$(render_dev_monitor_owner_location \
+  "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" '/monitor/api/owner/harness/')"
 owner_location=""
 if [ "$MESSAGES" = true ]; then
-  # nginx exposes a request header as $http_<name>, lowercased with '-' turned into '_'.
-  hdr_var="$(printf '%s' "${IDENTITY_HEADER//-/_}" | tr '[:upper:]' '[:lower:]')"
   owner_location="$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET")"
 fi
 
@@ -380,7 +435,7 @@ fi
 # the secret already in it and only narrow the mode afterwards. nginx reads its config
 # as root, so 0600 owned by the installing user is readable where it needs to be.
 install -m 600 /dev/null "$frag"
-render_dev_monitor_nginx "$BACKEND_PORT" "$owner_location" >"$frag"
+render_dev_monitor_nginx "$BACKEND_PORT" "$updates_location" "$owner_location" >"$frag"
 log "wrote nginx fragment: $frag"
 
 # NOTE: smoke runs from the orchestrator AFTER nginx reload (gate not live before).

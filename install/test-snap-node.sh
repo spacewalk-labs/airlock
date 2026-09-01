@@ -175,11 +175,17 @@ else
 fi
 
 # ---- 4. a native node is untouched ----
+# NoNewPrivileges is OFF on the ordinary path too since 2026-09-02: this unit is the
+# parent of the operator's agent sessions and the directive is inherited, so setting it
+# removed sudo AND setgid (crontab) from the human's own shell. See apps/paseo/install.sh.
+# What this test still guards is that the ordinary path is NOT the snap path: it must
+# install without the override and without the snap reason text.
 d="$TMP/native"; p="$(make_box "$d" native)"
 out="$(run_paseo_dry "$d" "$p")"; rc=$?
 unit="$d/render/units/airlock-paseo.service"
-if [ "$rc" -eq 0 ] && [ -f "$unit" ] && grep -qx 'NoNewPrivileges=yes' "$unit"; then
-  ok "a non-snap node installs normally and keeps NoNewPrivileges=yes"
+if [ "$rc" -eq 0 ] && [ -f "$unit" ] && grep -qx 'NoNewPrivileges=no' "$unit" \
+   && ! grep -q 'snap' "$unit"; then
+  ok "a non-snap node installs normally, without the snap override or its reason text"
 else
   bad "a non-snap node did not take the ordinary path (rc=$rc)"
   printf '%s\n' "$out" | tail -12 | sed 's/^/    /'
@@ -198,9 +204,7 @@ expected='code-server/installer-path/unit-manager.service
 code-server/slots1/unit-manager.service
 code-server/slots3/unit-manager.service
 orca/default/unit-serve.service
-orca/installer-path/unit-serve.service
-paseo/default/unit.service
-paseo/installer-path/unit.service'
+orca/installer-path/unit-serve.service'
 actual="$(cd "$HERE/golden/render" && grep -rlx 'NoNewPrivileges=yes' . 2>/dev/null | sed 's|^\./||' | sort)"
 if [ "$actual" = "$expected" ]; then
   ok "exactly the seven known goldens set NoNewPrivileges=yes"
@@ -208,10 +212,14 @@ else
   bad "the set of units setting NoNewPrivileges=yes changed — classify the exec chain of each new one"
   diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") | sed 's/^/    /'
 fi
-# And the override golden is the one place it is off.
+# The directive is off in exactly the three paseo units — every one of them is a
+# parent of operator sessions (2026-09-02). Any OTHER unit turning it off is a defect.
+expected_off='paseo/default/unit.service
+paseo/installer-path/unit.service
+paseo/snap-override/unit.service'
 off="$(cd "$HERE/golden/render" && grep -rlx 'NoNewPrivileges=no' . 2>/dev/null | sed 's|^\./||' | sort)"
-[ "$off" = "paseo/snap-override/unit.service" ] \
-  && ok "the directive is off in exactly one golden, the snap override" \
+[ "$off" = "$expected_off" ] \
+  && ok "the directive is off in exactly the three paseo goldens" \
   || bad "NoNewPrivileges=no appears in an unexpected set of goldens: ${off:-none}"
 
 # ---- 6. the manifests no longer prescribe what the installer refuses ----

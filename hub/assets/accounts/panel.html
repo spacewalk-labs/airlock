@@ -7,17 +7,25 @@
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="stylesheet" href="popup.css">
 <!--
-  panel.html — devterm's account UI on a page with NO terminal.
+  panel.html — the Airlock subscription account panel, on a page with NO terminal.
+
+  A PLATFORM asset (hub/assets/accounts/), not devterm's. It was devterm's until
+  ACCT_OWN (2026-09-01): a box's logins are the platform's business, and an app that
+  happens to have a terminal in it is not where "which subscription am I on" belongs.
+  It is deployed to <webroot>/assets/accounts/ with the rest of hub/assets and served
+  BY the devterm owner gate (alias, no copy), because the account API answers on that
+  origin — the same arrangement airlock-return.js already has.
 
   Who opens it: the Airlock return widget injected into tools that run on their own
-  ports (an agent runner, a browser IDE). Its menu opens this page in a modal iframe so
-  the user can switch subscription accounts without leaving the app they are in — on a
-  home-screen web app, opening devterm meant leaving it altogether.
+  ports (an agent runner, a browser IDE), devterm's own account icon, and the hub's
+  identity pill. Its menu opens this page in a modal iframe so the user can switch
+  subscription accounts without leaving the app they are in — on a home-screen web app,
+  opening devterm meant leaving it altogether.
 
-  Why an iframe and not a copy of the UI: every fetch here is a same-origin devterm path,
-  so there is no CORS to arrange, and accounts.js stays the only implementation of the
-  account list. Identity is the ingress header, not a cookie, so this authenticates the
-  same way inside a cross-origin iframe.
+  Why an iframe and not a copy of the UI: every fetch here is a same-origin path on the
+  gate that serves the account API, so there is no CORS to arrange, and accounts.js
+  stays the only implementation of the account list. Identity is the ingress header,
+  not a cookie, so this authenticates the same way inside a cross-origin iframe.
 
   ?p=accounts | secret (default accounts). Closing is the parent's job — an iframe cannot
   close the modal that contains it, so we postMessage and the widget removes it.

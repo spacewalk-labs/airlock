@@ -61,6 +61,7 @@ STUB
 cat >"$SHIM/systemctl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$AIRLOCK_TEST_TMP/systemctl.log"
+case "$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left airlock-update-detect.timer airlock-update-detect.service' ;; esac
 exit 0
 STUB
 cat >"$SHIM/tailscale" <<'STUB'
@@ -595,9 +596,12 @@ cat >"$pkg/install.sh" <<'EOF'
 #!/usr/bin/env bash
 airlock_config get apps.full.required_text >/dev/null
 airlock_config get apps.full.default_num >/dev/null
-airlock_config get apps.full.base_port >/dev/null
-airlock_config get apps.full.span_count >/dev/null
-airlock_config get apps.full.serve_port >/dev/null
+base_port="$(airlock_config get apps.full.base_port)"
+span_count="$(airlock_config get apps.full.span_count)"
+serve_port="$(airlock_config get apps.full.serve_port)"
+test "$base_port" -gt 0
+test "$span_count" -gt 0
+test "$serve_port" -gt 0
 airlock_config get apps.full.options.leaf >/dev/null
 EOF
 chmod +x "$pkg/install.sh"
@@ -1334,6 +1338,388 @@ else
   failure_detail "$out57"
 fi
 
+# Incident control (2026-08-30): a package declared port=18832 while its unit
+# and backend used a separate literal 18832. The declared value therefore
+# looked globally unique but did not govern the listener. The bad fixture must
+# be red, and adding the literal platform read must turn the same fixture green.
+reset_box
+pkg="$PKGROOT/g57-port-unread"; mkpkg "$pkg" g57port
+pkg_manifest "$pkg" 'contract = 1' 'id = "g57port"' '[config.defaults]' 'port = 18832'
+cfg="$CFGROOT/g57-port-unread.toml"; make_pkg_cfg "$cfg" g57port "$pkg"
+expect_fail "G57a an unread port declaration is fatal" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+printf '%s\n' 'AIRLOCK_G57PORT_PORT' >"$pkg/.decoy-port-read"
+expect_fail "G57b a hidden decoy token is not runtime read evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/smoke.py" <<'PY'
+"""The name AIRLOCK_G57PORT_PORT is documentation, not a read."""
+probe = "AIRLOCK_G57PORT_PORT"
+PY
+expect_fail "G57b0 Python docstrings and inert strings are not port reads" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/smoke.py" <<'PY'
+import os
+os.environ["AIRLOCK_G57PORT_PORT"] = "9999"
+PY
+expect_fail "G57b0c a Python environment overwrite is not a read" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+printf '%s\n' '[Service]' 'Environment=PORT=$AIRLOCK_G57PORT_PORT' >"$pkg/decoy.service"
+expect_fail "G57b0b a unit assignment that overwrites the name is not a read" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '$AIRLOCK_G57PORT_PORT'
+EOF
+chmod +x "$pkg/install.sh"
+expect_fail "G57b0a a single-quoted shell token is not a port read" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+port=\$AIRLOCK_G57PORT_PORT
+EOF
+expect_fail "G57b0d an escaped shell token is not a port read" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "\$AIRLOCK_G57PORT_PORT"
+EOF
+expect_fail "G57b0d2 a double-quoted escaped argument is not a port read" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+cat <<'TEXT'
+port=$AIRLOCK_G57PORT_PORT
+TEXT
+EOF
+expect_fail "G57b0e a quoted heredoc token is not a port read" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+cat <<FIRST <<SECOND
+first body
+FIRST
+renderer --api-port "${AIRLOCK_G57PORT_PORT:?}"
+SECOND
+EOF
+expect_fail "G57b0e1 a second heredoc body is not command-argument evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+port=$(printf 9999); printf '%s\n' "airlock_config get apps.g57port.port"
+EOF
+expect_fail "G57b0f a quoted get outside the assigned substitution is not a port read" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+rm -f "$pkg/smoke.py"
+rm -f "$pkg/decoy.service"
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+: "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+chmod +x "$pkg/install.sh"
+expect_fail "G57b1 a shell no-op is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+dummy=1; : "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1a a prefixed shell no-op is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+if true; then : "${AIRLOCK_G57PORT_PORT:?}"; fi
+EOF
+expect_fail "G57b1b a branch-contained shell no-op is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+command : "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1c a command-wrapped shell no-op is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+builtin : "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1d a builtin-wrapped shell no-op is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+true --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1da a true command argument is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+IGNORED=1 true --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1db an assignment-prefixed true argument is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+env IGNORED=1 true --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1dc an env-wrapped true argument is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+env -i true --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1dd an option-bearing env true wrapper is not consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+env -u IGNORED true --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1de an env option value cannot hide a true no-op" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+env -S 'env -S true' --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1df nested env split-string cannot synthesize a passing true no-op" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/true --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1dg a path-qualified true command is not consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/env -i true --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1dh a path-qualified env wrapper is not consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+env -i /usr/bin/true --port "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57b1di env cannot hide a path-qualified true no-op" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+if : "${AIRLOCK_G57PORT_PORT:?}"; then true; fi
+EOF
+expect_fail "G57b1e a no-op condition is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+case x in x) : "${AIRLOCK_G57PORT_PORT:?}";; esac
+EOF
+expect_fail "G57b1f a case-contained no-op is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+airlock_config get apps.g57port.port >/dev/null
+EOF
+expect_fail "G57b2 a discarded config get is not port consumption evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/smoke.py" <<'PY'
+import os
+port = int(os.environ["AIRLOCK_G57PORT_PORT"])
+assert port > 0
+PY
+expect_ok "G57b3 a real Python environment read satisfies the contract" \
+  run "$cfg" validate
+rm -f "$pkg/smoke.py"
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+port="${AIRLOCK_G57PORT_PORT:?}"
+printf 'Environment=PORT=%s\n' "$port" >"$TMPDIR/g57port.unit"
+EOF
+chmod +x "$pkg/install.sh"
+expect_ok "G57c consuming the same declared port turns the fixture green" \
+  run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57c1 an arbitrary command argument is not listener ownership evidence" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "diagnostic --port ${AIRLOCK_G57PORT_PORT:?}"
+EOF
+expect_fail "G57c2 a port-shaped phrase inside one quoted argument stays inert" \
+  "declares port-ownership config key(s) its files never read: port" run "$cfg" validate
+
+# Follow-up incident control (2026-08-30): claude-fleet passes the platform
+# value straight to its package installer. This is the exact logical command
+# shape from the out-of-tree claude-fleet install.sh, including the
+# shell line continuations that the scanner normalises before classification.
+reset_box
+pkg="$PKGROOT/g57-claude-fleet-argv"; mkpkg "$pkg" claude-fleet
+pkg_manifest "$pkg" 'contract = 1' 'id = "claude-fleet"' \
+  '[config.defaults]' 'api_port = 18830' 'control_host = "control"' \
+  'key_host = "key"' 'key_file = "/tmp/key"' 'smoke_box = "box"'
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/python3 -B "$artifact/package.py" install --artifact "$artifact" \
+  --api-port "${AIRLOCK_CLAUDE_FLEET_API_PORT:?}" \
+  --control-host "${AIRLOCK_CLAUDE_FLEET_CONTROL_HOST:?}" \
+  --key-host "${AIRLOCK_CLAUDE_FLEET_KEY_HOST:?}" \
+  --key-file "${AIRLOCK_CLAUDE_FLEET_KEY_FILE:?}"
+EOF
+chmod +x "$pkg/install.sh"
+cfg="$CFGROOT/g57-claude-fleet-argv.toml"
+make_pkg_cfg "$cfg" claude-fleet "$pkg"
+expect_ok "G57d claude-fleet multiline command argument consumes api_port" \
+  run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+renderer --listen-port="${AIRLOCK_CLAUDE_FLEET_API_PORT:?}"
+EOF
+expect_ok "G57d0 an equals-form --*-port argument consumes api_port" \
+  run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+renderer --listen-port="${AIRLOCK_CLAUDE_FLEET_API_PORT:?}-suffix"
+EOF
+expect_fail "G57d0a a modified port option value is not ownership evidence" \
+  "declares port-ownership config key(s) its files never read: api_port" run "$cfg" validate
+cat >"$pkg/smoke.sh" <<'EOF'
+#!/usr/bin/env bash
+exec /usr/bin/python3 -B "$current/package.py" smoke \
+  --box "${AIRLOCK_CLAUDE_FLEET_SMOKE_BOX:?}" \
+  --port "${AIRLOCK_CLAUDE_FLEET_API_PORT:?}"
+EOF
+chmod +x "$pkg/smoke.sh"
+expect_ok "G57d1 claude-fleet smoke --port argument consumes api_port" \
+  run "$cfg" validate
+
+# A bare `port` and the conventional `*_port` spelling join one ownership
+# pool. Both packages really read their values, so this probes uniqueness
+# independently of the unread-port gate above.
+reset_box
+left="$PKGROOT/g57-port-left"; mkpkg "$left" g57left
+pkg_manifest "$left" 'contract = 1' 'id = "g57left"' '[config.defaults]' 'backend_port = 18832'
+cat >"$left/install.sh" <<'EOF'
+#!/usr/bin/env bash
+port="${AIRLOCK_G57LEFT_BACKEND_PORT:?}"
+test "$port" -gt 0
+EOF
+right="$PKGROOT/g57-port-right"; mkpkg "$right" g57right
+pkg_manifest "$right" 'contract = 1' 'id = "g57right"' '[config.defaults]' 'port = 18832'
+cat >"$right/install.sh" <<'EOF'
+#!/usr/bin/env bash
+port="${AIRLOCK_G57RIGHT_PORT:?}"
+test "$port" -gt 0
+EOF
+chmod +x "$left/install.sh" "$right/install.sh"
+cfg="$CFGROOT/g57-port-collision.toml"
+{
+  base_config
+  printf '[apps.g57left]\n[apps.g57right]\n'
+  printf '[packages.g57left]\npath = "%s"\n' "$left"
+  printf '[packages.g57right]\npath = "%s"\n' "$right"
+} >"$cfg"
+expect_fail "G57d bare port collides with backend_port" \
+  "port 18832 is used twice" run "$cfg" validate
+sed -i 's/port = 18832/port = 18833/' "$right/airlock-app.toml"
+expect_ok "G57e moving the bare port turns the collision fixture green" \
+  run "$cfg" validate
+
+# Port ownership can also be declared semantically under a non-port-shaped
+# name. It must get the same read gate; checking names alone would leave the
+# explicit manifest surfaces as a second escape route.
+reset_box
+pkg="$PKGROOT/g57-semantic-port"; mkpkg "$pkg" g57semantic
+pkg_manifest "$pkg" 'contract = 1' 'id = "g57semantic"' \
+  '[config.defaults]' 'listen = 18834' 'target = 18835' \
+  '[artifacts]' 'serve_ports = ["listen"]' \
+  '[serve.https]' 'listen = "target"'
+semantic_pkg="$pkg"
+cfg="$CFGROOT/g57-semantic-port.toml"; make_pkg_cfg "$cfg" g57semantic "$pkg"
+expect_fail "G57f unread package-owned semantic target is fatal" \
+  "files never read: target" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+target="${AIRLOCK_G57SEMANTIC_TARGET:?}"
+test "$target" -gt 0
+EOF
+chmod +x "$pkg/install.sh"
+expect_ok "G57g platform-owned listen needs no fake package read; consumed target is green" \
+  run "$cfg" validate
+
+# A key can be platform-owned as one HTTPS mapping's listen and package-owned
+# as another mapping's target. Target ownership must win over the listen
+# exemption or role overlap recreates the unread-listener escape.
+reset_box
+pkg="$PKGROOT/g57-overlap-port"; mkpkg "$pkg" g57overlap
+pkg_manifest "$pkg" 'contract = 1' 'id = "g57overlap"' \
+  '[config.defaults]' 'listen = 18837' 'target = 18838' 'backend = 18839' \
+  '[artifacts]' 'serve_ports = ["listen", "target"]' \
+  '[serve.https]' 'listen = "target"' 'target = "backend"'
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+backend="${AIRLOCK_G57OVERLAP_BACKEND:?}"
+test "$backend" -gt 0
+EOF
+chmod +x "$pkg/install.sh"
+cfg="$CFGROOT/g57-overlap-port.toml"; make_pkg_cfg "$cfg" g57overlap "$pkg"
+expect_fail "G57g1 target/listen overlap keeps the package target fatal" \
+  "files never read: target" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+target="${AIRLOCK_G57OVERLAP_TARGET:?}"
+backend="${AIRLOCK_G57OVERLAP_BACKEND:?}"
+test "$target" -ne "$backend"
+EOF
+expect_ok "G57g2 consuming the overlapping package target turns it green" \
+  run "$cfg" validate
+
+# The target is not named *_port, but [serve.https] makes it a real loopback
+# target. It must collide with an ordinary backend_port just like two named
+# port keys do.
+other="$PKGROOT/g57-semantic-other"; mkpkg "$other" g57semanticother
+pkg_manifest "$other" 'contract = 1' 'id = "g57semanticother"' \
+  '[config.defaults]' 'backend_port = 18835'
+cat >"$other/install.sh" <<'EOF'
+#!/usr/bin/env bash
+port="${AIRLOCK_G57SEMANTICOTHER_BACKEND_PORT:?}"
+test "$port" -gt 0
+EOF
+chmod +x "$other/install.sh"
+{
+  base_config
+  printf '[apps.g57semantic]\n[apps.g57semanticother]\n'
+  printf '[packages.g57semantic]\npath = "%s"\n' "$semantic_pkg"
+  printf '[packages.g57semanticother]\npath = "%s"\n' "$other"
+} >"$cfg"
+expect_fail "G57h semantic serve target collides with backend_port" \
+  "port 18835 is used twice" run "$cfg" validate
+sed -i 's/backend_port = 18835/backend_port = 18836/' "$other/airlock-app.toml"
+expect_ok "G57i moving the semantic target peer turns the fixture green" \
+  run "$cfg" validate
+
+# Nested table leaves are still config-owned listeners. Without this control a
+# package can move the exact same `port` spelling one level down and escape both
+# the read gate and the global pool.
+reset_box
+pkg="$PKGROOT/g57-nested-port"; mkpkg "$pkg" g57nested
+pkg_manifest "$pkg" 'contract = 1' 'id = "g57nested"' \
+  '[config.tables.listener]' 'allowed_keys = ["port"]'
+cfg="$CFGROOT/g57-nested-port.toml"
+{
+  base_config
+  printf '[apps.g57nested]\n[apps.g57nested.listener]\nport = 19904\n'
+  printf '[packages.g57nested]\npath = "%s"\n' "$pkg"
+} >"$cfg"
+expect_fail "G57j an unread nested port declaration is fatal" \
+  "files never read: listener.port" run "$cfg" validate
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+port="$(airlock_config get apps.g57nested.listener.port)"
+test "$port" -gt 0
+EOF
+chmod +x "$pkg/install.sh"
+sed -i 's/port = 19904/port = 19902/' "$cfg"
+expect_fail "G57k a nested port collides with a top-level port" \
+  "port 19902 is used twice" run "$cfg" validate
+sed -i 's/port = 19902/port = 19904/' "$cfg"
+expect_ok "G57l moving the nested port turns the fixture green" \
+  run "$cfg" validate
+
 reset_box
 pkg="$PKGROOT/g58-exclusions"; mkpkg "$pkg" g58
 printf '%s\n' 'AIRLOCK_G58_NOPE' >"$pkg/README"
@@ -1475,7 +1861,7 @@ cat >"$pkg/install.sh" <<'EOF'
 #!/usr/bin/env bash
 airlock_config get apps.g60b.port-bad
 EOF
-printf '#!/usr/bin/env bash\nexit 0\n' >"$pkg/smoke.sh"
+printf '#!/usr/bin/env bash\nport="${AIRLOCK_G60B_PORT:?}"\ntest "$port" -gt 0\n' >"$pkg/smoke.sh"
 chmod +x "$pkg"/*.sh
 cfg="$CFGROOT/g60b.toml"; make_pkg_cfg "$cfg" g60b "$pkg"
 expect_warn "G60b invalid key chain in a get read warns (no prefix truncation)" \
@@ -1601,7 +1987,8 @@ cat >"$pkg/install.sh" <<'SH'
 echo 'usage:
   airlock_config get apps.g60b.doc_line
 '
-airlock_config get apps.g60b.port >/dev/null
+port="$(airlock_config get apps.g60b.port)"
+test "$port" -gt 0
 SH
 chmod +x "$pkg/install.sh"
 expect_ok "G60w a multiline quoted usage block is not scanned" run "$cfg" validate
@@ -1622,7 +2009,8 @@ cat >"$pkg/install.sh" <<'SH'
 cat >/dev/null <<\USAGE
 example: airlock_config get apps.g60b.doc_only
 USAGE
-airlock_config get apps.g60b.port >/dev/null
+port="$(airlock_config get apps.g60b.port)"
+test "$port" -gt 0
 SH
 chmod +x "$pkg/install.sh"
 expect_ok "G60u a <<\\DELIM here-doc body is not scanned" run "$cfg" validate
@@ -1660,7 +2048,8 @@ expect_warn "G60r an escaped quote does not hide the next line's call" \
 cat >"$pkg/install.sh" <<'SH'
 #!/usr/bin/env bash
 # example: AIRLOCK_G60B_DOC_ONLY
-airlock_config get apps.g60b.port >/dev/null
+port="$(airlock_config get apps.g60b.port)"
+test "$port" -gt 0
 SH
 chmod +x "$pkg/install.sh"
 expect_ok "G60s an env reference in a comment is not a read" \
@@ -1694,7 +2083,8 @@ cat >"$pkg/install.sh" <<'SH'
 cat >/dev/null <<'USAGE'
 example: airlock_config get apps.g60b.not_a_real_key
 USAGE
-airlock_config get apps.g60b.port >/dev/null
+port="$(airlock_config get apps.g60b.port)"
+test "$port" -gt 0
 SH
 chmod +x "$pkg/install.sh"
 expect_ok "G60n a here-doc body is not scanned as code" run "$cfg" validate
@@ -1703,7 +2093,8 @@ cat >"$pkg/install.sh" <<'SH'
 #!/usr/bin/env bash
 echo "usage: airlock_config get apps.g60b.some_key"
 true ;# airlock_config get apps.g60b.other_key
-airlock_config get apps.g60b.port >/dev/null
+port="$(airlock_config get apps.g60b.port)"
+test "$port" -gt 0
 SH
 chmod +x "$pkg/install.sh"
 expect_ok "G60o quoted and ;#-commented examples are not call sites" \

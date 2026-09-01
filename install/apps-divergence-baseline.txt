@@ -129,7 +129,6 @@ content	apps/devterm/install.sh
 content	apps/devterm/render.sh
 content	apps/devterm/smoke.sh
 content	apps/devterm/test-accounts.py
-content	apps/devterm/web/accounts.js
 content	apps/devterm/web/app.js
 content	apps/devterm/web/index.html
 content	apps/feedback/backend/airlock-feedback.py
@@ -194,6 +193,12 @@ content	apps/paseo/patches/credential-key-preservation.test.mjs
 # devmon_tokens.py stays a pure (raw JSON, clock) verdict engine. The public mirror
 # receives it at the next publish sync; it is not a permanent private-only file.
 only-work	apps/dev-monitor/backend/devmon_accounts.py
+# 13) 2026-09-01 update detection: this is a dev-monitor package backend helper, not
+# a platform-only test. The platform-owned daily unit invokes it from the installed
+# dev-monitor package, so it belongs in the next public app mirror. This work tree is
+# the live consumer until that sync; recording this exact temporary only-work path
+# preserves the gate's refusal of any unrelated private backend module.
+only-work	apps/dev-monitor/backend/devmon_updates.py
 # 8) 2026-08-22 secret drop double header: the embedded panel drew a second title bar
 #    inside the widget's own, because the guard keyed on `close` (which panel.html hands
 #    over precisely when embedded) instead of on who owns the window. The fix edits
@@ -269,3 +274,49 @@ only-work	apps/paseo/test-uistate-backend.py
 #     README, smoke, test-backend) is already tracked above; this is the one path
 #     that had stayed byte-identical until now.
 content	apps/dev-monitor/backend/devmon_cron.py
+# 11) 2026-09-01 platform default agent CLI: the action runner stopped having 'claude'
+#     written into its argv and now reads the platform's [agent].provider, and learning
+#     carries the vendored copy of the platform selection rule (bin/agent_provider.py —
+#     a package cannot import from the platform tree, so the copy is the mechanism, and
+#     install/test-agent-provider.sh pins it byte-identical). Batch 1's shape again:
+#     work is the live consumer and the published copy is behind until the next publish
+#     sync, not a designed split. Every other file the change touched inside apps/
+#     (airlock-dev-monitor.py, install.sh, render.sh, test_devmon.py, learning's
+#     providers.py) is already tracked above; these two paths are the new ones.
+content	apps/dev-monitor/backend/action_runner.py
+only-work	apps/learning/backend/agent_provider.py
+# 12) 2026-09-01 ACCT_OWN: the subscription account panel moved from devterm to the
+#     platform (hub/assets/accounts/). Same shape as batch 10 above it in the
+#     ownership sense — the work tree deliberately no longer has these two paths, and
+#     airlock-apps keeps them until the next publish sync. accounts.js was a content
+#     split and panel.html was byte-identical; both become only-apps, and changing a
+#     kind is part of an ownership move rather than new drift.
+only-apps	apps/devterm/web/accounts.js
+only-apps	apps/devterm/web/panel.html
+# 14) 2026-09-01 update execution (UPD_EXEC): the wrapper the approved-action runner
+#    execs to run bin/airlock-update and capture the before/after airlock-status
+#    summary. Same shape and same reason as batch 13's devmon_updates.py directly
+#    above — a dev-monitor package backend helper, not a platform-only test — so it
+#    belongs in the next public app mirror and this work tree is the live consumer
+#    until that sync. Recording this exact temporary only-work path keeps the gate
+#    refusing any unrelated private backend module. The rest of the change edits
+#    paths already tracked above (airlock-dev-monitor.py, install.sh, test-backend.py).
+only-work	apps/dev-monitor/backend/devmon_update_exec.py
+# 15) 2026-09-01 learning publish route (#297): the fix that stopped the published
+#    "주소 복사" button assembling a :8000 URL edited two files that airlock-apps also
+#    carries, so both became content drift — and the entry was not added, which left
+#    `main` itself red on this gate. Recorded here, not reverted: the fix is correct
+#    and the public copy receives it at the next publish sync, exactly like batch 1.
+#    Measured against airlock-apps f9ec7c7 — 1125517 (before #297) rc=0 extra=0 ·
+#    efa5c28 (#297) rc=1 extra=2 · 72018db (#293 on top of it) rc=1, the same 2 paths
+#    and no new one. So this is #297's split alone; #293 only inherited a red main.
+content	apps/learning/backend/airlock-learning.py
+content	apps/learning/frontend/learning.html
+# 16) 2026-09-01 harness section (HARNESS_PANEL): the wrapper the approved-action runner
+#    execs to upgrade the Codex CLI, and the read side of the settings panel's four
+#    harness layers. Same shape and same reason as batches 13 and 14 directly above —
+#    a dev-monitor package backend helper, not a platform-only test — so it belongs in
+#    the next public app mirror and this work tree is the live consumer until that sync.
+#    The rest of the change edits paths already tracked above (airlock-dev-monitor.py,
+#    devmon_updates.py, devmon_update_exec.py, install.sh, test-backend.py).
+only-work	apps/dev-monitor/backend/devmon_harness.py

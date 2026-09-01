@@ -111,25 +111,37 @@ if (!web.includes(`const PINNED_SHA = "${manifest.web_ui.sha256}";`)) {
 if (!web.includes(`const PINNED_VERSION = "${manifest.web_ui.version}";`)) {
   throw new Error("anchor manifest web-ui version does not match patch-web-ui.js");
 }
-const webStateConstants = {
-  GENERAL_ONLY_SHA: manifest.web_ui.general_only_sha256,
-  BROWSE_ONLY_SHA: manifest.web_ui.browse_only_sha256,
-  COMBINED_SHA: manifest.web_ui.combined_sha256,
-  THREE_ANCHOR_BROWSE_ONLY_SHA: manifest.web_ui.three_anchor_browse_only_sha256,
-  THREE_ANCHOR_COMBINED_SHA: manifest.web_ui.three_anchor_combined_sha256,
-  ONE_ANCHOR_GENERAL_ONLY_SHA: manifest.web_ui.one_anchor_general_only_sha256,
-  ONE_ANCHOR_GENERAL_COMBINED_SHA: manifest.web_ui.one_anchor_general_combined_sha256,
-  ONE_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA:
-    manifest.web_ui.one_anchor_general_three_anchor_browse_sha256,
-  TWO_ANCHOR_GENERAL_ONLY_SHA: manifest.web_ui.two_anchor_general_only_sha256,
-  TWO_ANCHOR_GENERAL_COMBINED_SHA: manifest.web_ui.two_anchor_general_combined_sha256,
-  TWO_ANCHOR_GENERAL_THREE_ANCHOR_BROWSE_SHA:
-    manifest.web_ui.two_anchor_general_three_anchor_browse_sha256,
-};
-for (const [name, value] of Object.entries(webStateConstants)) {
-  if (!web.includes(`const ${name} = "${value}";`)) {
-    throw new Error(`anchor manifest ${name} does not match patch-web-ui.js`);
+// The manifest's shape table must mirror patch-web-ui.js exactly. Compared as data,
+// not by grepping for constant names: the shapes ARE the pin, and a manifest that
+// merely looks similar would let a box in an unlisted state be refused at install
+// time on a box nobody tested. Order-insensitive on the edits within a shape, since
+// the eight edit sites are disjoint and the set is what identifies the bytes.
+const patcher = require(webPath);
+const shapeKey = (sha256, edits) => `${sha256}:${[...edits].sort().join("|")}`;
+const manifestShapes = (manifest.web_ui.shapes ?? []).map((shape) =>
+  shapeKey(shape.sha256, shape.edits));
+const patcherShapes = patcher.KNOWN_BUNDLE_SHAPES.map((shape) =>
+  shapeKey(shape.sha, shape.edits));
+if (manifestShapes.length !== patcherShapes.length
+    || [...manifestShapes].sort().join("\n") !== [...patcherShapes].sort().join("\n")) {
+  throw new Error("anchor manifest shape table does not match patch-web-ui.js KNOWN_BUNDLE_SHAPES");
+}
+// Every edit a shape names must be a real anchor in one of the two groups, or the
+// shape can never match and the box carrying it is refused for no reason.
+const editNames = new Set([
+  ...patcher.SUBAGENT_STREAM_PATCHES.map((patch) => patch.name),
+  ...patcher.BROWSE_PATCHES.map((patch) => patch.name),
+]);
+for (const shape of manifest.web_ui.shapes) {
+  for (const edit of shape.edits) {
+    if (!editNames.has(edit)) throw new Error(`anchor manifest shape names an unknown edit: ${edit}`);
   }
+}
+// The tablet "+" fix is an always-on edit, not a browse-group one. It shipped from
+// the optional group until 2026-09-01, which silently withheld it from every box
+// running the default `browse = false`.
+if (!patcher.SUBAGENT_STREAM_PATCHES.some((patch) => patch.name === "project-actions-coarse-pointer")) {
+  throw new Error("project-actions-coarse-pointer left the always-on group");
 }
 
 const expected = new Set([
@@ -166,7 +178,7 @@ if (subagent.paired_with !== "patch-web-ui:subagent-stream") {
 console.log("manifest agrees with the pinned version, SHA, anchors, and ordering");
 NODE
 if [ "$manifest_rc" -eq 0 ]; then
-  ok "anchor manifest: version, all state SHAs, eight patchers, and pair/order contracts"
+  ok "anchor manifest: version, shape table, eight patchers, and pair/order contracts"
 else
   bad "anchor manifest: version/SHA/coverage/order contract"
   sed 's/^/    /' "$manifest_out"
@@ -680,11 +692,10 @@ const patches = [
     find: '{style:u.container,children:[S,_,I]})',
     repl: '{style:u.container,dataSet:{paseoBrowserId:w,paseoWorkspaceId:f.workspaceId,paseoServerId:f.serverId},children:[S,_,I]})',
   },
-  {
-    find: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l,',
-    repl: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches,',
-  },
 ];
+// The coarse-pointer edit is deliberately absent: it moved to the always-on group on
+// 2026-09-01, and this fixture drives the legacy `(source, expectedSha)` seam, which
+// is browse-only. Its own coverage lives in patch-web-ui.test.js.
 const pristine = patches.map((patch) => patch.find).join("\n");
 const fixtureSha = crypto.createHash("sha256").update(pristine).digest("hex");
 
@@ -712,10 +723,10 @@ try {
   negativeFailed = /new-browser-gate-Wo/.test(String(err));
 }
 if (!negativeFailed) throw new Error("missing web-ui anchor did not fail the positive assertion");
-console.log("four replacements, marker, idempotence, and missing-anchor refusal asserted");
+console.log("three replacements, marker, idempotence, and missing-anchor refusal asserted");
 NODE
 if [ "$WEB_RC" -eq 0 ]; then
-  ok "web-ui patch core: patches all four anchors and rejects a missing-anchor fixture"
+  ok "web-ui patch core: patches all three browse anchors and rejects a missing-anchor fixture"
 else
   bad "web-ui patch core: synthetic fixture contract"
   sed 's/^/    /' "$WEB_OUT"

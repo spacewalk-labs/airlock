@@ -68,6 +68,7 @@ STUB
 cat >"$SHIM/systemctl" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TMP/systemctl.log"
+case "\$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left airlock-update-detect.timer airlock-update-detect.service' ;; esac
 case "\$*" in *daemon-reload*) [ -e "$TMP/reload-fails" ] && exit 1 ;; esac
 # Real systemd's \`disable\` REMOVES a symlinked unit file itself. Opt-in seam
 # (flag file) so a test can model that; every other test sees the old shim.
@@ -140,7 +141,9 @@ manifest() {
 # invoked, so the fixtures can assert env + cwd. install.sh writes one declared
 # webroot marker and one data file; deactivate removes the marker, keeps data.
 mkpkg() {
-  local dir="$1" id="$2" deact="${3:-1}"
+  local dir="$1" id="$2" deact="${3:-1}" env_id
+  env_id="${id^^}"
+  env_id="${env_id//-/_}"
   mkdir -p "$dir"
   cat >"$dir/airlock-app.toml" <<EOF
 contract = 1
@@ -154,6 +157,10 @@ EOF
   cat >"$dir/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_${env_id}_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 printf 'ROOT=%s DIR=%s ID=%s CWD=%s\n' "\$AIRLOCK_ROOT" "\$AIRLOCK_APP_DIR" "\$AIRLOCK_APP_ID" "\$PWD" >> "$TMP/invoke-\$AIRLOCK_APP_ID.log"
 mkdir -p "\$AIRLOCK_WEBROOT/\$AIRLOCK_APP_ID"
 printf 'marker\n' > "\$AIRLOCK_WEBROOT/\$AIRLOCK_APP_ID/marker"
@@ -706,6 +713,10 @@ EOF
 cat > "$F7/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_T2_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 printf 'v2\n' >> "$TMP/invoke-t2.log"
 EOF
 cat > "$F7/pkg/smoke.sh" <<'EOF'
@@ -782,6 +793,10 @@ F9="$TMP/f9"; mkdir -p "$F9/cfg"; mkpkg "$F9/pkg" t4 1
 cat > "$F9/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_T4_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/t4"; printf 'marker\n' > "\$AIRLOCK_WEBROOT/t4/marker"
 exit 1
 EOF
@@ -812,6 +827,10 @@ mkdir -p "$F9/cfg"; mkpkg "$F9/pkg" t4 1
 cat > "$F9/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_T4_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/t4"; printf 'marker\n' > "\$AIRLOCK_WEBROOT/t4/marker"
 exit 1
 EOF
@@ -857,6 +876,37 @@ else
 fi
 exec 8>&-
 rm -f "$STATE/app-ledger.json"
+
+# A restore caller that already owns the exact lock file may hand the open
+# descriptor into the orchestrator. Before this contract the orchestrator
+# opened fd 9 independently and failed against the caller's still-held lock;
+# releasing first created the writer race this test is meant to prevent.
+reset_box
+mkdir -p "$F9/cfg" "$STATE"; mkpkg "$F9/pkg" t4 1
+cat >>"$F9/pkg/install.sh" <<'EOF'
+(sleep 5) </dev/null >/dev/null 2>&1 &
+EOF
+mkcfg "$F9/cfg/inherited.toml" "[apps.t4]" "backend_port = 18904" \
+                               "[packages.t4]" "path = \"$F9/pkg\""
+exec 8>>"$STATE/app-ledger.lock"
+if flock -n 8; then
+  out="$(orch "$F9/cfg/inherited.toml" AIRLOCK_LEDGER_LOCK_FD=8 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" = 0 ] && [ "$(ledger_field t4 x '"committed" in e')" = True ]; then
+    ok "F9c: inherited exact lock fd closes the restore-to-installer handoff"
+  else
+    bad "F9c: inherited lock handoff failed (rc=$rc, out=${out:0:160})"
+  fi
+else
+  bad "F9c: could not take the inherited-handoff test lock"
+fi
+exec 8>&-
+exec 7>>"$STATE/app-ledger.lock"
+if flock -n 7; then
+  ok "F9c: inherited lock is still closed before lifecycle background children"
+else
+  bad "F9c: a lifecycle background child leaked the inherited lock"
+fi
+exec 7>&-
 
 # =============================================================================
 # Non-interference: no-packages runs and dry runs
@@ -1213,6 +1263,10 @@ EOF
 cat > "$CM/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_T11_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/shared-x"; printf 'f\n' > "\$AIRLOCK_WEBROOT/shared-x/f"
 EOF
 cat > "$CM/pkg/smoke.sh" <<'EOF'
@@ -1245,6 +1299,10 @@ EOF
 cat > "$GR/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_T12_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/gx"; printf 'f\n' > "\$AIRLOCK_WEBROOT/gx/f"
 EOF
 cat > "$GR/pkg/smoke.sh" <<'EOF'
@@ -1298,6 +1356,10 @@ EOF
 cat > "$CS/p1/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_V1_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 printf 's\n' > "$CS/real/shared"
 EOF
 cat > "$CS/p1/smoke.sh" <<'EOF'
@@ -1388,6 +1450,10 @@ EOF
 cat > "$DI/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_DI_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/di-old"; printf 'p\n' > "\$AIRLOCK_WEBROOT/di-old/partial"
 exit 1
 EOF
@@ -1400,6 +1466,10 @@ EOF
 cat > "$DI/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_DI_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/di-new"; printf 'n\n' > "\$AIRLOCK_WEBROOT/di-new/f"
 EOF
 out="$(orch "$DI/cfg/airlock.toml" 2>&1)" && rc=0 || rc=$?
@@ -1427,6 +1497,10 @@ EOF
 cat > "$SV/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_SV_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/sv-a"; printf 'a\n' > "\$AIRLOCK_WEBROOT/sv-a/f"
 EOF
 mkcfg "$SV/cfg/airlock.toml" "[apps.sv]" "backend_port = 18929" "[packages.sv]" "path = \"$SV/pkg\""
@@ -1438,6 +1512,10 @@ EOF
 cat > "$SV/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_SV_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/sv-b"; printf 'b\n' > "\$AIRLOCK_WEBROOT/sv-b/partial"
 exit 1
 EOF
@@ -1448,6 +1526,11 @@ webroot = ["sv-c/"]
 EOF
 cat > "$SV/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
+set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_SV_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 exit 1
 EOF
 out="$(orch "$SV/cfg/airlock.toml" 2>&1)" && rc=0 || rc=$?
@@ -1475,6 +1558,10 @@ EOF
 cat > "$CV/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_CV_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/cv"
 printf 'app\n' > "\$AIRLOCK_WEBROOT/cv/app.js"
 [ -f "\$AIRLOCK_WEBROOT/cv/db.sqlite" ] || printf 'data\n' > "\$AIRLOCK_WEBROOT/cv/db.sqlite"
@@ -1516,6 +1603,10 @@ EOF
 cat > "$DV/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_DV_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 mkdir -p "\$AIRLOCK_WEBROOT/dv"
 printf 'i\n' > "\$AIRLOCK_WEBROOT/dv/index.html"
 printf 'SECRET=x\n' > "\$AIRLOCK_WEBROOT/dv/.env"
@@ -1560,7 +1651,7 @@ serve_ports = ["port"]
 EOF
 mkcfg "$PU/airlock.toml" "[apps.pu]" "port = 443" "[packages.pu]" "path = \"$PU/pkg\""
 msg="$(run "$PU/airlock.toml" validate 2>&1)" && bad "ports: serve key 'port' = 443 accepted" || {
-  grep -q "TLS entrypoint" <<<"$msg" \
+  grep -Eq "TLS entrypoint|port 443 is used twice" <<<"$msg" \
     && ok "ports: 443 is reserved — never an app's serve port" \
     || bad "ports: wrong message: $msg"; }
 # "other" is a second package (child 4/P3: a bare unpackaged [apps.X] is
@@ -1576,7 +1667,7 @@ id = "other"
 [config.defaults]
 backend_port = 18900
 EOF
-printf '#!/usr/bin/env bash\ntrue\n' >"$PU/other-pkg/install.sh"
+printf '#!/usr/bin/env bash\nport="${AIRLOCK_OTHER_BACKEND_PORT:?}"\ntest "$port" -gt 0\n' >"$PU/other-pkg/install.sh"
 cp "$PU/other-pkg/install.sh" "$PU/other-pkg/smoke.sh"
 mkcfg "$PU/airlock.toml" "[apps.other]" "backend_port = 18940" "[packages.other]" "path = \"$PU/other-pkg\"" \
       "[apps.pu]" "port = 18940" "[packages.pu]" "path = \"$PU/pkg\""
@@ -1671,6 +1762,10 @@ EOF
 cat > "$HH/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_HH_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 printf 'h\n' > "\$HOME/hh-file"
 exit 1
 EOF
@@ -1707,6 +1802,10 @@ EOF
 cat > "$IR/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_IR_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 printf '[Unit]\n' > "$UU/ir.service"
 exit 1
 EOF
@@ -2813,6 +2912,10 @@ EOF
 cat > "$DG/pkg/install.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+airlock_load "\$AIRLOCK_APP_ID"
+fixture_port="\${AIRLOCK_DG_BACKEND_PORT:?}"
+test "\$fixture_port" -gt 0
 printf '[Unit]\n' > "$UU/dg.service"
 EOF
 cat > "$DG/pkg/smoke.sh" <<'EOF'

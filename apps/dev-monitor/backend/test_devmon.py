@@ -4141,6 +4141,190 @@ class TestRunner(unittest.TestCase):
         self.assertTrue(os.path.exists(fresh))               # do not remove settings for a running run
 
 
+class TestRunnerAgent(unittest.TestCase):
+    """Which agent CLI the runner starts, and what it does when it cannot find out.
+
+    The compatibility half of this is the point: `[agent].provider` arrived after boxes were
+    already running approved actions, and on those boxes the plan carries no agent at all.
+    Every one of them has to keep starting claude with the same argv it always did.
+    """
+
+    CODEX = {'provider': 'codex', 'command': 'codex', 'binary': '/opt/codex',
+             'reason': 'pinned', 'turnend_hook': False}
+
+    def _selector(self, prints):
+        """Write a fake bin/airlock-agent that prints `prints`, and return its path.
+
+        A PYTHON file left non-executable, because that is what it stands in for: the real
+        bin/airlock-agent is mode 100644 and the runner spawns an interpreter for it. A fake
+        with a #!/bin/sh shebang and the executable bit would pass a runner that exec'd the
+        path directly — the very thing this must not do.
+        """
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'airlock-agent')
+        with open(path, 'w') as f:
+            f.write('import sys\nsys.stdout.write(%r)\n' % prints)
+        os.chmod(path, 0o644)
+        return path
+
+    def _selector_rc(self, code):
+        """A fake selector that exits non-zero without printing."""
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'airlock-agent')
+        with open(path, 'w') as f:
+            f.write('raise SystemExit(%d)\n' % code)
+        os.chmod(path, 0o644)
+        return path
+
+    # ---- argv per provider ----
+    def test_no_agent_in_plan_is_the_old_claude_argv(self):
+        # A plan written before this key existed, and a box that never set it, are the same
+        # case and must both be indistinguishable from the previous release.
+        for plan in ({'cwd': '/x', 'prompt': 'hi'},
+                     {'cwd': '/x', 'prompt': 'hi', 'agent': {}},
+                     {'cwd': '/x', 'prompt': 'hi', 'agent': {'provider': '', 'select_bin': ''}}):
+            argv = action_runner.build_argv(plan, '/tmp/s.json',
+                                            action_runner.resolve_agent(plan.get('agent')))
+            self.assertEqual(argv, ['claude', '--settings', '/tmp/s.json', '--', 'hi'])
+
+    def test_codex_argv_uses_exec_and_no_settings(self):
+        # `--settings` is claude's flag. Passing it to codex would be a parse error, and the
+        # Stop hook it installs is a claude concept codex would never fire.
+        argv = action_runner.build_argv({'cwd': '/x', 'prompt': 'hi'}, '/tmp/s.json', self.CODEX)
+        self.assertEqual(argv, ['/opt/codex', 'exec', '--', 'hi'])
+        self.assertNotIn('--settings', argv)
+
+    def test_codex_keeps_the_positional_first_input_contract(self):
+        # The injection guarantee is per-provider or it is not a guarantee: the first input is
+        # one argv element and it sits after '--', whichever CLI runs.
+        argv = action_runner.build_argv({'cwd': '/x', 'prompt': '--dangerously-bypass-approvals-and-sandbox'},
+                                        None, self.CODEX)
+        self.assertEqual(argv.index('--'), len(argv) - 2)
+        self.assertEqual(argv[-1], '--dangerously-bypass-approvals-and-sandbox')
+        self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', argv[:argv.index('--')])
+
+    def test_codex_skill_is_one_element(self):
+        argv = action_runner.build_argv({'cwd': '/x', 'skill': 'harness-gardener', 'args': 'a b'},
+                                        None, self.CODEX)
+        self.assertEqual(argv[-1], '/harness-gardener a b')
+
+    def test_no_provider_gets_a_model_flag(self):
+        # Owner decision 5, as a test rather than a comment: the model is the CLI's to pick.
+        for agent in (None, self.CODEX):
+            argv = action_runner.build_argv({'cwd': '/x', 'prompt': 'hi'}, None, agent)
+            self.assertNotIn('--model', argv)
+            self.assertNotIn('-m', argv)
+
+    def test_exec_ignores_the_agent_entirely(self):
+        argv = action_runner.build_argv({'cwd': '/x', 'exec': ['/bin/echo', 'a']}, '/tmp/s.json',
+                                        self.CODEX)
+        self.assertEqual(argv, ['/bin/echo', 'a'])
+
+    # ---- resolution ----
+    def test_selection_is_read_from_the_selector(self):
+        # A REAL executable, because the runner now checks that the path it was handed is one
+        # — a fictional path would make this pass for the wrong reason (or, as it did once,
+        # fail for one).
+        found = os.path.join(tempfile.mkdtemp(), 'codex')
+        with open(found, 'w') as f:
+            f.write('#!/bin/sh\n')
+        os.chmod(found, 0o755)
+        sel = self._selector('{"schema_version":1,"provider":"codex","command":"codex",'
+                             '"binary":"%s","reason":"pinned"}' % found)
+        agent = action_runner.resolve_agent({'provider': 'auto', 'select_bin': sel})
+        self.assertEqual((agent['provider'], agent['binary']), ('codex', found))
+        self.assertFalse(agent['turnend_hook'])
+
+    def test_unconfigured_plan_is_silent_but_half_configured_is_not(self):
+        # 🔴 Found by adversarial review 2026-09-01. The two cases look alike and are not.
+        # NEITHER field = a box that never set [agent].provider: ordinary, not an event, so a
+        # line here would print on every run of every box that never opted in.
+        # ONE field = a box that DID configure a provider whose selector did not arrive — the
+        # likeliest cause being a unit rendered before this feature and never re-rendered.
+        # That box's airlock.toml says codex while claude runs, which is the exact failure
+        # this change exists to remove, so it cannot be the quiet case.
+        for spec in (None, {}, {'provider': '', 'select_bin': ''}):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                action_runner.resolve_agent(spec)
+            self.assertEqual(err.getvalue(), '', spec)
+        for spec in ({'provider': 'codex'}, {'select_bin': '/nonexistent/airlock-agent'}):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                agent = action_runner.resolve_agent(spec)
+            self.assertEqual(agent['provider'], 'claude', spec)
+            self.assertIn('action_runner', err.getvalue(), spec)
+
+    def test_true_is_not_schema_version_one(self):
+        # 🔴 Found by adversarial review 2026-09-01: in Python `True == 1`, so a selector
+        # answering `"schema_version": true` passed an `== 1` version check and its answer was
+        # then trusted. Same guard learning already applies to the login-state payload.
+        sel = self._selector('{"schema_version":true,"provider":"codex",'
+                             '"command":"codex","binary":"/bin/sh"}')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            agent = action_runner.resolve_agent({'provider': 'auto', 'select_bin': sel})
+        self.assertEqual(agent['provider'], 'claude')
+        self.assertIn('unknown schema', err.getvalue())
+
+    def test_command_name_comes_from_this_runner_not_the_answer(self):
+        # 🔴 Found by adversarial review 2026-09-01. The runner has to know each provider it
+        # accepts anyway (to decide the turn-end hook), so reading the command name from its
+        # own table costs nothing and removes a way for a wrong answer to name another program.
+        sel = self._selector('{"schema_version":1,"provider":"codex",'
+                             '"command":"sh","reason":"r"}')
+        agent = action_runner.resolve_agent({'provider': 'auto', 'select_bin': sel})
+        self.assertEqual(agent['command'], 'codex')
+        self.assertEqual(action_runner.build_argv({'cwd': '/x', 'prompt': 'p'}, None, agent),
+                         ['codex', 'exec', '--', 'p'])
+
+    def test_unusable_binary_keeps_the_provider_and_drops_the_path(self):
+        # A stale path must not silently become "run claude instead": on a codex box that is
+        # the wrong CLI. Keep the provider, drop the path, say so — resolve_exe then searches
+        # by name and reports what it looked for if that fails too.
+        for named in ('/etc/hostname', 'codex', '/nonexistent/codex'):
+            sel = self._selector('{"schema_version":1,"provider":"codex","command":"codex",'
+                                 '"binary":"%s","reason":"r"}' % named)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                agent = action_runner.resolve_agent({'provider': 'auto', 'select_bin': sel})
+            self.assertEqual(agent['provider'], 'codex', named)
+            self.assertIsNone(agent['binary'], named)
+            self.assertIn('not an executable file', err.getvalue(), named)
+
+    def test_broken_selector_falls_back_to_claude_loudly(self):
+        # A selector that cannot answer must not take away a capability the box had yesterday,
+        # and must not do it quietly — the pane stays open, so the reason is readable there.
+        cases = {
+            'missing': '/nonexistent/airlock-agent',
+            'nonzero': self._selector_rc(3),
+            'garbage': self._selector('not json'),
+            'unknown schema': self._selector('{"schema_version":99}'),
+            'unknown provider': self._selector(
+                '{"schema_version":1,"provider":"gemini","command":"gemini"}'),
+        }
+        for label, sel in cases.items():
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                agent = action_runner.resolve_agent({'provider': 'auto', 'select_bin': sel})
+            self.assertEqual(agent['provider'], 'claude', label)
+            self.assertTrue(agent['turnend_hook'], label)
+            self.assertIn('action_runner', err.getvalue(), label)
+            self.assertIn('claude', err.getvalue(), label)
+            # and the argv is byte-for-byte the pre-key one
+            self.assertEqual(action_runner.build_argv({'cwd': '/x', 'prompt': 'hi'}, None, agent),
+                             ['claude', '--', 'hi'])
+
+    def test_no_cli_at_all_is_reported_not_swallowed(self):
+        # "nothing is installed" is an answer. Falling back to claude here would replace a
+        # sentence the owner can act on with a bare rc=127.
+        sel = self._selector('{"schema_version":1,"provider":null,'
+                             '"binary":null,"reason":"no agent CLI is installed"}')
+        with self.assertRaises(FileNotFoundError) as caught:
+            action_runner.resolve_agent({'provider': 'auto', 'select_bin': sel})
+        self.assertIn('no agent CLI is installed', str(caught.exception))
+
+
 class FakeHeaders(dict):
     def get(self, k, default=''):
         return super().get(k, default)
@@ -4158,6 +4342,27 @@ class FakeHandler:
 
 
 class TestOwnerGate(unittest.TestCase):
+    def test_load_gate_config_none(self):
+        for k in devmon_owner._GATE_REQUIRED:
+            os.environ.pop(k, None)
+        self.assertIsNone(devmon_owner.load_gate_config())
+
+    def test_load_gate_config_partial_fails_closed(self):
+        os.environ['DEV_MONITOR_OWNER'] = 'owner@example.test'
+        os.environ.pop('DEV_MONITOR_PROXY_SECRET', None)
+        with self.assertRaises(devmon_owner.ConfigError):
+            devmon_owner.load_gate_config()
+        os.environ.pop('DEV_MONITOR_OWNER', None)
+
+    def test_load_gate_config_full(self):
+        env = {'DEV_MONITOR_OWNER': 'owner@example.test',
+               'DEV_MONITOR_PROXY_SECRET': 's3cr3t'}
+        os.environ.update(env)
+        self.assertEqual(devmon_owner.load_gate_config(),
+                         {'owner': 'owner@example.test', 'secret': 's3cr3t'})
+        for k in env:
+            os.environ.pop(k, None)
+
     def test_load_config_none(self):
         for k in devmon_owner._REQUIRED:
             os.environ.pop(k, None)

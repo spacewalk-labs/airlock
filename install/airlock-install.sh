@@ -18,8 +18,9 @@ AIRLOCK_CONFIG_BIN="$ROOT/bin/airlock-config"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
 
-# This marker is asserted only after this process acquires fd 9 below. Never
-# trust a value inherited from a parent shell as proof of lock ownership.
+# This marker is asserted only after this process acquires or verifies the
+# ledger lock below. Never trust a value inherited from a parent shell as
+# proof of lock ownership.
 unset AIRLOCK_LEDGER_LOCK_HELD AIRLOCK_CONFIG_SNAPSHOT \
   AIRLOCK_CONFIG_SNAPSHOT_SHA256
 
@@ -152,8 +153,26 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] \
   _state_dir="${AIRLOCK_STATE_DIR:-$_state_dir}"
   LEDGER_FILE="$_state_dir/app-ledger.json"
   RETIREMENT_FILE="$_state_dir/plaintext-retirement.json"
-  exec 9>>"$_state_dir/app-ledger.lock"
-  flock -n 9 || die "another airlock run holds the ledger lock ($_state_dir/app-ledger.lock) — one writer at a time; re-run when it finishes"
+  if [ -n "${AIRLOCK_LEDGER_LOCK_FD:-}" ]; then
+    case "$AIRLOCK_LEDGER_LOCK_FD" in
+      *[!0-9]*) die "inherited ledger lock fd must be an open descriptor >= 3" ;;
+    esac
+    [ "$AIRLOCK_LEDGER_LOCK_FD" -ge 3 ] 2>/dev/null \
+      || die "inherited ledger lock fd must be an open descriptor >= 3"
+    [ -f "/proc/self/fd/$AIRLOCK_LEDGER_LOCK_FD" ] \
+      && [ "/proc/self/fd/$AIRLOCK_LEDGER_LOCK_FD" -ef "$_state_dir/app-ledger.lock" ] \
+      || die "inherited ledger lock fd does not name $_state_dir/app-ledger.lock"
+    flock -n "$AIRLOCK_LEDGER_LOCK_FD" \
+      || die "inherited ledger lock fd is not available ($_state_dir/app-ledger.lock)"
+    if [ "$AIRLOCK_LEDGER_LOCK_FD" != 9 ]; then
+      eval "exec 9<&$AIRLOCK_LEDGER_LOCK_FD"
+      eval "exec $AIRLOCK_LEDGER_LOCK_FD>&-"
+    fi
+  else
+    exec 9>>"$_state_dir/app-ledger.lock"
+    flock -n 9 || die "another airlock run holds the ledger lock ($_state_dir/app-ledger.lock) — one writer at a time; re-run when it finishes"
+  fi
+  unset AIRLOCK_LEDGER_LOCK_FD
   # Sidecar mutation commands are also directly dispatchable. Tell them this
   # process already owns the shared writer lock so they neither deadlock nor
   # admit a concurrent manual recovery mutation into this run.
@@ -372,6 +391,11 @@ fi
 # helper owns both render/install and the symmetric explicit teardown path.
 log "installing platform secret TTL timer"
 AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-secret-timer.sh" install
+
+# Update discovery is likewise platform-owned: it compares the platform release,
+# package ledger and local harness once per day, then dev-monitor only reads its snapshot.
+log "installing platform update detector timer"
+AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-update-timer.sh" install
 
 # 2) enabled app installers (each drops its own nginx fragment into $CONFD/*)
 # Child 4/P3: validate already refused any enabled app that is neither hub

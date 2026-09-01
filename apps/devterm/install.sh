@@ -48,6 +48,12 @@ FLEET_STORE="${AIRLOCK_DEVTERM_FLEET_STORE:-}"
 FLEET_STORE_URL="${AIRLOCK_DEVTERM_FLEET_STORE_URL:-}"
 ORCA_SHIM_CFG="${AIRLOCK_DEVTERM_ORCA_SHIM:-}"
 WEB_ROOT="$HOME/.local/share/airlock-devterm/web"
+# The subscription account panel is a platform asset (hub/assets/accounts), deployed
+# with the rest of hub/assets by the orchestrator. devterm serves it rather than
+# shipping a copy: accounts.js fetches root-absolute paths that only exist on this
+# gate, so the page has to be on this origin — but the implementation is not ours.
+# Same shape as paseo reading the shared return widget out of the webroot.
+ACCOUNT_PANEL_DIR="${AIRLOCK_WEBROOT:-/opt/airlock/hub}/assets/accounts"
 GATE_PY="$HERE/backend/devterm-gate.py"
 UNIT_DIR="$HOME/.config/systemd/user"
 # AIRLOCK_RENDER_DIR: harness-only destination-root override (highest
@@ -181,11 +187,11 @@ fi
 # --- 3. custom web client into WEB_ROOT (index.html templated with runtime config) ---
 CFG_JSON="{\"accounts\":${ACCOUNTS},\"xai\":${XAI},\"fileview\":${FILEVIEW},\"orca\":$([ -n "$ORCA_SHIM" ] && echo true || echo false)}"
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "[dry] install web/ -> $WEB_ROOT (index.html config=${CFG_JSON}, + ui.js/popup.css/panel.html)"
+  log "[dry] install web/ -> $WEB_ROOT (index.html config=${CFG_JSON}, + ui.js/popup.css)"
 else
   install -d "$WEB_ROOT/vendor"
-  install -m644 "$HERE/web/app.js" "$HERE/web/accounts.js" "$HERE/web/ui.js" \
-                "$HERE/web/secretdrop.js" "$HERE/web/popup.css" "$HERE/web/panel.html" \
+  install -m644 "$HERE/web/app.js" "$HERE/web/ui.js" \
+                "$HERE/web/secretdrop.js" "$HERE/web/popup.css" \
                 "$HERE/web/favicon.svg" "$HERE/web/apple-touch-icon.png" "$WEB_ROOT/"
   install -m644 "$HERE"/web/vendor/* "$WEB_ROOT/vendor/"
   # template the config placeholder (JSON has no sed metachars; use | as delimiter)
@@ -218,9 +224,12 @@ fi
 # gate unit: serves the custom client + API, proxies /ws,/token to ttyd. A content
 # revision (hash of gate + web) is embedded so write_if_changed triggers a restart when
 # the code changes — and NOT on a no-op re-run.
+# The account panel is deliberately NOT in this hash any more. It is served by nginx
+# straight off the platform webroot, so changing it needs no gate restart — hashing it
+# would bounce every terminal session on the box for a file the gate never reads.
 REV="$(cat "$GATE_PY" "$HERE"/backend/bin_discovery.py \
-        "$HERE"/web/app.js "$HERE"/web/accounts.js "$HERE"/web/ui.js \
-        "$HERE"/web/secretdrop.js "$HERE"/web/popup.css "$HERE"/web/panel.html \
+        "$HERE"/web/app.js "$HERE"/web/ui.js \
+        "$HERE"/web/secretdrop.js "$HERE"/web/popup.css \
         "$HERE"/web/index.html 2>/dev/null | sha256sum | cut -c1-12)"
 
 # Unit PATH. This unit was the only one of the four that shipped without one, and it
@@ -310,7 +319,7 @@ fi
 # Written unconditionally: it is config the renderer includes, not a system mutation.
 frag="$CONFD/servers.d/devterm.conf"
 install -d "$CONFD/servers.d"
-render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" > "$frag"
+render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR" > "$frag"
 log "wrote nginx fragment: $frag"
 
 # --- 6. tailscale serve: HTTPS carries devterm ---

@@ -32,6 +32,7 @@
  */
 
 :root {
+  color-scheme: dark;
   /* ─── Surfaces — one ladder, deep space ───────────────────────────────
      Anchored on the navy already shipped as the hub's `theme-color`.
      Deliberately not pure black: the dark tool surfaces have to stay visible
@@ -120,6 +121,7 @@
 /* ─── Light — derived, not canonical ─────────────────────────────────────── */
 @media (prefers-color-scheme: light) {
   :root {
+    color-scheme: light;
     --airlock-canvas:     #f5f5f7;
     --airlock-surface-1:  #ffffff;
     --airlock-surface-2:  #eceff2;
@@ -147,6 +149,7 @@
 /* Explicit overrides, for the theme toggle and for embedding one theme inside
    the other. Same values as above. */
 [data-theme="light"] {
+  color-scheme: light;
   --airlock-canvas:     #f5f5f7;
   --airlock-surface-1:  #ffffff;
   --airlock-surface-2:  #eceff2;
@@ -158,10 +161,16 @@
   --airlock-on-primary: #ffffff;
   --airlock-warning:    #9a6700;
   --airlock-danger:     #cf222e;
-  --airlock-edge:       rgba(0, 0, 0, .06);
+  --airlock-edge:         rgba(0, 0, 0, .06);
+  --airlock-shadow:       0 3px 8px -2px rgba(0, 0, 0, .20),
+                          0 1px 2px rgba(0, 0, 0, .10);
+  --airlock-shadow-hover: 0 9px 18px -5px rgba(0, 0, 0, .28),
+                          0 2px 5px rgba(0, 0, 0, .12);
+  --airlock-focus:        0 0 0 3px rgba(0, 102, 204, .30);
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --airlock-canvas:     #0a0f1e;
   --airlock-surface-1:  #141b2e;
   --airlock-surface-2:  #1d2740;
@@ -173,5 +182,10 @@
   --airlock-on-primary: #0a0f1e;
   --airlock-warning:    #ffb340;
   --airlock-danger:     #ff6961;
-  --airlock-edge:       rgba(255, 255, 255, .10);
+  --airlock-edge:         rgba(255, 255, 255, .10);
+  --airlock-shadow:       0 3px 10px -2px rgba(0, 0, 0, .55),
+                          0 0 0 1px rgba(255, 255, 255, .06);
+  --airlock-shadow-hover: 0 10px 20px -5px rgba(0, 0, 0, .60),
+                          0 0 0 1px rgba(255, 255, 255, .08);
+  --airlock-focus:        0 0 0 3px rgba(41, 151, 255, .30);
 }

@@ -230,7 +230,30 @@ NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 
 # airlock_load_nvm and the version gate, and before the first npm call, file
 # write or systemctl — the same position, and the same shape, as the memory
 # refusal above.
-PASEO_NNP_BLOCK="NoNewPrivileges=yes"
+# --- NoNewPrivileges is OFF for this unit by default (owner decision, 2026-09-02) ---
+#
+# This unit is not just a daemon: it is the PARENT of every agent session on the
+# box. Those sessions are the operator working, and operator work includes `sudo`
+# (reading the crontab spool, nginx config, tailscale serve, package state).
+# NoNewPrivileges is inherited by every child, so setting it here does not harden
+# a service — it removes sudo from the human's own shell, on their own box.
+#
+# Measured 2026-09-02 on an airlock box: a session could not run `sudo -n crontab
+# -l` and got "the 'no new privileges' flag is set". Every privileged read had to
+# be laundered through `ssh <self>` to obtain a clean process — which grants
+# strictly MORE than sudo would have, through a longer path. The directive did not
+# reduce what the session could reach; it only made reaching it indirect.
+#
+# The legacy box ran the same daemon with the directive off and had none of this.
+# Turn it back on only if paseo stops hosting interactive sessions.
+#
+# NOTE: airlock-paseo-uistate (rendered further down) KEEPS NoNewPrivileges=yes —
+# that one is a small python service with no children and no operator inside it.
+printf -v PASEO_NNP_BLOCK '%s\n%s\n%s\n%s' \
+  "# NoNewPrivileges is deliberately OFF for this unit." \
+  "# This unit is the parent of the operator's agent sessions, and the directive" \
+  "# is inherited by every child — it would remove sudo from the human's own shell." \
+  "NoNewPrivileges=no"
 _node_found="$(command -v node 2>/dev/null || true)"
 _node_real="$(readlink -f -- "$_node_found" 2>/dev/null || true)"
 _node_runtime="$(node -p 'process.execPath' 2>/dev/null || true)"
@@ -721,10 +744,23 @@ else
 fi
 
 # --- 3. tailnet FQDN (for the gate Host header + the daemon hostname allowlist) ---
-# In dry-run, ts_fqdn may fail (no tailscale) — use a placeholder so the fragment
-# still renders. In a real install a failing ts_fqdn fails closed (as intended).
-if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+# The nginx fragment below is written unconditionally (step 5) and bakes this value
+# into a literal `proxy_set_header Host`, so a placeholder here is not inert: on a
+# real box a dry run overwrites the LIVE fragment with `<your-box>.ts.net`, and the
+# daemon then answers every request with {"error":"Invalid Host header"} until
+# someone re-installs for real. So the placeholder is used only where nothing live
+# can be reached:
+#   - AIRLOCK_RENDER_DIR (golden render): must stay box-independent, never this host.
+#   - dry run WITHOUT tailscale: nothing else is knowable; step 5 then refuses to
+#     clobber an existing fragment.
+# A real install still fails closed on a failing ts_fqdn (as intended).
+if [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
   FQDN="<your-box>.ts.net"
+elif [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  FQDN="$(tailscale status --json 2>/dev/null \
+           | python3 -c 'import sys,json; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null)" \
+    || FQDN=""
+  [ -n "$FQDN" ] || FQDN="<your-box>.ts.net"
 else
   FQDN="$(ts_fqdn)"
 fi
@@ -835,9 +871,17 @@ fi
 # server (browse-host sidecar). This gate guards per-location (not
 # server-level), so the guard MUST be repeated there — without it the stream
 # WS would be an unauthenticated hole.
-render_paseo_nginx "$GATE_PORT" "$BACKEND_PORT" "$FQDN" "$HTTPS_PORT" "$WIDGET" "$WIDGET_MENU_ATTRS" \
-  "$BROWSE" "$BROWSE_WS_PORT" "$ICON_LOC_BODY" "$UISTATE_PORT" > "$frag"
-log "wrote nginx fragment: $frag${BROWSE:+ (browse=$BROWSE)}"
+# Last line of defence for the baked-in Host header (step 3): a placeholder FQDN
+# must never replace a fragment that is already serving a real box. Only reachable
+# from a dry run on a host without tailscale; the golden render writes into
+# AIRLOCK_RENDER_DIR, where nothing pre-exists.
+if [ "${FQDN#*<}" != "$FQDN" ] && [ -f "$frag" ]; then
+  log "WARNING: tailnet FQDN unknown (placeholder) — keeping the existing $frag rather than breaking its Host header"
+else
+  render_paseo_nginx "$GATE_PORT" "$BACKEND_PORT" "$FQDN" "$HTTPS_PORT" "$WIDGET" "$WIDGET_MENU_ATTRS" \
+    "$BROWSE" "$BROWSE_WS_PORT" "$ICON_LOC_BODY" "$UISTATE_PORT" > "$frag"
+  log "wrote nginx fragment: $frag${BROWSE:+ (browse=$BROWSE)}"
+fi
 
 # --- 6. tailscale serve (https only — the web UI wants a secure context) ---
 # The platform renders this now (manifest [serve.https]; child-4 P2b STEP 0

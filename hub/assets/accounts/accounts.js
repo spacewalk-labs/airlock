@@ -1,11 +1,21 @@
 'use strict';
 /*
- * devterm account pool — split out of app.js. Optional feature (the account icon is
- *   only shown when the accounts feature is enabled). Switch / usage / pool-login UI.
- *   Coupling to the terminal core is only the injected functions below (no core vars).
+ * Airlock subscription account pool — the one implementation of the account list.
+ *   A PLATFORM asset (hub/assets/accounts/) since ACCT_OWN, 2026-09-01; it began as
+ *   part of devterm's app.js, which is why the injected deps below are shaped like a
+ *   terminal's. Its three hosts — devterm's own page, panel.html in the return
+ *   widget's modal, and the hub's identity pill — all open THIS file, so a fix lands
+ *   in all three at once.
+ *   Optional feature (the account icon is only shown when the accounts feature is
+ *   enabled). Switch / usage / pool-login UI. Coupling to a terminal is only the
+ *   injected functions below (no core vars), which is what let it move.
  * DI factory: window.initAccounts(deps) is the only global. deps =
  *   { flash, postJson, mkFocus, closeTabPops, placePop }; returns 4 API functions.
- * Load order: before app.js in index.html; app.js calls this factory while running.
+ * Every fetch is a root-absolute path on the origin that serves the account API, so
+ *   the page hosting it must be served by that same gate. That is why the devterm
+ *   gate aliases this file rather than the hub serving it at its own origin.
+ * Load order: before app.js in devterm's index.html; app.js calls this factory while
+ *   running.
  */
 window.initAccounts = function initAccounts(deps) {
   const flash = deps.flash, postJson = deps.postJson, mkFocus = deps.mkFocus,

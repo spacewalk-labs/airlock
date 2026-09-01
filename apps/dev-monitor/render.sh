@@ -40,6 +40,19 @@ DEV_MONITOR_ROSTER=${ROSTER_PATH}
 ENVF
 }
 
+# render_dev_monitor_owner_env OWNER DEVMON_SECRET
+#
+# Updates use this minimal ingress gate even when the optional messages spool is
+# disabled.  Keep spool/execution/delivery settings out of that off-path file.
+render_dev_monitor_owner_env() {
+  local OWNER="$1" DEVMON_SECRET="$2"
+  cat <<ENVF
+# generated owner gate for dev-monitor updates
+DEV_MONITOR_OWNER=${OWNER}
+DEV_MONITOR_PROXY_SECRET=${DEVMON_SECRET}
+ENVF
+}
+
 # render_dev_monitor_compat_env DEVMON_STATE SLACK_WEBHOOK_URGENT SLACK_WEBHOOK_ROUTINE
 #
 # A cutover may have producers that still read one operator-declared EnvironmentFile path.
@@ -59,7 +72,7 @@ ENVF
 
 # render_dev_monitor_unit BACKEND_PORT MESSAGES IDENTITY_HEADER cors_hosts DEVMON_ENV \
 #                         [TOKEN_FRESHNESS TOKEN_WARN_HOURS TOKEN_STALE_HOURS
-#                          SPOOL_HARDENING ACCOUNTS_STATUS_BIN]
+#                          SPOOL_HARDENING ACCOUNTS_STATUS_BIN AGENT_PROVIDER AGENT_BIN]
 # The token arguments default rather than being required: this function is called by
 # install/test-systemd-ordering.sh and by fixtures written before the feature existed,
 # and an unset positional under `set -u` would turn a missing argument into an unbound
@@ -69,6 +82,13 @@ render_dev_monitor_unit() {
   local TOKEN_FRESHNESS="${6:-false}" TOKEN_WARN_HOURS="${7:-24}" TOKEN_STALE_HOURS="${8:-24}"
   local SPOOL_HARDENING="${9:-false}" guard=""
   local ACCOUNTS_STATUS_BIN="${10:-${AIRLOCK_ACCOUNTS_STATUS_BIN:-}}"
+  # Which agent CLI approved actions run, and the platform CLI that resolves `auto`. Both
+  # default rather than being required, for the same reason the token arguments above do:
+  # fixtures and install/test-systemd-ordering.sh call this with fewer arguments, and under
+  # `set -u` a missing positional would be an unbound-variable error rather than the key
+  # simply being unset. Unset here = the backend hands the runner an empty pair = claude.
+  local AGENT_PROVIDER="${11:-${AIRLOCK_AGENT_PROVIDER:-}}"
+  local AGENT_BIN="${12:-${AIRLOCK_AGENT_BIN:-}}"
   local BACKEND_PY="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/backend/airlock-dev-monitor.py"
   if [ "$SPOOL_HARDENING" = true ]; then
     guard=$'\nExecStartPre=/usr/bin/systemctl is-active --quiet airlock-dev-monitor-spool-firewall.service'
@@ -88,11 +108,29 @@ Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS=${TOKEN_FRESHNESS}
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS=${TOKEN_WARN_HOURS}
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS=${TOKEN_STALE_HOURS}
 Environment=AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN=${ACCOUNTS_STATUS_BIN}
-# '-' = optional: with messages off the file is absent by design, and the backend
-# then serves observability only. Secrets stay in this 0600 file, out of the unit.
+Environment=AIRLOCK_AGENT_PROVIDER=${AGENT_PROVIDER}
+Environment=AIRLOCK_AGENT_BIN=${AGENT_BIN}
+# This 0600 file always carries the update owner's ingress gate. With messages on it
+# also carries the optional spool/action configuration; secrets never enter the unit.
 EnvironmentFile=-${DEVMON_ENV}${guard}
 ExecStart=$(command -v python3) ${BACKEND_PY}
-Restart=on-failure
+# always, not on-failure. On 2026-08-27 this backend exited with status 0 on its
+# own -- no crash, no stop command -- and on-failure does not restart a clean
+# exit, so it simply stayed down. It was down 5h13m before a human noticed, and
+# in that window 39 spooled messages (32 of them urgent, from six producers)
+# reached nobody: the collector is what drains new/, so nothing it would have
+# alerted about was even queued for delivery.
+#
+# A daemon whose whole job is to notice silence must not be able to leave
+# quietly. Restart=always also covers the exit reason we never identified,
+# which is
+# the point: the restart policy should not depend on our having diagnosed it.
+#
+# The crash-loop this could mask is caught from outside now: a backend that
+# keeps dying does not drain the spool either, and the host's own dead-man
+# check reports a new/ that stops emptying. Restart policy and that check are
+# a pair; neither is sufficient alone.
+Restart=always
 RestartSec=3
 
 [Install]
@@ -171,12 +209,12 @@ WantedBy=multi-user.target
 UNIT
 }
 
-# render_dev_monitor_owner_location BACKEND_PORT hdr_var DEVMON_SECRET
+# render_dev_monitor_owner_location BACKEND_PORT hdr_var DEVMON_SECRET [LOCATION]
 render_dev_monitor_owner_location() {
-  local BACKEND_PORT="$1" hdr_var="$2" DEVMON_SECRET="$3"
+  local BACKEND_PORT="$1" hdr_var="$2" DEVMON_SECRET="$3" LOCATION="${4:-/monitor/api/owner/}"
   cat <<NGXOWNER
 
-location /monitor/api/owner/ {
+location ${LOCATION} {
     proxy_pass http://127.0.0.1:${BACKEND_PORT};
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
@@ -187,9 +225,9 @@ location /monitor/api/owner/ {
 NGXOWNER
 }
 
-# render_dev_monitor_nginx BACKEND_PORT owner_location
+# render_dev_monitor_nginx BACKEND_PORT updates_location [messages_owner_location]
 render_dev_monitor_nginx() {
-  local BACKEND_PORT="$1" owner_location="$2"
+  local BACKEND_PORT="$1" updates_location="$2" owner_location="${3:-}"
   cat <<EOF
 # dev-monitor subpath — generated by apps/dev-monitor/install.sh
 # API backend (the backend strips the /monitor/ prefix itself). The UI at
@@ -204,6 +242,6 @@ location /monitor/api/ {
     proxy_set_header X-Devmon-Proxy-Secret "";
     add_header Cache-Control "no-cache" always;
 }
-${owner_location}
+${updates_location}${owner_location}
 EOF
 }

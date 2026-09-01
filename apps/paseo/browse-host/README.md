@@ -50,7 +50,9 @@ sha256sum "$W/_expo/static/js/web/index-*.js"          # the new PINNED_SHA
 
 Then, against that **pristine** bundle, update `PINNED_SHA`, `PINNED_VERSION` and
 each `PATCHES` entry until every `find` occurs **exactly once** and every `repl`
-**zero** times. Two things make this less alarming than it looks:
+**zero** times. `KNOWN_BUNDLE_SHAPES` is re-derived the same way — apply each listed
+subset of edits to the pristine bundle and take `sha256` of the whole file — and the
+same values go into `anchor-manifest.json`, which the drift test compares as data. Two things make this less alarming than it looks:
 
 - The two `new-browser-gate-*` anchors are mostly minifier-local names, which are
   renamed between versions even when the code is untouched (0.1.110 → 0.2.5 renamed

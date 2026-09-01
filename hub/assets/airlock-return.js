@@ -15,20 +15,23 @@
  *   - native: an inline tile appended into a data-target placeholder
  *     (default #airlock-slot) so a frontend can place it in its own header.
  *
- * Menu (only when the injected script carries data-menu="1" AND data-panel="<devterm
- * base url>", i.e. the separate-port tools): a tap opens a small menu instead of
- * navigating: "Go to Airlock", "Subscription accounts", "Secret drop". The latter two
- * open devterm's panel.html in a modal iframe rather than reimplementing it: the UI lives in
- * devterm, its fetches are same-origin there, and there is one implementation to keep
- * right. Without data-panel there is nothing to open, so the menu stays off and a tap
- * navigates as before (never a dead menu entry). If the panel does not load within 6s
- * the modal says so and prints the address it tried, instead of showing a blank box.
+ * Menu (only when the injected script carries data-menu="1" AND data-panel="<base url
+ * of the gate that answers the account API>", i.e. the separate-port tools): a tap
+ * opens a small menu instead of navigating: "Go to Airlock", "Subscription accounts",
+ * "Secret drop". The latter two open panel.html in a modal iframe rather than
+ * reimplementing it. That page is a PLATFORM asset (hub/assets/accounts/panel.html,
+ * ACCT_OWN) served by devterm's gate, because its fetches are root-absolute paths only
+ * that gate answers — so this widget, devterm's own account icon and the hub's identity
+ * pill all open the one implementation. Without data-panel there is nothing to open, so
+ * the menu stays off and a tap navigates as before (never a dead menu entry). If the
+ * panel does not load within 6s the modal says so and prints the address it tried,
+ * instead of showing a blank box.
  *
- * Subscription ring (all modes, needs data-panel): polls devterm's /acct-alert every
- * 30s — the same endpoint devterm's own account icon uses, so both turn amber (warn) or
- * red-and-blinking (critical) at the same instant. The thresholds live only in the
- * backend, so there is no second copy here to drift. A failed poll clears the ring: no
- * reading is not a warning.
+ * Subscription ring (all modes, needs data-panel): polls /acct-alert every 30s — the
+ * same endpoint devterm's own account icon and the hub's pill use, so all three turn
+ * amber (warn) or red-and-blinking (critical) at the same instant. The thresholds live
+ * only in the backend, so there is no second copy here to drift. A failed poll clears
+ * the ring: no reading is not a warning.
  *
  * Needs-action badge (all modes): polls Dev Monitor's owner message preview every 30s
  * and shows the "still needs a person" count (falling back to the older unread count
@@ -346,8 +349,9 @@
     b.addEventListener("click", function (e) { e.preventDefault(); e.stopPropagation(); onClick(); });
     return b;
   }
-  // The panel is shown in a modal iframe: the UI lives in devterm and its fetches are
-  // same-origin there, so nothing has to be duplicated here and no CORS is involved.
+  // The panel is shown in a modal iframe: it is the platform's account panel, served
+  // by the gate whose API it calls, so its fetches are same-origin there — nothing has
+  // to be duplicated here and no CORS is involved.
   function openPanel(which, title) {
     closeMenu();
     closeModal();
@@ -387,7 +391,7 @@
       if (loaded || modalEl !== ov) return;
       frame.style.display = "none";
       note.style.display = "block";
-      note.textContent = "The devterm panel did not load within 6s: " + frame.src +
+      note.textContent = "The account panel did not load within 6s: " + frame.src +
         " — check that devterm is installed and reachable on that address.";
     }, 6000);
   }

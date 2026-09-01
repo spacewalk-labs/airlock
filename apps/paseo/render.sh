@@ -21,7 +21,9 @@
 # MEMMAX/MEMHIGH/TASKSMAX: resource backstop, picked from the box's RAM tier by
 # the caller (install.sh). Passed in rather than computed here so the rendered text
 # stays a pure function of its arguments — the golden-render tests depend on it.
-# NNP_BLOCK: normally the single line `NoNewPrivileges=yes`. When the installer
+# NNP_BLOCK: normally the block that turns NoNewPrivileges OFF and says why (see
+# install.sh — this unit is the PARENT of the operator's agent sessions, and those
+# legitimately need sudo). Callers may pass a different block. When the installer
 # has been told to proceed on a snap-wrapped node it is that line turned off plus
 # the comment saying why — assembled by the caller and passed as ONE argument, on
 # purpose. This heredoc is unquoted, and the reason text quotes a shell command;
@@ -32,7 +34,11 @@
 render_paseo_unit() {
   local UNIT_PATH="$1" HOME="$2" FQDN="$3" HTTPS_PORT="$4" PASEO_BIN="$5" BACKEND_PORT="$6" \
         MEMMAX="$9" MEMHIGH="${10}" TASKSMAX="${11}" \
-        NNP_BLOCK="${12:-NoNewPrivileges=yes}"
+        NNP_BLOCK="${12:-$(printf '%s\n%s\n%s\n%s' \
+          "# NoNewPrivileges is deliberately OFF for this unit." \
+          "# This unit is the parent of the operator's agent sessions, and the directive" \
+          "# is inherited by every child — it would remove sudo and setgid from their shell." \
+          "NoNewPrivileges=no")}"
   : "$7" "$8" # reserved PY/PID_GUARD ABI slots; cleanup belongs to install.sh
   cat <<UNITEOF
 [Unit]

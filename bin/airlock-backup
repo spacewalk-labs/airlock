@@ -1,0 +1,1090 @@
+#!/usr/bin/env python3
+"""Back up and restore one Airlock box's configuration and install records.
+
+The archive is deliberately not a home-directory backup.  It contains the exact
+Airlock config bytes, the package lock, the installed-state ledger and plaintext
+retirement record, plus the healthy status report and checkout revision that
+made those bytes meaningful.  App-created data and secret EnvironmentFiles are
+outside this contract.
+
+Invoke through Python; this file intentionally remains mode 100644:
+
+    python3 bin/airlock-backup create /private/path/box.airlock-backup
+    python3 bin/airlock-backup restore /private/path/box.airlock-backup
+    python3 bin/airlock-backup verify /private/path/box.airlock-backup
+"""
+
+from __future__ import annotations
+
+# A Python script normally prepends its own directory to sys.path. An
+# untracked bin/json.py or bin/tomllib.py would otherwise execute before the
+# checkout-integrity gate that exists to reject it. This tool imports no
+# repository modules through sys.path, so remove the checkout paths first.
+import os as _bootstrap_os
+import sys as _bootstrap_sys
+if __name__ == "__main__":
+    _bootstrap_bin = _bootstrap_os.path.realpath(_bootstrap_os.path.dirname(__file__))
+    _bootstrap_root = _bootstrap_os.path.dirname(_bootstrap_bin)
+    _bootstrap_sys.path[:] = [
+        item for item in _bootstrap_sys.path
+        if _bootstrap_os.path.realpath(item or _bootstrap_os.getcwd())
+        not in {_bootstrap_bin, _bootstrap_root}
+    ]
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.parse
+import zipfile
+
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONFIG_BIN = ROOT / "bin" / "airlock-config"
+STATUS_BIN = ROOT / "bin" / "airlock-status"
+INSTALL_BIN = ROOT / "install" / "airlock-install.sh"
+LEDGER_BIN = ROOT / "bin" / "airlock-ledger"
+PACKAGE_LOCK = ROOT / "airlock.lock"
+
+SCHEMA_VERSION = 1
+MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_MEMBERS = 6
+RECORDS = ("app-ledger.json", "plaintext-retirement.json", "airlock.lock")
+FIXED_MEMBERS = {"manifest.json", "config.toml", "status.json"}
+RESTORE_RECEIPT = "restore-in-progress.json"
+
+SECRET_KEY_RE = re.compile(
+    r"(?:^|_)(?:api_?key|access_?key|client_?secret|credential|passphrase|password|private_?key|secret|token)(?:$|_)",
+    re.IGNORECASE,
+)
+ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
+PEM_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*(?:PRIVATE KEY|CERTIFICATE)-----")
+COMMENT_SECRET_RE = re.compile(
+    r"(?:^|\s)(?P<key>[a-z0-9_-]*(?:api_?key|access_?key|client_?secret|credential|passphrase|password|private_?key|secret|token)[a-z0-9_-]*)\s*[:=]\s*(?P<value>[^\s#]+)",
+    re.IGNORECASE,
+)
+SAFE_COMMENT_VALUES = {"<redacted>", "redacted", "unset", "none", "null", "example", "placeholder"}
+SAFE_SECRET_METADATA_TYPES = {
+    # These describe credential handling; none is credential material.  Keep
+    # the allowlist exact and type-aware so a string accidentally placed under
+    # the same name is still refused.
+    "secret_ttl_sec": int,
+    "token_freshness": bool,
+    "token_freshness_warn_hours": int,
+    "token_freshness_stale_hours": int,
+}
+
+
+class BackupError(Exception):
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.code = code
+
+
+def fail(message: str, code: int = 1) -> "None":
+    raise BackupError(message, code)
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def json_bytes(value: object) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def run(argv: list[str], *, env: dict[str, str] | None = None, timeout: int = 300,
+        pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(argv, capture_output=True, env=env, timeout=timeout,
+                              pass_fds=pass_fds)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"cannot run {argv[0]}: {exc}", 2)
+
+
+def subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    internal_authority = {
+        "AIRLOCK_APP_DIR", "AIRLOCK_APP_ID", "AIRLOCK_CONFIG_BIN",
+        "AIRLOCK_CONFIG_SNAPSHOT", "AIRLOCK_CONFIG_SNAPSHOT_SHA256",
+        "AIRLOCK_CONTAINER_DAEMON_IDENTITY", "AIRLOCK_CONTAINER_RECONCILE_MODE",
+        "AIRLOCK_DRY_RUN", "AIRLOCK_INSTALL_NONCE", "AIRLOCK_LEDGER_LOCK_HELD",
+        "AIRLOCK_PKG_INFO", "AIRLOCK_PREREQUISITES", "AIRLOCK_ROOT",
+        "AIRLOCK_SHIPPED_APPS_ROOT",
+    }
+    for key in tuple(env):
+        if key.startswith("GIT_") or key in {"PYTHONHOME", "PYTHONPATH"} | internal_authority:
+            env.pop(key)
+    return env
+
+
+def git_env() -> dict[str, str]:
+    return subprocess_env()
+
+
+def checked_regular(path: pathlib.Path, label: str, *, required: bool) -> bytes | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if required:
+            fail(f"required {label} is absent: {path}")
+        return None
+    except OSError as exc:
+        fail(f"cannot read {label} {path}: {exc}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            fail(f"{label} must be a regular non-symlink file: {path}")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read()
+    except OSError as exc:
+        fail(f"cannot read {label} {path}: {exc}")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def state_dir(value: str | None) -> pathlib.Path:
+    raw = value or os.environ.get("AIRLOCK_STATE_DIR") or str(pathlib.Path.home() / ".local/state/airlock")
+    path = pathlib.Path(raw)
+    if not path.is_absolute():
+        fail(f"Airlock state directory must be absolute: {path}", 2)
+    return path
+
+
+def git_value(spec: str, label: str) -> str:
+    proc = run(["git", "-C", str(ROOT), "rev-parse", spec], env=git_env(), timeout=30)
+    value = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        fail(f"cannot record the Airlock checkout {label}", 2)
+    return value
+
+
+def git_identity() -> tuple[str, str]:
+    return git_value("HEAD", "revision"), git_value("HEAD^{tree}", "tree")
+
+
+def require_clean_checkout(action: str = "backup", *, allowed: tuple[pathlib.Path, ...] = ()) -> None:
+    env = git_env()
+    for args in (["diff", "--quiet", "--"], ["diff", "--cached", "--quiet", "--"]):
+        proc = run(["git", "-C", str(ROOT), *args], env=env, timeout=60)
+        if proc.returncode not in (0, 1):
+            fail("cannot establish whether the Airlock checkout is clean", 2)
+        if proc.returncode == 1:
+            fail(f"{action} requires a clean tracked Airlock checkout so the recorded tree names the exact code in use")
+
+    allowed_rel = set()
+    root_real = ROOT.resolve()
+    for path in allowed:
+        try:
+            allowed_rel.add(str(path.resolve().relative_to(root_real)))
+        except ValueError:
+            pass
+    extras = set()
+    for args in (["ls-files", "--others", "--exclude-standard", "-z"],
+                 ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]):
+        proc = run(["git", "-C", str(ROOT), *args], env=env, timeout=60)
+        if proc.returncode != 0:
+            fail("cannot enumerate untracked/ignored Airlock checkout files", 2)
+        extras.update(item.decode("utf-8", "surrogateescape")
+                      for item in proc.stdout.split(b"\0") if item)
+    unexpected = sorted(extras - allowed_rel)
+    if unexpected:
+        sample = ", ".join(unexpected[:3])
+        more = f" (+{len(unexpected) - 3} more)" if len(unexpected) > 3 else ""
+        fail(f"{action} refuses untracked/ignored checkout content not covered by the archive: {sample}{more}")
+
+
+def snapshot_config(temp: pathlib.Path) -> tuple[bytes, str, str]:
+    target = temp / "config.toml"
+    target.touch(mode=0o600)
+    proc = run([sys.executable, str(CONFIG_BIN), "install-snapshot", str(target)],
+               env=subprocess_env(), timeout=60)
+    if proc.returncode != 0:
+        fail("cannot freeze Airlock config: " + proc.stderr.decode("utf-8", "replace").strip(), 2)
+    try:
+        receipt = json.loads(proc.stdout)
+        origin = receipt["config_path"]
+        digest = receipt["sha256"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        fail(f"airlock-config returned an invalid snapshot receipt: {exc}", 2)
+    data = checked_regular(target, "config snapshot", required=True)
+    assert data is not None
+    if sha256(data) != digest or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        fail("airlock-config snapshot receipt does not match its bytes", 2)
+    return data, str(origin), digest
+
+
+def selected_config_path() -> pathlib.Path:
+    raw = os.environ.get("AIRLOCK_CONFIG")
+    path = pathlib.Path(raw) if raw else ROOT / "airlock.toml"
+    if not path.is_absolute():
+        fail("AIRLOCK_CONFIG must be absolute for backup", 2)
+    return path.resolve()
+
+
+def snapshot_env(config_origin: str, snapshot: pathlib.Path, digest: str, selected_state: pathlib.Path) -> dict[str, str]:
+    env = subprocess_env()
+    env.update({
+        "AIRLOCK_CONFIG": config_origin,
+        "AIRLOCK_CONFIG_SNAPSHOT": str(snapshot),
+        "AIRLOCK_CONFIG_SNAPSHOT_SHA256": digest,
+        "AIRLOCK_STATE_DIR": str(selected_state),
+    })
+    return env
+
+
+def config_apps(env: dict[str, str]) -> list[str]:
+    validate = run([sys.executable, str(CONFIG_BIN), "validate"], env=env, timeout=120)
+    if validate.returncode != 0:
+        fail("config snapshot does not validate: " + validate.stderr.decode("utf-8", "replace").strip(), 2)
+    proc = run([sys.executable, str(CONFIG_BIN), "apps"], env=env, timeout=120)
+    if proc.returncode != 0:
+        fail("cannot read enabled apps from config snapshot", 2)
+    apps = sorted({line.strip() for line in proc.stdout.decode().splitlines() if line.strip()} - {"hub"})
+    return apps
+
+
+def ledger_module():
+    """Load the checkout's canonical installed-state grammar."""
+    try:
+        loader = importlib.machinery.SourceFileLoader("airlock_backup_ledger", str(LEDGER_BIN))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise ImportError("no module spec")
+        ledger = importlib.util.module_from_spec(spec)
+        previous_bytecode = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            loader.exec_module(ledger)
+        finally:
+            sys.dont_write_bytecode = previous_bytecode
+        return ledger
+    except (ImportError, OSError, SystemExit) as exc:
+        fail(f"cannot load Airlock's canonical installed-state grammar: {exc}", 2)
+
+
+def configured_artifact_findings(env: dict[str, str]) -> list[str]:
+    """Return configured-app artifacts already present on a would-be fresh box.
+
+    `adopt-scan` deliberately skips configured apps, so it cannot answer this
+    question. Reuse the ledger's package-info validator and artifact expander;
+    duplicating its glob/root/capability rules here would create a second,
+    eventually divergent ownership grammar.
+    """
+    proc = run([sys.executable, str(CONFIG_BIN), "package-info"], env=env, timeout=120)
+    if proc.returncode != 0:
+        fail("cannot resolve configured app artifacts for fresh-box preflight", 2)
+    try:
+        info = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"airlock-config package-info is not JSON: {exc}", 2)
+    try:
+        ledger = ledger_module()
+        packages = ledger.packages_from_info(info)
+        roots = ledger._current_roots()
+        findings = []
+        declarations = {
+            pid: package["containers"] for pid, package in packages.items()
+            if package["containers"]
+        }
+        live_containers = ledger._enumerate_containers() if declarations else []
+        for pid, package in sorted(packages.items()):
+            expanded = ledger.expand_declared(
+                package["artifacts"], package["serve_port_values"], roots,
+                unit_scopes=package["unit_scopes"],
+                capabilities=package["capabilities"],
+            )
+            for artifact_class in ledger.PATH_CLASSES:
+                if expanded[artifact_class]:
+                    findings.append(f"{pid}:{artifact_class}:{len(expanded[artifact_class])}")
+            if declarations.get(pid):
+                count = sum(1 for obj in live_containers
+                            if ledger._container_name_matches(obj["name"], declarations[pid]))
+                if count:
+                    findings.append(f"{pid}:containers:{count}")
+        return findings
+    except Exception as exc:
+        fail(f"cannot inspect configured app artifacts: {exc}", 2)
+
+
+def committed_apps(ledger: bytes, label: str) -> list[str]:
+    try:
+        data = json.loads(ledger)
+        entries = data["entries"]
+        if not isinstance(entries, dict):
+            raise TypeError("entries is not an object")
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        fail(f"{label} is not a readable Airlock ledger: {exc}")
+    return sorted(name for name, row in entries.items()
+                  if isinstance(name, str) and isinstance(row, dict) and row.get("committed"))
+
+
+def _walk_config(value: object, path: tuple[str, ...] = ()):  # yields path, key, value
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = (*path, str(key))
+            yield child_path, str(key), child
+            yield from _walk_config(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _walk_config(child, (*path, str(index)))
+
+
+def safe_secret_metadata(key: str, value: object) -> bool:
+    expected = SAFE_SECRET_METADATA_TYPES.get(key.lower())
+    # bool is an int subclass; an integer TTL must not accept true/false.
+    return expected is not None and type(value) is expected
+
+
+def safe_comment_metadata(key: str, raw_token: str) -> bool:
+    # A quoted number/bool is a string, not metadata. Do not strip quotes
+    # before this check: numeric-looking PINs/tokens must remain suspicious.
+    if raw_token[:1] in {"'", '"'}:
+        return False
+    expected = SAFE_SECRET_METADATA_TYPES.get(key.lower())
+    if expected is bool:
+        return raw_token.lower() in {"true", "false"}
+    if expected is int:
+        return re.fullmatch(r"[0-9]+", raw_token) is not None
+    return False
+
+
+def secret_paths(config: bytes) -> list[str]:
+    try:
+        text = config.decode("utf-8")
+        parsed = tomllib.loads(text)
+    except (UnicodeError, ValueError) as exc:
+        fail(f"config snapshot is not valid UTF-8 TOML: {exc}", 2)
+    found: set[str] = set()
+    for path, key, value in _walk_config(parsed):
+        dotted = ".".join(path)
+        if SECRET_KEY_RE.search(key) and not safe_secret_metadata(key, value):
+            # Airlock config stores the NAME of a secret-bearing environment
+            # variable, never its value.  Keep that declared seam in scope.
+            if key.lower().endswith("_env") and isinstance(value, str) and ENV_NAME_RE.fullmatch(value):
+                continue
+            found.add(dotted)
+        if isinstance(value, str):
+            if PEM_RE.search(value):
+                found.add(dotted)
+            try:
+                url = urllib.parse.urlsplit(value)
+            except ValueError:
+                url = None
+            if url and url.scheme and (url.username is not None or url.password is not None):
+                found.add(dotted)
+            if url and url.scheme:
+                for query_key, query_value in urllib.parse.parse_qsl(url.query, keep_blank_values=True):
+                    if SECRET_KEY_RE.search(query_key) and query_value:
+                        found.add(dotted)
+    # Exact config bytes include comments. TOML parsing deliberately discards
+    # them, so inspect common `token = value` emergency-note shapes separately.
+    # Report only the line number; never echo the possible value.
+    for line_number, line in enumerate(text.splitlines(), 1):
+        comment = line.partition("#")[2]
+        if not comment:
+            continue
+        for match in COMMENT_SECRET_RE.finditer(comment):
+            raw_token = match.group("value")
+            raw_value = raw_token.strip("'\"")
+            value = raw_value.lower()
+            key = match.group("key").lower()
+            if value in SAFE_COMMENT_VALUES or value.startswith("<"):
+                continue
+            if safe_comment_metadata(key, raw_token):
+                continue
+            if key.endswith("_env") and ENV_NAME_RE.fullmatch(raw_value):
+                continue
+            found.add(f"comment-line-{line_number}")
+    return sorted(found)
+
+
+def require_secret_free(config: bytes) -> None:
+    found = secret_paths(config)
+    if found:
+        # Paths are safe to report; values never are.
+        fail("refusing to put possible secret values in the backup; review config key(s): " + ", ".join(found))
+
+
+def require_record_safe(name: str, data: bytes | None) -> None:
+    if data is None or name == "airlock.lock":
+        return
+    try:
+        document = json.loads(data)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{name} is not JSON install-record data: {exc}")
+    if not isinstance(document, dict):
+        fail(f"{name} must contain a JSON object")
+    if name == "app-ledger.json":
+        try:
+            ledger_module()._validate_store(document, pathlib.Path(name))
+        except Exception:
+            fail("app-ledger.json does not have the canonical install-ledger shape")
+    elif name == "plaintext-retirement.json":
+        if set(document) != {"version", "entries"} or document.get("version") != 1:
+            fail("plaintext-retirement.json does not have the retirement-record shape")
+        entries = document.get("entries")
+        if not isinstance(entries, list):
+            fail("plaintext-retirement.json entries must be a list")
+        keys = []
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"package", "listen", "target", "state"}:
+                fail("plaintext-retirement.json has an invalid entry shape")
+            package, listen, target, state = (entry["package"], entry["listen"],
+                                               entry["target"], entry["state"])
+            if not isinstance(package, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", package):
+                fail("plaintext-retirement.json has an invalid package id")
+            if state not in {"intent", "committed"}:
+                fail("plaintext-retirement.json has an invalid entry state")
+            if any(isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
+                   for port in (listen, target)):
+                fail("plaintext-retirement.json has an invalid port")
+            keys.append((package, listen))
+        if keys != sorted(keys) or len(keys) != len(set(keys)):
+            fail("plaintext-retirement.json entries must be sorted and unique")
+    suspicious = []
+    for path, key, value in _walk_config(document):
+        dotted = ".".join(path)
+        if SECRET_KEY_RE.search(key):
+            if key.lower().endswith("_env") and isinstance(value, str) and ENV_NAME_RE.fullmatch(value):
+                continue
+            suspicious.append(dotted)
+        if isinstance(value, str):
+            if PEM_RE.search(value):
+                suspicious.append(dotted)
+            try:
+                url = urllib.parse.urlsplit(value)
+            except ValueError:
+                url = None
+            if url and url.scheme and (url.username is not None or url.password is not None):
+                suspicious.append(dotted)
+            if url and url.scheme and any(SECRET_KEY_RE.search(k) and v
+                                          for k, v in urllib.parse.parse_qsl(url.query, keep_blank_values=True)):
+                suspicious.append(dotted)
+    if suspicious:
+        fail(f"refusing possible secret material in {name}; review key(s): "
+             + ", ".join(sorted(set(suspicious))))
+
+
+def relative_package_paths(config: bytes) -> list[str]:
+    parsed = tomllib.loads(config.decode("utf-8"))
+    packages = parsed.get("packages") or {}
+    if not isinstance(packages, dict):
+        return []
+    found = []
+    for package_id, row in packages.items():
+        if isinstance(row, dict) and isinstance(row.get("path"), str):
+            path = pathlib.Path(row["path"])
+            if not path.is_absolute():
+                found.append(str(package_id))
+    return sorted(found)
+
+
+def status_document(env: dict[str, str]) -> tuple[int, bytes]:
+    proc = run([sys.executable, str(STATUS_BIN), "--json"], env=env, timeout=180)
+    raw = proc.stdout
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"airlock-status did not emit JSON (rc={proc.returncode}): {exc}", 2)
+    if report.get("schema_version") != 1 or report.get("exit_code") != proc.returncode:
+        fail("airlock-status JSON disagrees with its process result", 2)
+    return proc.returncode, json_bytes(report)
+
+
+def require_green_status(env: dict[str, str]) -> bytes:
+    rc, raw = status_document(env)
+    report = json.loads(raw)
+    if rc != 0 or report.get("verdict") != "ok":
+        fail(f"Airlock status is not fully verified (rc={rc}, verdict={report.get('verdict')!r}); rc=3 is not success", rc if rc in (1, 3) else 1)
+    return raw
+
+
+@contextlib.contextmanager
+def ledger_lock(selected_state: pathlib.Path):
+    if not selected_state.exists():
+        yield None
+        return
+    if not selected_state.is_dir() or selected_state.is_symlink():
+        fail(f"Airlock state path must be a real directory: {selected_state}")
+    lock_path = selected_state / "app-ledger.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            fail(f"ledger lock is not a regular file: {lock_path}")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("another Airlock writer holds the ledger lock; retry after it finishes")
+    except OSError as exc:
+        fail(f"cannot lock Airlock install records: {exc}")
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def record_bytes(selected_state: pathlib.Path) -> dict[str, bytes | None]:
+    records = {
+        "app-ledger.json": checked_regular(selected_state / "app-ledger.json", "install ledger", required=True),
+        "plaintext-retirement.json": checked_regular(selected_state / "plaintext-retirement.json", "plaintext retirement record", required=False),
+        "airlock.lock": checked_regular(PACKAGE_LOCK, "package lock", required=False),
+    }
+    for name, data in records.items():
+        require_record_safe(name, data)
+    return records
+
+
+def write_archive(destination: pathlib.Path, members: dict[str, bytes]) -> None:
+    if destination.exists() or destination.is_symlink():
+        fail(f"backup destination already exists: {destination}")
+    if not destination.parent.is_dir():
+        fail(f"backup destination parent does not exist: {destination.parent}")
+    if len(members) > MAX_MEMBERS:
+        fail("backup candidate contains too many members")
+    if any(len(data) > MAX_MEMBER_BYTES for data in members.values()):
+        fail("backup candidate contains an oversized member")
+    if sum(len(data) for data in members.values()) > MAX_ARCHIVE_BYTES:
+        fail("backup candidate expands beyond the total size limit")
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    temp_path = pathlib.Path(temporary)
+    try:
+        with os.fdopen(fd, "w+b") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            with zipfile.ZipFile(handle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for name in sorted(members):
+                    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.external_attr = 0o600 << 16
+                    archive.writestr(info, members[name])
+            handle.flush()
+            os.fsync(handle.fileno())
+            if os.fstat(handle.fileno()).st_size > MAX_ARCHIVE_BYTES:
+                fail(f"backup candidate archive exceeds {MAX_ARCHIVE_BYTES} bytes")
+        # link, unlike replace, is an atomic no-clobber publish. If another
+        # writer creates the destination after the first check, this fails.
+        os.link(temp_path, destination, follow_symlinks=False)
+        parent_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except FileExistsError:
+        fail(f"backup destination appeared while the archive was being written: {destination}")
+    except OSError as exc:
+        fail(f"cannot publish backup archive {destination}: {exc}")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def path_within(path: pathlib.Path, parent: pathlib.Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def require_output_separate(destination: pathlib.Path, config_origin: str,
+                            selected_state: pathlib.Path) -> None:
+    config_path = pathlib.Path(config_origin).resolve()
+    if destination == config_path or destination == PACKAGE_LOCK.resolve():
+        fail("backup destination overlaps protected Airlock config/install state")
+    if path_within(destination, selected_state.resolve()):
+        fail("backup destination must be outside the Airlock installed-state directory")
+    if path_within(destination, ROOT.resolve()):
+        fail("backup destination must be outside the Airlock checkout")
+
+
+def create(args: argparse.Namespace) -> int:
+    destination = pathlib.Path(args.archive).resolve()
+    selected_state = state_dir(args.state_dir)
+    if path_within(selected_state.resolve(), ROOT.resolve()):
+        fail("Airlock installed-state directory must be outside the checkout")
+    config_hint = selected_config_path()
+    require_clean_checkout(allowed=(config_hint, PACKAGE_LOCK))
+    source_revision, source_tree = git_identity()
+    with tempfile.TemporaryDirectory(prefix="airlock-backup-") as raw_temp:
+        temp = pathlib.Path(raw_temp)
+        os.chmod(temp, 0o700)
+        config, config_origin, digest = snapshot_config(temp)
+        if pathlib.Path(config_origin).resolve() != config_hint:
+            fail("airlock-config selected a different config path after checkout preflight", 2)
+        require_output_separate(destination, config_origin, selected_state)
+        require_secret_free(config)
+        env = snapshot_env(config_origin, temp / "config.toml", digest, selected_state)
+        enabled = config_apps(env)
+        with ledger_lock(selected_state):
+            records = record_bytes(selected_state)
+            status = require_green_status(env)
+            records_after = record_bytes(selected_state)
+            if records != records_after:
+                fail("install records changed while the backup was being verified; retry when the box is idle")
+        ledger = records["app-ledger.json"]
+        assert ledger is not None
+        installed = committed_apps(ledger, "source app-ledger.json")
+        if enabled != installed:
+            fail(f"healthy status disagrees with the backup app set (config={enabled}, ledger={installed})", 2)
+        files = {}
+        members = {"config.toml": config, "status.json": status}
+        for name, data in records.items():
+            files[name] = {"state": "present" if data is not None else "absent"}
+            if data is not None:
+                archive_name = f"records/{name}"
+                members[archive_name] = data
+                files[name]["sha256"] = sha256(data)
+        require_clean_checkout(allowed=(config_hint, PACKAGE_LOCK))
+        after_revision, after_tree = git_identity()
+        if (source_revision, source_tree) != (after_revision, after_tree):
+            fail("Airlock checkout changed while the backup was being created")
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "created_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "source_revision": source_revision,
+            "source_tree": source_tree,
+            "config_path": config_origin,
+            "state_dir": str(selected_state),
+            "config_sha256": digest,
+            "status_sha256": sha256(status),
+            "enabled_apps": enabled,
+            "installed_apps": installed,
+            "relative_package_paths": relative_package_paths(config),
+            "files": files,
+            "scope": "airlock-config-and-install-records",
+            "excluded": ["app-created-data", "home-directory", "secret-environment-files", "tokens-and-credentials"],
+        }
+        members["manifest.json"] = json_bytes(manifest)
+        write_archive(destination, members)
+    print(f"backup=ok archive={destination} revision={manifest['source_revision']} apps={len(installed)} status_rc=0")
+    return 0
+
+
+def read_archive(path: pathlib.Path) -> tuple[dict, dict[str, bytes]]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect backup archive {path}: {exc}")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(f"backup archive must be a regular non-symlink file: {path}")
+    if info.st_size > MAX_ARCHIVE_BYTES:
+        fail(f"backup archive exceeds {MAX_ARCHIVE_BYTES} bytes")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if len(infos) > MAX_MEMBERS:
+                fail("backup archive contains too many members")
+            names = [info.filename for info in infos]
+            if len(names) != len(set(names)):
+                fail("backup archive contains duplicate member names")
+            if any(info.file_size > MAX_MEMBER_BYTES for info in infos):
+                fail("backup archive contains an oversized member")
+            if sum(info.file_size for info in infos) > MAX_ARCHIVE_BYTES:
+                fail("backup archive expands beyond the total size limit")
+            members = {info.filename: archive.read(info) for info in infos}
+    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+        fail(f"cannot read backup archive: {exc}")
+    if "manifest.json" not in members:
+        fail("backup archive has no manifest.json")
+    try:
+        manifest = json.loads(members["manifest.json"])
+    except json.JSONDecodeError as exc:
+        fail(f"backup manifest is not JSON: {exc}")
+    if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("scope") != "airlock-config-and-install-records":
+        fail("unsupported backup manifest schema or scope")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) != set(RECORDS):
+        fail("backup manifest does not describe the fixed install-record set")
+    expected = set(FIXED_MEMBERS)
+    for name in RECORDS:
+        row = files.get(name)
+        if not isinstance(row, dict) or row.get("state") not in ("present", "absent"):
+            fail(f"invalid state for backup record {name}")
+        member = f"records/{name}"
+        if row["state"] == "present":
+            expected.add(member)
+            if re.fullmatch(r"[0-9a-f]{64}", str(row.get("sha256", ""))) is None:
+                fail(f"invalid digest for backup record {name}")
+        elif "sha256" in row:
+            fail(f"absent backup record has a digest: {name}")
+    if set(members) != expected:
+        fail("backup archive member set does not match its manifest")
+    if sha256(members["config.toml"]) != manifest.get("config_sha256"):
+        fail("backup config digest mismatch")
+    if sha256(members["status.json"]) != manifest.get("status_sha256"):
+        fail("backup status digest mismatch")
+    for name in RECORDS:
+        row = files[name]
+        if row["state"] == "present" and sha256(members[f"records/{name}"]) != row["sha256"]:
+            fail(f"backup record digest mismatch: {name}")
+        require_record_safe(name, members.get(f"records/{name}"))
+    require_secret_free(members["config.toml"])
+    if re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("source_revision", ""))) is None:
+        fail("backup source revision is invalid")
+    if re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("source_tree", ""))) is None:
+        fail("backup source tree is invalid")
+    package_paths = manifest.get("relative_package_paths")
+    if (not isinstance(package_paths, list)
+            or package_paths != relative_package_paths(members["config.toml"])):
+        fail("backup relative package-path record disagrees with its config")
+    try:
+        source_status = json.loads(members["status.json"])
+    except json.JSONDecodeError as exc:
+        fail(f"backup status document is not JSON: {exc}")
+    if source_status.get("schema_version") != 1 or source_status.get("exit_code") != 0 or source_status.get("verdict") != "ok":
+        fail("backup was not created from an exact rc=0 status verdict")
+    ledger = members.get("records/app-ledger.json")
+    if ledger is None or committed_apps(ledger, "backup app-ledger.json") != manifest.get("installed_apps"):
+        fail("backup ledger app set disagrees with its manifest")
+    if manifest.get("enabled_apps") != manifest.get("installed_apps"):
+        fail("backup config and ledger app sets disagree")
+    return manifest, members
+
+
+def atomic_new(path: pathlib.Path, data: bytes, mode: int = 0o600) -> None:
+    if path.exists() or path.is_symlink():
+        fail(f"fresh restore refuses to overwrite existing path: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def restore_paths(args: argparse.Namespace, manifest: dict) -> tuple[pathlib.Path, pathlib.Path]:
+    original_raw = manifest.get("config_path")
+    if not isinstance(original_raw, str):
+        fail("backup config path is not a string")
+    original_config = pathlib.Path(original_raw)
+    if not original_config.is_absolute():
+        fail("backup config path is not absolute")
+    # Archive metadata is evidence, not write authority. Default sinks come
+    # from this checkout/current user; only an explicit CLI option may relocate
+    # them to an archive-recorded absolute path.
+    config = pathlib.Path(args.config).resolve() if args.config else ROOT / "airlock.toml"
+    if (manifest["relative_package_paths"]
+            and config.parent != original_config.parent):
+        fail("config has relative package paths; restore must preserve its original parent directory")
+    selected_state = state_dir(args.state_dir)
+    config_real = config.resolve()
+    state_real = selected_state.resolve()
+    lock_real = PACKAGE_LOCK.resolve()
+    root_real = ROOT.resolve()
+    if path_within(state_real, root_real) or path_within(root_real, state_real):
+        fail("Airlock installed-state directory must be outside the checkout")
+    for left, right, label in (
+        (config_real, state_real, "config and installed-state"),
+        (config_real, lock_real, "config and package lock"),
+        (state_real, lock_real, "installed-state and package lock"),
+    ):
+        if left == right or path_within(left, right) or path_within(right, left):
+            fail(f"restore paths overlap ({label}); refusing any write")
+    return config, selected_state
+
+
+def require_matching_tree(action: str, manifest: dict, config: pathlib.Path) -> None:
+    require_clean_checkout(action, allowed=(config, PACKAGE_LOCK))
+    _, current_tree = git_identity()
+    if current_tree != manifest["source_tree"]:
+        fail(f"{action} checkout tree differs from the backup; install the recorded release tree first")
+
+
+def require_empty_directory(path: pathlib.Path, label: str) -> None:
+    if path.is_symlink():
+        fail(f"{label} must be an absent or empty real directory: {path}")
+    if not path.exists():
+        return
+    if not path.is_dir():
+        fail(f"{label} must be an absent or empty real directory: {path}")
+    try:
+        if next(path.iterdir(), None) is not None:
+            fail(f"{label} is not empty: {path}")
+    except OSError as exc:
+        fail(f"cannot inspect {label} {path}: {exc}")
+
+
+def fresh_box_preflight(manifest: dict, members: dict[str, bytes], config: pathlib.Path,
+                        selected_state: pathlib.Path) -> None:
+    for path in (config, PACKAGE_LOCK):
+        if path.exists() or path.is_symlink():
+            fail(f"fresh restore refuses a box that already has Airlock state: {path}")
+    require_empty_directory(selected_state, "Airlock installed-state directory")
+
+    unit_dir = pathlib.Path(os.environ.get("AIRLOCK_UNIT_DIR_USER",
+                                           str(pathlib.Path.home() / ".config/systemd/user")))
+    core_paths = (
+        pathlib.Path(os.environ.get("AIRLOCK_WEBROOT", "/opt/airlock/hub")),
+        pathlib.Path(os.environ.get("AIRLOCK_CONFD", "/etc/airlock/nginx")),
+        pathlib.Path(os.environ.get("AIRLOCK_NGINX_SITE", "/etc/nginx/conf.d/airlock.conf")),
+        unit_dir / "airlock-secret-sweep.service",
+        unit_dir / "airlock-secret-sweep.timer",
+    )
+    for path in core_paths:
+        if path.exists() or path.is_symlink():
+            fail(f"fresh restore found an existing Airlock platform artifact: {path}")
+
+    serve = run(["tailscale", "serve", "status", "--json"], timeout=30)
+    if serve.returncode != 0:
+        fail("fresh restore cannot verify that Tailscale serve has no existing mappings", 2)
+    try:
+        serve_status = json.loads(serve.stdout or b"{}")
+    except json.JSONDecodeError as exc:
+        fail(f"Tailscale serve status is not JSON: {exc}", 2)
+    if not isinstance(serve_status, dict):
+        fail("Tailscale serve status is not an object", 2)
+    if serve_status.get("TCP") or serve_status.get("Web"):
+        fail("fresh restore refuses a box with existing Tailscale serve mappings")
+
+    with tempfile.TemporaryDirectory(prefix="airlock-restore-preflight-") as raw_temp:
+        temp = pathlib.Path(raw_temp)
+        snapshot = temp / "config.toml"
+        snapshot.write_bytes(members["config.toml"])
+        snapshot.chmod(0o600)
+        env = snapshot_env(str(config), snapshot, manifest["config_sha256"], selected_state)
+        config_apps(env)  # validates config and resolves relative package inputs
+        configured = configured_artifact_findings(env)
+        if configured:
+            fail("fresh restore found configured-app artifacts: " + ", ".join(configured))
+        adopt = run([sys.executable, str(CONFIG_BIN), "adopt-scan"], env=env, timeout=120)
+        if adopt.returncode != 0:
+            fail("cannot scan the fresh box for unowned Airlock app artifacts", 2)
+        if adopt.stdout.strip():
+            fail("fresh restore found pre-ledger Airlock app artifacts; use a newly provisioned target")
+
+
+def receipt_bytes(manifest: dict, members: dict[str, bytes], config: pathlib.Path,
+                  selected_state: pathlib.Path, phase: str) -> bytes:
+    if phase not in {"prepared", "installing"}:
+        fail(f"invalid restore receipt phase: {phase}", 2)
+    return json_bytes({
+        "schema_version": 1,
+        "phase": phase,
+        "manifest_sha256": sha256(members["manifest.json"]),
+        "source_tree": manifest["source_tree"],
+        "config_path": str(config),
+        "state_dir": str(selected_state),
+    })
+
+
+def transition_receipt(receipt: pathlib.Path, before: bytes, after: bytes) -> None:
+    if checked_regular(receipt, "restore retry receipt", required=True) != before:
+        fail("restore retry receipt changed before its phase transition")
+    fd, temporary = tempfile.mkstemp(prefix=".restore-receipt.", dir=receipt.parent)
+    temp_path = pathlib.Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(after)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, receipt)
+        parent_fd = os.open(receipt.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except OSError as exc:
+        fail(f"cannot advance restore receipt phase: {exc}")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def require_resume_state(manifest: dict, members: dict[str, bytes], config: pathlib.Path,
+                         selected_state: pathlib.Path) -> tuple[pathlib.Path, str]:
+    receipt = selected_state / RESTORE_RECEIPT
+    actual = checked_regular(receipt, "restore retry receipt", required=True)
+    phase = next((candidate for candidate in ("prepared", "installing")
+                  if actual == receipt_bytes(manifest, members, config, selected_state, candidate)), None)
+    if phase is None:
+        fail("restore retry receipt does not match this archive and target")
+    config_now = checked_regular(config, "partial restore config", required=False)
+    if config_now is None:
+        atomic_new(config, members["config.toml"])
+    elif config_now != members["config.toml"]:
+        fail("partial restore config changed; refusing automatic retry")
+    lock_expected = members.get("records/airlock.lock")
+    lock_now = checked_regular(PACKAGE_LOCK, "partial restore package lock",
+                               required=False)
+    if lock_expected is not None and lock_now is None:
+        atomic_new(PACKAGE_LOCK, lock_expected, 0o644)
+    elif lock_now != lock_expected:
+        fail("partial restore package lock changed; refusing automatic retry")
+    return receipt, phase
+
+
+def compare_restored_records(manifest: dict, members: dict[str, bytes], config: pathlib.Path,
+                             selected_state: pathlib.Path) -> None:
+    config_now = checked_regular(config, "restored config", required=True)
+    if config_now != members["config.toml"]:
+        fail("restored config bytes differ from the backup")
+    expected_lock = members.get("records/airlock.lock")
+    lock_now = checked_regular(PACKAGE_LOCK, "restored package lock", required=expected_lock is not None)
+    if lock_now != expected_lock:
+        fail("restored package lock differs from the backup")
+    ledger_now = checked_regular(selected_state / "app-ledger.json", "restored install ledger", required=True)
+    assert ledger_now is not None
+    require_record_safe("app-ledger.json", ledger_now)
+    installed_now = committed_apps(ledger_now, "restored app-ledger.json")
+    if installed_now != manifest["installed_apps"]:
+        fail(f"restored app set differs from backup (backup={manifest['installed_apps']}, restored={installed_now})")
+    retirement_expected = members.get("records/plaintext-retirement.json")
+    retirement_now = checked_regular(selected_state / "plaintext-retirement.json", "restored plaintext retirement record", required=retirement_expected is not None)
+    require_record_safe("plaintext-retirement.json", retirement_now)
+    if retirement_now != retirement_expected:
+        fail("restored plaintext retirement record differs from the backup")
+
+
+def verify_current_locked(manifest: dict, members: dict[str, bytes], config: pathlib.Path,
+                          selected_state: pathlib.Path, *, allow_receipt: bool) -> None:
+    if not allow_receipt and (selected_state / RESTORE_RECEIPT).exists():
+        fail("restore retry receipt is still present; restore has not completed")
+    compare_restored_records(manifest, members, config, selected_state)
+    env = subprocess_env()
+    env.update({"AIRLOCK_CONFIG": str(config), "AIRLOCK_STATE_DIR": str(selected_state)})
+    require_green_status(env)
+    compare_restored_records(manifest, members, config, selected_state)
+
+
+def verify_current(manifest: dict, members: dict[str, bytes], config: pathlib.Path,
+                   selected_state: pathlib.Path, *, allow_receipt: bool = False,
+                   lock_held: bool = False) -> None:
+    require_matching_tree("verify", manifest, config)
+    if lock_held:
+        verify_current_locked(manifest, members, config, selected_state,
+                              allow_receipt=allow_receipt)
+    else:
+        with ledger_lock(selected_state):
+            verify_current_locked(manifest, members, config, selected_state,
+                                  allow_receipt=allow_receipt)
+    require_matching_tree("verify", manifest, config)
+
+
+def require_initial_restore_state_locked(selected_state: pathlib.Path,
+                                         receipt: pathlib.Path) -> None:
+    allowed = {receipt.name, "app-ledger.lock"}
+    try:
+        unexpected = sorted(path.name for path in selected_state.iterdir()
+                            if path.name not in allowed)
+    except OSError as exc:
+        fail(f"cannot recheck fresh installed-state before install: {exc}")
+    if unexpected:
+        fail("fresh installed-state changed before install; refusing old ledger/artifacts: "
+             + ", ".join(unexpected[:3]))
+
+
+def require_initial_restore_state(selected_state: pathlib.Path, receipt: pathlib.Path) -> None:
+    with ledger_lock(selected_state):
+        require_initial_restore_state_locked(selected_state, receipt)
+
+
+def verify(args: argparse.Namespace) -> int:
+    archive = pathlib.Path(args.archive).resolve()
+    manifest, members = read_archive(archive)
+    config, selected_state = restore_paths(args, manifest)
+    verify_current(manifest, members, config, selected_state)
+    print(f"restore-verdict=ok archive={archive} apps={len(manifest['installed_apps'])} status_rc=0")
+    return 0
+
+
+def restore(args: argparse.Namespace) -> int:
+    archive = pathlib.Path(args.archive).resolve()
+    manifest, members = read_archive(archive)
+    config, selected_state = restore_paths(args, manifest)
+    require_matching_tree("restore", manifest, config)
+    if args.resume:
+        receipt, phase = require_resume_state(manifest, members, config, selected_state)
+    else:
+        fresh_box_preflight(manifest, members, config, selected_state)
+        receipt = selected_state / RESTORE_RECEIPT
+        # The receipt is the first durable mutation. A crash during either
+        # following sink write is therefore resumable without overwriting an
+        # unrelated file.
+        prepared_receipt = receipt_bytes(manifest, members, config, selected_state, "prepared")
+        atomic_new(receipt, prepared_receipt)
+        atomic_new(config, members["config.toml"])
+        lock_data = members.get("records/airlock.lock")
+        if lock_data is not None:
+            atomic_new(PACKAGE_LOCK, lock_data, 0o644)
+        phase = "prepared"
+    with ledger_lock(selected_state) as lock_fd:
+        if lock_fd is None:
+            fail("restore installed-state directory disappeared before install")
+        if phase == "prepared":
+            require_initial_restore_state_locked(selected_state, receipt)
+            transition_receipt(
+                receipt,
+                receipt_bytes(manifest, members, config, selected_state, "prepared"),
+                receipt_bytes(manifest, members, config, selected_state, "installing"),
+            )
+        env = subprocess_env()
+        env.update({"AIRLOCK_CONFIG": str(config), "AIRLOCK_STATE_DIR": str(selected_state),
+                    "AIRLOCK_LEDGER_LOCK_FD": str(lock_fd)})
+        install = run(["bash", str(INSTALL_BIN)], env=env, timeout=1800,
+                      pass_fds=(lock_fd,))
+        if install.returncode != 0:
+            sys.stderr.buffer.write(install.stdout)
+            sys.stderr.buffer.write(install.stderr)
+            fail(f"Airlock installer failed during restore (rc={install.returncode}); retry only with `python3 bin/airlock-backup restore --resume {archive}`")
+        # Keep both the writer lock and receipt until every semantic check
+        # passes. There is no green-to-unlink handoff window for another
+        # cooperative Airlock writer.
+        verify_current(manifest, members, config, selected_state,
+                       allow_receipt=True, lock_held=True)
+        receipt.unlink()
+    print(f"restore=ok archive={archive} tree={manifest['source_tree']} apps={len(manifest['installed_apps'])} status_rc=0")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    top = argparse.ArgumentParser(description=__doc__)
+    subs = top.add_subparsers(dest="command", required=True)
+    create_p = subs.add_parser("create", help="write a private backup archive from a fully healthy box")
+    create_p.add_argument("archive")
+    create_p.add_argument("--state-dir")
+    create_p.set_defaults(function=create)
+    restore_p = subs.add_parser("restore", help="restore a fresh Airlock box")
+    restore_p.add_argument("archive")
+    restore_p.add_argument("--config")
+    restore_p.add_argument("--state-dir")
+    restore_p.add_argument("--resume", action="store_true",
+                           help="retry only the partial restore recorded for this archive and target")
+    restore_p.set_defaults(function=restore)
+    verify_p = subs.add_parser("verify", help="verify a restored Airlock box")
+    verify_p.add_argument("archive")
+    verify_p.add_argument("--config")
+    verify_p.add_argument("--state-dir")
+    verify_p.set_defaults(function=verify)
+    return top
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return args.function(args)
+    except BackupError as exc:
+        print(f"airlock-backup: {exc}", file=sys.stderr)
+        return exc.code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

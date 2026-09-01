@@ -256,6 +256,22 @@ run_update --dry-run >/dev/null 2>&1
 [ -d "$BOX/.git" ] && bad "--dry-run created a repository in the operator's directory" \
                    || ok "--dry-run creates no repository"
 
+# The update detector must consume a machine result, not scrape Korean progress text.
+# This exercises the non-git path too: that is the reason the updater owns a scratch
+# GIT_DIR during preview.
+make_box "$BOX" --no-git
+json_out="$(AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$REL" bash "$UPDATE" --dry-run --json 2>"$scratch/update-json.err")"; json_rc=$?
+json_check="$(printf '%s' "$json_out" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is True, value
+assert isinstance(value["changedCount"], int) and value["changedCount"] > 0, value
+assert len(value["ref"]) == 40 and all(c in "0123456789abcdef" for c in value["ref"]), value
+')"; json_check_rc=$?
+[ "$json_rc" = 0 ] && [ "$json_check_rc" = 0 ] \
+  && ok "--dry-run --json is a clean machine result on a non-git checkout" \
+  || bad "--dry-run --json was not the detector contract (update=$json_rc json=$json_check_rc): $json_out"
+
 # ---------------------------------------------------------------- 5) refuses strangers
 notabox="$scratch/not-a-checkout"; mkdir -p "$notabox"; printf 'hi\n' > "$notabox/file"
 AIRLOCK_DIR="$notabox" AIRLOCK_RELEASE_URL="$REL" bash "$UPDATE" --no-install >/dev/null 2>&1 \
@@ -395,6 +411,328 @@ out8="$(run_mac)"
 printf '%s' "$out8" | grep -q 'OrbStack 이 켜져 있는지' \
   && ok "a failing orb list is reported as itself, not as 'no machine has Airlock'" \
   || bad "OrbStack being down was reported as 'no machine has Airlock' — that sends the operator to --machine"
+
+# ---------------------------------------------------------------- 8) failed install rollback
+# This fixture gives status one observable machine fact: the version marker the
+# installer left.  A failed new installer writes "new-partial" and exits 42, so the
+# no-rollback control is red; the old installer writes "old", so a real rollback can
+# only turn green by actually running it.  No production-only fault switch is needed.
+make_rollback_tree() { # make_rollback_tree <dir> <old|new>
+  local d="$1" version="$2"
+  rm -rf "$d"
+  seed_tree "$d" "$version"
+  printf 'airlock.lock\n' >>"$d/.gitignore"
+  cat >"$d/bin/airlock-ledger" <<'PY'
+#!/usr/bin/env python3
+import json, os, pathlib, sys
+
+def ledger_path():
+    return pathlib.Path(os.environ["AIRLOCK_STATE_DIR"]) / "app-ledger.json"
+
+def load_store():
+    return json.loads(ledger_path().read_text())
+
+def _removal_order(store, selected):
+    entries = store["entries"]
+    seen, ordered = set(), []
+    def visit(app):
+        if app in seen:
+            return
+        seen.add(app)
+        for dependent, record in entries.items():
+            if app in record.get("deps", []):
+                visit(dependent)
+        if app in selected:
+            ordered.append(app)
+    for app in selected:
+        visit(app)
+    return ordered
+
+def main():
+    if sys.argv[1:2] != ["teardown"] or len(sys.argv) != 3:
+        raise SystemExit(2)
+    app = sys.argv[2]
+    store = load_store()
+    with open(os.environ["AIRLOCK_TEST_TEARDOWN_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(app + "\n")
+    (pathlib.Path(os.environ["AIRLOCK_TEST_ARTIFACT_DIR"]) / app).unlink(missing_ok=True)
+    store["entries"].pop(app)
+    ledger_path().write_text(json.dumps(store, sort_keys=True) + "\n")
+
+if __name__ == "__main__":
+    main()
+PY
+  cat >"$d/bin/airlock-config" <<'PY'
+#!/usr/bin/env python3
+import hashlib, json, os, pathlib, shutil, sys
+if sys.argv[1:2] != ["install-snapshot"] or len(sys.argv) != 3:
+    raise SystemExit(2)
+source = pathlib.Path(os.environ.get("AIRLOCK_CONFIG", "airlock.toml")).resolve()
+target = pathlib.Path(sys.argv[2])
+data = source.read_bytes()
+target.write_bytes(data)
+target.chmod(0o600)
+print(json.dumps({"config_path": str(source), "sha256": hashlib.sha256(data).hexdigest()}))
+PY
+  if [ "$version" = new ]; then
+    cat >"$d/bin/airlock-config" <<'PY'
+#!/usr/bin/env python3
+import sys
+sys.stderr.write("fixture: the failed new release config command is unavailable\n")
+raise SystemExit(91)
+PY
+  fi
+  cat >"$d/bin/airlock-status" <<PY
+#!/usr/bin/env python3
+import json, os, pathlib, sys
+want = "$version"
+got = pathlib.Path(os.environ["AIRLOCK_TEST_RUNTIME"]).read_text().strip()
+forced = int(os.environ.get("AIRLOCK_TEST_STATUS_RC", "-1"))
+expected_state = os.environ.get("AIRLOCK_TEST_EXPECT_STATE_DIR", "")
+expected_config = os.environ.get("AIRLOCK_TEST_EXPECT_CONFIG", "")
+state_ok = not expected_state or os.environ.get("AIRLOCK_STATE_DIR") == expected_state
+actual_config = pathlib.Path(os.environ.get("AIRLOCK_CONFIG", "airlock.toml")).resolve()
+config_ok = not expected_config or actual_config == pathlib.Path(expected_config).resolve()
+rc = forced if forced >= 0 else (0 if got == want and state_ok and config_ok else 1)
+verdict = "ok" if rc == 0 else ("incomplete" if rc == 3 else "fail")
+print(json.dumps({"schema_version": 1, "verdict": verdict, "exit_code": rc,
+                  "checks": [{"id": "fixture.runtime", "status": verdict,
+                              "detail": got},
+                             {"id": "fixture.context", "status": verdict,
+                              "detail": f"state={state_ok} config={config_ok}"}]}))
+raise SystemExit(rc)
+PY
+  if [ "$version" = old ]; then
+    cat >"$d/install/airlock-install.sh" <<'SH'
+#!/usr/bin/env bash
+[ ! -e /proc/$$/fd/8 ] || exit 88
+test "$AIRLOCK_STATE_DIR" = "$AIRLOCK_TEST_EXPECT_STATE_DIR"
+test "$AIRLOCK_CONFIG" = "$AIRLOCK_TEST_EXPECT_CONFIG"
+printf 'old\n' >"$AIRLOCK_TEST_RUNTIME"
+printf 'old\n' >>"$AIRLOCK_TEST_INSTALL_LOG"
+SH
+  else
+    cat >"$d/install/airlock-install.sh" <<'SH'
+#!/usr/bin/env bash
+[ ! -e /proc/$$/fd/8 ] || exit 88
+printf 'new-partial\n' >"$AIRLOCK_TEST_RUNTIME"
+printf 'new\n' >>"$AIRLOCK_TEST_INSTALL_LOG"
+mkdir -p "$AIRLOCK_TEST_ARTIFACT_DIR"
+printf 'parent\n' >"$AIRLOCK_TEST_ARTIFACT_DIR/a-parent"
+printf 'child\n' >"$AIRLOCK_TEST_ARTIFACT_DIR/z-child"
+printf '{\n  "version": 6,\n  "entries": {"a-parent":{"deps":[]},"z-child":{"deps":["a-parent"]}},\n  "events": []\n}\n' \
+  >"$AIRLOCK_STATE_DIR/app-ledger.json"
+printf '{"version":1,"entries":[{"package":"fixture","listen":444,"target":445}]}\n' \
+  >"$AIRLOCK_STATE_DIR/plaintext-retirement.json"
+printf 'new partial lock\n' >airlock.lock
+[ "${AIRLOCK_TEST_INSTALL_FAIL:-1}" != 0 ] || {
+  printf 'new\n' >"$AIRLOCK_TEST_RUNTIME"
+  exit 0
+}
+exit 42
+SH
+  fi
+}
+
+ROLLREL="$scratch/rollback-release"
+make_rollback_tree "$ROLLREL" new
+git -C "$ROLLREL" init -q -b main
+git -C "$ROLLREL" add -A
+git -C "$ROLLREL" commit -q -m release
+
+make_rollback_box() {
+  make_rollback_tree "$BOX" old
+  RCONFIG="$scratch/rollback-custom.toml"
+  printf '[site]\nname = "Rollback Fixture"\n' >"$RCONFIG"
+  git -C "$BOX" init -q -b main
+  git -C "$BOX" add -A
+  git -C "$BOX" commit -q -m old
+  RUNTIME="$scratch/runtime"; INSTALL_LOG="$scratch/install.log"; RSTATE="$scratch/rollback-state"
+  TEARDOWN_LOG="$scratch/teardown.log"; ARTIFACT_DIR="$scratch/current-artifacts"
+  printf 'old\n' >"$RUNTIME"; : >"$INSTALL_LOG"; : >"$TEARDOWN_LOG"
+  rm -rf "$RSTATE" "$ARTIFACT_DIR"; mkdir -p "$RSTATE"
+  printf '{"version":6,"entries":{},"events":[]}\n' >"$RSTATE/app-ledger.json"
+  printf '{"version":1,"entries":[]}\n' >"$RSTATE/plaintext-retirement.json"
+  printf 'old lock\n' >"$BOX/airlock.lock"
+  RBEFORE="$(git -C "$BOX" rev-parse HEAD)"
+}
+run_failed_update() {
+  AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$ROLLREL" AIRLOCK_STATE_DIR="$RSTATE" AIRLOCK_CONFIG="$RCONFIG" \
+    AIRLOCK_TEST_EXPECT_STATE_DIR="$RSTATE" AIRLOCK_TEST_EXPECT_CONFIG="$RCONFIG" \
+    AIRLOCK_TEST_RUNTIME="$RUNTIME" AIRLOCK_TEST_INSTALL_LOG="$INSTALL_LOG" \
+    AIRLOCK_TEST_TEARDOWN_LOG="$TEARDOWN_LOG" AIRLOCK_TEST_ARTIFACT_DIR="$ARTIFACT_DIR" \
+    bash "$UPDATE" 2>&1
+}
+run_rollback() {
+  AIRLOCK_DIR="$BOX" AIRLOCK_TEST_RUNTIME="$RUNTIME" \
+    AIRLOCK_TEST_EXPECT_STATE_DIR="$RSTATE" AIRLOCK_TEST_EXPECT_CONFIG="$RCONFIG" \
+    AIRLOCK_TEST_INSTALL_LOG="$INSTALL_LOG" \
+    AIRLOCK_TEST_TEARDOWN_LOG="$TEARDOWN_LOG" AIRLOCK_TEST_ARTIFACT_DIR="$ARTIFACT_DIR" \
+    bash "$BOX/.git/airlock-update-rollback/airlock-update" --rollback 2>&1
+}
+fixture_status() {
+  (cd "$BOX" && AIRLOCK_STATE_DIR="$RSTATE" AIRLOCK_CONFIG="$RCONFIG" \
+    AIRLOCK_TEST_RUNTIME="$RUNTIME" python3 bin/airlock-status --json >/dev/null 2>&1)
+}
+
+make_rollback_box
+update_success_out="$(AIRLOCK_TEST_INSTALL_FAIL=0 run_failed_update)"; update_success_rc=$?
+[ "$update_success_rc" = 0 ] && [ "$(cat "$RUNTIME")" = new ] \
+  && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
+  && ! git -C "$BOX" show-ref --verify --quiet refs/airlock-update/rollback \
+  && printf '%s' "$update_success_out" | grep -q 'airlock-status rc=0' \
+  && ok "a healthy update verifies exactly and removes its armed recovery record" \
+  || bad "a healthy update left recovery state behind or skipped exact status: $update_success_out"
+
+make_rollback_box
+update_lock_ready="$scratch/update-lock-ready"
+rm -f "$update_lock_ready"
+python3 - "$BOX/.git" "$update_lock_ready" <<'PY' &
+import fcntl, os, pathlib, sys, time
+descriptor = os.open(sys.argv[1], os.O_RDONLY)
+fcntl.flock(descriptor, fcntl.LOCK_EX)
+pathlib.Path(sys.argv[2]).touch()
+time.sleep(2)
+PY
+update_lock_holder=$!
+while [ ! -e "$update_lock_ready" ]; do sleep 0.01; done
+update_lock_out="$(run_failed_update)"; update_lock_rc=$?
+wait "$update_lock_holder"
+[ "$update_lock_rc" -ne 0 ] && [ "$(git -C "$BOX" rev-parse HEAD)" = "$RBEFORE" ] \
+  && [ ! -s "$INSTALL_LOG" ] && [ "$(cat "$RUNTIME")" = old ] \
+  && ok "a second updater is refused by the git-dir mutex before checkout or install" \
+  || bad "the update mutex admitted a concurrent updater: $update_lock_out"
+
+make_rollback_box
+pre_incomplete_out="$(AIRLOCK_TEST_STATUS_RC=3 run_failed_update)"; pre_incomplete_rc=$?
+[ "$pre_incomplete_rc" = 1 ] && [ "$(git -C "$BOX" rev-parse HEAD)" = "$RBEFORE" ] \
+  && [ ! -s "$INSTALL_LOG" ] && [ "$(cat "$RUNTIME")" = old ] \
+  && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
+  && printf '%s' "$pre_incomplete_out" | grep -q 'airlock-status rc=3' \
+  && ok "pre-update status rc=3 refuses checkout and install before recovery is armed" \
+  || bad "an incomplete pre-update status changed the box or was misreported: $pre_incomplete_out"
+
+make_rollback_box
+rollback_fail_out="$(run_failed_update)"; rollback_fail_rc=$?
+[ "$rollback_fail_rc" = 42 ] && ok "an injected installer failure stays a failed update" \
+  || bad "the injected installer failure exited $rollback_fail_rc, not 42: $rollback_fail_out"
+fixture_status; no_rollback_status=$?
+[ "$no_rollback_status" = 1 ] && ok "negative control: without rollback the mixed box is red" \
+  || bad "negative control: a rollback that never ran looked green (status rc=$no_rollback_status)"
+[ "$(cat "$INSTALL_LOG")" = new ] && ok "negative control: the old installer has not run yet" \
+  || bad "negative control: rollback ran before it was requested"
+rollback_out="$(run_rollback)"; rollback_rc=$?
+[ "$rollback_rc" = 0 ] && ok "one rollback command restores and verifies the failed update" \
+  || bad "rollback exited $rollback_rc: $rollback_out"
+[ "$(git -C "$BOX" rev-parse HEAD)" = "$RBEFORE" ] \
+  && [ "$(cat "$RUNTIME")" = old ] \
+  && [ "$(tr '\n' ' ' <"$INSTALL_LOG")" = "new old " ] \
+  && [ -z "$(git -C "$BOX" status --porcelain --untracked-files=all)" ] \
+  && ok "rollback restores the old checkout and reruns the old installer" \
+  || bad "rollback left checkout/runtime/install order mixed"
+[ "$(tr '\n' ' ' <"$TEARDOWN_LOG")" = "z-child a-parent " ] \
+  && [ ! -e "$ARTIFACT_DIR/z-child" ] && [ ! -e "$ARTIFACT_DIR/a-parent" ] \
+  && ok "rollback tears down current artifacts in dependent-before-dependency order" \
+  || bad "rollback did not exercise the current ledger teardown order"
+grep -qx '{"version":6,"entries":{},"events":\[\]}' "$RSTATE/app-ledger.json" \
+  && [ "$(cat "$RSTATE/plaintext-retirement.json")" = '{"version":1,"entries":[]}' ] \
+  && [ "$(cat "$BOX/airlock.lock")" = 'old lock' ] \
+  && ok "rollback restores the pre-update ledger, retirement record, and package lock" \
+  || bad "rollback left a new installed-state record behind"
+printf '%s' "$rollback_out" | grep -q 'airlock-status rc=0' \
+  && ok "rollback success names the exact status verdict" \
+  || bad "rollback did not record its rc=0 verification"
+grep -q $'\tupdate-failed\t' "$BOX/.git/airlock-update.log" \
+  && grep -q $'\trollback-ok\t' "$BOX/.git/airlock-update.log" \
+  && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
+  && ! git -C "$BOX" show-ref --verify --quiet refs/airlock-update/rollback \
+  && ok "failed update and successful rollback stay logged without a stale recovery ref" \
+  || bad "rollback log or recovery metadata cleanup is incomplete"
+
+make_rollback_box
+run_failed_update >/dev/null 2>&1
+printf '\n# changed after failure\n' >>"$RCONFIG"
+config_refuse_out="$(run_rollback)"; config_refuse_rc=$?
+[ "$config_refuse_rc" -ne 0 ] && [ "$(cat "$INSTALL_LOG")" = new ] \
+  && [ "$(cat "$RUNTIME")" = new-partial ] \
+  && ok "rollback refuses a changed ignored config before running the old installer" \
+  || bad "rollback erased or used a config changed after the failure: $config_refuse_out"
+
+make_rollback_box
+run_failed_update >/dev/null 2>&1
+alternate_config="$scratch/alternate/airlock.toml"
+mkdir -p "$(dirname "$alternate_config")"
+cp "$RCONFIG" "$alternate_config"
+printf '%s' "$alternate_config" >"$BOX/.git/airlock-update-rollback/config-path"
+path_refuse_out="$(run_rollback)"; path_refuse_rc=$?
+[ "$path_refuse_rc" -ne 0 ] && [ "$(cat "$INSTALL_LOG")" = new ] \
+  && [ "$(cat "$RUNTIME")" = new-partial ] \
+  && ok "rollback refuses same-byte config metadata retargeted to another base directory" \
+  || bad "rollback trusted tampered config-path metadata: $path_refuse_out"
+
+make_rollback_box
+run_failed_update >/dev/null 2>&1
+printf '%s' "$scratch/other-state" >"$BOX/.git/airlock-update-rollback/state-dir"
+state_path_refuse_out="$(run_rollback)"; state_path_refuse_rc=$?
+[ "$state_path_refuse_rc" -ne 0 ] && [ "$(cat "$INSTALL_LOG")" = new ] \
+  && [ "$(cat "$RUNTIME")" = new-partial ] \
+  && ok "rollback refuses tampered destructive state-dir metadata" \
+  || bad "rollback trusted tampered state-dir metadata: $state_path_refuse_out"
+
+make_rollback_box
+run_failed_update >/dev/null 2>&1
+printf 'operator edit after failure\n' >>"$BOX/README.md"
+dirty_refuse_out="$(run_rollback)"; dirty_refuse_rc=$?
+[ "$dirty_refuse_rc" -ne 0 ] && [ "$(cat "$INSTALL_LOG")" = new ] \
+  && ok "rollback refuses tracked work added after the failed update" \
+  || bad "rollback discarded tracked work or ran the old installer: $dirty_refuse_out"
+
+make_rollback_box
+run_failed_update >/dev/null 2>&1
+printf ' \n' >>"$RSTATE/app-ledger.json" # still valid JSON; represents a later state writer
+state_refuse_out="$(run_rollback)"; state_refuse_rc=$?
+[ "$state_refuse_rc" -ne 0 ] && [ "$(cat "$INSTALL_LOG")" = new ] \
+  && [ "$(cat "$RUNTIME")" = new-partial ] \
+  && ok "rollback refuses installed-state changes made after the failed update" \
+  || bad "rollback overwrote state changed after failure: $state_refuse_out"
+
+make_rollback_box
+run_failed_update >/dev/null 2>&1
+lock_ready="$scratch/ledger-lock-ready"
+rm -f "$lock_ready"
+flock "$RSTATE/app-ledger.lock" bash -c 'touch "$1"; sleep 2' airlock-lock "$lock_ready" &
+lock_holder=$!
+while [ ! -e "$lock_ready" ]; do sleep 0.01; done
+lock_refuse_out="$(run_rollback)"; lock_refuse_rc=$?
+wait "$lock_holder"
+[ "$lock_refuse_rc" -ne 0 ] && [ "$(cat "$INSTALL_LOG")" = new ] \
+  && [ "$(cat "$RUNTIME")" = new-partial ] \
+  && [ -e "$ARTIFACT_DIR/z-child" ] && [ -e "$ARTIFACT_DIR/a-parent" ] \
+  && [ ! -s "$TEARDOWN_LOG" ] \
+  && ok "rollback refuses a competing ledger writer before teardown or restore" \
+  || bad "rollback mutated the box while another ledger writer held the lock: $lock_refuse_out"
+
+make_rollback_box
+run_failed_update >/dev/null 2>&1
+incomplete_out="$(AIRLOCK_TEST_STATUS_RC=3 run_rollback)"; incomplete_rc=$?
+[ "$incomplete_rc" = 3 ] \
+  && ! printf '%s' "$incomplete_out" | grep -q '검증도 통과' \
+  && [ -d "$BOX/.git/airlock-update-rollback" ] \
+  && git -C "$BOX" show-ref --verify --quiet refs/airlock-update/rollback \
+  && ok "status rc=3 is never reported as a successful rollback" \
+  || bad "an incomplete status became rollback success: $incomplete_out"
+incomplete_retry_out="$(run_rollback)"; incomplete_retry_rc=$?
+[ "$incomplete_retry_rc" = 0 ] \
+  && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
+  && ! git -C "$BOX" show-ref --verify --quiet refs/airlock-update/rollback \
+  && printf '%s' "$incomplete_retry_out" | grep -q 'airlock-status rc=0' \
+  && ok "a rollback left incomplete can retry to exact status and clean recovery state" \
+  || bad "an incomplete rollback could not be retried safely: $incomplete_retry_out"
+
+timer_out="$(bash "$ROOT/install/test-update-timer.sh" 2>&1)"; timer_rc=$?
+[ "$timer_rc" = 0 ] \
+  && ok "daily update detector timer is rendered, installed and systemd-verified hermetically" \
+  || bad "daily update detector timer contract failed: $timer_out"
 
 printf '\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

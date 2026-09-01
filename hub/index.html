@@ -1,13 +1,31 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="system">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Airlock</title>
+<script>
+/* Match the live launcher's persisted choice before the page or browser chrome paints. */
+(function () {
+  var theme = "system";
+  try {
+    var stored = localStorage.getItem("markwand-theme");
+    if (stored === "light" || stored === "dark" || stored === "system") {
+      theme = stored;
+    }
+  } catch (_) {}
+  document.documentElement.setAttribute("data-theme", theme);
+  var light = theme === "light" ||
+    (theme === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+  var themeColor = document.createElement("meta");
+  themeColor.name = "theme-color";
+  themeColor.content = light ? "#f5f5f7" : "#0a0f1e";
+  document.head.appendChild(themeColor);
+})();
+</script>
 <link rel="stylesheet" href="/assets/airlock-tokens.css">
 <link rel="icon" type="image/png" href="/assets/favicon.png">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
-<meta name="theme-color" content="#0a0f1e">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -25,11 +43,70 @@
     padding: max(env(safe-area-inset-top), 1.5rem) 1.25rem 3rem;
   }
   header { max-width: 880px; margin: 0 auto 2rem; display: flex; align-items: center; gap: 1rem;
+           flex-wrap: wrap; position: relative;   /* anchors the settings sheet */
            padding-bottom: 0.9rem; border-bottom: 1px solid var(--airlock-hairline); }
   h1 { font-size: 1.25rem; margin: 0; letter-spacing: -0.02em; font-weight: 700; }
-  .who { margin-left: auto; color: var(--airlock-mute); font-size: 0.9rem; font-weight: 500;
+  .theme-group { margin-left: auto; display: flex; align-items: center; gap: 4px; }
+  .theme-group button {
+    min-height: 44px; padding: 5px 10px; border: 1px solid var(--airlock-hairline);
+    border-radius: 999px; background: transparent; color: var(--airlock-mute);
+    font: inherit; font-size: 0.75rem; font-weight: 600; cursor: pointer;
+  }
+  .theme-group button:hover { color: var(--airlock-ink); background: var(--airlock-surface-1); }
+  .theme-group button:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
+  .theme-group button[aria-pressed="true"] {
+    border-color: var(--airlock-primary); background: var(--airlock-primary);
+    color: var(--airlock-on-primary);
+  }
+  .who { color: var(--airlock-mute); font-size: 0.9rem; font-weight: 500;
          padding: 4px 12px; border: 1px solid var(--airlock-hairline); border-radius: 999px; white-space: nowrap; }
   .who:empty { display: none; }
+  /* The pill is the entrance to subscription accounts (owner decision, confirmed
+     mockup 9: the settings sheet has no subscription row — this does, because the
+     pill is already the place that says whose box this is). [data-acct] is set by
+     script only once there is a panel to open, so an unwired pill keeps exactly
+     the plain-label look it has today. */
+  .who[data-acct] { cursor: pointer; color: var(--airlock-ink); }
+  .who[data-acct]:hover { background: var(--airlock-surface-1); }
+  .who[data-acct]:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
+  /* Warning ring. The level comes from devterm's /acct-alert — the same verdict
+     devterm's own account icon and the return widget's ring read, so all three
+     change colour at the same instant and no threshold is restated here. Amber
+     warns; red blinks, because a static ring on something you have learnt to
+     ignore has stopped being a warning. */
+  .who[data-acct-level="warn"] { border-color: var(--airlock-warning); color: var(--airlock-warning); }
+  .who[data-acct-level="crit"] { border-color: var(--airlock-danger); color: var(--airlock-danger);
+                                 animation: acct-ring-blink 1.4s steps(1, end) infinite; }
+  @keyframes acct-ring-blink { 50% { border-color: var(--airlock-hairline); } }
+  @media (prefers-reduced-motion: reduce) {
+    .who[data-acct-level="crit"] { animation: none; }
+  }
+
+  /* Subscription panel, opened from the pill. The panel is the platform asset at
+     hub/assets/accounts/ — the same file devterm's account icon and the return
+     widget's menu open, so there is one implementation with three hosts. It has to
+     be an iframe on devterm's origin rather than a copy here: every fetch inside it
+     is a root-absolute path that only that gate answers. This is just the modal
+     around it, in the hub's own tokens. */
+  .acct-modal { position: fixed; inset: 0; z-index: 60; display: flex;
+                align-items: center; justify-content: center;
+                padding: var(--airlock-sp-4); background: rgba(0, 0, 0, .6); }
+  .acct-box { display: flex; flex-direction: column; overflow: hidden;
+              width: min(460px, 100%); height: min(620px, 92vh);
+              border: 1px solid var(--airlock-hairline); border-radius: var(--airlock-r-lg);
+              background: var(--airlock-surface-1); box-shadow: var(--airlock-shadow-hover); }
+  .acct-head { flex: 0 0 auto; display: flex; align-items: center; gap: var(--airlock-sp-3);
+               padding: var(--airlock-sp-3) var(--airlock-sp-4);
+               border-bottom: 1px solid var(--airlock-hairline);
+               font-size: 0.95rem; font-weight: var(--airlock-fw-semibold); }
+  .acct-ttl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .acct-x { flex: none; width: 34px; height: 30px; border: 0; cursor: pointer;
+            border-radius: var(--airlock-r-sm); background: var(--airlock-surface-2);
+            color: var(--airlock-ink); font: inherit; font-size: 1rem; line-height: 1; }
+  .acct-x:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
+  .acct-frame { flex: 1 1 auto; width: 100%; border: 0; background: var(--airlock-surface-1); }
+  .acct-note { padding: var(--airlock-sp-4); color: var(--airlock-body);
+               font-size: 0.85rem; line-height: 1.55; word-break: break-word; }
   main { max-width: 880px; margin: 0 auto; }
   .sec-h { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
            color: var(--airlock-mute); margin: 0 0 1.25rem; display: flex; align-items: center; gap: 8px; }
@@ -50,6 +127,7 @@
           gap: 26px 12px; justify-items: center; }
   .app { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 82px;
          text-decoration: none; color: var(--airlock-ink); position: relative; }
+  .app[hidden] { display: none; }
   .app .ic {
     width: 60px; height: 60px; border-radius: 15px; display: grid; place-items: center;
     overflow: hidden; position: relative;
@@ -73,6 +151,24 @@
   .app .ic img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .app.has-brand .ic { background: none; box-shadow: var(--airlock-shadow); }
   .app .lb { font-size: 0.85rem; font-weight: 500; text-align: center; line-height: 1.25; }
+  /* The manifest description remains in each tile's DOM, but an iPhone-style
+     home screen leads with the icon and name alone. Setting the root attribute
+     to `data-tile-descriptions="visible"` is the single opt-in for a future
+     preference or long-press reveal. */
+  .app .sub { display: none; color: var(--airlock-mute); font-size: 0.72rem;
+              text-align: center; line-height: 1.35; }
+  :root[data-tile-descriptions="visible"] .app .sub { display: block; max-width: 18ch; }
+  .app .origin { color: var(--airlock-mute); font-size: 0.68rem; font-weight: 600;
+                 line-height: 1; padding: 3px 7px; border: 1px solid var(--airlock-hairline);
+                 border-radius: 999px; white-space: nowrap; }
+
+  /* Keep the home-screen density on phones: three icons, not two explanatory
+     cards. The 82px tile is still wider and taller than the 44px touch target. */
+  @media (hover: none), (pointer: coarse), (max-width: 560px) {
+    .apps { grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 26px 12px; align-items: start; }
+    .app { width: 100%; }
+  }
 
   /* Tile colour is the app's, not the system's.
      Every other colour on this page is a token, and this block is the one
@@ -93,6 +189,25 @@
   .app[data-cat="system"] { --app-tile: #46597e; --app-glyph: #ffffff; }
   .app[data-cat="comms"]  { --app-tile: #3f9a5c; --app-glyph: #ffffff; }
 
+  .find-open, .find-close {
+    width: 44px; height: 44px; padding: 0; display: grid; place-items: center;
+    border: 1px solid var(--airlock-hairline); border-radius: 999px;
+    background: transparent; color: var(--airlock-mute); cursor: pointer;
+  }
+  .find-open { margin-left: auto; }
+  .find-open:hover, .find-close:hover { color: var(--airlock-ink); background: var(--airlock-surface-1); }
+  .find-open:focus-visible, .find-close:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
+  .find-open svg, .find-close svg { width: 18px; height: 18px; fill: none; stroke: currentColor;
+                                     stroke-width: 1.8; stroke-linecap: round; }
+  .launcher-find { margin: 0 0 2rem; display: flex; align-items: center; gap: 8px; }
+  .launcher-find[hidden] { display: none; }
+  .launcher-find input {
+    width: min(100%, 28rem); flex: 1; min-height: 44px; padding: 9px 14px;
+    border: 1px solid var(--airlock-hairline); border-radius: 12px;
+    background: var(--airlock-surface-1); color: var(--airlock-ink);
+    font: inherit; font-size: 0.95rem; -webkit-appearance: none;
+  }
+  .launcher-find input:focus { outline: none; border-color: var(--airlock-primary); }
   .empty { color: var(--airlock-mute); }
 
   /* message strip — dev-monitor's "needs a person" preview, above the tool grid.
@@ -115,6 +230,131 @@
   .ms-row .ms-t { font-size: 0.88rem; font-weight: 500; flex: 1; min-width: 0;
                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ms-row .ms-s { color: var(--airlock-mute); font-size: 0.76rem; white-space: nowrap; }
+
+  /* ── settings: one gear, one number, one sheet ─────────────────────────
+     The macOS convention rather than ours: the gear IS the update surface and
+     the badge is the only thing that appears when something is waiting. A
+     second "updates" icon would make the header say twice what one number
+     says once. Owner-only, and gated on the very API that fills it — a box
+     with detection switched off draws no gear at all rather than an empty
+     panel (same 403/404 discipline as the message strip above). */
+  .gear {
+    position: relative; width: 44px; height: 44px; padding: 0; display: grid; place-items: center;
+    border: 1px solid var(--airlock-hairline); border-radius: var(--airlock-r-pill);
+    background: transparent; color: var(--airlock-mute); cursor: pointer;
+  }
+  .gear[hidden] { display: none; }
+  .gear:hover { color: var(--airlock-ink); background: var(--airlock-surface-1); }
+  .gear:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
+  .gear[aria-expanded="true"] { color: var(--airlock-ink); border-color: var(--airlock-primary); }
+  .gear svg { width: 20px; height: 20px; display: block; fill: none; stroke: currentColor;
+              stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  /* Hidden at zero rather than drawn as "0": a zero is a number a reader stops
+     to parse, and no badge is the fastest way to say there is nothing to do. */
+  .gear-badge {
+    position: absolute; top: 0; right: 0; min-width: 18px; height: 18px; padding: 0 5px;
+    display: grid; place-items: center; border-radius: var(--airlock-r-pill);
+    background: var(--airlock-primary); color: var(--airlock-on-primary);
+    font-size: 0.68rem; font-weight: var(--airlock-fw-bold); line-height: 1;
+  }
+  .gear-badge[hidden] { display: none; }
+
+  .settings {
+    position: absolute; top: calc(100% + 8px); right: 0; z-index: 20;
+    width: min(480px, calc(100vw - 2.5rem)); max-height: min(78vh, 780px); overflow-y: auto;
+    padding: var(--airlock-sp-5); border: 1px solid var(--airlock-hairline);
+    border-radius: var(--airlock-r-lg); background: var(--airlock-surface-1);
+    box-shadow: var(--airlock-shadow-hover);
+  }
+  .settings[hidden] { display: none; }
+  .set-ttl { font-size: var(--airlock-fs-lg); font-weight: var(--airlock-fw-bold);
+             letter-spacing: var(--airlock-track); }
+  .set-sub { color: var(--airlock-mute); font-size: 0.82rem; margin-top: 2px; }
+  .set-sec { margin-top: var(--airlock-sp-6); }
+  .set-h { display: flex; align-items: center; gap: var(--airlock-sp-2);
+           font-size: 0.82rem; font-weight: var(--airlock-fw-semibold); color: var(--airlock-body);
+           padding-bottom: var(--airlock-sp-2); border-bottom: 1px solid var(--airlock-hairline); }
+  .set-n { padding: 2px 8px; border-radius: var(--airlock-r-pill);
+           background: var(--airlock-surface-2); color: var(--airlock-ink);
+           font-size: 0.72rem; font-weight: var(--airlock-fw-semibold); }
+  .set-row { display: flex; align-items: flex-start; gap: var(--airlock-sp-4);
+             padding: var(--airlock-sp-4) 0; border-bottom: 1px solid var(--airlock-hairline); }
+  .set-row:last-child { border-bottom: 0; }
+  .set-txt { flex: 1; min-width: 0; }
+  .set-name { font-size: 0.95rem; font-weight: var(--airlock-fw-semibold); }
+  .set-note { color: var(--airlock-mute); font-size: 0.82rem; line-height: 1.45; margin-top: 3px; }
+  .set-quiet { color: var(--airlock-mute); font-size: 0.85rem; padding: var(--airlock-sp-4) 0; }
+  .set-foot { color: var(--airlock-mute); font-size: 0.76rem; line-height: 1.5;
+              margin: var(--airlock-sp-5) 0 0; padding-top: var(--airlock-sp-4);
+              border-top: 1px solid var(--airlock-hairline); }
+
+  /* Button grammar, fixed by the confirmed mockup and worth stating once:
+     a FILLED button runs something in one click; an OUTLINED button only shows
+     you something; a YELLOW CHIP means a person has to decide, and the row
+     deliberately carries no filled button beside it. An external package whose
+     source digest moved is the whole reason the third case exists. */
+  .set-go, .set-see {
+    flex: none; min-height: 34px; padding: 0 var(--airlock-sp-4);
+    border-radius: var(--airlock-r-pill); font: inherit; font-size: 0.82rem;
+    font-weight: var(--airlock-fw-semibold); cursor: pointer;
+  }
+  .set-go  { border: 0; background: var(--airlock-primary); color: var(--airlock-on-primary); }
+  .set-see { border: 1px solid var(--airlock-hairline); background: transparent; color: var(--airlock-ink); }
+  .set-go:focus-visible, .set-see:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
+  .set-go:disabled, .set-see:disabled { opacity: .55; cursor: default; }
+  .set-chip { display: inline-block; margin-top: var(--airlock-sp-2); padding: 3px 9px;
+              border: 1px solid var(--airlock-warning); border-radius: var(--airlock-r-pill);
+              color: var(--airlock-warning); font-size: 0.74rem;
+              font-weight: var(--airlock-fw-medium); }
+  /* The run line. It is inside the updates section rather than beside the
+     buttons because the panel's own connection can die mid-update (the installer
+     reloads nginx and restarts dev-monitor), so this reads a record on disk and
+     not a live request — see the poller. */
+  .set-run { margin-top: var(--airlock-sp-3); font-size: 0.82rem;
+             line-height: var(--airlock-lh); color: var(--airlock-mute); }
+  .set-run[hidden] { display: none; }
+  /* A revealed detail line: the checker's own output, indented under its row. */
+  .set-detail { margin-top: var(--airlock-sp-2); overflow-wrap: anywhere; }
+  .set-detail[hidden] { display: none; }
+  .set-run-head { color: var(--airlock-ink); font-weight: var(--airlock-fw-medium); }
+  .set-run-bad .set-run-head { color: var(--airlock-danger); }
+  .set-run-fix { display: block; margin-top: var(--airlock-sp-2);
+                 padding: var(--airlock-sp-2) var(--airlock-sp-3);
+                 border: 1px solid var(--airlock-hairline);
+                 border-radius: var(--airlock-r-sm);
+                 background: var(--airlock-surface-2);
+                 font-family: var(--airlock-font-mono); font-size: 0.76rem;
+                 color: var(--airlock-ink); overflow-wrap: anywhere;
+                 user-select: all; -webkit-user-select: all; }
+  .set-opts { display: flex; flex-wrap: wrap; align-items: center;
+              gap: var(--airlock-sp-2) var(--airlock-sp-5); margin-top: var(--airlock-sp-3); }
+  .set-opts label { display: inline-flex; align-items: center; gap: var(--airlock-sp-2);
+                    font-size: 0.88rem; }
+  .set-opts input { accent-color: var(--airlock-primary); width: 16px; height: 16px; margin: 0; }
+  .set-opts input:disabled + span { color: var(--airlock-mute); }
+
+  /* The sheet is a dropdown on a desktop and a sheet on a phone: at 480px the
+     header is narrower than the panel wants to be, so it stops being anchored
+     to the gear and spans the screen instead. */
+  @media (max-width: 560px) {
+    .settings { position: fixed; top: auto; right: 0; left: 0; bottom: 0;
+                width: 100%; max-height: 82vh;
+                border-radius: var(--airlock-r-lg) var(--airlock-r-lg) 0 0;
+                padding-bottom: max(env(safe-area-inset-bottom), var(--airlock-sp-5)); }
+  }
+
+  /* A tile whose app has an update carries the same dot the gear badge counts,
+     so the launcher answers "which one?" without opening the panel. Hung off
+     .app (already position: relative) and not off .app .ic, whose width and
+     radius bin/gen-app-icons.py reads out of this file expecting exactly one
+     declaration each — and which clips its children anyway (overflow: hidden).
+     Centred-relative, so it lands on the icon's corner in both the 82px
+     desktop tile and the full-width phone column. */
+  .app .dot {
+    position: absolute; top: -3px; left: calc(50% + 19px); width: 12px; height: 12px;
+    border-radius: 50%; background: var(--airlock-primary);
+    box-shadow: 0 0 0 2px var(--airlock-canvas);
+  }
 
   /* suggestion box — a same-origin feedback relay (see apps/feedback).
      Collapsed by default: the launcher stays quiet and only a small trigger
@@ -198,15 +438,87 @@
 
 <header>
   <h1 id="product">Airlock</h1>
-  <span class="who" id="who"></span>
+  <div class="theme-group" role="group" aria-label="Theme">
+    <button type="button" data-theme-btn="system" aria-pressed="true">Auto</button>
+    <button type="button" data-theme-btn="light" aria-pressed="false">Light</button>
+    <button type="button" data-theme-btn="dark" aria-pressed="false">Dark</button>
+  </div>
+  <!-- The gear sits between the theme group and the identity pill: settings are
+       the box's, the pill is the person's. Hidden until the updates API answers
+       for a verified owner — see the settings poller at the foot of this file. -->
+  <button type="button" class="gear" id="settings-open" aria-label="Airlock 설정"
+          aria-expanded="false" aria-controls="settings-panel" hidden>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.3"></circle><path d="M19.1 14.4a1.5 1.5 0 0 0 .3 1.65l.06.06a1.8 1.8 0 1 1-2.55 2.55l-.06-.06a1.5 1.5 0 0 0-1.65-.3 1.5 1.5 0 0 0-.91 1.37v.17a1.8 1.8 0 1 1-3.6 0v-.09a1.5 1.5 0 0 0-.98-1.37 1.5 1.5 0 0 0-1.65.3l-.06.06a1.8 1.8 0 1 1-2.55-2.55l.06-.06a1.5 1.5 0 0 0 .3-1.65 1.5 1.5 0 0 0-1.37-.91H4.2a1.8 1.8 0 1 1 0-3.6h.09a1.5 1.5 0 0 0 1.37-.98 1.5 1.5 0 0 0-.3-1.65l-.06-.06A1.8 1.8 0 1 1 7.85 4.9l.06.06a1.5 1.5 0 0 0 1.65.3h.07a1.5 1.5 0 0 0 .91-1.37V3.7a1.8 1.8 0 1 1 3.6 0v.09a1.5 1.5 0 0 0 .91 1.37 1.5 1.5 0 0 0 1.65-.3l.06-.06a1.8 1.8 0 1 1 2.55 2.55l-.06.06a1.5 1.5 0 0 0-.3 1.65v.07a1.5 1.5 0 0 0 1.37.91h.17a1.8 1.8 0 1 1 0 3.6h-.09a1.5 1.5 0 0 0-1.37.91Z"></path></svg>
+    <span class="gear-badge" id="settings-badge" hidden></span>
+  </button>
+  <!-- Identity pill, and the entrance to subscription accounts (ACCT_OWN): the
+       account panel opens from here and an expiring login shows as this pill's
+       ring. data-account-entry is what the poller at the foot of this file binds;
+       it stays a plain label unless there is a panel to open. -->
+  <span class="who" id="who" data-account-entry></span>
+  <button type="button" class="find-open" id="find-open" aria-label="Find an app"
+          aria-expanded="false" aria-controls="launcher-find" hidden>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.3"></circle><path d="m16 16 4.2 4.2"></path></svg>
+  </button>
+  <!-- Settings sheet. The three section shells are static so their order is
+       readable here rather than assembled in script; their rows are drawn from
+       GET /monitor/api/owner/updates by the poller at the foot of this file.
+       Subscription/account management is deliberately NOT a section — it is
+       reached from the identity pill above (owner decision, mockup 9). -->
+  <div class="settings" id="settings-panel" role="group" aria-labelledby="set-title" hidden>
+    <div class="set-ttl" id="set-title">Airlock 설정</div>
+    <div class="set-sub" id="set-checked"></div>
+    <section class="set-sec">
+      <div class="set-h">업데이트 <span class="set-n" id="set-upd-n" hidden></span></div>
+      <div id="set-updates"></div>
+      <div class="set-run" id="set-upd-run" hidden></div>
+    </section>
+    <section class="set-sec">
+      <div class="set-h">에이전트</div>
+      <div class="set-row">
+        <div class="set-txt">
+          <div class="set-name">기본 에이전트</div>
+          <div class="set-note">플랫폼 도구(모니터 액션·자동 작업)가 쓰는 CLI · 모델은 각 CLI 가 정합니다</div>
+          <!-- Reading and writing the airlock.toml platform key is the
+               AGENT_DEFAULT card's; these stay disabled until it lands, so the
+               launcher never shows a choice it cannot keep. -->
+          <div class="set-opts" role="radiogroup" aria-label="기본 에이전트">
+            <label><input type="radio" name="default-agent" value="auto" checked disabled><span>자동</span></label>
+            <label><input type="radio" name="default-agent" value="claude" disabled><span>Claude</span></label>
+            <label><input type="radio" name="default-agent" value="codex" disabled><span>Codex</span></label>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="set-sec">
+      <div class="set-h">하네스</div>
+      <!-- Four layers, drawn from the same snapshot: the Claude CLI (self-updating,
+           shown only), the Codex CLI (npm global — the one button), the shared skills
+           counted per agent root, and hook drift, which is reported and never
+           applied (owner decision HARNESS_V1). The run line below belongs to the
+           Codex upgrade and is separate from the update section's: the two runs share
+           no mutex and neither may report over the other. -->
+      <div id="set-harness"></div>
+      <div class="set-run" id="set-harness-run" hidden></div>
+    </section>
+    <p class="set-foot" id="set-foot"></p>
+  </div>
 </header>
 <main>
   <div class="msgstrip" id="msgstrip" hidden></div>
+  <div class="launcher-find" id="launcher-find" hidden>
+    <input type="search" id="app-find" aria-label="Find an app"
+           placeholder="Find an app" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <button type="button" class="find-close" id="find-close" aria-label="Close app search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>
+    </button>
+  </div>
   <!-- One headed section per tile group; the headings and their order come from
        airlockTileSections below, not from this markup, because a box names its
        own shortcut sections in airlock.toml. -->
   <div id="secs"></div>
   <p class="empty" id="empty" hidden>No apps enabled. Add app tables to <code>airlock.toml</code>.</p>
+  <p class="empty" id="no-matches" hidden>No apps match.</p>
 </main>
 
 <!-- suggestion box — same-origin; the owner identity is attached server-side by the
@@ -294,6 +606,319 @@ function airlockTileSections(apps, names) {
   return order.map(title => ({ title: title, names: by.get(title) }));
 }
 
+function airlockSourceLabel(entry) {
+  return entry && entry.source_class === "explicit" ? "Added app" : "";
+}
+
+function airlockMatchesApp(name, label, query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return true;
+  return (String(name) + " " + String(label)).toLowerCase().includes(q);
+}
+
+// How many things the gear badge is counting, from one payload of
+// GET /monitor/api/owner/updates. Pure and total, so install/test-hub-filter.sh
+// can hold it against contract fixtures in node — the badge is the one number
+// on this page a person acts on, and it has to be arithmetic, not a render
+// side effect.
+//
+// Three sources, the three the confirmed mockup adds up (본체 1 + 앱 2 +
+// Codex CLI 1 = 4): the platform itself; EVERY app the ledger flagged,
+// including a lock-mismatch, which needs a person precisely because it gets no
+// button; and the one harness binary that does not update itself. Hook drift
+// and skill wiring are deliberately NOT counted — they are states to look at,
+// not items to apply, and a badge that mixes the two stops meaning anything.
+//
+// Missing/!ok fields count as nothing. An absent `latest` is "we could not
+// check", and the fail-quiet direction for a number that provokes a click is
+// down: a badge that overstates sends someone to a panel with nothing in it.
+function airlockUpdateCount(d) {
+  if (!d) return 0;
+  let n = 0;
+  if (d.platform && d.platform.available) n += 1;
+  n += airlockUpdateAppIds(d).length;
+  if (airlockCodexOutdated(d)) n += 1;
+  return n;
+}
+
+// THE app list, normalised once. Every consumer — the badge count, the panel
+// rows, the tile dots, the badge footnote — goes through this function, so
+// there is exactly one answer to "which apps have an update" and the four
+// surfaces cannot drift apart.
+//
+// Array.isArray, not a truthiness test, and it matters twice: `apps: {}` is a
+// shape a half-written backend really does emit, and it breaks BOTH readers —
+// `{}.filter` throws, and so does `for (const a of {})`. A throw halfway
+// through a render is the worst outcome available: it lands after the badge has
+// been rewritten and before the dots have, so the launcher ends up showing a
+// count and a set of dots that disagree, with nothing on screen saying why.
+function airlockUpdateApps(d) {
+  const apps = d && Array.isArray(d.apps) ? d.apps : [];
+  return apps.filter(a => a && a.id);
+}
+
+function airlockUpdateAppIds(d) {
+  return airlockUpdateApps(d).map(a => a.id);
+}
+
+// Which of the settings panel's named actions this build can actually RUN.
+//
+// Kept as a pure function next to the badge arithmetic, and for the same reason:
+// it is the difference between a button that works and a button that lies, and
+// node can hold it against fixtures where a browser is not available.
+//
+// `platform` and `app:<id>` both POST /monitor/api/owner/updates/execute. Nothing
+// else does, and the two exclusions are deliberate, not unfinished:
+//   review:<id>  — an external package whose source digest moved. Re-approving a
+//                  package lock is a terminal procedure (owner decision LOCK_UI_V1);
+//                  v1 shows and reviews, it does not re-approve. The backend refuses
+//                  a lock-mismatch id as well, so this is presentation over a real
+//                  boundary rather than the boundary itself.
+//   harness:*    — the Codex CLI and the hook/skill layers belong to HARNESS_PANEL.
+function airlockUpdActionArmed(action) {
+  const a = String(action || "");
+  return a === "platform" || (a.startsWith("app:") && a.length > 4);
+}
+
+// The request body for an armed action. Returns null for anything not armed, so a
+// mis-drawn button cannot turn into a request that the backend then has to refuse.
+function airlockUpdActionBody(action) {
+  const a = String(action || "");
+  if (a === "platform") return { action: "platform" };
+  if (a.startsWith("app:") && a.length > 4) return { action: "app", id: a.slice(4) };
+  return null;
+}
+
+// One status summary (`before`/`after` from bin/airlock-status --json) as one clause.
+function airlockUpdStatusText(s) {
+  if (!s) return "";
+  if (s.error) return String(s.error);
+  const bits = ["airlock-status rc=" + s.rc];
+  if (s.verdict) bits.push(String(s.verdict));
+  const c = s.counts;
+  if (c) bits.push(c.fail + " fail · " + c.warn + " warn · " + c.unchecked + " 미확인");
+  return bits.join(" · ");
+}
+
+// GET /monitor/api/owner/updates/run -> what the panel says and whether it may run.
+//
+// Total, and every branch names a real state rather than falling through to an
+// encouraging default. In particular `busy: null` is "we could not measure the
+// updater's lock", which is NOT "nothing is running" — an unmeasured lock leaves the
+// buttons alone rather than either blocking them or promising they are safe.
+function airlockUpdRunLine(state) {
+  if (!state) return { text: "", detail: "", recovery: "", blocked: false };
+  if (state.enabled === false) {
+    return { text: "이 박스에서는 패널에서 실행할 수 없습니다.",
+             detail: "터미널에서 bash bin/airlock-update 를 쓰십시오.",
+             recovery: "", blocked: true, bad: false };
+  }
+  const run = state.run;
+  const label = run && run.action === "app" && run.appId
+    ? "'" + run.appId + "' 재설치" : "본체 업데이트";
+  if (run && (run.status === "starting" || run.status === "running")) {
+    return { text: "실행 중 — " + label + ".",
+             detail: "설치기가 도는 동안 이 화면의 연결이 잠시 끊길 수 있습니다. "
+                   + "결과는 다시 붙으면 여기에 나옵니다.",
+             recovery: "", blocked: true, bad: false };
+  }
+  if (state.busy === true) {
+    return { text: "다른 Airlock 갱신 작업이 진행 중입니다.",
+             detail: "터미널에서 시작된 업데이트이거나 매일 도는 감지입니다 — "
+                   + "끝난 뒤 다시 시도하십시오.",
+             recovery: "", blocked: true, bad: false };
+  }
+  if (!run) return { text: "", detail: "", recovery: "", blocked: false, bad: false };
+  if (run.status === "done") {
+    const moved = run.before && run.after && run.before.revision !== run.after.revision;
+    return {
+      text: "지난 실행 성공 — " + label + ".",
+      detail: (moved ? "revision " + String(run.before.revision).slice(0, 12) + " → "
+                       + String(run.after.revision).slice(0, 12) + " · "
+                     : (run.after && run.after.revision
+                        ? "revision " + String(run.after.revision).slice(0, 12) + " (변동 없음) · "
+                        : ""))
+              + airlockUpdStatusText(run.after),
+      recovery: "", blocked: false, bad: false };
+  }
+  const rc = run.exitCode === null || run.exitCode === undefined ? "?" : run.exitCode;
+  return {
+    text: (run.status === "interrupted" ? "지난 실행이 끝맺지 못했습니다 — " : "지난 실행 실패 — ")
+          + label + (run.status === "interrupted" ? "." : " (rc=" + rc + ")."),
+    detail: [run.note, airlockUpdStatusText(run.after)].filter(Boolean).join(" "),
+    recovery: (run.recovery && run.recovery.command) || "",
+    recoveryNote: (run.recovery && run.recovery.reason) || "",
+    blocked: false, bad: true };
+}
+
+// Is the box's Codex CLI behind npm? Both versions have to be known: `latest`
+// absent means the check did not run, which is not the same as up to date.
+function airlockCodexOutdated(d) {
+  const c = d && d.harness && d.harness.codex;
+  return !!(c && c.installed && c.latest && c.installed !== c.latest);
+}
+
+// Same-day shows a clock; older shows the date too, so a stale timestamp cannot
+// quietly relabel itself as today (the message strip's fmtCollected bug). Pure and
+// global because two surfaces read it now — the panel's "마지막 확인" and the skill
+// row's clone sync — and two copies would drift.
+function airlockWhen(iso) {
+  if (!iso) return "";
+  let d;
+  try { d = new Date(iso); } catch (_) { return String(iso); }
+  if (isNaN(d.getTime())) return String(iso);
+  const clock = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return (d.toDateString() === new Date().toDateString())
+    ? "오늘 " + clock
+    : d.toLocaleDateString() + " " + clock;
+}
+
+// ── the 하네스 section ───────────────────────────────────────────────────
+//
+// Four layers, one of which can be pressed. Kept as pure functions beside the badge
+// arithmetic for the same reason: node can hold them against contract fixtures, and
+// every one of them is the difference between a row that reports and a row that
+// claims.
+//
+// The harness actions live in their OWN namespace, not in airlockUpdActionArmed's.
+// They POST a different route with a different run record, and a Codex upgrade must
+// not be blocked by (or reported over) an `bin/airlock-update` in flight.
+//   harness:codex   — npm install -g @openai/codex@latest, in a tmux window.
+//   harness:recheck — one more run of the detection collector, now.
+// Hook reconciliation is deliberately absent and always will be: applying a hook is a
+// reviewed procedure (/harness-provision), so this section shows drift and stops.
+function airlockHarnessActionArmed(action) {
+  const a = String(action || "");
+  return a === "harness:codex" || a === "harness:recheck";
+}
+
+function airlockHarnessBody(action) {
+  const a = String(action || "");
+  if (a === "harness:codex") return { action: "codex" };
+  if (a === "harness:recheck") return { action: "recheck" };
+  return null;
+}
+
+// The Claude Code CLI row. It updates itself, so the collector takes no `latest` for
+// it and this returns no comparison — there is nothing here that can be read as
+// "behind", which is the whole reason it is a separate key from codex's pair.
+function airlockClaudeLine(d) {
+  const c = d && d.harness && d.harness.claude;
+  if (!c || !c.installed) return "";
+  return c.installed + " · 자체 자동 업데이트로 최신 유지";
+}
+
+// The Codex CLI row. Three states and each says which one it is: behind, current, and
+// "we could not ask the registry" — that last one is NOT current, and giving it its
+// own words is what stops an unreachable npm from reading as up to date.
+function airlockCodexLine(d) {
+  const c = d && d.harness && d.harness.codex;
+  if (!c || !c.installed) return "";
+  if (airlockCodexOutdated(d)) {
+    return c.installed + " → " + c.latest + " 새 버전 · npm 전역 설치라 수동 갱신 대상";
+  }
+  return c.installed + (c.latest ? " · 최신" : " · 최신 버전 확인 실패");
+}
+
+// The 공통 스킬 row: what each agent can actually invoke, counted per root.
+//
+// Two counts, never one total. The roots are per agent — Claude Code reads
+// ~/.claude/skills and the Codex CLI reads ~/.agents/skills — and a skill wired for
+// one and missing for the other raises no error anywhere; it simply never triggers
+// for that agent. A single summed number is exactly the shape that hides it.
+function airlockSkillsLine(d) {
+  const s = d && d.harness && d.harness.skills;
+  if (!s || typeof s.claude !== "number" || typeof s.codex !== "number") return "";
+  const bits = ["Claude " + s.claude + " · Codex " + s.codex + " 배선"];
+  const canon = s.canon;
+  if (canon && canon.name) {
+    // The last fetch, which this box can measure. NOT "최신": that would need the
+    // network, and the collector deliberately does not claim it.
+    bits.push(canon.name + (canon.syncedAt ? " " + airlockWhen(canon.syncedAt) + " 동기화" : ""));
+  }
+  return bits.join(" · ");
+}
+
+// 🔴 There is deliberately no "one root is behind the other" verdict here. Measured on
+// a live box 2026-09-01: of the 8 names present for Claude and not for the Codex CLI,
+// 2 were opt-in canon (no wiring obligation) and 6 were local copies belonging to no
+// canon at all. "One root has more" is therefore not "the other is missing something",
+// and a chip saying so would have been wrong on its very first reading. Which names a
+// root is OWED is a judgment about the canon, and it is made by the wiring checker
+// that reads the canon — this row reports what each agent can invoke and stops there.
+
+// GET /monitor/api/owner/harness/run -> what the harness rows say and whether they
+// may run. Same discipline as airlockUpdRunLine, minus `busy`: an npm global install
+// takes no cross-process mutex, so there is no second updater to measure and this
+// function never claims there is one.
+function airlockHarnessRunLine(state) {
+  if (!state) return { text: "", detail: "", blocked: false, bad: false };
+  if (state.enabled === false) {
+    return { text: "이 박스에서는 패널에서 갱신할 수 없습니다.",
+             detail: "터미널에서 npm install -g @openai/codex@latest 를 쓰십시오.",
+             blocked: true, bad: false };
+  }
+  const run = state.run;
+  if (run && (run.status === "starting" || run.status === "running")) {
+    return { text: "갱신 중 — Codex CLI.",
+             detail: "npm 전역 설치가 끝나면 결과가 여기에 나옵니다.",
+             blocked: true, bad: false };
+  }
+  if (!run) return { text: "", detail: "", blocked: false, bad: false };
+  const before = (run.before && run.before.installed) || "";
+  const after = (run.after && run.after.installed) || "";
+  if (run.status === "done") {
+    // `note` on a SUCCESSFUL run is the case npm's exit code cannot see: it installed,
+    // and the codex this box actually runs did not move. That reads as a failure here
+    // because for the person at the panel it is one.
+    const moved = before && after && before !== after;
+    return { text: (run.note ? "지난 갱신이 반영되지 않았습니다 — Codex CLI."
+                             : "지난 갱신 성공 — Codex CLI."),
+             detail: [moved ? before + " → " + after
+                            : (after ? after + " (변동 없음)" : ""), run.note]
+                     .filter(Boolean).join(" · "),
+             blocked: false, bad: !!run.note };
+  }
+  const rc = run.exitCode === null || run.exitCode === undefined ? "?" : run.exitCode;
+  return {
+    text: (run.status === "interrupted" ? "지난 갱신이 끝맺지 못했습니다 — Codex CLI."
+                                        : "지난 갱신 실패 — Codex CLI (rc=" + rc + ")."),
+    detail: [run.note, after ? "설치된 버전은 " + after + " 입니다." : ""]
+            .filter(Boolean).join(" "),
+    blocked: false, bad: true };
+}
+
+(function () {
+  const themes = new Set(["system", "light", "dark"]);
+  const root = document.documentElement;
+  const buttons = document.querySelectorAll(".theme-group [data-theme-btn]");
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  const lightPreference = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
+
+  function reflect(theme) {
+    buttons.forEach(button => {
+      button.setAttribute("aria-pressed", String(button.dataset.themeBtn === theme));
+    });
+    const light = theme === "light" || (theme === "system" && lightPreference && lightPreference.matches);
+    if (themeColor) themeColor.content = light ? "#f5f5f7" : "#0a0f1e";
+  }
+
+  function setTheme(theme) {
+    if (!themes.has(theme)) theme = "system";
+    root.dataset.theme = theme;
+    try { localStorage.setItem("markwand-theme", theme); } catch (_) {}
+    reflect(theme);
+  }
+
+  buttons.forEach(button => button.addEventListener("click", () => setTheme(button.dataset.themeBtn)));
+  if (lightPreference && lightPreference.addEventListener) {
+    lightPreference.addEventListener("change", () => {
+      if (root.dataset.theme === "system") reflect("system");
+    });
+  }
+  reflect(themes.has(root.dataset.theme) ? root.dataset.theme : "system");
+})();
+
 (async () => {
   const [cfg, me] = [await j("/__airlock.json"), await j("/whoami")];
   if (cfg && cfg.product) {
@@ -310,6 +935,7 @@ function airlockTileSections(apps, names) {
   // "feedback" is not a launcher tile — it's the suggestion box below the grid.
   const names = Object.keys(apps).filter(n => n !== "hub" && n !== "feedback");
   if (!names.length) { document.getElementById("empty").hidden = false; return; }
+  const tiles = new Map();
 
   for (const sec of airlockTileSections(apps, names)) {
     // The grid is filled first and the section is attached only if a tile landed
@@ -340,8 +966,8 @@ function airlockTileSections(apps, names) {
       const a = document.createElement("a");
       a.className = "app";
       a.href = href;
+      a.dataset.appName = name;
       if (meta.cat) a.dataset.cat = meta.cat;
-      if (meta.sub) a.title = meta.sub;
       if (external) { a.target = "_blank"; a.rel = "noopener"; }
 
       const ic = document.createElement("span");
@@ -359,7 +985,21 @@ function airlockTileSections(apps, names) {
       lb.textContent = meta.label;
 
       a.append(ic, lb);
+      if (meta.sub) {
+        const sub = document.createElement("span");
+        sub.className = "sub";
+        sub.textContent = meta.sub;
+        a.appendChild(sub);
+      }
+      const sourceLabel = airlockSourceLabel(apps[name]);
+      if (sourceLabel) {
+        const origin = document.createElement("span");
+        origin.className = "origin";
+        origin.textContent = sourceLabel;
+        a.appendChild(origin);
+      }
       grid.appendChild(a);
+      tiles.set(name, a);
     }
 
     if (!grid.children.length) continue;
@@ -380,6 +1020,53 @@ function airlockTileSections(apps, names) {
     wrap.appendChild(grid);
     secs.appendChild(wrap);
   }
+
+  if (!tiles.size) { document.getElementById("empty").hidden = false; return; }
+
+  const findWrap = document.getElementById("launcher-find");
+  const find = document.getElementById("app-find");
+  const findOpen = document.getElementById("find-open");
+  const findClose = document.getElementById("find-close");
+  const noMatches = document.getElementById("no-matches");
+
+  function filterApps() {
+    const query = find.value;
+    let matches = 0;
+    for (const section of secs.querySelectorAll(".sec")) {
+      let sectionMatches = 0;
+      for (const tile of section.querySelectorAll(".app")) {
+        const meta = airlockTileMeta(apps[tile.dataset.appName]);
+        const visible = airlockMatchesApp(tile.dataset.appName, meta.label, query);
+        tile.hidden = !visible;
+        if (visible) { sectionMatches += 1; matches += 1; }
+      }
+      section.hidden = !sectionMatches;
+    }
+    const searching = !!String(query).trim();
+    noMatches.hidden = !searching || !!matches;
+  }
+
+  function closeFind() {
+    find.value = "";
+    filterApps();
+    findWrap.hidden = true;
+    findOpen.setAttribute("aria-expanded", "false");
+  }
+
+  findOpen.hidden = false;
+  findOpen.addEventListener("click", () => {
+    findWrap.hidden = false;
+    findOpen.setAttribute("aria-expanded", "true");
+    find.focus();
+  });
+  findClose.addEventListener("click", () => {
+    closeFind();
+    findOpen.focus();
+  });
+  find.addEventListener("input", () => {
+    if (!find.value.trim()) closeFind();
+    else filterApps();
+  });
 })();
 
 // iOS home-screen standalone: a plain same-origin <a> can bounce out to Safari.
@@ -496,6 +1183,594 @@ if (("standalone" in navigator) && navigator.standalone) {
 </script>
 
 <script>
+// Settings gear — the badge, the sheet, and the tile dots, all from one poll of
+// dev-monitor's GET /monitor/api/owner/updates (contract: docs/tasks/active/
+// 2026-09-01_airlock-platform-appstore.task.md, "접근"). The hub stays a static
+// file: no build step, no __airlock.json change, same as the message strip.
+//
+// Failure discipline is the strip's, deliberately: 403/404 are a real "this box
+// does not offer it" and take the gear away entirely; anything else (5xx,
+// network, bad JSON) leaves the last render standing rather than blinking the
+// badge off, because a badge that vanishes reads as "you are done" and that was
+// the exact bug this campaign exists to fix.
+//
+// What this card does NOT do: run anything. Every button below ships disabled
+// with its action named on it — arming them is UPD_EXEC's card, the account
+// entry on the identity pill is ACCT_OWN's, and the four harness layers are
+// HARNESS_PANEL's. A disabled control says "not yet" out loud; a live-looking
+// button that no-ops does not.
+(async () => {
+  const gear = document.getElementById("settings-open");
+  const panel = document.getElementById("settings-panel");
+  const badge = document.getElementById("settings-badge");
+  if (!gear || !panel || !badge) return;
+
+  const checkedEl = document.getElementById("set-checked");
+  const updEl = document.getElementById("set-updates");
+  const updN = document.getElementById("set-upd-n");
+  const harnessEl = document.getElementById("set-harness");
+  const footEl = document.getElementById("set-foot");
+  const runEl = document.getElementById("set-upd-run");
+  const harnessRunEl = document.getElementById("set-harness-run");
+
+  function setOpen(on) {
+    panel.hidden = !on;
+    gear.setAttribute("aria-expanded", String(on));
+  }
+  gear.addEventListener("click", () => {
+    setOpen(panel.hidden);
+    // Opening is the one moment a stale run line is worth a request: the panel is
+    // otherwise on a slow tick so that a closed sheet costs nothing.
+    if (!panel.hidden && runPollStarted) { pollRun(); pollHarness(); }
+  });
+  // Escape and an outside click both close it. A dropdown you can only dismiss
+  // by finding the same 44px target again is a modal wearing a gear.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !panel.hidden) { setOpen(false); gear.focus(); }
+  });
+  document.addEventListener("click", (e) => {
+    if (panel.hidden) return;
+    if (panel.contains(e.target) || gear.contains(e.target)) return;
+    setOpen(false);
+  });
+
+  function fmtChecked(iso) {
+    return airlockWhen(iso) || "확인 기록 없음";
+  }
+
+  // The launcher already holds each app's human name; reuse it rather than
+  // printing a package id at a person. Falls back to the id for an app with no
+  // tile (owner-audience filtered out, or no [tile] in its manifest at all).
+  function appLabel(id) {
+    let tile = null;
+    try { tile = document.querySelector('.app[data-app-name="' + CSS.escape(id) + '"] .lb'); }
+    catch (_) {}
+    return (tile && tile.textContent) || String(id);
+  }
+
+  // One row shape for every row in the sheet: name, note, optional amber chip,
+  // optional button. `kind` is the button grammar — "go" is filled and runs
+  // something, "see" is outlined and only shows you something.
+  function row(name, note, opt) {
+    const o = opt || {};
+    const r = document.createElement("div");
+    r.className = "set-row";
+    const txt = document.createElement("div");
+    txt.className = "set-txt";
+    const n = document.createElement("div");
+    n.className = "set-name"; n.textContent = name;
+    const sub = document.createElement("div");
+    sub.className = "set-note"; sub.textContent = note;
+    txt.append(n, sub);
+    if (o.chip) {
+      const chip = document.createElement("div");
+      const span = document.createElement("span");
+      span.className = "set-chip"; span.textContent = o.chip;
+      chip.appendChild(span);
+      txt.appendChild(chip);
+    }
+    // A detail line the row can reveal. Hidden until its own button is pressed, and
+    // it is TEXT the backend measured, never a second render of the same claim: the
+    // hook row's detail is the wiring checker's own output line.
+    if (o.detail) {
+      const detail = document.createElement("div");
+      detail.className = "set-note set-detail";
+      detail.hidden = true;
+      detail.textContent = o.detail;
+      txt.appendChild(detail);
+    }
+    r.appendChild(txt);
+    if (o.button) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = o.kind === "see" ? "set-see" : "set-go";
+      b.textContent = o.button;
+      if (o.detail) {
+        // Reveals text already on this page. Nothing is requested, nothing runs, and
+        // so nothing here is ever disabled by a run in flight.
+        b.dataset.detailToggle = "1";
+        b.setAttribute("aria-expanded", "false");
+      } else if (o.family === "harness") {
+        b.dataset.harnessAction = o.action;
+        b.disabled = !airlockHarnessActionArmed(o.action);
+      } else {
+        b.dataset.updAction = o.action;
+        // Armed here, refused server-side: airlockUpdActionArmed decides which
+        // actions this build can run at all, and applyRunState() decides whether
+        // right now is a moment to run one.
+        b.disabled = !airlockUpdActionArmed(o.action);
+      }
+      if (b.disabled) b.title = o.disabledWhy || "";
+      r.appendChild(b);
+    }
+    return r;
+  }
+
+  // ── running one ────────────────────────────────────────────────────────
+  //
+  // The update reruns the installer, which reloads nginx and restarts dev-monitor.
+  // THIS PAGE'S OWN CONNECTION therefore dies partway through a successful run, and
+  // completion must never be judged from the response to the request that started it.
+  // So: POST, then forget the response, and read a record on disk until it is
+  // terminal. A dropped fetch is not a verdict — it keeps the last render, the same
+  // discipline the snapshot poll uses.
+  let runState = null;                        // last answer from .../updates/run
+  let execError = "";                         // a refusal from .../updates/execute
+  let runTimer = null;
+  let runPollStarted = false;
+  let harnessState = null;                    // last answer from .../harness/run
+  let harnessError = "";                      // a refusal from .../harness/execute
+  let harnessTimer = null;
+
+  const EXEC_ERROR = {
+    run_active: "이미 업데이트가 실행 중입니다.",
+    updater_busy: "다른 Airlock 갱신 작업이 진행 중입니다 — 끝난 뒤 다시 시도하십시오.",
+    app_not_pending: "이 앱은 지금 재설치 대상이 아닙니다 — 목록을 새로 고칩니다.",
+    bad_app_id: "앱 이름을 알아보지 못했습니다.",
+    bad_action: "알 수 없는 동작입니다.",
+    state_unwritable: "실행 기록을 쓰지 못했습니다 — 상태 디렉터리를 확인하십시오.",
+    launch_failed: "실행 창을 만들지 못했습니다 — 이 박스에 tmux 가 필요합니다.",
+  };
+
+  const HARNESS_ERROR = {
+    run_active: "이미 갱신이 실행 중입니다.",
+    bad_action: "알 수 없는 동작입니다.",
+    state_unwritable: "실행 기록을 쓰지 못했습니다 — 상태 디렉터리를 확인하십시오.",
+    launch_failed: "실행 창을 만들지 못했습니다 — 이 박스에 tmux 가 필요합니다.",
+    // The detection timer is a separate install step, so its absence is a real state
+    // of a working box rather than a fault to retry into.
+    recheck_unavailable: "이 박스에는 자동 감지 타이머가 설치돼 있지 않습니다 — "
+                       + "install/airlock-update-timer.sh 로 설치합니다.",
+    recheck_timeout: "점검을 시작하지 못했습니다 — 잠시 뒤 다시 시도하십시오.",
+  };
+
+  function renderRun() {
+    const line = airlockUpdRunLine(runState);
+    runEl.textContent = "";
+    runEl.classList.toggle("set-run-bad", !!line.bad || !!execError);
+    const parts = [];
+    if (execError) parts.push({ head: true, text: execError });
+    if (line.text) parts.push({ head: true, text: line.text });
+    if (line.detail) parts.push({ head: false, text: line.detail });
+    if (line.recoveryNote) parts.push({ head: false, text: line.recoveryNote });
+    for (const part of parts) {
+      const el = document.createElement("div");
+      if (part.head) el.className = "set-run-head";
+      el.textContent = part.text;
+      runEl.appendChild(el);
+    }
+    if (line.recovery) {
+      const fix = document.createElement("code");
+      fix.className = "set-run-fix";
+      fix.textContent = line.recovery;
+      runEl.appendChild(fix);
+    }
+    runEl.hidden = !runEl.children.length;
+    applyRunState();
+  }
+
+  // Disabling is a second gate on top of the armed check: an armed action may still
+  // be a bad idea right now (a run in flight, or somebody else's updater holding the
+  // mutex). Buttons that were never armed stay disabled either way.
+  //
+  // The two families are gated SEPARATELY and on purpose. An `bin/airlock-update` in
+  // flight says nothing about whether the Codex CLI can be upgraded — folding them
+  // into one blocked flag would take away a button for a reason that is not true of
+  // it, and the panel would be refusing on evidence it does not have.
+  function applyRunState() {
+    const blocked = airlockUpdRunLine(runState).blocked;
+    for (const b of panel.querySelectorAll("button[data-upd-action]")) {
+      b.disabled = !airlockUpdActionArmed(b.dataset.updAction) || blocked;
+    }
+    const harnessBlocked = airlockHarnessRunLine(harnessState).blocked;
+    for (const b of panel.querySelectorAll("button[data-harness-action]")) {
+      b.disabled = !airlockHarnessActionArmed(b.dataset.harnessAction) || harnessBlocked;
+    }
+  }
+
+  // ── the harness run line ───────────────────────────────────────────────
+  //
+  // Its own poller, its own record, its own element. Nothing here restarts this
+  // backend, so unlike the update poller it never has to survive its own connection
+  // dying — but it keeps the same "a dropped fetch is not a verdict" discipline,
+  // because a blanked line reads as "nothing happened" and something did.
+  function renderHarnessRun() {
+    const line = airlockHarnessRunLine(harnessState);
+    harnessRunEl.textContent = "";
+    harnessRunEl.classList.toggle("set-run-bad", !!line.bad || !!harnessError);
+    const parts = [];
+    if (harnessError) parts.push({ head: true, text: harnessError });
+    if (line.text) parts.push({ head: true, text: line.text });
+    if (line.detail) parts.push({ head: false, text: line.detail });
+    for (const part of parts) {
+      const el = document.createElement("div");
+      if (part.head) el.className = "set-run-head";
+      el.textContent = part.text;
+      harnessRunEl.appendChild(el);
+    }
+    harnessRunEl.hidden = !harnessRunEl.children.length;
+    applyRunState();
+  }
+
+  function scheduleHarness(ms) {
+    if (harnessTimer) clearTimeout(harnessTimer);
+    harnessTimer = setTimeout(pollHarness, ms);
+  }
+
+  async function pollHarness() {
+    let r;
+    try { r = await fetch("/monitor/api/owner/harness/run", { cache: "no-store" }); }
+    catch (_) { scheduleHarness(15000); return; }
+    if (r.status === 404) {                    // detection without harness execution
+      harnessState = { enabled: false, run: null };
+      renderHarnessRun();
+      return;                                  // nothing left to poll for
+    }
+    if (!r.ok) { scheduleHarness(15000); return; }   // keep the last render
+    let d; try { d = await r.json(); } catch (_) { scheduleHarness(15000); return; }
+    if (!d || typeof d !== "object" || Array.isArray(d)) { scheduleHarness(15000); return; }
+    harnessState = { enabled: true, run: d.run || null };
+    if (d.run && (d.run.status === "starting" || d.run.status === "running")) harnessError = "";
+    renderHarnessRun();
+    scheduleHarness(airlockHarnessRunLine(harnessState).blocked ? 4000 : 60000);
+  }
+
+  function scheduleRun(ms) {
+    if (runTimer) clearTimeout(runTimer);
+    runTimer = setTimeout(pollRun, ms);
+  }
+
+  async function pollRun() {
+    let r;
+    try { r = await fetch("/monitor/api/owner/updates/run", { cache: "no-store" }); }
+    catch (_) { scheduleRun(5000); return; }   // mid-update disconnect: try again soon
+    if (r.status === 404) {                    // detection without execution
+      runState = { enabled: false, busy: null, run: null };
+      renderRun();
+      return;                                  // nothing left to poll for
+    }
+    if (!r.ok) { scheduleRun(15000); return; } // keep the last render
+    let d; try { d = await r.json(); } catch (_) { scheduleRun(15000); return; }
+    if (!d || typeof d !== "object" || Array.isArray(d)) { scheduleRun(15000); return; }
+    runState = { enabled: true, busy: d.busy, run: d.run || null };
+    if (d.run && (d.run.status === "starting" || d.run.status === "running")) execError = "";
+    renderRun();
+    scheduleRun(airlockUpdRunLine(runState).blocked ? 4000 : 60000);
+  }
+
+  panel.addEventListener("click", async (e) => {
+    const button = e.target.closest && e.target.closest("button[data-upd-action]");
+    if (!button || button.disabled) return;
+    const body = airlockUpdActionBody(button.dataset.updAction);
+    if (!body) return;                         // drawn, but not ours to run
+    execError = "";
+    // Optimistic about "a run was asked for", never about its outcome. The record
+    // replaces this on the next poll, one way or the other.
+    runState = { enabled: true, busy: null,
+                 run: { status: "starting", action: body.action,
+                        appId: body.id || null } };
+    renderRun();
+    let r;
+    try {
+      r = await fetch("/monitor/api/owner/updates/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch (_) {
+      scheduleRun(1500);                       // the answer was lost, not the request
+      return;
+    }
+    let j = null; try { j = await r.json(); } catch (_) {}
+    if (!r.ok) {
+      execError = EXEC_ERROR[j && j.error]
+        || (r.status === 403 ? "권한이 확인되지 않았습니다."
+            : "실행 요청이 거부됐습니다 (HTTP " + r.status + ").");
+      runState = { enabled: r.status !== 404, busy: null, run: null };
+      renderRun();
+      scheduleRun(15000);
+      return;
+    }
+    scheduleRun(1200);
+  });
+
+  // Reveals a line already on this page. Separate from the action handler below
+  // because it is not an action: nothing is requested and nothing can refuse it.
+  panel.addEventListener("click", (e) => {
+    const button = e.target.closest && e.target.closest("button[data-detail-toggle]");
+    if (!button) return;
+    const detail = button.parentElement
+      && button.parentElement.querySelector(".set-detail");
+    if (!detail) return;
+    detail.hidden = !detail.hidden;
+    button.setAttribute("aria-expanded", String(!detail.hidden));
+  });
+
+  panel.addEventListener("click", async (e) => {
+    const button = e.target.closest && e.target.closest("button[data-harness-action]");
+    if (!button || button.disabled) return;
+    const body = airlockHarnessBody(button.dataset.harnessAction);
+    if (!body) return;                         // drawn, but not ours to run
+    harnessError = "";
+    if (body.action === "codex") {
+      // Optimistic about "a run was asked for", never about its outcome — the record
+      // replaces this on the next poll, one way or the other.
+      harnessState = { enabled: true, run: { status: "starting", action: "codex" } };
+      renderHarnessRun();
+    }
+    let r;
+    try {
+      r = await fetch("/monitor/api/owner/harness/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch (_) {
+      scheduleHarness(1500);                   // the answer was lost, not the request
+      return;
+    }
+    let j = null; try { j = await r.json(); } catch (_) {}
+    if (!r.ok) {
+      harnessError = HARNESS_ERROR[j && j.error]
+        || (r.status === 403 ? "권한이 확인되지 않았습니다."
+            : "요청이 거부됐습니다 (HTTP " + r.status + ").");
+      // A refused codex run leaves no record to poll; a refused recheck leaves the
+      // last one standing. Neither may invent one.
+      if (body.action === "codex") harnessState = { enabled: r.status !== 404, run: null };
+      renderHarnessRun();
+      scheduleHarness(15000);
+      return;
+    }
+    if (body.action === "recheck") {
+      // The collector is a systemd oneshot started with --no-block, so there is no run
+      // record here and nothing to poll. What a person asked for is a fresher reading,
+      // and the snapshot poll is what carries it — re-read on a short ladder rather
+      // than making them wait out the five-minute tick.
+      harnessError = "";
+      harnessRunEl.textContent = "";
+      const said = document.createElement("div");
+      said.className = "set-run-head";
+      said.textContent = "점검을 시작했습니다 — 끝나면 위의 '마지막 확인' 시각이 바뀝니다.";
+      harnessRunEl.appendChild(said);
+      harnessRunEl.hidden = false;
+      for (const ms of [15000, 40000, 90000, 180000]) setTimeout(poll, ms);
+      return;
+    }
+    scheduleHarness(1200);
+  });
+
+  function renderUpdates(d) {
+    updEl.textContent = "";
+    let rows = 0;
+    if (d.platform && d.platform.available) {
+      const changed = d.platform.changedCount;
+      const bits = [];
+      bits.push(changed != null ? "새 버전 — 파일 " + changed + "개 변경" : "새 버전 감지");
+      if (d.platform.ref) bits.push(d.platform.ref);
+      bits.push("업데이트 전 자동 백업");
+      updEl.appendChild(row("Airlock 본체", bits.join(" · "),
+        { button: "업데이트", kind: "go", action: "platform" }));
+      rows += 1;
+    }
+    for (const a of airlockUpdateApps(d)) {
+      // A built-in app is a one-click reinstall. An external package whose
+      // source digest moved is NOT: the lock is a security gate, re-approving
+      // it is a terminal procedure by owner decision (LOCK_UI_V1), and so this
+      // row gets the amber chip and a review button and no filled button at all.
+      if (a.action === "lock-mismatch") {
+        updEl.appendChild(row(appLabel(a.id) + " 앱",
+          "소스 변경 감지 — 외부 패키지: 승인 없이 바뀐 코드는 설치가 거부됩니다",
+          { chip: "잠금 재승인 필요 · 터미널 절차",
+            button: "변경 검토", kind: "see", action: "review:" + a.id,
+            disabledWhy: "잠금 재승인은 터미널 절차입니다 (결정 LOCK_UI_V1)." }));
+      } else {
+        updEl.appendChild(row(appLabel(a.id) + " 앱",
+          "소스 변경 감지 — 본체 업데이트 경로로 재설치합니다",
+          { button: "업데이트", kind: "go", action: "app:" + a.id }));
+      }
+      rows += 1;
+    }
+    if (!rows) {
+      const quiet = document.createElement("div");
+      quiet.className = "set-quiet";
+      quiet.textContent = "새 버전이 없습니다.";
+      updEl.appendChild(quiet);
+    }
+    updN.hidden = !rows;
+    updN.textContent = rows + "건";
+    applyRunState();
+  }
+
+  // Four layers, in the order the confirmed mockup fixes: the CLI that updates
+  // itself, the CLI that does not, the shared skills, the hooks.
+  //
+  // A layer the snapshot did not report draws NO row. An empty row would be a claim
+  // ("nothing to see here") made out of a missing measurement, which is the shape of
+  // failure this whole panel exists to stop.
+  function renderHarness(d) {
+    harnessEl.textContent = "";
+    const h = d.harness || {};
+
+    const claude = airlockClaudeLine(d);
+    if (claude) {
+      harnessEl.appendChild(row("Claude Code CLI", claude, { chip: "자동 — 표시만" }));
+    }
+
+    const codex = airlockCodexLine(d);
+    if (codex) {
+      harnessEl.appendChild(airlockCodexOutdated(d)
+        ? row("Codex CLI", codex,
+              { button: "업데이트", kind: "go", family: "harness", action: "harness:codex" })
+        : row("Codex CLI", codex, {}));
+    }
+
+    const skills = airlockSkillsLine(d);
+    if (skills) {
+      const canon = h.skills && h.skills.canon;
+      harnessEl.appendChild(row(
+        "공통 스킬" + (canon && canon.name ? " (" + canon.name + ")" : ""),
+        skills,
+        { button: "지금 점검", kind: "see",
+          family: "harness", action: "harness:recheck" }));
+    }
+
+    // Display only, by owner decision HARNESS_V1: drift is reported and the fix stays
+    // a reviewed procedure. There is no armed action in this row and there is not
+    // meant to be one — 자세히 only reveals the checker's own output.
+    if (typeof h.hooksDrift === "boolean") {
+      harnessEl.appendChild(h.hooksDrift
+        ? row("훅", "정본과 다른 훅이 있습니다 — 반영은 사람 확인을 거칩니다",
+              { chip: "/harness-provision 으로 반영",
+                button: "자세히", kind: "see",
+                detail: h.hooksDetail || "점검기가 이유를 남기지 않았습니다." })
+        : row("훅", "정본과 같습니다", {}));
+    }
+
+    if (!harnessEl.children.length) {
+      const quiet = document.createElement("div");
+      quiet.className = "set-quiet";
+      quiet.textContent = "하네스 상태를 아직 받지 못했습니다.";
+      harnessEl.appendChild(quiet);
+    }
+    applyRunState();
+  }
+
+  // The dot and the badge read the same list, so the launcher and the sheet
+  // cannot disagree about which app is waiting. Cleared every render: an app
+  // that was updated elsewhere has to lose its dot without a page reload — and
+  // so does every app when the API stops offering the feature at all, or the
+  // launcher keeps showing update marks nobody can act on or explain.
+  //
+  // `wanted` is remembered because this runs in a different async block from
+  // the tile render loop above and can win the race with it: the first poll can
+  // land before /__airlock.json resolves, find no tiles, and mark nothing for
+  // five minutes. The observer below re-applies the last answer to tiles as
+  // they appear, so the dots do not depend on which fetch finished first.
+  let wanted = new Set();
+  function paintDots() {
+    for (const tile of document.querySelectorAll(".app[data-app-name]")) {
+      const has = tile.querySelector(":scope > .dot");
+      if (wanted.has(tile.dataset.appName)) {
+        if (!has) {
+          const dot = document.createElement("span");
+          dot.className = "dot";
+          dot.title = "업데이트 있음";
+          tile.appendChild(dot);
+        }
+      } else if (has) {
+        has.remove();
+      }
+    }
+  }
+  function renderDots(d) { wanted = new Set(airlockUpdateAppIds(d)); paintDots(); }
+  const secs = document.getElementById("secs");
+  if (secs && window.MutationObserver) {
+    new MutationObserver(paintDots).observe(secs, { childList: true, subtree: true });
+  }
+
+  // Spelled out because the badge is a single number over three different
+  // things, and "why does it say 4" is otherwise unanswerable from this screen.
+  function renderFoot(d, count) {
+    const parts = [];
+    if (d.platform && d.platform.available) parts.push("본체 1");
+    const apps = airlockUpdateAppIds(d).length;
+    if (apps) parts.push("앱 " + apps);
+    if (airlockCodexOutdated(d)) parts.push("Codex CLI 1");
+    footEl.textContent = count
+      ? "배지 " + count + " = " + parts.join(" + ") + " · 구독 계정 관리는 헤더 신원 pill 로 들어갑니다"
+      : "구독 계정 관리는 헤더 신원 pill 로 들어갑니다";
+  }
+
+  // Everything that reads the payload is computed BEFORE the first surface is
+  // touched. A throw halfway through leaves a badge, a row list and a set of
+  // dots that disagree with each other and with nothing on screen saying so —
+  // so the reads go first and the writes go after, and there is no seam between
+  // them for a bad payload to land in.
+  function render(d) {
+    const count = airlockUpdateCount(d);
+    const checked =
+      "업데이트 · 에이전트 · 하네스 — 본체 소유 · 마지막 확인 " + fmtChecked(d.checkedAt);
+    gear.hidden = false;
+    badge.hidden = count === 0;
+    badge.textContent = String(count);
+    gear.setAttribute("aria-label", count ? "Airlock 설정 — 업데이트 " + count + "건" : "Airlock 설정");
+    checkedEl.textContent = checked;
+    renderUpdates(d);
+    renderHarness(d);
+    renderDots(d);
+    renderFoot(d, count);
+  }
+
+  // Identity is resolved inside the poll, not once before it. `j()` returns null
+  // for a 500 and for a dropped connection exactly as it does for "not the
+  // owner", so deciding once at load time means one bad moment on the network
+  // costs the owner the gear until they reload. A DEFINITE answer settles it
+  // both ways: role "owner" arms the poll, any other role stops it for good and
+  // draws no further fetch; only "we could not ask" is retried.
+  let owner = null;                             // null = still unknown
+  async function identified() {
+    if (owner !== null) return owner;
+    let me = null;
+    try { me = await j("/whoami"); } catch (_) {}
+    if (!me) return null;                       // unknown — ask again next poll
+    owner = me.role === "owner";
+    return owner;
+  }
+
+  async function poll() {
+    const isOwner = await identified();
+    if (isOwner === false) { clearInterval(timer); return; }
+    if (!isOwner) return;                       // identity unknown — retry next tick
+    // Started from here, not at load: a collaborator (or an unresolved identity)
+    // must not open a second polling loop that only ever collects 403s.
+    if (!runPollStarted) { runPollStarted = true; pollRun(); pollHarness(); }
+    let r;
+    try { r = await fetch("/monitor/api/owner/updates", { cache: "no-store" }); }
+    catch (_) { return; }                       // network failure — keep the last render
+    if (r.status === 403 || r.status === 404) { // not offered here — no gear at all
+      setOpen(false);
+      gear.hidden = true;
+      renderDots(null);                         // and no orphaned tile dots either
+      return;
+    }
+    if (!r.ok) return;                          // unexpected status — keep the last render
+    let d; try { d = await r.json(); } catch (_) { return; }
+    // `null` and `[]` are valid JSON and a 200 can carry either. Rendering one
+    // would blank the badge on its way to throwing at `d.checkedAt`, which is
+    // the "keep the last render" rule failing in the exact shape it exists to
+    // prevent — so a payload that is not an object is an unexpected payload.
+    if (!d || typeof d !== "object" || Array.isArray(d)) return;
+    render(d);
+  }
+  // Detection runs on a daily timer, so a 30s poll would be 2,880 requests to
+  // watch a number that moves once. Five minutes is short enough that a manual
+  // run of the timer shows up while you are still looking at the screen.
+  const timer = setInterval(poll, 300000);
+  poll();
+})();
+</script>
+
+<script>
 // Suggestion box: POST only {text} to the same-origin /feedback/api/ — the owner
 // is attached server-side by the backend from the gate header (never sent here).
 // The box stays hidden unless the backend reports it's configured, and even then
@@ -568,6 +1843,156 @@ if (("standalone" in navigator) && navigator.standalone) {
       btn.disabled = false;
     }
   });
+})();
+</script>
+<script>
+// Identity pill -> subscription accounts. The confirmed mockup (9) took the
+// subscription row OUT of the settings sheet and put the entrance here instead:
+// the pill is already the place that says whose box this is, so "my account"
+// reads off it, and an expiring login becomes its ring rather than another badge
+// competing with the gear's.
+//
+// What opens is the SAME panel devterm's own account icon and the return widget's
+// menu open — hub/assets/accounts/panel.html, one implementation with three hosts.
+// It is an iframe on devterm's origin and not a copy of the UI here, because every
+// fetch inside it is a root-absolute path that only that gate answers. That is also
+// why the gate aliases the file out of the webroot instead of the hub serving it
+// from /assets/: moving the file would not have moved the API with it.
+//
+// Failure discipline, split on purpose — the two halves fail differently:
+//   - becoming an entrance at all needs a definite yes: devterm installed with a
+//     public port, a verified owner, and /acct-alert actually answering. Short of
+//     that the pill stays the plain label it is today. An entrance that opens a
+//     modal saying "could not load" is worse than no entrance.
+//   - once it IS an entrance, a later failed poll clears the RING and keeps the
+//     entrance. No reading is not a warning (the widget's rule, same endpoint), and
+//     it is not a reason to take the way in away either.
+(() => {
+  const pill = document.querySelector("[data-account-entry]");
+  if (!pill) return;
+
+  // Where the account panel lives, from the launcher config the page already
+  // fetches. devterm by name, deliberately: the account API is that gate's, which
+  // is the same thing install/lib.sh's airlock_panel_url decides for the return
+  // widget — two derivations of one fact, so they name the same app.
+  //
+  // The port key is webjson's public port, and the host is the FQDN the installer
+  // measured, because a separate-port URL has to match the Tailscale cert — the
+  // cert covers the FQDN only, so a short hostname would give the browser a link it
+  // cannot verify. Pure (host passed in, nothing read off `location`) so that
+  // install/test-hub-filter.sh can exercise it in node.
+  function airlockAccountPanelBase(apps, fqdn, fallbackHost) {
+    const devterm = apps && apps.devterm;
+    const port = devterm && devterm.port;
+    if (!port) return "";
+    const host = (fqdn && fqdn.indexOf(".") > 0) ? fqdn : fallbackHost;
+    if (!host) return "";
+    return "https://" + host + ":" + port + "/";
+  }
+
+  let base = "", modal = null, level = "";
+
+  function paintRing() {
+    if (level === "warn" || level === "crit") pill.setAttribute("data-acct-level", level);
+    else pill.removeAttribute("data-acct-level");
+  }
+
+  function closePanel() {
+    if (!modal) return;
+    modal.remove();
+    modal = null;
+    pill.focus();
+  }
+
+  function openPanel() {
+    if (modal) { closePanel(); return; }
+    const ov = document.createElement("div");
+    ov.className = "acct-modal";
+    const box = document.createElement("div");
+    box.className = "acct-box";
+    box.setAttribute("role", "dialog");
+    box.setAttribute("aria-modal", "true");
+    box.setAttribute("aria-label", "구독 계정 관리");
+    const head = document.createElement("div");
+    head.className = "acct-head";
+    const ttl = document.createElement("span");
+    ttl.className = "acct-ttl"; ttl.textContent = "구독 계정 관리";
+    const x = document.createElement("button");
+    x.type = "button"; x.className = "acct-x"; x.textContent = "\u2715";
+    x.setAttribute("aria-label", "닫기");
+    x.addEventListener("click", closePanel);
+    head.append(ttl, x);
+    // embed=1 tells the panel the host owns the header, so it drops its own.
+    const frame = document.createElement("iframe");
+    frame.className = "acct-frame";
+    frame.src = base + "panel.html?p=accounts&embed=1";
+    frame.title = "구독 계정 관리";
+    const note = document.createElement("div");
+    note.className = "acct-note";
+    note.hidden = true;
+    box.append(head, frame, note);
+    ov.appendChild(box);
+    ov.addEventListener("click", (e) => { if (e.target === ov) closePanel(); });
+    document.body.appendChild(ov);
+    modal = ov;
+    x.focus();
+    // A blank rectangle is not an error message: if the panel never loads, say so
+    // and show the address that was tried (the widget's rule, same wording problem).
+    let loaded = false;
+    frame.addEventListener("load", () => { loaded = true; });
+    setTimeout(() => {
+      if (loaded || modal !== ov) return;
+      frame.hidden = true;
+      note.hidden = false;
+      note.textContent = "구독 계정 패널이 6초 안에 열리지 않았습니다: " + frame.src +
+        " — devterm 이 이 주소에서 응답하는지 확인해 주십시오.";
+    }, 6000);
+  }
+
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePanel(); });
+  // The panel cannot close the modal that contains it, so it asks us to. Only the
+  // panel's own origin may ask: this listener is on the hub, which any framed page
+  // could post to, and the current spelling is the only one accepted — the legacy
+  // one is due for deletion (docs/tasks/active/frontend-namespace-overlap-end.md)
+  // and a new listener must not be a fresh reason to keep it alive.
+  window.addEventListener("message", (e) => {
+    if (!base || e.data !== "airlock-panel-close") return;
+    let want; try { want = new URL(base).origin; } catch (_) { return; }
+    if (e.origin === want) closePanel();
+  });
+
+  function arm() {
+    if (pill.hasAttribute("data-acct")) return;
+    pill.setAttribute("data-acct", "");
+    pill.setAttribute("role", "button");
+    pill.setAttribute("tabindex", "0");
+    pill.setAttribute("aria-haspopup", "dialog");
+    pill.setAttribute("title", "구독 계정 관리");
+    pill.addEventListener("click", openPanel);
+    pill.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openPanel(); }
+    });
+  }
+
+  async function poll() {
+    let r;
+    try { r = await fetch(base + "acct-alert", { cache: "no-store" }); }
+    catch (_) { level = ""; paintRing(); return; }   // no reading is not a warning
+    if (!r.ok) { level = ""; paintRing(); return; }
+    let a; try { a = await r.json(); } catch (_) { level = ""; paintRing(); return; }
+    arm();                                            // it answered: there is a panel
+    level = (a && (a.level === "warn" || a.level === "crit")) ? a.level : "";
+    paintRing();
+  }
+
+  (async () => {
+    const [cfg, me] = [await j("/__airlock.json"), await j("/whoami")];
+    if (!me || me.role !== "owner") return;           // collaborators draw no fetch
+    base = airlockAccountPanelBase(cfg && cfg.apps, cfg && cfg.fqdn, location.hostname);
+    if (!base) return;                                // no devterm on this box
+    poll();
+    setInterval(poll, 30000);
+  })();
 })();
 </script>
 </body>

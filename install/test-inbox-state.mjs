@@ -24,7 +24,7 @@ import vm from 'node:vm';
 const html = fs.readFileSync(
   new URL('../apps/dev-monitor/frontend/dev-monitor.html', import.meta.url), 'utf8');
 const start = html.indexOf('/* TESTABLE:inbox-state');
-const end = html.indexOf('/* :TESTABLE */');
+const end = html.indexOf('/* :TESTABLE */', start);
 assert.ok(start >= 0 && end > start, 'inbox-state markers missing from dev-monitor.html');
 
 const context = {};

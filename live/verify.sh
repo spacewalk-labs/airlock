@@ -326,11 +326,17 @@ trap cleanup EXIT
 STAGE=creating
 say "launching $IMAGE"
 CONTAINER_LAUNCH_ATTEMPTED=1
-"${SSH[@]}" "lxc launch $IMAGE $NAME \
-  -c limits.memory=$MEM -c limits.cpu=$CPU \
-  -c user.airlock_live_owner_nonce=$RUN_NONCE \
-  ${AIRLOCK_LIVE_POOL:+-s $AIRLOCK_LIVE_POOL} -d root,size=$DISK" >/dev/null 2>&1 \
-  || die "lxc launch failed"
+if ! launch_err="$("${SSH[@]}" "lxc launch $IMAGE $NAME \
+    -c limits.memory=$MEM -c limits.cpu=$CPU \
+    -c user.airlock_live_owner_nonce=$RUN_NONCE \
+    ${AIRLOCK_LIVE_POOL:+-s $AIRLOCK_LIVE_POOL} -d root,size=$DISK" \
+    2>&1 >/dev/null | tail -c 1200 | tr '\r\n' '  ' \
+    | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')"; then
+  # LXD's stderr names the failing boundary (for example, a missing storage
+  # pool). Bound the stream before command substitution captures it, then
+  # flatten it so a remote failure cannot become an unbounded or multiline log.
+  die "lxc launch failed${launch_err:+: $launch_err}"
+fi
 CONTAINER_MADE=1
 # The image fingerprint, not just the alias. "ubuntu:24.04" is a moving target; a
 # result that cannot say which build it ran on cannot be compared with last week's.

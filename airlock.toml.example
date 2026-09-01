@@ -26,6 +26,34 @@ owner    = "me@example.com"   # full access
 # what you mean.
 collaborators = []
 
+[agent]
+# Which agent CLI the PLATFORM's own tools run. Today that is dev-monitor's approved
+# actions; anything added later reads this key rather than inventing its own.
+#
+#   claude  (default)  pin Claude Code
+#   codex              pin the Codex CLI
+#   auto               pick an installed CLI, preferring one that has a login on this
+#                      box. With both logged in, claude wins — see below.
+#
+# The default is `claude` and not `auto` on purpose. Before this key existed the action
+# runner had `claude` written into its argv, so a box that never sets this key has to
+# keep running claude; `auto` is a choice you make, not one made for you.
+#
+# 🔴 There is deliberately NO model key here, and there will not be one. The model is the
+# CLI's to pick (owner decision 5). A model setting on this box would silently disagree
+# with the one in the CLI's own configuration, and only one of them can win.
+provider = "claude"
+#
+# Precedence, when an app ALSO has a key naming an agent or a binary:
+#   1. the app's own key in [apps.<id>] always wins inside that app. [apps.learning].provider
+#      chooses learning's ingest CLI; [apps.devterm].claude_switch names a specific binary.
+#      They are per-app answers to a per-app question and this key never rewrites them.
+#   2. otherwise this key answers, for platform-owned tools.
+# The two layers share one rule for what `auto` means (bin/agent_provider.py) and nothing
+# else. An app whose provider question is the same as the platform's should drop its key
+# rather than default it to this one — an app key that exists is an answer, and there is
+# no way for an installer to tell "the operator chose auto" from "the manifest said auto".
+
 [paths]
 # fileview has no root setting: it serves the filesystem, bounded by what this
 # box's user account can reach (see SECURITY.md). `code_root` used to live here

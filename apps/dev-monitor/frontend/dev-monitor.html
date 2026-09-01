@@ -120,9 +120,10 @@
     .svc-row:last-child { border-bottom: 0; }
     .svc-row .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
     .svc-row.inactive .dot { background: var(--muted); }
-    .svc-row.failed .dot { background: var(--danger); }
+    .svc-row.failed .dot, .svc-row.attention .dot { background: var(--danger); }
     .svc-row .name { font-family: var(--font-mono); }
     .svc-row .scope { font-size: 12px; color: var(--muted); }
+    .svc-row .attention-reason { color: var(--danger); }
     .svc-row .uptime { color: var(--muted); font-family: var(--font-mono); font-size: 12px; }
     .svc-row .svc-restart { justify-self: end; }
 
@@ -395,7 +396,7 @@
 
   <nav class="nav" role="tablist" aria-label="Screens">
     <button role="tab" data-tab="inbox" aria-selected="true">Inbox <span class="nbadge" id="nav-todo" hidden></span></button>
-    <button role="tab" data-tab="system" aria-selected="false">System</button>
+    <button role="tab" data-tab="system" aria-selected="false">System <span class="nbadge" id="nav-system-attention" hidden></span></button>
     <button role="tab" data-tab="cron" aria-selected="false">Cron</button>
     <button role="tab" data-tab="routing" aria-selected="false">Notifications</button>
   </nav>
@@ -475,7 +476,7 @@
   </div>
 
   <!-- Services -->
-  <details class="section">
+  <details class="section" id="services-section">
     <summary><svg class="ic"><use href="#ic-services"/></svg> Services <span class="hint">— systemd user/system units · expand</span></summary>
     <div class="svc-list" id="svc-list"><div class="empty">loading…</div></div>
   </details>
@@ -557,7 +558,7 @@
 
 <nav class="tabbar" role="tablist" aria-label="Screens">
   <button role="tab" data-tab="inbox" aria-selected="true"><span class="glyph">✉<span class="nbadge" id="tb-todo" hidden></span></span>Inbox</button>
-  <button role="tab" data-tab="system" aria-selected="false"><span class="glyph">▤</span>System</button>
+  <button role="tab" data-tab="system" aria-selected="false"><span class="glyph">▤<span class="nbadge" id="tb-system-attention" hidden></span></span>System</button>
   <button role="tab" data-tab="cron" aria-selected="false"><span class="glyph">◷</span>Cron</button>
   <button role="tab" data-tab="routing" aria-selected="false"><span class="glyph">⚙</span>Notifications</button>
 </nav>
@@ -728,15 +729,59 @@
     loadLogs(sel.value);
   }
 
+  /* TESTABLE:monitor-services */
+  function applyServiceAttention(count) {
+    count = Number.isFinite(Number(count)) ? Math.max(0, Number(count)) : 0;
+    ['nav-system-attention', 'tb-system-attention'].forEach(function (id) {
+      var badge = document.getElementById(id);
+      badge.textContent = String(count);
+      badge.hidden = count === 0;
+    });
+    if (count > 0) document.getElementById('services-section').open = true;
+  }
+
+  function serviceStateClass(service) {
+    if (service.attention) return 'attention';
+    var state = service.active_state || service.state;
+    if (state === 'active') return '';
+    if (state === 'failed') return 'failed';
+    return 'inactive';
+  }
+
+  function serviceDetail(service) {
+    var state = (service.active_state || service.state || 'unknown') + '/' +
+      (service.sub_state || 'unknown');
+    var result = 'Result=' + (service.result || 'unknown');
+    var restarts = 'NRestarts=' +
+      (service.n_restarts === null || service.n_restarts === undefined
+        ? 'unknown' : String(service.n_restarts));
+    return state + ' | ' + result + ' | ' + restarts;
+  }
+
+  function serviceJSON() {
+    return fetch(API + '/services', { cache: 'no-store' }).then(function (response) {
+      if (!response.ok) throw new Error('service health request failed (HTTP ' + response.status + ')');
+      return response.json();
+    });
+  }
+
+  var serviceLoadTask = null;
   function loadServices() {
-    return j(API + '/services').then(function (d) {
+    if (serviceLoadTask) return serviceLoadTask;
+    serviceLoadTask = serviceJSON().then(function (d) {
       var svcs = d.services || [];
+      applyServiceAttention(d.attention_count || 0);
+      svcs.sort(function (a, b) {
+        var attention = Number(Boolean(b.attention)) - Number(Boolean(a.attention));
+        return attention || String(a.name || '').localeCompare(String(b.name || ''));
+      });
       var html = '';
       svcs.forEach(function (s) {
-        var stateClass = s.state === 'active' ? '' : (s.state === 'failed' ? 'failed' : 'inactive');
+        var stateClass = serviceStateClass(s);
         html += '<div class="svc-row ' + stateClass + '">' +
-          '<div class="dot" title="' + escHTML(s.state) + '"></div>' +
-          '<div><div class="name">' + escHTML(s.name) + '</div><div class="scope">' + escHTML(s.scope) + ' · ' + escHTML(s.state) + '</div></div>' +
+          '<div class="dot" title="' + escHTML(s.attention_reason || serviceDetail(s)) + '"></div>' +
+          '<div><div class="name">' + escHTML(s.name) + '</div><div class="scope">' + escHTML(s.scope) + ' · ' + escHTML(serviceDetail(s)) + '</div>' +
+          (s.attention_reason ? '<div class="scope attention-reason">' + escHTML(s.attention_reason) + '</div>' : '') + '</div>' +
           '<div class="uptime">' + escHTML(s.uptime || '') + '</div>' +
           '<div>' + (s.action_allowed ? '<button class="mbtn svc-restart" type="button" data-service="' + escHTML(s.name) + '">Restart</button>' : '') + '</div>' +
           '</div>';
@@ -761,9 +806,14 @@
       });
       populateLogUnits(svcs);
     }).catch(function (e) {
+      applyServiceAttention(1);
       document.getElementById('svc-list').innerHTML = '<div class="empty err">' + escHTML(e.message) + '</div>';
     });
+    serviceLoadTask.then(function () { serviceLoadTask = null; },
+      function () { serviceLoadTask = null; });
+    return serviceLoadTask;
   }
+  /* :TESTABLE */
 
   function loadNetwork() {
     return j(API + '/network').then(function (d) {

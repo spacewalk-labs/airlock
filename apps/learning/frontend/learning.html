@@ -2072,7 +2072,7 @@ window.__LEARNING_DATA__ = null;
   function addedOf(entry) { return stringValue(fieldOf(entry, "added", ""), "날짜 없음"); }
 
   /* 발행본 파일 이름. 앱과 같은 오리진(`doc/<이름>`)으로 띄우려면 URL 이 아니라 이름이 필요하다.
-     `:8000` 절대 URL 로 직접 열면 앱 껍데기(뒤로가기)를 잃고, 앱이 https 면 iframe 이 차단된다. */
+     발행본 절대 URL 로 직접 열면 앱 껍데기(뒤로가기)를 잃고, 앱이 https 면 iframe 이 차단된다. */
   function publishedName(item) {
     var names = publishCandidates(item);
     for (var i = 0; i < names.length; i += 1) {
@@ -2136,7 +2136,9 @@ window.__LEARNING_DATA__ = null;
     return candidates;
   }
 
-  /* 앱 밖(`:8000`) 절대 URL. 뷰어 바의 "주소 복사" 와 뷰어를 쓸 수 없는 항목의 폴백이다. */
+  /* 앱 밖 절대 URL. 뷰어 바의 "주소 복사" 와 뷰어를 쓸 수 없는 항목의 폴백이다.
+     발행본은 publish 앱이 **같은 오리진**의 `/publish/files/<이름>` 으로 내준다 — 옛 박스처럼
+     `<호스트>:8000` 을 조립하면 그 포트를 서빙하는 것이 없어 링크가 죽는다. */
   function publicHref(item) {
     var candidates = publishCandidates(item);
     for (var i = 0; i < candidates.length; i += 1) {
@@ -2154,7 +2156,8 @@ window.__LEARNING_DATA__ = null;
           if (absolute.protocol === "http:" || absolute.protocol === "https:") return absolute.href;
         } catch (error) { continue; }
       } else if (/^[^/?#\\]+\.html(?:[?#].*)?$/i.test(candidate)) {
-        return "http://" + window.location.hostname + ":8000/" + encodeURIComponent(candidate);
+        return new URL("/publish/files/" + encodeURIComponent(candidate),
+                       window.location.origin).href;
       }
     }
     return null;

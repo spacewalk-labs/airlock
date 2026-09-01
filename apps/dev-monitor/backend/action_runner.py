@@ -23,10 +23,20 @@ Contract (why this way):
     watcher thread writes the sentinel at that point. The window stays alive (preserving follow-up
     work and output).
 
-plan_file JSON: {"cwd": "...", "skill":"..."|"prompt":"..."|"exec":["prog","arg"], "explain": "..."}
-  - exec = execute the program directly (does not go through claude, argv elements passed as-is —
-    zero shell parsing). exec[0] = absolute path.
+plan_file JSON: {"cwd": "...", "skill":"..."|"prompt":"..."|"exec":["prog","arg"], "explain": "...",
+                 "agent": {"provider": "auto|claude|codex", "select_bin": "/…/bin/airlock-agent"}}
+  - exec = execute the program directly (does not go through an agent CLI, argv elements passed
+    as-is — zero shell parsing). exec[0] = absolute path.
     In exec mode the process actually dies when it completes, so no turn marker is needed.
+  - agent = the platform's `[agent].provider` key plus the platform CLI that resolves it. It
+    arrives in the PLAN rather than the environment because it cannot arrive any other way: a
+    tmux window inherits the tmux SERVER's environment (whatever started the server, often a
+    login shell from hours earlier), not the environment of the backend that called
+    `tmux new-window`. Measured 2026-09-01 — server started with FOO=first, new-window called
+    with FOO=second, the window sees FOO=first. This is the same mechanism as the rc=127
+    incident recorded under runtime_env() below.
+    Absent or empty = claude, exactly as before the key existed. A box that never set it must
+    keep running what it was running.
 """
 import json
 import os
@@ -51,8 +61,127 @@ def write_sentinel(sentinel_dir, run_id, exit_code):
         sys.stderr.write('[action_runner] sentinel write failed: %s\n' % e)
 
 
-def build_argv(plan, settings_file=None):
-    """plan → claude argv (element-by-element — no shell parsing).
+# The selector reads two small files and scans a handful of directories. If it has not answered
+# in this long it is wedged, and waiting longer only delays a run the owner already approved.
+AGENT_SELECT_TIMEOUT = 15
+
+# What runs when the plan says nothing about an agent. Not a preference — the value this
+# file had written into its argv before `[agent].provider` existed. Compatibility is the
+# whole reason it is spelled out here instead of being read from the platform.
+AGENT_FALLBACK = {'provider': 'claude', 'command': 'claude', 'binary': None,
+                  'reason': 'no platform agent key in this plan', 'turnend_hook': True}
+
+# The providers this runner can spell an argv for, and what it spells. The COMMAND NAME is
+# read from here and never from the selector's answer: the runner has to know each provider
+# it accepts anyway (to know whether to install a turn-end hook), so taking the name from its
+# own table costs nothing and removes a way for a wrong answer to name a different program.
+# turnend_hook: only claude needs it. `claude -p` is a REPL that waits at the prompt when a
+# turn ends (see the module docstring), while `codex exec` exits when the work is done — so
+# for codex the process exit IS the completion signal, the same way exec mode already works.
+AGENT_SPELLING = {
+    'claude': {'command': 'claude', 'turnend_hook': True},
+    'codex': {'command': 'codex', 'turnend_hook': False},
+}
+
+
+def _agent_fallback(why):
+    """AGENT_FALLBACK, after saying on stderr why we are not doing what was configured.
+
+    Falling back to claude rather than refusing to run is deliberate — a broken selector must
+    not take away a capability the box had yesterday. Doing it QUIETLY is not: the pane stays
+    open after the run, so this line is where a person who wonders why claude started reads it.
+    """
+    sys.stderr.write('[action_runner] %s — running %s\n' % (why, AGENT_FALLBACK['command']))
+    return dict(AGENT_FALLBACK)
+
+
+def resolve_agent(spec):
+    """plan['agent'] → {provider, command, binary, reason, turnend_hook}.
+
+    Silence is correct in exactly one case: the plan names NEITHER a provider nor a selector.
+    That is a box that never set `[agent].provider`, which is the ordinary state and not an
+    event. Everything else that ends up on claude says so.
+
+    The one case that does not fall back at all is a selector that answered "nothing is
+    installed". That is an answer, and honouring it gives the owner its sentence instead of a
+    bare rc=127.
+    """
+    spec = spec if isinstance(spec, dict) else {}
+    preference = str(spec.get('provider') or '').strip()
+    select_bin = str(spec.get('select_bin') or '').strip()
+    if not preference and not select_bin:
+        return dict(AGENT_FALLBACK)         # the unconfigured box — not an event, so no line
+    if not preference or not select_bin:
+        # HALF configured. The likeliest cause is a unit rendered before this feature and not
+        # re-rendered since, and the consequence is a box whose airlock.toml says codex quietly
+        # running claude. That is exactly the failure this whole change exists to remove.
+        return _agent_fallback(
+            'the plan carries %s but not %s'
+            % ('an agent provider' if preference else 'an agent selector',
+               'a selector' if preference else 'a provider'))
+    try:
+        # Through the interpreter, not as an executable: bin/airlock-agent is mode 100644 on
+        # purpose (a new executable under bin/ needs an explicit cutline catalog entry, and
+        # this tool does not need one). install/lib.sh spawns bin/airlock-config the same way.
+        proc = subprocess.run([sys.executable, select_bin, 'select', '--json',
+                               '--prefer', preference],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=AGENT_SELECT_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return _agent_fallback('agent selection failed (%s: %s)' % (select_bin, e))
+    if proc.returncode != 0:
+        return _agent_fallback('agent selection exited %d (%s)'
+                               % (proc.returncode,
+                                  proc.stderr.decode('utf-8', 'replace').strip()))
+    try:
+        answer = json.loads(proc.stdout.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as e:
+        return _agent_fallback('agent selection returned no usable JSON (%s)' % e)
+    # `is int` and not `== 1`: in Python `True == 1`, so a selector answering
+    # `"schema_version": true` would otherwise pass a version check as version 1.
+    if (not isinstance(answer, dict)
+            or type(answer.get('schema_version')) is not int
+            or answer['schema_version'] != 1):
+        return _agent_fallback('agent selection spoke an unknown schema')
+    provider = answer.get('provider')
+    if provider is None:
+        raise FileNotFoundError(answer.get('reason') or 'no agent CLI is available')
+    if provider not in AGENT_SPELLING:
+        # The platform grew a CLI this runner does not know how to spell an argv for. Guessing
+        # would produce a command line nobody wrote; say so and run what we do know.
+        return _agent_fallback('agent %r has no argv form in this runner' % (provider,))
+    spelling = AGENT_SPELLING[provider]
+    binary = answer.get('binary')
+    if binary is not None and not _usable_binary(binary):
+        # Keep the provider, drop the path. Falling back to claude here would be worse than
+        # useless on a box configured for codex — it would run the wrong CLI over a stale
+        # path. Without the path, resolve_exe searches by name and, if that fails too, says
+        # exactly what it looked for and where.
+        sys.stderr.write('[action_runner] agent selection named %r, which is not an executable '
+                         'file — looking for %s on PATH instead\n' % (binary, spelling['command']))
+        binary = None
+    return {'provider': provider, 'command': spelling['command'], 'binary': binary,
+            'reason': str(answer.get('reason') or ''),
+            'turnend_hook': spelling['turnend_hook']}
+
+
+def _usable_binary(path):
+    """Absolute, existing, executable. Deliberately NOT "its basename is the command name":
+    a native claude install lives at `~/.local/share/claude/versions/<version>`, where the
+    file is named after the version, and bin_discovery returns exactly that path.
+
+    What this check is and is not. It catches a selector that answers with a stale or
+    misspelled path — the realistic failure. It does not make the selector's answer
+    untrusted input: the selector is named by the unit file, so anything able to forge its
+    answer can already rewrite the unit, the plan and this runner. That is the same trust
+    the runner already places in `plan['cwd']` and in its own path.
+    """
+    return (isinstance(path, str) and os.path.isabs(path)
+            and os.path.isfile(path) and os.access(path, os.X_OK))
+
+
+def build_argv(plan, settings_file=None, agent=None):
+    """plan → agent-CLI argv (element-by-element — no shell parsing).
 
     permission follows the **owner's normal settings exactly** (no separate mode is forced and no
     re-approval is added). What runs is the owner's own work, approved after the owner (or company)
@@ -62,13 +191,23 @@ def build_argv(plan, settings_file=None):
 
     Keep only the `--` (end-of-options marker) before the prompt/skill — even if a prompt starts
     with `-`, it is treated as input rather than an option, preventing misparsing (frictionless argv
-    correctness). Everything after `--` is positional.
+    correctness). Everything after `--` is positional. That holds for every provider: the first
+    input is one argv element and it is positional, so which CLI runs never changes whether a
+    prompt can reach an option slot.
+
+    🔴 No provider gets a `--model`, and none gets a sandbox or permission flag this file invents.
+    Owner decision 5: the model is the CLI's to pick. The permission posture is the owner's own
+    configuration for that CLI, the same way the claude path has always taken the owner's
+    settings — a flag here would quietly override what the owner set for their own tool.
     """
     exec_argv = plan.get('exec')
     if exec_argv:
-        return list(exec_argv)                      # direct executable — no claude or '--', argv as-is (zero shell parsing)
-    argv = ['claude']
-    if settings_file:
+        return list(exec_argv)                      # direct executable — no agent CLI or '--', argv as-is (zero shell parsing)
+    agent = agent or AGENT_FALLBACK
+    argv = [agent.get('binary') or agent['command']]
+    if agent['provider'] == 'codex':
+        argv.append('exec')                         # codex's non-interactive verb; it exits when the work is done
+    elif settings_file:
         argv += ['--settings', settings_file]       # turn-end marker via Stop hook (merged **in addition** to owner's settings)
     argv.append('--')                               # '--' = end of options (only prevents prompt misparsing)
     skill = plan.get('skill')
@@ -76,9 +215,9 @@ def build_argv(plan, settings_file=None):
         arg = '/' + skill
         if plan.get('args'):
             arg += ' ' + plan['args']
-        argv.append(arg)                            # claude's first input = /skill (one argv element)
+        argv.append(arg)                            # the CLI's first input = /skill (one argv element)
     else:
-        argv.append(plan['prompt'])                 # claude's first input = the original prompt
+        argv.append(plan['prompt'])                 # the CLI's first input = the original prompt
     return argv
 
 
@@ -241,13 +380,17 @@ def main():
         cwd = plan['cwd']
         if not os.path.isdir(cwd):
             raise ValueError('cwd disappeared: %s' % cwd)
+        agent = resolve_agent(plan.get('agent')) if not plan.get('exec') else AGENT_FALLBACK
         settings_file = None
-        if not plan.get('exec'):      # claude path only — exec really dies when it finishes
+        # The hook is claude-only: exec and codex both really die when they finish, and for them
+        # completion is the process exit. Installing a Stop hook they never fire would leave the
+        # watcher waiting for a marker that cannot arrive.
+        if not plan.get('exec') and agent['turnend_hook']:
             try:
                 settings_file = write_turnend_settings(sentinel_dir, run_id)
             except OSError as e:      # continue even if the hook cannot be installed (old behavior = judge by process exit)
                 sys.stderr.write('[action_runner] failed to install turn-end hook (completion will be determined when the window closes): %s\n' % e)
-        argv = build_argv(plan, settings_file)
+        argv = build_argv(plan, settings_file, agent)
         cwd = resolve_cwd_under_root(cwd, plan.get('cwd_root'))   # chdir + root recheck (#6 TOCTOU)
         print('▶ dev-monitor execution  [%s]' % run_id)
         print('   cwd    : %s' % cwd)
@@ -258,11 +401,17 @@ def main():
         else:
             run_label = 'Prompt'
         print('   execution   : %s' % run_label)
+        if not plan.get('exec'):
+            # WHICH CLI is running, printed next to what it is running. The owner configured a
+            # box-wide default they may not remember, `auto` can change answer between two runs
+            # of the same card, and the pane is the only place either fact is visible.
+            print('   agent   : %s%s' % (agent['command'],
+                                         '  (%s)' % agent['reason'] if agent['reason'] else ''))
         if plan.get('explain'):
             print('   reason   : %s' % plan['explain'])
         print('─' * 56)
         sys.stdout.flush()
-        env = runtime_env()                         # add ~/.local/bin to PATH (resolve claude)
+        env = runtime_env()                         # add ~/.local/bin to PATH (resolve the agent CLI)
         argv[0] = resolve_exe(argv, env)            # if missing, record what and where, then return 127
         if settings_file:
             # Report completion the moment the turn ends — claude and the window remain alive.

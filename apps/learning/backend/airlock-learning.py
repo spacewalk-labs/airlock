@@ -2413,7 +2413,7 @@ class Handler(BaseHTTPRequestHandler):
     def _published_doc(self, name):
         """발행본 HTML 을 **앱과 같은 오리진**으로 내준다 — iframe 뷰어가 쓴다.
 
-        문서를 `:8000` 으로 직접 열면 앱 껍데기(뒤로가기)를 잃고, 앱이 테일넷 https 로
+        문서를 발행 URL 로 직접 열면 앱 껍데기(뒤로가기)를 잃고, 앱이 테일넷 https 로
         열렸을 때는 http iframe 이 혼합 콘텐츠로 차단된다. 그래서 여기서 내준다.
         발행 디렉터리의 항목은 learning 레포를 가리키는 심링크라 realpath 는 밖으로
         나간다 — 경계는 **이름**으로 잡는다(디렉터리 이동 금지).

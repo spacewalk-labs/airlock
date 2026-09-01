@@ -1,0 +1,11 @@
+[Unit]
+Description=airlock — daily update detection
+
+[Timer]
+# One network fetch per day. Persistent catches up after the laptop/box was asleep.
+OnCalendar=daily
+Persistent=true
+AccuracySec=15min
+
+[Install]
+WantedBy=timers.target
