@@ -38,7 +38,21 @@ HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/.." && pwd)"
 export ROOT
 GOLDEN="$HERE/golden/render"
 MODE="${1:-check}"
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
+NGTMP=""
+NGSOCKDIR=""
+NGINX_PARITY_PID=""
+nginx_parity_cleanup() {
+  if [ -n "$NGINX_PARITY_PID" ] && kill -0 "$NGINX_PARITY_PID" 2>/dev/null; then
+    kill -TERM "$NGINX_PARITY_PID" 2>/dev/null || true
+    wait "$NGINX_PARITY_PID" 2>/dev/null || true
+  fi
+  [ -z "$NGTMP" ] || chmod 700 "$NGTMP/private" 2>/dev/null || true
+  rm -rf "$TMP"
+  [ -z "$NGTMP" ] || rm -rf "$NGTMP"
+  [ -z "$NGSOCKDIR" ] || rm -rf "$NGSOCKDIR"
+}
+trap nginx_parity_cleanup EXIT
 # paseo's real installer resolves node's bin dir off PATH (`readlink -f
 # "$(command -v node)"`) into the unit's Environment=PATH — a box-real,
 # non-fixture-controlled absolute path. The installer-path fixtures run the
@@ -653,6 +667,7 @@ golden_check_file "publish/$SET/nginx-main.conf" "$f"
 # functions directly, never the actual call site argument wiring).
 # ===========================================================================
 NGTMP="$(mktemp -d)"
+NGSOCKDIR="$(mktemp -d /tmp/airlock-nginx.XXXXXX)"
 mkdir -p "$NGTMP/home" "$NGTMP/web/assets" "$NGTMP/confd/hub-locations.d" "$NGTMP/confd/servers.d" "$NGTMP/code"
 NGCFG="$NGTMP/airlock.toml"
 cat > "$NGCFG" <<EOF
@@ -688,7 +703,157 @@ else
   bad "nginx render golden: render-nginx.sh produced no output"
   sed 's/^/    /' "$NGTMP/site.err"
 fi
+
+# The golden above pins bytes; this live matrix pins meaning. The regression this
+# guards was invisible to nginx -t: a filesystem 403 from publish's alias inherited
+# the server-level error_page and therefore rendered the identity-denial page. A
+# collaborator is the important allowed identity here — using the owner would not
+# catch an accidental $owner_ok selector.
+NGINX_BIN="$(command -v nginx 2>/dev/null || true)"
+for candidate in /usr/sbin/nginx /sbin/nginx; do
+  [ -n "$NGINX_BIN" ] || [ ! -x "$candidate" ] || NGINX_BIN="$candidate"
+done
+CURL_HELP=""
+if command -v curl >/dev/null 2>&1; then
+  CURL_HELP="$(curl --help all 2>/dev/null || true)"
+fi
+if [ -z "$NGINX_BIN" ]; then
+  bad "nginx 403 provenance e2e: nginx is required (also checked /usr/sbin and /sbin)"
+elif [[ "$CURL_HELP" != *"--unix-socket"* ]]; then
+  bad "nginx 403 provenance e2e: curl with --unix-socket is required"
+else
+  NGE2E_CFG="$NGTMP/airlock-e2e.toml"
+  sed '/owner = "owner@fixture.dev"/a collaborators = ["friend@fixture.dev"]' "$NGCFG" > "$NGE2E_CFG"
+  (
+    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
+           AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
+    bash "$ROOT/install/render-nginx.sh"
+  ) > "$NGTMP/e2e-site.conf" 2> "$NGTMP/e2e-site.err"
+
+  mkdir -p "$NGTMP/share" "$NGTMP/private" "$NGTMP/cbt" "$NGTMP/pt" \
+    "$NGTMP/ft" "$NGTMP/ut" "$NGTMP/st"
+  chmod 755 "$NGTMP" "$NGTMP/web" "$NGTMP/share" "$NGTMP/confd" \
+    "$NGTMP/confd/hub-locations.d" "$NGTMP/confd/servers.d"
+  chmod 777 "$NGTMP/cbt" "$NGTMP/pt" "$NGTMP/ft" "$NGTMP/ut" "$NGTMP/st"
+  cp "$ROOT/hub/wrong-owner.html" "$NGTMP/web/wrong-owner.html"
+  printf '%s\n' 'HUB OK' > "$NGTMP/web/index.html"
+  printf '%s\n' 'READABLE' > "$NGTMP/share/readable.html"
+  printf '%s\n' 'UNREADABLE' > "$NGTMP/private/unreadable.html"
+  chmod 000 "$NGTMP/private"
+  ln -s "$NGTMP/private/unreadable.html" "$NGTMP/share/unreadable.html"
+  ln -s "$NGTMP/does-not-exist.html" "$NGTMP/share/dangling.html"
+  render_publish_nginx_main 19800 "$NGTMP/share" > "$NGTMP/confd/hub-locations.d/publish.conf"
+  render_fileview_nginx 19501 owner > "$NGTMP/confd/hub-locations.d/fileview.conf"
+
+  sed -e "s|listen 127.0.0.1:19902;|listen unix:$NGSOCKDIR/hub.sock;|" \
+      -e "s|listen 127.0.0.1:19903;|listen unix:$NGSOCKDIR/redirect.sock;|" \
+      "$NGTMP/e2e-site.conf" > "$NGTMP/e2e-site-unix.conf"
+  {
+    [ "$(id -u)" -ne 0 ] || echo 'user nobody;'
+    echo "pid $NGTMP/e2e-nginx.pid;"
+    echo "error_log $NGTMP/e2e-nginx-error.log;"
+    echo 'daemon off;'
+    echo 'events {}'
+    echo 'http {'
+    echo '  access_log off;'
+    echo "  client_body_temp_path $NGTMP/cbt;"
+    echo "  proxy_temp_path $NGTMP/pt;"
+    echo "  fastcgi_temp_path $NGTMP/ft;"
+    echo "  uwsgi_temp_path $NGTMP/ut;"
+    echo "  scgi_temp_path $NGTMP/st;"
+    cat "$NGTMP/e2e-site-unix.conf"
+    echo '}'
+  } > "$NGTMP/e2e-nginx.conf"
+
+  if ! "$NGINX_BIN" -t -c "$NGTMP/e2e-nginx.conf" -p "$NGTMP" > "$NGTMP/e2e-nginx-test.log" 2>&1; then
+    bad "nginx 403 provenance e2e: rendered config is invalid"
+    sed 's/^/    /' "$NGTMP/e2e-nginx-test.log"
+  else
+    "$NGINX_BIN" -c "$NGTMP/e2e-nginx.conf" -p "$NGTMP" > "$NGTMP/e2e-nginx-start.log" 2>&1 &
+    NGINX_PARITY_PID=$!
+    NGINX_READY=0
+    for ((attempt = 0; attempt < 50; attempt++)); do
+      if [ -S "$NGSOCKDIR/hub.sock" ] && kill -0 "$NGINX_PARITY_PID" 2>/dev/null; then
+        NGINX_READY=1
+        break
+      fi
+      sleep 0.1
+    done
+    if [ "$NGINX_READY" -eq 0 ]; then
+      bad "nginx 403 provenance e2e: nginx did not start"
+      sed 's/^/    /' "$NGTMP/e2e-nginx-start.log"
+    else
+      hub_get() {
+        local login="$1" path="$2" body="$3"
+        curl --silent --show-error --path-as-is --max-time 5 \
+          --unix-socket "$NGSOCKDIR/hub.sock" -H "Tailscale-User-Login: $login" \
+          --output "$body" --write-out '%{http_code}' "http://localhost$path" 2> "$body.err" || true
+      }
+
+      status="$(hub_get friend@fixture.dev /publish/files/readable.html "$NGTMP/friend-readable.body")"
+      if [ "$status" = 200 ] && grep -qx READABLE "$NGTMP/friend-readable.body"; then
+        ok "nginx 403 provenance: collaborator can read a readable publish target"
+      else
+        bad "nginx 403 provenance: collaborator readable target returned $status"
+      fi
+
+      status="$(hub_get friend@fixture.dev /publish/files/unreadable.html "$NGTMP/friend-unreadable.body")"
+      if [ "$status" = 403 ] \
+        && grep -qF 'This is not an Airlock ownership error.' "$NGTMP/friend-unreadable.body" \
+        && ! grep -qF "This isn't your Airlock" "$NGTMP/friend-unreadable.body"; then
+        ok "nginx 403 provenance: collaborator filesystem 403 names the resource error"
+      else
+        bad "nginx 403 provenance: collaborator filesystem denial returned $status or the wrong explanation"
+      fi
+
+      status="$(hub_get friend@fixture.dev /publish/files/dangling.html "$NGTMP/friend-dangling.body")"
+      if [ "$status" = 404 ] && ! grep -qF "This isn't your Airlock" "$NGTMP/friend-dangling.body"; then
+        ok "nginx 403 provenance: collaborator dangling target remains 404"
+      else
+        bad "nginx 403 provenance: collaborator dangling target returned $status or an ownership error"
+      fi
+
+      status="$(hub_get friend@fixture.dev /fileview/ "$NGTMP/friend-owner-only.body")"
+      if [ "$status" = 403 ] \
+        && grep -qF 'This is not an Airlock ownership error.' "$NGTMP/friend-owner-only.body" \
+        && ! grep -qF "This isn't your Airlock" "$NGTMP/friend-owner-only.body"; then
+        ok "nginx 403 provenance: collaborator location denial names the resource error"
+      else
+        bad "nginx 403 provenance: collaborator location denial returned $status or the wrong explanation"
+      fi
+
+      status="$(hub_get stranger@fixture.dev /fileview/ "$NGTMP/stranger-owner-only.body")"
+      if [ "$status" = 403 ] \
+        && grep -qF "This isn't your Airlock" "$NGTMP/stranger-owner-only.body" \
+        && ! grep -qF 'This is not an Airlock ownership error.' "$NGTMP/stranger-owner-only.body"; then
+        ok "nginx 403 provenance: stranger owner-only location is stopped by the identity gate"
+      else
+        bad "nginx 403 provenance: stranger owner-only location returned $status or bypassed the identity explanation"
+      fi
+
+      for target in readable unreadable dangling; do
+        status="$(hub_get stranger@fixture.dev "/publish/files/$target.html" "$NGTMP/stranger-$target.body")"
+        if [ "$status" = 403 ] \
+          && grep -qF "This isn't your Airlock" "$NGTMP/stranger-$target.body" \
+          && ! grep -qF 'This is not an Airlock ownership error.' "$NGTMP/stranger-$target.body"; then
+          ok "nginx 403 provenance: stranger $target target is stopped by the identity gate"
+        else
+          bad "nginx 403 provenance: stranger $target target returned $status or bypassed the identity explanation"
+        fi
+      done
+    fi
+  fi
+  if [ -n "$NGINX_PARITY_PID" ] && kill -0 "$NGINX_PARITY_PID" 2>/dev/null; then
+    kill -TERM "$NGINX_PARITY_PID" 2>/dev/null || true
+    wait "$NGINX_PARITY_PID" 2>/dev/null || true
+  fi
+  NGINX_PARITY_PID=""
+fi
+chmod 700 "$NGTMP/private" 2>/dev/null || true
 rm -rf "$NGTMP"
+NGTMP=""
+rm -rf "$NGSOCKDIR"
+NGSOCKDIR=""
 
 # ===========================================================================
 # tile projection golden (F13c) — the manifest-driven projection: CURRENT

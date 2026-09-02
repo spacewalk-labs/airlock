@@ -501,17 +501,36 @@ airlock_escape_selfkill_cgroup() {
     return 0
   fi
 
-  # --scope forks the command from this process, so the environment (every
-  # AIRLOCK_* value the caller set) carries over; only the cgroup changes.
+  # A transient SERVICE, not a --scope. The first version of this guard used a scope
+  # and was not enough: a scope leaves the run in the caller's process group and on
+  # the caller's stdout pipe, and the session being torn down takes both with it.
+  # Measured on one box, killing each coupling in turn:
   #
-  # Run it as a CHILD rather than exec'ing: a failed exec would take this shell
-  # down with it, which is the one outcome this guard must never produce. As a
-  # child, the escaped run owns the work — if the stop later kills this parent,
-  # the child in the sibling scope carries on and finishes the install.
-  log "  moving to: ${runner} --user --scope --collect -- bash $*"
-  if "$runner" --user --scope --collect --quiet \
+  #                                  --scope     --unit=
+  #   cgroup torn down (the stop)    survives    survives
+  #   process group killed           DIES        survives
+  #   stdout pipe closed (SIGPIPE)   DIES        survives
+  #
+  # Both extra deaths were real: an update escaped into a scope, the session that
+  # launched it went away with the daemon, and the install died at rc=141 (SIGPIPE)
+  # having reclaimed the units and not yet reinstalled them — the exact damage this
+  # guard exists to prevent, through a door it had left open.
+  #
+  # A --unit= service is parented by the user manager (own process group) and writes
+  # to the journal (no pipe), so all three couplings are cut at once.
+  local esc_unit
+  esc_unit="airlock-install-$$-$(date +%s)"
+  log "  moving to: ${runner} --user --unit=${esc_unit} -- bash $*"
+  log "  live output: journalctl --user -u ${esc_unit} -f"
+
+  # --wait blocks here for the exit status, so an operator watching a terminal still
+  # gets one. It is only this waiter that is fragile: if the caller dies, the service
+  # keeps running and finishes the install, which is the whole point.
+  if "$runner" --user --unit="$esc_unit" --service-type=exec --collect --quiet --wait \
+       --same-dir \
        --setenv=AIRLOCK_SELFKILL_ESCAPED=1 \
        -- bash "$@"; then
+    log "  escaped run finished (unit ${esc_unit})"
     exit 0
   fi
   local rc=$?
@@ -523,6 +542,8 @@ airlock_escape_selfkill_cgroup() {
     log "  place. If this run dies at a 'Stopping ${unit}' line, that is why."
     return 0
   fi
+  log "  escaped run failed (unit ${esc_unit}, rc=${rc}) — its log:"
+  log "    journalctl --user -u ${esc_unit}"
   exit "$rc"
 }
 

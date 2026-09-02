@@ -1266,10 +1266,20 @@ def main(argv):
             crecord = BACKEND.QUEUE.get(cancel_conn, cid)
             check("취소하면 cancelled 로 종결된다", crecord["state"] == "cancelled",
                   f"{crecord['state']} / {crecord.get('reason')}")
-            time.sleep(1.5)
-            after = subprocess.run(["pgrep", "-f", "while :; do sleep 1"],
-                                   capture_output=True, text=True).stdout.split()
-            survivors = [pid for pid in after if pid not in before]
+            # 🔴 고정 대기(예전 `time.sleep(1.5)`) 한 번만 재면 안 된다. SIGKILL 전달과
+            # 실제 소멸 사이에는 커널 스케줄링만큼의 창이 있고, 부하가 큰 CI 러너에서는
+            # 그 창이 1.5초를 넘는다 — 2026-09-01 lint 에서 손자 하나가 그렇게 잡혔다.
+            # 여기서 **약하게 고치지 않는다**: 단언은 그대로 "아무도 살아남지 않는다" 이고,
+            # 진짜로 새는 프로세스는 아무리 기다려도 안 사라지므로 여전히 빨갛다.
+            # 바뀐 것은 판정이 아니라 **관측 창**뿐이다.
+            deadline = time.monotonic() + 15.0
+            while True:
+                after = subprocess.run(["pgrep", "-f", "while :; do sleep 1"],
+                                       capture_output=True, text=True).stdout.split()
+                survivors = [pid for pid in after if pid not in before]
+                if not survivors or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.25)
             check("자식도 손자도 살아남지 않는다", not survivors, str(survivors))
             check("취소된 적재는 라이브러리에 아무것도 남기지 않는다",
                   os.listdir(cancel_lib) == [], str(os.listdir(cancel_lib)))

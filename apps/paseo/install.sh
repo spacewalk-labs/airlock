@@ -489,6 +489,42 @@ fi
 # Opus 5, and under `set -u` removing that step would have taken the prune with it.
 CLAUDE_MANIFEST_JS="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/server/agent/providers/claude/model-manifest.js"
 
+# --- 2b2. add Fable 5.1 to the picker (idempotent) ---
+# The pinned manifest predates Fable 5.1, so the picker cannot offer a model the
+# installed CLI already runs. Same shape as the Opus 5 backport step that lived
+# here until the pin caught up — the patch removes itself (exit 20) once upstream
+# ships the rows. Runs BEFORE the prune so each patch sees the array in the shape
+# its own anchors were written against.
+# Picker-only: the manifest is not on the execution path, so adding a row cannot
+# change how an existing session runs.
+FABLE51_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/claude-model-fable51.mjs"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] add Fable 5.1 rows to $CLAUDE_MANIFEST_JS"
+elif [ ! -f "$CLAUDE_MANIFEST_JS" ]; then
+  log "warning: model-manifest.js not found ($CLAUDE_MANIFEST_JS) — Fable 5.1 add skipped (paseo dist layout changed?)"
+elif [ ! -f "$FABLE51_PATCHER" ]; then
+  log "warning: Fable 5.1 patcher not found ($FABLE51_PATCHER) — skipped"
+else
+  fb_rc=0
+  fb_out="$(node "$FABLE51_PATCHER" "$CLAUDE_MANIFEST_JS")" || fb_rc=$?
+  case "$fb_rc" in
+    10) log "Fable 5.1 rows already present" ;;
+    20) log "Fable 5.1 add skipped — $fb_out" ;;
+    0)
+      FB_TMP="${CLAUDE_MANIFEST_JS}.paseo-new.mjs"
+      if node --check "$FB_TMP"; then
+        mv "$FB_TMP" "$CLAUDE_MANIFEST_JS" || die "Fable 5.1 add mv failed"
+        need_restart=1   # bundle changed -> restart so the daemon serves the new list
+        log "Fable 5.1 rows added ($fb_out)"
+      else
+        rm -f "$FB_TMP"
+        die "Fable 5.1 add produced invalid JS — not applied"
+      fi
+      ;;
+    *) die "Fable 5.1 patcher error (rc=$fb_rc): $fb_out" ;;
+  esac
+fi
+
 # --- 2c. prune superseded models (idempotent) ---
 # The pinned manifest still lists Opus 4.7/4.6 and Sonnet 4.6; drop them so the
 # picker is the handful people actually choose. Picker-only: the manifest is not

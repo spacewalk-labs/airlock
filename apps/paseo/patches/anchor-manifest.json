@@ -189,6 +189,14 @@
       ]
     },
     {
+      "id": "claude-model-fable51",
+      "source": "apps/paseo/patches/claude-model-fable51.mjs",
+      "anchors": [
+        "export const CLAUDE_MODEL_MANIFEST = [",
+        "CLAUDE_EFFORT_LEVELS"
+      ]
+    },
+    {
       "id": "claude-model-prune",
       "source": "apps/paseo/patches/claude-model-prune.mjs",
       "anchors": [

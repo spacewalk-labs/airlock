@@ -47,6 +47,13 @@ _PROVIDERS_SPEC = importlib.util.spec_from_file_location("learning_providers", P
 PROVIDERS = importlib.util.module_from_spec(_PROVIDERS_SPEC)
 _PROVIDERS_SPEC.loader.exec_module(PROVIDERS)
 
+# 라이브러리가 git 저장소일 때만 도는 커밋·push. 판정과 분리돼 있고 기본값은 off —
+# 이유는 git_sync.py 의 첫 문단에 있다.
+GIT_SYNC_PATH = os.path.join(BACKEND_DIR, "git_sync.py")
+_GIT_SYNC_SPEC = importlib.util.spec_from_file_location("learning_git_sync", GIT_SYNC_PATH)
+GITSYNC = importlib.util.module_from_spec(_GIT_SYNC_SPEC)
+_GIT_SYNC_SPEC.loader.exec_module(GITSYNC)
+
 SAVE_PATH = os.path.join(BACKEND_DIR, "save_document.py")
 SAVE_SPEC = importlib.util.spec_from_file_location("learning_save_document", SAVE_PATH)
 SAVE = importlib.util.module_from_spec(SAVE_SPEC)
@@ -764,12 +771,26 @@ def main(argv=None):
         recovered = QUEUE.recover_interrupted(conn, now_iso())
         if recovered:
             print(f"중단된 적재 {recovered}건을 실패로 확정했습니다", file=sys.stderr)
+        # 🔴 커밋은 큐 바깥에 산다. 적재 판정은 파일이 디스크에 있는지로 끝나고
+        #    (그 결합을 떼는 것이 이 앱의 재설계였다), git 은 그 뒤에 따로 따라온다.
+        #    워커에 두는 이유는 이 앱의 규칙 그대로다 — 라이브러리에 쓰는 주체는 하나여야
+        #    하고, 별표 한 번에 push 한 번이 붙으면 화면이 네트워크를 기다리게 된다.
+        ticker = GITSYNC.Ticker()
+
+        def git_tick(force=False):
+            ticker.tick(paths["repo"], state_dir,
+                        BACKEND.library_categories(paths["repo"]),
+                        log=lambda line: print(line, file=sys.stderr), force=force)
+
         while not STOPPING:
             row = QUEUE.claim_next(conn, now_iso())
             if row is None:
+                git_tick()
                 time.sleep(POLL_SECONDS)
                 continue
             run_attempt(conn, paths, row)
+            # 방금 문서가 생겼다. 다음 주기를 기다리지 않는다 — 사용자가 지금 보고 있다.
+            git_tick(force=True)
     finally:
         conn.close()
         lock.close()

@@ -462,6 +462,13 @@ _SAVE_SPEC = importlib.util.spec_from_file_location("learning_save_document", SA
 SAVE = importlib.util.module_from_spec(_SAVE_SPEC)
 _SAVE_SPEC.loader.exec_module(SAVE)
 
+# 커밋·push 는 워커가 한다. 서버는 그 **결과만** 읽어서 화면에 올린다 — push 가 계속
+# 실패하는 라이브러리는 조용히 로컬에만 쌓이므로, 아무도 모르는 상태가 가장 나쁘다.
+GIT_SYNC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "git_sync.py")
+_GIT_SYNC_SPEC = importlib.util.spec_from_file_location("learning_git_sync", GIT_SYNC_PATH)
+GITSYNC = importlib.util.module_from_spec(_GIT_SYNC_SPEC)
+_GIT_SYNC_SPEC.loader.exec_module(GITSYNC)
+
 
 def normalized_document(repo, relative):
     """영수증의 경로를 **목록이 쓰는 철자**로 맞춘다. 쓸 수 없는 경로면 None.
@@ -1862,6 +1869,19 @@ def document_flag(repo, manifest, path, key):
     return truthy_scalar(fields.get(key))
 
 
+def git_sync_warnings(state_dir):
+    """워커가 남긴 마지막 커밋·push 결과를 경고 한 줄로 옮긴다.
+
+    상태 파일이 없으면 아무 말도 하지 않는다 — 기능이 꺼져 있는 것과 아직 한 번도 돌지
+    않은 것을 경고로 구분해 봐야 사용자가 할 일이 없다.
+    """
+    status = GITSYNC.read_status(state_dir)
+    if not isinstance(status, dict) or status.get("ok") is not False:
+        return []
+    error = status.get("error") or "알 수 없는 이유로 실패했습니다"
+    return [f"라이브러리 git 동기화가 실패했습니다 — {error}"]
+
+
 def build_snapshot():
     paths = configured_paths()
     with state_lock(paths["state"]):
@@ -1942,7 +1962,7 @@ def build_snapshot():
             "archived": archived,
             "needs_attention": needs_attention,
         },
-        "warnings": manifest["warnings"],
+        "warnings": manifest["warnings"] + git_sync_warnings(paths["state"]),
         "repo_head": manifest["repo_head"],
         "orphan_starred_paths": sorted(set(starred) - set(views)),
         "stale": False,

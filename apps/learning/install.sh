@@ -36,6 +36,14 @@ case "$LISTING" in
   auto|builtin|legacy) ;;
   *) die "listing_provider must be auto, builtin or legacy; got '$LISTING'" ;;
 esac
+# off = never touch git. auto = commit and push the documents this app wrote, but
+# only when the library is a git repository root. Off is the default because a
+# library that happens to live in a repository has not asked us to push it.
+GIT_SYNC="${AIRLOCK_LEARNING_GIT_SYNC:-off}"
+case "$GIT_SYNC" in
+  off|auto) ;;
+  *) die "git_sync must be off or auto; got '$GIT_SYNC'" ;;
+esac
 
 # ~ is not expanded by the TOML reader, and a unit file cannot expand it either.
 # shellcheck disable=SC2088  # the tilde is DATA here, not a path to expand: these
@@ -154,7 +162,7 @@ render_learning_unit_server "$LIBRARY" "$PUBLISH_SHARE" "$STATE_DIR" "$PORT" "$L
   "$APP_DIR_LOCAL/backend" "$INGEST_PATH" "$ACCOUNTS_STATUS_BIN" \
   > "$UNIT_DIR/airlock-learning.service"
 render_learning_unit_ingest "$LIBRARY" "$STATE_DIR" "$PROVIDER" "$INGEST_PATH" \
-  "$APP_DIR_LOCAL/backend" "$UNSAFE_ENV" "$ACCOUNTS_STATUS_BIN" \
+  "$APP_DIR_LOCAL/backend" "$UNSAFE_ENV" "$ACCOUNTS_STATUS_BIN" "$GIT_SYNC" \
   > "$UNIT_DIR/airlock-learning-ingest.service"
 fi
 log "wrote units: airlock-learning.service, airlock-learning-ingest.service"
@@ -237,4 +245,4 @@ if ! command -v claude >/dev/null 2>&1 && ! command -v codex >/dev/null 2>&1; th
   log "note: no agent CLI (claude/codex) found on PATH — browsing, reading and sharing work, but pasting a link cannot produce a document until one is installed and logged in."
 fi
 
-log "learning installed (library: ${LIBRARY}, shares via publish: ${PUBLISH_SHARE}, listing: ${LISTING}, ingest: ${PROVIDER}, owner: ${AIRLOCK_OWNER})"
+log "learning installed (library: ${LIBRARY}, shares via publish: ${PUBLISH_SHARE}, listing: ${LISTING}, ingest: ${PROVIDER}, git sync: ${GIT_SYNC}, owner: ${AIRLOCK_OWNER})"

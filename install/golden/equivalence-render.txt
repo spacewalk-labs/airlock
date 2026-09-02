@@ -32,12 +32,18 @@ server {
     # per-location `if` + `try_files`, which do not gate reliably together.
     # owner + collaborators pass ($hub_ok); everyone else gets the wrong-owner page.
     if ($hub_ok = 0) { return 403; }
-    # No `=`: keep the honest 403 status AND serve the wrong-owner page body
-    # (browsers render an error_page body regardless of status). This matches the
-    # separate-port gates, which also 403 a denied identity.
+    # No `=`: keep the honest 403 status. The server-rewrite gate runs before a
+    # location is chosen, so a request with hub_ok=0 cannot reach any other 403
+    # source. That makes hub_ok an exact selector here: denied identities keep the
+    # wrong-owner page, while a location/filesystem 403 reached by an allowed
+    # identity gets an honest resource-error explanation instead.
     error_page 403 @denied;
     location @denied {
         root TMP/web;
+        default_type text/html;
+        if ($hub_ok = 1) {
+            return 403 '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Resource forbidden</title></head><body><main><h1>Airlock cannot serve this resource</h1><p>Your access to this Airlock was verified, but the requested resource is forbidden.</p><p>This is not an Airlock ownership error. Check the resource access rules and every file and directory in its path.</p></main></body></html>';
+        }
         rewrite ^ /wrong-owner.html break;
     }
 

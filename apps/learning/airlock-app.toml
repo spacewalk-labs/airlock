@@ -21,6 +21,13 @@ listing_provider = "auto"
 # prefer one with a credential file; claude/codex pin it. The model is never part of
 # this — owner decision 5: the app detects a logged-in CLI and the CLI picks.
 provider = "auto"
+# off  = never touch git (default). auto = when the library IS a git repository
+#        root, commit the documents this app wrote and push them if the branch
+#        has an upstream. A library that happens to sit in a repository is not
+#        consent to write to somebody's remote, which is why the default is off
+#        and not auto. Failures are warnings, never a failed ingest — the
+#        coupling between the success verdict and git is what this app removed.
+git_sync = "off"
 
 # Env vars this installer WRITES onto the units and the backend reads at runtime.
 # Knobs live in [config] above — the same split publish documents. A name is one
@@ -49,6 +56,11 @@ runtime_env = [
   "AIRLOCK_LEARNING_LIBRARY",
   "AIRLOCK_LEARNING_LISTING",
   "AIRLOCK_LEARNING_PORT",
+  # The resolved value of the `git_sync` knob, under a distinct runtime name for
+  # the same reason `listing_provider` becomes AIRLOCK_LEARNING_LISTING: a name
+  # is a config key or a runtime var, never both. Only the ingest worker unit
+  # carries it — the server never writes to the library.
+  "AIRLOCK_LEARNING_REPO_SYNC",
   # The two the ingest worker writes onto the agent CLI it spawns, so the skill
   # does not have to guess where the app was installed: RECEIPT is where the save
   # helper records what it wrote for this attempt, SAVE is the helper itself.

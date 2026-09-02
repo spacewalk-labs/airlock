@@ -119,54 +119,86 @@ if ! systemctl --user show-environment >/dev/null 2>&1 || ! command -v systemd-r
 else
   UNIT=airlock-selfkill-escape-test
   probe="$TMP/probe.sh"
+  # KILL says which coupling to sever after the guard has moved (or not moved) the
+  # run. The first version of this guard only survived "cgroup"; "pgroup" and "pipe"
+  # killed it in the field, so all three are driven here.
+  #
+  # pgroup kills the group the run STARTED in, recorded by the launcher below. Killing
+  # "-$$" instead only lands when the probe happens to lead its own group, which is
+  # true exactly when the guard already moved it — that scores the axis backwards,
+  # passing the control and failing the guard.
   cat > "$probe" <<EOF
 #!/usr/bin/env bash
 set -uo pipefail
-OUT="\$1"; MODE="\$2"
+OUT="\$1"; MODE="\$2"; KILL="\$3"
 export AIRLOCK_ROOT="$ROOT"
 if [ "\$MODE" = on ]; then
   . "$ROOT/install/lib.sh"
-  airlock_escape_selfkill_cgroup "\$0" "\$OUT" "\$MODE" 2>/dev/null
+  airlock_escape_selfkill_cgroup "\$0" "\$OUT" "\$MODE" "\$KILL" 2>/dev/null
 fi
 echo "reached-stop" >> "\$OUT"
-systemctl --user stop ${UNIT}.service >/dev/null 2>&1 &
+case "\$KILL" in
+  cgroup) systemctl --user stop ${UNIT}.service >/dev/null 2>&1 & ;;
+  pgroup) ( sleep 1; kill -9 -"\$(cat "\$OUT.pgid")" >/dev/null 2>&1 ) & ;;
+  pipe)   ( sleep 1; systemctl --user stop ${UNIT}.service >/dev/null 2>&1 ) & ;;
+esac
 sleep 6
 echo "reached-restart" >> "\$OUT"
 EOF
   chmod +x "$probe"
 
-  live_case() {  # live_case <on|off> -> prints the probe's trace
-    local mode="$1" out="$TMP/live-$1.out"
+  live_case() {  # live_case <on|off> <cgroup|pgroup|pipe> -> prints the probe's trace
+    local mode="$1" kill="$2" out="$TMP/live-$1-$2.out"
     rm -f "$out"
     # The run is a CHILD of the unit's main process, matching an installer started
     # from an agent session: exec'ing it as MainPID would let systemd kill it by PID
     # regardless of cgroup, and the test would pass for the wrong reason.
-    systemd-run --user --unit="$UNIT" --service-type=simple --quiet --collect \
-      bash -c "'$probe' '$out' '$mode' & wait" >/dev/null 2>&1
+    #
+    # For the pipe case the probe's stdout is a pipe whose reader goes away with the
+    # unit — the shape that produced rc=141 in the field.
+    if [ "$kill" = pipe ]; then
+      systemd-run --user --unit="$UNIT" --service-type=simple --quiet --collect \
+        bash -c "awk '{print \$5}' /proc/self/stat > '$out.pgid'; '$probe' '$out' '$mode' '$kill' | cat & wait" >/dev/null 2>&1
+    else
+      systemd-run --user --unit="$UNIT" --service-type=simple --quiet --collect \
+        bash -c "awk '{print \$5}' /proc/self/stat > '$out.pgid'; '$probe' '$out' '$mode' '$kill' & wait" >/dev/null 2>&1
+    fi
     # Poll for the outcome on a clock, not on the unit's state: the guarded run
-    # stops that unit almost immediately and then keeps working for several more
+    # severs the coupling almost immediately and then keeps working for several more
     # seconds, so "unit is gone" is not "the run is done" — reading the trace there
     # scores the guarded case as dead and the test passes for the wrong reason.
     local i=0
-    while [ $i -lt 20 ]; do
+    while [ $i -lt 25 ]; do
       grep -q reached-restart "$out" 2>/dev/null && break
       sleep 1; i=$((i+1))
     done
+    systemctl --user stop "${UNIT}.service" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
     cat "$out" 2>/dev/null
   }
 
-  neg="$(live_case off)"
-  case "$neg" in
-    *reached-stop*reached-restart*) bad "NEGATIVE CONTROL did not die — the reproduction is not reproducing" ;;
-    *reached-stop*)                 ok  "negative control: unguarded run dies at its own stop (the real defect)" ;;
-    *)                              bad "negative control never reached the stop; got: ${neg:-<empty>}" ;;
-  esac
+  # Every axis carries its own negative control. Without one, a green "survived"
+  # proves nothing: a run that was never killed survives too.
+  for axis in cgroup pgroup pipe; do
+    case "$axis" in
+      cgroup) what="the stop of its own host unit" ;;
+      pgroup) what="its process group being killed" ;;
+      pipe)   what="its stdout pipe closing (the rc=141 shape)" ;;
+    esac
 
-  pos="$(live_case on)"
-  case "$pos" in
-    *reached-restart*) ok "guarded run survives stopping its own host unit" ;;
-    *)                 bad "guarded run died like the control; got: ${pos:-<empty>}" ;;
-  esac
+    neg="$(live_case off "$axis")"
+    case "$neg" in
+      *reached-restart*) bad "NEGATIVE CONTROL ($axis) did not die — that axis is not reproducing" ;;
+      *reached-stop*)    ok  "negative control ($axis): unguarded run dies at $what" ;;
+      *)                 bad "negative control ($axis) never reached the kill; got: ${neg:-<empty>}" ;;
+    esac
+
+    pos="$(live_case on "$axis")"
+    case "$pos" in
+      *reached-restart*) ok "guarded run survives $what" ;;
+      *)                 bad "guarded run died like the control ($axis); got: ${pos:-<empty>}" ;;
+    esac
+  done
 fi
 
 echo

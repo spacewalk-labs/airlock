@@ -146,6 +146,7 @@ if (!patcher.SUBAGENT_STREAM_PATCHES.some((patch) => patch.name === "project-act
 
 const expected = new Set([
   "depth4-search",
+  "claude-model-fable51",
   "claude-model-prune",
   "provider-subagent-stream-filter",
   "image-attachments-persist",
@@ -165,7 +166,7 @@ for (const patch of manifest.patches) {
   }
 }
 if (seen.size !== expected.size || [...expected].some((id) => !seen.has(id))) {
-  throw new Error("anchor manifest does not cover exactly the eight paseo patchers");
+  throw new Error("anchor manifest does not cover exactly the nine paseo patchers");
 }
 const group = manifest.patches.find((patch) => patch.id === "orphan-process-group");
 if (!group.requires || !group.requires.includes("orphan-process-guard")) {
@@ -178,7 +179,7 @@ if (subagent.paired_with !== "patch-web-ui:subagent-stream") {
 console.log("manifest agrees with the pinned version, SHA, anchors, and ordering");
 NODE
 if [ "$manifest_rc" -eq 0 ]; then
-  ok "anchor manifest: version, shape table, eight patchers, and pair/order contracts"
+  ok "anchor manifest: version, shape table, nine patchers, and pair/order contracts"
 else
   bad "anchor manifest: version/SHA/coverage/order contract"
   sed 's/^/    /' "$manifest_out"
@@ -265,6 +266,68 @@ if grep -qF 'node "$WEBUI_PATCHER" --subagent-stream "$WEBUI_DIR"' "$ROOT/apps/p
   ok "provider-subagent install wiring: always-on pair is fail-hard and optional browse is explicit"
 else
   bad "provider-subagent install wiring: server/UI pair or explicit browse mode is missing"
+fi
+
+# ------------------------------------------------------------------ model fable 5.1
+# The pin (paseo 0.2.5) predates Fable 5.1, so the picker cannot offer a model the
+# installed CLI already runs. Additive sibling of the prune patch; it must retire
+# itself (rc 20) the moment upstream ships the rows.
+FB51="$TMP/model-manifest-fable51.js"
+# The prune preimage carries no Fable rows, so this fixture is built here: the
+# minimum shape the patcher anchors on (array head, the Fable 5 sibling it inserts
+# above, and the CLAUDE_EFFORT_LEVELS symbol the new entries reference).
+cat > "$FB51" <<'FB51EOF'
+export const CLAUDE_EFFORT_LEVELS = { xhigh: ["low", "medium", "high", "xhigh", "max"] };
+export const CLAUDE_MODEL_MANIFEST = [
+    {
+        id: "claude-opus-5",
+        label: "Opus 5",
+        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
+    },
+    {
+        id: "claude-fable-5[1m]",
+        label: "Fable 5 1M",
+        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
+    },
+    {
+        id: "claude-fable-5",
+        label: "Fable 5",
+        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
+    },
+];
+FB51EOF
+if [ "${PASEO_PATCH_DRIFT_BREAK:-}" = "model-fable51" ]; then
+  sed -i '/id: "claude-fable-5\[1m\]"/d' "$FB51"
+fi
+if positive_js "$PATCH_DIR/claude-model-fable51.mjs" "$FB51"; then
+  if grep -qF '[airlock-model-fable51]' "$FB51.paseo-new.mjs" \
+    && grep -qF 'id: "claude-fable-5-1",' "$FB51.paseo-new.mjs" \
+    && grep -qF 'id: "claude-fable-5-1[1m]",' "$FB51.paseo-new.mjs" \
+    && grep -qF 'id: "claude-fable-5",' "$FB51.paseo-new.mjs"; then
+    ok "model fable51: adds both 5.1 rows and keeps the Fable 5 family"
+  else
+    bad "model fable51: patched result did not match the intended manifest"
+  fi
+else
+  bad "model fable51: representative fixture was not patched"
+fi
+FB51_DONE="$TMP/model-manifest-fable51-done.js"
+cp "$FB51.paseo-new.mjs" "$FB51_DONE" 2>/dev/null || cp "$FB51" "$FB51_DONE"
+sed -i 's/\[airlock-model-fable51\]/[gone]/' "$FB51_DONE"
+cp "$FB51_DONE" "$TMP/model-manifest-fable51-done.before"
+if negative_js "$PATCH_DIR/claude-model-fable51.mjs" "$FB51_DONE" 20 "$TMP/model-manifest-fable51-done.before"; then
+  ok "model fable51 negative control: upstream already shipping 5.1 is an untouched rc 20 skip"
+else
+  bad "model fable51 negative control: patch ran on a manifest that already lists 5.1"
+fi
+FB51_BAD="$TMP/model-manifest-fable51-bad.js"
+cp "$FB51" "$FB51_BAD"
+sed -i '/id: "claude-fable-5\[1m\]"/d' "$FB51_BAD"
+cp "$FB51_BAD" "$TMP/model-manifest-fable51-bad.before"
+if negative_js "$PATCH_DIR/claude-model-fable51.mjs" "$FB51_BAD" 20 "$TMP/model-manifest-fable51-bad.before"; then
+  ok "model fable51 negative control: missing Fable anchor is an untouched rc 20 skip"
+else
+  bad "model fable51 negative control: skipped patch did not fail the positive assertion"
 fi
 
 # ---------------------------------------------------------------------- model prune

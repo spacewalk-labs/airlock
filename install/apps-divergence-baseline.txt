@@ -51,6 +51,7 @@ only-work	apps/dev-monitor/backend/devmon_roster.py
 #    uses for codex-strip-ambient-openai-key below, only on the other side: a patch that
 #    exists on one repo and lands on the other at the next publish sync. It is only-work
 #    today because that sync has not run, not because it is work-only by design.
+only-work	apps/paseo/patches/claude-model-fable51.mjs
 only-work	apps/paseo/patches/provider-subagent-stream-filter.mjs
 only-work	apps/paseo/patches/provider-subagent-stream-filter.patch
 only-work	apps/paseo/patches/provider-subagent-stream-filter.test.mjs
@@ -327,3 +328,13 @@ content	apps/learning/frontend/learning.html
 #    The rest of the change edits paths already tracked above (airlock-dev-monitor.py,
 #    devmon_updates.py, devmon_update_exec.py, install.sh, test-backend.py).
 only-work	apps/dev-monitor/backend/devmon_harness.py
+# 17) 2026-09-02 learning library git sync (#316): the app now commits and pushes the
+#    documents it wrote, when the library IS a git repository root and the operator
+#    turned it on (`git_sync = "auto"`, default off). The helper is a new package
+#    backend file and the ingest worker calls it on its own beat, so this is the same
+#    shape as batches 13, 14 and 16 above — an app-side addition that belongs in the
+#    next public app mirror, with this work tree as the live consumer until that sync.
+#    The rest of the change edits paths already tracked above (airlock-app.toml,
+#    airlock-learning.py, install.sh, render.sh).
+only-work	apps/learning/backend/git_sync.py
+content	apps/learning/backend/ingest_runner.py

@@ -36,11 +36,14 @@ WantedBy=default.target
 UNIT
 }
 
-# render_learning_unit_ingest LIBRARY STATE_DIR PROVIDER UNIT_PATH BACKEND_DIR UNSAFE_ENV ACCOUNTS_STATUS_BIN
+# render_learning_unit_ingest LIBRARY STATE_DIR PROVIDER UNIT_PATH BACKEND_DIR UNSAFE_ENV ACCOUNTS_STATUS_BIN GIT_SYNC
 render_learning_unit_ingest() {
   local LIBRARY="$1" STATE_DIR="$2" PROVIDER="$3" UNIT_PATH="$4" BACKEND_DIR="$5"
   local UNSAFE_ENV="$6"
   local ACCOUNTS_STATUS_BIN="$7"
+  # Only this unit gets it. The server never writes to the library, so handing
+  # it a git knob would say it might.
+  local GIT_SYNC="${8:-off}"
   cat <<UNIT
 [Unit]
 Description=airlock learning ingest worker — one link at a time
@@ -62,6 +65,7 @@ Environment=PATH=${UNIT_PATH}
 Environment="AIRLOCK_LEARNING_LIBRARY=${LIBRARY}"
 Environment="AIRLOCK_LEARNING_STATE_DIR=${STATE_DIR}"
 Environment="AIRLOCK_LEARNING_AGENT=${PROVIDER}"
+Environment="AIRLOCK_LEARNING_REPO_SYNC=${GIT_SYNC}"
 Environment="AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN=${ACCOUNTS_STATUS_BIN}"
 ExecStart=/usr/bin/python3 ${BACKEND_DIR}/ingest_runner.py
 Restart=on-failure
