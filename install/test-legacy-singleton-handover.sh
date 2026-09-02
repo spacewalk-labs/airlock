@@ -185,7 +185,7 @@ run_fileview_case() {
 name = "LegacySingletonTest"
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 [apps.fileview]
 EOF
 

@@ -69,7 +69,7 @@ export PYTHONPATH="$TMP${PYTHONPATH:+:$PYTHONPATH}"
 cat >"$TMP/active.toml" <<EOF
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 [apps.$WITNESS_ID]
 public_port = 45678
@@ -79,7 +79,7 @@ EOF
 cat >"$TMP/removed.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 TOML
 

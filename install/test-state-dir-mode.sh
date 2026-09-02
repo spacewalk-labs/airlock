@@ -40,7 +40,7 @@ config_version = 2
 name = "Mode Test"
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [paths]
 [apps.hub]
 TOML

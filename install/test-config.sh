@@ -20,7 +20,7 @@ cat >"$TMP/good.toml" <<'TOML'
 name = "My Dev Hub"
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 collaborators = ["a@example.com", "b@example.com"]
 [paths]
 wiki = "~/wiki"
@@ -36,7 +36,7 @@ TOML
 cat >"$TMP/badprovider.toml" <<'TOML'
 [auth]
 provider = "basic"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 TOML
 
@@ -64,7 +64,7 @@ if run "$TMP/noowner.toml" validate >/dev/null 2>&1; then bad "validate: rejects
 cat >"$TMP/portclash.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 [apps.devterm]
 backend_port = 19911
@@ -111,7 +111,7 @@ apps="$(run "$TMP/good.toml" apps 2>/dev/null | sort | tr '\n' ',')"
 cat >"$TMP/bad-app-name.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 [apps."paseo\nlocal"]
 TOML
@@ -133,7 +133,7 @@ fi
 cat >"$TMP/trailing-newline-app-name.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 [apps."paseo\n"]
 TOML
@@ -167,7 +167,7 @@ fi
 # 5. env exposes identity header (fixed) + common + app-specific override + default
 env="$(run "$TMP/good.toml" env devterm 2>/dev/null)"
 echo "$env" | grep -q "AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login" && ok "env: identity header fixed" || bad "env: identity header"
-echo "$env" | grep -q "AIRLOCK_OWNER=me@example.com" && ok "env: owner" || bad "env: owner"
+echo "$env" | grep -q "AIRLOCK_OWNER=owner@fixture.dev" && ok "env: owner" || bad "env: owner"
 echo "$env" | grep -q "AIRLOCK_COLLABORATORS=a@example.com,b@example.com" && ok "env: collaborators joined" || bad "env: collaborators"
 echo "$env" | grep -q "AIRLOCK_DEVTERM_FONT_SIZE=16" && ok "env: app override" || bad "env: app override"
 echo "$env" | grep -q "AIRLOCK_DEVTERM_TTYD_PORT=19912" && ok "env: app default merged" || bad "env: app default"
@@ -179,7 +179,7 @@ echo "$env" | grep -q "AIRLOCK_DEVTERM_XAI=true" && ok "env: xAI app override" |
 if run "$TMP/good.toml" env orca >/dev/null 2>&1; then bad "env: rejects disabled app"; else ok "env: rejects disabled app"; fi
 
 # 7. get with default fallback + dotted key
-[ "$(run "$TMP/good.toml" get auth.owner 2>/dev/null)" = "me@example.com" ] && ok "get: dotted" || bad "get: dotted"
+[ "$(run "$TMP/good.toml" get auth.owner 2>/dev/null)" = "owner@fixture.dev" ] && ok "get: dotted" || bad "get: dotted"
 [ "$(run "$TMP/good.toml" get apps.devterm.ttyd_port 2>/dev/null)" = "19912" ] && ok "get: default merged" || bad "get: default merged"
 
 # 8. a [paths] value expands ~ — to the real home, not merely to something without a '~'
@@ -190,7 +190,7 @@ if run "$TMP/good.toml" env orca >/dev/null 2>&1; then bad "env: rejects disable
 # fileview's filebrowser runs with `--root /`, so there is nothing to configure.
 # A leftover key must NOT fail the box (every config written before this release
 # carries one) — it gets the targeted retired-key message instead.
-mk() { printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n[apps.hub]\n%s\n' "$1" >"$TMP/t.toml"; }
+mk() { printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n%s\n' "$1" >"$TMP/t.toml"; }
 
 mk '[paths]
 code_root = "~/code"
@@ -283,7 +283,7 @@ mk '[apps.dev-monitor]
 smtp_host = "relay.example.com"
 smtp_port = 587
 smtp_from = "dev-monitor@example.com"
-smtp_to = "owner@example.com"
+smtp_to = "owner@fixture.dev"
 smtp_user = "devmon"
 smtp_password_env = "DEVMON_SMTP_PASSWORD"'
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then
@@ -295,7 +295,7 @@ dm_smtp="$(run "$TMP/t.toml" env dev-monitor 2>/dev/null)"
 if printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_HOST=relay.example.com$' \
     && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_PORT=587$' \
     && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_FROM=dev-monitor@example.com$' \
-    && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_TO=owner@example.com$' \
+    && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_TO=owner@fixture.dev$' \
     && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_USER=devmon$' \
     && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_PASSWORD_ENV=DEVMON_SMTP_PASSWORD$'; then
   ok "dev-monitor: smtp config keys export the names install.sh reads"
@@ -394,7 +394,7 @@ if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "keys: common 'external' 
 cat >"$TMP/t.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 colaborators = ["c@example.com"]
 [apps.hub]
 TOML
@@ -405,14 +405,14 @@ if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects [branding
 
 # An unknown SECTION is a typo too: [brandng] would leave the product name at its
 # default while the config reads as if it had been set.
-printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n[apps.hub]\n[brandng]\nproduct = "Acme"\n' >"$TMP/t.toml"
+printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n[brandng]\nproduct = "Acme"\n' >"$TMP/t.toml"
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects unknown section"; else ok "keys: rejects unknown section"; fi
 
 # A malformed section must produce an actionable error — not a traceback, and not
 # a pass. Both halves are asserted: absence of a traceback alone would also hold
 # if the validator wrongly succeeded.
 for bad_shape in 'auth = 1' 'apps = 1' 'site = 1' 'branding = false'; do
-  printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n[apps.hub]\n' >"$TMP/t.toml"
+  printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n' >"$TMP/t.toml"
   printf '%s\n' "$bad_shape" | cat - "$TMP/t.toml" >"$TMP/t2.toml"; mv "$TMP/t2.toml" "$TMP/t.toml"
   msg="$(run "$TMP/t.toml" validate 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ] && ! grep -q 'Traceback' <<<"$msg"; then
@@ -476,7 +476,7 @@ grep -qi 'never implemented' <<<"$msg" && ok "retired: says it never worked" || 
 cat >"$TMP/t.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 read_open = true
 [apps.hub]
 TOML
@@ -490,7 +490,7 @@ grep -q 'read_open' <<<"$msg" && ok "retired: warns on auth.read_open" || bad "r
 cat >"$TMP/t.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [paths]
 code_root = "/srv/code"
 [apps.hub]
@@ -505,7 +505,7 @@ grep -q 'prompt' <<<"$msg" && ok "retired: says the list was bypassable" || bad 
 cat >"$TMP/t.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [paths]
 code_root = "/srv/code"
 [apps.hub]
@@ -520,20 +520,28 @@ if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "retired: a typo beside 
 # the warning has no input to look at. What replaced it is a plain statement in
 # SECURITY.md — the scope is the unix account, always. Assert the key's absence
 # does not resurrect a gate: a collaborators box validates with no [paths] at all.
-printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\ncollaborators = ["c@example.com"]\n[apps.hub]\n[apps.fileview]\n' >"$TMP/t.toml"
+printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\ncollaborators = ["c@example.com"]\n[apps.hub]\n[apps.fileview]\n' >"$TMP/t.toml"
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "scope: fileview + collaborators validates with no paths key"; else bad "scope: fileview + collaborators validates with no paths key"; fi
 
-# --- 13. airlock.toml.example must validate --------------------------------
-# The tool points operators straight at this file — find_config() dies with
-# "copy airlock.toml.example and fill it in", and the unknown-key error says
-# "see airlock.toml.example". If it does not validate, the very first command a
-# new operator runs fails. It drifted exactly that way: D-DEVTERM-9900 retired
-# devterm's public_port/redirect_port from the manifest and the example kept
-# documenting both, so the shipped example died on its own validator.
-if run "$HERE/../airlock.toml.example" validate >/dev/null 2>&1; then
-  ok "example: airlock.toml.example validates"
+# --- 13. airlock.toml.example is a copy-and-fill template ------------------
+# README instructs an operator to fill in owner before preflight. Keep the
+# template structurally valid (D-DEVTERM-9900 once left retired keys here), but
+# ensure an unedited copy never looks ready for installation.
+example="$HERE/../airlock.toml.example"
+sed 's/owner    = "me@example.com"/owner    = "owner@fixture.dev"/' "$example" >"$TMP/example-valid.toml"
+if run "$TMP/example-valid.toml" validate >/dev/null 2>&1; then
+  ok "example: filled owner validates"
 else
-  bad "example: airlock.toml.example validates — $(run "$HERE/../airlock.toml.example" validate 2>&1 | head -1)"
+  bad "example: filled owner validates — $(run "$TMP/example-valid.toml" validate 2>&1 | head -1)"
+fi
+
+example_msg="$(run "$example" validate 2>&1)"
+example_rc=$?
+if [ "$example_rc" -ne 0 ] \
+    && grep -Fq "documentation placeholder ('me@example.com')" <<<"$example_msg"; then
+  ok "example: unedited owner is refused"
+else
+  bad "example: unedited owner is refused — $example_msg"
 fi
 
 # --- 14. [shortcuts.<id>] ---------------------------------------------------
@@ -543,7 +551,7 @@ fi
 # (https, a real glyph, a heading the launcher can draw) are exactly the fields
 # a silent regression would take away.
 sc() {   # a good config plus the shortcut body passed in
-  printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n[paths]\ncode_root = "~/code"\n[apps.hub]\n[apps.fileview]\n%s\n' "$1" >"$TMP/sc.toml"
+  printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[paths]\ncode_root = "~/code"\n[apps.hub]\n[apps.fileview]\n%s\n' "$1" >"$TMP/sc.toml"
 }
 SC_OK='[shortcuts.team-chat]
 label = "Team Chat"

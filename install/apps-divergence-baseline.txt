@@ -131,6 +131,13 @@ content	apps/devterm/smoke.sh
 content	apps/devterm/test-accounts.py
 content	apps/devterm/web/app.js
 content	apps/devterm/web/index.html
+#    2026-09-01: popup.css joins its own siblings above. It was the last devterm web
+#    asset still byte-identical to the published copy, so a work-side fix (the panel
+#    flavour never reset .tab-pop's 66vh cap, which hid the login button inside the
+#    return widget's modal) is what split it. Same batch (1) work-ahead drift as
+#    web/app.js and web/secretdrop.js beside it, healed the same way: the mirror
+#    catches up on the next publish, not by copying the fix backwards.
+content	apps/devterm/web/popup.css
 content	apps/feedback/backend/airlock-feedback.py
 content	apps/notepad/airlock-app.toml
 content	apps/notepad/deactivate.sh

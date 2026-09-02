@@ -427,6 +427,105 @@ airlock_panel_url() {
   printf 'https://%s:%s/' "$fqdn" "$port"
 }
 
+# airlock_escape_selfkill_cgroup SCRIPT [ARGS...] — survive stopping our own host.
+#
+# An install stops and restarts the app units it manages. When the run was started
+# from INSIDE one of those units — an agent session hosted by airlock-paseo.service
+# is the everyday case, but a shell opened through devterm, code-server or orca is
+# the same shape — stopping that unit kills the whole cgroup, and the installer is
+# in it. The run dies at the "stop" step and never reaches the "start again" step,
+# so the box is left with units stopped, disabled, and unit files reclaimed. That
+# happened three times on one box on 2026-09-01 (21:41, 22:01, 23:04); each time
+# the journal named the caller: "Reloading requested from client PID N ('systemctl')
+# (unit airlock-paseo.service)".
+#
+# This does NOT refuse the run. Restarting its own host is a legitimate thing for an
+# agent to ask for, and refusing would block it. Instead the run is moved out of the
+# doomed cgroup into its own transient scope (measured: a --user --scope started
+# inside a service lands in app.slice/run-uN.scope, a sibling of that service), so
+# the very same command now survives the restart it asked for and completes.
+#
+# Always says what it measured and what it did — the condition only reproduces
+# inside such a session, so the cgroup path it read is the evidence for the next
+# person. If it cannot escape, it warns and continues rather than blocking.
+airlock_escape_selfkill_cgroup() {
+  # A dry run stops nothing, so there is nothing to survive.
+  [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && return 0
+  # Re-exec exactly once. Without this a scope that still matched would loop.
+  [ -n "${AIRLOCK_SELFKILL_ESCAPED:-}" ] && return 0
+  # Test seam only (install/test-selfkill-escape.sh): where the cgroup is read
+  # from. Production never sets it, so the guard always measures this process.
+  local cgroup_file="${AIRLOCK_SELFKILL_CGROUP_FILE:-/proc/self/cgroup}"
+  [ -r "$cgroup_file" ] || return 0
+
+  local cgroup path unit
+  cgroup="$(cat "$cgroup_file" 2>/dev/null || true)"
+  # cgroup v2 writes one "0::<path>" line; take that and read the LEAF, which is
+  # the unit actually containing this process.
+  path="$(printf '%s\n' "$cgroup" | sed -n 's|^0::||p' | head -n1)"
+  [ -n "$path" ] || return 0
+  unit="${path##*/}"
+
+  # Two conditions, both required, and both learned the hard way:
+  #
+  #  - a --user unit. This installer stops `systemctl --user` units, so a system
+  #    unit is not the unit it is about to stop.
+  #  - the LEAF is exactly an airlock-*.service, not merely a path containing that
+  #    text. A substring match reported a CI runner's own system unit,
+  #    actions.runner.<org>-<repo>.<runner>.service, as the host unit and
+  #    moved every install in CI into a scope it could not create.
+  case "$path" in */user@*.service/*) ;; *) return 0 ;; esac
+  case "$unit" in airlock-*.service) ;; *) return 0 ;; esac
+
+  log "this run is inside ${unit} — the same unit the install stops and restarts"
+  log "  measured cgroup: ${cgroup}"
+  log "  stopping ${unit} from in here would kill this run mid-install (units left"
+  log "  stopped and reclaimed, never restarted), so moving out to its own scope"
+
+  # Test seam only: which binary performs the move. Production leaves it unset.
+  local runner="${AIRLOCK_SELFKILL_SYSTEMD_RUN:-systemd-run}"
+  if ! command -v "$runner" >/dev/null 2>&1; then
+    log "WARNING: ${runner} not found — continuing INSIDE ${unit}. If the install"
+    log "  stops that unit this run dies mid-way. Re-run detached instead:"
+    log "    systemd-run --user --scope --collect bash $*"
+    return 0
+  fi
+  # Ask the user manager BEFORE trying to move. Without this, a box with no user
+  # bus (a CI container is the everyday case) gets "Failed to connect to bus" from
+  # the move, and the run cannot tell "the escaped install ran and failed" from
+  # "nothing was ever launched" — it aborted a healthy install on the second.
+  # No manager also means no unit here can be stopped the way this guard fears.
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    log "  no systemd --user manager reachable — nothing here stops that unit,"
+    log "  so continuing in place"
+    return 0
+  fi
+
+  # --scope forks the command from this process, so the environment (every
+  # AIRLOCK_* value the caller set) carries over; only the cgroup changes.
+  #
+  # Run it as a CHILD rather than exec'ing: a failed exec would take this shell
+  # down with it, which is the one outcome this guard must never produce. As a
+  # child, the escaped run owns the work — if the stop later kills this parent,
+  # the child in the sibling scope carries on and finishes the install.
+  log "  moving to: ${runner} --user --scope --collect -- bash $*"
+  if "$runner" --user --scope --collect --quiet \
+       --setenv=AIRLOCK_SELFKILL_ESCAPED=1 \
+       -- bash "$@"; then
+    exit 0
+  fi
+  local rc=$?
+  # Past the manager probe above, a failure here is the escaped install's own exit
+  # status, so it is reported as the run's result. 126/127 stay carved out: those
+  # mean the command never started, which is this guard's problem, not the install's.
+  if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
+    log "WARNING: could not move out of ${unit} (${runner} rc=${rc}) — continuing in"
+    log "  place. If this run dies at a 'Stopping ${unit}' line, that is why."
+    return 0
+  fi
+  exit "$rc"
+}
+
 # ts_fqdn — this box's tailnet FQDN (no trailing dot), measured live.
 ts_fqdn() {
   require_cmd tailscale python3

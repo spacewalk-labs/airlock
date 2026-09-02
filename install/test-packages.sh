@@ -113,7 +113,7 @@ run() { AIRLOCK_CONFIG="$1" python3 "$CFG" "${@:2}"; }
 # mkcfg <path> <extra-toml...>
 mkcfg() {
   local path="$1"; shift
-  { printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n[apps.hub]\n'
+  { printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n'
     printf '%s\n' "$@"; } >"$path"
 }
 

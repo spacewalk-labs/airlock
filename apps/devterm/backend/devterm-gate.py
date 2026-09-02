@@ -1645,6 +1645,13 @@ async def _acct_list_with_usage():
         pass
     store = await asyncio.get_running_loop().run_in_executor(None, _fetch_fleet_store)
     now = time.time()
+    # "nothing here yet" and "nothing will ever be here" are different operator states,
+    # and only one of them resolves by waiting. With no store configured this gate has no
+    # source for any account but the active one, so reporting the transient (which the UI
+    # words as "Collecting") promises a collector that does not exist — measured on this
+    # box as seven rows that had been "collecting" indefinitely, with a healthy collector
+    # running beside an unset fleet_store. Say which state it is; the UI words each.
+    no_source = not (FLEET_STORE or FLEET_STORE_URL)
     for a in data.get("accounts", []):
         ent = _claude_store_entry(store, a.get("email"), a.get("kind"))
         a["kind"] = _claude_kind(a.get("kind"))
@@ -1654,7 +1661,7 @@ async def _acct_list_with_usage():
                                age=int(now - (ent.get("observedAt") or now)),
                                observedAt=ent.get("observedAt"))
         else:
-            a["usage"] = {"err": "no data"}
+            a["usage"] = {"err": "no store" if no_source else "no data"}
         # Which boxes hold this account (identity only, never a secret). Two boxes on
         # one account burn the 5h window twice as fast, so it is worth seeing before a
         # swap. Empty unless a shared store is configured.
@@ -1711,6 +1718,13 @@ async def _live_usage_cached():
         return payload
     generation = _acct_cache_generation
     result = await _probe_json(["--usage", "live"])
+    # Same reading /acct-usage-now already persists, taken on a cadence a human does not
+    # have to trigger: the widget polls /acct-alert, so an account in actual use keeps a
+    # fresh stored value and still reads "(last value)" tomorrow instead of falling back
+    # to "no data". Filed under the probe's OWN identity, so a reading that raced a swap
+    # lands on the account it actually describes. Display memory only — /acct-alert
+    # deliberately grades from the unmerged list, so this cannot feed its own verdict.
+    _claude_usage_state_save(result)
     usage = {}
     if isinstance(result, dict):
         u = result.get("usage")

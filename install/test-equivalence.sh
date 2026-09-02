@@ -68,7 +68,7 @@ name = "Equivalence"
 
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 
 [paths]
 

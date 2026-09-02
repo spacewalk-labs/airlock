@@ -33,7 +33,7 @@ mkdir -p "$HOME" "$AIRLOCK_STATE_DIR"
 cat >"$TMP/airlock.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [paths]
 [apps.hub]
 [apps.devterm]
@@ -83,7 +83,7 @@ case " ${AIRLOCK_SMOKE_FIXTURE_DENY_PORTS:-} " in
 esac
 case "$headers" in
   *nobody@example.com*) status=403 ;;
-  *"${AIRLOCK_IDENTITY_HEADER:-X-Webauth-User}: ${AIRLOCK_OWNER:-me@example.com}"*) status=200 ;;
+  *"${AIRLOCK_IDENTITY_HEADER:-X-Webauth-User}: ${AIRLOCK_OWNER:-owner@fixture.dev}"*) status=200 ;;
 esac
 if [ "${AIRLOCK_SMOKE_FIXTURE_APP:-}" = dev-monitor ]; then
   case "$path" in

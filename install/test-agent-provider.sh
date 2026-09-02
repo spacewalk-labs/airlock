@@ -66,7 +66,7 @@ config_version = 2
 name = "T"
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]'
 
 mk plain.toml "$base"

@@ -2,9 +2,24 @@
 # Shared prerequisite checker. Source this file; do not source app installers.
 
 AIRLOCK_PREREQUISITES="$AIRLOCK_ROOT/install/prerequisites.tsv"
+# System daemons (nginx, nft) live in the sbin directories, which are absent
+# from an unprivileged PATH in some sessions. Assigned unconditionally, like
+# AIRLOCK_PREREQUISITES above, so an ambient value cannot redirect daemon
+# discovery in production; the suite overrides it in-process after sourcing.
+AIRLOCK_PREFLIGHT_SBIN_DIRS="/usr/local/sbin /usr/sbin /sbin"
 
 airlock_preflight_find() {
-  command -v "$1" 2>/dev/null
+  local hit d
+  hit="$(command -v "$1" 2>/dev/null)" && { printf '%s\n' "$hit"; return 0; }
+  # System daemons (nginx, nft) live in the sbin directories, which are not on
+  # an unprivileged PATH in every session. Without this fallback, preflight
+  # reports an installed-and-running nginx as "missing" and the installer
+  # refuses to run -- the failure looks like a missing package, so the operator
+  # is told to apt-get install something that is already there.
+  for d in $AIRLOCK_PREFLIGHT_SBIN_DIRS; do
+    if [ -x "$d/$1" ]; then printf '%s\n' "$d/$1"; return 0; fi
+  done
+  return 1
 }
 
 airlock_load_nvm() {

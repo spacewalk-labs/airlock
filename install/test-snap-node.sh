@@ -97,7 +97,7 @@ EOF
 run_paseo_dry() {   # run_paseo_dry <dir> <path> [VAR=VAL ...]  ; echoes output, sets RC
   local d="$1" pth="$2"; shift 2
   local cfg="$d/airlock.toml" c out
-  printf '[site]\nname = "SnapNode"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n\n[apps.paseo]\n' > "$cfg"
+  printf '[site]\nname = "SnapNode"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n\n[apps.paseo]\n' > "$cfg"
   # Shim every prerequisite command this box may lack — a dry run never executes
   # them, it only needs `command -v` to succeed at require_cmd.
   for c in systemctl tailscale ss sudo nginx python3 curl jq openssl; do

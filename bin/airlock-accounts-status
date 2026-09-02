@@ -46,10 +46,19 @@ CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 
-# Shared binary discovery lives beside this platform CLI. Keeping the runtime
-# module with its consumers makes the checkout directly executable and avoids
-# any dependency on an app artifact directory.
+# Shared runtime modules live beside this platform CLI. Keeping them with their
+# consumers makes the checkout directly executable and avoids any dependency on an app
+# artifact directory. Executing this file puts bin/ on sys.path implicitly, but the
+# offline suites load it by absolute path, which does not — so say it explicitly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bin_discovery  # noqa: E402
+# The death-verdict marker protocol is shared with airlock-accounts: this tool observes
+# the rejection, that one lists the result. One module so they cannot drift apart.
+import account_health  # noqa: E402
+
+_DEAD_REASON = account_health.DEAD_REASON
+_mark_dead = account_health.mark_dead
+_clear_dead_marker = account_health.clear_dead_marker
 
 
 def _get(url, token, timeout=8):
@@ -130,7 +139,16 @@ def _describe(path, with_usage=False, is_live=True):
             return out
         # pool slots have no other refresher, so this box is it. Without this the
         # accessToken dies after 8h and identity/usage can never be queried again.
-        if not _refresh_pool(path, creds):
+        refreshed, kind = _refresh_pool(path, creds)
+        if not refreshed:
+            if kind == "auth":
+                # The server rejected the refreshToken. This does not resolve by waiting,
+                # and the slot's own refreshTokenExpiresAt still being in the future does
+                # not make it usable — a lineage can be revoked long before that date
+                # (logged out elsewhere, rotated on another box, subscription ended).
+                out.update(state="dead", reason=_DEAD_REASON)
+                _mark_dead(path, creds)
+                return out
             out.update(state="unknown",
                        reason="accessToken expired and refresh failed — may be transient")
             return out
@@ -152,17 +170,26 @@ def _describe(path, with_usage=False, is_live=True):
 
 
 def _refresh_pool(path, creds):
-    """Revive an expired *pool* slot (True on success).
+    """Revive an expired *pool* slot. Returns (ok, kind):
+      (True, None)        refreshed and saved back
+      (False, "auth")     the server *rejected* the refreshToken (HTTP 400/401) — a
+                          verdict. Only a re-login revives this slot.
+      (False, "transient") no token, network, 5xx, 429 — retrying later works.
 
     Why only pool: refreshTokens rotate, so a lineage may have exactly one refresher.
       - live: Claude Code refreshes it. Touching it here breaks that lineage. Never.
       - pool: nobody else refreshes it, so this box is the sole refresher.
     A rotated token must be saved back immediately, or the next refresh kills the
-    lineage."""
+    lineage.
+
+    The kind is returned rather than collapsed into the bool because the caller reports
+    a state to a human. This used to `return False` for both, and the caller then said
+    "may be transient" about accounts the server had permanently rejected — asserting
+    the opposite of the evidence it was holding one frame earlier."""
     o = _oauth(creds)
     rt = o.get("refreshToken")
     if not rt:
-        return False
+        return False, "auth"        # nothing to refresh with: only a re-login helps
     body = json.dumps({"grant_type": "refresh_token", "refresh_token": rt,
                        "client_id": CLIENT_ID}).encode()
     req = urllib.request.Request(TOKEN_ENDPOINT, data=body, method="POST",
@@ -172,8 +199,11 @@ def _refresh_pool(path, creds):
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # 400 invalid_grant / 401 = rejected, a verdict. Everything else is a hiccup.
+        return False, ("auth" if e.code in (400, 401) else "transient")
     except Exception:
-        return False      # 400/401 = dead, anything else transient; _describe reports state
+        return False, "transient"
     o["accessToken"] = resp["access_token"]
     if resp.get("refresh_token"):
         o["refreshToken"] = resp["refresh_token"]
@@ -181,6 +211,9 @@ def _refresh_pool(path, creds):
         o["expiresAt"] = int((time.time() + resp["expires_in"]) * 1000)
     if resp.get("refresh_token_expires_in"):
         o["refreshTokenExpiresAt"] = int((time.time() + resp["refresh_token_expires_in"]) * 1000)
+    # The server just honoured this lineage, so any recorded verdict about it is now
+    # wrong. Clear before the write, not after, or the correction never reaches disk.
+    _clear_dead_marker(creds)
     try:
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -188,8 +221,10 @@ def _refresh_pool(path, creds):
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)     # persist the rotation — mandatory
     except OSError:
-        return False
-    return True
+        # The refresh itself worked; we just could not keep it. Transient by nature —
+        # calling this account dead over a disk error would be a lie about the server.
+        return False, "transient"
+    return True, None
 
 
 def _slot_path(slot):

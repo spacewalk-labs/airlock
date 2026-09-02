@@ -12,7 +12,7 @@ Environment=AIRLOCK_CODE_SERVER_MANAGER_HOST=127.0.0.1
 Environment=AIRLOCK_CODE_SERVER_MANAGER_PORT=19199
 Environment=AIRLOCK_CODE_SERVER_SLOTS=1
 Environment=AIRLOCK_CODE_SERVER_BACKEND_PORT=19100
-Environment=AIRLOCK_CODE_SERVER_ALLOW=owner@example.com
+Environment=AIRLOCK_CODE_SERVER_ALLOW=owner@fixture.dev
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 ExecStart=%h/.local/bin/airlock-code-server-manager

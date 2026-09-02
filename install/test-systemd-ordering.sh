@@ -249,7 +249,7 @@ ingest_unit system "airlock-orca-firewall.service" "$(render_orca_unit_firewall 
 # ---- code-server ----
 APP="$ROOT/apps/code-server"; . "$APP/render.sh"
 CS_BACKEND_PORT=19100; CS_BACKEND_BASE=$((CS_BACKEND_PORT - 1)); CS_MANAGER_PORT=19199
-CS_OWNER="owner@example.com"; CS_ID_HEADER="Tailscale-User-Login"
+CS_OWNER="owner@fixture.dev"; CS_ID_HEADER="Tailscale-User-Login"
 ingest_unit user "airlock-code-server@.service" "$(render_code_server_unit_slot "$CS_BACKEND_BASE" "1|2|3" 3)"
 ingest_unit user "airlock-code-server-manager.service" "$(render_code_server_unit_manager "$CS_MANAGER_PORT" 3 "$CS_BACKEND_PORT" "$CS_OWNER" "$CS_ID_HEADER")"
 

@@ -57,7 +57,14 @@ browser --https--> tailscale serve :https_port --(identity)--> nginx owner-gate
   the same slot. No secret value is ever returned to the browser or logged.
 - **Fleet usage store** (`fleet_store` / `fleet_store_url`): annotates the account
   popup with utilization from a shared store. No host is hardcoded; unset = no usage
-  numbers (the list still works).
+  numbers (the list still works), and the rows say `No usage source` rather than
+  pretending a collector is about to fill them.
+  The store's writer is an out-of-tree collector — this gate only reads it. If your box
+  runs one, point `fleet_store` at the file it writes; a box running `claude-fleet`
+  wants `fleet_store = "~/.claude-accounts/.fleet-usage.json"`. Leaving it unset on a
+  box that *does* have a collector is a silent misprovision that looks exactly like a
+  box that has none, which is how a box migration lost this value once: the
+  pre-Airlock gate hardcoded the path, so the config had nothing to carry across.
 - **OpenCode xAI login** (`xai = true`): shows the credential OpenCode keeps in
   `~/.local/share/opencode/auth.json`, and provides its supported SuperGrok device
   login and provider-scoped logout commands. Only credential state and access-token

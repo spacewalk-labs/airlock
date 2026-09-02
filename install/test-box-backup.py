@@ -130,7 +130,7 @@ config_version = 2
 name = "Backup Fixture"
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 https_port = 443
 [packages.notes]

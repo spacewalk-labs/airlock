@@ -138,7 +138,7 @@ write_config() {
     if [ "$abi" != legacy ]; then
       printf '[airlock]\nconfig_version = %s\n' "$abi"
     fi
-    printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n'
+    printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n'
     printf '[apps.hub]\n[apps.%s]\n[packages.%s]\npath = "%s"\n' \
       "$id" "$id" "$package"
     [ "$grant" = __absent__ ] || printf 'grant = %s\n' "$grant"
@@ -475,7 +475,7 @@ cat >"$LOCK_CASE/bundle.toml" <<'EOF'
 config_version = 2
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 [apps.dev-monitor]
 EOF
@@ -598,7 +598,7 @@ cat >"$MULTI/airlock.toml" <<EOF
 config_version = 2
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 [apps.a-fail]
 [packages.a-fail]
@@ -1249,7 +1249,7 @@ cat >"$SCOPED/airlock.toml" <<EOF
 config_version = 2
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 [apps.honesty-a]
 [packages.honesty-a]
@@ -1453,7 +1453,7 @@ EOF
 cat >"$RETIRE/airlock.toml" <<'EOF'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 
 [apps.hub]
 [apps.devterm]
@@ -1496,7 +1496,7 @@ mkdir -p "$RETIRE_LOCK/empty-apps"
 cat >"$RETIRE_LOCK/airlock.toml" <<'EOF'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 EOF
 reset_box

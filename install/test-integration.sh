@@ -23,7 +23,7 @@ bad(){ printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
 cat >"$TMP/airlock.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 collaborators = ["friend@example.com"]
 [apps.hub]
 [apps.devterm]
@@ -98,7 +98,7 @@ JSON
 cat >"$TMP/publish-remote-transition.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share-transition"
 [apps.publish.public_target]
@@ -124,7 +124,7 @@ publish_corrupt_out="$(publish_probe "$TMP/publish-remote-transition.toml" "$TMP
 cat >"$TMP/publish-local-uppercase.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share-uppercase"
 [apps.publish.public_target]
@@ -147,7 +147,7 @@ fi
 cat >"$TMP/publish-state-overlap.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share-state"
 [apps.publish.public_target]
@@ -189,7 +189,7 @@ mkdir -p "$PUBLISH_PROBE_ROOT/existing"; chmod 701 "$PUBLISH_PROBE_ROOT/existing
 cat >"$TMP/publish-umask.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share-umask"
 [apps.publish.public_target]
@@ -222,7 +222,7 @@ body=yes owner=no nobody=no
 for arg in "$@"; do
   case "$arg" in
     -o) body=no ;;
-    *"me@example.com"*) owner=yes ;;
+    *"owner@fixture.dev"*) owner=yes ;;
     *"nobody@example.com"*) nobody=yes ;;
   esac
 done
@@ -253,7 +253,7 @@ chmod 755 "$PUBLISH_PROBE_ROOT/smoke-public" "$PUBLISH_PROBE_ROOT/smoke-gated" "
 cat >"$TMP/publish-smoke-local.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 nginx_port = 18080
 [apps.publish]
@@ -280,7 +280,7 @@ esac
 cat >"$TMP/publish-overlap.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share"
 [apps.publish.public_target]
@@ -301,7 +301,7 @@ esac
 cat >"$TMP/publish-auth-overlap.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share"
 [apps.publish.public_target]
@@ -321,7 +321,7 @@ esac
 cat >"$TMP/publish-root-overlap.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share"
 [apps.publish.public_target]
@@ -341,7 +341,7 @@ esac
 cat >"$TMP/publish-missing-parent-overlap.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share"
 [apps.publish.public_target]
@@ -361,7 +361,7 @@ esac
 cat >"$TMP/publish-relative.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share"
 [apps.publish.public_target]
@@ -382,7 +382,7 @@ mkdir -p "$PUBLISH_PROBE_ROOT/private"; chmod 700 "$PUBLISH_PROBE_ROOT/private"
 cat >"$TMP/publish-traverse.toml" <<TOML
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.publish]
 share_dir = "$PUBLISH_PROBE_ROOT/share"
 [apps.publish.public_target]
@@ -414,7 +414,7 @@ CLEAN="$TMP/clean"; mkdir -p "$CLEAN"
 cat >"$CLEAN/airlock.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [paths]
 [apps.hub]
 [apps.paseo]
@@ -530,7 +530,7 @@ STUB
   cat >"$TMP/hubport.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 https_port = 8443
 TOML
@@ -561,7 +561,7 @@ TOML
   cat >"$TMP/hubonly.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 TOML
   sm_rc=0

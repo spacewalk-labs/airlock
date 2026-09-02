@@ -39,7 +39,7 @@ if [ "$ctl_rc" -eq 0 ]; then
   bad "positive control broken: validate succeeded with no config"
 elif ! printf '%s' "$ctl" | grep -q "no airlock.toml found"; then
   bad "positive control inconclusive: validate failed for another reason: $(printf '%s' "$ctl" | head -1)"
-elif (cd "$scratch" && env -u AIRLOCK_CONFIG "$CFG" init --owner me@example.com) > "$scratch/bare.toml" 2>/dev/null; then
+elif (cd "$scratch" && env -u AIRLOCK_CONFIG "$CFG" init --owner owner@fixture.dev) > "$scratch/bare.toml" 2>/dev/null; then
   ok "init succeeds where validate fails for want of a config"
 else
   bad "init failed with no config present"
@@ -49,7 +49,7 @@ fi
 #    These three values are the ones docs/tasks/active/macos-app-launcher.md cites as
 #    evidence that the 186-line example is a bluff.
 # shellcheck disable=SC2088  # literal on purpose: airlock-config expands ~ itself
-"$CFG" init --owner me@example.com --site-name Test \
+"$CFG" init --owner owner@fixture.dev --site-name Test \
        --apps devterm,fileview,paseo > "$scratch/full.toml" 2>/dev/null
 if AIRLOCK_CONFIG="$scratch/full.toml" "$CFG" validate >/dev/null 2>&1; then
   ok "a generated config passes the real validator"
@@ -110,7 +110,7 @@ fi
 #    in app_order, so a picker that passed exactly what was ticked would emit a config
 #    that fails at validate. Adding it silently would be the other failure: an app the
 #    operator never chose, appearing with no explanation.
-dep_err="$("$CFG" init --owner me@example.com --apps notepad 2>&1 >"$scratch/dep.toml")"
+dep_err="$("$CFG" init --owner owner@fixture.dev --apps notepad 2>&1 >"$scratch/dep.toml")"
 if ! AIRLOCK_CONFIG="$scratch/dep.toml" "$CFG" validate >/dev/null 2>&1; then
   bad "notepad alone produced a config that does not validate — the dependency was not closed"
 elif ! printf '%s' "$dep_err" | grep -q "added as dependencies: publish"; then
@@ -138,9 +138,9 @@ refuse() {
   fi
 }
 refuse "an owner that is not a login"        --owner notalogin --apps devterm
-refuse "an app this checkout does not ship"  --owner me@example.com --apps nosuchapp
+refuse "an app this checkout does not ship"  --owner owner@fixture.dev --apps nosuchapp
 refuse "a flag with no value"                --owner
-refuse "an unknown flag"                     --owner me@example.com --nope x
+refuse "an unknown flag"                     --owner owner@fixture.dev --nope x
 "$CFG" init >/dev/null 2>&1
 noowner_rc=$?
 if [ "$noowner_rc" -eq 2 ]; then
@@ -152,9 +152,9 @@ fi
 # 7. The output is a function of the inputs alone — same inputs, same bytes, whatever
 #    order the picker's checkboxes happened to be read in. A launcher re-runs this to add
 #    an app; an unstable generator would rewrite the operator's file every time.
-one="$("$CFG" init --owner me@example.com --apps paseo,devterm 2>/dev/null)"
-two="$("$CFG" init --owner me@example.com --apps devterm,paseo 2>/dev/null)"
-three="$("$CFG" init --owner me@example.com --apps paseo,devterm 2>/dev/null)"
+one="$("$CFG" init --owner owner@fixture.dev --apps paseo,devterm 2>/dev/null)"
+two="$("$CFG" init --owner owner@fixture.dev --apps devterm,paseo 2>/dev/null)"
+three="$("$CFG" init --owner owner@fixture.dev --apps paseo,devterm 2>/dev/null)"
 if [ "$one" = "$two" ] && [ "$one" = "$three" ]; then
   ok "output is byte-identical across repeats and input orderings"
 else
@@ -171,7 +171,7 @@ mkdir -p "$watched"
 printf 'DO NOT OVERWRITE\n' > "$watched/airlock.toml"
 find "$watched" -type f -exec sha256sum {} + | sort > "$scratch/before.sums"
 (cd "$watched" && AIRLOCK_CONFIG="$watched/airlock.toml" "$CFG" init \
-    --owner me@example.com --apps fileview) >/dev/null 2>&1
+    --owner owner@fixture.dev --apps fileview) >/dev/null 2>&1
 find "$watched" -type f -exec sha256sum {} + | sort > "$scratch/after.sums"
 if cmp -s "$scratch/before.sums" "$scratch/after.sums"; then
   ok "init creates and modifies no file, even run inside a directory holding a config"
@@ -189,7 +189,7 @@ while read -r app; do
   seen_apps=$((seen_apps+1))
   [ "$app" = orca ] && continue
   # shellcheck disable=SC2088  # literal on purpose, as above
-  "$CFG" init --owner me@example.com --apps "$app" > "$scratch/one.toml" 2>/dev/null
+  "$CFG" init --owner owner@fixture.dev --apps "$app" > "$scratch/one.toml" 2>/dev/null
   AIRLOCK_CONFIG="$scratch/one.toml" "$CFG" validate >/dev/null 2>&1 || {
     bad "selecting '$app' alone produced a config that does not validate"; every_ok=0; }
 done < <("$CFG" catalog | python3 -c 'import json,sys; [print(a["id"]) for a in json.load(sys.stdin)["apps"]]')
@@ -211,7 +211,7 @@ fi
 #     round-tripped through the real TOML parser and compared to what was passed.
 esc_ok=1
 while IFS= read -r value; do
-  "$CFG" init --owner me@example.com --site-name "$value" > "$scratch/esc.toml" 2>/dev/null
+  "$CFG" init --owner owner@fixture.dev --site-name "$value" > "$scratch/esc.toml" 2>/dev/null
   python3 - "$scratch/esc.toml" "$value" <<'PYESC' || esc_ok=0
 import sys, tomllib
 path, expected = sys.argv[1], sys.argv[2]
@@ -242,7 +242,7 @@ fi
 # 11. A value cannot escape its string and invent a table. The generator writes three
 #     operator-supplied values into TOML; if quoting were wrong, --site-name would be an
 #     arbitrary-config-injection point, and the app it silently enabled would be installed.
-"$CFG" init --owner me@example.com --site-name 'x"
+"$CFG" init --owner owner@fixture.dev --site-name 'x"
 [apps.orca]
 y = "z' > "$scratch/inj.toml" 2>/dev/null
 if python3 -c 'import sys,tomllib; d=tomllib.load(open(sys.argv[1],"rb")); sys.exit(0 if list(d["apps"])==["hub"] else 1)' "$scratch/inj.toml"; then
@@ -254,13 +254,13 @@ fi
 # 12. A list flag must accumulate. `--apps a --apps b` dropping the first silently is how
 #     a caller that builds its selection in pieces ends up with a box missing an app, with
 #     nothing anywhere saying so.
-"$CFG" init --owner me@example.com --apps devterm --apps paseo > "$scratch/acc.toml" 2>/dev/null
+"$CFG" init --owner owner@fixture.dev --apps devterm --apps paseo > "$scratch/acc.toml" 2>/dev/null
 if grep -q '^\[apps\.devterm\]' "$scratch/acc.toml" && grep -q '^\[apps\.paseo\]' "$scratch/acc.toml"; then
   ok "a repeated --apps accumulates instead of silently replacing"
 else
   bad "a repeated --apps dropped an earlier selection silently"
 fi
-"$CFG" init --owner me@example.com --apps ' devterm , paseo ' > "$scratch/ws.toml" 2>/dev/null
+"$CFG" init --owner owner@fixture.dev --apps ' devterm , paseo ' > "$scratch/ws.toml" 2>/dev/null
 if grep -q '^\[apps\.devterm\]' "$scratch/ws.toml" && grep -q '^\[apps\.paseo\]' "$scratch/ws.toml"; then
   ok "spaces around a comma-separated list are tolerated"
 else
@@ -279,7 +279,7 @@ cyc="$scratch/cyc"; fixture "$cyc" aa '"bb"'; fixture "$cyc" bb '"aa"'
 # A real timeout, because the failure mode being tested is a hang: `a -> b -> a`
 # spun the ordering loop forever, and a GUI would simply have sat there. `placed`
 # stopped an app being emitted twice, never being visited again.
-cyc_out="$(AIRLOCK_SHIPPED_APPS_ROOT="$cyc" timeout 10 "$CFG" init --owner me@example.com --apps aa 2>&1 >/dev/null)"
+cyc_out="$(AIRLOCK_SHIPPED_APPS_ROOT="$cyc" timeout 10 "$CFG" init --owner owner@fixture.dev --apps aa 2>&1 >/dev/null)"
 cyc_rc=$?
 if [ "$cyc_rc" -eq 124 ]; then
   bad "a dependency cycle hangs init — the ordering loop has no cycle guard"
@@ -290,7 +290,7 @@ else
 fi
 
 miss="$scratch/miss"; fixture "$miss" aa '"legacy"'
-miss_out="$(AIRLOCK_SHIPPED_APPS_ROOT="$miss" "$CFG" init --owner me@example.com --apps aa 2>&1 >/dev/null)"
+miss_out="$(AIRLOCK_SHIPPED_APPS_ROOT="$miss" "$CFG" init --owner owner@fixture.dev --apps aa 2>&1 >/dev/null)"
 miss_rc=$?
 if [ "$miss_rc" -eq 2 ] && printf '%s' "$miss_out" | grep -q "does not ship"; then
   ok "a dependency this checkout does not ship is refused with a message"
@@ -304,7 +304,7 @@ fi
 #     fileview was selected; fileview now serves the filesystem and has no root to
 #     choose, so the flag must be rejected as unknown rather than quietly ignored —
 #     a silently-accepted flag would let a caller believe it had set a boundary.
-"$CFG" init --owner me@example.com --apps fileview --code-root /srv/code >"$scratch/cr.toml" 2>/dev/null
+"$CFG" init --owner owner@fixture.dev --apps fileview --code-root /srv/code >"$scratch/cr.toml" 2>/dev/null
 cr_rc=$?
 if [ "$cr_rc" -ne 2 ]; then
   bad "init accepted the retired --code-root flag (rc=$cr_rc)"
@@ -315,7 +315,7 @@ else
 fi
 
 # ...and fileview alone, with no path flag at all, produces a config that validates.
-"$CFG" init --owner me@example.com --apps fileview >"$scratch/mw.toml" 2>/dev/null
+"$CFG" init --owner owner@fixture.dev --apps fileview >"$scratch/mw.toml" 2>/dev/null
 if AIRLOCK_CONFIG="$scratch/mw.toml" "$CFG" validate >/dev/null 2>&1; then
   ok "init fileview needs no path flag"
 else

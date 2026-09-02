@@ -1861,6 +1861,56 @@ check("P1 real fleet reader carries observedAt into tie and newer comparisons",
       and real_recency[0]["accounts"][0]["kind"] == "personal"
       and real_recency[1]["accounts"][0]["usage"]["use5h"] == 80)
 
+
+async def _usage_source_case(fleet_store, fleet_store_url):
+    """An account with no stored reading, with and without a store configured.
+
+    "no data" says wait; "no store" says nothing is coming. A box whose fleet_store is
+    unset can never fill a non-active row, and reporting the transient there is how a
+    misprovisioned box looked identical to a correctly configured one.
+    """
+    saved_create = g.asyncio.create_subprocess_exec
+    saved_fetch = g._fetch_fleet_store
+    saved_store, saved_url = g.FLEET_STORE, g.FLEET_STORE_URL
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            payload = {"active": "slot-a", "accounts": [{
+                "name": "slot-a", "active": True, "email": "claude@example.com",
+                "kind": "personal", "sub": "Claude",
+            }]}
+            return json.dumps(payload).encode(), b""
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    try:
+        async def create_proc(*_args, **_kwargs):
+            return FakeProc()
+
+        g.asyncio.create_subprocess_exec = create_proc
+        g._fetch_fleet_store = lambda: {}
+        g.FLEET_STORE, g.FLEET_STORE_URL = fleet_store, fleet_store_url
+        data = await g._acct_list_with_usage()
+        return data["accounts"][0]["usage"]
+    finally:
+        g.asyncio.create_subprocess_exec = saved_create
+        g._fetch_fleet_store = saved_fetch
+        g.FLEET_STORE, g.FLEET_STORE_URL = saved_store, saved_url
+
+
+check("P1 no usage source configured is reported as 'no store', not as collecting",
+      asyncio.run(_usage_source_case("", "")) == {"err": "no store"})
+check("P1 a configured file store with no entry yet still reports 'no data'",
+      asyncio.run(_usage_source_case("/tmp/does-not-matter", "")) == {"err": "no data"})
+check("P1 a configured URL store alone is enough to mean 'no data'",
+      asyncio.run(_usage_source_case("", "http://example.invalid/store")) == {"err": "no data"})
+
 # Every malformed store shape quietly falls back to the fleet reading.
 _valid_entry = {"usage": {"use5h": 90, "use7d": 91,
                            "reset5h": None, "reset7d": None},
@@ -2003,6 +2053,38 @@ check("P1 live handler writes inline, unlike the fleet-store reader",
       "_claude_usage_state_save(payload)" in handler_source
       and "run_in_executor" not in handler_source
       and "run_in_executor" in list_source)
+
+
+async def _alert_probe_persists_case():
+    """The /acct-alert live fallback must persist what it already read.
+
+    Opening the panel is not the only time this box learns the active account's usage:
+    the return widget polls /acct-alert on its own. Throwing that reading away is why an
+    account in daily use could still show "no data" — the legacy box kept it.
+    """
+    saved_probe = g._probe_json
+    saved_cache = dict(g._live_usage_cache)
+    try:
+        async def probe(_args, **_kwargs):
+            return _claude_result(use5h=44, use7d=33, email="alertpath@example.com")
+
+        g._probe_json = probe
+        g._live_usage_cache.update(at=0.0, payload=None)
+        await g._live_usage_cached()
+    finally:
+        g._probe_json = saved_probe
+        g._live_usage_cache.clear()
+        g._live_usage_cache.update(saved_cache)
+    with open(g.CLAUDE_USAGE_STATE, encoding="utf-8") as f:
+        return json.load(f)["accounts"]
+
+
+_write_claude_store({"version": 1, "accounts": {}})
+alert_persisted = asyncio.run(_alert_probe_persists_case())
+check("P1 the alert path's live probe is persisted, not discarded",
+      alert_persisted.get("alertpath@example.com|personal", {}).get("usage", {}).get("use5h") == 44)
+check("P1 ...and it is filed under the probe's own identity",
+      set(alert_persisted) == {"alertpath@example.com|personal"})
 
 # Most importantly, the local display store must never become an /acct-alert input. Use
 # the real list function here (not alert_with's stub), preload an alarming local 99%, and
@@ -2169,6 +2251,136 @@ check("no identity in the payload",
 p = asyncio.run(alert_with("not-a-dict", {}, {}))
 check("broken account data degrades to none + typed err",
       p["level"] == "none" and str(p["err"]).startswith("accounts-"))
+
+
+# ---- the death verdict: recorded where it is observed, honoured where it is listed ----
+# The bug these pin: `health` was computed from refreshTokenExpiresAt alone, so a lineage
+# the server had already revoked listed as "ok" until that stored date passed. Measured
+# on a migrated box: four accounts "ok", every switch to them HTTP 400 invalid_grant.
+ah = importlib.import_module("account_health") if "account_health" in sys.modules else None
+if ah is None:
+    ah_loader = importlib.machinery.SourceFileLoader("account_health", "bin/account_health.py")
+    ah_spec = importlib.util.spec_from_loader("account_health", ah_loader)
+    ah = importlib.util.module_from_spec(ah_spec); ah_loader.exec_module(ah)
+
+FUTURE_RT = int((time.time() + 20 * 86400) * 1000)
+
+
+def _slot_creds(rt_expiry=FUTURE_RT, at_expiry=None, meta=None):
+    at = at_expiry if at_expiry is not None else int((time.time() + 3600) * 1000)
+    creds = {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt",
+                               "expiresAt": at, "refreshTokenExpiresAt": rt_expiry,
+                               "subscriptionType": "max"}}
+    creds["_meta"] = dict(meta or {"email": "slot@example.com", "kind": "personal"})
+    return creds
+
+
+@contextlib.contextmanager
+def _pool(slots):
+    """A throwaway pool directory; _account_infos reads whatever is in it."""
+    root = tempfile.mkdtemp()
+    saved_pool, saved_active = ac.POOL, ac.ACTIVE
+    try:
+        ac.POOL = root
+        ac.ACTIVE = os.path.join(root, ".active")
+        for name, creds in slots.items():
+            with open(os.path.join(root, name + ".json"), "w", encoding="utf-8") as f:
+                json.dump(creds, f)
+        yield root
+    finally:
+        ac.POOL, ac.ACTIVE = saved_pool, saved_active
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _health_of(creds, name="slot-a"):
+    with _pool({name: creds}):
+        return {i["name"]: i["health"] for i in ac._account_infos()}[name]
+
+
+marked = _slot_creds()
+marked["_meta"]["dead"] = ah.build_marker(marked)
+check("a recorded server rejection lists as dead even with a future rtExpiry",
+      _health_of(marked)["state"] == "dead"
+      and "400" in _health_of(marked)["reason"])
+check("no marker and a future rtExpiry still lists as ok",
+      _health_of(_slot_creds())["state"] == "ok")
+check("an expired rtExpiry still lists as dead without any marker",
+      _health_of(_slot_creds(rt_expiry=1))["state"] == "dead")
+
+# The discriminator: a lineage that rotated after the verdict is not the one that was
+# rejected. Without this, one bad marker would outlive every later successful refresh.
+rotated = _slot_creds()
+rotated["_meta"]["dead"] = ah.build_marker(rotated)
+rotated["claudeAiOauth"]["refreshTokenExpiresAt"] = FUTURE_RT + 86400000
+check("a marker whose lineage has since rotated is ignored",
+      _health_of(rotated)["state"] == "ok")
+check("a malformed marker is ignored rather than believed",
+      _health_of(_slot_creds(meta={"email": "e", "kind": "personal", "dead": "yes"}))["state"] == "ok")
+
+# _account_infos must stay a pure reader: it runs where the pool is mounted read-only.
+infos_source = inspect.getsource(ac._account_infos)
+check("listing accounts never writes the pool",
+      not any(w in infos_source for w in ("_save_atomic", "mark_dead", "open(", "os.remove")))
+
+# A wrong marker must not be able to delete a credential. prune deletes; only arithmetic
+# on a stored date may feed it, never a remote judgement.
+prune_source = inspect.getsource(ac.cmd_prune)
+check("prune deletes only expiry-dead slots, not server-verdict ones",
+      'i["health"]["state"] == "dead"' in prune_source and 'not i["rtValid"]' in prune_source)
+
+# save-back's unidentified branch writes live into a slot it could not confirm; carrying
+# _meta across would transplant one account's death onto another's file.
+saveback_source = inspect.getsource(ac._saveback)
+check("unidentified save-back strips the death marker before writing",
+      "clear_dead_marker" in saveback_source)
+
+# The status probe already had the verdict in hand and returned a bare False, after which
+# its caller announced the opposite ("may be transient") about a permanent rejection.
+refresh_source = inspect.getsource(cs._refresh_pool)
+describe_source = inspect.getsource(cs._describe)
+check("the pool refresh reports auth separately from transient",
+      'return False, ("auth" if e.code in (400, 401) else "transient")' in refresh_source
+      and 'return False, "transient"' in refresh_source)
+check("a rejected pool refresh is described as dead, not as maybe-transient",
+      'if kind == "auth":' in describe_source
+      and 'out.update(state="dead", reason=_DEAD_REASON)' in describe_source)
+check("a successful refresh clears the marker before it persists the rotation",
+      refresh_source.index("_clear_dead_marker") < refresh_source.index("os.replace"))
+
+# The switch is the last cheap moment to refuse: installing a rejected lineage "succeeds"
+# and then dies mid-session once the still-valid accessToken runs out.
+switch_source = inspect.getsource(ac._switch_core)
+check("a switch refuses an auth-rejected account even while its accessToken is valid",
+      'elif kind == "auth":' in switch_source
+      and switch_source.index('elif kind == "auth":') < switch_source.index("elif not _at_valid(o)"))
+check("...and records the verdict so the list stops calling it healthy",
+      "account_health.mark_dead(target, creds)" in switch_source)
+check("a successful refresh during a switch clears any stale verdict",
+      "account_health.clear_dead_marker(creds)" in switch_source)
+
+# Round-trip through the real writer, on a real file.
+with _pool({"slot-a": _slot_creds()}) as pool_root:
+    slot_file = os.path.join(pool_root, "slot-a.json")
+    ah.mark_dead(slot_file, _slot_creds())
+    with open(slot_file, encoding="utf-8") as f:
+        written = json.load(f)
+    check("the writer persists a marker that survives a reload",
+          ah.dead_marker(written) is not None
+          and written["_meta"]["email"] == "slot@example.com")
+    check("...at owner-only permissions",
+          stat.S_IMODE(os.stat(slot_file).st_mode) == 0o600)
+    first_since = ah.dead_marker(written)["since"]
+    ah.mark_dead(slot_file, written)
+    with open(slot_file, encoding="utf-8") as f:
+        rewritten = json.load(f)
+    check("re-recording the same verdict does not push 'since' forward",
+          ah.dead_marker(rewritten)["since"] == first_since)
+    ah.clear_dead_marker(written)
+    check("clearing removes it without touching the rest of _meta",
+          ah.dead_marker(written) is None and written["_meta"]["kind"] == "personal")
+
+check("a re-login replaces _meta wholesale, so a marker cannot survive one",
+      'creds["_meta"] = {"email": ident["email"]' in inspect.getsource(ac._store_account))
 
 print(("\nFAILED: " + ", ".join(fails)) if fails else "\nall contract checks passed")
 sys.exit(1 if fails else 0)

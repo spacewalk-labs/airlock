@@ -9,11 +9,12 @@
 //   node bin/patch-web-ui.js <web-ui-dir> <companion-js-path>  # legacy --browse
 //
 // The always-on general group (CLI flag `--subagent-stream`, kept for callers that
-// predate it carrying more than one edit) applies FIVE edits every box wants: a
+// predate it carrying more than one edit) applies SIX edits every box wants: a
 // visible provider-subagent panel subscribes to its parent agent's timeline; the
 // fresh-install font-size defaults move to 18 (ui) / 14 (code); the sidebar order
 // store points at the airlock ui-state backend so the order follows the owner across
-// devices instead of living in one browser; a device that cannot hover is treated as
+// devices instead of living in one browser; an already-open tab rehydrates that order
+// when it becomes visible; a device that cannot hover is treated as
 // compact for the tooltip gate; and a coarse pointer gets the project row's trailing
 // actions without having to manufacture a hover first. The optional browse group
 // applies THREE minimal, verified-unique edits so the self-hosted web runtime can open
@@ -71,6 +72,12 @@ const KNOWN_BUNDLE_SHAPES = [
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
             "project-actions-coarse-pointer"] },
+  // A device that was already open now rehydrates the shared order when its tab
+  // becomes visible; this is the current browse-less shape.
+  { sha: "b9aa1eac972a2030f03e8c786830a07d40f13839c658664c20c628dcb47c0cea",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
+            "tooltip-hover-none-is-compact", "project-actions-coarse-pointer"] },
 
   // --- the same eras again on a box that also runs the browse group ---
   // `project-actions-coarse-pointer` shipped FROM the browse group until this
@@ -115,6 +122,13 @@ const KNOWN_BUNDLE_SHAPES = [
             "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
             "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
             "project-actions-coarse-pointer"] },
+  // Fully patched, including visibility-triggered shared-order rehydration.
+  { sha: "9f0ef2a3fd13ec714d4d9b95324d6b21136ef85bcb1ecf3e1e1baee81339a8b6",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
+            "tooltip-hover-none-is-compact", "new-browser-gate-vo",
+            "new-browser-gate-Wo", "browserpane-marker",
+            "project-actions-coarse-pointer"] },
 ];
 const PINNED_VERSION = "@getpaseo/cli@0.2.5 (index-55db56b9)";
 
@@ -139,6 +153,8 @@ const BROWSE_PATCHES = [
     repl: '{style:u.container,dataSet:{paseoBrowserId:w,paseoWorkspaceId:f.workspaceId,paseoServerId:f.serverId},children:[S,_,I]})',
   },
 ];
+const SIDEBAR_STORAGE_LEGACY = '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e);return{getItem:async e=>{try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok)return await t.text()}catch(t){}return l.getItem(e)},setItem:async(e,t)=>{await l.setItem(e,t);try{await fetch(u(e),{method:"PUT",headers:{"content-type":"application/json"},body:t})}catch(n){}},removeItem:async e=>{await l.removeItem(e);try{await fetch(u(e),{method:"DELETE"})}catch(t){}}}})(o.default))),partialize:';
+const SIDEBAR_STORAGE_DURABLE = '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e),p=e=>"@airlock-pending:"+e;let q=Promise.resolve(),r=Promise.resolve(),h=0;const v=new Map,x=e=>{const t=q.catch(()=>{}).then(e);return q=t,t},b=e=>{const t=r.catch(()=>{}).then(e);return r=t,t},y=(e,t)=>{const n={i:++h,v:t};return v.set(e,n),n},z=e=>v.get(e).v,s=async(e,t,n)=>{const o=null===t?"":t;if(n&&v.get(e)!==n||await l.getItem(p(e))!==o)return;const c=await fetch(u(e),null===t?{method:"DELETE"}:{method:"PUT",headers:{"content-type":"application/json"},body:t});if(!c.ok)throw Error("ui-state write failed: "+c.status);(n?v.get(e)===n:!v.has(e))&&(await l.getItem(p(e)))===o&&await l.removeItem(p(e))};return{getItem:e=>x(async()=>{if(v.has(e))return z(e);const t=await l.getItem(p(e));if(null!==t){const n=""===t?null:t;try{await s(e,n)}catch(o){}return v.has(e)?z(e):n}try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok){const n=await t.text();if(v.has(e))return z(e);return await l.setItem(e,n),v.has(e)?z(e):n}}catch(t){}return v.has(e)?z(e):l.getItem(e)}),setItem:(e,t)=>{const n=y(e,t),o=b(async()=>{if(v.get(e)!==n)return;await l.setItem(e,t),await l.setItem(p(e),t)});return x(async()=>{await o;if(v.get(e)!==n)return;try{await s(e,t,n)}catch(c){}v.get(e)===n&&v.delete(e)})},removeItem:e=>{const t=y(e,null),n=b(async()=>{if(v.get(e)!==t)return;await l.removeItem(e),await l.setItem(p(e),"")});return x(async()=>{await n;if(v.get(e)!==t)return;try{await s(e,null,t)}catch(o){}v.get(e)===t&&v.delete(e)})}}})(o.default))),partialize:';
 const SUBAGENT_STREAM_PATCHES = [
   {
     name: "provider-subagent-visible-parent",
@@ -169,7 +185,22 @@ const SUBAGENT_STREAM_PATCHES = [
     // upstream does, instead of losing the order to a failed fetch.
     name: "sidebar-order-shared-storage",
     find: '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>o.default),partialize:',
-    repl: '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e);return{getItem:async e=>{try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok)return await t.text()}catch(t){}return l.getItem(e)},setItem:async(e,t)=>{await l.setItem(e,t);try{await fetch(u(e),{method:"PUT",headers:{"content-type":"application/json"},body:t})}catch(n){}},removeItem:async e=>{await l.removeItem(e);try{await fetch(u(e),{method:"DELETE"})}catch(t){}}}})(o.default))),partialize:',
+    repl: SIDEBAR_STORAGE_DURABLE,
+    // PR #256 shipped the first adapter without an outbox or write queue. Treat its
+    // exact bytes as a named migration source: the SHA still has to match a known
+    // fleet shape, then this patch upgrades it in place.
+    legacyRepls: [SIDEBAR_STORAGE_LEGACY],
+  },
+  {
+    // A second device commonly already has Paseo open. Persist hydrates only once,
+    // so the server-first adapter above does not run again merely because the owner
+    // switches back to that tab: the in-memory sidebar keeps the device's old order
+    // until a full refresh. Rehydrate when a hidden tab becomes visible. Zustand's
+    // persist rehydrate updates the existing store (and therefore the rendered
+    // sidebar) without restarting Paseo or reloading the page.
+    name: "sidebar-order-rehydrate-on-visibility",
+    find: 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}))},3544,[3368,3273,3276]);',
+    repl: 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));"undefined"!=typeof document&&document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&f.persist.rehydrate()})},3544,[3368,3273,3276]);',
   },
   {
     // Tooltips are gated on useIsCompactFormFactor() — the xs/sm breakpoint — and a
@@ -276,10 +307,20 @@ function patchGroupState(src, name, patches) {
   for (const patch of patches) {
     const oldOccurrences = occurrences(src, patch.find);
     const newOccurrences = occurrences(src, patch.repl);
-    if (oldOccurrences === 1 && newOccurrences === 0) oldCount++;
-    else if (oldOccurrences === 0 && newOccurrences === 1) applied.push(patch.name);
+    const legacyOccurrences = (patch.legacyRepls ?? []).reduce(
+      (count, legacy) => count + occurrences(src, legacy),
+      0,
+    );
+    if (oldOccurrences === 1 && newOccurrences === 0 && legacyOccurrences === 0) oldCount++;
+    else if (oldOccurrences === 0 && newOccurrences === 1 && legacyOccurrences === 0) applied.push(patch.name);
+    else if (oldOccurrences === 0 && newOccurrences === 0 && legacyOccurrences === 1) {
+      // The old adapter is a shipped edit (so include it in the shape lookup) but
+      // still needs this revision applied (so count it as old for group state).
+      applied.push(patch.name);
+      oldCount++;
+    }
     else {
-      throw new Error(`bundle half/ambiguous ${name} patch: ${patch.name} old=${oldOccurrences} new=${newOccurrences} — refusing`);
+      throw new Error(`bundle half/ambiguous ${name} patch: ${patch.name} old=${oldOccurrences} new=${newOccurrences} legacy=${legacyOccurrences} — refusing`);
     }
   }
   if (oldCount === patches.length) return { state: "unpatched", applied };
@@ -360,9 +401,18 @@ function patchBundleContent(src, expectedShaOrOptions = PINNED_SHA) {
   }
 
   const patches = GROUPS[options.mode];
-  for (const p of patches) src = src.replace(p.find, p.repl);
+  for (const p of patches) {
+    if (src.includes(p.find)) src = src.replace(p.find, p.repl);
+    else {
+      const legacy = (p.legacyRepls ?? []).find((candidate) => src.includes(candidate));
+      if (legacy) src = src.replace(legacy, p.repl);
+    }
+  }
   for (const p of patches) {
     if (occurrences(src, p.find) !== 0) throw new Error(`post-patch: original anchor ${p.name} still present`);
+    for (const legacy of p.legacyRepls ?? []) {
+      if (occurrences(src, legacy) !== 0) throw new Error(`post-patch: legacy replacement ${p.name} still present`);
+    }
     if (!src.includes(p.repl)) throw new Error(`post-patch: replacement ${p.name} not applied`);
   }
   return { source: src, alreadyPatched: false, mode: options.mode, states };

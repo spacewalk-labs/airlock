@@ -101,7 +101,7 @@ ledger_run() {
 }
 
 base_config() {
-  printf '[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n[apps.hub]\n'
+  printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n'
 }
 
 make_pkg_cfg() {

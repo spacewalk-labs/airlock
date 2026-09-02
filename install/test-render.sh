@@ -28,7 +28,7 @@ cat >"$TMP/airlock.toml" <<'TOML'
 name = "My Dev Hub"
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 collaborators = ["friend@example.com"]
 [apps.hub]
 [apps.notepad]
@@ -75,7 +75,7 @@ cat >"$TMP/aud.toml" <<TOML
 name = "My Dev Hub"
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [apps.hub]
 [apps.audapp]
 [packages.audapp]
@@ -124,7 +124,7 @@ grep -q '@@' <<<"$SITE" && bad "no unresolved placeholder" || ok "no unresolved 
 # rather than a second hand-copied nginx snippet.
 LOCAL_CONFIG="$TMP/local-publish.toml"
 printf '%s\n' \
-  '[auth]' 'provider = "tailscale"' 'owner = "me@example.com"' \
+  '[auth]' 'provider = "tailscale"' 'owner = "owner@fixture.dev"' \
   '[apps.publish]' '[apps.publish.public_target]' \
   'mode = "local"' 'base_url = "https://docs.example"' \
   "public_dir = \"$TMP/public\"" "gated_dir = \"$TMP/gated\"" \
@@ -148,7 +148,7 @@ GATED_SYNTAX_FRAGMENT="$TMP/gated-syntax.conf"
 cp "$GATED_FRAGMENT" "$GATED_SYNTAX_FRAGMENT" 2>/dev/null || :
 REMOTE_CONFIG="$TMP/remote-publish.toml"
 printf '%s\n' \
-  '[auth]' 'provider = "tailscale"' 'owner = "me@example.com"' \
+  '[auth]' 'provider = "tailscale"' 'owner = "owner@fixture.dev"' \
   '[apps.publish]' '[apps.publish.public_target]' \
   'mode = "remote"' 'ingest_url = "https://ingest.example"' \
   'base_url = "https://docs.example"' 'token_env = "PUBLISH_TEST_TOKEN"' >"$REMOTE_CONFIG"

@@ -13,7 +13,7 @@ Environment=DEVTERM_TTYD_HOST=127.0.0.1
 Environment=DEVTERM_TTYD_PORT=19300
 Environment=DEVTERM_WEB=/home/example/.local/share/airlock-devterm/web
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
-Environment=AIRLOCK_OWNER=owner@example.com
+Environment=AIRLOCK_OWNER=owner@fixture.dev
 Environment=AIRLOCK_CODE_ROOT=
 Environment=DEVTERM_FILEVIEW=false
 Environment=DEVTERM_ACCOUNTS=true

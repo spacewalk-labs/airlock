@@ -633,6 +633,94 @@ await valuedLiveUsageReplacesPersistedRow();
 await xaiFiveStatesRenderExactActions();
 await xaiOldCredentialCannotCompletePendingLogin();
 await xaiRendersWithoutClaudeAccounts();
+
+// ---- the pool has to say which accounts are actually usable ----
+const TH = { warn5: 78, crit5: 88, warn7: 88, crit7: 93, rtWarnDays: 5 };
+
+async function deadRowShowsReasonAndReloginInsteadOfUsage() {
+  // A server-rejected account must not read as a healthy one. Before this, a revoked
+  // lineage rendered green with usage numbers and its click attempted a switch that
+  // could only fail.
+  const h = makeHarness({
+    statuses: [{ state: 'none' }], usage: [{}],
+    postResponses: { '/acct-login-url': { ok: true, url: 'https://claude.com/cai/oauth/authorize?x=1' } },
+    accountPayload: { enabled: true, thresholds: TH, accounts: [{
+      active: false, email: 'revoked@example.com', kind: 'personal', sub: 'max',
+      usage: { use5h: 3, use7d: 1 },
+      rtExpiry: Date.now() + 20 * 86400000,
+      health: { state: 'dead', reason: 'refresh rejected by the server (HTTP 400/401)' },
+    }] },
+  });
+  const panel = h.mountPanel();
+  await h.flush();
+  const row = panel.querySelector('.acctrow');
+  check('P1 a dead row shows the reason and offers re-login instead of usage',
+        row.className.split(/\s+/).includes('dead')
+        && row.querySelector('.nm').textContent.startsWith('\u274c')
+        && row.querySelector('.pl').textContent.includes('rejected by the server')
+        && row.querySelector('.acct-r').textContent === 'Re-login');
+  // rtExpiry is in the future on exactly the accounts this bug was about, so leaving the
+  // "expires in N days" note here would argue against the verdict beside it.
+  check('P1 ...and does not also argue that it merely expires soon',
+        !row.querySelector('.pl').textContent.includes('Expires in'));
+  row.onclick();
+  await h.flush();
+  check('P1 clicking a dead row starts a login instead of a doomed switch',
+        h.postCalls.some((call) => call.url === '/acct-login-url')
+        && !h.postCalls.some((call) => call.url === '/acct-switch')
+        && !!panel.querySelector('.addform'));
+}
+
+async function unknownHealthStateRendersAsUsable() {
+  // Pins the contract the backend has to work within: only 'dead' changes the row. A new
+  // state invented server-side renders green and switchable, so it cannot be used to warn
+  // anyone without a frontend change landing first.
+  const h = makeHarness({
+    statuses: [{ state: 'none' }], usage: [{}],
+    postResponses: { '/acct-switch': { ok: true } },
+    accountPayload: { enabled: true, thresholds: TH, accounts: [{
+      active: false, email: 'odd@example.com', kind: 'personal', sub: 'max',
+      usage: { use5h: 5, use7d: 5 },
+      health: { state: 'suspect', reason: 'something new' },
+    }] },
+  });
+  const panel = h.mountPanel();
+  await h.flush();
+  const row = panel.querySelector('.acctrow');
+  const numbers = row.querySelector('.acct-r').textContent;
+  row.onclick();
+  await h.flush();
+  check('P1 an unrecognised health state renders as a normal switchable row',
+        !row.className.split(/\s+/).includes('dead')
+        && numbers.includes('5h 5%')
+        && h.postCalls.some((call) => call.url === '/acct-switch'));
+}
+
+async function noUsageSourceIsNotReportedAsCollecting() {
+  const mk = (usage) => makeHarness({
+    statuses: [{ state: 'none' }], usage: [{}],
+    accountPayload: { enabled: true, thresholds: TH, accounts: [{
+      active: false, email: 'row@example.com', kind: 'personal', sub: 'max', usage,
+    }] },
+  });
+  const h = mk({ err: 'no store' });
+  const panel = h.mountPanel();
+  await h.flush();
+  const numbers = panel.querySelector('.acctrow').querySelector('.acct-r').textContent;
+  check('P1 a box with no usage source says so instead of promising a collector',
+        numbers.includes('No usage') && !numbers.includes('Collecting'));
+
+  const pending = mk({ err: 'no data' });
+  const pendingPanel = pending.mountPanel();
+  await pending.flush();
+  check('P1 ...while a configured store with no entry yet still says collecting',
+        pendingPanel.querySelector('.acctrow').querySelector('.acct-r')
+          .textContent.includes('Collecting'));
+}
+
+await deadRowShowsReasonAndReloginInsteadOfUsage();
+await unknownHealthStateRendersAsUsable();
+await noUsageSourceIsNotReportedAsCollecting();
 check('P3 shared account buttons retain the Claude warning selector contract',
       !appSource.includes("'Subscription accounts'")
       && appSource.includes("'Switch account / subscriptions'"));

@@ -738,6 +738,12 @@ def identity_header(cfg: dict) -> str:
     return PROVIDER_HEADER[provider]
 
 
+# RFC 2606 / RFC 6761 reserved names. Never resolvable, so never a real login.
+RESERVED_EXAMPLE_DOMAINS = frozenset(
+    {"example.com", "example.org", "example.net", "example", "invalid",
+     "test", "localhost"})
+
+
 def cmd_validate(cfg: dict) -> "None":
     _validate_shape(cfg)   # first: everything below assumes tables are tables
     auth = cfg.get("auth", {})
@@ -747,6 +753,17 @@ def cmd_validate(cfg: dict) -> "None":
     owner = auth.get("owner", "")
     if not isinstance(owner, str) or "@" not in owner:
         die(f"auth.owner must be a login (email-like); got {owner!r}")
+    # The example config ships a placeholder owner. An edit that misses it
+    # leaves a config that validates while the gate 403s the real operator --
+    # the failure surfaces much later, as "this isn't your Airlock" in a
+    # browser, with nothing pointing back at the config. RFC 2606 reserves
+    # these names precisely so they can never be a real login, so refusing
+    # them cannot reject a genuine owner.
+    domain = owner.rsplit("@", 1)[1].strip().lower().rstrip(".")
+    if domain in RESERVED_EXAMPLE_DOMAINS or domain.endswith(".example"):
+        die(f"auth.owner is still the documentation placeholder ({owner!r}); "
+            "set it to the Tailscale login that should own this box. "
+            "It validates but the gate would refuse that login.")
     _validate_agent(cfg)
     apps = cfg.get("apps", {})
     if "hub" not in apps:
@@ -3043,7 +3060,8 @@ def package_specs(cfg: dict) -> dict:
             die(f"--dangerously-admit-unverified target "
                 f"'{_DANGEROUS_ADMIT_UNVERIFIED}' does not name a configured "
                 "explicit package", code=2)
-    out = {}
+    prepared = {}
+    missing_paths = []
     for pid in sorted(sources):
         table, source_class, bundle_principal = sources[pid]
         if not isinstance(table, dict):
@@ -3081,7 +3099,23 @@ def package_specs(cfg: dict) -> dict:
             p = cfg_dir / p
         pdir = p.resolve()
         if not pdir.is_dir():
-            die(f"[packages.{pid}].path does not resolve to a directory: {pdir}")
+            if source_class == "explicit":
+                missing_paths.append((pid, raw, str(pdir)))
+            else:
+                die(f"[packages.{pid}].path does not resolve to a directory: {pdir}")
+        prepared[pid] = (source_class, bundle_principal, granted, pdir)
+
+    if missing_paths:
+        details = "\n".join(
+            f"  - id={pid!r} raw={raw!r} resolved={resolved!r}"
+            for pid, raw, resolved in sorted(missing_paths)
+        )
+        die("[packages.*].path does not resolve to a directory for one or "
+            f"more packages:\n{details}")
+
+    out = {}
+    for pid in sorted(prepared):
+        source_class, bundle_principal, granted, pdir = prepared[pid]
         spec = _parse_manifest_spec(pid, pdir, source_class,
                                     bundle_principal=bundle_principal,
                                     granted_capabilities=granted)

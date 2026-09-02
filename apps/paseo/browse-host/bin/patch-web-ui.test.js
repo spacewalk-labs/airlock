@@ -29,6 +29,7 @@ assert.deepEqual(SUBAGENT_STREAM_PATCHES.map((patch) => patch.name), [
   "provider-subagent-visible-parent",
   "appearance-default-font-sizes",
   "sidebar-order-shared-storage",
+  "sidebar-order-rehydrate-on-visibility",
   "tooltip-hover-none-is-compact",
   "project-actions-coarse-pointer",
 ]);
@@ -51,6 +52,35 @@ assert.ok(byName("tooltip-hover-none-is-compact").repl.includes('matchMedia?.("(
 assert.ok(byName("sidebar-order-shared-storage").repl.includes("/airlock-ui-state/"));
 assert.ok(byName("sidebar-order-shared-storage").repl.includes("l.getItem(e)"));
 assert.ok(byName("sidebar-order-shared-storage").repl.includes("await l.setItem(e,t)"));
+// An already-open second device must converge when the owner switches back to it;
+// initial hydration alone only updates a device that performs a full page load.
+assert.ok(byName("sidebar-order-rehydrate-on-visibility").find.includes("migrate:j"));
+assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes('document.addEventListener("visibilitychange"'));
+assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes('"visible"===document.visibilityState'));
+assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes("f.persist.rehydrate()"));
+{
+  const patch = byName("sidebar-order-rehydrate-on-visibility");
+  const start = patch.repl.indexOf('"undefined"!=typeof document');
+  const end = patch.repl.indexOf("},3544,[", start);
+  const expression = patch.repl.slice(start, end);
+  let listener = null;
+  let rehydrates = 0;
+  const documentStub = {
+    visibilityState: "hidden",
+    addEventListener: (name, callback) => {
+      assert.equal(name, "visibilitychange");
+      listener = callback;
+    },
+  };
+  const f = { persist: { rehydrate: () => { rehydrates += 1; } } };
+  new Function("document", "f", `return (${expression});`)(documentStub, f);
+  assert.ok(listener, "visibility listener was not registered");
+  listener();
+  assert.equal(rehydrates, 0, "a hidden tab must not rehydrate");
+  documentStub.visibilityState = "visible";
+  listener();
+  assert.equal(rehydrates, 1, "a returning tab must rehydrate shared order");
+}
 // The default the user sees on a device that has never saved settings. Asserted on
 // the bytes, not the name: a silent revert to upstream's 16/12 is the failure mode.
 assert.ok(byName("appearance-default-font-sizes").find.includes("_=16,O=11,T=24,F=12"));
@@ -61,6 +91,9 @@ const ALL_EDITS = [
   ...BROWSE_PATCHES.map((patch) => patch.name),
 ];
 const GENERAL_EDITS = SUBAGENT_STREAM_PATCHES.map((patch) => patch.name);
+const PREVIOUS_GENERAL_EDITS = GENERAL_EDITS.filter(
+  (edit) => edit !== "sidebar-order-rehydrate-on-visibility",
+);
 const BROWSE_EDITS = BROWSE_PATCHES.map((patch) => patch.name);
 const key = (edits) => [...edits].sort().join("|");
 
@@ -91,14 +124,17 @@ assert.equal(productionShasForEdits(BROWSE_EDITS).length, 1);
 // The shape THIS box carried when the bug was found: the whole general group as it
 // stood before the move, no browse. Completing it is the entire point of the change.
 assert.equal(
-  productionShasForEdits(GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer")).length,
+  productionShasForEdits(PREVIOUS_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer")).length,
   1,
 );
+// The immediately previous complete general shape is the migration source for this
+// revision's visibility rehydrate edit.
+assert.equal(productionShasForEdits(PREVIOUS_GENERAL_EDITS).length, 1);
 // Every pre-move browse box holds the coarse-pointer edit already, beside a general
 // group that is one, two, three or four edits old. All four must remain nameable.
 for (const revision of [1, 2, 3, 4]) {
   const edits = [
-    ...GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer").slice(0, revision),
+    ...PREVIOUS_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer").slice(0, revision),
     ...BROWSE_EDITS,
     "project-actions-coarse-pointer",
   ];
@@ -164,6 +200,24 @@ assert.equal(migratedMove.alreadyPatched, false);
 assert.equal(migratedMove.states["subagent-stream"], "partial");
 assert.equal(migratedMove.source, general.source);
 assert.ok(migratedMove.source.includes("(pointer: coarse)"));
+
+// PR #256's adapter is a migration source, not an ambiguous foreign bundle. It
+// already counts as the shared-storage edit for shape lookup, but running the
+// current group must replace it with the durable outbox/queue adapter and add the
+// visibility rehydrate edit.
+const storagePatch = byName("sidebar-order-shared-storage");
+assert.equal(storagePatch.legacyRepls.length, 1);
+const legacyGeneral = general.source
+  .replace(storagePatch.repl, storagePatch.legacyRepls[0])
+  .replace(
+    byName("sidebar-order-rehydrate-on-visibility").repl,
+    byName("sidebar-order-rehydrate-on-visibility").find,
+  );
+const migratedStorage = apply(legacyGeneral, "subagent-stream", [sha(legacyGeneral)]);
+assert.equal(migratedStorage.alreadyPatched, false);
+assert.equal(migratedStorage.states["subagent-stream"], "partial");
+assert.equal(migratedStorage.source, general.source);
+assert.ok(!migratedStorage.source.includes(storagePatch.legacyRepls[0]));
 
 // ...and the mirror case: a PRE-move browse box already holds the coarse-pointer edit,
 // so running the general group there must complete the rest around it and reach the

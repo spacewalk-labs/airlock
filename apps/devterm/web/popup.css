@@ -73,6 +73,15 @@
             pointer-events: none; font: 13.5px/1.5 system-ui; color: #aeb4c0;
             white-space: pre; font-variant-numeric: tabular-nums; }
 
-/* panel flavour — no floating and no fixed width: fill the container we were given. */
+/* panel flavour — no floating and no fixed width: fill the container we were given.
+   max-height/overflow must be reset too, not just position/width. `.tab-pop`'s 66vh cap
+   and its own scroller belong to the anchored popup, which floats over a terminal and
+   must not cover it. In the panel they clip the list inside a box shorter than the
+   container: measured in the return widget's modal (420x560, the iframe size set by
+   hub/assets/airlock-return.js), the panel stopped at 386px with 248px of content —
+   including "+ Add account (login)" — behind an internal scrollbar no touch user can
+   see, and 162px of the modal left empty below it. The container (panel.html #body) is
+   already the scroller; the panel just has to be its natural height. */
 .tab-pop.acct.acct-panel { position: static; z-index: auto; width: auto; max-width: 100%;
+                           max-height: none; overflow: visible;
                            box-shadow: none; border: none; background: transparent; }

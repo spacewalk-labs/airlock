@@ -18,6 +18,11 @@ AIRLOCK_CONFIG_BIN="$ROOT/bin/airlock-config"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
 
+# Before anything is stopped: if this run is hosted by one of the units it is about
+# to restart, move it out of that cgroup so it survives its own teardown. Informs
+# and continues rather than refusing — see install/lib.sh.
+airlock_escape_selfkill_cgroup "$0" "$@"
+
 # This marker is asserted only after this process acquires or verifies the
 # ledger lock below. Never trust a value inherited from a parent shell as
 # proof of lock ownership.

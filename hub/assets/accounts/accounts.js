@@ -79,7 +79,10 @@ function rtWarnText(d) {
 function acctTipText(u, a) {
   const L = [];
   if (u.use5h == null && u.use7d == null) {
-    L.push(u.err === 'no data' ? 'Collecting usage\n(every minute)' : 'Query failed\n' + (u.err || '?'));
+    L.push(u.err === 'no data' ? 'Collecting usage\n(every minute)'
+         : u.err === 'no store' ? 'No shared usage store is configured,\n'
+             + 'so only the active account can be read here.'
+         : 'Query failed\n' + (u.err || '?'));
   } else {
     L.push('5h↻ ' + (u.reset5h ? fmtReset(u.reset5h, false) : '—') +
            '\n7d↺ ' + (u.reset7d ? fmtReset(u.reset7d, true) : '—') +
@@ -677,7 +680,12 @@ function fillAcctList(list, opts) {
         R.textContent = '5h ' + (u.use5h == null ? '—' : u.use5h + '%') + '\n7d ' + (u.use7d == null ? '—' : u.use7d + '%');
       } else {
         R.style.color = '#8a92a6';
-        R.textContent = u.err === 'no data' ? 'Collecting\n(<1 min)' : (u.err ? 'Query failed\n' + u.err : 'Usage\n—');
+        // "no store" = this gate has no usage source configured, so this row will never
+        // fill in. Saying "Collecting" there is a promise nothing keeps; the only account
+        // this box can read on its own is the active one.
+        R.textContent = u.err === 'no data' ? 'Collecting\n(<1 min)'
+                      : u.err === 'no store' ? 'No usage\nsource'
+                      : (u.err ? 'Query failed\n' + u.err : 'Usage\n—');
       }
       // hover = when it recovers + who holds it + expiry. Next to the cursor immediately.
       if (!dead) {

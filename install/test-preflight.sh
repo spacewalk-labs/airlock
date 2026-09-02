@@ -21,7 +21,7 @@ bad(){ printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
 make_config() {
   local path="$1"; shift
   {
-    printf '[auth]\nprovider = "tailscale"\nowner = "me@example.com"\n'
+    printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n'
     for app in "$@"; do printf '[apps.%s]\n' "$app"; done
   } >"$path"
 }
@@ -130,6 +130,10 @@ fi
 
 # Enabled code-server and paseo share core rows. Leave nginx and the download
 # tools absent, and provide Node 18, so one report must contain every gap.
+# nginx is deliberately NOT asserted absent below: it is a daemon, so
+# preflight also looks in the sbin directories and a runner that genuinely has
+# nginx installed would report it present no matter what this PATH contains.
+# Asserting on it would make the result depend on the box running the suite.
 GAPS="$TMP/gaps"; cp -a "$BASE" "$GAPS"; rm "$GAPS/nginx" "$GAPS/curl"
 cat >"$GAPS/node" <<'STUB'
 #!/usr/bin/env bash
@@ -143,7 +147,6 @@ make_config "$TMP/gaps.toml" hub code-server devterm paseo
 gaps="$(run_preflight "$TMP/gaps.toml" "$GAPS" 2>&1)" && gaps_rc=0 || gaps_rc=$?
 header_count="$(printf '%s\n' "$gaps" | grep -c '^requirement' || true)"
 if [ "$gaps_rc" = 1 ] && [ "$header_count" = 1 ] \
-  && [[ "$gaps" == *nginx*missing* ]] \
   && [[ "$gaps" == *curl*missing* ]] \
   && [[ "$gaps" == *sha256sum*missing* ]] \
   && [[ "$gaps" == *tar*missing* ]] \
@@ -201,7 +204,7 @@ chmod +x "$MW/node"
 cat >"$TMP/fileview.toml" <<'TOML'
 [auth]
 provider = "tailscale"
-owner = "me@example.com"
+owner = "owner@fixture.dev"
 [paths]
 [apps.hub]
 [apps.fileview]
@@ -574,6 +577,55 @@ if [ "$mut_rc" = 1 ] && [ ! -e "$MUT/web" ] && [ ! -e "$MUT/confd" ] \
   ok "failed installer preflight aborts before mutation"
 else
   bad "installer crossed mutation boundary after failed preflight"
+fi
+
+# --- sbin fallback -----------------------------------------------------------
+# nginx and nft live in the sbin directories, which are absent from an
+# unprivileged PATH in some sessions (an agent session was the observed case,
+# 2026-09-01). Before this fallback, preflight reported an installed and
+# actively serving nginx as "missing" and the installer refused to run, telling
+# the operator to apt-get install a package that was already there.
+SBINFX="$TMP/sbinfx"; mkdir -p "$SBINFX"
+make_stub "$SBINFX" faux-daemon
+# shellcheck source=/dev/null
+AIRLOCK_ROOT="$ROOT" . "$ROOT/install/preflight.sh"
+
+# shellcheck disable=SC2034  # consumed by airlock_preflight_find, sourced above
+AIRLOCK_PREFLIGHT_SBIN_DIRS="$SBINFX"
+found="$(PATH="/nonexistent" airlock_preflight_find faux-daemon)" || found=""
+if [ "$found" = "$SBINFX/faux-daemon" ]; then
+  ok "preflight finds a daemon that is only in an sbin dir"
+else
+  bad "preflight missed an sbin-only daemon (got '${found:-<none>}')"
+fi
+
+# PATH still wins, so an operator override is not silently discarded.
+PATHFX="$TMP/pathfx"; mkdir -p "$PATHFX"
+make_stub "$PATHFX" faux-daemon
+found="$(PATH="$PATHFX" airlock_preflight_find faux-daemon)" || found=""
+if [ "$found" = "$PATHFX/faux-daemon" ]; then
+  ok "PATH still takes precedence over the sbin fallback"
+else
+  bad "sbin fallback overrode PATH (got '${found:-<none>}')"
+fi
+
+# A genuinely absent command must still be absent -- the fallback must not
+# turn every miss into a hit.
+if PATH="/nonexistent" airlock_preflight_find no-such-daemon-anywhere \
+  >/dev/null 2>&1; then
+  bad "preflight reported a command that exists nowhere"
+else
+  ok "a command that exists nowhere is still reported missing"
+fi
+
+# The list is assigned unconditionally when preflight.sh is sourced, so an
+# ambient value cannot redirect daemon discovery in a production run.
+if out="$(AIRLOCK_PREFLIGHT_SBIN_DIRS="$SBINFX" AIRLOCK_ROOT="$ROOT" /bin/bash -c \
+  '. "$1/install/preflight.sh"; printf %s "$AIRLOCK_PREFLIGHT_SBIN_DIRS"' _ "$ROOT")" \
+  && [ "$out" = "/usr/local/sbin /usr/sbin /sbin" ]; then
+  ok "an ambient sbin list does not reach production discovery"
+else
+  bad "ambient AIRLOCK_PREFLIGHT_SBIN_DIRS survived sourcing (got '$out')"
 fi
 
 echo "---"; echo "passed=$pass failed=$fail"; [ "$fail" -eq 0 ]

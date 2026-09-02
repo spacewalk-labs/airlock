@@ -6,14 +6,14 @@ Wants=airlock-devterm.service
 [Service]
 Type=simple
 Environment=PATH=WDIR/home/.local/bin:WDIR/home/.npm-global/bin:NODE_BIN:/usr/local/bin:/usr/bin:/bin
-Environment=DEVTERM_REV=a2c27a5702c3
+Environment=DEVTERM_REV=4b02d410f006
 Environment=DEVTERM_LISTEN_HOST=127.0.0.1
 Environment=DEVTERM_LISTEN_PORT=19913
 Environment=DEVTERM_TTYD_HOST=127.0.0.1
 Environment=DEVTERM_TTYD_PORT=19912
 Environment=DEVTERM_WEB=WDIR/home/.local/share/airlock-devterm/web
 Environment=AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login
-Environment=AIRLOCK_OWNER=owner@example.com
+Environment=AIRLOCK_OWNER=owner@fixture.dev
 Environment=DEVTERM_FILEVIEW=false
 Environment=DEVTERM_ACCOUNTS=true
 Environment=DEVTERM_XAI=false

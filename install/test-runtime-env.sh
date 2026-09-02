@@ -91,7 +91,7 @@ mkpkg() {   # mkpkg <dir> <manifest-config-body> [file-contents]
 
 mkcfg() {   # mkcfg <dir>  -> echoes a config path enabling the probe package
   local d="$1" c="$TMP/cfg-$RANDOM.toml"
-  { printf '[site]\nname = "P"\n\n[auth]\nprovider = "tailscale"\nowner = "o@example.com"\n\n'
+  { printf '[site]\nname = "P"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n\n'
     printf '[apps.hub]\n[apps.probe]\n\n[packages.probe]\npath = "%s"\n' "$d"
   } > "$c"
   printf '%s\n' "$c"
@@ -206,7 +206,7 @@ mkpkg "$SHIP/probe" '[config.defaults]
 value = 1234' 'echo "$AIRLOCK_PROBE_UNDECLARED"'
 sed -i 's/^id = "probe"/id = "probe"/' "$SHIP/probe/airlock-app.toml"
 shipcfg="$TMP/shipcfg.toml"
-printf '[site]\nname = "P"\n\n[auth]\nprovider = "tailscale"\nowner = "o@example.com"\n\n[apps.hub]\n[apps.probe]\n' > "$shipcfg"
+printf '[site]\nname = "P"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n\n[apps.hub]\n[apps.probe]\n' > "$shipcfg"
 OUT="$(AIRLOCK_CONFIG="$shipcfg" AIRLOCK_SHIPPED_APPS_ROOT="$SHIP" AIRLOCK_TEST_BUNDLE_ROOT="$SHIP" python3 "$CFG" validate 2>&1)"; RC=$?
 [ "$RC" = 0 ] \
   && ok "a shipped package with an undeclared reference passes when strict is OFF (today's behaviour)" \
@@ -239,7 +239,7 @@ OUT="$(AIRLOCK_CONFIG="$shipcfg" AIRLOCK_SHIPPED_APPS_ROOT="$SHIP" AIRLOCK_TEST_
 
 # ---- the shipped tree ----
 allcfg="$TMP/all.toml"
-{ printf '[site]\nname = "S"\n\n[auth]\nprovider = "tailscale"\nowner = "o@example.com"\n\n'
+{ printf '[site]\nname = "S"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n\n'
   printf '[apps.hub]\n'
   for a in "$ROOT"/apps/*/; do printf '[apps.%s]\n' "$(basename "$a")"; done
 } > "$allcfg"

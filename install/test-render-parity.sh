@@ -69,7 +69,7 @@ bad(){ echo "FAIL $1"; fail=$((fail+1)); }
 # install/test-equivalence.sh's rationale, generalised to manifests).
 ALL_PREREQ_CMDS_CFG="$TMP/all-prereq-cmds.toml"
 {
-  printf '[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n[apps.hub]\n'
+  printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n'
   find "$ROOT/apps" -mindepth 1 -maxdepth 1 -type d -printf '[apps.%f]\n' | sort
 } > "$ALL_PREREQ_CMDS_CFG"
 ALL_PREREQ_CMDS="$(AIRLOCK_CONFIG="$ALL_PREREQ_CMDS_CFG" python3 "$ROOT/bin/airlock-config" prereqs 2>/dev/null \
@@ -210,7 +210,7 @@ for SET in slots1 slots3; do
     slots3) SLOTS=3; SLOT_CASE="1|2|3" ;;
   esac
   BACKEND_PORT=19100; BACKEND_BASE=$((BACKEND_PORT - 1)); MANAGER_PORT=19199
-  GATE_PORT=19198; AIRLOCK_OWNER="owner@example.com"; AIRLOCK_IDENTITY_HEADER="Tailscale-User-Login"
+  GATE_PORT=19198; AIRLOCK_OWNER="owner@fixture.dev"; AIRLOCK_IDENTITY_HEADER="Tailscale-User-Login"
   WEBROOT="/opt/airlock/hub"; SHELL_DIR="/etc/airlock/nginx/code-server"
 
   f="$(out_file)"; render_to "$f" render_code_server_unit_slot "$BACKEND_BASE" "$SLOT_CASE" "$SLOTS"
@@ -248,7 +248,7 @@ AIRLOCK_ACCOUNTS_STATUS_BIN="/opt/example/airlock/bin/airlock-accounts-status"
 # The env-file renderer gets its own secret-empty golden. A non-empty webhook or
 # proxy secret in a committed golden would turn a fixture into a credential copy.
 f="$(out_file)"; render_to "$f" render_dev_monitor_env \
-  "owner@example.com" "" "/home/example/.local/state/airlock/dev-monitor" \
+  "owner@fixture.dev" "" "/home/example/.local/state/airlock/dev-monitor" \
   "/home/example" "devmon-exec" "" "" "https://box.example.ts.net/monitor/#messages"
 golden_check_file "dev-monitor/env/messages-on.env.txt" "$f"
 # The email lane configured, pinned separately. The lane being off is the shape most boxes
@@ -257,16 +257,16 @@ golden_check_file "dev-monitor/env/messages-on.env.txt" "$f"
 # email path would go missing with nothing to see. The password stays empty here for the
 # same reason the webhooks do.
 f_mail="$(out_file)"; render_to "$f_mail" render_dev_monitor_env \
-  "owner@example.com" "" "/home/example/.local/state/airlock/dev-monitor" \
+  "owner@fixture.dev" "" "/home/example/.local/state/airlock/dev-monitor" \
   "/home/example" "devmon-exec" "" "" "https://box.example.ts.net/monitor/#messages" \
-  "relay.example.com" "587" "dev-monitor@example.com" "owner@example.com" "devmon" ""
+  "relay.example.com" "587" "dev-monitor@example.com" "owner@fixture.dev" "devmon" ""
 golden_check_file "dev-monitor/env/messages-on-email.env.txt" "$f_mail"
 # The roster path (P4) configured, pinned separately for the same reason the email lane
 # is: unconfigured is the shape most boxes have (the golden above), so it is the shape a
 # regression most easily hides behind. A path is not a secret, so unlike the SMTP/webhook
 # fixtures this one carries a real-looking value rather than an empty placeholder.
 f_roster="$(out_file)"; render_to "$f_roster" render_dev_monitor_env \
-  "owner@example.com" "" "/home/example/.local/state/airlock/dev-monitor" \
+  "owner@fixture.dev" "" "/home/example/.local/state/airlock/dev-monitor" \
   "/home/example" "devmon-exec" "" "" "https://box.example.ts.net/monitor/#messages" \
   "" "" "" "" "" "" "/home/example/.local/state/roster/roster.json"
 golden_check_file "dev-monitor/env/messages-on-roster.env.txt" "$f_roster"
@@ -332,7 +332,7 @@ for SET in accounts-off accounts-on; do
   BACKEND_PORT=19301; GATE_PORT=19302; REDIRECT_PORT=19303
   PY="/usr/bin/python3"; GATE_PY="$APP/backend/devterm-gate.py"
   WEB_ROOT="/home/example/.local/share/airlock-devterm/web"
-  IDENTITY_HEADER="Tailscale-User-Login"; AIRLOCK_OWNER="owner@example.com"
+  IDENTITY_HEADER="Tailscale-User-Login"; AIRLOCK_OWNER="owner@fixture.dev"
   CODE_ROOT=""; FILEVIEW=false; REMOTE_HOSTS=""; ORCA_SHIM=""
   XAI=false
   REV="deadbeefcafe"
@@ -661,7 +661,7 @@ name = "RenderParity"
 
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 
 [paths]
 
@@ -708,7 +708,7 @@ name = "RenderParity"
 
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 
 [paths]
 
@@ -785,7 +785,7 @@ run_installer_path() {
   mkdir -p "$WDIR/home" "$WDIR/render" "$WDIR/code" "$WDIR/shim"
   CFG="$WDIR/airlock.toml"
   {
-    printf '[site]\nname = "RenderParity"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n\n'
+    printf '[site]\nname = "RenderParity"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n\n'
     printf '%s\n' "$extra_toml"
     printf '[apps.%s]\n' "$app"
     [ -z "$app_toml" ] || printf '%s\n' "$app_toml"
@@ -891,7 +891,7 @@ run_devmon_webhook_case() {
   mkdir -p "$WDIR/home/.config/airlock" "$WDIR/render" "$WDIR/shim"
   printf 'DEV_MONITOR_PROXY_SECRET=fixture-proxy-only\n' > "$WDIR/home/.config/airlock/dev-monitor.env"
   {
-    printf '[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n[apps.dev-monitor]\nmessages = true\n'
+    printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.dev-monitor]\nmessages = true\n'
     [ "$urgent" = set ] && printf 'slack_webhook_urgent_env = "DEVMON_FIXTURE_URGENT"\n'
     [ "$urgent" = missing ] && printf 'slack_webhook_urgent_env = "DEVMON_FIXTURE_MISSING"\n'
     [ "$routine" = set ] && printf 'slack_webhook_routine_env = "DEVMON_FIXTURE_ROUTINE"\n'
@@ -960,7 +960,7 @@ printf 'stale\n' > "$DMOFF/render/files-placeholder" 2>/dev/null || true
 cat > "$DMOFF/on.toml" <<'EOF'
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 [apps.dev-monitor]
 messages = true
 EOF
@@ -976,7 +976,7 @@ HOME="$DMOFF/home" AIRLOCK_CONFIG="$DMOFF/off.toml" AIRLOCK_TS_FQDN=box.example.
   bash "$ROOT/apps/dev-monitor/install.sh" >/dev/null 2>&1
 if [ "$(cat "$DMOFF/render/files/dev-monitor.env")" = "$(printf '%s\n' \
   '# generated owner gate for dev-monitor updates' \
-  'DEV_MONITOR_OWNER=owner@example.com' \
+  'DEV_MONITOR_OWNER=owner@fixture.dev' \
   'DEV_MONITOR_PROXY_SECRET=fixture-proxy-only')" ]; then
   ok "dev-monitor messages off retains only the updates owner gate"
 else
@@ -989,7 +989,7 @@ rm -rf "$DMOFF"
 for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_env; do
   DMBAD="$(mktemp -d)"; mkdir -p "$DMBAD/home/.config/airlock" "$DMBAD/render"
   {
-    printf '[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n[apps.dev-monitor]\nmessages = true\n'
+    printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.dev-monitor]\nmessages = true\n'
     printf '%s = "BAD\\nNAME"\n' "$dm_key"
   } > "$DMBAD/airlock.toml"
   dm_out="$(HOME="$DMBAD/home" AIRLOCK_CONFIG="$DMBAD/airlock.toml" \
@@ -1009,7 +1009,7 @@ for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_e
   DMBAD="$(mktemp -d)"; mkdir -p "$DMBAD/home/.config/airlock" "$DMBAD/render"
   printf 'DEV_MONITOR_PROXY_SECRET=fixture-proxy-only\n' > "$DMBAD/home/.config/airlock/dev-monitor.env"
   {
-    printf '[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n[apps.dev-monitor]\nmessages = true\n'
+    printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.dev-monitor]\nmessages = true\n'
     printf '%s = "DEVMON_BAD_VALUE"\n' "$dm_key"
   } > "$DMBAD/airlock.toml"
   dm_out="$(HOME="$DMBAD/home" AIRLOCK_CONFIG="$DMBAD/airlock.toml" \
@@ -1056,7 +1056,7 @@ run_devterm_shim_install() {
   fi
   {
     printf '[site]\nname = "RenderParity"\n\n'
-    printf '[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n\n'
+    printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n\n'
     printf '[apps.devterm]\n%s\n' "$app_toml"
   } > "$case_dir/airlock.toml"
   out="$(
@@ -1178,7 +1178,7 @@ paseo_memory_case() {
   mkdir -p "$WDIR/home" "$WDIR/render" "$WDIR/shim"
   CFG="$WDIR/airlock.toml"
   {
-    printf '[site]\nname = "RenderParity"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n\n'
+    printf '[site]\nname = "RenderParity"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n\n'
     printf '[apps.paseo]\n'
   } > "$CFG"
   while IFS= read -r cmd; do
@@ -1365,7 +1365,7 @@ paseo_bad_seam_case() {
   WDIR="$(mktemp -d)"; mkdir -p "$WDIR/home" "$WDIR/render" "$WDIR/shim"
   CFG="$WDIR/airlock.toml"
   {
-    printf '[site]\nname = "RenderParity"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@example.com"\n\n'
+    printf '[site]\nname = "RenderParity"\n\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n\n'
     printf '[apps.paseo]\n'
   } > "$CFG"
   while IFS= read -r cmd; do
@@ -1547,7 +1547,7 @@ name = "RenderParity"
 
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 
 [apps.hub]
 [apps.feedback]
@@ -1598,7 +1598,7 @@ name = "RenderParity"
 
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 
 [apps.hub]
 [apps.feedback]
@@ -1640,7 +1640,7 @@ name = "RenderParity"
 
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 
 [apps.hub]
 [apps.feedback]
@@ -1682,7 +1682,7 @@ name = "RenderParity"
 
 [auth]
 provider = "tailscale"
-owner = "owner@example.com"
+owner = "owner@fixture.dev"
 
 [apps.hub]
 [apps.orca]

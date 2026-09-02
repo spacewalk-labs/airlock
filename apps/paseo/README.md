@@ -133,18 +133,23 @@ Three properties are the design, not incidental:
   asked for here, and an unlisted key is 404 on every verb. A patched bundle cannot
   turn this into a general store for whatever upstream persists next.
 - **Local stays the fallback, not the loser.** The bundle patch reads the server
-  first and falls back to this device's own copy on 404 or on an unreachable
-  backend; writes go local first, then to the server. A box without the service, or
-  offline, behaves exactly like upstream instead of losing the order.
+  first and mirrors that value locally. Writes go through a local queue to a per-key
+  outbox immediately, independently of the serialized network queue; only a
+  successful 2xx for the newest
+  pending value clears it. A service outage therefore keeps the latest device order
+  and retries it when the device next reads, instead of letting an older server value
+  overwrite it after recovery.
 
-What it deliberately does NOT do: push. The store reads the server when the page
-loads and writes on every change, so a reorder on one device shows up on the next one
-at its next load — not live in an already-open tab. A live channel would mean holding
-a socket open for a list of strings; a reload is the cheaper convergence.
+What it deliberately does NOT do: push while a tab remains visible. The store reads
+the server when the page loads and whenever a hidden tab becomes visible again, and
+writes on every change. Switching back to Paseo on another device therefore updates
+the existing sidebar without a full page reload. A continuously live channel would
+mean holding a socket open for a list of strings and is not needed for device return.
 
-The patch itself is one anchor in the always-on group of
-`browse-host/bin/patch-web-ui.js` (`sidebar-order-shared-storage`) and swaps the
-storage of that ONE store — no other persisted state changes hands.
+The patch uses two anchors in the always-on group of
+`browse-host/bin/patch-web-ui.js`: `sidebar-order-shared-storage` swaps the storage of
+that ONE store, and `sidebar-order-rehydrate-on-visibility` refreshes it on device/tab
+return. No other persisted state changes hands.
 
 ## Files
 

@@ -142,7 +142,10 @@ font_size    = 15
 #                                            # Uses `opencode`; this is separate from Orca's Grok login.
 # claude_switch = ""                          # override: path to your own claude-switch CLI
 # claude_status = ""                          # override: path to your own claude-status probe
-# fleet_store     = ""                        # path to a shared usage-store file (optional, annotates usage)
+# fleet_store     = ""                        # path to a shared usage-store file (optional, annotates usage).
+#                                             # Written by an out-of-tree collector, not by devterm. A box
+#                                             # running claude-fleet: "~/.claude-accounts/.fleet-usage.json".
+#                                             # Unset on a box that HAS a collector = no per-account usage.
 # fleet_store_url = ""                        # URL of a shared usage store (optional; no host is hardcoded)
 # remote_hosts = "hostA,hostB"               # comma-separated ssh hosts whose tmux sessions also appear as tabs
 # orca_shim  = "~/.config/orca/linux-orca-cli-shim/orca"  # Orca CLI shim -> enables the worktree sidebar

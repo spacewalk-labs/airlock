@@ -46,10 +46,15 @@ CODEX_CAPTURE_TRIES = 20
 CODEX_CAPTURE_INTERVAL = 0.5
 CODEX_LOGOUT_TIMEOUT = 20
 
-# Shared binary discovery lives beside this platform CLI. Keeping the runtime
-# module with its consumers makes the checkout directly executable and avoids
-# any dependency on an app artifact directory.
+# Shared runtime modules live beside this platform CLI. Keeping them with their
+# consumers makes the checkout directly executable and avoids any dependency on an app
+# artifact directory. Executing this file puts bin/ on sys.path implicitly, but the
+# offline suites load it by absolute path, which does not — so say it explicitly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bin_discovery  # noqa: E402
+# The death-verdict marker protocol is shared with airlock-accounts-status: that tool
+# observes rejections during a status read, this one during a switch, and both list it.
+import account_health  # noqa: E402
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 TOKEN_ENDPOINTS = [
@@ -533,9 +538,13 @@ def _account_infos(with_usage=False):
     _ensure_pool()
     active = _get_active()
     infos = []
+    verdicts = {}
     for n in _pool_names():
         full = _load(_pool_path(n))
         o, meta = _oauth(full), (full.get("_meta") or {})
+        # Read only. This function must never write the pool: it runs in read-only
+        # sandboxes (see _ensure_pool), and `list` staying a pure reader is what lets it.
+        verdicts[n] = account_health.dead_marker(full)
         info = {
             "name": n,
             "email": meta.get("email"),   # display uses the real id, not a nickname
@@ -551,13 +560,26 @@ def _account_infos(with_usage=False):
         if with_usage:
             info["usage"] = _usage(o.get("accessToken", ""))
         infos.append(info)
-    # Health from refreshToken expiry — decidable without any API call. The 401-based
-    # verdict is the airlock-accounts-status probe's job.
+    # Two ways an account is known to be unusable, and both have to be here or the list
+    # reports healthy accounts that no switch can reach:
+    #   1. refreshToken expiry — decidable locally, no API call;
+    #   2. a recorded server rejection — a real HTTP 400/401 from a refresh attempt that
+    #      already happened (see account_health). A lineage can be revoked well before
+    #      its stored expiry, so (1) alone called four revoked accounts "ok" on a
+    #      migrated box while every switch to them failed.
+    # Nothing new is probed here: (2) is evidence collected elsewhere, only now kept.
     now = time.time()
     for info in infos:
-        info["health"] = ({"state": "dead", "since": now,
-                           "reason": "refreshToken expired — re-login required"}
-                          if not info["rtValid"] else {"state": "ok"})
+        verdict = verdicts.get(info["name"])
+        if not info["rtValid"]:
+            info["health"] = {"state": "dead", "since": now,
+                              "reason": "refreshToken expired — re-login required"}
+        elif verdict:
+            info["health"] = {"state": "dead",
+                              "since": verdict.get("since", now),
+                              "reason": verdict.get("reason", account_health.DEAD_REASON)}
+        else:
+            info["health"] = {"state": "ok"}
     return infos
 
 
@@ -598,9 +620,17 @@ def cmd_prune(yes=False):
     (1) a death verdict can be wrong, and deleting on a transient failure destroys a
         healthy credential, (2) a re-login revives the same slot anyway (name = id), so
         there is little to gain, (3) pool deletion is irreversible.
-    Dead accounts are already excluded from switching and show their reason in the UI."""
+    Dead accounts are already excluded from switching and show their reason in the UI.
+
+    Only expiry-based death is deletable. A recorded server rejection also renders as
+    dead, but it is a remote judgement that can be wrong in ways an expired date cannot
+    (an outage answering 400, a client-id problem, a lineage revoked for one box only),
+    and the cost of being wrong here is an irreversible credential deletion rather than a
+    red row. An expired refreshToken is arithmetic on a stored date and needs no such
+    caution."""
     _ensure_pool()
-    dead = [i for i in _account_infos() if i["health"]["state"] == "dead"]
+    dead = [i for i in _account_infos()
+            if i["health"]["state"] == "dead" and not i["rtValid"]]
     if not dead:
         print("  no dead accounts."); return
     for i in dead:
@@ -670,6 +700,13 @@ def _saveback():
     elif active:
         target = active   # identity lookup failed (offline/expired) -> old behaviour
         print("  warn: cannot identify live — saving back to the active slot", file=sys.stderr)
+        # This branch writes live's blob into a slot we could not confirm it belongs to,
+        # so anything in _meta may be about a different account. A transplanted death
+        # verdict would mark a healthy slot dead — and a dead verdict is what prune reads
+        # before deleting. Drop it: absence only costs us the next switch re-learning it.
+        creds = dict(creds)
+        creds["_meta"] = dict(creds.get("_meta") or {})
+        account_health.clear_dead_marker(creds)
     else:
         return
     try:
@@ -692,10 +729,21 @@ def _switch_core(name):
     o = _oauth(creds)
     if o.get("expiresAt", 0) / 1000 <= time.time() + REFRESH_IF_WITHIN_SEC:
         print(f"  '{name}' accessToken near expiry -> refreshing")
-        refreshed, _kind = refresh_creds(creds)
+        refreshed, kind = refresh_creds(creds)
         if refreshed:
+            # The server honoured this lineage: any recorded verdict is now wrong.
+            account_health.clear_dead_marker(creds)
             creds = refreshed
             _save_atomic(target, creds)  # keep the pool in step with the rotation
+        elif kind == "auth":
+            # The server rejected the refreshToken. Record it so the account list stops
+            # calling this slot healthy, then refuse — including when the accessToken is
+            # still valid for a few more minutes. Installing it anyway "succeeds" and
+            # then dies inside a session once that token runs out, with no refresh left
+            # to save it; the switch is the last moment we can say so cheaply.
+            account_health.mark_dead(target, creds)
+            die(f"'{name}': the server rejected this account's refresh token — re-login "
+                "required ('airlock-accounts login-url'). The slot is now listed as dead.")
         elif not _at_valid(o):
             die(f"'{name}': refresh failed and the accessToken is expired — re-login "
                 "required ('airlock-accounts login-url')")
