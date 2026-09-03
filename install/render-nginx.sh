@@ -26,6 +26,29 @@ WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
 CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
 IDENT="$(ident_var "$AIRLOCK_IDENTITY_HEADER")"
 
+# publish's dedicated document-view port is always present when the app is
+# enabled. Its broader tailnet-member tier is not: the shipped default is false,
+# which selects the exact same owner+collaborators map as the hub. A box opts in
+# with [apps.publish] tailnet_view = true. Only Tailscale Serve may reach this
+# loopback listener, so a non-empty identity header is an authenticated tailnet
+# identity rather than a client assertion (SECURITY.md, Trust model facts 1-3).
+PUBLISH_ENABLED=false
+PUBLISH_GATE="hub_ok"
+PUBLISH_HTTPS_PORT=""
+PUBLISH_GATE_PORT=""
+PUBLISH_SHARE_DIR=""
+if airlock_config apps | grep -qx publish; then
+  eval "$(airlock_config env publish)"
+  PUBLISH_ENABLED=true
+  PUBLISH_HTTPS_PORT="${AIRLOCK_PUBLISH_HTTPS_PORT:?publish https_port missing}"
+  PUBLISH_GATE_PORT="${AIRLOCK_PUBLISH_GATE_PORT:?publish gate_port missing}"
+  PUBLISH_SHARE_DIR="${AIRLOCK_PUBLISH_SHARE_DIR:?publish share_dir missing}"
+  PUBLISH_SHARE_DIR="${PUBLISH_SHARE_DIR/#\~/$HOME}"
+  if [ "${AIRLOCK_PUBLISH_TAILNET_VIEW:-false}" = true ]; then
+    PUBLISH_GATE="tailnet_ok"
+  fi
+fi
+
 # hub is reachable by owner + collaborators; privileged apps stay owner-only.
 hub_logins=("$AIRLOCK_OWNER")
 if [ -n "${AIRLOCK_COLLABORATORS:-}" ]; then
@@ -36,6 +59,9 @@ fi
 emit_connection_upgrade_map
 emit_identity_map hub_ok "${hub_logins[@]}"
 emit_identity_map owner_ok "$AIRLOCK_OWNER"
+if [ "$PUBLISH_ENABLED" = true ]; then
+  printf 'map $%s $tailnet_ok {\n    "" 0;\n    default 1;\n}\n' "$IDENT"
+fi
 
 # Plaintext entrance -> canonical https. `tailscale serve --http=<http_port>`
 # points at this loopback port (never at the hub server), so the hub is only ever
@@ -140,6 +166,54 @@ server {
     # gate above — fragments are plain proxies, no per-location guard needed.
     include @@CONFD@@/hub-locations.d/*.conf;
 }
+
+NGINX
+
+if [ "$PUBLISH_ENABLED" = true ]; then
+  PUBLISH_SHARE_SED="$(printf '%s' "$PUBLISH_SHARE_DIR" | sed 's/[\\&|]/\\&/g')"
+  sed -e "s/@@PORT@@/${PUBLISH_GATE_PORT}/g" \
+      -e "s/@@HTTPS_PORT@@/${PUBLISH_HTTPS_PORT}/g" \
+      -e "s/@@GATE@@/${PUBLISH_GATE}/g" \
+      -e "s|@@WEBROOT@@|${WEBROOT}|g" \
+      -e "s|@@SHARE@@|${PUBLISH_SHARE_SED}|g" <<'NGINX'
+# ==== Publish dedicated document-view gate ====
+# tailscale serve --https=@@HTTPS_PORT@@ targets this loopback server.
+server {
+    listen 127.0.0.1:@@PORT@@;
+    server_name _;
+
+    # The selector is hub_ok unless this box explicitly enables tailnet_view.
+    # Keep it at server rewrite phase so every document and asset path shares
+    # one guard and a later location cannot forget it.
+    if ($@@GATE@@ = 0) { return 403; }
+    error_page 403 @publish_denied;
+    location @publish_denied {
+        root @@WEBROOT@@;
+        default_type text/html;
+        if ($@@GATE@@ = 1) {
+            return 403 '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Resource forbidden</title></head><body><main><h1>Airlock cannot serve this resource</h1><p>Your access to this Airlock was verified, but the requested resource is forbidden.</p><p>This is not an Airlock ownership error. Check the resource access rules and every file and directory in its path.</p></main></body></html>';
+        }
+        rewrite ^ /wrong-owner.html break;
+    }
+
+    # Read-only document surface. The manager UI and /publish/api/ are
+    # deliberately absent from this server and fall through to the 404 below.
+    location /publish/files/ {
+        alias @@SHARE@@/;
+        autoindex on;
+        add_header Cache-Control "no-cache" always;
+    }
+    location /_assets/ {
+        alias @@SHARE@@/_assets/;
+        add_header Cache-Control "no-cache" always;
+    }
+    location / { return 404; }
+}
+# ==== End publish dedicated document-view gate ====
+NGINX
+fi
+
+sed -e "s|@@CONFD@@|${CONFD}|g" <<'NGINX'
 
 # separate-port owner gates (devterm, code-server, orca, paseo) drop server
 # fragments here as they are installed.

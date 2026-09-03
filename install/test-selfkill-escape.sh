@@ -112,6 +112,46 @@ out="$(detect '0::/user.slice/.../app.slice/airlock-paseo.service')"
 if [ -z "$out" ]; then ok "the loop guard makes a second pass a no-op"
 else bad "AIRLOCK_SELFKILL_ESCAPED should short-circuit; got: $out"; fi
 
+# ---------------------------------------------------------------- escape result
+# Keep this offline: the fake user manager and runner let us drive the status
+# contract without starting a real transient service from this Paseo session.
+fakebin="$TMP/fakebin"
+mkdir -p "$fakebin"
+cat >"$fakebin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+test "$1" = --user && test "$2" = show-environment
+EOF
+cat >"$fakebin/systemd-run" <<'EOF'
+#!/usr/bin/env bash
+exit "${AIRLOCK_SELFKILL_TEST_RUNNER_RC:?}"
+EOF
+chmod +x "$fakebin/systemctl" "$fakebin/systemd-run"
+
+escape_result() {  # escape_result <runner-rc> <command...>
+  local runner_rc="$1"
+  shift
+  printf '%s\n' '0::/user.slice/user-1001.slice/user@1001.service/app.slice/airlock-paseo.service' >"$TMP/cgroup"
+  PATH="$fakebin:$PATH" \
+  AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup" \
+  AIRLOCK_SELFKILL_SYSTEMD_RUN="$fakebin/systemd-run" \
+  AIRLOCK_SELFKILL_TEST_RUNNER_RC="$runner_rc" \
+    bash -c '. "$AIRLOCK_ROOT/install/lib.sh"; airlock_escape_selfkill_cgroup "$@"' -- "$@" 2>&1
+}
+
+out="$(escape_result 3 /bin/false)"; rc=$?
+if [ "$rc" -eq 3 ]; then
+  ok "escaped command rc=3 is returned to the caller"
+else
+  bad "escaped command rc=3 must be returned (got rc=$rc; output: $out)"
+fi
+
+out="$(escape_result 127 /bin/true)"; rc=$?
+if [ "$rc" -eq 0 ] && [[ "$out" == *"could not move out"*"continuing in"* ]]; then
+  ok "runner rc=127 falls back to the in-place branch"
+else
+  bad "runner rc=127 must fall back in place (got rc=$rc; output: $out)"
+fi
+
 # ---------------------------------------------------------------- live
 # The half that actually proves the defect is fixed. Needs a user manager.
 if ! systemctl --user show-environment >/dev/null 2>&1 || ! command -v systemd-run >/dev/null 2>&1; then

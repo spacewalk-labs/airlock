@@ -142,7 +142,12 @@ NGINX
         if ($@@MAP@@ = 0) { return 403; }
         proxy_pass http://@@UPSTREAM@@;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        # $http_host, NOT $host: $host strips the port, and these gates sit behind a
+        # `tailscale serve` entrance on a non-443 port. An upstream that compares the
+        # browser's Origin (which always carries the port) against Host would then see
+        # a mismatch on every same-origin request — devterm's account/secret write
+        # guard answered 403 "forbidden origin" to the owner's own page because of it.
+        proxy_set_header Host $http_host;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_read_timeout 86400s;

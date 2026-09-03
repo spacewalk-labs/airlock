@@ -244,6 +244,23 @@ def main(argv):
         check("인자를 안 주면 off 로 렌더된다",
               'Environment="AIRLOCK_LEARNING_REPO_SYNC=off"' in omitted)
 
+        # --- 11. every backend module the app ships is actually installed ---
+        # 🔴 The copy list is written by hand, and a file missing from it does not
+        #    degrade the feature — the module that imports it fails at load, so the
+        #    server AND the worker crash-loop. Measured 2026-09-02: git_sync.py was
+        #    added, every suite stayed green, and the live box came back with
+        #    `FileNotFoundError ... git_sync.py` on both units. Nothing else looks at
+        #    this list, so nothing else can catch the next omission.
+        installer = open(os.path.join(root, "apps/learning/install.sh"),
+                         encoding="utf-8").read()
+        backend_dir = os.path.join(root, "apps/learning/backend")
+        shipped = sorted(n for n in os.listdir(backend_dir) if n.endswith(".py"))
+        missing = [n for n in shipped if f'"$HERE/backend/{n}"' not in installer]
+        check("설치기가 backend 의 모든 .py 를 깐다", not missing, str(missing))
+        # 양성 대조군 — 대조기가 살아 있나. 없으면 위의 "없다" 는 측정이 아니다.
+        check("대조기 양성 대조군이 잡힌다",
+              "definitely-not-shipped.py" not in installer and bool(shipped))
+
         # --- 11. the installer refuses a value it does not understand -------
         manifest = open(os.path.join(root, "apps/learning/airlock-app.toml"),
                         encoding="utf-8").read()

@@ -156,7 +156,14 @@ font_size    = 15
 filebrowser_port = 19921
 
 [apps.publish]
+https_port = 19920  # dedicated document-view port
 backend_port = 19922
+gate_port    = 19925  # loopback nginx document gate
+# false (default): owner + collaborators only, matching the hub.
+# true: any identity authenticated by this box's Tailscale Serve ingress may
+# read /publish/files/ and /_assets/ on https_port. The manager UI and every
+# upload/delete API stay on the hub gate either way.
+tailnet_view = false
 # share_dir  = "~/public_html"   # the static-share directory this manages/serves
 # Optional external publishing. Omit this table = share manager only (the
 # external-publish buttons stay hidden). Two modes:

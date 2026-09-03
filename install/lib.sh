@@ -526,14 +526,15 @@ airlock_escape_selfkill_cgroup() {
   # --wait blocks here for the exit status, so an operator watching a terminal still
   # gets one. It is only this waiter that is fragile: if the caller dies, the service
   # keeps running and finishes the install, which is the whole point.
-  if "$runner" --user --unit="$esc_unit" --service-type=exec --collect --quiet --wait \
-       --same-dir \
-       --setenv=AIRLOCK_SELFKILL_ESCAPED=1 \
-       -- bash "$@"; then
+  local rc=0
+  "$runner" --user --unit="$esc_unit" --service-type=exec --collect --quiet --wait \
+    --same-dir \
+    --setenv=AIRLOCK_SELFKILL_ESCAPED=1 \
+    -- bash "$@" || rc=$?
+  if [ "$rc" -eq 0 ]; then
     log "  escaped run finished (unit ${esc_unit})"
     exit 0
   fi
-  local rc=$?
   # Past the manager probe above, a failure here is the escaped install's own exit
   # status, so it is reported as the run's result. 126/127 stay carved out: those
   # mean the command never started, which is this guard's problem, not the install's.

@@ -139,6 +139,11 @@ else
   install -m644 "$HERE/backend/ingest_runner.py"    "$APP_DIR_LOCAL/backend/ingest_runner.py"
   install -m644 "$HERE/backend/save_document.py"   "$APP_DIR_LOCAL/backend/save_document.py"
   install -m644 "$HERE/backend/providers.py"       "$APP_DIR_LOCAL/backend/providers.py"
+  # 🔴 이 목록에서 빠진 백엔드 파일은 "그 기능만 안 되는" 것이 아니다. 다른 모듈이
+  #    import 하는 순간 **앱 전체가 안 뜬다** — 실측 2026-09-02: git_sync.py 를 여기
+  #    적지 않고 배포해 서버·워커가 둘 다 크래시 루프에 들어갔고, 렌더도 CI 도
+  #    초록이었다. 아래 스위트가 이 목록과 backend/ 실물을 대조한다.
+  install -m644 "$HERE/backend/git_sync.py"        "$APP_DIR_LOCAL/backend/git_sync.py"
   # 플랫폼 선택 규칙의 vendored 사본. providers.py 가 **파일 경로로** 읽으므로 같은
   # 디렉터리에 있어야 한다 — 빠뜨리면 백엔드가 임포트에서 죽고, 그때는 "적재가 안 된다"
   # 가 아니라 앱 전체가 안 뜬다. bin/agent_provider.py 와 바이트 동일성은

@@ -2503,7 +2503,8 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
 
     both matched as whole tokens — dynamically-constructed names are a stated
     limitation of the lint. Scope:
-    the package root only; regular files <= 1 MiB that decode as UTF-8
+    the package root plus an explicit, package-scoped list of platform-owned
+    consumers; regular files <= 1 MiB that decode as UTF-8
     (decode failure = binary = skipped); symlinks (file or dir) not followed;
     README*, docs/, and *.md are excluded (examples are not reads). The
     mechanical whole-table env export never counts as a read."""
@@ -2675,7 +2676,19 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
     env_re = re.compile(r"\bAIRLOCK_" + re.escape(envid) + r"_([A-Z0-9_]+)\b")  # noqa: regex-anchor
     read_scalars, read_tables = set(), set()
     port_read_scalars, port_read_tables = set(), set()
-    for dirpath, dirnames, filenames in os.walk(pdir, followlinks=False):
+    platform_root = Path(__file__).resolve().parent.parent
+
+    def _scan_walk():
+        yield from os.walk(pdir, followlinks=False)
+        # publish's dedicated read-only gate is rendered by the platform core,
+        # not the package lifecycle. Keep that exceptional consumer explicit:
+        # scanning every core file for every package would let an unrelated
+        # token satisfy a package's listener-ownership proof.
+        if pid == "publish":
+            consumer = platform_root / "install" / "render-nginx.sh"
+            yield str(consumer.parent), [], [consumer.name]
+
+    for dirpath, dirnames, filenames in _scan_walk():
         if Path(dirpath) == pdir:
             # docs/ is excluded at the PACKAGE ROOT only — a nested docs
             # directory is ordinary package content and stays scanned (the
@@ -2712,7 +2725,10 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
             # (a plain removal would shift every later diagnostic up by one
             # per preceding continuation).
             text = text.replace("\\\n", "\x00")
-            where = str(fp.relative_to(pdir))
+            try:
+                where = str(fp.relative_to(pdir))
+            except ValueError:
+                where = f"<platform>/{fp.relative_to(platform_root)}"
             port_runtime_site = (
                 not fname.startswith(".")
                 and (

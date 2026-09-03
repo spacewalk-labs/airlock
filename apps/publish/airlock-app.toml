@@ -30,8 +30,13 @@ runtime_env = [
 ]
 
 [config.defaults]
+https_port = 19920
 backend_port = 19922
+gate_port = 19925
 share_dir = "/opt/airlock/share"
+# A box may opt into the tailnet-member document-view tier. False keeps the
+# dedicated port behind the existing owner+collaborators gate.
+tailnet_view = false
 
 [config.tables.public_target]
 allowed_keys = ["mode", "ingest_url", "base_url", "token_env", "public_dir",
@@ -76,13 +81,17 @@ note = "Shared directory setup"
 # wouldn't catch it): ~/.local/state/airlock/publish-public.json (inside
 # AIRLOCK_STATE_DIR — platform state, not an app artifact), /opt/airlock/
 # share* (share_dir/public_dir/gated_dir), the htpasswd auth directory, and
-# ~/uploads. No serve_ports: backend_port is proxied by the hub's own
-# nginx, never tailscale-served directly.
+# ~/uploads. The dedicated HTTPS surface targets the read-only nginx server on
+# gate_port; backend_port remains loopback-only behind the hub manager/API.
 [artifacts]
 units = ["airlock-publish.service", "airlock-publish-cleanup.service",
          "airlock-publish-cleanup.timer"]
 fragments = ["hub-locations.d/publish.conf", "public-includes.d/publish-gated.conf"]
 webroot = ["publish/index.html"]
+serve_ports = ["https_port"]
+
+[serve.https]
+https_port = "gate_port"
 
 # From hub/index.html's APPS table (publish row).
 [tile]

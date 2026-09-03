@@ -414,6 +414,19 @@ for SET in accounts-off accounts-on; do
   # the fixture names a webroot path rather than leaving a port to be read as one.
   f="$(out_file)"; render_to "$f" render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR"
   golden_check_file "devterm/$SET/nginx.conf" "$f"
+
+  # The gate must forward the client Host VERBATIM. nginx's $host drops the port, and
+  # the devterm backend's write guard (_secret_origin_ok) compares the browser Origin
+  # -- which always carries the port -- against Host. Behind the non-443 `tailscale
+  # serve` entrance, $host therefore made every same-origin account/secret write from
+  # the owner's own page answer 403 "forbidden origin". The golden above pins the
+  # bytes; this pins the reason, so a future rewrite cannot regen the defect back in.
+  if grep -q 'proxy_set_header Host \$http_host;' "$f" \
+     && ! grep -q 'proxy_set_header Host \$host;' "$f"; then
+    ok "devterm/$SET: gate forwards the client Host verbatim (port survives to the origin guard)"
+  else
+    bad "devterm/$SET: gate must send Host \$http_host — \$host strips the port and the backend answers 403 forbidden origin"
+  fi
 done
 
 # ===========================================================================
@@ -704,6 +717,70 @@ else
   sed 's/^/    /' "$NGTMP/site.err"
 fi
 
+# tailnet_view changes only the selector inside publish's dedicated server. It
+# must not rewrite the allowlist-backed map or the hub server it protects.
+# Extract the two brace-delimited blocks from off/on renders and compare bytes;
+# a grep for a line or two would miss a moved/relaxed guard elsewhere in either
+# block. The fixture's identity header is fixed by the Tailscale provider.
+NGONCFG="$NGTMP/airlock-tailnet-on.toml"
+sed '/^\[apps.publish\]$/a tailnet_view = true' "$NGCFG" > "$NGONCFG"
+(
+  export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGONCFG" AIRLOCK_WEBROOT="$NGTMP/web" \
+         AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
+  bash "$ROOT/install/render-nginx.sh"
+) > "$NGTMP/site-tailnet-on.conf" 2> "$NGTMP/site-tailnet-on.err"
+extract_hub_contract() {
+  python3 - "$1" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+for token, opener in (
+    ("map $http_tailscale_user_login $hub_ok {", "map "),
+    ("listen 127.0.0.1:19902;", "server {"),
+):
+    pos = text.index(token)
+    start = text.rfind(opener, 0, pos + 1)
+    if start < 0:
+        raise SystemExit(f"could not find block opener for {token!r}")
+    depth = 0
+    opened = False
+    for end in range(start, len(text)):
+        if text[end] == "{":
+            depth += 1
+            opened = True
+        elif text[end] == "}":
+            depth -= 1
+            if opened and depth == 0:
+                end += 1
+                if end < len(text) and text[end] == "\n":
+                    end += 1
+                sys.stdout.write(text[start:end])
+                break
+    else:
+        raise SystemExit(f"unterminated block for {token!r}")
+PY
+}
+extract_hub_contract "$NGTMP/site.conf" > "$NGTMP/hub-off.contract"
+extract_hub_contract "$NGTMP/site-tailnet-on.conf" > "$NGTMP/hub-on.contract"
+if cmp -s "$NGTMP/hub-off.contract" "$NGTMP/hub-on.contract"; then
+  ok "publish tailnet view: hub_ok map and hub server are byte-identical off/on"
+else
+  bad "publish tailnet view: enabling the dedicated tier changed hub_ok or the hub server"
+  diff -u "$NGTMP/hub-off.contract" "$NGTMP/hub-on.contract" | head -n 40 | sed 's/^/    /'
+fi
+if sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
+     "$NGTMP/site.conf" | grep -qF 'if ($hub_ok = 0)'; then
+  ok "publish tailnet view: shipped default keeps the dedicated port on hub_ok"
+else
+  bad "publish tailnet view: shipped default is not hub_ok (tailnet-wide trust must default off)"
+fi
+if sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
+     "$NGTMP/site-tailnet-on.conf" | grep -qF 'if ($tailnet_ok = 0)'; then
+  ok "publish tailnet view: box opt-in selects the non-empty tailnet identity tier"
+else
+  bad "publish tailnet view: box opt-in did not select tailnet_ok"
+fi
+
 # The golden above pins bytes; this live matrix pins meaning. The regression this
 # guards was invisible to nginx -t: a filesystem 403 from publish's alias inherited
 # the server-level error_page and therefore rendered the identity-denial page. A
@@ -723,12 +800,21 @@ elif [[ "$CURL_HELP" != *"--unix-socket"* ]]; then
   bad "nginx 403 provenance e2e: curl with --unix-socket is required"
 else
   NGE2E_CFG="$NGTMP/airlock-e2e.toml"
-  sed '/owner = "owner@fixture.dev"/a collaborators = ["friend@fixture.dev"]' "$NGCFG" > "$NGE2E_CFG"
+  sed -e '/owner = "owner@fixture.dev"/a collaborators = ["friend@fixture.dev"]' \
+      -e "/^\[apps.publish\]$/a share_dir = \"$NGTMP/share\"" \
+      "$NGCFG" > "$NGE2E_CFG"
+  NGE2E_ON_CFG="$NGTMP/airlock-e2e-tailnet-on.toml"
+  sed '/^\[apps.publish\]$/a tailnet_view = true' "$NGE2E_CFG" > "$NGE2E_ON_CFG"
+  (
+    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_ON_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
+           AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
+    bash "$ROOT/install/render-nginx.sh"
+  ) > "$NGTMP/e2e-site.conf" 2> "$NGTMP/e2e-site.err"
   (
     export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
            AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
     bash "$ROOT/install/render-nginx.sh"
-  ) > "$NGTMP/e2e-site.conf" 2> "$NGTMP/e2e-site.err"
+  ) > "$NGTMP/e2e-site-tailnet-off.conf" 2> "$NGTMP/e2e-site-tailnet-off.err"
 
   mkdir -p "$NGTMP/share" "$NGTMP/private" "$NGTMP/cbt" "$NGTMP/pt" \
     "$NGTMP/ft" "$NGTMP/ut" "$NGTMP/st"
@@ -747,7 +833,12 @@ else
 
   sed -e "s|listen 127.0.0.1:19902;|listen unix:$NGSOCKDIR/hub.sock;|" \
       -e "s|listen 127.0.0.1:19903;|listen unix:$NGSOCKDIR/redirect.sock;|" \
+      -e "s|listen 127.0.0.1:19925;|listen unix:$NGSOCKDIR/publish-on.sock;|" \
       "$NGTMP/e2e-site.conf" > "$NGTMP/e2e-site-unix.conf"
+  sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
+      "$NGTMP/e2e-site-tailnet-off.conf" \
+    | sed -e "s|listen 127.0.0.1:19925;|listen unix:$NGSOCKDIR/publish-off.sock;|" \
+      > "$NGTMP/e2e-publish-tailnet-off.conf"
   {
     [ "$(id -u)" -ne 0 ] || echo 'user nobody;'
     echo "pid $NGTMP/e2e-nginx.pid;"
@@ -762,6 +853,7 @@ else
     echo "  uwsgi_temp_path $NGTMP/ut;"
     echo "  scgi_temp_path $NGTMP/st;"
     cat "$NGTMP/e2e-site-unix.conf"
+    cat "$NGTMP/e2e-publish-tailnet-off.conf"
     echo '}'
   } > "$NGTMP/e2e-nginx.conf"
 
@@ -773,7 +865,10 @@ else
     NGINX_PARITY_PID=$!
     NGINX_READY=0
     for ((attempt = 0; attempt < 50; attempt++)); do
-      if [ -S "$NGSOCKDIR/hub.sock" ] && kill -0 "$NGINX_PARITY_PID" 2>/dev/null; then
+      if [ -S "$NGSOCKDIR/hub.sock" ] \
+        && [ -S "$NGSOCKDIR/publish-on.sock" ] \
+        && [ -S "$NGSOCKDIR/publish-off.sock" ] \
+        && kill -0 "$NGINX_PARITY_PID" 2>/dev/null; then
         NGINX_READY=1
         break
       fi
@@ -789,6 +884,62 @@ else
           --unix-socket "$NGSOCKDIR/hub.sock" -H "Tailscale-User-Login: $login" \
           --output "$body" --write-out '%{http_code}' "http://localhost$path" 2> "$body.err" || true
       }
+
+      publish_get() {
+        local socket="$1" login="$2" path="$3" body="$4"
+        local -a headers=()
+        [ "$login" = __NO_HEADER__ ] || headers=(-H "Tailscale-User-Login: $login")
+        curl --silent --show-error --path-as-is --max-time 5 \
+          --unix-socket "$socket" "${headers[@]}" \
+          --output "$body" --write-out '%{http_code}' "http://localhost$path" 2> "$body.err" || true
+      }
+
+      publish_post() {
+        local socket="$1" login="$2" path="$3" body="$4"
+        curl --silent --show-error --path-as-is --max-time 5 \
+          --unix-socket "$socket" -H "Tailscale-User-Login: $login" \
+          -H 'Content-Type: application/json' --data '{}' \
+          --output "$body" --write-out '%{http_code}' "http://localhost$path" 2> "$body.err" || true
+      }
+
+      status="$(publish_get "$NGSOCKDIR/publish-off.sock" stranger@fixture.dev \
+        /publish/files/readable.html "$NGTMP/publish-off-stranger.body")"
+      if [ "$status" = 403 ] && grep -qF "This isn't your Airlock" "$NGTMP/publish-off-stranger.body"; then
+        ok "publish tailnet view: flag=false denies a non-allowlisted identity on the dedicated port"
+      else
+        bad "publish tailnet view: flag=false stranger returned $status or bypassed hub_ok"
+      fi
+
+      status="$(publish_get "$NGSOCKDIR/publish-on.sock" __NO_HEADER__ \
+        /publish/files/readable.html "$NGTMP/publish-on-no-header.body")"
+      if [ "$status" = 403 ] && grep -qF "This isn't your Airlock" "$NGTMP/publish-on-no-header.body"; then
+        ok "publish tailnet view: flag=true still denies a request with no identity header"
+      else
+        bad "publish tailnet view: missing identity header returned $status or passed"
+      fi
+
+      status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        /publish/files/readable.html "$NGTMP/publish-on-member.body")"
+      if [ "$status" = 200 ] && grep -qx READABLE "$NGTMP/publish-on-member.body"; then
+        ok "publish tailnet view: flag=true admits an arbitrary non-empty tailnet identity to a document"
+      else
+        bad "publish tailnet view: authenticated tailnet member document returned $status"
+      fi
+
+      manager_status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        /publish/ "$NGTMP/publish-on-manager.body")"
+      list_status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        /publish/api/list "$NGTMP/publish-on-list.body")"
+      upload_status="$(publish_post "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        /publish/api/upload-file "$NGTMP/publish-on-upload.body")"
+      delete_status="$(publish_post "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        /publish/api/unpublish-direct "$NGTMP/publish-on-delete.body")"
+      if [ "$manager_status" = 404 ] && [ "$list_status" = 404 ] \
+        && [ "$upload_status" = 404 ] && [ "$delete_status" = 404 ]; then
+        ok "publish tailnet view: manager UI and list/upload/delete APIs are absent from the dedicated port"
+      else
+        bad "publish tailnet view: dedicated port exposed manager=$manager_status list=$list_status upload=$upload_status delete=$delete_status"
+      fi
 
       status="$(hub_get friend@fixture.dev /publish/files/readable.html "$NGTMP/friend-readable.body")"
       if [ "$status" = 200 ] && grep -qx READABLE "$NGTMP/friend-readable.body"; then

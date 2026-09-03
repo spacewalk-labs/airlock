@@ -31,6 +31,7 @@ ok: config valid
 [airlock] wrote nginx fragment: TMP/confd/hub-locations.d/publish.conf
 [airlock] [dry] remove disabled nginx gated fragments
 [airlock] publish installed (owner: owner@fixture.dev; external target: <none, share-manager only>)
+[dry] sudo tailscale serve --bg --https=19920 http://127.0.0.1:19925
 [airlock] [dry] installing packaged app: notepad (ROOT/apps/notepad) (shipped app — dry run executes)
 [airlock] [dry] install notepad.html -> TMP/web/notepad/index.html
 [airlock] notepad installed (owner: owner@fixture.dev)

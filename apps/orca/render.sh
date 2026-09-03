@@ -169,6 +169,12 @@ render_orca_nginx_extra() {
         proxy_set_header Connection \$connection_upgrade;
         proxy_read_timeout 86400s;
         # WS-safe: no X-Forwarded-* (orca verifies Origin).
+        # Host stays \$host here, unlike the shared gate above, which sends
+        # \$http_host. This exact-/ location IS orca's websocket route (see the
+        # \$orca_redir map: an Upgrade request falls through to the proxy), and
+        # orca's own Origin verification lives outside this repo — so the entrance
+        # authority it is handed is not something to change without a live
+        # handshake test. The split is deliberate; do not "unify" it blind.
     }
     location = /web-index.html {
         absolute_redirect off;
