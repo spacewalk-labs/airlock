@@ -156,7 +156,14 @@ if PATH="$INSTALL_BIN:$PATH" HOME="$TMP/remote-home" AIRLOCK_DRY_RUN=0 AIRLOCK_C
   AIRLOCK_CONFD="$LOCAL_CONFD" AIRLOCK_WEBROOT="$TMP/remote-web" \
   AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
   bash "$ROOT/apps/publish/install.sh" >"$TMP/remote-publish.log" 2>&1; then
-  [ ! -e "$GATED_FRAGMENT" ] && ok "remote install retracts the gated fragment" || bad "remote install left gated fragment active"
+  # Retraction is "serves nothing", not "is gone". The operator's own public server
+  # block includes this path (README), so removing the file makes nginx refuse to
+  # load the whole configuration — silently, until the next reload or restart.
+  if [ -f "$GATED_FRAGMENT" ]; then ok "remote install leaves the operator's include resolvable"
+  else bad "remote install removed the fragment an operator include points at"; fi
+  if [ -f "$GATED_FRAGMENT" ] && ! grep -qE '^[[:space:]]*(location|auth_basic)' "$GATED_FRAGMENT"; then
+    ok "remote install retracts the gated fragment (no directives left)"
+  else bad "remote install left gated fragment active"; fi
 else
   bad "remote publish installer failed"; sed 's/^/    /' "$TMP/remote-publish.log"
 fi

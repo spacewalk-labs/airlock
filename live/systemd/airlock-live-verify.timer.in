@@ -1,5 +1,6 @@
 [Unit]
 Description=airlock — weekly full-tree install on a disposable container
+X-Airlock-Owner=airlock-live
 
 [Timer]
 OnCalendar=@ONCALENDAR@

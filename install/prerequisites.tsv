@@ -3,6 +3,7 @@
 # (coreutils, grep, sed, and awk) are platform assumptions. Hub has no additional
 # app-specific package. The shared smoke/serve frontend check uses curl.
 core	python3	major-gte	3.11	sudo apt-get update && sudo apt-get install -y python3	Configuration bootstrap
+core	git	present	-	sudo apt-get update && sudo apt-get install -y git	Updates and repository-aware tools
 core	nginx	present	-	sudo apt-get update && sudo apt-get install -y nginx	HTTP frontend
 core	sudo	present	-	su -c 'apt-get update && apt-get install -y sudo'	Privilege escalation
 core	systemctl	present	-	sudo apt-get update && sudo apt-get install -y systemd	Service management

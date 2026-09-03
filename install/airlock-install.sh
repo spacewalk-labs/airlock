@@ -402,6 +402,17 @@ AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-secret-timer.sh" install
 log "installing platform update detector timer"
 AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-update-timer.sh" install
 
+# 1d) Retire platform units this tree no longer declares. Runs AFTER the installs above,
+# so a failure up there aborts (set -e) before anything is swept — the declared set is
+# only trustworthy once it has actually been written. The list below is this installer's
+# complete platform unit set; adding a unit above without adding it here deletes it on the
+# next run, which is what the test's "declared units survive" control is for.
+# live/systemd/* is a different owner and a different installer (live/install-timer.sh) —
+# see airlock_sweep_platform_units for why the marker names one.
+airlock_sweep_platform_units airlock-install \
+  airlock-secret-sweep.service airlock-secret-sweep.timer \
+  airlock-update-detect.service airlock-update-detect.timer
+
 # 2) enabled app installers (each drops its own nginx fragment into $CONFD/*)
 # Child 4/P3: validate already refused any enabled app that is neither hub
 # nor a resolvable package (shipped or explicit) — pkg_dir is unconditionally

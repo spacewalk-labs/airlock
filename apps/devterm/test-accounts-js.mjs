@@ -725,6 +725,64 @@ check('P3 shared account buttons retain the Claude warning selector contract',
       !appSource.includes("'Subscription accounts'")
       && appSource.includes("'Switch account / subscriptions'"));
 
+// The API base. accounts.js calls paths relative to its document's directory rather
+// than a hard-coded "/", so the panel can move under a prefix without a second source
+// of truth for the route names. The first two cases are today's hosts and must keep
+// producing exactly the paths the backend already dispatches on — this is the control
+// that the refactor changed nothing — and the third is the shape the move needs.
+function firstFetchPathFor(pathname) {
+  let seen = null;
+  const ctx = {
+    window: {},
+    location: { pathname },
+    document: {
+      createElement: () => makeElement('div'),
+      querySelectorAll: () => [],
+      body: makeElement('body'),
+    },
+    setInterval: () => 0,
+    setTimeout: () => 0,
+    fetch: (url) => { if (seen === null) seen = url; return new Promise(() => {}); },
+  };
+  vm.createContext(ctx);
+  vm.runInContext(source, ctx);
+  ctx.window.initAccounts({
+    flash() {}, postJson: () => new Promise(() => {}),
+    mkFocus() {}, closeTabPops() {}, placePop() {},
+  }).startAcctIconWatch();
+  return seen;
+}
+
+// The behavioural cases above only exercise the FIRST fetch (/acct-alert), so on their
+// own they would pass with the other nineteen call sites left hard-coded — measured:
+// reverting acct-switch, xai-status, codex-login-start or accounts to a root-absolute
+// path kept every check green. This is the invariant that covers all of them at once.
+const hardCoded = [...source.matchAll(/\b(?:fetch|postJson)\('\/[a-z0-9-]+/g)].map((m) => m[0]);
+check(`API base: no call site hard-codes a root-absolute API path${hardCoded.length ? ` (found: ${hardCoded.join(', ')})` : ''}`,
+      hardCoded.length === 0);
+const throughBase = [...source.matchAll(/\b(?:fetch|postJson)\(API \+ '/g)];
+check(`API base: every network call site goes through the base (${throughBase.length} sites)`,
+      throughBase.length >= 20);
+
+check('API base: devterm terminal page (served at /) still calls /acct-alert',
+      firstFetchPathFor('/') === '/acct-alert');
+check('API base: panel at the gate root still calls /acct-alert',
+      firstFetchPathFor('/panel.html') === '/acct-alert');
+check('API base: a panel under a prefix calls the API under that same prefix',
+      firstFetchPathFor('/airlock-accounts/panel.html') === '/airlock-accounts/acct-alert');
+// A missing `location` must not throw the file on load — some hosts (and this
+// harness's other cases) have none.
+check('API base: an absent location falls back to the origin root',
+      (() => {
+        const ctx = { window: {}, document: { createElement: () => makeElement('div'),
+                     querySelectorAll: () => [], body: makeElement('body') },
+                     setInterval: () => 0, setTimeout: () => 0,
+                     fetch: () => new Promise(() => {}) };
+        vm.createContext(ctx);
+        vm.runInContext(source, ctx);
+        return typeof ctx.window.initAccounts === 'function';
+      })());
+
 if (failures.length) {
   console.error(`\nFAILED: ${failures.join(', ')}`);
   process.exitCode = 1;

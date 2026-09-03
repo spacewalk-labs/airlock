@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Airlock</vendor>
+  <vendor_url>https://github.com/spacewalk-labs/airlock</vendor_url>
+  <action id="org.airlock.installer.run">
+    <description>Airlock 설치</description>
+    <message>Airlock 설치에 관리자 권한이 필요합니다.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/airlock-gui-installer-helper</annotate>
+  </action>
+</policyconfig>

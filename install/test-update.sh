@@ -63,11 +63,18 @@ seed_tree() {   # seed_tree <dir> <marker>
 }
 
 REL="$scratch/release"
-seed_tree "$REL" new
-printf 'brand new file\n' > "$REL/NOTICE"
+seed_tree "$REL" old
+printf 'airlock.toml\n' > "$REL/.gitignore"
 git -C "$REL" init -q -b main
 git -C "$REL" add -A
-git -C "$REL" commit -q -m "release"
+git -C "$REL" commit -q -m "release old-ignore"
+seed_tree "$REL" old
+git -C "$REL" add -A
+git -C "$REL" commit -q -m "release old"
+seed_tree "$REL" new
+printf 'brand new file\n' > "$REL/NOTICE"
+git -C "$REL" add -A
+git -C "$REL" commit -q -m "release new"
 
 # The installed box, in the shape the install guide actually produces: the tree at an
 # older revision, `git init`ed and committed (their own repository, no remote to us),
@@ -134,6 +141,26 @@ if [ -n "$sha2b" ]; then
     || bad "the operator's uncommitted edit was overwritten and is unrecoverable"
 else
   bad "no undo revision printed for a box with uncommitted work"
+fi
+
+# A committed operator edit must not erase the older release provenance.  The local
+# repo is theirs; direction recovery walks its history instead of demanding that the
+# newest local commit still be byte-identical to a public release.
+make_box "$BOX"
+printf 'version old, then committed by operator\n' >"$BOX/README.md"
+git -C "$BOX" add README.md
+git -C "$BOX" commit -q -m "operator note"
+committed_json="$(AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$REL" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/committed-edit.err")"; committed_json_rc=$?
+if [ "$committed_json_rc" = 0 ] && printf '%s' "$committed_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is True, value
+assert value["changedCount"] > 0, value
+'; then
+  ok "a committed operator edit keeps its older release provenance"
+else
+  bad "a committed operator edit made a forward release ambiguous: $committed_json"
 fi
 
 # ---------------------------------------------------------------- 2c) REVIEW: a failed
@@ -271,6 +298,248 @@ assert len(value["ref"]) == 40 and all(c in "0123456789abcdef" for c in value["r
 [ "$json_rc" = 0 ] && [ "$json_check_rc" = 0 ] \
   && ok "--dry-run --json is a clean machine result on a non-git checkout" \
   || bad "--dry-run --json was not the detector contract (update=$json_rc json=$json_check_rc): $json_out"
+
+# ------------------------------------------------------ 4b) release direction
+# A content diff is symmetric: an older release differs from the installed tree just
+# as a newer one does.  The updater must use release provenance, not changed files, to
+# decide whether a badge/action is an update.  Keep the release commits in the box's
+# object store, as a real prior airlock-update does, but make the operator's HEAD an
+# unrelated safety commit — that is the installed checkout contract.
+DIRECTION_REL="$scratch/direction-release"
+seed_tree "$DIRECTION_REL" release-old
+git -C "$DIRECTION_REL" init -q -b main
+git -C "$DIRECTION_REL" add -A
+git -C "$DIRECTION_REL" commit -q -m "release from test-source @ 1111111"
+direction_old="$(git -C "$DIRECTION_REL" rev-parse HEAD)"
+seed_tree "$DIRECTION_REL" release-current
+git -C "$DIRECTION_REL" add -A
+git -C "$DIRECTION_REL" commit -q -m "release from test-source @ 2222222"
+direction_current="$(git -C "$DIRECTION_REL" rev-parse HEAD)"
+git -C "$DIRECTION_REL" merge-base --is-ancestor "$direction_old" "$direction_current" \
+  && ok "positive control: the rejected release is behind the installed release" \
+  || bad "positive control: stale-release fixture has no forward release ancestry"
+
+DIRECTION_BOX="$scratch/direction-box"
+mkdir -p "$DIRECTION_BOX"
+git -C "$DIRECTION_REL" archive "$direction_current" | tar -x -C "$DIRECTION_BOX"
+git -C "$DIRECTION_BOX" init -q -b main
+git -C "$DIRECTION_BOX" remote add airlock-release "$DIRECTION_REL"
+git -C "$DIRECTION_BOX" fetch -q airlock-release "$direction_current"
+git -C "$DIRECTION_BOX" add -A
+git -C "$DIRECTION_BOX" commit -q \
+  -m "airlock-update: 배포본 ${direction_current:0:12} 으로 갱신"
+direction_before_head="$(git -C "$DIRECTION_BOX" rev-parse HEAD)"
+
+direction_json="$(AIRLOCK_DIR="$DIRECTION_BOX" AIRLOCK_RELEASE_URL="$DIRECTION_REL" \
+  AIRLOCK_RELEASE_REF="$direction_old" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/direction-json.err")"; direction_json_rc=$?
+if [ "$direction_json_rc" = 0 ] && printf '%s' "$direction_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is False, value
+assert value["changedCount"] == 0, value
+'; then
+  ok "a release behind the installed release produces no update badge"
+else
+  bad "a stale release was reported as available: $direction_json"
+fi
+
+direction_run_out="$(AIRLOCK_DIR="$DIRECTION_BOX" AIRLOCK_RELEASE_URL="$DIRECTION_REL" \
+  AIRLOCK_RELEASE_REF="$direction_old" bash "$UPDATE" --no-install 2>&1)"
+direction_run_rc=$?
+if [ "$direction_run_rc" -ne 0 ] \
+  && [ "$(git -C "$DIRECTION_BOX" rev-parse HEAD)" = "$direction_before_head" ] \
+  && grep -q 'release-current' "$DIRECTION_BOX/README.md"; then
+  ok "an explicit stale-release update is refused before changing the checkout"
+else
+  bad "a stale release changed or was allowed on the box (rc=$direction_run_rc): $direction_run_out"
+fi
+
+# A deployment checkout has the private source graph, but its HEAD can be an
+# unrelated-history merge wrapper.  Compare the release subject's source SHA with the
+# checkout's merge-base against fresh private main; comparing it with HEAD directly
+# would call the current release a rollback.
+PRIVATE_PUBLIC_NAME=airlock
+PRIVATE_SOURCE_NAME="${PRIVATE_PUBLIC_NAME}-work"
+PRIVATE_ROOT="$scratch/private/spacewalk-labs"
+PRIVATE_REL="$PRIVATE_ROOT/$PRIVATE_SOURCE_NAME"
+private_name_probe="$scratch/private-name-probe"
+printf '%s\n' "$PRIVATE_SOURCE_NAME" >"$private_name_probe"
+grep -Fq "$PRIVATE_SOURCE_NAME" "$private_name_probe" \
+  && ok "positive control: the private repository name probe is live" \
+  || bad "positive control: the private repository name probe missed its fixture"
+private_name_hits="$(grep -Fn "$PRIVATE_SOURCE_NAME" "$UPDATE" "$ROOT/install/test-update.sh" 2>/dev/null || true)"
+if [ -z "$private_name_hits" ]; then
+  ok "public update files do not publish the private repository name"
+else
+  bad "public update files expose the private repository name: $private_name_hits"
+fi
+seed_tree "$PRIVATE_REL" private-old
+git -C "$PRIVATE_REL" init -q -b main
+git -C "$PRIVATE_REL" add -A
+git -C "$PRIVATE_REL" commit -q -m "private old"
+private_old="$(git -C "$PRIVATE_REL" rev-parse HEAD)"
+seed_tree "$PRIVATE_REL" private-current
+git -C "$PRIVATE_REL" add -A
+git -C "$PRIVATE_REL" commit -q -m "private current"
+private_current="$(git -C "$PRIVATE_REL" rev-parse HEAD)"
+git -C "$PRIVATE_REL" checkout -q -b side-release "$private_old"
+seed_tree "$PRIVATE_REL" private-side
+git -C "$PRIVATE_REL" add -A
+git -C "$PRIVATE_REL" commit -q -m "private side"
+private_side="$(git -C "$PRIVATE_REL" rev-parse HEAD)"
+git -C "$PRIVATE_REL" checkout -q main
+
+PRIVATE_PUBLIC="$PRIVATE_ROOT/$PRIVATE_PUBLIC_NAME"
+seed_tree "$PRIVATE_PUBLIC" private-old
+git -C "$PRIVATE_PUBLIC" init -q -b main
+git -C "$PRIVATE_PUBLIC" add -A
+git -C "$PRIVATE_PUBLIC" commit -q \
+  -m "release from ${PRIVATE_SOURCE_NAME} @ ${private_old:0:7}"
+private_public_old="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
+seed_tree "$PRIVATE_PUBLIC" private-current
+git -C "$PRIVATE_PUBLIC" add -A
+git -C "$PRIVATE_PUBLIC" commit -q \
+  -m "release from ${PRIVATE_SOURCE_NAME} @ ${private_current:0:7}"
+private_public_current="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
+seed_tree "$PRIVATE_PUBLIC" private-side
+git -C "$PRIVATE_PUBLIC" add -A
+git -C "$PRIVATE_PUBLIC" commit -q \
+  -m "release from ${PRIVATE_SOURCE_NAME} @ ${private_side:0:7}"
+private_public_side="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
+seed_tree "$PRIVATE_PUBLIC" private-current
+git -C "$PRIVATE_PUBLIC" add -A
+git -C "$PRIVATE_PUBLIC" commit -q \
+  -m "release from other-source @ ${private_current:0:7}"
+private_public_mismatch="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
+
+PRIVATE_BOX="$scratch/private-deployment"
+git clone -q "$PRIVATE_REL" "$PRIVATE_BOX"
+canonical_private="https://github.com/spacewalk-labs/${PRIVATE_SOURCE_NAME}.git"
+git -C "$PRIVATE_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
+git -C "$PRIVATE_BOX" fetch -q airlock-release main
+git -C "$PRIVATE_BOX" merge -q --allow-unrelated-histories -s ours \
+  -m "deploy current release" FETCH_HEAD
+private_deploy_head="$(git -C "$PRIVATE_BOX" rev-parse HEAD)"
+
+private_stale_json="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/private-stale.err")"; private_stale_json_rc=$?
+if [ "$private_stale_json_rc" = 0 ] && printf '%s' "$private_stale_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is False, value
+assert value["changedCount"] == 0, value
+'; then
+  ok "a private deployment checkout hides a release behind its deployed source"
+else
+  bad "a private deployment checkout reported its older release as available: $private_stale_json"
+fi
+private_stale_out="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --no-install 2>&1)"
+private_stale_rc=$?
+[ "$private_stale_rc" -ne 0 ] \
+  && [ "$(git -C "$PRIVATE_BOX" rev-parse HEAD)" = "$private_deploy_head" ] \
+  && grep -q 'private-current' "$PRIVATE_BOX/README.md" \
+  && ok "a stale release cannot rewind a private deployment checkout" \
+  || bad "a stale release mutated a private deployment checkout (rc=$private_stale_rc): $private_stale_out"
+
+private_same_out="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_current" bash "$UPDATE" --no-install 2>&1)"; private_same_rc=$?
+[ "$private_same_rc" = 0 ] \
+  && [ "$(git -C "$PRIVATE_BOX" rev-parse HEAD)" = "$private_deploy_head" ] \
+  && grep -q '이미 같은 배포본' <<<"$private_same_out" \
+  && ok "a merge-wrapper deployment recognises its current release as current" \
+  || bad "a merge-wrapper deployment mistook its current release for rollback: $private_same_out"
+
+private_mismatch_json="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_mismatch" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/private-mismatch.err")"; private_mismatch_json_rc=$?
+if [ "$private_mismatch_json_rc" = 0 ] && printf '%s' "$private_mismatch_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is False, value
+assert value["changedCount"] == 0, value
+'; then
+  ok "a release naming another source produces no update badge"
+else
+  bad "a mismatched release source was offered as an update: $private_mismatch_json"
+fi
+private_mismatch_out="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_mismatch" bash "$UPDATE" --no-install 2>&1)"
+private_mismatch_rc=$?
+[ "$private_mismatch_rc" -ne 0 ] \
+  && [ "$(git -C "$PRIVATE_BOX" rev-parse HEAD)" = "$private_deploy_head" ] \
+  && grep -q 'private-current' "$PRIVATE_BOX/README.md" \
+  && ok "a release naming another source is refused before checkout mutation" \
+  || bad "a mismatched release source reached the checkout (rc=$private_mismatch_rc): $private_mismatch_out"
+
+PRIVATE_OLD_BOX="$scratch/private-old-deployment"
+git clone -q "$PRIVATE_REL" "$PRIVATE_OLD_BOX"
+git -C "$PRIVATE_OLD_BOX" checkout -q -b deploy-old "$private_old"
+git -C "$PRIVATE_OLD_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_OLD_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+private_old_head="$(git -C "$PRIVATE_OLD_BOX" rev-parse HEAD)"
+private_side_json="$(AIRLOCK_DIR="$PRIVATE_OLD_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_side" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/private-side.err")"; private_side_json_rc=$?
+if [ "$private_side_json_rc" = 0 ] && printf '%s' "$private_side_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is False, value
+assert value["changedCount"] == 0, value
+'; then
+  ok "a release sourced outside private main is never offered as an update"
+else
+  bad "an off-main source was offered as a release: $private_side_json"
+fi
+private_side_out="$(AIRLOCK_DIR="$PRIVATE_OLD_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_side" bash "$UPDATE" --no-install 2>&1)"
+private_side_rc=$?
+[ "$private_side_rc" -ne 0 ] \
+  && [ "$(git -C "$PRIVATE_OLD_BOX" rev-parse HEAD)" = "$private_old_head" ] \
+  && grep -q '배포본 방향이 모호' <<<"$private_side_out" \
+  && ok "an off-main release source is refused before checkout mutation" \
+  || bad "an off-main release source reached the checkout (rc=$private_side_rc): $private_side_out"
+
+# A failed provenance measurement is not an empty diff.  Make only `git diff` fail;
+# fetch and every other git operation remain live positive controls.
+DIFF_FAIL_BIN="$scratch/diff-fail-bin"
+mkdir -p "$DIFF_FAIL_BIN"
+real_git="$(command -v git)"
+cat >"$DIFF_FAIL_BIN/git" <<SH
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  [ "\$arg" != diff ] || exit 72
+done
+exec "$real_git" "\$@"
+SH
+chmod 755 "$DIFF_FAIL_BIN/git"
+make_box "$BOX"
+diff_fail_head="$(git -C "$BOX" rev-parse HEAD)"
+diff_fail_json="$(PATH="$DIFF_FAIL_BIN:$PATH" AIRLOCK_DIR="$BOX" \
+  AIRLOCK_RELEASE_URL="$REL" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/diff-fail.err")"; diff_fail_json_rc=$?
+if [ "$diff_fail_json_rc" = 0 ] && printf '%s' "$diff_fail_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is False, value
+assert value["changedCount"] == 0, value
+'; then
+  ok "a failed direction diff produces no update badge"
+else
+  bad "a failed direction diff became an available update: $diff_fail_json"
+fi
+diff_fail_out="$(PATH="$DIFF_FAIL_BIN:$PATH" AIRLOCK_DIR="$BOX" \
+  AIRLOCK_RELEASE_URL="$REL" bash "$UPDATE" --no-install 2>&1)"
+diff_fail_rc=$?
+[ "$diff_fail_rc" -ne 0 ] \
+  && [ "$(git -C "$BOX" rev-parse HEAD)" = "$diff_fail_head" ] \
+  && grep -q 'version old' "$BOX/README.md" \
+  && ok "a failed direction diff is refused before checkout mutation" \
+  || bad "a failed direction diff was treated as a match (rc=$diff_fail_rc): $diff_fail_out"
 
 # ---------------------------------------------------------------- 5) refuses strangers
 notabox="$scratch/not-a-checkout"; mkdir -p "$notabox"; printf 'hi\n' > "$notabox/file"
@@ -417,9 +686,13 @@ printf '%s' "$out8" | grep -q 'OrbStack 이 켜져 있는지' \
 # installer left.  A failed new installer writes "new-partial" and exits 42, so the
 # no-rollback control is red; the old installer writes "old", so a real rollback can
 # only turn green by actually running it.  No production-only fault switch is needed.
-make_rollback_tree() { # make_rollback_tree <dir> <old|new>
-  local d="$1" version="$2"
-  rm -rf "$d"
+make_rollback_tree() { # make_rollback_tree <dir> <old|new> [keep-git]
+  local d="$1" version="$2" keep_git="${3:-}"
+  if [ "$keep_git" = keep-git ]; then
+    find "$d" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+  else
+    rm -rf "$d"
+  fi
   seed_tree "$d" "$version"
   printf 'airlock.lock\n' >>"$d/.gitignore"
   cat >"$d/bin/airlock-ledger" <<'PY'
@@ -554,10 +827,13 @@ SH
 }
 
 ROLLREL="$scratch/rollback-release"
-make_rollback_tree "$ROLLREL" new
+make_rollback_tree "$ROLLREL" old
 git -C "$ROLLREL" init -q -b main
 git -C "$ROLLREL" add -A
-git -C "$ROLLREL" commit -q -m release
+git -C "$ROLLREL" commit -q -m "release old"
+make_rollback_tree "$ROLLREL" new keep-git
+git -C "$ROLLREL" add -A
+git -C "$ROLLREL" commit -q -m "release new"
 
 make_rollback_box() {
   make_rollback_tree "$BOX" old

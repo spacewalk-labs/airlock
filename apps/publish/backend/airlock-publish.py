@@ -22,7 +22,8 @@ Unconfigured => local-share manager only (the external endpoints report disabled
 and the UI hides them).
 
 Ingest protocol (what a REMOTE target must implement) — JSON over HTTPS, the
-token in the `X-Airlock-Publish-Token` header:
+token in the `X-Airlock-Publish-Token` header (rename with
+      [apps.publish.public_target].token_header when the receiver expects another):
   POST <ingest>/ingest      {slug, owner, src, title, ttl_hours, html_b64} -> {ok, result:{expiry, ttl_hours}}
   GET  <ingest>/list?owner= -> {ok, items:[{slug, owner, src, title, expiry, expired, mode}]}
   POST <ingest>/revoke      {slug, owner} -> {ok}
@@ -65,6 +66,11 @@ BASE_URL = os.environ.get('AIRLOCK_PUBLISH_BASE_URL', '').rstrip('/')
 # config file); default AIRLOCK_PUBLISH_TOKEN. The installer wires an EnvironmentFile.
 _TOKEN_ENV = os.environ.get('AIRLOCK_PUBLISH_TOKEN_ENV', 'AIRLOCK_PUBLISH_TOKEN')
 TOKEN = os.environ.get(_TOKEN_ENV, '')
+# The header the RECEIVER authenticates with. Ours is the default, but a receiver
+# that already has publishers deployed against another name is the normal case, and
+# renaming on its side breaks all of them at once — so the publisher bends here.
+TOKEN_HEADER = (os.environ.get('AIRLOCK_PUBLISH_TOKEN_HEADER', '')
+                or 'X-Airlock-Publish-Token')
 # "local" is opt-in and EXPLICIT. Inferring it from which keys are present would
 # silently turn a half-configured remote install (base_url left behind, token
 # gone) into a live public publisher, so the mode is never guessed.
@@ -732,7 +738,7 @@ def _ingest(method, ep, body=None, timeout=20):
     data = json.dumps(body).encode('utf-8') if body is not None else None
     req = urllib.request.Request(
         INGEST_URL + ep, data=data, method=method,
-        headers={'Content-Type': 'application/json', 'X-Airlock-Publish-Token': TOKEN})
+        headers={'Content-Type': 'application/json', TOKEN_HEADER: TOKEN})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode('utf-8'))
 

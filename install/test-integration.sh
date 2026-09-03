@@ -700,7 +700,17 @@ fi
 MWFRAG="$AIRLOCK_CONFD/hub-locations.d/fileview.conf"
 [ -f "$MWFRAG" ] && ok "fileview fragment written" || bad "fileview fragment missing"
 [ -f "$AIRLOCK_CONFD/hub-locations.d/publish.conf" ] && ok "publish fragment written" || bad "publish fragment missing"
-[ ! -e "$AIRLOCK_CONFD/public-includes.d/publish-gated.conf" ] && ok "remote publish does not write gated fragment" || bad "remote publish wrote gated fragment"
+# Remote mode must leave this path RESOLVABLE, not absent: the README has the
+# operator include it from their own server block, and an include with nothing
+# behind it makes nginx refuse to load at all (the running process keeps serving
+# from memory, so it surfaces at the next reload — or the next restart, as a box
+# with no nginx). It must also serve nothing, which is what the retraction is for.
+GFRAG="$AIRLOCK_CONFD/public-includes.d/publish-gated.conf"
+if [ -f "$GFRAG" ]; then ok "remote publish leaves the gated include resolvable"
+else bad "remote publish removed the gated fragment an operator include points at"; fi
+if [ -f "$GFRAG" ] && ! grep -qE '^[[:space:]]*(location|auth_basic)' "$GFRAG"; then
+  ok "remote publish serves no gate (retracted fragment has no directives)"
+else bad "remote gated fragment still carries directives"; fi
 [ -f "$AIRLOCK_CONFD/hub-locations.d/dev-monitor.conf" ] && ok "dev-monitor fragment written" || bad "dev-monitor fragment missing"
 
 SITE="$(AIRLOCK_DRY_RUN=0 bash "$ROOT/install/render-nginx.sh")" || bad "render failed"

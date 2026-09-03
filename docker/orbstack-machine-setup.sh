@@ -12,7 +12,9 @@
 # Idempotent: re-run after editing airlock.toml to re-apply. Nothing here is
 # destructive to an existing machine — it never deletes the machine or its state.
 #
-# STATUS: unverified on real hardware (see docs/design/macos-container.md §8).
+# STATUS: the terminal path has passed on Apple Silicon hardware. The first external
+# launcher run reached this script on 2026-09-03 and exposed a Finder PATH defect; the
+# launcher now supplies this account's resolved orb path through AIRLOCK_ORB_BIN.
 set -euo pipefail
 
 # ---- knobs (override via env) -------------------------------------------------
@@ -127,24 +129,42 @@ set AIRLOCK_ARCH=arm64 (Apple Silicon) or AIRLOCK_ARCH=amd64 (Intel) explicitly.
 event arch "arch=$ARCH" "source=$ARCH_SRC"
 log "architecture: $ARCH ($ARCH_SRC)"
 
-command -v orb  >/dev/null 2>&1 || die "OrbStack 'orb' CLI not found. Install OrbStack: https://orbstack.dev"
+if [ -n "${AIRLOCK_ORB_BIN:-}" ]; then
+  case "$AIRLOCK_ORB_BIN" in
+    /*) ;;
+    *) die "AIRLOCK_ORB_BIN must be an absolute path; got '$AIRLOCK_ORB_BIN'" ;;
+  esac
+  if [ ! -x "$AIRLOCK_ORB_BIN" ] || [ -d "$AIRLOCK_ORB_BIN" ]; then
+    die "OrbStack is installed, but its 'orb' command is not available at '$AIRLOCK_ORB_BIN'. Open OrbStack once in this account, then try again."
+  fi
+  ORB_BIN="$AIRLOCK_ORB_BIN"
+else
+  ORB_BIN="$(command -v orb 2>/dev/null || true)"
+  if [ -z "$ORB_BIN" ]; then
+    if [ -d /Applications/OrbStack.app ]; then
+      die "OrbStack is installed, but its 'orb' command is not available for this account. Open OrbStack once, then try again."
+    fi
+    die "OrbStack 'orb' CLI not found. Install OrbStack: https://orbstack.dev"
+  fi
+fi
 command -v orbctl >/dev/null 2>&1 || true
+orb_cmd() { "$ORB_BIN" "$@"; }
 
 # ---- 1. create the machine (idempotent) --------------------------------------
 step machine
-if orb list 2>/dev/null | awk '{print $1}' | grep -qx "$MACHINE"; then
+if orb_cmd list 2>/dev/null | awk '{print $1}' | grep -qx "$MACHINE"; then
   log "machine '$MACHINE' already exists — reusing"
 else
   log "creating machine '$MACHINE' ($DISTRO, $ARCH via Rosetta if amd64)"
-  orb create -a "$ARCH" "$DISTRO" "$MACHINE"
+  orb_cmd create -a "$ARCH" "$DISTRO" "$MACHINE"
 fi
 
 step_ok machine
 
 # Helper: run a command inside the machine as the default user (has passwd-less sudo).
-inmc() { orb -m "$MACHINE" "$@"; }
+inmc() { orb_cmd -m "$MACHINE" "$@"; }
 # Helper: run as root inside the machine.
-inroot() { orb -m "$MACHINE" -u root "$@"; }
+inroot() { orb_cmd -m "$MACHINE" -u root "$@"; }
 
 # ---- 2. base prerequisites ----------------------------------------------------
 step packages

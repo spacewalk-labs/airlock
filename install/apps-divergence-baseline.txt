@@ -146,6 +146,7 @@ content	apps/notepad/frontend/notepad.html
 content	apps/notepad/install.sh
 content	apps/orca/airlock-app.toml
 content	apps/orca/bin/verify-web-bundle.sh
+content	apps/orca/deactivate.sh
 content	apps/orca/install.sh
 content	apps/orca/render.sh
 content	apps/orca/web-bundle/README.md

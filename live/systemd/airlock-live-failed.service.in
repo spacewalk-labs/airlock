@@ -1,5 +1,6 @@
 [Unit]
 Description=airlock — the weekly verification failed, say so
+X-Airlock-Owner=airlock-live
 
 [Service]
 Type=oneshot

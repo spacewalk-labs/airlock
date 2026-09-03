@@ -280,7 +280,7 @@ ingest_unit user "airlock-feedback.service" "$(render_feedback_unit 19500 "Tails
 
 # ---- publish ----
 APP="$ROOT/apps/publish"; . "$APP/render.sh"
-PUB_ARGS=(19800 "/opt/airlock/share" "/home/example/uploads" "Tailscale-User-Login" "" "" "AIRLOCK_PUBLISH_TOKEN" remote "" "/home/example/.local/state/airlock" "/opt/airlock/share-gated" "/opt/airlock/publish-gated-auth" htpasswd)
+PUB_ARGS=(19800 "/opt/airlock/share" "/home/example/uploads" "Tailscale-User-Login" "" "" "AIRLOCK_PUBLISH_TOKEN" remote "" "/home/example/.local/state/airlock" "/opt/airlock/share-gated" "/opt/airlock/publish-gated-auth" htpasswd X-Airlock-Publish-Token)
 ingest_unit user "airlock-publish.service" "$(render_publish_unit_service "${PUB_ARGS[@]}")"
 ingest_unit user "airlock-publish-cleanup.service" "$(render_publish_unit_cleanup "/home/example/uploads" remote "" "/home/example/.local/state/airlock" "/opt/airlock/share-gated" "/opt/airlock/publish-gated-auth" htpasswd)"
 ingest_unit user "airlock-publish-cleanup.timer" "$(render_publish_unit_timer)"

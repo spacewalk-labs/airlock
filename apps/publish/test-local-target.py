@@ -413,11 +413,11 @@ class _StubIngest(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('Content-Length', '0'))
         body = json.loads(self.rfile.read(n) or b'{}')
-        _StubIngest.seen.append((self.path, self.headers.get('X-Airlock-Publish-Token'), body))
+        _StubIngest.seen.append((self.path, dict(self.headers), body))
         self._reply({'ok': True, 'result': {'expiry': 1790000000, 'ttl_hours': body.get('ttl_hours')}})
 
     def do_GET(self):
-        _StubIngest.seen.append((self.path, self.headers.get('X-Airlock-Publish-Token'), None))
+        _StubIngest.seen.append((self.path, dict(self.headers), None))
         self._reply({'ok': True, 'items': []})
 
     def log_message(self, *_a):
@@ -919,13 +919,49 @@ def t_state_first_transaction(tmp):
           f'state={restored}, content={open(os.path.join(live, "index.html")).read()}')
 
 
+
+def t_token_header_name(tmp):
+    print('\n[19] the receiver names the auth header, and we send that name')
+    # Driven through the REAL _ingest against a stub receiver: the bug this covers
+    # was a hardcoded header, so a test that stubs _ingest cannot see it.
+    share, _p, state, _env = make_dirs(tmp)
+    srv = http.server.HTTPServer(('127.0.0.1', 0), _StubIngest)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f'http://127.0.0.1:{srv.server_address[1]}'
+    try:
+        for label, extra, expect in (
+            ('default', {}, 'X-Airlock-Publish-Token'),
+            ('configured', {'AIRLOCK_PUBLISH_TOKEN_HEADER': 'X-Docpub-Token'}, 'X-Docpub-Token'),
+        ):
+            _StubIngest.seen = []
+            m = load({'AIRLOCK_PUBLISH_SHARE_DIR': share, 'AIRLOCK_PUBLISH_STATE_DIR': state,
+                      'AIRLOCK_PUBLISH_INGEST_URL': url,
+                      'AIRLOCK_PUBLISH_BASE_URL': 'https://docs.example',
+                      'AIRLOCK_PUBLISH_TOKEN': 'sekret', **extra})
+            page(share, f'h-{label}.html')
+            ok, res = m.publish_public(f'h-{label}.html', 336, OWNER)
+            check(f'{label}: publish reached the receiver', ok, str(res))
+            hdrs = {k.lower(): v for k, v in _StubIngest.seen[-1][1].items()}
+            check(f'{label}: sends {expect}', hdrs.get(expect.lower()) == 'sekret',
+                  f'got headers: {sorted(hdrs)}')
+            # The negative half, and the one that actually bit: a receiver that sees
+            # only a name it does not know answers 403, which reads as a bad token
+            # rather than a misnamed header. So the other name must be ABSENT.
+            other = ('X-Docpub-Token' if expect == 'X-Airlock-Publish-Token'
+                     else 'X-Airlock-Publish-Token')
+            check(f'{label}: does not also send {other}', other.lower() not in hdrs,
+                  f'both names present: {sorted(hdrs)}')
+    finally:
+        srv.shutdown()
+
+
 def main():
     for fn in (t_happy_path, t_slug_abuse, t_symlinked_source, t_empty_owner, t_owner_collision,
                t_crash_between, t_concurrent, t_corrupt_state, t_overlap_refused,
                t_config_shapes, t_remote_regression, t_bundle_plan_contract, t_gated_contract,
                t_gated_reconciliation_and_storage, t_local_bundle_limit,
                t_open_sweep_without_gated, t_local_ingest_transaction,
-               t_state_first_transaction):
+               t_state_first_transaction, t_token_header_name):
         tmp = tempfile.mkdtemp(prefix='airlock-pub-test-')
         try:
             fn(tmp)

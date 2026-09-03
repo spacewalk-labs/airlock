@@ -1,12 +1,13 @@
 # Running Airlock on macOS (design draft)
 
-> Status: **design draft + unverified scaffolding.** Airlock v1 installs on a
+> Status: **design plus hardware-verified OrbStack helper.** Airlock v1 installs on a
 > Linux box (Ubuntu 24.04). This document is the plan for running that same
 > stack on a **macOS host** — the intended use is a **personal home server** on
-> an Apple Silicon Mac using **OrbStack**. The scripts under `docker/` are
-> reviewed for shell correctness and structure but have **not** been run on a
-> real Mac yet; treat first boot as a shakedown. What is verified vs. assumed is
-> called out inline.
+> an Apple Silicon Mac using **OrbStack**. The helper has completed on a real
+> Apple Silicon Mac; the first external launcher delivery on 2026-09-03 passed
+> Gatekeeper guidance and opened, then stopped on account-specific OrbStack CLI
+> discovery before completing an install. What is verified vs. assumed is called
+> out inline.
 
 ## 1. Why macOS can't run the stock installer directly
 

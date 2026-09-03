@@ -300,6 +300,43 @@ else
   sudo systemctl enable --now airlock-orca-firewall.service
 fi
 
+# --- 4b. AppArmor: let the Electron sandbox open its user namespace ---
+# Ubuntu 24.04's default kernel.apparmor_restrict_unprivileged_userns=1 makes orca
+# SIGTRAP on every start (see render_orca_apparmor for why the SUID fallback cannot
+# rescue it under NoNewPrivileges=yes). This never showed on the dev box because that
+# host has the restriction turned off; a stock 24.04 desktop restart-loops instead.
+# Scoped to this AppImage's binaries, so the box-wide sysctl is left alone.
+AA_PROFILE="/etc/apparmor.d/airlock-orca"
+if [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
+  AA_PROFILE="$AIRLOCK_RENDER_DIR/etc-apparmor.d/airlock-orca"
+fi
+# Same three-branch shape as the nft block above: dry-run logs, RENDER_DIR emits the
+# bytes with a plain redirect, and only the real branch reaches sudo.
+AA_RESTRICT_SYSCTL=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -z "${AIRLOCK_RENDER_DIR:-}" ]; then
+  log "[dry] write $AA_PROFILE + sudo apparmor_parser -r (userns for $SQUASHFS)"
+elif [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
+  install -d "$(dirname "$AA_PROFILE")"
+  render_orca_apparmor "$SQUASHFS" > "$AA_PROFILE"
+elif [ ! -d /sys/kernel/security/apparmor ] || ! command -v apparmor_parser >/dev/null 2>&1; then
+  log "apparmor not enabled on this box — skipping the orca userns profile"
+else
+  # Required (not best-effort) exactly when the kernel is denying userns: without the
+  # profile orca cannot start at all, so a parser failure must stop the install
+  # rather than hand back a box whose orca restart-loops.
+  AA_REQUIRED=0
+  [ -r "$AA_RESTRICT_SYSCTL" ] && [ "$(cat "$AA_RESTRICT_SYSCTL")" = 1 ] && AA_REQUIRED=1
+  render_orca_apparmor "$SQUASHFS" | sudo tee "$AA_PROFILE" >/dev/null
+  if sudo apparmor_parser -r "$AA_PROFILE"; then
+    log "apparmor: userns profile loaded for orca ($AA_PROFILE)"
+  elif [ "$AA_REQUIRED" = 1 ]; then
+    die "apparmor_parser failed on $AA_PROFILE and this kernel denies unprivileged userns — orca would restart-loop"
+  else
+    sudo rm -f "$AA_PROFILE"
+    log "apparmor: profile rejected by this parser; kernel allows userns, so continuing without it"
+  fi
+fi
+
 # --- 5. tailscale serve: HTTPS (secure context, for clipboard) -> the owner gate ---
 # The platform renders this now (manifest [serve.https]; child-4 P2b STEP 0
 # — install/lib.sh's airlock_render_serve_https, called from

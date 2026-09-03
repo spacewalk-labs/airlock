@@ -931,3 +931,65 @@ write_if_changed() {
   rm -f "$tmp"
   return 0
 }
+
+# airlock_sweep_platform_units <owner> <declared-unit>...
+#
+# Remove platform systemd user units this tree no longer declares.
+#
+# Why this exists: apps declare [artifacts] and D6 record-diff deletes what a package
+# stopped declaring. The platform has no equivalent — its only ledger entry is a set of
+# path claims (bin/airlock-config _platform_state_claims), which names no units. Removal
+# therefore depended on each helper's own `uninstall` branch, and **that code disappears
+# with the tree**: a box that only took an update never runs it. The unit stays in
+# ~/.config/systemd/user, enabled, its ExecStart pointing at a script that is gone, and it
+# fails quietly on every trigger. (airlock-update-detect.timer was already in that state —
+# nothing called its uninstall.)
+#
+# The fix is to make removal the NEW tree's job rather than the removing one's: units
+# carry `X-Airlock-Owner=<installer>`, and each installer deletes marked units of its own
+# owner that it did not just declare. Nothing has to be remembered across revisions.
+#
+# Why a marker and not a name prefix: app units are `airlock-<app>.service` too
+# (airlock-devterm.service, airlock-paseo.service, ...), so an `airlock-*` sweep would
+# delete units that D6 owns. Unmarked files are structurally out of reach here.
+#
+# Why the owner is part of the marker: platform units come from TWO installers —
+# install/systemd/* (this one) and live/systemd/* (live/install-timer.sh, which is
+# independent and does not source this file). A bare "platform" marker would make each
+# installer delete the other's units.
+#
+# Scope note: this only sees units rendered since the marker was introduced. Both
+# installers re-render unconditionally, so one pass marks everything they own — but a unit
+# retired in the SAME revision that adds the marker is not covered retroactively. Nothing
+# is in that position today.
+airlock_sweep_platform_units() {
+  local owner="${1:?airlock_sweep_platform_units: owner required}"; shift
+  # An empty declared set would make every marked unit an orphan. A caller bug must not
+  # become a wipe, so this is fatal rather than a no-op sweep.
+  [ "$#" -gt 0 ] || die "airlock_sweep_platform_units: refusing to sweep with an empty declared set (owner=$owner)"
+
+  local unit_dir="${AIRLOCK_UNIT_DIR_USER:-$HOME/.config/systemd/user}"
+  [ -d "$unit_dir" ] || return 0
+
+  local declared=" $* "
+  local removed=0 path base
+  # Timers before services: disabling a timer whose service is already gone is noisier
+  # than the reverse, and `ls` gives no ordering guarantee worth relying on.
+  for path in "$unit_dir"/*.timer "$unit_dir"/*.service; do
+    [ -f "$path" ] || continue
+    base="$(basename "$path")"
+    grep -qx "X-Airlock-Owner=${owner}" "$path" || continue
+    case "$declared" in *" $base "*) continue ;; esac
+    log "removing orphaned platform unit: $base (owner=$owner, no longer declared)"
+    airlock_run systemctl --user disable --now "$base" \
+      || log "WARN: could not disable $base — removing the file anyway"
+    airlock_run rm -f -- "$path"
+    removed=$((removed + 1))
+  done
+
+  if [ "$removed" -gt 0 ]; then
+    airlock_run systemctl --user daemon-reload \
+      || log "WARN: removed $removed orphaned unit(s) but could not reload the user unit manager"
+    log "swept $removed orphaned platform unit(s) (owner=$owner)"
+  fi
+}

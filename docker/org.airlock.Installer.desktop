@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Airlock 설치
+Comment=Airlock 앱을 고르고 설치합니다
+Exec=/usr/bin/python3 /usr/libexec/airlock-gui-installer/gui-installer.py
+Icon=system-software-install
+Terminal=false
+Categories=System;Utility;
+StartupNotify=true

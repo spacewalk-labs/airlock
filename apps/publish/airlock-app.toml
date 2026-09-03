@@ -26,6 +26,7 @@ runtime_env = [
   "AIRLOCK_PUBLISH_STATE_DIR",
   "AIRLOCK_PUBLISH_TOKEN",
   "AIRLOCK_PUBLISH_TOKEN_ENV",
+  "AIRLOCK_PUBLISH_TOKEN_HEADER",
   "AIRLOCK_PUBLISH_UPLOADS_DIR",
 ]
 
@@ -39,8 +40,8 @@ share_dir = "/opt/airlock/share"
 tailnet_view = false
 
 [config.tables.public_target]
-allowed_keys = ["mode", "ingest_url", "base_url", "token_env", "public_dir",
-                 "gated_dir", "htpasswd_dir", "htpasswd_bin"]
+allowed_keys = ["mode", "ingest_url", "base_url", "token_env", "token_header",
+                 "public_dir", "gated_dir", "htpasswd_dir", "htpasswd_bin"]
 
 # Transcribed from install/prerequisites.tsv's four publish rows (F11).
 [[prerequisites]]
@@ -72,9 +73,12 @@ fix = "su -c 'apt-get update && apt-get install -y sudo'"
 note = "Shared directory setup"
 
 # Appendix: three user units, two hub/public-includes fragments (the gated
-# one is mode-gated — install.sh writes it only when public_target.mode =
-# "local" and removes it otherwise, but declaring it here is what lets the
-# ledger reclaim it if the app is removed while it exists), and the manager
+# one carries the gate only when public_target.mode = "local"; remote mode
+# writes it EMPTY rather than removing it, because the operator's own server
+# block includes that path and an include with nothing behind it makes nginx
+# refuse to load. Declaring it here is what lets the ledger reclaim it when
+# the app is removed — and that removal is the one case where the operator
+# must delete their include line too, see the README), and the manager
 # webroot page. Deliberately NOT declared (platform-protected / retained
 # operator data, per the ADR appendix and revision-9 note — declaring any
 # of these removable would be fatal-in-spirit even where the schema

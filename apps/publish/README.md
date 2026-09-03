@@ -84,6 +84,18 @@ location / { try_files $uri $uri/ $uri/index.html =404; }
 include /etc/airlock/nginx/public-includes.d/publish-gated.conf;
 ```
 
+That `include` line is yours, and this app never edits it. What the installer owns
+is the file behind it, which it keeps present in every mode: switching back to
+`mode = "remote"` **empties** the fragment rather than deleting it, so the gate stops
+being served while your include still resolves. Deleting it instead would make nginx
+refuse to load the entire configuration — and not at that moment: the running nginx
+keeps serving from memory, so the box looks healthy until the next reload fails, and
+the next restart leaves it with no nginx at all.
+
+The one case that still needs your hand is removing this app altogether. That
+reclaims the fragment, and your `include` is then pointing at nothing — delete the
+`include` line in the same change.
+
 The gate uses nginx `auth_basic`. Its username is the published slug and its
 password is the value supplied for that gated publish. Each slug has a separate
 credential file, so a password for one document cannot unlock another. Airlock uses the system
@@ -114,7 +126,20 @@ AIRLOCK_PUBLISH_TOKEN=…your token…
 
 ### Ingest protocol (what your target must implement)
 
-JSON over HTTPS. The token is sent in the `X-Airlock-Publish-Token` header.
+JSON over HTTPS. The token is sent in the `X-Airlock-Publish-Token` header by
+default. Receivers disagree about that name, and a receiver that already has
+publishers deployed against a different one cannot rename without breaking all of
+them at once — so the publisher bends: set `token_header` in
+`[apps.publish.public_target]` and this app sends that name instead.
+
+```toml
+[apps.publish.public_target]
+token_header = "X-Docpub-Token"   # what THIS receiver authenticates with
+```
+
+A wrong header name looks like an authorization failure, not a configuration one:
+the receiver answers 403 because it never saw a token. If publishing 403s while the
+token is known good, compare this value against what the receiver expects first.
 
 | Method + path        | Request body                                              | Response                                              |
 |----------------------|----------------------------------------------------------|------------------------------------------------------|

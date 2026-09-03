@@ -65,7 +65,7 @@ run_engine_inventory() {
 BASE="$TMP/base"; mkdir -p "$BASE"
 add_runtime_tools "$BASE"
 ln -s "$(command -v python3)" "$BASE/python3"
-for cmd in nginx sudo systemctl tailscale curl flock; do make_stub "$BASE" "$cmd"; done
+for cmd in git nginx sudo systemctl tailscale curl flock; do make_stub "$BASE" "$cmd"; done
 
 make_config "$TMP/hub.toml" hub
 satisfied="$(run_preflight "$TMP/hub.toml" "$BASE" 2>&1)" && sat_rc=0 || sat_rc=$?
@@ -89,6 +89,17 @@ if [ "$nocurl_rc" = 1 ] && [[ "$nocurl_out" == *curl*missing*core* ]]; then
   ok "hub-only preflight enforces shared smoke dependencies"
 else
   bad "hub-only preflight missed core curl: rc=$nocurl_rc out=$nocurl_out"
+fi
+
+# Every installed tree carries bin/airlock-update, whose reversible update path is
+# git-backed even when the first install arrived as a tar bundle rather than a clone.
+NOGIT="$TMP/no-git"; cp -a "$BASE" "$NOGIT"; rm -f "$NOGIT/git"
+nogit_rc=0
+nogit_out="$(run_preflight "$TMP/hub.toml" "$NOGIT" 2>&1)" || nogit_rc=$?
+if [ "$nogit_rc" = 1 ] && [[ "$nogit_out" == *git*missing*core* ]]; then
+  ok "hub-only preflight enforces the update runtime's git dependency"
+else
+  bad "hub-only preflight missed core git: rc=$nogit_rc out=$nogit_out"
 fi
 
 # Python is the one honest bootstrap exception: config cannot be parsed before

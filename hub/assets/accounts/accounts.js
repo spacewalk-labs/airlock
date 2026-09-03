@@ -11,13 +11,23 @@
  *   injected functions below (no core vars), which is what let it move.
  * DI factory: window.initAccounts(deps) is the only global. deps =
  *   { flash, postJson, mkFocus, closeTabPops, placePop }; returns 4 API functions.
- * Every fetch is a root-absolute path on the origin that serves the account API, so
- *   the page hosting it must be served by that same gate. That is why the devterm
- *   gate aliases this file rather than the hub serving it at its own origin.
+ * Every fetch is relative to THIS DOCUMENT'S directory (see API below) on the origin
+ *   that serves the account API, so the page hosting it must be served by that same
+ *   gate and from the same directory. That is why the devterm gate aliases this file
+ *   rather than the hub serving it at its own origin — until the surface moves.
  * Load order: before app.js in devterm's index.html; app.js calls this factory while
  *   running.
  */
 window.initAccounts = function initAccounts(deps) {
+  // Where the account API answers. Every fetch below is same-origin to the page that
+  // loaded this file, and the panel is always served beside the API it calls — so the
+  // base is this document's own directory rather than a hard-coded "/". Both of today's
+  // hosts serve at the origin root, so this is "/" and nothing changes yet; when the
+  // panel moves under a prefix its fetches follow it, with no second place to update.
+  var API = (function () {
+    try { return String(location.pathname).replace(/[^/]*$/, '') || '/'; }
+    catch (e) { return '/'; }
+  })();
   const flash = deps.flash, postJson = deps.postJson, mkFocus = deps.mkFocus,
         closeTabPops = deps.closeTabPops, placePop = deps.placePop;
 
@@ -114,7 +124,7 @@ function applyAcctIconCls() {
 // only paint the class. The Airlock return widget polls the same endpoint, so the icon
 // and the widget turn amber/red at the same instant instead of drifting apart.
 function refreshAcctIcon() {
-  fetch('/acct-alert', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (j) {
+  fetch(API + 'acct-alert', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (j) {
     _acctAlert = j || null;
     if (j && j.thresholds) setThresholds(j.thresholds);
     _acctIconCls = j && j.level === 'crit' ? 'acct-crit' : j && j.level === 'warn' ? 'acct-warn' : '';
@@ -152,7 +162,7 @@ function showAcctTip(e, u, a) {
 // Add account = completed inside the popup: the backend runs login-url/login-code; the human just
 // approves the link and pastes the returned code.
 function startAddAcct(list, addBtn, reflow) {
-  postJson('/acct-login-url', {}).then(function (res) {
+  postJson(API + 'acct-login-url', {}).then(function (res) {
     if (!res || !res.ok || !res.url) {
       addBtn.disabled = false; addBtn.textContent = '+ Add account (login)';
       flash('Failed to issue login link' + (res && res.error ? ': ' + res.error : ''), 3000); return;
@@ -171,7 +181,7 @@ function startAddAcct(list, addBtn, reflow) {
       const code = inp.value.trim();
       if (!code) { inp.focus(); return; }
       go.disabled = true; inp.disabled = true; go.textContent = 'Registering…';
-      postJson('/acct-login-code', { code: code }).then(function (r) {
+      postJson(API + 'acct-login-code', { code: code }).then(function (r) {
         if (r && r.ok) { closeTabPops(); flash('✓ ' + (r.msg || 'Account registered'), 4000); refreshAcctIcon(); mkFocus(); }
         else {
           go.disabled = false; inp.disabled = false; go.textContent = 'Register'; inp.value = '';
@@ -228,7 +238,7 @@ function fetchCodexUsage(box, cx, identity, reflow, alive, reaskState, revalidat
   if (!alive() || _codexIdentity !== identity) return;
   const fetchOpts = { cache: 'no-store' };
   if (revalidate) fetchOpts.headers = { 'X-Airlock-Revalidate': 'wait' };
-  fetch('/codex-usage', fetchOpts).then(function (x) { return x.json(); }).then(function (u) {
+  fetch(API + 'codex-usage', fetchOpts).then(function (x) { return x.json(); }).then(function (u) {
     if (!alive() || _codexIdentity !== identity) return;   // login state changed or section closed -> drop
     const hasValue = u && u.use7d != null;
     if (hasValue && (cx.state !== 'ok' || !cx.accountId || !u.accountId || cx.accountId !== u.accountId)) {
@@ -267,7 +277,7 @@ function renderCodexSection(list, reflow, parentAlive) {
       && (!parentAlive || parentAlive()) && document.body.contains(box);
   };
   const reaskState = { scheduled: false };
-  fetch('/claude-status').then(function (x) { return x.json(); }).then(function (s) {
+  fetch(API + 'claude-status').then(function (x) { return x.json(); }).then(function (s) {
     if (!alive()) return;
     const cx = (s && s.codex) || { state: 'unknown' };
     const identity = setCodexIdentity(cx);
@@ -314,7 +324,7 @@ function renderCodexBody(box, cx, usage) {
         return generation === _codexViewGeneration && document.body.contains(box);
       };
       lo.disabled = true; lo.textContent = '…';
-      postJson('/codex-logout', {}).then(function (r) {
+      postJson(API + 'codex-logout', {}).then(function (r) {
         if (!alive()) return;
         _codexOperationPending = false;
         if (r && r.ok) {
@@ -371,7 +381,7 @@ function codexUsageRow(usage) {
 function startCodexLogin(box, btn, alive) {
   alive = alive || function () { return document.body.contains(box); };
   btn.disabled = true; btn.textContent = 'codex login…';
-  postJson('/codex-login-start', {}).then(function (r) {
+  postJson(API + 'codex-login-start', {}).then(function (r) {
     if (!alive()) return;
     if (!r || !r.ok || !r.code) { btn.disabled = false; btn.textContent = 'Re-login';
       _codexOperationPending = false;
@@ -392,7 +402,7 @@ function startCodexLogin(box, btn, alive) {
     chk.addEventListener('pointerdown', function (e) { e.preventDefault(); });
     chk.onclick = function () {
       chk.disabled = true; chk.textContent = 'Checking…';
-      fetch('/claude-status').then(function (x) { return x.json(); }).then(function (st) {
+      fetch(API + 'claude-status').then(function (x) { return x.json(); }).then(function (st) {
         if (!alive()) return;
         const cx = (st && st.codex) || {};
         if (cx.state === 'ok') {
@@ -410,12 +420,12 @@ function startCodexLogin(box, btn, alive) {
     cancel.addEventListener('pointerdown', function (e) { e.preventDefault(); });
     cancel.onclick = function () {
       cancel.disabled = true; cancel.textContent = '…';
-      postJson('/codex-login-cancel', {}).then(function (rr) {
+      postJson(API + 'codex-login-cancel', {}).then(function (rr) {
         if (!alive()) return;
         if (rr && rr.ok) {
           _codexOperationPending = false;
           flash(rr.restored ? 'Cancelled — previous login restored' : 'Cancelled', 2500);
-          fetch('/claude-status').then(function (x) { return x.json(); })
+          fetch(API + 'claude-status').then(function (x) { return x.json(); })
             .then(function (st) {
               if (!alive()) return;
               const rcx = (st && st.codex) || { state: 'unknown' };
@@ -449,7 +459,7 @@ function renderXaiSection(list, reflow, parentAlive) {
     return generation === _xaiViewGeneration
       && (!parentAlive || parentAlive()) && document.body.contains(box);
   };
-  fetch('/xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (xai) {
+  fetch(API + 'xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (xai) {
     if (!alive()) return;
     if (xai && xai.enabled === false) {
       sep.remove(); hd.remove(); box.remove(); if (reflow) reflow(); return;
@@ -517,7 +527,7 @@ function renderXaiBody(box, xai, alive) {
         return generation === _xaiViewGeneration && document.body.contains(box);
       };
       logout.disabled = true; logout.textContent = '…';
-      postJson('/xai-logout', {}).then(function (res) {
+      postJson(API + 'xai-logout', {}).then(function (res) {
         if (!operationAlive()) return;
         _xaiOperationPending = false;
         if (res && res.ok) {
@@ -542,7 +552,7 @@ function renderXaiBody(box, xai, alive) {
 function startXaiLogin(box, btn, alive) {
   const idleLabel = btn.textContent;
   btn.disabled = true; btn.textContent = 'OpenCode login…';
-  postJson('/xai-login-start', {}).then(function (res) {
+  postJson(API + 'xai-login-start', {}).then(function (res) {
     if (!alive()) return;
     if (!res || !res.ok || !res.url || !res.code) {
       _xaiOperationPending = false;
@@ -567,7 +577,7 @@ function startXaiLogin(box, btn, alive) {
     const check = document.createElement('button'); check.className = 'codex-btn'; check.textContent = 'Check';
     check.onclick = function () {
       check.disabled = true; check.textContent = 'Checking…';
-      fetch('/xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (status) {
+      fetch(API + 'xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (status) {
         if (!alive()) return;
         if (status && status.loginState === 'succeeded'
             && (status.state === 'ok' || status.state === 'expired')) {
@@ -586,11 +596,11 @@ function startXaiLogin(box, btn, alive) {
     const cancel = document.createElement('button'); cancel.className = 'codex-btn danger'; cancel.textContent = 'Cancel';
     cancel.onclick = function () {
       cancel.disabled = true; cancel.textContent = '…';
-      postJson('/xai-login-cancel', {}).then(function (r) {
+      postJson(API + 'xai-login-cancel', {}).then(function (r) {
         if (!alive()) return;
         if (r && r.ok) {
           _xaiOperationPending = false;
-          fetch('/xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); })
+          fetch(API + 'xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); })
             .then(function (status) { if (alive()) renderXaiBody(box, status, alive); });
         } else {
           cancel.disabled = false; cancel.textContent = 'Cancel';
@@ -705,7 +715,7 @@ function fillAcctList(list, opts) {
           const label = a.email || a.name;
           if (!window.confirm('Remove account: ' + label + '\n\nDeleted from the pool.\nRe-login revives the same slot. Continue?')) return;
           hideAcctTip();
-          postJson('/acct-remove', { name: a.name }).then(function (res) {
+          postJson(API + 'acct-remove', { name: a.name }).then(function (res) {
             if (res && res.ok) { flash('🗑 ' + label + ' removed', 2500); reopen(); refreshAcctIcon(); }
             else flash('Remove failed' + (res && res.error ? ': ' + res.error : ''), 3500);
           }).catch(function () { flash('Remove request failed', 2000); });
@@ -718,7 +728,7 @@ function fillAcctList(list, opts) {
         if (dead) { startAddAcct(list, b, reflow); return; }
         if (a.active) { onSwitched(); flash('Already using ' + a.name, 1400); return; }
         onSwitched();
-        postJson('/acct-switch', { name: a.name }).then(function (res) {
+        postJson(API + 'acct-switch', { name: a.name }).then(function (res) {
           if (res && res.ok) { flash('✓ Switched to ' + (a.email || a.name) + ' (applies within ~1 min; restart the session for immediate effect)', 3000);
             refreshAcctIcon(); onSwitched(); }
           else flash('Switch failed' + (res && res.error ? ': ' + res.error : ''), 2800);
@@ -736,12 +746,12 @@ function fillAcctList(list, opts) {
     renderXaiSection(list, reflow, alive);
     reflow();                           // re-place at the full rendered height (flip above from a bottom key bar)
   };
-  fetch('/accounts').then(function (x) { return x.json(); }).then(function (j) {
+  fetch(API + 'accounts').then(function (x) { return x.json(); }).then(function (j) {
     if (j && j.thresholds) setThresholds(j.thresholds);
     render(j);                       // draw with cached values first (stay snappy)
     if (j && j.enabled === false) return;
     // the value at the moment it opened — the timer polls active every minute, so it can be up to 1 min stale.
-    postJson('/acct-usage-now', {}).then(function (fresh) {
+    postJson(API + 'acct-usage-now', {}).then(function (fresh) {
       if (!alive()) return;                                  // already closed -> drop
       if (list.querySelector('.addform') || _codexOperationPending || _xaiOperationPending) return;
       // Both login flows temporarily own the section. Re-rendering the whole list here

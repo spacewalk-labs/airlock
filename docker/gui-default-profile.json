@@ -1,0 +1,20 @@
+{
+  "schema": "airlock.gui-default-profile/v1",
+  "always": [
+    "hub"
+  ],
+  "required": [
+    "devterm",
+    "fileview",
+    "publish"
+  ],
+  "default": [
+    "paseo"
+  ],
+  "install": [
+    "devterm",
+    "fileview",
+    "publish",
+    "paseo"
+  ]
+}

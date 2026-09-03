@@ -17,7 +17,9 @@ set -u
 # `["a b", "c"]` and `["a", "b c"]` record identically — and the call log is the
 # strongest oracle the test has. It must not be able to call two different commands
 # the same thing.
-{ printf 'orb'; printf ' %q' "$@"; printf '\n'; } \
+{ printf 'orb';
+  if [ "${STUB_RECORD_EXECUTABLE:-0}" = 1 ]; then printf ' executable=%q' "$0"; fi
+  printf ' %q' "$@"; printf '\n'; } \
   >> "${ORB_LOG:?ORB_LOG must be set — refusing to run unrecorded}"
 case "${1:-}" in
   list)

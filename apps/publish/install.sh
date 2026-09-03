@@ -75,6 +75,12 @@ HTPASSWD_DIR="$(airlock_config get apps.publish.public_target.htpasswd_dir 2>/de
 [ -n "$HTPASSWD_DIR" ] || HTPASSWD_DIR=/opt/airlock/publish-gated-auth
 HTPASSWD_DIR="${HTPASSWD_DIR/#\~/$HOME}"
 HTPASSWD_BIN="$(airlock_config get apps.publish.public_target.htpasswd_bin 2>/dev/null || true)"
+# The receiver names the header it authenticates with, and receivers disagree: this
+# app's own name is not the only one in service. Configurable rather than hardcoded
+# so a box can talk to a receiver that already has publishers deployed against a
+# different name — changing the shared default would break every one of them.
+TOKEN_HEADER="$(airlock_config get apps.publish.public_target.token_header 2>/dev/null || true)"
+[ -n "$TOKEN_HEADER" ] || TOKEN_HEADER=X-Airlock-Publish-Token
 [ -n "$HTPASSWD_BIN" ] || HTPASSWD_BIN=htpasswd
 if [ "$PUBLIC_MODE" = local ]; then
   [ -n "$PUBLIC_DIR" ] || PUBLIC_DIR=/opt/airlock/share-public
@@ -256,7 +262,8 @@ else
   install -d "$UNIT_DIR"
   render_publish_unit_service "$BACKEND_PORT" "$SHARE_DIR" "$UPLOADS_DIR" "$IDENTITY_HEADER" \
     "$INGEST_URL" "$BASE_URL" "$TOKEN_ENV" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" \
-    "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" >"$UNIT_DIR/airlock-publish.service"
+    "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" "$TOKEN_HEADER" \
+    >"$UNIT_DIR/airlock-publish.service"
   render_publish_unit_cleanup "$UPLOADS_DIR" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" \
     "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" >"$UNIT_DIR/airlock-publish-cleanup.service"
   render_publish_unit_timer >"$UNIT_DIR/airlock-publish-cleanup.timer"
@@ -297,11 +304,27 @@ if [ "$PUBLIC_MODE" = local ]; then
 else
   # A mode change must retract the generated gate; otherwise an operator's
   # existing include keeps serving stale gated content in remote mode.
+  #
+  # Retract by EMPTYING the fragment, not by removing it. The README tells the
+  # operator to include this exact path from their own public server block, and that
+  # include is not ours to edit — but deleting its target makes nginx refuse the
+  # whole configuration. Nothing looks wrong while nginx serves from memory; the
+  # next reload fails and the next restart cannot start nginx at all.
+  #
+  # The legacy top-level fragment beside it is still removed: no documented include
+  # ever pointed at that one.
+  # Written unconditionally, exactly like the local branch above and every other
+  # fragment: it is config the renderer includes, not a system mutation. Only the
+  # legacy file's removal is a mutation and stays behind the dry-run guard.
+  gated_frag="$CONFD/public-includes.d/publish-gated.conf"
+  install -d "$CONFD/public-includes.d"
+  render_publish_nginx_gated_retracted > "$gated_frag"
   if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-    log "[dry] remove disabled nginx gated fragments"
+    log "[dry] remove legacy nginx fragment: $CONFD/publish-public-gated.conf"
   else
-    rm -f "$CONFD/public-includes.d/publish-gated.conf" "$CONFD/publish-public-gated.conf"
+    rm -f "$CONFD/publish-public-gated.conf"
   fi
+  log "retracted nginx gated-public fragment: $gated_frag (no directives)"
 fi
 
 # NOTE: smoke runs from the orchestrator AFTER nginx reload (gate not live before).

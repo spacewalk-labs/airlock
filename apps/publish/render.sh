@@ -7,12 +7,13 @@
 
 # render_publish_unit_service BACKEND_PORT SHARE_DIR UPLOADS_DIR IDENTITY_HEADER \
 #   INGEST_URL BASE_URL TOKEN_ENV PUBLIC_MODE PUBLIC_DIR STATE_DIR GATED_DIR \
-#   HTPASSWD_DIR HTPASSWD_BIN
+#   HTPASSWD_DIR HTPASSWD_BIN TOKEN_HEADER
 render_publish_unit_service() {
   local BACKEND_PORT="$1" SHARE_DIR="$2" UPLOADS_DIR="$3" IDENTITY_HEADER="$4" \
         INGEST_URL="$5" BASE_URL="$6" TOKEN_ENV="$7" PUBLIC_MODE="$8" PUBLIC_DIR="$9"
   shift 9
-  local STATE_DIR="$1" GATED_DIR="$2" HTPASSWD_DIR="$3" HTPASSWD_BIN="$4"
+  local STATE_DIR="$1" GATED_DIR="$2" HTPASSWD_DIR="$3" HTPASSWD_BIN="$4" \
+        TOKEN_HEADER="$5"
   local BACKEND_PY="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/backend/airlock-publish.py"
   cat <<UNIT
 [Unit]
@@ -36,6 +37,7 @@ Environment=AIRLOCK_PUBLISH_STATE_DIR=${STATE_DIR}
 Environment=AIRLOCK_PUBLISH_GATED_DIR=${GATED_DIR}
 Environment=AIRLOCK_PUBLISH_HTPASSWD_DIR=${HTPASSWD_DIR}
 Environment=AIRLOCK_PUBLISH_HTPASSWD_BIN=${HTPASSWD_BIN}
+Environment=AIRLOCK_PUBLISH_TOKEN_HEADER=${TOKEN_HEADER}
 ExecStart=$(command -v python3) ${BACKEND_PY}
 Restart=on-failure
 RestartSec=3
@@ -124,6 +126,27 @@ location /_assets/ {
     alias @@SHARE@@/_assets/;
     add_header Cache-Control "no-cache" always;
 }
+NGINX
+}
+
+# render_publish_nginx_gated_retracted — what remote mode leaves in the gated
+# fragment's place. It must be a FILE, not an absence: the README tells the operator
+# to `include` this path from THEIR OWN public server block, so deleting it turns
+# their config into one that nginx refuses to load. The running nginx keeps serving
+# from memory, so nothing looks wrong until the next reload fails — and the next
+# restart cannot bring nginx up at all, taking the whole hub with it. Measured on one
+# box: `nginx -t` -> [emerg] open() ".../public-includes.d/publish-gated.conf" failed.
+#
+# Empty of directives, so remote mode serves no gate — the retraction this replaces
+# was right about that part, only wrong about how to spell it.
+render_publish_nginx_gated_retracted() {
+  cat <<'NGINX'
+# gated public snapshots — RETRACTED (this box runs publish in remote mode).
+#
+# Deliberately a file with no directives rather than no file: the public server
+# block includes this path, and an include with nothing behind it makes nginx
+# refuse to load the whole configuration. Re-installing with
+# [apps.publish.public_target].mode = "local" fills this back in.
 NGINX
 }
 

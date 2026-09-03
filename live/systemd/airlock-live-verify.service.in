@@ -6,6 +6,7 @@ Documentation=file:@REPO@/live/README.md
 # it would die too. OnFailure= is started by systemd after this unit has already
 # failed, which is the only version of "raise an alarm" that survives the failure.
 OnFailure=airlock-live-failed.service
+X-Airlock-Owner=airlock-live
 
 [Service]
 Type=oneshot

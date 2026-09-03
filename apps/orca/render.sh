@@ -152,6 +152,27 @@ WantedBy=multi-user.target
 UNIT
 }
 
+# render_orca_apparmor SQUASHFS
+# Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which denies
+# the unprivileged user namespace Chromium needs for its sandbox. The SUID-sandbox
+# fallback cannot cover for it here: airlock-orca.service sets NoNewPrivileges=yes,
+# and that neuters setuid, so chrome-sandbox aborts too ("setuid sandbox is not
+# running as root"). Electron then SIGTRAPs on every start and systemd restart-loops
+# it forever. Grant userns to this AppImage's two binaries only — the system-wide
+# sysctl stays untouched, so nothing else on the box loses the restriction.
+render_orca_apparmor() {
+  local SQUASHFS="$1"
+  cat <<PROFILE
+abi <abi/4.0>,
+include <tunables/global>
+
+profile airlock-orca ${SQUASHFS}/{AppRun,orca-ide} flags=(unconfined) {
+  userns,
+  include if exists <local/airlock-orca>
+}
+PROFILE
+}
+
 # render_orca_nginx_extra BACKEND_PORT ORCA_DIST_SERVE WIDGET_MENU_ATTRS
 # Only called when the patched web client is vendored (ORCA_WEB_ENABLED=1).
 render_orca_nginx_extra() {

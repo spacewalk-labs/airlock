@@ -630,6 +630,7 @@ UPLOADS_DIR="/home/example/uploads"; IDENTITY_HEADER="Tailscale-User-Login"
 SHARE_DIR="/opt/airlock/share"; STATE_DIR="/home/example/.local/state/airlock"
 GATED_DIR="/opt/airlock/share-gated"; HTPASSWD_DIR="/opt/airlock/publish-gated-auth"
 HTPASSWD_BIN="htpasswd"; INGEST_URL=""; BASE_URL=""; TOKEN_ENV="AIRLOCK_PUBLISH_TOKEN"
+TOKEN_HEADER="X-Airlock-Publish-Token"
 BACKEND_PORT=19800
 for SET in mode-remote mode-local; do
   case "$SET" in
@@ -638,7 +639,7 @@ for SET in mode-remote mode-local; do
   esac
 
   f="$(out_file)"; render_to "$f" render_publish_unit_service "$BACKEND_PORT" "$SHARE_DIR" "$UPLOADS_DIR" "$IDENTITY_HEADER" \
-    "$INGEST_URL" "$BASE_URL" "$TOKEN_ENV" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN"
+    "$INGEST_URL" "$BASE_URL" "$TOKEN_ENV" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" "$TOKEN_HEADER"
   golden_check_file "publish/$SET/unit-service.service" "$f"
 
   f="$(out_file)"; render_to "$f" render_publish_unit_cleanup "$UPLOADS_DIR" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN"
@@ -650,9 +651,13 @@ for SET in mode-remote mode-local; do
   f="$(out_file)"; render_to "$f" render_publish_nginx_main "$BACKEND_PORT" "$SHARE_DIR"
   golden_check_file "publish/$SET/nginx-main.conf" "$f"
 
-  f="$(out_file)"; render_to "$f" render_publish_nginx_gated "$GATED_DIR" "$HTPASSWD_DIR"
   if [ "$PUBLIC_MODE" = local ]; then
+    f="$(out_file)"; render_to "$f" render_publish_nginx_gated "$GATED_DIR" "$HTPASSWD_DIR"
     golden_check_file "publish/$SET/nginx-gated.conf" "$f"
+  else
+    # What remote mode leaves behind so the operator's include still resolves.
+    f="$(out_file)"; render_to "$f" render_publish_nginx_gated_retracted
+    golden_check_file "publish/$SET/nginx-gated-retracted.conf" "$f"
   fi
 done
 

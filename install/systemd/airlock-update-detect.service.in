@@ -2,6 +2,7 @@
 Description=airlock — collect the daily update snapshot
 After=network-online.target
 Wants=network-online.target
+X-Airlock-Owner=airlock-install
 
 [Service]
 Type=oneshot

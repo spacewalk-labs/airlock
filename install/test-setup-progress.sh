@@ -348,6 +348,44 @@ else
   bad "a login URL with no trailing newline was dropped by the read loop"
 fi
 
+# 16. Finder does not inherit an interactive shell's PATH. The launcher therefore
+#     resolves this account's OrbStack command and hands the exact absolute path to the
+#     setup script. Put that command somewhere outside PATH to prove the script uses the
+#     contract rather than accidentally finding the ordinary stub.
+setup_or_die mkdir -p "$TMP/account-orb"
+setup_or_die cp "$HERE/setup-orb-stub.sh" "$TMP/account-orb/orb"
+setup_or_die chmod +x "$TMP/account-orb/orb"
+run "$TMP/e.out" "$TMP/e.err" "$TMP/e.orb" env AIRLOCK_PROGRESS=json \
+  AIRLOCK_ORB_BIN="$TMP/account-orb/orb" STUB_RECORD_EXECUTABLE=1
+if [ "$RC" -ne 0 ]; then
+  bad "the explicit per-account orb path failed (rc=$RC): $(tail -1 "$TMP/e.err")"
+elif ! grep -Fq "orb executable=$TMP/account-orb/orb " "$TMP/e.orb"; then
+  bad "setup did not use the supplied orb executable: $(head -1 "$TMP/e.orb")"
+else
+  ok "the exact per-account orb path drives the whole setup"
+fi
+
+# 17. The override is an executable path, not shell text or a second PATH. Refuse a
+#     relative value before any machine command runs and report one parseable failure
+#     to the GUI.
+run "$TMP/r.out" "$TMP/r.err" "$TMP/r.orb" env AIRLOCK_PROGRESS=json \
+  AIRLOCK_ORB_BIN="relative/orb"
+if [ "$RC" -eq 0 ]; then
+  bad "a relative AIRLOCK_ORB_BIN was accepted"
+elif [ -s "$TMP/r.orb" ]; then
+  bad "a relative AIRLOCK_ORB_BIN reached the machine command"
+elif python3 - "$TMP/r.err" <<'PYR'
+import json, sys
+events = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+raise SystemExit(0 if len(events) == 3 and events[-1].get("event") == "fatal"
+                 and "absolute path" in events[-1].get("message", "") else 1)
+PYR
+then
+  ok "a relative orb override is refused before mutation with a parseable failure"
+else
+  bad "a relative orb override did not produce the expected fatal event"
+fi
+
 echo "---"
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

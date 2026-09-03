@@ -30,14 +30,15 @@
 # checkout, and commits the result to the operator's OWN repository — which is what
 # makes the update reversible without us having to build a backup mechanism.
 #
-# The whole body is inside main(), called on the last line. A `curl | bash` that is
-# cut off mid-transfer then runs NOTHING instead of running the first half: bash
-# executes what it has read so far, and a truncated function definition is a syntax
-# error, not a partial update. (Measured: an earlier draft, truncated, replaced every
-# file and exited 0 without committing or re-running the installer.)
+# The executable program is inside one outer function, called on the last line. A
+# `curl | bash` that is cut off mid-transfer then runs NOTHING instead of running the
+# first half: bash executes what it has read so far, and a truncated outer function is
+# a syntax error, not a partial update. (Measured: an earlier draft, truncated,
+# replaced every file and exited 0 without committing or re-running the installer.)
 # ---------------------------------------------------------------------------------
 set -uo pipefail
 
+airlock_update_program() {
 main() {
   local RELEASE_URL="${AIRLOCK_RELEASE_URL:-https://github.com/spacewalk-labs/airlock}"
   local RELEASE_REF="${AIRLOCK_RELEASE_REF:-main}"
@@ -141,6 +142,9 @@ main() {
   local git_dir recovery_dir
   git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" \
     || die "git 메타데이터 경로를 읽지 못했습니다"
+  local installed_head=""
+  git rev-parse --verify -q HEAD >/dev/null 2>&1 \
+    && installed_head="$(git rev-parse HEAD)"
   acquire_update_mutex "$git_dir"
   recovery_dir="$git_dir/airlock-update-rollback"
   if [ "$dry" != 1 ] && [ -e "$recovery_dir" ]; then
@@ -163,6 +167,26 @@ main() {
   git fetch -q "$RELEASE_REMOTE" "$RELEASE_REF" \
     || die "배포본을 받지 못했습니다 — 인터넷 연결을 확인해 주세요. (레포는 공개라 로그인은 필요 없습니다)"
   local new; new="$(git rev-parse FETCH_HEAD)" || die "받은 내용을 읽지 못했습니다"
+  local direction
+  direction="$(release_direction "$new" "$installed_head" "$RELEASE_REF" "$RELEASE_URL")"
+  case "$direction" in
+    rollback)
+      say "받은 배포본은 현재 설치본보다 뒤입니다 — 업데이트로 보이지 않고 실행도 거부합니다."
+      if [ "$dry" = 1 ]; then
+        [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && emit_update_json 0 0 "$new"
+        return 0
+      fi
+      die "뒤진 배포본으로는 갱신할 수 없습니다. 이전 버전으로 돌아가려면 별도 롤백 절차를 사용하세요." ;;
+    ambiguous)
+      say "받은 배포본이 현재 설치본보다 앞서는지 확인하지 못했습니다."
+      if [ "$dry" = 1 ]; then
+        [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && emit_update_json 0 0 "$new"
+        return 0
+      fi
+      die "배포본 방향이 모호해 파일을 바꾸지 않습니다." ;;
+    same|forward) ;;
+    *) die "배포본 방향 판정값이 잘못됐습니다: $direction" ;;
+  esac
 
   # ---------------------------------------------------------------- 3) 무엇이 바뀌나
   #
@@ -208,6 +232,14 @@ main() {
 $release_paths
 EOF
 
+  if [ "$direction" = same ]; then
+    say "이미 같은 배포본입니다 — 새 업데이트가 아닙니다."
+    [ "$dry" != 1 ] || {
+      [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && emit_update_json 0 0 "$new"
+      return 0
+    }
+  fi
+
   if [ "$changed" = 0 ]; then
     say "이미 최신입니다 — 바뀔 파일이 없습니다."
     [ "$do_install" = 1 ] || return 0
@@ -227,14 +259,8 @@ EOF
   if [ "$dry" = 1 ]; then
     say "[미리보기] 여기까지입니다. 아무것도 바꾸지 않았습니다."
     if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
-      python3 - "$changed" "$new" <<'PY'
-import json
-import sys
-
-changed, ref = sys.argv[1:]
-print(json.dumps({"available": int(changed) > 0,
-                  "changedCount": int(changed), "ref": ref}, separators=(",", ":")))
-PY
+      emit_update_json "$([ "$changed" -gt 0 ] && printf 1 || printf 0)" \
+        "$changed" "$new"
     fi
     return 0
   fi
@@ -441,6 +467,148 @@ is_checkout() {
   [ -f "$1/bin/airlock-config" ] \
     && [ -f "$1/install/airlock-install.sh" ] \
     && [ -f "$1/docker/orbstack-machine-setup.sh" ]
+}
+
+emit_update_json() { # <available:0|1> <changed-count> <release-ref>
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+available, changed, ref = sys.argv[1:]
+print(json.dumps({"available": available == "1", "changedCount": int(changed),
+                  "ref": ref}, separators=(",", ":")))
+PY
+}
+
+release_tree_matches_state() { # <public-release-commit> <local-commit-or-empty-for-worktree>
+  local ref="$1" local_commit="$2" paths diff_names changed
+  paths="$(git -c core.quotePath=false ls-tree -r --name-only "$ref" | sort)" || return 2
+  if [ -n "$local_commit" ]; then
+    diff_names="$(git -c core.quotePath=false diff --name-only "$ref" "$local_commit" \
+      2>/dev/null)" || return 2
+  else
+    diff_names="$(git -c core.quotePath=false diff --name-only "$ref" -- . \
+      2>/dev/null)" || return 2
+  fi
+  changed="$(printf '%s\n' "$diff_names" | sort \
+    | comm -12 - <(printf '%s\n' "$paths"))" || return 2
+  [ -z "$changed" ]
+}
+
+repository_name_from_url() { # <repository-url-or-path>
+  local url="${1%/}"
+  url="${url%.git}"
+  printf '%s' "${url##*/}"
+}
+
+release_direction() { # <candidate-public-commit> <installed-head-or-empty> <requested-ref> <release-url>
+  local candidate="$1" installed_head="$2" requested_ref="$3" release_url="$4"
+  local origin_url="" release_name="" private_name="" subject="" subject_label=""
+  local source_token="" source_commit="" private_tip="" installed_source=""
+  local installed_release="" token="" ref=""
+
+  # A developer checkout has the private graph locally. Public release commits name
+  # their source repository and SHA, so compare those commits rather than pretending
+  # the unrelated public and private histories share ancestry. Build the source name
+  # from the public repository identity instead of publishing a private name here.
+  # Read the configured identity, not `remote get-url`: Git rewrites the latter via
+  # url.*.insteadOf, which is transport routing and must not redefine repository
+  # identity.  The tests use that distinction to route this canonical URL locally.
+  origin_url="$(git config --get remote.origin.url 2>/dev/null || true)"
+  origin_url="${origin_url%/}"
+  origin_url="${origin_url%.git}"
+  release_name="$(repository_name_from_url "$release_url")"
+  private_name="${release_name}-work"
+  case "$origin_url" in
+    "https://github.com/spacewalk-labs/$private_name"|"git@github.com:spacewalk-labs/$private_name"|"ssh://git@github.com/spacewalk-labs/$private_name")
+      # Deployment checkouts can have a local merge commit whose parents are the
+      # deployed private source point and a public release. Comparing the public
+      # source directly with HEAD would call the current release a rollback. The
+      # merge-base with a freshly fetched source main is the deployed source point.
+      if git fetch -q origin main >/dev/null 2>&1; then
+        private_tip="$(git rev-parse --verify -q FETCH_HEAD 2>/dev/null || true)"
+      fi
+      subject="$(git log -1 --format=%s "$candidate" 2>/dev/null || true)"
+      if [[ "$subject" =~ ^release[[:space:]]from[[:space:]]([[:alnum:]_.-]+)[[:space:]]@[[:space:]]([0-9a-f]{7,40})$ ]]; then
+        subject_label="${BASH_REMATCH[1]}"
+        source_token="${BASH_REMATCH[2]}"
+      fi
+      if [ "$subject_label" = "$private_name" ] && [ -n "$source_token" ] \
+         && [ -n "$installed_head" ] && [ -n "$private_tip" ]; then
+        source_commit="$(git rev-parse --verify -q "${source_token}^{commit}" 2>/dev/null || true)"
+        installed_source="$(git merge-base "$installed_head" "$private_tip" 2>/dev/null || true)"
+        if [ -n "$source_commit" ] && [ -n "$installed_source" ] \
+           && git merge-base --is-ancestor "$source_commit" "$private_tip" 2>/dev/null; then
+          [ "$source_commit" = "$installed_source" ] && { printf '%s' same; return 0; }
+          git merge-base --is-ancestor "$source_commit" "$installed_source" 2>/dev/null \
+            && { printf '%s' rollback; return 0; }
+          git merge-base --is-ancestor "$installed_source" "$source_commit" 2>/dev/null \
+            && { printf '%s' forward; return 0; }
+          printf '%s' ambiguous
+          return 0
+        fi
+      fi
+      printf '%s' ambiguous
+      return 0
+      ;;
+  esac
+
+  # A box updated by this command has an unrelated local safety history, but its
+  # commit subject records the public release SHA.  Resolve the newest such marker
+  # against the public objects retained by the airlock-release remote.
+  if [ -n "$installed_head" ]; then
+    token="$(git log --format=%s "$installed_head" 2>/dev/null \
+      | sed -n 's/^airlock-update: 배포본 \([0-9a-f]\{12,40\}\) 으로 갱신$/\1/p' \
+      | head -1)"
+    [ -z "$token" ] \
+      || installed_release="$(git rev-parse --verify -q "${token}^{commit}" 2>/dev/null || true)"
+  fi
+
+  # Legacy first installs have no marker.  For the normal moving `main` ref, recover
+  # provenance by finding the newest public ancestor whose complete public path set
+  # matches any local commit.  Looking only at HEAD would reject a valid old install
+  # after its operator committed an edit to a release-owned file.  Do not apply this
+  # to an explicitly pinned old ref: files added by a later release would otherwise
+  # be mistaken for operator files.
+  if [ -z "$installed_release" ] && [ "$requested_ref" = main ]; then
+    if [ -n "$installed_head" ]; then
+      local local_ref match_rc lookup_failed=0
+      while IFS= read -r ref; do
+        while IFS= read -r local_ref; do
+          if release_tree_matches_state "$ref" "$local_ref"; then
+            installed_release="$ref"
+            break
+          else
+            match_rc=$?
+            [ "$match_rc" = 1 ] || { lookup_failed=1; break; }
+          fi
+        done < <(git rev-list "$installed_head")
+        if [ "$lookup_failed" != 0 ] || [ -n "$installed_release" ]; then
+          break
+        fi
+      done < <(git rev-list "$candidate")
+      [ "$lookup_failed" = 0 ] || { printf '%s' ambiguous; return 0; }
+    else
+      local match_rc
+      while IFS= read -r ref; do
+        if release_tree_matches_state "$ref" ""; then
+          installed_release="$ref"
+          break
+        else
+          match_rc=$?
+          [ "$match_rc" = 1 ] || { printf '%s' ambiguous; return 0; }
+        fi
+      done < <(git rev-list "$candidate")
+    fi
+  fi
+
+  [ -n "$installed_release" ] || { printf '%s' ambiguous; return 0; }
+  [ "$installed_release" = "$candidate" ] && { printf '%s' same; return 0; }
+  git merge-base --is-ancestor "$installed_release" "$candidate" 2>/dev/null \
+    && { printf '%s' forward; return 0; }
+  git merge-base --is-ancestor "$candidate" "$installed_release" 2>/dev/null \
+    && { printf '%s' rollback; return 0; }
+  printf '%s' ambiguous
 }
 
 # Serialize the whole updater without a host `flock` dependency (macOS does not ship
@@ -1106,3 +1274,5 @@ $(printf '%s' "$found" | grep . | sed 's/^/         /')
 }
 
 main "$@"
+}
+airlock_update_program "$@"
