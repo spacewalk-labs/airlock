@@ -223,7 +223,7 @@ TPL = f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
 <title>수강생 하네스 — 안에 무엇이 있나 · K-AI PRO Day 1</title>
 <style>{CSS}</style></head><body>
-<div class="topbar"><a href="/k-ai-pro.html"><b>[K-AI PRO]</b></a><span class="sep">›</span><a class="back" href="/k-ai-pro-airlock.html">← Day 1</a><span class="sep">›</span>하네스 미리보기</div>
+<div class="topbar"><b>[K-AI PRO]</b><span class="sep">›</span>Day 1<span class="sep">›</span>하네스 미리보기</div>
 <div class="wrap">
 <div class="hero"><h1>🧰 수강생 하네스 — 안에 무엇이 있나</h1>
 <p>에이전트가 내 방식대로·안전하게 일하도록 <code>~/.claude</code>에 까는 기본 세팅 한 벌.

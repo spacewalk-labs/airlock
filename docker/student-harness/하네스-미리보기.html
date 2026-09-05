@@ -1870,7 +1870,7 @@ VOID_TAGS = {
     &quot;link&quot;, &quot;meta&quot;, &quot;source&quot;, &quot;track&quot;, &quot;wbr&quot;,
 }
 
-SMALL_LEN = re.compile(r&quot;^([\d.]+)(em|rem|px|ch)$&quot;)
+SMALL_LEN = re.compile(r&quot;^([0-9.]+)(em|rem|px|ch)\Z&quot;)
 
 
 def small_box(value):
@@ -1930,7 +1930,7 @@ def declared_risk(body):
     return out
 
 
-BARE_CLASS = re.compile(r&quot;^\.([A-Za-z_][\w-]*)((?:[.:\[][^\s&gt;+~]*)*)$&quot;)
+BARE_CLASS = re.compile(r&quot;^\.([A-Za-z_][\w-]*)((?:[.:\[][^\s&gt;+~]*)*)\Z&quot;)
 ANY_CLASS = re.compile(r&quot;\.([A-Za-z_][\w-]*)&quot;)
 
 

@@ -40,6 +40,18 @@ else
   bad "a projected input contains an internal identifier"
 fi
 
+preview_copy="$scratch/student-harness-preview"
+cp -a "$HARNESS" "$preview_copy"
+if python3 "$preview_copy/_build-preview.py" >/dev/null \
+  && cmp -s "$HARNESS/하네스-미리보기.html" \
+       "$preview_copy/하네스-미리보기.html" \
+  && ! grep -q 'href="/' "$preview_copy/하네스-미리보기.html" \
+  && python3 "$INSTALL" --check --harness "$preview_copy" >/dev/null; then
+  ok "preview regeneration is byte-reproducible, self-contained and keeps the projection pin valid"
+else
+  bad "preview regeneration drifted, regained an absolute link or broke the projection pin"
+fi
+
 if python3 - "$INSTALL" "$ROOT/docker/student-harness-provenance.json" "$scratch" <<'PY'
 import json, pathlib, subprocess, sys
 

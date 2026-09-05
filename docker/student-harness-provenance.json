@@ -5,7 +5,7 @@
     "deny_rules": 4,
     "files": 64,
     "hooks": 3,
-    "projection_sha256": "b70cd2c6c0d99fd576c274fe9bba902e72c4c6381a2fbfb9c753ff4878610ff1",
+    "projection_sha256": "7eeb877595f1a26f47b923f746169c8a6ecbffb100dd8be774a09190c6b123f6",
     "skills": 29,
     "executable_paths": [
       "hooks/secret-guard.sh",
