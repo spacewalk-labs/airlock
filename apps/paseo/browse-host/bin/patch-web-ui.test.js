@@ -32,6 +32,7 @@ assert.deepEqual(SUBAGENT_STREAM_PATCHES.map((patch) => patch.name), [
   "sidebar-order-rehydrate-on-visibility",
   "tooltip-hover-none-is-compact",
   "project-actions-coarse-pointer",
+  "sidebar-tap-not-swallowed-on-web",
 ]);
 // The tablet "+" fix belongs to the ALWAYS-ON group. It rode on the optional browse
 // group until 2026-09-01, which meant a box with `browse = false` — the default —
@@ -40,6 +41,23 @@ assert.deepEqual(SUBAGENT_STREAM_PATCHES.map((patch) => patch.name), [
 assert.ok(byName("project-actions-coarse-pointer"));
 assert.ok(byName("project-actions-coarse-pointer").repl.includes("(pointer: coarse)"));
 assert.ok(!BROWSE_PATCHES.some((patch) => patch.repl.includes("(pointer: coarse)")));
+// The sidebar-tap fix is only a fix if it keeps BOTH halves: the web branch (or nothing
+// changes) and the ORIGINAL handler untouched for native (or a native build loses its
+// drag/menu suppression). Reusing `o.isWeb` matters — it is the exact predicate the
+// hook's own long-press timers are already disabled by, so the edit is inert on native
+// rather than a second, differently-spelled platform test.
+{
+  const patch = byName("sidebar-tap-not-swallowed-on-web");
+  assert.ok(patch.repl.includes("o.isWeb?()=>{}:"));
+  // Byte-for-byte: the only difference is the branch in front of the handler.
+  assert.equal(patch.repl.replace("o.isWeb?()=>{}:", ""), patch.find);
+  // The platform test MUST sit in the hook body, in front of the handler — never
+  // inside it. The handler declares its own `const o={x:c,y:u}` for the current touch
+  // point, so an `o.isWeb` written inside resolves to that local in its temporal dead
+  // zone and throws on EVERY touchmove. Measured: the first draft of this edit did
+  // exactly that. This assertion is what keeps a "tidy-up" from moving it back in.
+  assert.ok(patch.repl.indexOf("o.isWeb") < patch.repl.indexOf("e=>{"));
+}
 // The tooltip gate is only a fix if it keeps BOTH halves: the app's own compact
 // branch (or nothing changes) and the hover-capability test (or desktop loses its
 // tooltips too). Asserted on the bytes — a rewrite to `(pointer: coarse)` would
@@ -91,7 +109,14 @@ const ALL_EDITS = [
   ...BROWSE_PATCHES.map((patch) => patch.name),
 ];
 const GENERAL_EDITS = SUBAGENT_STREAM_PATCHES.map((patch) => patch.name);
+// The general group as it stood one revision back — the shape every already-installed
+// browse-less box carries when this revision reaches it.
 const PREVIOUS_GENERAL_EDITS = GENERAL_EDITS.filter(
+  (edit) => edit !== "sidebar-tap-not-swallowed-on-web",
+);
+// ...and as it stood before the visibility-rehydrate revision, which is the era every
+// pre-move browse shape below belongs to.
+const PRE_REHYDRATE_GENERAL_EDITS = PREVIOUS_GENERAL_EDITS.filter(
   (edit) => edit !== "sidebar-order-rehydrate-on-visibility",
 );
 const BROWSE_EDITS = BROWSE_PATCHES.map((patch) => patch.name);
@@ -124,17 +149,18 @@ assert.equal(productionShasForEdits(BROWSE_EDITS).length, 1);
 // The shape THIS box carried when the bug was found: the whole general group as it
 // stood before the move, no browse. Completing it is the entire point of the change.
 assert.equal(
-  productionShasForEdits(PREVIOUS_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer")).length,
+  productionShasForEdits(PRE_REHYDRATE_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer")).length,
   1,
 );
-// The immediately previous complete general shape is the migration source for this
-// revision's visibility rehydrate edit.
+// Both complete general shapes behind this revision stay nameable: the one before the
+// visibility rehydrate edit, and the one this revision's sidebar-tap fix migrates from.
+assert.equal(productionShasForEdits(PRE_REHYDRATE_GENERAL_EDITS).length, 1);
 assert.equal(productionShasForEdits(PREVIOUS_GENERAL_EDITS).length, 1);
 // Every pre-move browse box holds the coarse-pointer edit already, beside a general
 // group that is one, two, three or four edits old. All four must remain nameable.
 for (const revision of [1, 2, 3, 4]) {
   const edits = [
-    ...PREVIOUS_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer").slice(0, revision),
+    ...PRE_REHYDRATE_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer").slice(0, revision),
     ...BROWSE_EDITS,
     "project-actions-coarse-pointer",
   ];
@@ -173,6 +199,7 @@ const general = apply(pristine, "subagent-stream", [sha(pristine)]);
 assert.equal(general.alreadyPatched, false);
 assert.match(general.source, /provider_subagent/);
 assert.ok(general.source.includes("(pointer: coarse)"));
+assert.ok(general.source.includes(byName("sidebar-tap-not-swallowed-on-web").repl));
 for (const patch of BROWSE_PATCHES) assert.ok(general.source.includes(patch.find));
 
 const combinedFromGeneral = apply(general.source, "browse", [sha(general.source)]);
@@ -200,6 +227,18 @@ assert.equal(migratedMove.alreadyPatched, false);
 assert.equal(migratedMove.states["subagent-stream"], "partial");
 assert.equal(migratedMove.source, general.source);
 assert.ok(migratedMove.source.includes("(pointer: coarse)"));
+
+// The migration THIS revision exists for: a box carrying the general group as it stood
+// one revision back must come out with the sidebar-tap fix, not with a marker that
+// claims success. This is the state every installed browse-less box is actually in.
+const preTapGeneral = SUBAGENT_STREAM_PATCHES
+  .filter((patch) => patch.name !== "sidebar-tap-not-swallowed-on-web")
+  .reduce((source, patch) => source.replace(patch.find, patch.repl), pristine);
+const migratedTap = apply(preTapGeneral, "subagent-stream", [sha(preTapGeneral)]);
+assert.equal(migratedTap.alreadyPatched, false);
+assert.equal(migratedTap.states["subagent-stream"], "partial");
+assert.equal(migratedTap.source, general.source);
+assert.ok(migratedTap.source.includes(byName("sidebar-tap-not-swallowed-on-web").repl));
 
 // PR #256's adapter is a migration source, not an ambiguous foreign bundle. It
 // already counts as the shared-storage edit for shape lookup, but running the
@@ -230,7 +269,7 @@ assert.equal(migratedBrowseBox.states["subagent-stream"], "partial");
 assert.equal(migratedBrowseBox.source, combinedFromGeneral.source);
 
 // Every earlier revision of the general group is still completable.
-for (const revision of [1, 2, 3, 4]) {
+for (const revision of [1, 2, 3, 4, 5, 6]) {
   const older = SUBAGENT_STREAM_PATCHES.slice(0, revision).reduce(
     (source, patch) => source.replace(patch.find, patch.repl),
     pristine,

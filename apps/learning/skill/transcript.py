@@ -37,8 +37,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 YT_DLP_TIMEOUT_SECONDS = 300
+# 🔴 유튜브의 레이트리밋은 IP 단위이고, 여러 영상을 잇달아 적재하면 반드시 만난다.
+#    한 번 맞고 포기하면 되는 영상이 "자막 없음" 으로 기록된다 — 몇십 초 기다리면 대개
+#    통과한다(실측 2026-09-04~05: 429 8건 중 6건이 재시도·우회로 결국 성공).
+YT_DLP_RETRY_DELAYS = (5, 15, 45)
 # 영상 id 는 URL 이 무엇이든 이 모양이다. 저장 헬퍼의 프론트매터 검사와 같은 문자 집합.
 VIDEO_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 
@@ -66,6 +71,37 @@ def run(argv, **kwargs):
         die(f"yt-dlp 을 실행하지 못했습니다: {exc}")
 
 
+def rate_limited(stderr):
+    text = stderr.decode("utf-8", "replace")
+    return "429" in text or "Too Many Requests" in text
+
+
+def run_patiently(argv, sleep=None):
+    """429 면 잠깐 기다렸다 다시 청한다. 다른 실패는 그대로 돌려준다 — 재시도가 고칠 수
+    있는 것은 레이트리밋뿐이고, 지역차단·삭제된 영상을 세 번 더 물어봐야 답은 같다."""
+    sleep = time.sleep if sleep is None else sleep
+    for delay in YT_DLP_RETRY_DELAYS:
+        result = run(argv)
+        if result.returncode == 0 or not rate_limited(result.stderr):
+            return result
+        sleep(delay)
+    return run(argv)
+
+
+def language_rounds(language):
+    """자막 언어를 청하는 순서. 영상이 자기 언어를 말하면 **그것만** 먼저 청하고, `en` 은
+    그 라운드가 빈손일 때의 대비책으로 미룬다.
+
+    🔴 한 번에 `ko,ko-orig,en` 을 청하면 안 된다. yt-dlp 는 청한 언어 중 **하나라도**
+       못 받으면 비영 종료라, ko 자막을 이미 손에 쥐고도 en 하나의 429 로 전체가 실패한다
+       (실측 2026-09-02~05: 잡 118건 중 18건이 이 경로로 죽었고 실패 사유는 전부
+       `for 'en'` 이었다). 요청 수도 영상마다 두 배가 되어 레이트리밋을 스스로 앞당긴다.
+    """
+    if language and language != "en":
+        return ([language, f"{language}-orig"], ["en"])
+    return (["en"],)
+
+
 def metadata(binary, url):
     # 🔴 `--no-playlist` 가 없으면 `list=` 가 붙은 평범한 watch 주소에서 yt-dlp 가 영상마다
     #    JSON 을 한 줄씩 내고 `json.loads` 가 죽는다. 재생목록에서 복사한 주소는 흔하고,
@@ -90,6 +126,19 @@ def hms(seconds):
     return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
+def attempts(language):
+    """(플래그, 종류, 언어목록, 끈질기게) 를 시도할 순서대로. 사람 자막 → 자동자막, 각
+    안에서 영상 언어 → en.
+
+    🔴 429 를 기다려 주는 것은 **1순위 라운드에만** 한다. 대비책인 en 라운드에서까지
+       세 번 기다리면 영상 하나에 2분이 그냥 사라지는데, 정작 그 영상의 진짜 자막은
+       다음 라운드에 있다. 대비책은 한 번 청해 보고 아니면 넘어가는 것이 맞다.
+    """
+    for flag, kind in (("--write-subs", "manual"), ("--write-auto-subs", "auto")):
+        for index, langs in enumerate(language_rounds(language)):
+            yield flag, kind, langs, index == 0
+
+
 def subtitle_events(binary, url, workdir, language=None, failures=None):
     """(이벤트 목록, 종류). 자막이 없으면 (None, None). 실패 사유는 `failures` 에 쌓인다.
 
@@ -97,32 +146,32 @@ def subtitle_events(binary, url, workdir, language=None, failures=None):
     고유명사와 숫자가 틀린다.
     """
     failures = [] if failures is None else failures
-    for flag, kind in (("--write-subs", "manual"), ("--write-auto-subs", "auto")):
+    for flag, kind, langs, patient in attempts(language):
         for name in os.listdir(workdir):
             os.unlink(os.path.join(workdir, name))   # 앞 시도의 산출물을 이번 것으로 읽지 않는다
+        # 🔴 언어를 안 주면 yt-dlp 는 **영어를 고른다.** 한국어 영상의 자동자막에 ko 와
+        #    en 이 다 있으면 en(기계번역)을 받아 오고, 요약이 번역본에서 만들어진다
+        #    (적대검증 2026-08-22 실측). 그래서 언제나 명시해서 청한다.
         argv = [binary, "--skip-download", flag, "--sub-format", "json3",
+                "--sub-langs", ",".join(langs),
                 "--no-playlist", "--no-warnings",
                 "-o", os.path.join(workdir, "s.%(ext)s"), url]
-        if language:
-            # 🔴 언어를 안 주면 yt-dlp 는 **영어를 고른다.** 한국어 영상의 자동자막에 ko 와
-            #    en 이 다 있으면 en(기계번역)을 받아 오고, 요약이 번역본에서 만들어진다
-            #    (적대검증 2026-08-22 실측). 영상이 자기 언어를 말하면 그것을 먼저 청한다.
-            argv[5:5] = ["--sub-langs", f"{language},{language}-orig,en"]
-        result = run(argv)
+        result = run_patiently(argv) if patient else run(argv)
+        label = f"{kind}/{','.join(langs)}"
         if result.returncode != 0:
             # 🔴 실패 사유를 버리지 않는다. 버리면 429·지역차단·인증요구가 전부 "자막이
             #    없습니다" 로 세탁된다 — 사용자는 되는 영상을 안 된다고 읽고, 그 오해를
             #    풀 방법이 없다.
             detail = result.stderr.decode("utf-8", "replace").strip()
             if detail:
-                failures.append(f"{kind}: {detail.splitlines()[-1][:200]}")
+                failures.append(f"{label}: {detail.splitlines()[-1][:200]}")
             continue
         landed = sorted(os.listdir(workdir))
         hits = [name for name in landed if name.endswith(".json3")]
         if not hits:
             if landed:
                 # 자막은 왔는데 json3 가 아니다. "없다" 와 전혀 다른 사건이다.
-                failures.append(f"{kind}: json3 자막이 없습니다 (받은 것: {', '.join(landed)})")
+                failures.append(f"{label}: json3 자막이 없습니다 (받은 것: {', '.join(landed)})")
             continue
         try:
             with open(os.path.join(workdir, hits[0]), "r", encoding="utf-8") as handle:

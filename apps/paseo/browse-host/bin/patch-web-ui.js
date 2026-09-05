@@ -9,16 +9,17 @@
 //   node bin/patch-web-ui.js <web-ui-dir> <companion-js-path>  # legacy --browse
 //
 // The always-on general group (CLI flag `--subagent-stream`, kept for callers that
-// predate it carrying more than one edit) applies SIX edits every box wants: a
+// predate it carrying more than one edit) applies SEVEN edits every box wants: a
 // visible provider-subagent panel subscribes to its parent agent's timeline; the
 // fresh-install font-size defaults move to 18 (ui) / 14 (code); the sidebar order
 // store points at the airlock ui-state backend so the order follows the owner across
 // devices instead of living in one browser; an already-open tab rehydrates that order
 // when it becomes visible; a device that cannot hover is treated as
-// compact for the tooltip gate; and a coarse pointer gets the project row's trailing
-// actions without having to manufacture a hover first. The optional browse group
-// applies THREE minimal, verified-unique edits so the self-hosted web runtime can open
-// live browser panels:
+// compact for the tooltip gate; a coarse pointer gets the project row's trailing
+// actions without having to manufacture a hover first; and a sidebar tap stops being
+// swallowed by the long-press/drag machinery web never arms. The optional browse
+// group applies THREE minimal, verified-unique edits so the self-hosted web runtime
+// can open live browser panels:
 //   1+2. un-gate the "New browser" button callbacks (vo/Wo) on web;
 //   3.   mark the BrowserPane container with data-paseo-* so the companion mounts.
 // Then injects the companion <script> into index.html and installs the companion.
@@ -48,7 +49,7 @@ const PINNED_SHA = "435dff4ee752a352ee81ff1eae02338163455b2f7e9b605f1ef30967007c
 // and not "any subset goes": the SHA pin still names what upstream's bytes are.
 //
 // Each sha256 covers the whole bundle and was re-derived from the pristine bundle by
-// applying exactly the listed edits — order-independent, the eight sites are disjoint:
+// applying exactly the listed edits — order-independent, the nine sites are disjoint:
 //   npm pack @getpaseo/server@0.2.5 && tar xzf getpaseo-server-0.2.5.tgz
 //   # apply the subset to package/dist/server/web-ui/_expo/static/js/web/index-*.js
 const KNOWN_BUNDLE_SHAPES = [
@@ -73,11 +74,19 @@ const KNOWN_BUNDLE_SHAPES = [
             "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
             "project-actions-coarse-pointer"] },
   // A device that was already open now rehydrates the shared order when its tab
-  // becomes visible; this is the current browse-less shape.
+  // becomes visible.
   { sha: "b9aa1eac972a2030f03e8c786830a07d40f13839c658664c20c628dcb47c0cea",
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
             "tooltip-hover-none-is-compact", "project-actions-coarse-pointer"] },
+  // ...and the current browse-less shape: a sidebar tap is no longer swallowed by the
+  // long-press/drag machinery web never arms. A browse box passes through here too —
+  // the always-on group runs first, so this is also its mid-install state.
+  { sha: "e77864d635f9699e555e83d5a456425694b78745b98cc8249a010ac0c10223d3",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
+            "tooltip-hover-none-is-compact", "project-actions-coarse-pointer",
+            "sidebar-tap-not-swallowed-on-web"] },
 
   // --- the same eras again on a box that also runs the browse group ---
   // `project-actions-coarse-pointer` shipped FROM the browse group until this
@@ -129,6 +138,13 @@ const KNOWN_BUNDLE_SHAPES = [
             "tooltip-hover-none-is-compact", "new-browser-gate-vo",
             "new-browser-gate-Wo", "browserpane-marker",
             "project-actions-coarse-pointer"] },
+  // Fully patched, this revision: the same browse box after the sidebar-tap fix.
+  { sha: "9dc8c8fbd96032688977bc3b219587884930a3e53c94309d04a297fd76cb9d3c",
+    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
+            "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
+            "tooltip-hover-none-is-compact", "new-browser-gate-vo",
+            "new-browser-gate-Wo", "browserpane-marker",
+            "project-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web"] },
 ];
 const PINNED_VERSION = "@getpaseo/cli@0.2.5 (index-55db56b9)";
 
@@ -240,6 +256,39 @@ const SUBAGENT_STREAM_PATCHES = [
     name: "project-actions-coarse-pointer",
     find: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l,',
     repl: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches,',
+  },
+  {
+    // A tap on a sidebar row does nothing; the SECOND tap navigates. Reported from an
+    // iPad, 2026-09-05 — "the left tab needs a double click".
+    // Both sidebar rows (project and workspace) wrap their press as
+    //   didLongPressRef.current ? (didLongPressRef.current = false) : onPress()
+    // so a raised flag eats exactly one tap and clears itself, which is precisely the
+    // two-tap symptom. The flag belongs to useLongPressDragInteraction, whose
+    // handleTouchMove raises it as soon as decideLongPressMove reports `vertical_scroll`
+    // (>6px, dy-dominant) or `cancel_long_press` (>10px total) — a range an ordinary
+    // finger tap covers.
+    // On web the flag guards nothing. The same hook already disables its long-press and
+    // context-menu timers with `o.isWeb||(...)`, and this bundle's platform module
+    // reports isWeb=true / isNative=false, so dragArmed, didStartDrag and the menu flag
+    // can never become true and handleLongPress is a no-op. The handler still writes its
+    // own scratch refs, but the only effect that ESCAPES the hook on web — the only one
+    // anything outside can observe — is poisoning didLongPressRef. So web gets the no-op
+    // handler outright, on the same predicate upstream already gates the timers with —
+    // not a slop-threshold tweak, which would keep swallowing taps that drift further.
+    // The platform test sits OUTSIDE the handler, in the hook body, deliberately: the
+    // handler declares its own `const o={x:c,y:u}` for the current point, so an
+    // `o.isWeb` written INSIDE it resolves to that local in its temporal dead zone and
+    // throws on every touchmove. Measured — the first draft of this edit did exactly
+    // that, and `node --check` cannot see it; driving the extracted hook is what did.
+    // What now cancels a press that was really a scroll is the browser: react-native-web's
+    // PressResponder fires onPress from the DOM `onClick` handler, and a browser does not
+    // synthesise `click` after a touch that scrolled. That is the mechanism, read out of
+    // this bundle; it is NOT an iOS measurement, so scroll-then-release and end-of-list
+    // overscroll are what to watch on a real tablet. Desktop is unaffected outright — a
+    // mouse emits no touchmove at all.
+    name: "sidebar-tap-not-swallowed-on-web",
+    find: 'c[13]===Symbol.for("react.memo_cache_sentinel")?(B=e=>{const t=R.current;if(!t||p.current||x.current)return;',
+    repl: 'c[13]===Symbol.for("react.memo_cache_sentinel")?(B=o.isWeb?()=>{}:e=>{const t=R.current;if(!t||p.current||x.current)return;',
   },
 ];
 const GROUPS = {

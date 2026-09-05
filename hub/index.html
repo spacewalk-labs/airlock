@@ -42,7 +42,7 @@
     -webkit-font-smoothing: antialiased;
     padding: max(env(safe-area-inset-top), 1.5rem) 1.25rem 3rem;
   }
-  header { max-width: 880px; margin: 0 auto 2rem; display: flex; align-items: center; gap: 1rem;
+  header { max-width: var(--airlock-page); margin: 0 auto 2rem; display: flex; align-items: center; gap: 1rem;
            flex-wrap: wrap; position: relative;   /* anchors the settings sheet */
            padding-bottom: 0.9rem; border-bottom: 1px solid var(--airlock-hairline); }
   h1 { font-size: 1.25rem; margin: 0; letter-spacing: -0.02em; font-weight: 700; }
@@ -107,7 +107,7 @@
   .acct-frame { flex: 1 1 auto; width: 100%; border: 0; background: var(--airlock-surface-1); }
   .acct-note { padding: var(--airlock-sp-4); color: var(--airlock-body);
                font-size: 0.85rem; line-height: 1.55; word-break: break-word; }
-  main { max-width: 880px; margin: 0 auto; }
+  main { max-width: var(--airlock-page); margin: 0 auto; }
   .sec-h { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
            color: var(--airlock-mute); margin: 0 0 1.25rem; display: flex; align-items: center; gap: 8px; }
   .sec-h::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--airlock-primary); }
@@ -123,13 +123,23 @@
               font-size: 0.78rem; line-height: 1.45; max-width: 46ch; }
 
   /* launcher grid — category-coloured tiles + shared glyph sprite */
-  .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
-          gap: 26px 12px; justify-items: center; }
-  .app { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 82px;
+  /* Column count is not pinned; the tile size sets it and auto-fill does the rest
+     (owner, 2026-09-05: "타일을 키우고 자동으로"). Growing the tile is what thins
+     the row out — at the old 92px minimum an 880px column packed eight 82px tiles
+     into 99.5px cells, which read as a list rather than a home screen. */
+  .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
+          gap: 30px 18px; justify-items: center; }
+  .app { display: flex; flex-direction: column; align-items: center; gap: 11px; width: 108px;
          text-decoration: none; color: var(--airlock-ink); position: relative; }
   .app[hidden] { display: none; }
   .app .ic {
-    width: 60px; height: 60px; border-radius: 15px; display: grid; place-items: center;
+    /* px literals on purpose. bin/gen-app-icons.py reads this rule's width,
+       border-radius and the glyph width below to build every app icon from the
+       launcher's own geometry, so it needs numbers it can parse — a var() here
+       leaves the generator guessing and its guard fails closed.
+       80/20/48 keeps the ratios the 60/15/36 tile had exactly (radius 1:4,
+       glyph 3:5), so growing the tile does not silently redraw the icons. */
+    width: 80px; height: 80px; border-radius: 20px; display: grid; place-items: center;
     overflow: hidden; position: relative;
     color: var(--app-glyph, var(--airlock-primary));
     background: var(--app-tile, var(--airlock-surface-2));
@@ -145,7 +155,7 @@
       linear-gradient(180deg, rgba(255,255,255,.05) 0%, rgba(255,255,255,0) 48%, rgba(0,0,0,.05) 100%);
   }
   .app:hover .ic { transform: translateY(-3px); box-shadow: var(--airlock-shadow-hover); }
-  .app .ic svg { width: 36px; height: 36px; display: block; }
+  .app .ic svg { width: 48px; height: 48px; display: block; }
   .app .ic svg, .app .ic svg * { color: var(--app-glyph, var(--airlock-primary)); }
   /* real brand icon (orca, paseo): full-bleed image, no category tile behind it */
   .app .ic img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -163,11 +173,35 @@
                  border-radius: 999px; white-space: nowrap; }
 
   /* Keep the home-screen density on phones: three icons, not two explanatory
-     cards. The 82px tile is still wider and taller than the 44px touch target. */
-  @media (hover: none), (pointer: coarse), (max-width: 560px) {
-    .apps { grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 26px 12px; align-items: start; }
+     cards. The 82px tile is still wider and taller than the 44px touch target.
+
+     The touch tests are BOUNDED BY WIDTH, and that bound is the point. `hover: none`
+     and `pointer: coarse` describe the input, not the screen — an iPad in landscape
+     answers to both and is 1366px wide, so the unbounded version handed a tablet the
+     phone layout: three tiles stretched across the 880px column with the rest of the
+     row empty. Measured on a real iPad, 2026-09-05, and reported as "화면이 넓은데
+     3개만 나오니까 어색한데?".
+
+     This is the second time a coarse-pointer test has been too broad here (the first
+     was the iPad + button, 2026-09-02). The lesson both times: ask the media query
+     what it actually means. "Is this a phone" is a question about width; only "is
+     this a finger" is a question about the pointer.
+
+     960px sits between the widest phone landscape (932px) and the narrowest tablet
+     portrait (1024px), so phones keep the dense layout in both orientations and
+     tablets fall through to the auto-fill grid above — the same one desktops get. */
+  @media (max-width: 560px),
+         (hover: none) and (max-width: 960px),
+         (pointer: coarse) and (max-width: 960px) {
+    /* A phone still needs a floor. The 124px minimum above would give a 350px
+       phone column TWO tiles, so this is not the old hard cap returning — it is
+       the one width where auto-fill cannot reach a sensible answer. Four, like
+       an iPhone home screen. */
+    .apps { grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 24px 8px; align-items: start; }
     .app { width: 100%; }
+    .app .ic { width: 60px; height: 60px; border-radius: 15px; }
+    .app .ic svg { width: 36px; height: 36px; }
   }
 
   /* Tile colour is the app's, not the system's.
@@ -213,7 +247,7 @@
   /* message strip — dev-monitor's "needs a person" preview, above the tool grid.
      Owner-only (matches the API's own gate); hidden entirely for anyone else, same as
      the feedback box below is hidden when its backend is off. */
-  .msgstrip { max-width: 880px; margin: 0 auto 1.75rem; }
+  .msgstrip { max-width: var(--airlock-page); margin: 0 auto 1.75rem; }
   .msgstrip[hidden] { display: none; }
   .ms-quiet { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; color: var(--airlock-mute); }
   .ms-quiet .ok { color: var(--airlock-ink); font-weight: 500; }
@@ -359,7 +393,7 @@
   /* suggestion box — a same-origin feedback relay (see apps/feedback).
      Collapsed by default: the launcher stays quiet and only a small trigger
      shows. The panel below is revealed on click. */
-  .feedback { max-width: 880px; margin: 2.75rem auto 0; }
+  .feedback { max-width: var(--airlock-page); margin: 2.75rem auto 0; }
   .fb-open {
     border: 1px solid var(--airlock-hairline); border-radius: 999px; padding: 5px 14px; cursor: pointer;
     background: transparent; color: var(--airlock-mute); font: inherit; font-size: 0.8rem; font-weight: 500;
@@ -398,7 +432,7 @@
   .fb-status { min-width: 0; color: var(--airlock-mute); font-size: 0.8rem; }
   .fb-status a { color: var(--airlock-primary); }
 
-  footer { max-width: 880px; margin: 2.5rem auto 0; color: var(--airlock-mute); font-size: 0.8rem; }
+  footer { max-width: var(--airlock-page); margin: 2.5rem auto 0; color: var(--airlock-mute); font-size: 0.8rem; }
 </style>
 </head>
 <body>

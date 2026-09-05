@@ -60,6 +60,18 @@
         ]
       },
       {
+        "sha256": "e77864d635f9699e555e83d5a456425694b78745b98cc8249a010ac0c10223d3",
+        "edits": [
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web"
+        ]
+      },
+      {
         "sha256": "8a31b87021fc2e0b70b8b2009fd7bf19bd9da89f4ae0c86af2353ae5e1bcb6b9",
         "edits": [
           "new-browser-gate-vo",
@@ -177,6 +189,21 @@
           "browserpane-marker",
           "project-actions-coarse-pointer"
         ]
+      },
+      {
+        "sha256": "9dc8c8fbd96032688977bc3b219587884930a3e53c94309d04a297fd76cb9d3c",
+        "edits": [
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "new-browser-gate-vo",
+          "new-browser-gate-Wo",
+          "browserpane-marker",
+          "project-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web"
+        ]
       }
     ]
   },
@@ -269,7 +296,8 @@
         "b=1e4,S=0,h=1e6,_=16,O=11,T=24,F=12,I=9,E=22,N=200",
         "{name:\"sidebar-project-workspace-order\",storage:(0,n.createJSONStorage)(()=>o.default),partialize:",
         "partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}))},3544,[3368,3273,3276]);",
-        "const[E,S]=j(C),P=(0,y.useIsCompactFormFactor)(),z=P?w:v;"
+        "const[E,S]=j(C),P=(0,y.useIsCompactFormFactor)(),z=P?w:v;",
+        "c[13]===Symbol.for(\"react.memo_cache_sentinel\")?(B=e=>{const t=R.current;if(!t||p.current||x.current)return;"
       ]
     }
   ]

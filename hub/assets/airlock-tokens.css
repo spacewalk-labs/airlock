@@ -99,6 +99,12 @@
   --airlock-r-sm:   8px;
   --airlock-r-md:   12px;
   --airlock-r-lg:   14px;
+  /* The launcher does NOT read this one — hub/index.html writes its tile radius
+     as a px literal because bin/gen-app-icons.py parses that rule to build every
+     app icon from the launcher's geometry, and a var() defeats the parser. This
+     step exists for everything else that draws an app tile (design-preview), and
+     the launcher keeps its two literals (20px wide, 15px on a phone) in the
+     ratio this one set: radius is a quarter of the side. */
   --airlock-r-tile: 15px;
   --airlock-r-pill: 999px;
 
@@ -111,6 +117,16 @@
   --airlock-sp-6:  24px;
   --airlock-sp-8:  32px;
   --airlock-sp-12: 48px;
+
+  /* ─── Layout ──────────────────────────────────────────────────────────
+     The page column. One value because the header, the launcher, the message
+     strip, the feedback block and the footer are one column and have to agree —
+     they were five separate 880px literals until 2026-09-05, when widening the
+     launcher meant editing all five. The width itself is a launcher decision
+     (owner, 2026-09-05): a home screen on a 1366px iPad should use the iPad,
+     and an 880px band left both margins empty. Prose that needs a reading
+     measure caps itself in ch rather than riding this. */
+  --airlock-page: 1160px;
 
   /* ─── Motion ──────────────────────────────────────────────────────────── */
   --airlock-ease:     cubic-bezier(.2, .8, .2, 1);

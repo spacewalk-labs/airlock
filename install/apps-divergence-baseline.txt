@@ -354,3 +354,12 @@ content	apps/fileview/airlock-app.toml
 content	apps/fileview/render.sh
 content	apps/fileview/smoke.sh
 content	apps/fileview/static/app.js
+# 19) 2026-09-05 learning transcript rate-limit (#359): yt-dlp fails the whole run when
+#    any requested subtitle language is refused, so asking for `ko,ko-orig,en` in one
+#    call let a single 429 on the English fallback discard a Korean transcript that had
+#    already arrived — 18 of 118 ingest jobs hit it between 09-02 and 09-05 and every
+#    failure read `for 'en'`. The fix asks the video's own language first and keeps `en`
+#    as a second round, and backs off on 429 in the first round only. Same shape as
+#    batches 1, 13, 14, 16, 17 and 18: work is the live consumer of apps/ and the
+#    published copy is behind until the next publish sync, not a designed split.
+content	apps/learning/skill/transcript.py

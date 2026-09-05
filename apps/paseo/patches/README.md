@@ -134,9 +134,10 @@ subscription boundary, sets the fresh-install font-size defaults (ui 18 / code 1
 instead of upstream's 16 / 12 — a device that already saved settings keeps its own),
 shares the sidebar order across devices, and makes touch devices usable (tooltips do
 not park over the composer; a coarse pointer gets the project row's `+` without first
-manufacturing a hover); its optional `--browse` group contains the three live-panel
-edits. Both share fail-loud state classification, syntax gating, and content-hash
-cache busting. Everything else under `../browse-host/` is an independent Apache-2.0 sidecar.
+manufacturing a hover; one tap on a sidebar row navigates, instead of being eaten by
+the long-press/drag machinery web never arms); its optional `--browse` group contains
+the three live-panel edits. Both share fail-loud state classification, syntax gating,
+and content-hash cache busting. Everything else under `../browse-host/` is an independent Apache-2.0 sidecar.
 
 ## Why the rest of Airlock can stay Apache-2.0
 

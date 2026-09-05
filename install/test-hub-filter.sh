@@ -172,12 +172,32 @@ sourceCheck("tile descriptions default to hidden with an explicit opt-in",
   html.includes('sub.textContent = meta.sub;') &&
   !html.includes('a.title = meta.sub;'));
 
-// A phone retains the pre-change three-icon density. The button that exposes
-// search and both search controls are 44px targets; search opens on the icon
-// and folds once its query is empty or the explicit close button is used.
-sourceCheck("coarse-pointer layout is a three-column grid",
-  html.includes('grid-template-columns: repeat(3, minmax(0, 1fr));') &&
-  !html.includes('grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));'));
+// A phone keeps home-screen density — four icons, like an iPhone. It is a floor,
+// not a cap: the 124px minimum the wider layout uses would give a 350px phone
+// column two tiles, and that one width is the only place auto-fill cannot reach a
+// sensible answer.
+sourceCheck("phone layout is a four-column grid",
+  html.includes('grid-template-columns: repeat(4, minmax(0, 1fr));'));
+
+// The regression this pins is not the column count, it is the CONDITION. The phone
+// grid used to be selected by `(hover: none), (pointer: coarse)` alone — questions
+// about the input, not the screen — so an iPad answered yes to both at 1366px and
+// got three tiles stretched across the page with the rest of the row empty
+// (owner, 2026-09-05). Counting columns would not have caught that; both layouts
+// were present and correct, the wrong one was chosen. So assert that every touch
+// test carries a width bound, which is the thing that was missing.
+const phoneMedia = html.match(/@media \(max-width: 560px\),[\s\S]*?\{/);
+sourceCheck("the phone grid is chosen by width, not by pointer type alone",
+  !!phoneMedia &&
+  /\(hover: none\) and \(max-width: \d+px\)/.test(phoneMedia[0]) &&
+  /\(pointer: coarse\) and \(max-width: \d+px\)/.test(phoneMedia[0]) &&
+  !/\(hover: none\)\s*,/.test(phoneMedia[0]) &&
+  !/\(pointer: coarse\)\s*,/.test(phoneMedia[0]));
+
+// The page column is one value, not five literals that have to be kept in step.
+sourceCheck("the page column comes from a single token",
+  html.includes('max-width: var(--airlock-page)') &&
+  !html.includes('max-width: 880px'));
 sourceCheck("search is icon-triggered and its controls meet the 44px target",
   html.includes('id="find-open"') && html.includes('id="find-close"') &&
   html.includes('width: 44px; height: 44px;') &&
