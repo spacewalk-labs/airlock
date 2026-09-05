@@ -10,7 +10,9 @@ To authenticate, visit:
 
         https://login.tailscale.com/a/abc123def456
 
-[1;36m[airlock-mac][0m using repo at (in-machine path): /mnt/macTMP/repo
+[1;36m[airlock-mac][0m using launcher checkout at (in-machine path): /mnt/macTMP/repo
+[1;36m[airlock-mac][0m materializing the Linux checkout at /home/airlockuser/workspace/airlock
 [1;36m[airlock-mac][0m running install/airlock-install.sh inside the machine
+[1;36m[airlock-mac][0m installing the agent tools and pinned student harness
 [1;36m[airlock-mac][0m done (arm64, detected from arm64). Open:  https://airlock.example.ts.net/  and add to home screen.
 [1;36m[airlock-mac][0m re-run this script anytime after editing airlock.toml to re-apply.

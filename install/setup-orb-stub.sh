@@ -34,6 +34,7 @@ case "${1:-}" in
     [ "${1:-}" = "-u" ] && shift 2             # -u <user>
     case "$*" in
       *whoami*)                    echo "airlockuser" ;;
+      *"printf %s"*'"$HOME"'*)   printf '/home/airlockuser' ;;
       *"tailscale status --json"*)
         # STUB_BAD_FQDN=1 makes the parse fail, which the script tolerates by design
         # (`|| true`) and reports as a placeholder URL.

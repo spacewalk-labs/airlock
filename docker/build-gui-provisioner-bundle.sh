@@ -11,6 +11,7 @@ umask 022
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PROFILE="$HERE/gui-default-profile.json"
+HARNESS_PROVENANCE="$HERE/student-harness-provenance.json"
 
 usage() {
   echo "usage: $0 --output FILE [--revision REVISION] [--public-export]" >&2
@@ -45,6 +46,8 @@ if [ -e "$output" ] || [ -L "$output" ]; then
   exit 1
 fi
 [ -f "$PROFILE" ] || { echo "gui bundle: profile not found: $PROFILE" >&2; exit 1; }
+[ -f "$HARNESS_PROVENANCE" ] \
+  || { echo "gui bundle: student harness provenance not found: $HARNESS_PROVENANCE" >&2; exit 1; }
 
 source_sha="$(git -C "$ROOT" rev-parse --verify "${revision}^{commit}" 2>/dev/null)" \
   || { echo "gui bundle: revision is not a commit: $revision" >&2; exit 1; }
@@ -86,6 +89,13 @@ else
   done < "$prune_list"
   find "$export_root" -depth -type d -empty -delete
 fi
+
+python3 "$export_root/install/install-student-harness.py" --check >/dev/null \
+  || { echo "gui bundle: student harness projection failed its pinned-input check" >&2; exit 1; }
+bash "$export_root/install/check-internal-leaks.sh" --subset "$export_root/docker/student-harness" >/dev/null \
+  || { echo "gui bundle: student harness projection failed the public leak gate" >&2; exit 1; }
+bash "$export_root/install/check-internal-leaks.sh" --subset "$export_root/docker/project-starter" >/dev/null \
+  || { echo "gui bundle: project starter projection failed the public leak gate" >&2; exit 1; }
 
 # Profile validation is intentionally exact. A new app or a changed default is a
 # product decision, not something a release should infer from a nearby catalog.
@@ -150,13 +160,14 @@ validation_config="$scratch/airlock.toml"
 
 profile_sha="$(sha256sum "$export_root/docker/gui-default-profile.json" | awk '{print $1}')"
 catalog_sha="$(sha256sum "$export_root/docker/gui-catalog.json" | awk '{print $1}')"
+provenance_sha="$(sha256sum "$export_root/docker/student-harness-provenance.json" | awk '{print $1}')"
 python3 - "$export_root/gui-provisioner-manifest.json" "$source_sha" \
-  "$source_epoch" "$profile_sha" "$catalog_sha" <<'PY'
+  "$source_epoch" "$profile_sha" "$catalog_sha" "$provenance_sha" <<'PY'
 import json
 import pathlib
 import sys
 
-path, source_sha, source_epoch, profile_sha, catalog_sha = sys.argv[1:]
+path, source_sha, source_epoch, profile_sha, catalog_sha, provenance_sha = sys.argv[1:]
 manifest = {
     "schema": "airlock.gui-provisioner-bundle/v1",
     "source_sha": source_sha,
@@ -165,6 +176,8 @@ manifest = {
     "profile_sha256": profile_sha,
     "catalog_path": "docker/gui-catalog.json",
     "catalog_sha256": catalog_sha,
+    "harness_provenance_path": "docker/student-harness-provenance.json",
+    "harness_provenance_sha256": provenance_sha,
 }
 pathlib.Path(path).write_text(
     json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"

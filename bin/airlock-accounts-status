@@ -806,6 +806,13 @@ def main():
     if "--xai" in args:
         json.dump(_xai_status(), sys.stdout, ensure_ascii=False)
         print(); return
+    if "--codex" in args:
+        # This box's Codex login as auth.json records it — id_token claims only, no API
+        # call, no refresh, no write. The panel paints its Codex row from this in the
+        # time it takes to read one file; whether the token is still honoured is what
+        # --codex-usage finds out afterwards (an `auth` error there is the revocation).
+        json.dump(_codex_status(), sys.stdout, ensure_ascii=False)
+        print(); return
     if "--usage" in args:
         i = args.index("--usage")
         slot = args[i + 1] if len(args) > i + 1 else "live"

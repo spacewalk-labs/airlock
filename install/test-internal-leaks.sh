@@ -79,6 +79,34 @@ doc.s	pacewalk.dev
 PROBES
 [ "$i" -eq 12 ] || bad "expected 12 pattern branches, drove $i — the probe list and the pattern have drifted apart"
 
+# Case must not be an escape hatch. The readable pattern is mostly lowercase,
+# while document titles and licences may capitalise the same identifier.
+upper="$FIX/upper"; allow_all "$upper"
+printf 'a line that says %s in the middle of it\n' "S""PACEWALK" > "$upper/leaky.md"
+out="$(bash "$GUARD" --dir "$upper" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q 'Internal/site-specific string found'; then
+  ok "the scan is case-insensitive"
+else
+  bad "uppercase changed a forbidden identifier into a false green (rc=$rc)"
+fi
+
+# A component subset cannot contain every repository-wide allow entry. Subset mode
+# keeps the same pattern and allow stripping, while deliberately omitting only the
+# stale-entry assertion whose domain is the complete published repository.
+subset="$FIX/subset"; mkdir -p "$subset"
+printf 'plain external component\n' > "$subset/readme.md"
+if bash "$GUARD" --subset "$subset" >/dev/null 2>&1; then
+  ok "a clean component subset passes without repository-wide allow fixtures"
+else
+  bad "a clean component subset failed"
+fi
+printf '%s\n' "s""wk-planted" > "$subset/leaky.md"
+if ! bash "$GUARD" --subset "$subset" >/dev/null 2>&1; then
+  ok "subset mode still catches a planted internal identifier"
+else
+  bad "subset mode skipped a planted internal identifier"
+fi
+
 # ---- an allowlisted token excuses itself and nothing else ----
 # The scan strips permitted tokens and re-matches, rather than dropping the whole
 # line. So a line carrying both a permitted string and a real leak must still fail.

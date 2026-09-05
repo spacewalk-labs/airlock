@@ -1,0 +1,89 @@
+<!doctype html>
+<!--
+  decision — 사람이 골라서 돌려줘야 끝나는 문서 (결정 · 미결 · 피드백 · **제안 승인**).
+
+  제안서도 승인을 받아야 하면 이 유형입니다. 별도 proposal 템플릿을 두지 않는 이유:
+  제안 문서는 결국 둘 중 하나입니다 — 답을 받아야 하면 여기, 설계 기록으로 남기는
+  것이면 report.html §4("그래서 무엇을 하나" + 버린 대안 표). 유형을 하나 더 만드는
+  대신 이 갈래를 명시합니다.
+
+  🔴 이 유형의 실패는 "물어만 보고 답할 길이 없는 것"입니다. 선택지는 있는데 돌려줄
+  수단이 없으면 답이 채팅에서 흩어집니다. 아래 .commit-bar 를 지우지 마십시오 —
+  지우면 폼이 장식이 됩니다.
+
+  페이지 JavaScript 는 0줄입니다. doc.js 가 저장·복원·상태문구·Markdown 생성·
+  클립보드 폴백을 맡습니다.
+
+  ■ 섞어 써도 됩니다
+    결정에 근거가 필요하면 report.html 의 수치·figure·Mermaid 블록을 각 .dec 안에
+    가져다 붙이십시오. 다만 **맨 위는 정할 것의 목록**이라는 이 유형의 규칙은 유지합니다 —
+    근거가 길어져 결정이 아래로 밀리면 답이 늦어집니다. 회신 바는 위·아래 둘 이상 둬도 됩니다.
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{무엇을 정하는가} — 결정 {N}건</title>
+  <meta name="description" content="{한 줄 — 무엇이 걸려 있고 왜 지금 정해야 하나}">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="{프로젝트 또는 조직}">
+  <meta property="og:title" content="{무엇을 정하는가} — 결정 {N}건">
+  <meta property="og:description" content="{한 줄 — 무엇이 걸려 있고 왜 지금 정해야 하나}">
+  <meta name="twitter:card" content="summary">
+  <meta name="doc-label" content="{예: 내 프로젝트 · 결정}">
+  <link rel="stylesheet" href="doc.css">
+</head>
+<body>
+  <main class="doc">
+    <h1>{무엇을 정하는가}</h1>
+    <div class="doc-meta">
+      <span><strong>대상</strong> {결정권자}</span>
+      <span><strong>작성</strong> {YYYY-MM-DD}</span>
+      <span><strong>원본</strong> <code>{이 문서의 원본 파일 경로}</code></span>
+    </div>
+    <p class="lead">{정할 것 N건. 전부 권고안이 있고, 그대로면 그대로 진행합니다.}</p>
+
+    <!-- 맥락은 짧게. 결정에 필요한 만큼만 — 배경 설명이 길면 답이 늦어집니다. -->
+    <div class="case">
+      <span class="label">핵심</span>
+      {왜 지금 정해야 하나 — 정하지 않으면 무엇이 막히나}
+    </div>
+
+    <section class="dec" data-decision="{키}" data-title="{짧은 제목 — 복사본에 실림}">
+      <h3><span class="tag">01</span> {질문}</h3>
+      <p>{맥락 — 무엇이 걸려 있고 선택지들이 무엇을 바꾸나. 실측·수치가 있으면 여기.}</p>
+      <div class="decision-form">
+        <h4>선택</h4>
+        <label class="opt">
+          <!-- value = 복사본에 그대로 실릴 문구. "(a)" "1번" 같은 표시는 넣지 않습니다. -->
+          <input type="radio" name="{키}" value="{선택지 문구 그대로}" checked>
+          <strong>{선택지}</strong> — {귀결·비용·리스크}
+          <span class="rec">권고</span>
+        </label>
+        <label class="opt">
+          <input type="radio" name="{키}" value="{대안 문구 그대로}">
+          <strong>{대안}</strong> — {귀결·비용·리스크}
+        </label>
+        <label class="fld">
+          <span>메모 — {이 결정에서 반드시 같이 받아야 하는 정보가 있으면 여기 명시}</span>
+          <textarea name="{키}-note" placeholder="{예시 입력}"></textarea>
+        </label>
+      </div>
+    </section>
+
+    <!-- 항목 반복. data-decision 값은 문서 안에서 유일해야 합니다. -->
+
+    <!-- 🔴 data-decisions 가 런타임 스위치입니다. 지우면 버튼이 죽습니다. -->
+    <div class="commit-bar" data-decisions>
+      <button type="button" class="primary" data-act="copy-md">Markdown 복사</button>
+      <button type="button" class="secondary" data-act="download-json">JSON</button>
+      <button type="button" class="clear" data-act="reset">권고안으로</button>
+    </div>
+    <p>↑ 고르신 뒤 <strong>Markdown 복사</strong>를 눌러 채팅에 붙여 주시면 그대로 진행합니다.
+       입력은 이 브라우저에 자동 저장됩니다.</p>
+
+    <div class="doc-footer">원본: <code>{이 문서의 원본 파일 경로}</code></div>
+  </main>
+  <script type="module" src="doc.js"></script>
+</body>
+</html>

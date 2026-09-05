@@ -187,7 +187,9 @@ if run "$TMP/good.toml" env orca >/dev/null 2>&1; then bad "env: rejects disable
   && ok "get: ~ expanded to \$HOME" || bad "get: ~ expanded to \$HOME"
 
 # --- 9. code_root is retired: it names a boundary that no longer exists --------
-# fileview's filebrowser runs with `--root /`, so there is nothing to configure.
+# fileview's filebrowser runs with `--root %h` (the account's home), so there is
+# nothing to configure — and the message has to say the root is not a value, or the
+# key comes back pointed at home.
 # A leftover key must NOT fail the box (every config written before this release
 # carries one) — it gets the targeted retired-key message instead.
 mk() { printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n%s\n' "$1" >"$TMP/t.toml"; }
@@ -198,7 +200,7 @@ code_root = "~/code"
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "code_root: retired, does not fail"; else bad "code_root: retired, does not fail"; fi
 cr_msg="$(run "$TMP/t.toml" validate 2>&1)"
 grep -q 'code_root' <<<"$cr_msg" && ok "code_root: names the key" || bad "code_root: names the key"
-grep -q -- '--root /' <<<"$cr_msg" && ok "code_root: says what replaced it" || bad "code_root: says what replaced it"
+grep -q -- '--root %h' <<<"$cr_msg" && ok "code_root: says what replaced it" || bad "code_root: says what replaced it"
 
 # fileview no longer needs any path key at all.
 mk '[apps.fileview]'

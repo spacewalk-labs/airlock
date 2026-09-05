@@ -1,17 +1,20 @@
 contract = 1
 id = "fileview"
 
-# One key. There is no scope setting: filebrowser runs with `--root /` and the
-# tree is the filesystem, which is why `[paths].code_root` was retired rather
-# than replaced (see bin/airlock-config's RETIRED_KEYS and SECURITY.md).
+# One key. There is no scope setting: filebrowser runs with `--root %h`, so the
+# tree is the home directory of the account the service runs as and the root is a
+# fact about that account rather than a value anybody picks. That is why
+# `[paths].code_root` was retired rather than repointed at home (see
+# bin/airlock-config's RETIRED_KEYS and SECURITY.md).
 [config.defaults]
 filebrowser_port = 19921
 
 
-# fileview serves the whole filesystem read+write (filebrowser --root /), so it is
-# owner-only unless the operator explicitly opens it. Same policy markwand carried —
-# default owner, shared is an opt-in — kept because fileview replaced markwand and the
-# surface, if anything, is broader. #249: an app that declares no [audience] fails
+# fileview serves the account's whole home read+write (filebrowser --root %h), so it
+# is owner-only unless the operator explicitly opens it. Same policy markwand carried
+# — default owner, shared is an opt-in — and narrowing the root from `/` to home does
+# not soften it: ~/.ssh, ~/.config and every agent credential are inside home, which
+# is the reach that made this owner-only in the first place. #249: an app that declares no [audience] fails
 # closed to owner; this states it rather than relying on that default.
 [audience]
 supported = ["owner", "shared"]

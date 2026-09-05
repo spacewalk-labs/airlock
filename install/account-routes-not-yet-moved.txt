@@ -1,0 +1,11 @@
+# Account routes still served only by devterm's gate, one per line.
+#
+# 🔴 This file is the single declaration, read by BOTH test suites. It used to be a
+# Python set in one suite and a hand-written route name in the other, and the hand-written
+# one went stale three times in a row — every time a port landed, the "an unmoved route
+# answers 404" control was pointing at a route that had just moved. A control that needs
+# hand-editing after every step is a control that will eventually be edited wrong.
+#
+# The list may only shrink. install/test-accounts-api-parity.py fails if a route is
+# missing from the platform without being listed here, and also if a route listed here is
+# already implemented — a stale list is not a measurement.

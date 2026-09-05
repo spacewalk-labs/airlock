@@ -402,6 +402,15 @@ AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-secret-timer.sh" install
 log "installing platform update detector timer"
 AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-update-timer.sh" install
 
+# 1c-2) The platform account surface (ACCT_SURFACE). A service rather than a oneshot:
+# the hub proxies /airlock-accounts/ to it behind an owner-only guard. It stays behind
+# nginx on loopback and never binds the tailnet itself.
+log "installing platform account surface"
+AIRLOCK_ROOT="$ROOT" AIRLOCK_HUB_ACCOUNTS_PORT="$AIRLOCK_HUB_ACCOUNTS_PORT" \
+  AIRLOCK_HUB_FLEET_STORE="${AIRLOCK_HUB_FLEET_STORE-}" \
+  AIRLOCK_HUB_FLEET_STORE_URL="${AIRLOCK_HUB_FLEET_STORE_URL-}" \
+  bash "$ROOT/install/airlock-accounts-api.sh" install
+
 # 1d) Retire platform units this tree no longer declares. Runs AFTER the installs above,
 # so a failure up there aborts (set -e) before anything is swept — the declared set is
 # only trustworthy once it has actually been written. The list below is this installer's
@@ -411,7 +420,8 @@ AIRLOCK_ROOT="$ROOT" bash "$ROOT/install/airlock-update-timer.sh" install
 # see airlock_sweep_platform_units for why the marker names one.
 airlock_sweep_platform_units airlock-install \
   airlock-secret-sweep.service airlock-secret-sweep.timer \
-  airlock-update-detect.service airlock-update-detect.timer
+  airlock-update-detect.service airlock-update-detect.timer \
+  airlock-accounts-api.service
 
 # 2) enabled app installers (each drops its own nginx fragment into $CONFD/*)
 # Child 4/P3: validate already refused any enabled app that is neither hub

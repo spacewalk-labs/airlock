@@ -111,7 +111,8 @@ function jsonResponse(value) {
 }
 
 function makeHarness({ statuses, usage, xaiStatuses = [{ enabled: false }],
-                       postResponses = {}, accountPayload = null }) {
+                       postResponses = {}, accountPayload = null, accountsDeferred = false }) {
+  let resolveAccounts = null;
   const document = {
     body: makeElement('body'),
     createElement: (tagName) => makeElement(tagName),
@@ -143,10 +144,18 @@ function makeHarness({ statuses, usage, xaiStatuses = [{ enabled: false }],
 
   function fetch(url, options = {}) {
     fetchCalls.push({ url, options });
-    if (url === '/accounts') return Promise.resolve(jsonResponse(accounts));
+    if (url === '/accounts') {
+      if (accountsDeferred) return new Promise((resolve) => { resolveAccounts = resolve; });
+      return Promise.resolve(jsonResponse(accounts));
+    }
     if (url === '/claude-status') {
       const value = statuses[Math.min(statusIndex++, statuses.length - 1)];
       return Promise.resolve(jsonResponse({ codex: value }));
+    }
+    if (url === '/codex-status') {
+      // The local identity route: the same fixture values, served as the identity itself.
+      const value = statuses[Math.min(statusIndex++, statuses.length - 1)];
+      return Promise.resolve(jsonResponse(value));
     }
     if (url === '/codex-usage') {
       const value = usage[Math.min(usageIndex++, usage.length - 1)];
@@ -240,6 +249,8 @@ function makeHarness({ statuses, usage, xaiStatuses = [{ enabled: false }],
       resolve(value);
     },
     codexFetches() { return fetchCalls.filter((call) => call.url === '/codex-usage').length; },
+    fetchesOf(path) { return fetchCalls.filter((call) => call.url === path).length; },
+    resolveAccounts(value) { if (!resolveAccounts) throw new Error('accounts not deferred'); const r = resolveAccounts; resolveAccounts = null; r(jsonResponse(value || accounts)); },
     codexRequests() { return fetchCalls.filter((call) => call.url === '/codex-usage'); },
     codexBox(container) { return container.querySelector('.codex-box'); },
     xaiBox(container) { return container.querySelector('.xai-box'); },
@@ -618,6 +629,86 @@ async function xaiRendersWithoutClaudeAccounts() {
         && box.querySelectorAll('button').some((button) => button.textContent === 'Log in'));
 }
 
+
+// ---- P4 first paint comes from the local identity, and a usage refresh does not redraw providers ----
+async function firstPaintUsesLocalIdentityOnly() {
+  const h = makeHarness({
+    statuses: [{ state: 'ok', accountId: 'A', email: 'a@example.com', plan: 'pro' }],
+    usage: [{ use7d: 42, accountId: 'A', stale: false }],
+    postResponses: { '/acct-usage-now': { deferred: true } },
+  });
+  const panel = h.mountPanel();
+  await h.flush();
+  const box = h.codexBox(panel);
+  check('P4 opening the panel never calls /claude-status (the network probe) and asks /codex-status once',
+        h.fetchesOf('/claude-status') === 0 && h.fetchesOf('/codex-status') === 1
+        && box && box.textContent.includes('a@example.com') && box.textContent.includes('42%'));
+  const xai = h.xaiBox(panel);
+  h.resolvePost('/acct-usage-now', { email: 'claude@example.com', kind: 'personal',
+                                     usage: { use5h: 7, use7d: 9 } });
+  await h.flush();
+  check('P4 a usage refresh redraws only the Claude rows — Codex/xAI nodes and probes are untouched',
+        h.codexBox(panel) === box && h.xaiBox(panel) === xai
+        && h.fetchesOf('/codex-status') === 1 && h.fetchesOf('/xai-status') === 1
+        && panel.textContent.includes('5h 7%'));
+}
+async function disabledSwitchingStillShowsProviders() {
+  const h = makeHarness({
+    statuses: [{ state: 'ok', accountId: 'A', email: 'a@example.com' }],
+    usage: [{ use7d: 42, accountId: 'A', stale: false }],
+    accountPayload: { enabled: false, active: null, accounts: [] },
+  });
+  const panel = h.mountPanel();
+  await h.flush();
+  check('P4 accounts=false hides only Claude switching; the Codex row is still drawn',
+        panel.textContent.includes('switching is off') && !!h.codexBox(panel)
+        && h.codexBox(panel).textContent.includes('a@example.com'));
+}
+async function providersPaintBeforeAccountsAnswer() {
+  const h = makeHarness({
+    statuses: [{ state: 'ok', accountId: 'A', email: 'a@example.com', plan: 'pro' }],
+    usage: [{ use7d: 42, accountId: 'A', stale: false }],
+    xaiStatuses: [{ enabled: true, state: 'ok', expires: Date.now() + 60_000 }],
+    accountsDeferred: true,
+  });
+  const panel = h.mountPanel();
+  await h.flush();
+  check('P4 Codex and xAI rows are painted while /accounts is still pending (they never wait for the CLI)',
+        h.fetchesOf('/accounts') === 1 && h.fetchesOf('/codex-status') === 1 && h.fetchesOf('/xai-status') === 1
+        && !!h.codexBox(panel) && h.codexBox(panel).textContent.includes('a@example.com')
+        && !!h.xaiBox(panel) && panel.textContent.includes('Loading accounts'));
+  const box = h.codexBox(panel);
+  h.resolveAccounts();
+  await h.flush();
+  check('P4 the late /accounts answer fills the Claude box and leaves the provider nodes alone',
+        h.codexBox(panel) === box && panel.textContent.includes('claude@example.com')
+        && !panel.textContent.includes('Loading accounts'));
+}
+async function deadRowReloginFormLivesInClaudeBox() {
+  const h = makeHarness({
+    statuses: [{ state: 'ok', accountId: 'A', email: 'a@example.com' }],
+    usage: [{ use7d: 42, accountId: 'A', stale: false }],
+    accountPayload: { enabled: true, active: null, accounts: [
+      { active: false, email: 'dead@example.com', kind: 'personal', sub: 'max',
+        health: { state: 'dead', reason: 'refresh rejected' } }] },
+    postResponses: { '/acct-usage-now': { deferred: true }, '/acct-login-url': { ok: true, url: 'https://example.test/login' } },
+  });
+  const panel = h.mountPanel();
+  await h.flush();
+  const dead = panel.querySelector('.acctrow');   // the fake DOM matches one class at a time
+  check('P4 (setup) the only row is the dead one', !!dead && dead.className.split(/\s+/).includes('dead'));
+  dead.onclick();
+  await h.flush();
+  h.resolvePost('/acct-usage-now', { email: 'x@example.com', kind: 'personal', usage: { use5h: 1, use7d: 2 } });
+  await h.flush();
+  const forms = panel.querySelectorAll('.addform');
+  check('P4 a dead-row re-login form lives in the Claude box and a late usage answer does not erase or duplicate it',
+        forms.length === 1 && panel.querySelector('.claude-box').contains(forms[0]));
+}
+await providersPaintBeforeAccountsAnswer();
+await deadRowReloginFormLivesInClaudeBox();
+await firstPaintUsesLocalIdentityOnly();
+await disabledSwitchingStillShowsProviders();
 await staleResponseSchedulesOneReask();
 await freshResponseSchedulesNothing();
 await identityChangeCancelsDelayedWork();

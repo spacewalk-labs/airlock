@@ -292,18 +292,43 @@ step_ok tailscale
 
 # ---- 4. make the repo + config available inside the machine -------------------
 step repo
-# OrbStack mounts the Mac fs under /mnt/mac. We run the installer directly from
-# the shared checkout so there is a single copy of the code.
-MC_REPO="/mnt/mac${REPO_SRC}"
-log "using repo at (in-machine path): $MC_REPO"
-inmc test -f "$MC_REPO/install/airlock-install.sh" \
-  || die "repo not visible at $MC_REPO — is $REPO_SRC under your Mac home? (OrbStack shares /mnt/mac)"
+# OrbStack mounts the Mac fs under /mnt/mac. That checkout is the launcher input;
+# the Linux user's real working tree lives under its own home so a home-scoped File
+# Viewer can see it and no service depends on the Mac mount after provisioning.
+HOST_REPO="/mnt/mac${REPO_SRC}"
+log "using launcher checkout at (in-machine path): $HOST_REPO"
+inmc test -f "$HOST_REPO/install/airlock-install.sh" \
+  || die "repo not visible at $HOST_REPO — is $REPO_SRC under your Mac home? (OrbStack shares /mnt/mac)"
 
-if ! inmc test -f "$MC_REPO/airlock.toml"; then
+if ! inmc test -f "$HOST_REPO/airlock.toml"; then
   die "airlock.toml not found. Copy airlock.toml.example -> airlock.toml and fill it in
        (set owner; recommend leaving [apps.orca] out for the first run).
        See docs/design/macos-container.md §8."
 fi
+
+MC_HOME="$(inmc bash -lc 'printf %s "$HOME"' | tr -d '\r\n')"
+case "$MC_HOME" in /*) ;; *) die "could not read the OrbStack user's home" ;; esac
+MC_REPO="$MC_HOME/workspace/airlock"
+log "materializing the Linux checkout at $MC_REPO"
+inmc bash -c '
+set -e
+src="$1"; home="$2"; dst="$home/workspace/airlock"
+workspace="$home/workspace"
+[ ! -L "$workspace" ] && { [ ! -e "$workspace" ] || [ -d "$workspace" ]; }
+mkdir -p "$workspace" "$home/.local/state/airlock/checkout-backups"
+stage="$workspace/.airlock.$$.staging"
+[ ! -e "$stage" ] && [ ! -L "$stage" ]
+cp -a "$src" "$stage"
+backup=""
+if [ -e "$dst" ] || [ -L "$dst" ]; then
+  backup="$home/.local/state/airlock/checkout-backups/$(date -u +%Y%m%dT%H%M%S).$$-launcher"
+  mv "$dst" "$backup"
+fi
+if ! mv "$stage" "$dst"; then
+  [ -z "$backup" ] || mv "$backup" "$dst" || true
+  exit 1
+fi
+' _ "$HOST_REPO" "$MC_HOME" || die "could not materialize $MC_REPO"
 
 step_ok repo
 
@@ -311,10 +336,18 @@ step_ok repo
 step install
 log "running install/airlock-install.sh inside the machine"
 inmc bash -lc "cd '$MC_REPO' && bash install/airlock-install.sh"
+step_ok install
 
 FQDN="$(inroot tailscale status --json 2>/dev/null \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)"
-step_ok install
+step harness
+log "installing the agent tools and pinned student harness"
+inroot bash "$MC_REPO/install/install-agent-tools.sh" "$DEFAULT_USER" \
+  || die "agent tool install failed"
+inmc env HOME="$MC_HOME" python3 "$MC_REPO/install/install-student-harness.py" \
+  --home "$MC_HOME" --fqdn "${FQDN:-unavailable}" \
+  || die "student harness install failed"
+step_ok harness
 # No FQDN means the machine's tailnet name could not be read — which the script
 # tolerates (`|| true` above) because the install itself succeeded. Emit no `url` at
 # all rather than "https:///": an absent key makes the caller handle the case, while

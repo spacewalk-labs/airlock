@@ -1,0 +1,37 @@
+[Unit]
+Description=airlock — platform account surface (HTTP)
+X-Airlock-Owner=airlock-install
+# The hub's nginx proxies to this; if it is down the proxy answers 502 and the hub
+# itself stays up. That degradation is deliberate: an account panel that cannot load
+# must not take the entrance with it.
+After=network.target
+
+[Service]
+Type=simple
+# The port and the CLI path are handed in, never derived here. bin/airlock-config owns
+# the port (and validates it for uniqueness against every app), and install/lib.sh owns
+# the CLI path — a default in this unit would be a second source of truth for both.
+Environment=AIRLOCK_HUB_ACCOUNTS_PORT=@ACCOUNTS_PORT@
+Environment=AIRLOCK_ACCOUNTS_STATUS_BIN=@ACCOUNTS_STATUS_BIN@
+Environment=AIRLOCK_ACCOUNTS_BIN=@ACCOUNTS_BIN@
+# Read-only pointers at the shared usage store. Empty is a normal box: the account list
+# then reports "no store" rather than "collecting", because promising a collector that
+# does not exist is what left seven rows collecting indefinitely on a real box.
+Environment=AIRLOCK_HUB_FLEET_STORE=@FLEET_STORE@
+Environment=AIRLOCK_HUB_FLEET_STORE_URL=@FLEET_STORE_URL@
+ExecStart=@PYTHON@ "@AIRLOCK_ROOT@/bin/airlock-accounts-api"
+Restart=on-failure
+RestartSec=2
+# It shells out to a CLI that writes ~/.claude-accounts, so it cannot be sandboxed away
+# from $HOME. What it can be denied is everything it never needs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

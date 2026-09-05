@@ -67,10 +67,10 @@ name — MagicDNS off, some container runtimes), and `1` on failure. `3` is not 
 because a run that never checked the ingress is not a run that verified it; open the
 URL from another device once, which is the only check that can settle it.
 
-> **Before you add a collaborator:** fileview serves **the whole filesystem this
-> box's user account can reach** — dotfiles included — read **and write**. There is
-> no root setting and no ignore list. The bound is the unix account, nothing else.
-> See [SECURITY.md](SECURITY.md).
+> **Before you add a collaborator:** fileview serves **the whole home directory of
+> this box's user account** — dotfiles, `~/.ssh` and every agent credential included
+> — read **and write**. Nothing above home is served (`--root %h`), and there is no
+> root setting and no ignore list. See [SECURITY.md](SECURITY.md).
 
 ### Reboot survival (automatic)
 

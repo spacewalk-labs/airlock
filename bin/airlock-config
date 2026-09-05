@@ -118,7 +118,14 @@ APP_DEFAULTS: dict[str, dict] = {
     # *_port pairs: http_port/public_port are PLAINTEXT tailnet ports that only
     # 301 to https (served by the loopback redirect_port) — no content, ever.
     "hub":         {"https_port": 443, "http_port": 19901, "nginx_port": 19902,
-                    "redirect_port": 19903},
+                    "redirect_port": 19903, "accounts_port": 19904,
+                    # The shared usage store the account surface reads. Not a port and
+                    # not a secret: a path and a URL, both optional, both READ-ONLY here
+                    # — the writer is an out-of-process collector outside this repository
+                    # and nothing in this tree ever opens either for writing. That is why
+                    # moving them off devterm needed no coordination with it (parent
+                    # decision OQ2; devterm keeps both keys as overrides).
+                    "fleet_store": "", "fleet_store_url": ""},
 }
 
 # Accepted in ANY app table (not a default: they carry no value when absent).
@@ -169,9 +176,10 @@ RETIRED_KEYS: dict[str, str] = {
         "is gone (2026-08-23). Remove it. It was never a designed setting: markserv "
         "and filebrowser each demand a root argument, so the installer had to write "
         "one somewhere and it became a config key — and then read as a boundary it "
-        "never enforced. The viewer now runs with `--root /` and the tree is the "
-        "filesystem; what bounds it is the unix account the user service runs as "
-        "(see SECURITY.md).",
+        "never enforced. The viewer now runs with `--root %h`: the tree is the home "
+        "directory of the account the user service runs as, and nothing above it is "
+        "served. The root is a fact about that account, not a value to set — this key "
+        "is not coming back pointed at home (see SECURITY.md).",
     "paths.mount_exclude":
         "was never implemented — nothing was ever excluded. Remove it. The viewer "
         "hides nothing and has no ignore list: dotfiles, .env included, list and "

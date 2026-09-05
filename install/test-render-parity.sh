@@ -931,6 +931,14 @@ else
         bad "publish tailnet view: authenticated tailnet member document returned $status"
       fi
 
+      status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        /readable.html "$NGTMP/publish-on-root.body")"
+      if [ "$status" = 200 ] && grep -qx READABLE "$NGTMP/publish-on-root.body"; then
+        ok "publish tailnet view: the document is also served at the ROOT — /<name>.html is the whole link"
+      else
+        bad "publish tailnet view: root-path document returned $status"
+      fi
+
       manager_status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
         /publish/ "$NGTMP/publish-on-manager.body")"
       list_status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \

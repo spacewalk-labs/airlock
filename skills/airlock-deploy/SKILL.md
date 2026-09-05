@@ -19,8 +19,9 @@ it only through `bin/airlock-config`.
 2. **`airlock.toml` exists.** If only `airlock.toml.example` is present, copy it and
    help the user fill in `[auth] owner` and the app tables
    they want. A table's mere presence under `[apps.*]` enables that app.
-   fileview has no path setting: it serves **the whole filesystem this box's user
-   account can reach**, read and write, to the owner **and every collaborator**.
+   fileview has no path setting: it serves **the home directory of this box's user
+   account**, read and write, to the owner **and every collaborator** if its audience
+   is opened. Nothing above home is served.
    A leftover `[paths] code_root` is a retired key — tell the user to delete the
    line. Read `SECURITY.md` ("Two tiers") with the user before adding anyone to
    `collaborators`.

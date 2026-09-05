@@ -9,16 +9,21 @@ Type=simple
 # before ExecStart, so on a box with no leftover filebrowser directory the service
 # never started at all. Boxes that had one hid the bug.
 WorkingDirectory=%h/.config/airlock-fileview
-# --root /: the tree is the filesystem. There is no configured boundary any more —
-# what bounds this is the unix account the user service runs as (see SECURITY.md).
+# --root %h: the tree is the home directory of the account this user service runs
+# as, and nothing above it is served. %h is systemd's own specifier for that
+# account's home — it is not a value anybody chooses, which is what keeps this from
+# becoming the config key paths.code_root used to be (see SECURITY.md).
+# TWO boundaries now, and both are needed: the account still bounds what the process
+# could reach at all (the kernel draws that line), and --root bounds what the server
+# will address inside it. --followExternalSymlinks=false is what closes the third
+# door: a symlink pointing out of home answers 403 rather than following.
 # --disableTypeDetectionByHeader: without it, building a directory listing OPENS
 # every file whose MIME the extension does not settle, to read its first bytes.
 # Measured with strace on the pinned binary — one listing of three extension-less
 # files: 3 opens with detection on, 0 with this flag, 0 with it off in the stored
-# config (so the flag does override the config). Under --root / that is a listing of
-# /dev opening device nodes. The viewer decides how to render by extension anyway,
-# so the server-side sniff buys nothing and costs that.
-ExecStart=WDIR/home/.local/bin/filebrowser --database WDIR/home/.config/airlock-fileview/fb.db --root / --address 127.0.0.1 --port 19921 --followExternalSymlinks=false --disableTypeDetectionByHeader
+# config (so the flag does override the config). The viewer decides how to render by
+# extension anyway, so the server-side sniff buys nothing and costs that.
+ExecStart=WDIR/home/.local/bin/filebrowser --database WDIR/home/.config/airlock-fileview/fb.db --root %h --address 127.0.0.1 --port 19921 --followExternalSymlinks=false --disableTypeDetectionByHeader
 Restart=on-failure
 RestartSec=3
 

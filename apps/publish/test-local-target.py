@@ -457,11 +457,16 @@ def t_remote_regression(tmp):
     check('remote still allows an empty owner (unchanged)', ok_e)
 
     ok_plan, plan_err = m.plan_bundle('r.html', owner=OWNER)
-    check('remote bundle planning is refused', not ok_plan and 'local mode' in str(plan_err), str(plan_err))
+    # Refused because THIS receiver cannot do v1 — not because the code is remote.
+    # The old assertion said "local mode", which froze the wrong reason into place.
+    check('remote bundle planning is refused when the receiver has no v1',
+          not ok_plan and 'contract v1' in str(plan_err), str(plan_err))
     ok_docs, docs_err = m.publish_public('r.html', 24, OWNER, docs=[])
-    check('remote docs payload is refused', not ok_docs and 'local mode' in str(docs_err), str(docs_err))
+    check('remote docs payload is refused when the receiver has no v1',
+          not ok_docs and 'contract v1' in str(docs_err), str(docs_err))
     ok_gate, gate_res = m.publish_public('r.html', 24, OWNER, mode='gated', password='remote-password')
-    check('remote gated publish is refused', not ok_gate and 'local mode' in str(gate_res), str(gate_res))
+    check('remote gated publish is refused when the receiver has no v1',
+          not ok_gate and 'contract v1' in str(gate_res), str(gate_res))
     real_ingest = m._ingest
     m._ingest = lambda *_args, **_kwargs: {'ok': True, 'result': []}
     ok_bad, bad_res = m.publish_public('r.html', 24, OWNER)
@@ -955,13 +960,142 @@ def t_token_header_name(tmp):
         srv.shutdown()
 
 
+
+def t_inliner_silence_and_comments(tmp):
+    print('\n[20] the inliner names what it could not inline, and never reads past a comment')
+    share, _p, state, _env = make_dirs(tmp)
+    m = load({'AIRLOCK_PUBLISH_SHARE_DIR': share, 'AIRLOCK_PUBLISH_STATE_DIR': state})
+
+    with open(os.path.join(share, 'real.css'), 'w') as fh:
+        fh.write('body{color:red}')
+    with open(os.path.join(share, 'secret.png'), 'wb') as fh:
+        fh.write(b'SECRET-PIXEL-BYTES')
+    with open(os.path.join(share, 'p.html'), 'w') as fh:
+        fh.write('<html><head><title>T</title>\n'
+                 '<link rel="stylesheet" href="/real.css">\n'
+                 '<link rel="stylesheet" href="/_assets/missing.css">\n'
+                 '<link rel="stylesheet" href="https://cdn.example/x.css">\n'
+                 '</head><body>\n'
+                 '<!-- <img src="/secret.png"> -->\n'
+                 '<img src="/secret.png">\n'
+                 '</body></html>')
+
+    title, html_bytes, warns = m.bundle_single_file('p.html')
+    html = html_bytes.decode()
+
+    check('inlines the asset it can read', 'body{color:red}' in html)
+
+    # The silence half. A local asset that cannot be read used to leave its tag
+    # pointing at a path only this box has, and say nothing — the published page
+    # then rendered unstyled and nobody knew until someone opened it.
+    check('names the local asset it could not inline',
+          any('missing.css' in w for w in warns), f'warnings={warns}')
+    # ...and does NOT cry wolf about refs that are external on purpose.
+    check('an external ref is not a warning',
+          not any('cdn.example' in w for w in warns), f'warnings={warns}')
+
+    # The comment half, and the one with teeth: commenting a reference out is the
+    # author saying "do not publish this". Inlining it writes the bytes into the
+    # public page while the page still looks empty there.
+    # The page references secret.png twice: once inside a comment, once live. So
+    # the count is the whole assertion — two data URIs means the commented one was
+    # read off disk and written into the public page.
+    import base64 as _b64
+    inlined = [_b64.b64decode(seg.split('"')[0]) for seg in html.split('base64,')[1:]]
+    check('a commented-out asset is NOT inlined', len(inlined) == 1,
+          f'{len(inlined)} data URIs; expected 1 (the live <img> only)')
+    check('the live img outside the comment still inlines',
+          len(inlined) == 1 and inlined[0] == b'SECRET-PIXEL-BYTES')
+    check('the comment itself survives verbatim', '<!-- <img src="/secret.png"> -->' in html)
+
+
+
+def t_remote_contract_v1(tmp):
+    print('\n[21] remote contract v1: gated + bundles come from the receiver, not from being local')
+    share, _p, state, _env = make_dirs(tmp)
+
+    def load_with(contract):
+        m = load({'AIRLOCK_PUBLISH_SHARE_DIR': share, 'AIRLOCK_PUBLISH_STATE_DIR': state,
+                  'AIRLOCK_PUBLISH_INGEST_URL': 'https://ingest.example',
+                  'AIRLOCK_PUBLISH_BASE_URL': 'https://docs.example',
+                  'AIRLOCK_PUBLISH_TOKEN': 'sekret'})
+        sent = []
+        def fake(method, ep, body=None, timeout=20):
+            if ep == '/health':
+                return {'ok': True, 'public_contract': contract} if contract else {'ok': True}
+            sent.append((method, ep, body))
+            return {'ok': True, 'result': {'expiry': 1790000000, 'ttl_hours': (body or {}).get('ttl_hours')}}
+        m._ingest = fake
+        return m, sent
+
+    V1 = {'supported_versions': ['0', '1'], 'modes': ['open', 'gated']}
+
+    # --- a receiver that speaks v1 -------------------------------------------
+    m, sent = load_with(V1)
+    page(share, 'v1.html')
+    check('gated is available when the receiver offers it', m.gated_available())
+    ok, res = m.publish_public('v1.html', 24, OWNER, mode='gated', password='pw')
+    check('gated publish reaches the receiver', ok, str(res))
+    body = sent[-1][2]
+    check('payload declares contract_version 1', body.get('contract_version') == '1', str(sorted(body)))
+    check('payload carries the gate', body.get('mode') == 'gated'
+          and (body.get('gate') or {}).get('password') == 'pw', str(body.get('gate')))
+    check('v1 sends one files map with index.html', 'index.html' in (body.get('files') or {})
+          and 'html_b64' not in body, str(sorted(body)))
+    ok_plan, _plan = m.plan_bundle('v1.html', owner=OWNER)
+    check('bundle planning works against a v1 receiver', ok_plan, str(_plan))
+
+    # The identity that made documents unrecoverable. Refused before it leaves.
+    for bad, label in ((''  , 'empty'), ('cho', 'bare username')):
+        ok_b, err_b = m.publish_public('v1.html', 24, bad, mode='gated', password='pw')
+        check(f'v1 refuses a {label} owner', not ok_b and 'owner' in str(err_b), str(err_b))
+
+    # --- the same code against a v0-only receiver ----------------------------
+    m0, sent0 = load_with(None)
+    check('gated is unavailable when the receiver does not offer it', not m0.gated_available())
+    ok0, err0 = m0.publish_public('v1.html', 24, OWNER, mode='gated', password='pw')
+    check('gated is refused, naming the receiver as the reason',
+          not ok0 and 'contract v1' in str(err0), str(err0))
+    ok0b, res0b = m0.publish_public('v1.html', 24, OWNER)
+    check('open publishing still works on v0', ok0b, str(res0b))
+    body0 = sent0[-1][2]
+    # A deployed v0 receiver has never seen these keys. Adding them for tidiness
+    # would be a wire change on a receiver we do not control.
+    check('v0 payload gains no new keys', 'contract_version' not in body0 and 'mode' not in body0,
+          str(sorted(body0)))
+    check('v0 still sends html_b64', 'html_b64' in body0, str(sorted(body0)))
+
+    # --- an already-published open URL must not become gated in place --------
+    m3, sent3 = load_with(V1)
+    m3.public_list = lambda owner=None: {'ok': True, 'items': [
+        {'slug': 'v1-abc123', 'src': 'v1.html', 'mode': 'open', 'expired': False}]}
+    ok3, err3 = m3.publish_public('v1.html', 24, OWNER, mode='gated', password='pw')
+    check('an open URL cannot be switched to gated in place',
+          not ok3 and 'revoke' in str(err3), str(err3))
+    check('nothing was sent to the receiver on that refusal', not sent3, str(sent3))
+    ok3b, res3b = m3.publish_public('v1.html', 24, OWNER)   # same mode = plain update
+    check('republishing in the SAME mode still reuses the slug', ok3b, str(res3b))
+    check('and that update did reach the receiver', bool(sent3))
+
+    # --- the receiver's structured error is rendered, not repr'd -------------
+    m2, _ = load_with(V1)
+    m2._ingest = lambda *a, **k: ({'ok': True, 'public_contract': V1} if a[1] == '/health'
+                                  else {'ok': False, 'error': {'code': 'invalid_slug',
+                                                               'message': 'invalid or reserved slug'}})
+    ok2, err2 = m2.publish_public('v1.html', 24, OWNER)
+    check('a v1 error reads as a sentence, not a dict',
+          not ok2 and 'invalid or reserved slug' in str(err2) and '{' not in str(err2), str(err2))
+
+
 def main():
     for fn in (t_happy_path, t_slug_abuse, t_symlinked_source, t_empty_owner, t_owner_collision,
                t_crash_between, t_concurrent, t_corrupt_state, t_overlap_refused,
                t_config_shapes, t_remote_regression, t_bundle_plan_contract, t_gated_contract,
                t_gated_reconciliation_and_storage, t_local_bundle_limit,
                t_open_sweep_without_gated, t_local_ingest_transaction,
-               t_state_first_transaction, t_token_header_name):
+               t_state_first_transaction, t_token_header_name,
+               t_inliner_silence_and_comments,
+               t_remote_contract_v1):
         tmp = tempfile.mkdtemp(prefix='airlock-pub-test-')
         try:
             fn(tmp)

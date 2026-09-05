@@ -30,6 +30,11 @@ trap 'rm -rf "$TMP"' EXIT
 fails=0
 bad() { printf 'FAIL: %s\n' "$*" >&2; fails=$((fails + 1)); }
 ok() { printf 'ok: %s\n' "$*"; }
+# A block that loops calls bad() per item and then printed its ok() unconditionally, so a
+# failing run said both FAIL and ok for the same check. The exit code was still 1, but the
+# output lied about which checks held — and the output is what a person reads.
+mark() { _mark=$fails; }
+ok_if_clean() { [ "$fails" = "$_mark" ] && ok "$*"; }
 
 # ---- fake systemctl: records the calls, never touches the box ----
 mkdir -p "$TMP/bin"
@@ -82,6 +87,7 @@ for u in airlock-retired-thing.service airlock-retired-thing.timer; do
 done
 [ "$gone" = 1 ] && ok "T1: undeclared platform units were removed"
 
+mark
 # ---- T2: the sweep actually asked systemd to stop them, not just unlinked ----
 for u in airlock-retired-thing.service airlock-retired-thing.timer; do
   grep -q -- "--user disable --now $u" "$FAKE_SYSTEMCTL_LOG" \
@@ -89,14 +95,15 @@ for u in airlock-retired-thing.service airlock-retired-thing.timer; do
 done
 grep -q -- "--user daemon-reload" "$FAKE_SYSTEMCTL_LOG" \
   || bad "T2: no daemon-reload after removing units"
-ok "T2: disable --now + daemon-reload were issued"
+ok_if_clean "T2: disable --now + daemon-reload were issued"
 
+mark
 # ---- T3 (negative): declared units, another owner's unit, and unmarked units survive ----
 for u in airlock-secret-sweep.service airlock-secret-sweep.timer \
          airlock-live-verify.timer airlock-devterm.service some-other.service; do
   [ -e "$UD/$u" ] || bad "T3: $u was deleted and must not have been"
 done
-ok "T3: declared, other-owner, and unmarked units all survived"
+ok_if_clean "T3: declared, other-owner, and unmarked units all survived"
 
 # ---- T4: timers are disabled before services ----
 t_line="$(grep -n -- "disable --now airlock-retired-thing.timer" "$FAKE_SYSTEMCTL_LOG" | cut -d: -f1 | head -1)"
@@ -123,6 +130,7 @@ else
   [ "$survived" = 1 ] && ok "T5: an empty declared set is refused and nothing is touched"
 fi
 
+mark
 # ---- T6: every shipped platform unit template carries an owner marker ----
 for f in "$ROOT"/install/systemd/*.in; do
   grep -qx 'X-Airlock-Owner=airlock-install' "$f" \
@@ -132,16 +140,30 @@ for f in "$ROOT"/live/systemd/*.in; do
   grep -qx 'X-Airlock-Owner=airlock-live' "$f" \
     || bad "T6: $(basename "$f") has no X-Airlock-Owner=airlock-live — the install sweep could claim it"
 done
-ok "T6: all platform unit templates are marked with their owning installer"
+ok_if_clean "T6: all platform unit templates are marked with their owning installer"
 
+mark
 # ---- T7: the installer's declared set matches what it installs ----
-# The sweep deletes what is not declared, so a unit added above the call site without
-# being added to it would be removed on the next run.
-for u in airlock-secret-sweep airlock-update-detect; do
-  grep -q "$u.service" "$ROOT/install/airlock-install.sh" \
-    || bad "T7: $u.service is shipped but not in the installer's declared set"
+# The sweep deletes what is not declared, so a unit shipped in install/systemd/ but
+# missing from the call site would be removed on the next run — by us, silently.
+#
+# 🔴 Derived from the directory, NOT a hard-coded list. The first version of this check
+# named two units by hand, and when airlock-accounts-api.service was added it passed
+# without ever looking at the new unit. A list that has to be edited alongside the thing
+# it checks is not a check.
+t7_units=0
+for f in "$ROOT"/install/systemd/*.service.in "$ROOT"/install/systemd/*.timer.in; do
+  [ -f "$f" ] || continue
+  u="$(basename "$f" .in)"
+  t7_units=$((t7_units + 1))
+  grep -q -- "$u" "$ROOT/install/airlock-install.sh" \
+    || bad "T7: $u is shipped in install/systemd/ but is not in the installer's declared set — the next run would delete it"
 done
-ok "T7: shipped install/systemd units appear in the installer's declared set"
+# Positive control on the scan: if the glob ever stops matching, the loop above reports
+# nothing wrong while having looked at nothing.
+[ "$t7_units" -ge 4 ] \
+  || bad "T7: only $t7_units platform unit templates found — the glob is broken, not the tree"
+ok_if_clean "T7: all $t7_units shipped install/systemd units appear in the installer's declared set"
 
 if [ "$fails" -gt 0 ]; then
   printf '\n%d check(s) failed\n' "$fails" >&2

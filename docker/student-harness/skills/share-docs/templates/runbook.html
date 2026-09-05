@@ -1,0 +1,89 @@
+<!doctype html>
+<!--
+  runbook — 절차 · 런북 · 가이드. 독자가 읽고 끝나는 게 아니라 **따라 실행**합니다.
+
+  이 유형의 실패는 셋입니다.
+    ① 언제 쓰는 문서인지 위에 없다 → 잘못된 상황에 실행됨
+    ② 검증 단계가 없다 → 됐는지 모른 채 다음으로 감
+    ③ 실패했을 때 어디로 가는지 없다 → 반쯤 적용된 상태로 방치됨
+  단계마다 "무엇을 확인하면 넘어가도 되나" 를 반드시 붙입니다.
+
+  명령은 복사해 그대로 붙일 수 있어야 합니다(doc.js 가 <pre> 에 복사 버튼을 답니다).
+  🔴 시크릿 값은 명령에도 출력 예시에도 넣지 않습니다 — 참조만 씁니다.
+
+  ■ 섞어 써도 됩니다
+    왜 이 절차가 필요한지 진단이 앞에 붙는 경우가 흔합니다 — report.html 의 결론·수치·증거
+    블록을 앞머리에 두고 절차로 이어가십시오. 절차 도중 사람이 골라야 하는 갈림길이 있으면
+    decision.html 의 .dec 를 그 자리에 넣습니다. **언제 쓰는 문서인지가 맨 위**는 유지합니다.
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{무엇을 하는 절차인가}</title>
+  <meta name="description" content="{한 줄 — 언제 쓰고 무엇이 끝나면 완료인가}">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="{프로젝트 또는 조직}">
+  <meta property="og:title" content="{무엇을 하는 절차인가}">
+  <meta property="og:description" content="{한 줄 — 언제 쓰고 무엇이 끝나면 완료인가}">
+  <meta name="twitter:card" content="summary">
+  <meta name="doc-label" content="{예: 내 프로젝트 · 런북}">
+  <link rel="stylesheet" href="doc.css">
+</head>
+<body>
+  <main class="doc">
+    <h1>{제목 — 동사로. "무엇을 한다"}</h1>
+    <div class="doc-meta">
+      <span><strong>대상</strong> {실행하는 사람}</span>
+      <span><strong>작성</strong> {YYYY-MM-DD}</span>
+      <span><strong>소요</strong> {대략 시간}</span>
+      <span><strong>원본</strong> <code>{이 문서의 원본 파일 경로}</code></span>
+    </div>
+    <p class="lead">{언제 쓰는 문서인지 한 줄. 이 문장으로 잘못된 실행을 막습니다.}</p>
+
+    <div class="note">
+      <span class="label">정보</span>
+      <strong>언제 쓰나</strong> — {상황}.
+      <strong>쓰지 않는 경우</strong> — {비슷하지만 다른 상황과 그때 갈 문서}.
+    </div>
+
+    <div class="caution">
+      <span class="label">주의</span>
+      {되돌릴 수 없는 단계가 있으면 여기에 미리 밝힙니다. 없으면 이 블록을 지웁니다.}
+    </div>
+
+    <h2>사전 조건</h2>
+    <ul>
+      <li>{권한 — 예: sudo 가 필요합니다}</li>
+      <li>{백업 — 무엇을 먼저 받아 두나}</li>
+    </ul>
+
+    <h2>절차</h2>
+
+    <h3>1. {단계 이름}</h3>
+    <p>{무엇을 왜 하는지 한 줄.}</p>
+    <pre><code>{명령}</code></pre>
+    <div class="ok">
+      <span class="label">정상</span>
+      {이것이 보이면 다음으로 넘어갑니다 — 기대 출력을 구체적으로.}
+    </div>
+    <div class="warn">
+      <span class="label">실패</span>
+      {이것이 보이면} → {어디로 가나 · 무엇을 되돌리나}
+    </div>
+
+    <h3>2. {단계 이름}</h3>
+    <p>{...}</p>
+
+    <h2>완료 확인</h2>
+    <p>{절차 전체가 끝났음을 판정하는 검사. 단계별 확인과 별도로 둡니다.}</p>
+    <pre><code>{검증 명령}</code></pre>
+
+    <h2>되돌리기</h2>
+    <p>{롤백 절차. 되돌릴 수 없으면 "되돌릴 수 없음" 이라고 명시합니다 — 비워 두지 않습니다.}</p>
+
+    <div class="doc-footer">원본: <code>{이 문서의 원본 파일 경로}</code></div>
+  </main>
+  <script type="module" src="doc.js"></script>
+</body>
+</html>

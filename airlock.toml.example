@@ -123,6 +123,9 @@ https_port    = 443
 http_port     = 19901   # plaintext: 301 -> https entrance (serves no content)
 nginx_port    = 19902
 redirect_port = 19903   # loopback server that emits that 301
+accounts_port = 19904   # loopback backend for the platform account surface. Unlike the
+                        # three above it is not an nginx listener but a service: the hub
+                        # proxies /airlock-accounts/ to it behind an owner-only guard.
 
 [apps.devterm]
 # No plaintext pair here: D-DEVTERM-9900 retired devterm's public_port/
@@ -161,7 +164,8 @@ backend_port = 19922
 gate_port    = 19925  # loopback nginx document gate
 # false (default): owner + collaborators only, matching the hub.
 # true: any identity authenticated by this box's Tailscale Serve ingress may
-# read /publish/files/ and /_assets/ on https_port. The manager UI and every
+# read the share directory on https_port — the link is just
+# https://<fqdn>:<https_port>/<name>.html. The manager UI and every
 # upload/delete API stay on the hub gate either way.
 tailnet_view = false
 # share_dir  = "~/public_html"   # the static-share directory this manages/serves

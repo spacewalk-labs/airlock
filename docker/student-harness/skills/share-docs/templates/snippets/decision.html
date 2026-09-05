@@ -1,0 +1,27 @@
+<!--
+  결정을 받는 문서에 붙입니다. 페이지 JavaScript 는 0줄 —
+  저장·복원·마크다운 생성·클립보드는 같은 폴더의 doc.js 가 합니다.
+  항목을 원하는 만큼 복사하고, 마지막에 commit-bar 를 한 번만 둡니다.
+-->
+<section class="dec" data-decision="{키}" data-title="{짧은 제목}">
+  <h3><span class="tag">01</span> {무엇을 정하나}</h3>
+  <p>{왜 정해야 하고 무엇이 걸려 있나}</p>
+  <div class="decision-form">
+    <h4>선택</h4>
+    <label class="opt">
+      <input type="radio" name="{키}" value="{복사본에 그대로 실릴 문장}" checked>
+      <strong>{선택지}</strong> — {귀결} <span class="rec">권고</span>
+    </label>
+    <label class="opt">
+      <input type="radio" name="{키}" value="{복사본에 그대로 실릴 문장}">
+      <strong>{대안}</strong> — {귀결}
+    </label>
+    <label class="fld"><span>메모</span><textarea name="{키}-note"></textarea></label>
+  </div>
+</section>
+
+<div class="commit-bar" data-decisions>
+  <button type="button" class="primary" data-act="copy-md">Markdown 복사</button>
+  <button type="button" class="secondary" data-act="download-json">JSON</button>
+  <button type="button" class="clear" data-act="reset">권고안으로</button>
+</div>

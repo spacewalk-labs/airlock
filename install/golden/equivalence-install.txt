@@ -16,6 +16,10 @@ ok: config valid
 [airlock] [dry] render platform update detector units into TMP/home/.config/systemd/user
 [dry] systemctl --user daemon-reload
 [dry] systemctl --user enable --now airlock-update-detect.timer
+[airlock] installing platform account surface
+[airlock] [dry] render platform account surface unit into TMP/home/.config/systemd/user (port 19904)
+[dry] systemctl --user daemon-reload
+[dry] systemctl --user enable --now airlock-accounts-api.service
 [airlock] [dry] installing packaged app: publish (ROOT/apps/publish) (shipped app — dry run executes)
 [dry] sudo mkdir -p /opt/airlock/share
 [dry] sudo chmod 755 /opt/airlock/share

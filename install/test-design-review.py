@@ -68,7 +68,11 @@ RATCHET = {
     # panel moved to hub/assets/accounts/ (platform asset), taking its colours and
     # emoji with it. This gate walks apps/ only, so that file is now unwatched;
     # banking the drop at least keeps devterm's own ceiling tight.
-    "devterm":     {"hex": 283, "emoji": 62},
+    # 2026-09-04 (FILEVIEW_HOME): 62 -> 54. The fileview file-open failure messages
+    # each carried their own copy of the warning glyph, so adding one reason meant
+    # adding one more emoji. They now share a single named constant (resolveWhy's
+    # WHY), which is what banked the drop — nothing was restyled here either.
+    "devterm":     {"hex": 283, "emoji": 54},
     "learning":    {"hex": 22, "emoji": 75},
     "notepad":     {"hex": 26, "emoji": 10},
     # #247 로 합류. 도구가 --ratchet 으로 낸 값 그대로이며 0/0 이라 이 앱은

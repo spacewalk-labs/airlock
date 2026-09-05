@@ -53,17 +53,19 @@ denied=no; [[ "$deny_body" == *"isn't your Airlock"* ]]     && denied=yes
 #   2. `.env` is an ordinary file. filebrowser has a real user setting,
 #      --hideDotfiles, that would make dotfiles vanish server-side. The
 #      installer pins it false; this asserts it stayed false.
-# Writes only inside a mktemp -d it removes on exit. filebrowser serves `/`, so the
-# temp directory's absolute path IS its API path — no prefix arithmetic. (There used
-# to be some, keyed on AIRLOCK_CODE_ROOT; a stale value of that retired variable in
-# the environment made it strip a prefix the server knew nothing about and fail a
-# healthy install.)
+# Writes only inside a mktemp -d it removes on exit, and that directory is under
+# $HOME because that is what filebrowser serves (--root %h). Its API path is its
+# absolute path with $HOME removed — the one piece of prefix arithmetic in this file,
+# and it is derived from $HOME here, never from a config key. (There used to be some
+# keyed on AIRLOCK_CODE_ROOT; a stale value of that retired variable in the
+# environment made it strip a prefix the server knew nothing about and fail a healthy
+# install. This one cannot go stale: it is the same $HOME the unit gives the server.)
 api_rt=skip
 RT_DIR=""
 rt_cleanup() { [ -n "$RT_DIR" ] && rm -rf "$RT_DIR"; }
 trap rt_cleanup EXIT
-if RT_DIR=$(mktemp -d "/tmp/.airlock-smoke.XXXXXX" 2>/dev/null); then
-  rt_rel="$RT_DIR"
+if RT_DIR=$(mktemp -d "$HOME/.airlock-smoke.XXXXXX" 2>/dev/null); then
+  rt_rel="${RT_DIR#"$HOME"}"
   rt_odd='name with space #1.md'
   printf 'before\n' > "$RT_DIR/$rt_odd"
   printf 'SMOKE=1\n'  > "$RT_DIR/.env"
@@ -81,6 +83,31 @@ if RT_DIR=$(mktemp -d "/tmp/.airlock-smoke.XXXXXX" 2>/dev/null); then
   [ "$rt_read" = "before" ]                    || { echo "FAIL read of 'name with space #1.md' (got: ${rt_read:0:40})"; api_rt=bad; }
   [ "$rt_put" = 200 ]                          || { echo "FAIL save of 'name with space #1.md' (HTTP $rt_put)"; api_rt=bad; }
   [ "$(cat "$RT_DIR/$rt_odd")" = "after" ]     || { echo "FAIL save did not reach disk"; api_rt=bad; }
+
+  # --- and nothing ABOVE home answers ---------------------------------------
+  # The scope is the whole point of this app's boundary (SECURITY.md, "fileview →
+  # the account's home"), and a status code is not the assertion: what must be true
+  # is that no CONTENT from above home comes back. So the check is on the body, and
+  # it runs next to the reads above that must succeed — a server answering nothing
+  # would otherwise pass this and fail nobody.
+  #
+  # /etc/passwd is the target because it exists on every box this installs on and
+  # nothing inside home looks like it. `--path-as-is` matters: without it curl
+  # collapses `../` before the request leaves, and the server never sees the attack.
+  rt_out=""
+  for rt_att in "/resources/../etc/passwd" "/raw/../../etc/passwd?algo=none" \
+                "/raw/%2e%2e%2f%2e%2e%2fetc%2fpasswd?algo=none" "/raw/etc/passwd?algo=none" \
+                "/raw$(rt_enc "$rt_rel")/../../../etc/passwd?algo=none"; do
+    rt_body=$(curl -s -L --path-as-is --max-time 6 -H "${HDR}: ${OWNER}" -H "X-Auth: ${rt_jwt}" \
+                   "${rt_api}${rt_att}")
+    case "$rt_body" in *"root:x:"*) echo "FAIL above-home LEAK: ${rt_att} returned /etc/passwd"; rt_out=leak ;; esac
+  done
+  [ -z "$rt_out" ] || api_rt=bad
+  # Positive control for the line above: the marker it looks for is one this box
+  # really has, and a reader that CAN see it does. Without this, "no root:x: in the
+  # response" would also be true if /etc/passwd did not exist.
+  grep -q '^root:x:' /etc/passwd \
+    || { echo "FAIL smoke control: /etc/passwd has no root:x: line — the leak check above proves nothing"; api_rt=bad; }
 fi
 
 echo "[fileview smoke] filebrowser=${c_fb}/401 owner=${c_own}/200 ui-not-proxied=${c_edit}/404 subpath=${c_sub}/404 css=${c_css}/200 hljs=${c_hljs}/200 deny=${c_deny}/403 no-header=${c_no}/403 split-viewer=${split}/yes denied-page=${denied}/yes api-roundtrip=${api_rt}/ok"

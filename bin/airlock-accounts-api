@@ -1,0 +1,1504 @@
+#!/usr/bin/env python3
+"""airlock-accounts-api — the platform's HTTP surface for subscription accounts.
+
+WHY THIS EXISTS
+    The owner ratified A' on 2026-09-02: the account surface belongs to the platform,
+    not to whichever app happens to have a terminal in it. The values and their lifetime
+    already moved (bin/airlock-accounts, bin/airlock-accounts-status); this is the HTTP
+    half, and it is deliberately thin — every answer below is produced by those CLIs.
+    See docs/tasks/active/account-surface-to-platform.md.
+
+WHAT IT IS NOT
+    Not a credential store, not a refresher, not a cache of secrets. It shells out and
+    forwards JSON. Nothing here reads ~/.claude/.credentials.json: C0 of
+    docs/design/platform-owned-credentials.md says that lineage is Claude Code's.
+
+SURFACE
+    GET /claude-status   -> the box's Claude/Codex/xAI login state (no usage, no secrets)
+
+    That is ONE route of the eighteen this surface will carry, and the shortfall is
+    deliberate rather than unfinished-and-hoped-for: nothing points at this origin yet
+    (the panel and devterm's icon move in a later step), so a small honest surface is
+    safer than a large untested one. Every unserved path answers 404 with JSON, never a
+    silent success — see _not_found.
+
+    Two of the remaining routes, /accounts and /acct-alert, are additionally blocked on
+    OQ2 of the parent decision (does the fleet usage store move with accounts?). They are
+    the only two of nineteen handlers that read it. Measured, not assumed:
+    `grep` for FLEET/_fetch_fleet_store across every _serve_* account handler in
+    apps/devterm/backend/devterm-gate.py returns exactly those two.
+
+BINDING
+    127.0.0.1 only. The hub's nginx proxies /airlock-accounts/ here behind
+    `if ($owner_ok = 0) { return 403; }` — see install/render-nginx.sh, where that guard
+    is the ONLY declaration of this surface's audience because the hub is platform core
+    and has no manifest to declare it in a second time.
+"""
+
+import json
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import urllib.parse
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Long enough for a cold probe that has to refresh an expired pool slot, short enough
+# that a wedged child does not hold a browser request open forever. devterm's gate used
+# 25s for the same call and that number is inherited rather than reinvented.
+PROBE_TIMEOUT = 25
+
+# A JSON body on this surface is a name or a login code — hundreds of bytes. The cap is
+# here so an unbounded read cannot be the way in.
+BODY_MAX = 64 * 1024
+SWITCH_TIMEOUT = 120        # a login-code exchange talks to the provider
+# Upper bound on an approval code (bytes). The code#state pair devterm sees is well under
+# this; anything larger is not a code and is refused before it reaches the CLI.
+LOGIN_CODE_BODY_MAX = 400
+
+STATUS_BIN = os.environ.get("AIRLOCK_ACCOUNTS_STATUS_BIN", "").strip()
+ACCOUNTS_BIN = os.environ.get("AIRLOCK_ACCOUNTS_BIN", "").strip()
+OPENCODE_BIN = os.environ.get("AIRLOCK_OPENCODE_BIN", "").strip()
+
+# Where the detached xAI login child writes. The device code passes through this file for
+# at most the capture window below; see docs/design/account-surface-restart-contract.md.
+# This surface's own subdirectory of the platform state root, not the root itself. The
+# root holds the install ledger and its lock; dropping working files beside them invites
+# exactly the collision devterm's gate comment warns an app package about, and being the
+# platform does not make it tidier. Named `accounts/` because that is what owns it.
+ACCOUNTS_STATE_DIR = os.path.join(
+    os.environ.get("AIRLOCK_STATE_DIR") or os.path.expanduser("~/.local/state/airlock"),
+    "accounts")
+XAI_LOGIN_OUT = os.path.join(ACCOUNTS_STATE_DIR, "xai-login.out")
+XAI_CAPTURE_TRIES = 20      # x 0.5s. devterm's numbers, inherited rather than reinvented.
+XAI_CAPTURE_SLEEP = 0.5
+XAI_KILL_GRACE = 3.0
+XAI_LOGOUT_WAIT = 20
+
+# One login/logout at a time. devterm used an asyncio.Lock in a single-threaded loop; this
+# server is threaded, so the same invariant needs a real lock.
+_xai_lock = threading.Lock()
+_xai_login_process = None
+# Set once at startup when a login capture file from a previous process is found, and
+# cleared by the next idle report. It is the only evidence that an attempt existed, and
+# without it a redeploy looks to the person like "the code just did not work".
+_xai_interrupted = False
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _xai_device_values(text):
+    """Extract only OpenCode's documented device-flow URL/code labels."""
+    text = _ANSI_RE.sub("", text)
+    urls = re.findall(r"https://[^\s\x1b]+", text)
+    url = None
+    for item in urls:
+        candidate = item.rstrip("),.;")
+        # Browsers apply WHATWG backslash normalization while urlsplit follows RFC
+        # syntax. Reject that ambiguity (and userinfo) before trusting the hostname.
+        if "\\" in candidate:
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+            host = (parsed.hostname or "").lower()
+        except ValueError:
+            continue
+        if (parsed.scheme == "https" and parsed.username is None
+                and parsed.password is None
+                and (host == "x.ai" or host.endswith(".x.ai")
+                or host == "grok.com" or host.endswith(".grok.com"))):
+            url = candidate
+            break
+    # OpenCode 1.18.18 emits "enter code: XXXX-XXXX". Keep this anchored to
+    # that label: a loose search once returned the literal word "CODE".
+    match = re.search(
+        r"\benter\s+code\s*:\s*([A-Z0-9]{4,}(?:-[A-Z0-9]{4,})*)\b", text)
+    code = match.group(1) if match and match.group(1) != "CODE" else None
+    return url, code
+
+
+def _xai_group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _signal_group(pgid, sig):
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _terminate_xai(proc):
+    """TERM one tracked group, then KILL what outlives the leader.
+
+    Threaded translation of devterm's coroutine. The reasoning it keeps: TERM may reap the
+    leader while a child in the same group keeps polling, so signal again only when that
+    exact group still exists — a blind post-reap kill would hit a recycled pgid.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    pgid = proc.pid
+    _signal_group(pgid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=XAI_KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        _signal_group(pgid, signal.SIGKILL)
+        try:
+            proc.wait(timeout=XAI_KILL_GRACE)
+        except (subprocess.TimeoutExpired, OSError, ChildProcessError):
+            pass
+        return
+    except (OSError, ChildProcessError):
+        return
+    if _xai_group_alive(pgid):
+        _signal_group(pgid, signal.SIGKILL)
+
+
+def _cancel_xai_login():
+    """Stop the tracked login and remove its capture. Caller holds _xai_lock."""
+    global _xai_login_process
+    proc, _xai_login_process = _xai_login_process, None
+    stopped = bool(proc is not None and proc.poll() is None)
+    if proc is not None:
+        _terminate_xai(proc)
+    try:
+        os.unlink(XAI_LOGIN_OUT)
+    except OSError:
+        pass
+    return stopped
+
+
+def _xai_login_state():
+    """idle | pending | succeeded | failed | interrupted.
+
+    `interrupted` exists because after a restart the child is gone and the state would
+    otherwise collapse to `idle` — which reads as "no login was ever attempted" to
+    someone who was mid-login when the redeploy landed.
+    """
+    proc = _xai_login_process
+    if proc is None:
+        # 🔴 Sticky until a NEW attempt starts, not cleared by whoever reads first.
+        # The first draft cleared it on read, and the test's own readiness poll ate it —
+        # which is exactly what a health check, a second browser tab, or any poller would
+        # do in production. "The last attempt was interrupted" is a property of the last
+        # attempt, not a message in a queue with one recipient.
+        return "interrupted" if _xai_interrupted else "idle"
+    if proc.poll() is None:
+        return "pending"
+    return "succeeded" if proc.returncode == 0 else "failed"
+
+
+def _xai_startup_sweep():
+    """Delete a capture left by a process that is no longer running, and remember it.
+
+    A file here at startup is by definition from a login this process did not start, and
+    xAI's restart contract says such an attempt is already void (the poller is cancelled
+    on shutdown precisely because it would otherwise finish unobserved and replace a
+    working credential). Deleting it closes the crash window in which a device code is
+    left named on disk; recording it is what makes `interrupted` reportable.
+    """
+    global _xai_interrupted
+    try:
+        os.unlink(XAI_LOGIN_OUT)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    _xai_interrupted = True
+    return True
+
+
+# The shared usage store. READ-ONLY here and everywhere in this repository — the writer
+# is an out-of-process collector outside it, which is why these two keys could move off
+# devterm without coordinating with anything (parent decision OQ2, resolved 2026-09-04
+# after measuring that every use in devterm-gate.py is an open()/urlopen() read).
+FLEET_STORE = os.path.expanduser(os.environ["AIRLOCK_HUB_FLEET_STORE"]) \
+    if os.environ.get("AIRLOCK_HUB_FLEET_STORE") else ""
+FLEET_STORE_URL = os.environ.get("AIRLOCK_HUB_FLEET_STORE_URL", "")
+
+# The warning thresholds, shipped to the frontend with the account list. USAGE_TH is the
+# ONLY source: a frontend holding its own copy would drift from the verdict the alert
+# route computes. Copied verbatim from devterm's gate, which stops being the source when
+# its routes retire.
+USAGE_TH = {"warn5": 78, "crit5": 88, "warn7": 88, "crit7": 93, "rtWarnDays": 5}
+
+_CLAUDE_KIND_ALIASES = {
+    "personal": "personal", "개인": "personal",
+    "team": "team", "팀": "team",
+}
+_CLAUDE_KIND_VARIANTS = {
+    "personal": ("personal", "개인"),
+    "team": ("team", "팀"),
+}
+
+
+def _finite_number(value):
+    """The value if it is a real finite number, else None. Guards every threshold
+    comparison: a NaN would silently compare False and mute a warning."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if math.isfinite(value):
+                return value
+        except (OverflowError, ValueError):
+            pass
+    return None
+
+
+def _claude_kind(kind):
+    """Canonicalize the two legacy localized pool labels without guessing unknowns."""
+    if not isinstance(kind, str):
+        return ""
+    value = kind.strip()
+    return _CLAUDE_KIND_ALIASES.get(value.casefold(),
+                                    _CLAUDE_KIND_ALIASES.get(value, value))
+
+
+def _claude_store_entry(store, email, kind):
+    """Pick the newest canonical/legacy fleet entry for one account identity."""
+    if not isinstance(store, dict) or not isinstance(email, str) or not email:
+        return {}
+    original = kind.strip() if isinstance(kind, str) else kind
+    canonical = _claude_kind(original)
+    variants = []
+    for value in (original, canonical, *_CLAUDE_KIND_VARIANTS.get(canonical, ())):
+        if isinstance(value, str) and value and value not in variants:
+            variants.append(value)
+    best = None
+    best_at = None
+    best_is_canonical = False
+    for value in variants:
+        entry = store.get(f"{email}|{value}")
+        if not isinstance(entry, dict):
+            continue
+        observed_at = _finite_number(entry.get("observedAt"))
+        is_canonical = value == canonical
+        if best is None or (observed_at is not None
+                            and (best_at is None or observed_at > best_at)) \
+                or (observed_at == best_at and is_canonical
+                    and not best_is_canonical):
+            best, best_at, best_is_canonical = entry, observed_at, is_canonical
+    return best or {}
+
+
+def _fetch_fleet_store():
+    """Fetch the shared usage store: from the local file if present, else over HTTP if
+    a URL is configured. Failures are non-fatal — the account list still renders."""
+    if FLEET_STORE:
+        try:
+            with open(FLEET_STORE) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+    if FLEET_STORE_URL:
+        try:
+            with urllib.request.urlopen(FLEET_STORE_URL, timeout=6) as r:
+                return json.load(r)
+        except Exception:
+            pass
+    return {}
+
+
+def _acct_list_with_usage():
+    """`claude-switch list --json` + usage merged from the shared store (if any).
+    Shared by /accounts and /acct-alert so both see exactly the same account state."""
+    data = {"active": None, "accounts": []}
+    try:
+        proc = subprocess.run(
+            [ACCOUNTS_BIN, "list", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=15, check=False)
+        if proc.returncode == 0 and proc.stdout.strip():
+            data = json.loads(proc.stdout)
+    except (FileNotFoundError, ValueError, OSError, subprocess.TimeoutExpired):
+        pass
+    store = _fetch_fleet_store()
+    now = time.time()
+    # "nothing here yet" and "nothing will ever be here" are different operator states,
+    # and only one of them resolves by waiting. With no store configured this gate has no
+    # source for any account but the active one, so reporting the transient (which the UI
+    # words as "Collecting") promises a collector that does not exist — measured on this
+    # box as seven rows that had been "collecting" indefinitely, with a healthy collector
+    # running beside an unset fleet_store. Say which state it is; the UI words each.
+    no_source = not (FLEET_STORE or FLEET_STORE_URL)
+    for a in data.get("accounts", []):
+        ent = _claude_store_entry(store, a.get("email"), a.get("kind"))
+        a["kind"] = _claude_kind(a.get("kind"))
+        if ent.get("usage"):
+            # age = how old the reading is. Without it a number cannot be trusted.
+            a["usage"] = dict(ent["usage"],
+                               age=int(now - (ent.get("observedAt") or now)),
+                               observedAt=ent.get("observedAt"))
+        else:
+            a["usage"] = {"err": "no store" if no_source else "no data"}
+        # Which boxes hold this account (identity only, never a secret). Two boxes on
+        # one account burn the 5h window twice as fast, so it is worth seeing before a
+        # swap. Empty unless a shared store is configured.
+        a["holders"] = ent.get("holders") or []
+    return data
+
+
+def _probe(args=()):
+    """Run the platform status CLI and return (http_status, payload).
+
+    The CLI prints progress lines and then its JSON on the last line, which is why this
+    parses the last line rather than the whole stream. stderr is dropped on purpose: it
+    can carry account emails, and this process must not put them in a journal.
+    """
+    if not (STATUS_BIN and os.path.isfile(STATUS_BIN)):
+        # Not an error. A box may not have the account feature wired at all, and the
+        # frontend words `enabled: false` as "account switching is disabled".
+        return 200, {"enabled": False}
+    try:
+        proc = subprocess.run(
+            [sys.executable, STATUS_BIN, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=PROBE_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        return 504, {"error": "probe timeout"}
+    except OSError as exc:
+        # The message can name a path but never a credential.
+        return 500, {"error": str(exc)}
+    if proc.returncode != 0:
+        return 500, {"error": "probe failed"}
+    try:
+        payload = json.loads(proc.stdout.decode().strip().splitlines()[-1])
+    except (ValueError, IndexError, UnicodeDecodeError):
+        return 500, {"error": "probe output invalid"}
+    if not isinstance(payload, dict):
+        return 500, {"error": "probe output invalid"}
+    return 200, payload
+
+
+def _origin_ok(headers, host):
+    """Same-origin guard for every route that WRITES.
+
+    The identity header is injected by the ingress, not by the browser, so a request that
+    reaches this service carries the owner's identity no matter which page caused it. A
+    page on another origin can therefore make the owner's browser POST here, and only
+    this check stands between that and a real account switch. No Origin at all (curl, a
+    unit, the terminal) is fine — that is not a browser being aimed at us.
+
+    🔴 devterm guards ONE of its six account mutations this way (/acct-login-code) and
+    leaves /acct-switch, /acct-remove, /acct-login-url and /codex-logout open. That is a
+    pre-existing gap in the app, measured while porting, and this surface does NOT
+    inherit it: every mutation here is guarded. The design's verification obligations ask
+    for a cross-origin negative control on mutation endpoints, which only means something
+    if the endpoints actually refuse.
+
+    Host comes from nginx as $http_host — WITH the port. $host drops it, and an upstream
+    comparing a browser Origin (always ported) against a portless Host answered the
+    owner's own page 403 (#318).
+    """
+    origin = headers.get("origin")
+    if not origin:
+        return True
+    host = (host or "").lower()
+    try:
+        parsed = urllib.parse.urlsplit(origin)
+    except ValueError:
+        return False
+    return bool(host) and parsed.scheme in ("http", "https") and parsed.netloc.lower() == host
+
+
+def _cli(args, timeout=SWITCH_TIMEOUT, stdin_bytes=None):
+    """Run the account CLI and return (ok, stdout, stderr) as text.
+
+    stderr is captured rather than dropped here (unlike the probe): these verbs report
+    why they refused, and the frontend shows that reason. It is truncated by the caller
+    before it reaches a response — a CLI is entitled to be verbose, a JSON error field is
+    not.
+    """
+    if not (ACCOUNTS_BIN and os.path.isfile(ACCOUNTS_BIN)):
+        return False, "", "the platform account CLI is not available"
+    try:
+        # A value that must not appear in argv or the environment (the approval code)
+        # crosses this process boundary on stdin only — the CLI refuses it anywhere else.
+        proc = subprocess.run([ACCOUNTS_BIN, *args], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout, check=False,
+                              input=stdin_bytes,
+                              stdin=(None if stdin_bytes is not None else subprocess.DEVNULL))
+    except subprocess.TimeoutExpired:
+        return False, "", "timed out"
+    except OSError as exc:
+        return False, "", str(exc)
+    return (proc.returncode == 0,
+            proc.stdout.decode("utf-8", "replace").strip(),
+            proc.stderr.decode("utf-8", "replace").strip())
+
+
+def _valid_slot(name):
+    """A pool slot name is an identifier, never a path.
+
+    Same three refusals as devterm's: empty, contains a separator, or starts with a dot.
+    A slot name reaches the CLI as an argument and the CLI turns it into a filename.
+    """
+    return bool(name) and "/" not in name and not name.startswith(".")
+
+
+def _xai_status_payload():
+    """`GET /xai-status` — credential metadata only. Tokens never cross HTTP.
+
+    🔴 The response is an ALLOWLIST of the probe's output, not a pass-through, and moving
+    the surface does not relax it. The probe is a CLI this service does not own, so an
+    older or custom one could otherwise put a token-shaped value in a field the panel
+    prints. The platform surface is a *smaller* trust boundary than devterm's gate was,
+    not a larger one.
+    """
+    if not OPENCODE_BIN:
+        return 200, {"enabled": False}
+    status, result = _probe(["--xai"])
+    if status != 200 or not isinstance(result, dict) or result.get("state") not in {
+            "none", "ok", "expired", "malformed", "err"}:
+        return 500, {"enabled": True, "state": "err",
+                     "reason": "xAI status probe failed",
+                     "loginState": _xai_login_state()}
+    payload = {"enabled": True, "state": result["state"],
+               "loginState": _xai_login_state()}
+    if (result["state"] in {"ok", "expired"}
+            and isinstance(result.get("expires"), int)
+            and not isinstance(result.get("expires"), bool)):
+        payload["expires"] = result["expires"]
+    if result["state"] == "none":
+        payload["reason"] = "no OpenCode xAI credential"
+    elif result["state"] == "malformed":
+        payload["reason"] = "expected OAuth access, refresh and non-negative expires fields"
+    elif result["state"] == "err":
+        # Probe error text is diagnostic, not display data: an older probe could put a
+        # token-shaped value in `reason`. Say that it failed, not what it said.
+        payload["reason"] = "xAI status probe failed"
+    return 200, payload
+
+
+def _open_xai_capture():
+    """Create the capture at 0600, refusing to follow a symlink into it."""
+    d = os.path.dirname(XAI_LOGIN_OUT)
+    os.makedirs(d, exist_ok=True)
+    dir_fd = os.open(d, os.O_RDONLY)
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+        fd = os.open(os.path.basename(XAI_LOGIN_OUT), flags, 0o600, dir_fd=dir_fd)
+        try:
+            os.fchmod(fd, 0o600)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+    finally:
+        os.close(dir_fd)
+
+
+def _xai_login_start():
+    """Start OpenCode's headless device flow and return its URL + code.
+
+    The child is detached on purpose (its own session and process group): it outlives the
+    request that started it. That is also why the capture is a FILE and not a pipe — a
+    pipe held by this process breaks the moment the process dies for any reason other
+    than a clean stop, and the child then blocks on write.
+    """
+    global _xai_login_process, _xai_interrupted
+    if not OPENCODE_BIN:
+        return 400, {"ok": False, "error": "xAI disabled"}
+    # A new attempt supersedes the news about the old one.
+    _xai_interrupted = False
+    if not os.path.isfile(OPENCODE_BIN):
+        return 400, {"ok": False, "error": "the OpenCode binary is not available"}
+    _cancel_xai_login()
+    try:
+        fd = _open_xai_capture()
+        outf = os.fdopen(fd, "wb")
+        try:
+            proc = subprocess.Popen(
+                [OPENCODE_BIN, "auth", "login", "--provider", "xai",
+                 "--method", "SuperGrok Subscription"],
+                stdout=outf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True, env={**os.environ, "BROWSER": "true"})
+        finally:
+            outf.close()
+        _xai_login_process = proc
+    except (FileNotFoundError, OSError) as exc:
+        return 400, {"ok": False,
+                     "error": "OpenCode xAI login launch failed (" + type(exc).__name__ + ")"}
+
+    url = code = None
+    for _ in range(XAI_CAPTURE_TRIES):
+        time.sleep(XAI_CAPTURE_SLEEP)
+        try:
+            with open(XAI_LOGIN_OUT, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+        except OSError:
+            txt = ""
+        url, code = _xai_device_values(txt)
+        if url and code:
+            break
+        if proc.poll() is not None:
+            break
+    if url and code:
+        # The response is the only place these short-lived values go. Unlink while the
+        # child still owns its fd so they cannot linger on disk under a name.
+        try:
+            os.unlink(XAI_LOGIN_OUT)
+        except OSError:
+            pass
+        return 200, {"ok": True, "url": url, "code": code}
+    _cancel_xai_login()
+    return 400, {"ok": False, "error": "failed to capture OpenCode xAI device flow"}
+
+
+def _xai_logout():
+    """Drop the OpenCode xAI credential.
+
+    Cancels any login first: a logout racing a capture would otherwise decide by timing
+    which credential the box ends up with. Goes to the OpenCode binary, not the account
+    CLI — this credential is OpenCode's, and the account CLI has no verb for it.
+    """
+    if not OPENCODE_BIN or not os.path.isfile(OPENCODE_BIN):
+        return 400, {"ok": False, "error": "the OpenCode binary is not available"}
+    _cancel_xai_login()
+    try:
+        proc = subprocess.Popen(
+            [OPENCODE_BIN, "auth", "logout", "xai"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        try:
+            proc.wait(timeout=XAI_LOGOUT_WAIT)
+        except subprocess.TimeoutExpired:
+            _terminate_xai(proc)
+            return 400, {"ok": False, "error": "OpenCode xAI logout timed out"}
+        if proc.returncode == 0:
+            return 200, {"ok": True}
+        return 400, {"ok": False, "error": "OpenCode xAI logout failed"}
+    except (FileNotFoundError, OSError) as exc:
+        return 400, {"ok": False,
+                     "error": "OpenCode xAI logout failed (" + type(exc).__name__ + ")"}
+
+
+def _codex_auth_call(action, timeout):
+    """Run one platform-owned Codex credential action and return (payload, error).
+
+    Every Codex credential operation belongs to `airlock-accounts codex-auth`. This
+    surface owns the HTTP boundary, not the decision about what the operation does to
+    this box's login.
+
+    🔴 Only the platform tool's own JSON crosses back. Its stdout is parsed, never
+    forwarded, and codex's own stdout/stderr never reaches a response at all — a future
+    regression must not be able to turn arbitrary process output into a credential
+    exfiltration path. `ok: false` with an `error` is an operation that failed for a
+    reason a person can act on; a non-zero exit is the tool itself failing, and the two
+    are not collapsed because only the first is worth showing.
+    """
+    if not (ACCOUNTS_BIN and os.path.isfile(ACCOUNTS_BIN)):
+        return None, "platform accounts tool is not wired"
+    try:
+        proc = subprocess.run([ACCOUNTS_BIN, "codex-auth", action, "--json"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout, check=False)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None, "platform accounts operation failed"
+    if proc.returncode != 0:
+        return None, "platform accounts operation failed"
+    try:
+        payload = json.loads((proc.stdout or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "platform accounts operation returned invalid JSON"
+    if not isinstance(payload, dict):
+        return None, "platform accounts operation returned an invalid shape"
+    if payload.get("ok") is not True:
+        detail = payload.get("error")
+        # Bounded and type-checked so a malformed payload cannot inject a body.
+        return None, (detail[:400] if isinstance(detail, str) and detail
+                      else "platform accounts operation failed")
+    return payload, None
+
+
+def _codex_login_start():
+    """Codex re-login 1/2 — the platform CLI starts `codex login --device-auth`.
+
+    The capture polls for up to ~10s inside the CLI, so the wait here has to clear that
+    ceiling: too short reports a failure for a login that actually started.
+    """
+    payload, error = _codex_auth_call("login-start", 30)
+    if error:
+        return 400, {"ok": False, "error": error}
+    url, code = payload.get("url"), payload.get("code")
+    if not isinstance(url, str) or not isinstance(code, str) or not code:
+        return 400, {"ok": False,
+                     "error": "platform accounts operation returned an invalid shape"}
+    return 200, {"ok": True, "url": url, "code": code}
+
+
+def _codex_login_cancel():
+    """Stop a pending device-auth and restore the previous login.
+
+    Re-login logs out immediately, so this undoes an abandoned attempt rather than
+    merely stopping it.
+    """
+    payload, error = _codex_auth_call("login-cancel", 15)
+    if error:
+        return 400, {"ok": False, "error": error}
+    restored = payload.get("restored")
+    if not isinstance(restored, bool):
+        return 400, {"ok": False,
+                     "error": "platform accounts operation returned an invalid shape"}
+    return 200, {"ok": True, "restored": restored}
+
+
+
+# ---- usage caches ----------------------------------------------------------
+# devterm keeps these under its declared D6 share artifact; this surface keeps its own
+# under ACCOUNTS_STATE_DIR. 5c removes devterm's directory, and reading another package's
+# artifact would be wrong besides. The data is disposable display state — an empty start
+# self-heals on the next probe, so nothing migrates.
+CODEX_USAGE_STATE = os.path.join(ACCOUNTS_STATE_DIR, "codex-usage.json")
+CLAUDE_USAGE_STATE = os.path.join(ACCOUNTS_STATE_DIR, "claude-usage.json")
+CODEX_AUTH = os.path.expanduser(os.environ.get("AIRLOCK_CODEX_AUTH", "~/.codex/auth.json"))
+_CODEX_AUTH_GENERATION_UNAVAILABLE = object()
+
+ACCT_ALERT_TTL = 30          # /acct-alert response cache (s)
+LIVE_USAGE_TTL = 60          # the live account's own usage probe
+CODEX_USAGE_TTL = 300        # the weekly window moves a couple of % per day
+CODEX_USAGE_WAIT = 20        # how long a request waits for a fresh reading
+CODEX_USAGE_RETRY = 30       # a failure must not buy itself a full TTL of silence
+CLAUDE_USAGE_MAX_AGE = 30 * 86400
+CLAUDE_USAGE_FUTURE_SKEW = 5 * 60
+
+_cache_lock = threading.RLock()
+_acct_alert_cache = {"at": 0.0, "payload": None}
+_live_usage_cache = {"at": 0.0, "payload": None}
+_acct_cache_generation = 0
+_codex_usage_cache = {"valueAt": 0.0, "lastTryAt": 0.0, "payload": None,
+                      "authMtime": None, "refreshing": False, "generation": 0}
+_codex_refresh_done = threading.Condition(_cache_lock)
+
+
+def _acct_alert_level(u5, u7, rt_days, codex_u7=None, codex_err=None):
+    """The active account's warning level — (level, reason). level = none|warn|crit.
+
+    Each axis is graded on its own, then the worst (severity, reason-priority) wins.
+    Reason priority is login=3 > usage=2 > codex=1: at equal severity a looming login
+    expiry is the more actionable message, and codex is the newest axis so it never
+    displaces the two that were there before.
+    A spent 5h window mutes nothing, including itself. "5h exhausted" and "7d critical"
+    are separate facts and collapsing them hides the one that lasts longer — and a 5h
+    window at 100% is not a quiet state, it is the account being unusable right now.
+    Grading it as anything but crit reported an exhausted account as healthy.
+    codex_err="auth" (claude-status's verdict that the stored Codex credential was
+    revoked) is graded as crit on the codex axis: the panel still shows a healthy
+    email + plan, so without this the first report is an agent failing mid-run."""
+    u5 = _finite_number(u5)
+    u7 = _finite_number(u7)
+    rt_days = _finite_number(rt_days)
+    codex_u7 = _finite_number(codex_u7)
+    candidates = []
+    if u5 is not None:
+        if u5 >= USAGE_TH["crit5"]:
+            candidates.append((2, 2, "crit", "usage"))
+        elif u5 >= USAGE_TH["warn5"]:
+            candidates.append((1, 2, "warn", "usage"))
+    if u7 is not None:
+        if u7 >= USAGE_TH["crit7"]:
+            candidates.append((2, 2, "crit", "usage"))
+        elif u7 >= USAGE_TH["warn7"]:
+            candidates.append((1, 2, "warn", "usage"))
+    if rt_days is not None and rt_days <= USAGE_TH["rtWarnDays"]:
+        candidates.append((1, 3, "warn", "login"))
+    if codex_u7 is not None:
+        if codex_u7 >= USAGE_TH["crit7"]:
+            candidates.append((2, 1, "crit", "codex"))
+        elif codex_u7 >= USAGE_TH["warn7"]:
+            candidates.append((1, 1, "warn", "codex"))
+    if codex_err == "auth":
+        # Not a usage problem: no Codex agent runs until someone re-logs in. Its own
+        # reason so the widget says "re-login" instead of quoting a percentage.
+        candidates.append((2, 1, "crit", "codex-login"))
+    if not candidates:
+        return "none", None
+    _, _, level, reason = max(candidates, key=lambda item: (item[0], item[1]))
+    return level, reason
+
+
+def _codex_has_usage_value(result):
+    return (isinstance(result, dict)
+            and any(_finite_number(result.get(key)) is not None
+                    for key in ("use5h", "use7d")))
+
+
+def _codex_pending_payload(err="pending"):
+    return {"use5h": None, "use7d": None, "reset5h": None, "reset7d": None,
+            "plan": None, "resetCredits": None, "observedAt": None,
+            "err": err, "stale": True}
+
+
+def _codex_timeout_payload():
+    payload = _codex_usage_cache.get("payload")
+    if payload is not None:
+        return dict(payload, stale=True, lastErr="timeout")
+    result = _codex_pending_payload("timeout")
+    result["lastErr"] = "timeout"
+    return result
+
+
+def _codex_auth_mtime():
+    """Return login generation, absence, or a distinct unavailable sentinel.
+
+    Absence is a valid generation (`None`). Transport failure is not: treating two
+    failures as the same generation could let an in-flight result cross a login change.
+    """
+    if not ACCOUNTS_BIN:
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    try:
+        proc = subprocess.run(
+            [ACCOUNTS_BIN, "codex-auth", "generation", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    if proc.returncode != 0 or len(proc.stdout) > 4096:
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    try:
+        payload = json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    if (not isinstance(payload, dict) or payload.get("ok") is not True
+            or not isinstance(payload.get("present"), bool)):
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    generation = payload.get("generation")
+    if not payload["present"]:
+        return None
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        return _CODEX_AUTH_GENERATION_UNAVAILABLE
+    return generation
+
+
+def _claude_usage_candidate(result, now):
+    if not isinstance(result, dict) or result.get("state") != "ok":
+        return None
+    email = result.get("email")
+    kind = result.get("kind")
+    if not isinstance(email, str) or not email or not isinstance(kind, str) or not kind:
+        return None
+    key = f"{email}|{_claude_kind(kind)}"
+    if _claude_usage_key_parts(key) is None:
+        return None
+    usage = _claude_usage_normalize_usage(result.get("usage"))
+    if usage is None:
+        return None
+    return key, {"usage": usage, "valueAt": now}
+
+
+def _claude_usage_records(raw, now):
+    """Return only validated records from one versioned store object."""
+    if not isinstance(raw, dict) or isinstance(raw.get("version"), bool) \
+            or raw.get("version") != 1 or not isinstance(raw.get("accounts"), dict):
+        return {}
+    records = {}
+    for key, raw_entry in raw["accounts"].items():
+        parts = _claude_usage_key_parts(key)
+        if parts is None:
+            continue
+        entry = _claude_usage_validate_entry(raw_entry, now)
+        canonical_key = f"{parts[0]}|{parts[1]}"
+        current = records.get(canonical_key)
+        source_is_canonical = key == canonical_key
+        if entry is not None and (current is None
+                                  or entry["valueAt"] > current["valueAt"]
+                                  or (entry["valueAt"] == current["valueAt"]
+                                      and source_is_canonical)):
+            records[canonical_key] = entry
+    return records
+
+
+def _claude_usage_key_parts(key):
+    if not isinstance(key, str):
+        return None
+    parts = key.split("|")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    kind = _claude_kind(parts[1])
+    return (parts[0], kind) if kind else None
+
+
+def _claude_usage_normalize_usage(raw):
+    if not isinstance(raw, dict):
+        return None
+    usage = {}
+    has_value = False
+    for key in ("use5h", "use7d"):
+        value = raw.get(key)
+        if value is None:
+            usage[key] = None
+            continue
+        value = _finite_number(value)
+        if value is None or not 0 <= value <= 100:
+            return None
+        usage[key] = value
+        has_value = True
+    if not has_value:
+        return None
+    for key in ("reset5h", "reset7d"):
+        value = raw.get(key)
+        if value is not None and not isinstance(value, str):
+            return None
+        usage[key] = value
+    return usage
+
+
+def _claude_usage_validate_entry(raw, now):
+    if not isinstance(raw, dict):
+        return None
+    value_at = _finite_number(raw.get("valueAt"))
+    if (value_at is None or value_at <= 0
+            or value_at > now + CLAUDE_USAGE_FUTURE_SKEW):
+        return None
+    usage = _claude_usage_normalize_usage(raw.get("usage"))
+    if usage is None:
+        return None
+    return {"usage": usage, "valueAt": value_at}
+
+
+def _claude_usage_state_load(now=None):
+    """Load a cold/partially valid cache; malformed records are simply not usable."""
+    now = time.time() if now is None else now
+    try:
+        with open(CLAUDE_USAGE_STATE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return {}
+    return _claude_usage_records(raw, now)
+
+
+def _claude_usage_state_save(result):
+    """Persist one good live probe without ever making the probe request fail.
+
+    This deliberately stays a plain synchronous function. The gate has one asyncio
+    loop, so its read-modify-prune-write sequence cannot interleave with another handler.
+    """
+    global _claude_usage_write_logged
+    now = time.time()
+    candidate = _claude_usage_candidate(result, now)
+    if candidate is None:
+        return False
+    key, entry = candidate
+    tmp = None
+    fd = None
+    try:
+        # Keep the load in this same synchronous call as merge, prune and replace. Moving
+        # only the load to run_in_executor would reintroduce a lost-update window.
+        try:
+            with open(CLAUDE_USAGE_STATE, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError, UnicodeError, RecursionError):
+            raw = None
+        records = _claude_usage_records(raw, now)
+        cutoff = now - CLAUDE_USAGE_MAX_AGE
+        records = {k: v for k, v in records.items() if v["valueAt"] >= cutoff}
+        records[key] = entry
+        payload = {"version": 1, "accounts": records}
+
+        os.makedirs(ACCOUNTS_STATE_DIR, mode=0o700, exist_ok=True)
+        tmp = f"{CLAUDE_USAGE_STATE}.tmp.{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC, 0o600)
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with stream:
+            json.dump(payload, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, CLAUDE_USAGE_STATE)
+        return True
+    except (OSError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if not _claude_usage_write_logged:
+            _claude_usage_write_logged = True
+            print("devterm-gate: warning: Claude usage state write failed "
+                  f"({type(exc).__name__})", file=sys.stderr, flush=True)
+        return False
+
+
+# ---- Codex usage cache ------------------------------------------------------
+# Reading Codex utilization costs an `app-server` spawn, so it is cached with a TTL and
+# refreshed in a single background task. Callers never block on more than one refresh,
+# and a login/logout invalidates the cache so a previous account's numbers cannot be
+# served under the new identity.
+
+
+def _codex_usage_state_save():
+    """Remember the last good reading. Best effort — this is a cache, and failing to
+    write one must never disturb the request that produced it."""
+    payload = _codex_usage_cache.get("payload")
+    value_at = _codex_usage_cache.get("valueAt", 0.0)
+    if not _codex_has_usage_value(payload) or value_at <= 0:
+        return False
+    auth_mtime = _codex_usage_cache.get("authMtime")
+    if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
+        return False
+    record = {"payload": payload, "valueAt": value_at, "authMtime": auth_mtime}
+    try:
+        os.makedirs(ACCOUNTS_STATE_DIR, exist_ok=True)
+        tmp = CODEX_USAGE_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        os.replace(tmp, CODEX_USAGE_STATE)
+        return True
+    except OSError:
+        return False
+
+
+def _codex_usage_state_load():
+    """Seed the cache from the remembered reading. Called once, before serving.
+
+    Refused when it belongs to a different login: auth.json's mtime is stored with the
+    numbers, and after a login or logout the previous account's usage is not this
+    account's. Restored as stale when older than the value TTL, so the row says
+    '(last value)' rather than presenting a remembered number as a fresh observation.
+
+    🔴 devterm's version also falls back to a legacy path and migrates it. That is
+    devterm's history — a location IT moved away from — and this surface never wrote
+    there, so inheriting the migration would mean adopting another package's past.
+    """
+    try:
+        with open(CODEX_USAGE_STATE, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    payload = record.get("payload")
+    value_at = _finite_number(record.get("valueAt"))
+    if not _codex_has_usage_value(payload) or value_at is None or value_at <= 0:
+        return False
+    auth_mtime = _codex_auth_mtime()
+    if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
+        return False
+    if record.get("authMtime") != auth_mtime:
+        try:
+            os.remove(CODEX_USAGE_STATE)   # a different login wrote it; its numbers are void
+        except OSError:
+            pass
+        return False
+    payload = dict(payload)
+    payload["stale"] = time.time() - value_at > CODEX_USAGE_TTL
+    # lastTryAt stays 0 so a value past its TTL refreshes on the first request rather
+    # than riding the retry backoff of a probe this process never made.
+    with _cache_lock:
+        _codex_usage_cache.update(valueAt=value_at, lastTryAt=0.0, payload=payload,
+                                  authMtime=auth_mtime, refreshing=False)
+    return True
+
+
+def _invalidate_codex_usage_cache():
+    """Drop the remembered Codex numbers. Caller may hold _cache_lock."""
+    with _cache_lock:
+        _codex_usage_cache.update(valueAt=0.0, lastTryAt=0.0, payload=None,
+                                  authMtime=_codex_auth_mtime(),
+                                  generation=_codex_usage_cache["generation"] + 1)
+
+
+def _invalidate_acct_caches():
+    """A switch/remove changed the pool: the alert verdict and live reading are void."""
+    global _acct_cache_generation
+    with _cache_lock:
+        _acct_cache_generation += 1
+        _acct_alert_cache.update(at=0.0, payload=None)
+        _live_usage_cache.update(at=0.0, payload=None)
+
+
+def _codex_usage_refresh(generation):
+    """One probe, in a worker thread. Stores only if the world has not moved on.
+
+    🔴 This is the one place where the port is a REWRITE rather than a re-homing, and it
+    is the runtime that forces it: devterm runs an asyncio task and cancels it when
+    auth.json changes, and this service is a threaded stdlib server with no task to
+    cancel. The observable contract is unchanged — TTLs, the stale flag, the pending and
+    timeout payload shapes, and "a login invalidates the numbers".
+    What replaces cancellation is a generation check AT THE POINT OF STORING: a refresh
+    that was started before a login lands cannot overwrite the newer state, because the
+    generation it captured no longer matches. That is simpler than cancelling a task and
+    it cannot lose a race the cancel version could — a task cancelled after it had
+    already computed its value still had to be prevented from storing it.
+    """
+    status, payload = _probe(["--codex-usage"])
+    with _cache_lock:
+        try:
+            if generation != _codex_usage_cache["generation"]:
+                return                      # a login/logout happened while we probed
+            now = time.time()
+            if status == 200 and _codex_has_usage_value(payload):
+                _codex_usage_cache.update(valueAt=now, lastTryAt=now, payload=payload,
+                                          authMtime=_codex_auth_mtime())
+                _codex_usage_state_save()
+            else:
+                _codex_usage_cache["lastTryAt"] = now
+        finally:
+            _codex_usage_cache["refreshing"] = False
+            _codex_refresh_done.notify_all()
+
+
+def _codex_usage_due(now, force=False):
+    c = _codex_usage_cache
+    if force:
+        return True
+    if not _codex_has_usage_value(c.get("payload")):
+        return now - c["lastTryAt"] > CODEX_USAGE_RETRY
+    return now - c["valueAt"] > CODEX_USAGE_TTL
+
+
+def _codex_usage_cached(wait=False):
+    """The remembered Codex reading, refreshed in the background when it is due.
+
+    A remembered value is useful immediately; only a value-less cache needs the bounded
+    wait that keeps the first paint from being blank.
+    """
+    with _cache_lock:
+        auth_mtime = _codex_auth_mtime()
+        if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
+            _codex_usage_cache.update(valueAt=0.0, lastTryAt=0.0, payload=None,
+                                      authMtime=auth_mtime)
+            return _codex_pending_payload("auth-generation-unavailable")
+        if auth_mtime != _codex_usage_cache.get("authMtime"):
+            _invalidate_codex_usage_cache()
+
+        now = time.time()
+        if not _codex_usage_cache["refreshing"] and _codex_usage_due(now):
+            _codex_usage_cache["refreshing"] = True
+            gen = _codex_usage_cache["generation"]
+            threading.Thread(target=_codex_usage_refresh, args=(gen,),
+                             daemon=True, name="codex-usage-refresh").start()
+
+        have_value = _codex_has_usage_value(_codex_usage_cache.get("payload"))
+        if wait and _codex_usage_cache["refreshing"] and not have_value:
+            if not _codex_refresh_done.wait_for(
+                    lambda: not _codex_usage_cache["refreshing"], timeout=CODEX_USAGE_WAIT):
+                return _codex_timeout_payload()
+        payload = _codex_usage_cache.get("payload")
+        if not _codex_has_usage_value(payload):
+            return _codex_pending_payload("no-reading-yet")
+        out = dict(payload)
+        out["stale"] = time.time() - _codex_usage_cache["valueAt"] > CODEX_USAGE_TTL
+        return out
+
+
+def _live_usage_cached():
+    """The active account's own 5h/7d reading, cached for LIVE_USAGE_TTL."""
+    with _cache_lock:
+        now = time.time()
+        if _live_usage_cache["payload"] is not None and now - _live_usage_cache["at"] <= LIVE_USAGE_TTL:
+            return _live_usage_cache["payload"]
+    status, payload = _probe(["--usage", "live"])
+    value = payload if status == 200 and isinstance(payload, dict) else {}
+    with _cache_lock:
+        _live_usage_cache.update(at=time.time(), payload=value)
+    return value
+
+
+def _acct_alert_payload(_generation_retry=False):
+    """`GET /acct-alert` — the active account's warning grade, cached for ACCT_ALERT_TTL.
+
+    Deliberately consumes the UNMERGED account list: /accounts merges a person's last
+    manual reading, and letting that replace the live-probe fallback here would make a
+    stale number decide the alert.
+    """
+    now = time.time()
+    with _cache_lock:
+        cached = _acct_alert_cache["payload"]
+        fresh = cached is not None and now - _acct_alert_cache["at"] <= ACCT_ALERT_TTL
+        generation = _acct_cache_generation
+    if fresh:
+        return cached
+
+    claude_error = None
+    u = {}
+    rt_days = u5 = u7 = None
+    try:
+        data = _acct_list_with_usage()
+        if not isinstance(data, dict):
+            raise ValueError("accounts payload is not an object")
+        accounts = data.get("accounts", [])
+        if not isinstance(accounts, list):
+            raise ValueError("accounts payload is not a list")
+        act = next((a for a in accounts if isinstance(a, dict) and a.get("active")), None)
+        u = (act or {}).get("usage") or {}
+        if not isinstance(u, dict):
+            raise ValueError("usage payload is not an object")
+        u5 = _finite_number(u.get("use5h"))
+        u7 = _finite_number(u.get("use7d"))
+        rt = _finite_number((act or {}).get("rtExpiry"))
+        rt_days = _finite_number(((rt / 1000.0) - now) / 86400.0 if rt is not None else None)
+        if u5 is None and u7 is None:
+            # No shared store (or nothing in it for this account): ask this box.
+            live = _live_usage_cached()
+            if isinstance(live, dict) and live:
+                u = dict(live)
+                u5 = _finite_number(live.get("use5h"))
+                u7 = _finite_number(live.get("use7d"))
+                if rt_days is None:
+                    rt_days = _finite_number(live.get("rtDaysLeft"))
+    except Exception as exc:
+        # Isolated from the codex axis. Only the exception TYPE is reported — never a
+        # token, a path, or raw response text.
+        claude_error = f"accounts-{type(exc).__name__}"
+        u = {}
+        u5 = u7 = None
+    try:
+        codex = _codex_usage_cached()
+    except Exception as exc:
+        codex = {"stale": True, "err": f"cache-{type(exc).__name__}"}
+    if not isinstance(codex, dict):
+        codex = {"stale": True, "err": "cache-invalid"}
+    codex_u7 = _finite_number(codex.get("use7d"))
+    codex_err = codex.get("lastErr") or codex.get("err")
+    level, reason = _acct_alert_level(u5, u7, rt_days, codex_u7, codex_err)
+    payload = {"ok": True, "level": level, "reason": reason,
+               "use5h": u5, "use7d": u7,
+               "reset5h": u.get("reset5h"), "reset7d": u.get("reset7d"),
+               "rtDays": (int(rt_days) if rt_days is not None else None),
+               "stale": bool(u.get("stale")), "err": u.get("err") or claude_error,
+               "codexUse7d": codex_u7,
+               "codexReset7d": codex.get("reset7d"),
+               "codexPlan": codex.get("plan"),
+               "codexCredits": codex.get("resetCredits"),
+               "codexStale": bool(codex.get("stale")),
+               "codexErr": codex_err,
+               "thresholds": dict(USAGE_TH)}
+    with _cache_lock:
+        if generation != _acct_cache_generation:
+            # A login mutation won the race while the old account's probes were in
+            # flight. Recompute once; a second mutation still prevents caching.
+            if not _generation_retry:
+                return _acct_alert_payload(_generation_retry=True)
+        else:
+            _acct_alert_cache.update(at=now, payload=payload)
+    return payload
+
+
+def _accounts_payload():
+    """`GET /accounts` — the account list, its usage, and the thresholds the frontend
+    colours rows with.
+
+    devterm's gate also merges a LOCAL display cache here, written by /acct-usage-now
+    when a person asks for a fresh reading. This surface keeps its own, under
+    ACCOUNTS_STATE_DIR — devterm's lives inside its declared D6 share artifact
+    (~/.local/share/airlock-devterm/state/) and 5c removes that directory, so a platform
+    surface reading it would lose the cache and be reading another package's artifact
+    besides.
+
+    🔴 An earlier version of this comment named ~/.local/state/airlock/devterm/ as
+    devterm's path. That is LEGACY_CODEX_USAGE_STATE — the location devterm migrated
+    AWAY from — and the mistake came from reading the visible path string without
+    reading the constant above it. Kept as a note because the same misreading also
+    produced a wrong report about the design and a real bug in this file.
+
+    `enabled` is always true here. devterm gates the whole surface on its own
+    `accounts`/`xai` config keys; on the platform the surface exists because the operator
+    configured the platform, and the panel's "disabled" wording belongs to the app that
+    can be configured without it.
+    """
+    data = _acct_list_with_usage()
+    if not isinstance(data, dict):
+        data = {"active": None, "accounts": []}
+    now = time.time()
+    local = _claude_usage_state_load(now)
+    # The merge belongs at THIS boundary only. /acct-alert deliberately reads the
+    # unmerged list so a person's last manual reading cannot replace its live-probe
+    # fallback and decide the alert.
+    for account in data.get("accounts", []) if isinstance(data, dict) else []:
+        if not isinstance(account, dict):
+            continue
+        account["kind"] = _claude_kind(account.get("kind"))
+        email, kind = account.get("email"), account.get("kind")
+        key = f"{email}|{kind}" if isinstance(email, str) and email and kind else ""
+        entry = local.get(key) if key else None
+        fleet_usage = account.get("usage")
+        fleet_at = (_finite_number(fleet_usage.get("observedAt"))
+                    if isinstance(fleet_usage, dict) else None)
+        if not entry or (fleet_at is not None and entry["valueAt"] <= fleet_at):
+            continue
+        merged = dict(entry["usage"])
+        merged["age"] = max(0, int(now - entry["valueAt"]))
+        merged["stale"] = True
+        merged["observedAt"] = entry["valueAt"]
+        account["usage"] = merged
+    data["thresholds"] = dict(USAGE_TH)
+    data["enabled"] = True
+    return data
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "airlock-accounts-api"
+    sys_version = ""
+
+    def _send(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        # The answer is login state and usage. A cached one is a wrong one.
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _not_found(self):
+        """A route this surface does not serve.
+
+        JSON with 404, never HTML and never 200. The hub's `location /` answers an
+        unknown path with index.html at HTTP 200, and a caller doing `r.json()` on that
+        gets a parse error with nothing saying why — that silent shape is what the
+        prefix location and this handler both exist to avoid.
+        """
+        self._send(404, {"error": "no such route on the account surface"})
+
+    def send_error(self, code, message=None, explain=None):
+        """Every error leaves here as JSON.
+
+        Found by running it rather than reading it: BaseHTTPRequestHandler answers an
+        unimplemented method (HEAD, PUT, ...) with its own **HTML** error page, so a
+        surface that carefully returns JSON on every route it knows about was still
+        emitting `text/html` on the ones it did not. A caller doing r.json() on that gets
+        a parse error and no reason — the same silent shape this file's _not_found docs.
+        """
+        self._send(code, {"error": (message or "request refused")})
+
+    def do_HEAD(self):  # noqa: N802
+        # Answer the same status as GET, without a body. Explicit because the fallback
+        # for a missing method is the HTML page above.
+        if self.path == "/claude-status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            return
+        self._not_found()
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
+        if self.path == "/claude-status":
+            status, payload = _probe()
+            self._send(status, payload)
+            return
+        if self.path == "/codex-status":
+            # Local-only Codex identity (auth.json id_token): the panel's first paint.
+            status, payload = _probe(["--codex"])
+            self._send(status, payload)
+            return
+        if self.path == "/accounts":
+            self._send(200, _accounts_payload())
+            return
+        if self.path == "/xai-status":
+            status, payload = _xai_status_payload()
+            self._send(status, payload)
+            return
+        if self.path.startswith("/claude-usage?") or self.path == "/claude-usage":
+            # One slot at a time, on purpose: asking for every account at once risks 429
+            # when several boxes poll together.
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            slot = (q.get("slot") or ["live"])[0]
+            status, payload = _probe(["--usage", slot])
+            self._send(status, payload)
+            return
+        if self.path == "/acct-alert":
+            self._send(200, _acct_alert_payload())
+            return
+        if self.path == "/codex-usage":
+            self._send(200, _codex_usage_cached(wait=True))
+            return
+        if self.path == "/claude-usage-store":
+            self._send(200, _fetch_fleet_store() if FLEET_STORE else {})
+            return
+        self._not_found()
+
+    def _json_body(self):
+        """The request body as a dict, or None. Never raises into the handler."""
+        try:
+            declared = int(self.headers.get("content-length") or 0)
+        except ValueError:
+            return None
+        if declared <= 0 or declared > BODY_MAX:
+            return None
+        try:
+            return json.loads(self.rfile.read(declared).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, OSError):
+            return None
+
+    def _guarded(self):
+        """False (and an answered 403) when a mutation arrived cross-origin."""
+        if _origin_ok(self.headers, self.headers.get("host", "")):
+            return True
+        self._send(403, {"ok": False, "error": "origin not allowed"})
+        return False
+
+    def do_POST(self):  # noqa: N802
+        if self.path == "/acct-login-url":
+            if not self._guarded():
+                return
+            ok, out, err = _cli(["login-url"])
+            if ok and out.startswith("https://"):
+                self._send(200, {"ok": True, "url": out.splitlines()[0]})
+            else:
+                self._send(400, {"ok": False,
+                                 "error": (err or out or "failed to issue link")[:300]})
+            return
+        if self.path == "/acct-usage-now":
+            if not self._guarded():
+                return
+            # Only the active account — querying every one at once risks 429. The
+            # response is the probe payload verbatim; remembering it must not be able to
+            # fail the reading the person asked for.
+            status, payload = _probe(["--usage", "live"])
+            try:
+                _claude_usage_state_save(payload)
+            except Exception:
+                pass
+            self._send(status, payload)
+            return
+        if self.path in ("/codex-login-start", "/codex-login-cancel"):
+            if not self._guarded():
+                return
+            # A login wipes auth.json, so the cached numbers are void. This is the
+            # invalidation the previous step said would land here when /codex-usage
+            # arrived; it has.
+            _invalidate_codex_usage_cache()
+            if self.path == "/codex-login-start":
+                status, payload = _codex_login_start()
+            else:
+                status, payload = _codex_login_cancel()
+            self._send(status, payload)
+            return
+        if self.path in ("/xai-login-start", "/xai-login-cancel", "/xai-logout"):
+            if not self._guarded():
+                return
+            # One at a time: two logins would leave an untracked child, and a logout
+            # racing a login would decide which credential wins by timing.
+            with _xai_lock:
+                if self.path == "/xai-login-start":
+                    status, payload = _xai_login_start()
+                elif self.path == "/xai-login-cancel":
+                    stopped = _cancel_xai_login()
+                    status, payload = 200, {"ok": True, "stopped": stopped}
+                else:
+                    status, payload = _xai_logout()
+            self._send(status, payload)
+            return
+        if self.path in ("/acct-switch", "/acct-remove", "/acct-login-code", "/codex-logout"):
+            if not self._guarded():
+                return
+            body = self._json_body() or {}
+            if self.path == "/codex-logout":
+                ok, out, err = _cli(["codex-auth", "logout", "--json"])
+                self._send(200 if ok else 400,
+                           {"ok": ok} if ok else {"ok": False, "error": (err or out)[:200]})
+                return
+            if self.path == "/acct-login-code":
+                # The code is a one-time secret. It goes to the CLI on protected stdin —
+                # `airlock-accounts login-code` refuses argv (rc=2) — and it never comes
+                # back out: the CLI's stderr can echo what it was handed, so the error
+                # body here is a fixed sentence, not the subprocess output.
+                code = (body.get("code") or "")
+                if not isinstance(code, str):
+                    code = ""
+                code = code.strip()
+                try:
+                    code_bytes = code.encode("utf-8")
+                except UnicodeEncodeError:
+                    code_bytes = b""
+                if (not code_bytes or len(code_bytes) > LOGIN_CODE_BODY_MAX
+                        or any(ch.isspace() for ch in code)):
+                    self._send(400, {"ok": False, "error": "not a code"})
+                    return
+                ok, _out, _err = _cli(["login-code"], stdin_bytes=code_bytes)
+                self._send(200 if ok else 400,
+                           {"ok": True, "msg": "registered"} if ok
+                           else {"ok": False,
+                                 "error": "registration failed — request a new login link"})
+                return
+            name = (body.get("name") or "").strip()
+            if not _valid_slot(name):
+                self._send(400, {"ok": False, "error": "invalid name"})
+                return
+            if self.path == "/acct-switch":
+                ok, out, err = _cli(["swap", name])
+                if ok:
+                    _invalidate_acct_caches()
+                self._send(200 if ok else 400,
+                           {"ok": ok, "active": name if ok else None}
+                           if ok else {"ok": False, "active": None, "error": (err or out)[:200]})
+            else:
+                ok, out, err = _cli(["remove", name, "--yes"])
+                if ok:
+                    _invalidate_acct_caches()
+                self._send(200 if ok else 400,
+                           {"ok": ok} if ok else {"ok": False, "error": (err or out)[:200]})
+            return
+        self._not_found()
+
+    def log_message(self, fmt, *args):
+        """Access logging off.
+
+        Not for tidiness: request paths on this surface carry account names in a later
+        step, and a journal is the wrong place for them. nginx already logs the proxied
+        request without the body.
+        """
+        return
+
+
+def main():
+    port_raw = os.environ.get("AIRLOCK_HUB_ACCOUNTS_PORT", "").strip()
+    if not port_raw:
+        # Fail closed and say which name is missing. A default here would be a second
+        # source of truth for a port that bin/airlock-config validates for uniqueness.
+        sys.stderr.write("airlock-accounts-api: AIRLOCK_HUB_ACCOUNTS_PORT is not set\n")
+        return 2
+    try:
+        port = int(port_raw)
+    except ValueError:
+        sys.stderr.write(
+            "airlock-accounts-api: AIRLOCK_HUB_ACCOUNTS_PORT is not a number: %r\n" % port_raw)
+        return 2
+    if not 1 <= port <= 65535:
+        sys.stderr.write("airlock-accounts-api: port out of range: %d\n" % port)
+        return 2
+    # 127.0.0.1, never 0.0.0.0: the only caller is the hub's nginx on this box, and the
+    # owner guard lives there. Binding wider would put an unguarded copy of this surface
+    # on the tailnet.
+    # Before serving anything: a capture left by a process that is no longer running.
+    if _codex_usage_state_load():
+        sys.stderr.write("airlock-accounts-api: restored the last known Codex usage\n")
+    if _xai_startup_sweep():
+        sys.stderr.write("airlock-accounts-api: removed a login capture from a previous "
+                         "process; that attempt is reported as interrupted\n")
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    sys.stderr.write("airlock-accounts-api: listening on 127.0.0.1:%d\n" % port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # 🔴 xAI ONLY. Codex's device login deliberately SURVIVES a redeploy
+        # (devterm's unit uses KillMode=process for exactly that), and xAI has the
+        # opposite contract because its re-login runs while the old credential is still
+        # valid — a poller that outlives this service would finish unobserved and replace
+        # a working credential. A generic "clean up children on exit" would silently take
+        # Codex's contract away. See docs/design/account-surface-restart-contract.md.
+        with _xai_lock:
+            _cancel_xai_login()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

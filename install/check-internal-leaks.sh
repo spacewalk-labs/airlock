@@ -20,6 +20,10 @@
 #                                                   what to run before committing)
 #   bash install/check-internal-leaks.sh --dir DIR  a plain exported tree, for the
 #                                                   publish-sync path
+#   bash install/check-internal-leaks.sh --subset DIR
+#                                                   one plain component tree. Uses the
+#                                                   same rules without requiring every
+#                                                   repository-wide allow entry to be live
 #   bash install/check-internal-leaks.sh --print-pattern
 #   bash install/check-internal-leaks.sh --print-allow
 #
@@ -161,19 +165,20 @@ case "${1:-}" in
   --print-pattern) printf '%s\n' "$PATTERN"; exit 0 ;;
   --print-allow)   printf '%s\n' "$ALLOW";   exit 0 ;;
   --dir) mode=dir; dir="${2:?--dir needs a path}" ;;
+  --subset) mode=subset; dir="${2:?--subset needs a path}" ;;
   "") ;;
-  *) echo "usage: $0 [--dir DIR | --print-pattern | --print-allow]" >&2; exit 2 ;;
+  *) echo "usage: $0 [--dir DIR | --subset DIR | --print-pattern | --print-allow]" >&2; exit 2 ;;
 esac
 
 scan() {   # emit matching "path:line:text" for the whole scanned tree
-  if [ "$mode" = dir ]; then
-    grep -rnEI --exclude-dir=.git "$PATTERN" "$dir" 2>/dev/null | drop_private | grep -vE "(^|/)($SELF:|$VENDOR)"
+  if [ "$mode" != tree ]; then
+    grep -rnEiI --exclude-dir=.git "$PATTERN" "$dir" 2>/dev/null | drop_private | grep -vE "(^|/)($SELF:|$VENDOR)"
   else
-    git -C "$ROOT" grep --untracked -nEI "$PATTERN" -- "${PUBLIC_SPEC[@]}" ":(exclude)$SELF" ":(exclude)$VENDOR*"
+    git -C "$ROOT" grep --untracked -nIiE "$PATTERN" -- "${PUBLIC_SPEC[@]}" ":(exclude)$SELF" ":(exclude)$VENDOR*"
   fi
 }
 contains() {   # is this exact string present anywhere in the scanned tree?
-  if [ "$mode" = dir ]; then
+  if [ "$mode" != tree ]; then
     grep -rqF --exclude-dir=.git -- "$1" "$dir" 2>/dev/null
   else
     git -C "$ROOT" grep --untracked -qF -- "$1" -- "${PUBLIC_SPEC[@]}" ":(exclude)$SELF"
@@ -182,7 +187,7 @@ contains() {   # is this exact string present anywhere in the scanned tree?
 
 # Strip the permitted tokens and re-match, rather than dropping whole lines:
 # a line is excused for the token it carries, not for anything sharing it.
-hits=$(scan | sed -E "s/($ALLOW)//g" | grep -E "$PATTERN" || true)
+hits=$(scan | sed -E "s/($ALLOW)//g" | grep -Ei "$PATTERN" || true)
 if [ -n "$hits" ]; then
   printf '%s\n' "$hits"
   echo "::error::Internal/site-specific string found — scrub before commit."
@@ -190,9 +195,11 @@ if [ -n "$hits" ]; then
 fi
 
 # An exception that outlives the string it excuses is a hole nobody is watching.
-for s in "${ALLOW_LIST[@]}"; do
-  contains "$s" \
-    || { echo "::error::stale allowlist entry: $s no longer appears — remove it"; exit 1; }
-done
+if [ "$mode" != subset ]; then
+  for s in "${ALLOW_LIST[@]}"; do
+    contains "$s" \
+      || { echo "::error::stale allowlist entry: $s no longer appears — remove it"; exit 1; }
+  done
+fi
 
 echo "clean: no internal identifiers found"

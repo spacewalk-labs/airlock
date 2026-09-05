@@ -18,8 +18,11 @@ import vm from 'node:vm';
 
 const src = fs.readFileSync(
   new URL('../apps/fileview/static/app.js', import.meta.url), 'utf8');
+// The end marker is searched FROM the start marker: app.js carries more than one
+// testable region now (install/test-fileview-scope.mjs extracts two of its own), and
+// a bare indexOf found the first end marker in the file rather than this region's.
 const start = src.indexOf('/* TESTABLE:tree');
-const end = src.indexOf('/* :TESTABLE */');
+const end = src.indexOf('/* :TESTABLE */', start);
 assert.ok(start >= 0 && end > start, 'tree markers missing from apps/fileview/static/app.js');
 
 // A DOM small enough to read in one sitting. Only what renderNode touches.

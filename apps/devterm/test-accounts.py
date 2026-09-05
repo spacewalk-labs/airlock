@@ -14,7 +14,7 @@ What it pins down, because these are the parts that fail quietly:
     graded crit instead of passing for a healthy login;
   - that no identity ever appears in the alert payload.
 """
-import asyncio, contextlib, copy, importlib.machinery, importlib.util, inspect, io, json, os, shutil, stat, subprocess, sys, tempfile, time, types, urllib.error
+import asyncio, contextlib, re, copy, importlib.machinery, importlib.util, inspect, io, json, os, shutil, stat, subprocess, sys, tempfile, time, types, urllib.error
 os.environ.setdefault("AIRLOCK_OWNER", "owner@example.com")
 spec = importlib.util.spec_from_file_location("gate", "apps/devterm/backend/devterm-gate.py")
 g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
@@ -257,13 +257,13 @@ async def _codex_relogin_handler_contract():
         g._send_json = send
         g._invalidate_codex_usage_cache = lambda: events.append("invalidate")
         g.asyncio.create_subprocess_exec = spawn
-        await g._serve_codex_login_start(None)
+        await g._serve_codex_login_start({}, None)
         start = (list(events), list(sent))
         events.clear(); sent.clear()
-        await g._serve_codex_login_cancel(None)
+        await g._serve_codex_login_cancel({}, None)
         cancel = (list(events), list(sent))
         events.clear(); sent.clear()
-        await g._serve_codex_logout(None)
+        await g._serve_codex_logout({}, None)
         return start, cancel, (list(events), list(sent))
     finally:
         (g._codex_auth_call, g._send_json, g._invalidate_codex_usage_cache,
@@ -299,8 +299,8 @@ async def _codex_platform_failure_contract():
         g._codex_auth_call = call
         g._send_json = send
         g._invalidate_codex_usage_cache = lambda: None
-        await g._serve_codex_login_start(None)
-        await g._serve_codex_logout(None)
+        await g._serve_codex_login_start({}, None)
+        await g._serve_codex_logout({}, None)
         return list(sent)
     finally:
         (g._codex_auth_call, g._send_json, g._invalidate_codex_usage_cache) = saved
@@ -352,9 +352,9 @@ async def _codex_relogin_end_to_end():
         g.PLATFORM_ACCOUNTS = os.path.abspath("bin/airlock-accounts")
         g._send_json = send
         g._invalidate_codex_usage_cache = lambda: None
-        await g._serve_codex_login_start(None)
+        await g._serve_codex_login_start({}, None)
         started = os.path.exists(auth)
-        await g._serve_codex_login_cancel(None)
+        await g._serve_codex_login_cancel({}, None)
         with open(auth, "rb") as f:
             recovered = f.read()
         return list(sent), started, recovered == marker
@@ -1656,7 +1656,7 @@ async def _claude_usage_route_case():
         g._run_probe_result = probe
         g._send_json = send_json
         await g._serve_accounts(None)
-        await g._serve_acct_usage_now(None)
+        await g._serve_acct_usage_now({}, None)
         await g._serve_accounts(None)
         fleet_usage.clear()
         fleet_usage.update({"err": "no data"})
@@ -1962,7 +1962,7 @@ async def _deep_corrupt_live_case():
                 json.load(f)
         except RecursionError:
             fixture_recurses = True
-        await g._serve_acct_usage_now(None)
+        await g._serve_acct_usage_now({}, None)
         return fixture_recurses, sent
     finally:
         g._run_probe_result = saved_probe
@@ -2008,8 +2008,8 @@ async def _claude_unwritable_case():
         g._send_json = send_json
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            await g._serve_acct_usage_now(None)
-            await g._serve_acct_usage_now(None)
+            await g._serve_acct_usage_now({}, None)
+            await g._serve_acct_usage_now({}, None)
         return sent, stderr.getvalue()
     finally:
         g.CLAUDE_USAGE_STATE_DIR = saved_dir
@@ -2381,6 +2381,203 @@ with _pool({"slot-a": _slot_creds()}) as pool_root:
 
 check("a re-login replaces _meta wholesale, so a marker cannot survive one",
       'creds["_meta"] = {"email": ident["email"]' in inspect.getsource(ac._store_account))
+
+
+
+# ---- /codex-status is the local Codex identity, and it is what the panel paints from ----
+# The panel used to wait for /claude-status (a network probe of every slot) before it could
+# draw the Codex row; the identity it needed was in auth.json all along.
+async def _codex_status_dispatch():
+    saved = g._run_probe
+    seen = []
+    async def fake_probe(cw, args=()):
+        seen.append(list(args))
+    g._run_probe = fake_probe
+    try:
+        await g._serve_codex_status(None)
+    finally:
+        g._run_probe = saved
+    return seen
+check("GET /codex-status asks the status CLI for --codex (local identity, no network)",
+      asyncio.run(_codex_status_dispatch()) == [["--codex"]])
+def _codex_status_exact_keys():
+    """Feed _codex_status a fixture auth.json (id_token = unsigned JWT with the claims it
+    reads) and pin the exact key set — a token or hash field slipping in must go red."""
+    import base64
+    tmp = tempfile.mkdtemp(prefix="codex-status-keys-")
+    def b64(d): return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+    idt = b64({"alg": "none"}) + "." + b64({"email": "k@example.test",
+             "https://api.openai.com/auth": {"chatgpt_plan_type": "pro", "chatgpt_account_id": "acct-k"}}) + ".sig"
+    auth = os.path.join(tmp, "auth.json")
+    with open(auth, "w") as f:
+        json.dump({"auth_mode": "chatgpt", "last_refresh": "2026-09-03T00:00:00Z",
+                   "tokens": {"id_token": idt, "access_token": "MUST-NOT-LEAK", "refresh_token": "MUST-NOT-LEAK"}}, f)
+    saved = cs.CODEX_AUTH
+    try:
+        cs.CODEX_AUTH = auth
+        return cs._codex_status()
+    finally:
+        cs.CODEX_AUTH = saved; shutil.rmtree(tmp, ignore_errors=True)
+_ck = _codex_status_exact_keys()
+check("--codex emits exactly the identity key set and never a token",
+      set(_ck) == {"state", "mode", "email", "plan", "accountId", "lastRefresh"}
+      and "MUST-NOT-LEAK" not in json.dumps(_ck) and _ck["email"] == "k@example.test")
+check("the status CLI has a --codex verb that emits only local identity fields",
+      "--codex" in inspect.getsource(cs.main)
+      and all(k in inspect.getsource(cs._codex_status) for k in ("email", "plan", "accountId"))
+      and "urlopen" not in inspect.getsource(cs._codex_status))
+
+
+# ---- a first registration installs LIVE, not just the pool ----
+# On a pristine box `login-code` used to write the pool record and `.active` and stop:
+# Claude Code reads ~/.claude/.credentials.json, which nothing had written, and the panel
+# then showed that slot as active ("Already using") so there was no way to switch to it.
+def _first_login_installs_live():
+    tmp = tempfile.mkdtemp(prefix="first-login-")
+    home = os.path.join(tmp, "home"); os.makedirs(home)
+    # Paths come from the platform CLI's own constants (relative to its HOME), never
+    # spelled here: install/check-credential-reads.sh forbids app code that names them.
+    pool = os.path.join(home, os.path.relpath(ac.POOL, ac.HOME))
+    live = os.path.join(home, os.path.relpath(ac.LIVE, ac.HOME))
+    saved = {k: getattr(ac, k) for k in ("HOME", "POOL", "ACTIVE", "LIVE", "PENDING", "_identity")}
+    saved_urlopen = ac.urllib.request.urlopen
+    try:
+        ac.HOME, ac.POOL, ac.LIVE = home, pool, live
+        ac.ACTIVE = os.path.join(pool, os.path.basename(saved["ACTIVE"]))
+        ac.PENDING = os.path.join(pool, os.path.basename(saved["PENDING"]))
+        ac._ensure_pool()
+        ac._save_atomic(ac.PENDING, {"verifier": "v", "state": "s", "ts": time.time()})
+        # The token exchange and the profile lookup are the only network calls; stub both.
+        class _Resp:
+            def __init__(self, payload): self._b = json.dumps(payload).encode()
+            def read(self): return self._b
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        far = 10 ** 10  # seconds — never "near expiry", so _switch_core does not refresh
+        ac.urllib.request.urlopen = lambda req, timeout=30: _Resp(
+            {"access_token": "at-first", "refresh_token": "rt-first", "expires_in": far,
+             "scope": "user:inference", "organization": {"organization_type": "claude_max"}})
+        ac._identity = lambda tok: {"email": "first@example.test", "org": "claude_max",
+                                    "kind": "personal", "name": "first@example.test (personal)"}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ac.cmd_login_code("code#s")
+        pool_rec = json.load(open(os.path.join(pool, "first@example.test (personal).json")))
+        live_rec = json.load(open(live)) if os.path.isfile(live) else None
+        active = open(ac.ACTIVE).read().strip() if os.path.isfile(ac.ACTIVE) else None
+        mode = stat.S_IMODE(os.stat(live).st_mode) if live_rec else None
+        return pool_rec, live_rec, active, mode, out.getvalue()
+    finally:
+        for k, v in saved.items(): setattr(ac, k, v)
+        ac.urllib.request.urlopen = saved_urlopen
+        shutil.rmtree(tmp, ignore_errors=True)
+_fl_pool, _fl_live, _fl_active, _fl_mode, _fl_out = _first_login_installs_live()
+
+
+def _first_login_with_old_live_same_identity():
+    """No `.active` but a live file for the SAME identity already exists (someone ran
+    `claude` and logged in outside airlock-accounts). The first registration must end
+    with the NEW tokens in both the pool and live — the switch's save-back must not
+    copy the old live over the record just stored (the adversarial pass reproduced
+    exactly that: pool and live both ended on OLD)."""
+    tmp = tempfile.mkdtemp(prefix="first-login-oldlive-")
+    home = os.path.join(tmp, "home"); os.makedirs(home)
+    pool = os.path.join(home, os.path.relpath(ac.POOL, ac.HOME))
+    live = os.path.join(home, os.path.relpath(ac.LIVE, ac.HOME))
+    saved = {k: getattr(ac, k) for k in ("HOME", "POOL", "ACTIVE", "LIVE", "PENDING", "_identity")}
+    saved_urlopen = ac.urllib.request.urlopen
+    try:
+        ac.HOME, ac.POOL, ac.LIVE = home, pool, live
+        ac.ACTIVE = os.path.join(pool, os.path.basename(saved["ACTIVE"]))
+        ac.PENDING = os.path.join(pool, os.path.basename(saved["PENDING"]))
+        ac._ensure_pool()
+        os.makedirs(os.path.dirname(live), exist_ok=True)
+        far = 10 ** 10
+        with open(live, "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "OLD", "refreshToken": "OLD-r",
+                                         "expiresAt": int((time.time() + far) * 1000)}}, f)
+        ac._save_atomic(ac.PENDING, {"verifier": "v", "state": "s", "ts": time.time()})
+        class _Resp:
+            def __init__(self, payload): self._b = json.dumps(payload).encode()
+            def read(self): return self._b
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        ac.urllib.request.urlopen = lambda req, timeout=30: _Resp(
+            {"access_token": "NEW", "refresh_token": "NEW-r", "expires_in": far,
+             "scope": "user:inference", "organization": {"organization_type": "claude_max"}})
+        ac._identity = lambda tok: {"email": "same@example.test", "org": "claude_max",
+                                    "kind": "personal", "name": "same@example.test (personal)"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            ac.cmd_login_code("code#s")
+        pool_tok = json.load(open(os.path.join(pool, "same@example.test (personal).json")))["claudeAiOauth"]["accessToken"]
+        live_tok = json.load(open(live))["claudeAiOauth"]["accessToken"]
+        return pool_tok, live_tok
+    finally:
+        for k, v in saved.items(): setattr(ac, k, v)
+        ac.urllib.request.urlopen = saved_urlopen
+        shutil.rmtree(tmp, ignore_errors=True)
+_ol_pool, _ol_live = _first_login_with_old_live_same_identity()
+check("first login over an older live of the same identity ends with the NEW tokens in pool and live",
+      (_ol_pool, _ol_live) == ("NEW", "NEW"))
+check("first login installs live credentials, on the same lineage as the pool record",
+      _fl_live is not None
+      and _fl_live["claudeAiOauth"]["accessToken"] == _fl_pool["claudeAiOauth"]["accessToken"] == "at-first"
+      and _fl_active == "first@example.test (personal)")
+check("first login's live file is private (0600) and the CLI says it installed live",
+      _fl_mode == 0o600 and "installed as live" in _fl_out)
+# ---- every account mutation refuses a cross-origin browser POST ----
+# The identity header is injected by the ingress, not the browser, so a request that
+# reaches this gate carries the owner's identity whichever page caused it. Until
+# 2026-09-04 only /acct-login-code was guarded: another origin could make the owner's
+# browser switch or delete an account, or start a login. Found while porting these
+# routes to the platform surface; the owner chose to close the exposure here rather than
+# wait for the routes to retire in the move's last step.
+#
+# 🔴 Asserted by READING THE DISPATCH, not by naming the handlers. A list of names in a
+# test is a list that stops matching the code — the whole defect was one route that
+# nobody had listed. This walks every POST route the gate actually dispatches and
+# requires the account ones to guard.
+_gate_src = inspect.getsource(g)
+_posts = re.findall(r'elif path == b"(/[a-z0-9-]+)" and method == b"POST":\s*\n\s*await (\w+)\(',
+                    _gate_src)
+check("the dispatch scan finds POST routes at all (positive control on the regex)",
+      len(_posts) >= 15)
+_unguarded = []
+for _route, _fn in _posts:
+    if not any(k in _route for k in ("acct", "codex", "xai", "claude")):
+        continue          # the terminal line is a separate surface and a separate card
+    _body = inspect.getsource(getattr(g, _fn))
+    if "_secret_origin_ok" not in _body and "_xai_write_request_ok" not in _body:
+        _unguarded.append(_route)
+check("every account mutation carries the same-origin guard"
+      + (f" (open: {', '.join(_unguarded)})" if _unguarded else ""),
+      not _unguarded)
+
+# 🔴 And now EVERY POST on this gate, not just the account line. The terminal routes were
+# the larger half of the same hole — /kill-session cross-origin ends the owner's session,
+# which is worse than anything on the account side, and unlike the account routes these
+# do not retire when the surface moves: the terminal stays devterm's. Scoping the check
+# to "the account line" was how eight of them stayed open while the account line was
+# being fixed, so the scope is now the whole dispatch.
+_all_unguarded = []
+for _route, _fn in _posts:
+    _body = inspect.getsource(getattr(g, _fn))
+    if "_secret_origin_ok" not in _body and "_xai_write_request_ok" not in _body:
+        _all_unguarded.append(_route)
+check("EVERY POST route on the gate carries the same-origin guard"
+      + (f" (open: {', '.join(_all_unguarded)})" if _all_unguarded else ""),
+      not _all_unguarded)
+
+# The control on the control: a guard that refuses everything is an outage, not a guard.
+_hdr = lambda **kw: {k.encode(): v for k, v in kw.items()}
+check("...and a SAME-origin POST still passes",
+      g._secret_origin_ok(_hdr(origin=b"https://box.example.invalid:8443",
+                               host=b"box.example.invalid:8443")))
+check("...and a request with no Origin at all passes (curl, a unit, the terminal)",
+      g._secret_origin_ok({}))
+check("...while another origin does not",
+      not g._secret_origin_ok(_hdr(origin=b"https://evil.example",
+                                   host=b"box.example.invalid:8443")))
 
 print(("\nFAILED: " + ", ".join(fails)) if fails else "\nall contract checks passed")
 sys.exit(1 if fails else 0)

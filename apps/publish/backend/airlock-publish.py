@@ -171,6 +171,31 @@ if PUBLIC_MODE == 'local':
         GATED_ENABLED = not GATED_DISABLED_REASON
 
 
+def gated_available():
+    """Can this box publish a gated document right now?
+
+    Local mode gates with this box's nginx, so the answer is about local storage
+    and htpasswd (computed at import). Remote mode does not own the gate at all —
+    the receiver does — so the answer is whatever the receiver says it supports.
+    The old code answered "local only" for both, which was a statement about who
+    wrote the code rather than about what the receiver can do."""
+    if PUBLIC_MODE == 'local':
+        return GATED_ENABLED
+    return bool(PUBLIC_ENABLED and remote_supports('1', 'gated'))
+
+
+def gated_unavailable_reason():
+    if PUBLIC_MODE == 'local':
+        return GATED_DISABLED_REASON or 'htpasswd unavailable'
+    if not PUBLIC_ENABLED:
+        return PUBLIC_DISABLED_REASON or 'external publishing is not configured'
+    c = remote_contract()
+    if not c:
+        return 'the receiver did not answer /health, so its contract is unknown'
+    return ('the receiver does not offer gated publishing '
+            f'(versions={c.get("versions")}, modes={c.get("modes")})')
+
+
 def list_items():
     """One level of the share dir (no recursion)."""
     items = []
@@ -368,6 +393,9 @@ _RE_JS = re.compile(r'<script\b([^>]*)\bsrc=["\']([^"\']+)["\']([^>]*)>\s*</scri
 _RE_IMG = re.compile(r'(<img\b[^>]*\bsrc=)["\']([^"\']+)["\']', re.I)
 _RE_TITLE = re.compile(r'<title>([^<]*)</title>', re.I)
 _RE_SCHEME = re.compile(r'^[a-z]+:', re.I)
+# Non-greedy so each comment ends at its own '-->'. Unterminated comments run to
+# end of document, which is also how browsers treat them.
+_RE_COMMENT = re.compile(r'<!--.*?(?:-->|\Z)', re.S)
 
 
 def _read_share_file(ref, base_dir):
@@ -394,31 +422,64 @@ def _guess_ctype(path):
             '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp'}.get(ext, 'image/png')
 
 
+def _sub_outside_comments(rx, repl, html):
+    """Apply rx.sub(repl, ...) to everything EXCEPT HTML comment regions.
+
+    An author who comments a reference out has said "do not publish this". A plain
+    regex pass over the whole document does not hear that: `<!-- <img
+    src="/secret.png"> -->` gets read off disk and written back as a base64 data
+    URI, so the bytes ship inside the public page while the page still looks like
+    it has nothing there. Comments are skipped verbatim instead."""
+    out, pos = [], 0
+    for m in _RE_COMMENT.finditer(html):
+        out.append(rx.sub(repl, html[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(rx.sub(repl, html[pos:]))
+    return ''.join(out)
+
+
 def bundle_single_file(name):
     """Inline a published HTML page's local css/js/img into ONE self-contained
     file (read from disk — gate-safe, no HTTP self-fetch). External refs stay.
-    Returns (title, html_bytes)."""
+    Returns (title, html_bytes, warnings).
+
+    `warnings` names every LOCAL asset that could not be inlined. Those used to be
+    dropped: the tag was left pointing at a path that exists only on this box, so
+    the published page came out referencing an asset the public host has never
+    heard of and rendered unstyled — with nothing logged, nothing returned, and no
+    way for the operator to tell a plain page from a broken one. Refs that are
+    external on purpose (http(s), protocol-relative) are not warnings."""
     path = safe_resolve(name)
     if not path or not os.path.isfile(path):
         raise FileNotFoundError(name)
     base_dir = os.path.dirname(path)
     with open(path, 'r', encoding='utf-8', errors='replace') as fh:
         html = fh.read()
+    warnings = []
+
+    def _note(kind, ref, err):
+        # 'external' is the intended case, not a failure: those refs are meant to
+        # stay as links. Everything else means the reader could not produce bytes.
+        if err and err != 'external':
+            warnings.append(f'{kind} not inlined ({err}): {ref}')
 
     def _css(m):
         hm = _RE_HREF.search(m.group(0))
         if not hm:
             return m.group(0)
-        data, _err = _read_share_file(hm.group(1), base_dir)
+        data, err = _read_share_file(hm.group(1), base_dir)
         if data is None:
+            _note('stylesheet', hm.group(1), err)
             return m.group(0)
         css = data.decode('utf-8', 'replace').replace('</style', '<\\/style')
         return '<style>\n' + css + '\n</style>'
 
     def _js(m):
         pre, ref, post = m.group(1), m.group(2), m.group(3)
-        data, _err = _read_share_file(ref, base_dir)
+        data, err = _read_share_file(ref, base_dir)
         if data is None:
+            _note('script', ref, err)
             return m.group(0)
         typ = ' type="module"' if 'module' in (pre + post) else ''
         js = data.decode('utf-8', 'replace').replace('</script', '<\\/script')
@@ -426,17 +487,18 @@ def bundle_single_file(name):
 
     def _img(m):
         pre, ref = m.group(1), m.group(2)
-        data, _err = _read_share_file(ref, base_dir)
+        data, err = _read_share_file(ref, base_dir)
         if data is None:
+            _note('image', ref, err)
             return m.group(0)
         b = os.path.join(base_dir, ref) if not ref.startswith('/') else os.path.join(ROOT, ref.lstrip('/'))
         return pre + '"data:' + _guess_ctype(b) + ';base64,' + base64.b64encode(data).decode('ascii') + '"'
 
-    html = _RE_CSS.sub(_css, html)
-    html = _RE_JS.sub(_js, html)
-    html = _RE_IMG.sub(_img, html)
+    html = _sub_outside_comments(_RE_CSS, _css, html)
+    html = _sub_outside_comments(_RE_JS, _js, html)
+    html = _sub_outside_comments(_RE_IMG, _img, html)
     tm = _RE_TITLE.search(html)
-    return (tm.group(1).strip() if tm else name), html.encode('utf-8')
+    return (tm.group(1).strip() if tm else name), html.encode('utf-8'), warnings
 
 
 class BundleValidationError(RuntimeError):
@@ -633,9 +695,15 @@ def _consume_bundle_plan(plan_id, owner, entry, docs):
 
 def plan_bundle(entry, max_docs=MAX_BUNDLE_DOCS, owner=''):
     """Read-only BFS proposal of locally linked HTML documents."""
-    # Bundle planning is a local filesystem operation; remote ingest has no such contract.
-    if PUBLIC_MODE != 'local':
-        return False, 'bundle planning is available only in local mode'
+    # A read-only walk of this box's share dir. It proposes members; it publishes
+    # nothing. That is true in either mode — the old refusal read "remote ingest has
+    # no such contract", but the contract it needed is the receiver's v1 files map,
+    # and planning does not touch the receiver at all.
+    if PUBLIC_MODE != 'local' and not remote_supports('1'):
+        c = remote_contract()
+        return False, ('bundle planning needs a receiver that speaks contract v1: '
+                       + (gated_unavailable_reason() if not (PUBLIC_ENABLED and c)
+                          else f'receiver offers versions={c.get("versions") or []}'))
     try:
         max_docs = int(max_docs or MAX_BUNDLE_DOCS)
     except (TypeError, ValueError):
@@ -701,7 +769,8 @@ def build_bundle_files(entry, docs, include_integrity=False):
     entry_title = entry
     for name in names:
         # Hash the exact artifact that is about to be written; a second read only creates a race.
-        title, html_bytes = bundle_single_file(name)
+        title, html_bytes, asset_warnings = bundle_single_file(name)
+        warnings.extend(f'{name}: {w}' for w in asset_warnings)
         digest = hashlib.sha256(html_bytes).hexdigest()
         html, dangling, unsupported = _rewrite_bundle_anchors(
             html_bytes.decode('utf-8', 'replace'), name, link_map)
@@ -732,6 +801,67 @@ def _slugify(title, name):
     tbase = s(title)
     base = fbase if len(fbase) >= 4 else (tbase if len(tbase) >= 4 else (fbase or tbase or 'doc'))
     return f'{base}-{secrets.token_hex(3)}'
+
+
+# The receiver decides which contract it speaks; we ask it rather than assume.
+# Cached for the process: this is a capability, not a reading, and a publish that
+# re-asked on every call would turn one outage into two.
+_REMOTE_CONTRACT = None
+
+
+def remote_contract():
+    """{'versions': [...], 'modes': [...]} from the receiver, or {} if unknown.
+
+    Fail-safe, not fail-closed: an unreachable receiver yields {} and the caller
+    falls back to v0/open, which is what every deployed publisher did before v1
+    existed. Refusing to publish because a health probe failed would take away a
+    capability the box already had."""
+    global _REMOTE_CONTRACT
+    if _REMOTE_CONTRACT is None:
+        try:
+            h = _ingest('GET', '/health', timeout=5)
+            c = (h or {}).get('public_contract') or {}
+            _REMOTE_CONTRACT = {'versions': [str(v) for v in (c.get('supported_versions') or [])],
+                                'modes': list(c.get('modes') or [])}
+        except Exception:
+            _REMOTE_CONTRACT = {}
+    return _REMOTE_CONTRACT
+
+
+def remote_supports(version='1', mode=None):
+    c = remote_contract()
+    if version not in (c.get('versions') or []):
+        return False
+    return mode is None or mode in (c.get('modes') or [])
+
+
+def owner_shape_problem(owner):
+    """Why this owner is not publishable, or ''.
+
+    The receiver enforces its own identity rule and is the authority; this only
+    catches the shape that made documents unrecoverable before — a bare username,
+    which lands in the public console with no identity to look it up by. Checked
+    here so the payload never leaves rather than being explained after a round
+    trip, and kept to the shape so a differently-configured receiver is not
+    second-guessed on its own domain rule."""
+    o = (owner or '').strip()
+    if not o:
+        return 'owner is required'
+    if '@' not in o or o.startswith('@') or o.endswith('@') or ' ' in o:
+        return (f'owner must be a full identity (name@domain), not {o!r} — '
+                'bare usernames cannot be looked up or revoked in the publish console')
+    return ''
+
+
+def _ingest_error(res):
+    """Render the receiver's error. v1 answers with {'code','message'}; v0 with a
+    string. Formatting the dict with str() would print a Python literal at the
+    operator, so the two shapes are told apart here rather than at each call site."""
+    err = (res or {}).get('error', 'ingest error')
+    if isinstance(err, dict):
+        code, msg = err.get('code', ''), err.get('message', '')
+        return f'{msg} [{code}]' if code and msg else (msg or code or 'ingest error')
+    return err if isinstance(err, str) else 'ingest error'
 
 
 def _ingest(method, ep, body=None, timeout=20):
@@ -1081,8 +1211,8 @@ def _local_ingest(slug, owner, src, title, ttl_hours, files, mode='open', passwo
         return {'ok': False, 'error': f'snapshot too large (>{LOCAL_MAX_BYTES // (1024 * 1024)}MB)'}
     if mode not in ('open', 'gated'):
         return {'ok': False, 'error': 'mode must be open or gated'}
-    if mode == 'gated' and not GATED_ENABLED:
-        return {'ok': False, 'error': 'gated publish unavailable: ' + (GATED_DISABLED_REASON or 'htpasswd unavailable')}
+    if mode == 'gated' and not gated_available():
+        return {'ok': False, 'error': 'gated publish unavailable: ' + gated_unavailable_reason()}
     ttl = _ttl_hours(ttl_hours)
     now = int(time.time())
 
@@ -1367,12 +1497,18 @@ def publish_public(name, ttl_hours, owner, mode='open', password='', docs=None, 
         return False, 'identity header missing — refusing to publish without an owner'
     if mode not in ('open', 'gated'):
         return False, 'mode must be open or gated'
-    if PUBLIC_MODE != 'local' and docs is not None:
-        # Remote ingest accepts one html_b64 snapshot, not the local bundle files map.
-        return False, 'bundle publishing is available only in local mode'
-    if PUBLIC_MODE != 'local' and mode == 'gated':
-        # Never turn an explicit password request into an unauthenticated open URL.
-        return False, 'gated publishing is available only in local mode'
+    # Both of these used to be flat "local only". That was true of the v0 receiver
+    # this app first shipped against, and stopped being true when the receiver grew
+    # contract v1 — but the refusals stayed, so a box with a v1 receiver was told the
+    # feature did not exist. Ask the receiver instead; the safety property (never turn
+    # an explicit password request into an unauthenticated open URL) is unchanged and
+    # is now enforced by refusing rather than by downgrading.
+    if PUBLIC_MODE != 'local' and docs is not None and not remote_supports('1'):
+        return False, ('bundle publishing needs contract v1 from the receiver; '
+                       + gated_unavailable_reason())
+    if PUBLIC_MODE != 'local' and mode == 'gated' and not remote_supports('1', 'gated'):
+        return False, ('gated publishing needs contract v1 from the receiver; '
+                       + gated_unavailable_reason())
     # Validate the credential before reading or writing any source/public data.
     if mode == 'gated' and (not isinstance(password, str) or not password):
         return False, 'gated publish requires a password'
@@ -1408,7 +1544,11 @@ def publish_public(name, ttl_hours, owner, mode='open', password='', docs=None, 
         html_bytes = None
     else:
         try:
-            title, html_bytes = bundle_single_file(name)
+            title, html_bytes, asset_warnings = bundle_single_file(name)
+            # Same channel the bundle path already uses: the caller shows these,
+            # so a page that shipped without its stylesheet says so at publish time
+            # instead of being discovered later in a browser.
+            warnings = asset_warnings
             files = {'index.html': html_bytes}
         except Exception as e:
             return False, f'bundle failed: {e}'
@@ -1418,10 +1558,21 @@ def publish_public(name, ttl_hours, owner, mode='open', password='', docs=None, 
         existing = public_list(owner)
         if existing.get('ok'):
             items = existing.get('items', [])
-            reused = next((it['slug'] for it in items
-                           if it.get('src') == name and not it.get('expired')), None)
-            if not reused:
-                reused = next((it['slug'] for it in items if it.get('src') == name), None)
+            live = next((it for it in items
+                         if it.get('src') == name and not it.get('expired')), None)
+            reused = live['slug'] if live else next(
+                (it['slug'] for it in items if it.get('src') == name), None)
+            # Reusing the slug keeps the URL, and that is the problem: a URL already
+            # handed out as open would start asking for a password, or a gated one
+            # would quietly stop asking. Whoever holds the link is not told either
+            # way. Changing what a live link means is a revoke-and-republish, so the
+            # new URL is the signal that the old one is gone.
+            if live and live.get('mode', 'open') != mode:
+                return False, (
+                    f'{name} is already published as {live.get("mode", "open")} at '
+                    f'{BASE_URL}/{live["slug"]}/ — revoke it first, then publish as '
+                    f'{mode}. Switching in place would change what an already-shared '
+                    'link does without telling anyone holding it.')
             if reused:
                 slug = reused
     if PUBLIC_MODE == 'local':
@@ -1430,15 +1581,36 @@ def publish_public(name, ttl_hours, owner, mode='open', password='', docs=None, 
         except Exception as e:
             return False, f'local ingest failed: {e}'
     else:
+        use_v1 = remote_supports('1')
+        # 'unknown' used to be substituted for a missing owner. Under v1 that is a
+        # rejected identity, and under v0 it published a document nobody could look
+        # up or revoke. Refuse before the payload leaves.
+        problem = owner_shape_problem(owner)
+        if problem and (use_v1 or mode == 'gated'):
+            return False, problem
+        if mode == 'gated' and not use_v1:
+            return False, ('gated publishing needs contract v1 from the receiver; '
+                           + gated_unavailable_reason())
         try:
             payload = {
                 'slug': slug, 'owner': owner or 'unknown', 'src': name, 'title': title,
                 'ttl_hours': ttl_hours,
             }
-            if docs:
+            if use_v1:
+                payload['contract_version'] = '1'
+                # v1 carries every document in one files map, entry named index.html.
+                payload['files'] = {member: base64.b64encode(data).decode('ascii')
+                                    for member, data in files.items()}
+            elif docs:
                 payload['files'] = {member: base64.b64encode(data).decode('ascii') for member, data in files.items()}
             else:
                 payload['html_b64'] = base64.b64encode(html_bytes).decode('ascii')
+            # Only v1 carries an explicit mode. A v0 receiver has been getting
+            # payloads without one since before v1 existed, and adding a key to that
+            # wire format to make the code tidier is not a change worth risking on
+            # receivers we do not control.
+            if use_v1:
+                payload['mode'] = mode
             if mode == 'gated':
                 payload.update({'mode': 'gated', 'gate': {'type': 'password', 'password': password}})
             res = _ingest('POST', '/ingest', payload)
@@ -1447,7 +1619,7 @@ def publish_public(name, ttl_hours, owner, mode='open', password='', docs=None, 
     if not isinstance(res, dict):
         return False, 'ingest returned an invalid response'
     if not res.get('ok'):
-        return False, res.get('error', 'ingest error')
+        return False, _ingest_error(res)
     r = res.get('result', {})
     if not isinstance(r, dict) or 'expiry' not in r:
         return False, 'ingest returned an invalid result'
@@ -1705,8 +1877,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200 if ok else 400, {'ok': ok, 'result': res} if ok else {'ok': ok, 'error': res})
             return
         if path in ('/api/publish-plan', '/publish-plan'):
-            if PUBLIC_MODE != 'local':
-                self._json(400, {'ok': False, 'error': 'bundle planning is available only in local mode'})
+            if PUBLIC_MODE != 'local' and not remote_supports('1'):
+                self._json(400, {'ok': False, 'error':
+                                 'bundle planning needs contract v1 from the receiver; '
+                                 + gated_unavailable_reason()})
                 return
             owner = self._owner()
             if PUBLIC_MODE == 'local' and not owner:

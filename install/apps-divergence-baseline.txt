@@ -339,3 +339,18 @@ only-work	apps/dev-monitor/backend/devmon_harness.py
 #    airlock-learning.py, install.sh, render.sh).
 only-work	apps/learning/backend/git_sync.py
 content	apps/learning/backend/ingest_runner.py
+# 18) 2026-09-04 fileview home scope (FILEVIEW_HOME): filebrowser stopped serving `/`
+#    and now serves the running account's home (`--root %h`), which touched the unit
+#    renderer, the manifest's scope comment, the live smoke (its round-trip moved
+#    under $HOME and it gained an above-home leak check) and the viewer's client-side
+#    path translation. devterm gained one offline suite for the same boundary — the
+#    terminal's file-open has to refuse an out-of-home path as `outside_home`.
+#    Same shape as batches 1, 13, 14, 16 and 17: work is the live consumer of apps/
+#    and the published copy is behind until the next publish sync, not a designed
+#    split. apps/fileview/install.sh and static/viewer.html are the designed split
+#    already tracked in batch 5, and the change edits both; they keep their kind.
+only-work	apps/devterm/test-fileview-scope.py
+content	apps/fileview/airlock-app.toml
+content	apps/fileview/render.sh
+content	apps/fileview/smoke.sh
+content	apps/fileview/static/app.js

@@ -62,6 +62,12 @@ cat >"$SHIM/systemctl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$AIRLOCK_TEST_TMP/systemctl.log"
 case "$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left airlock-update-detect.timer airlock-update-detect.service' ;; esac
+# The platform account surface is a SERVICE, so its installer asks systemd whether it is
+# running rather than whether a timer is scheduled ("installed" and "active" are
+# different claims and only one serves a request). Answer it, for the same reason
+# list-timers above is answered: an unanswered verb reads as a dead unit and the
+# installer dies.
+case "$*" in *is-active*) printf '%s\n' active ;; esac
 exit 0
 STUB
 cat >"$SHIM/tailscale" <<'STUB'
@@ -1695,6 +1701,10 @@ expect_ok "G57i moving the semantic target peer turns the fixture green" \
 # Nested table leaves are still config-owned listeners. Without this control a
 # package can move the exact same `port` spelling one level down and escape both
 # the read gate and the global pool.
+# The free port is deliberately OUTSIDE the platform's 199xx band. It used to be 19904,
+# which sat in the middle of it: the moment the platform allocated that number this
+# fixture's "collides with nothing" premise silently became false, and G57j/G57l flipped
+# for a reason that had nothing to do with what they test.
 reset_box
 pkg="$PKGROOT/g57-nested-port"; mkpkg "$pkg" g57nested
 pkg_manifest "$pkg" 'contract = 1' 'id = "g57nested"' \
@@ -1702,7 +1712,7 @@ pkg_manifest "$pkg" 'contract = 1' 'id = "g57nested"' \
 cfg="$CFGROOT/g57-nested-port.toml"
 {
   base_config
-  printf '[apps.g57nested]\n[apps.g57nested.listener]\nport = 19904\n'
+  printf '[apps.g57nested]\n[apps.g57nested.listener]\nport = 29904\n'
   printf '[packages.g57nested]\npath = "%s"\n' "$pkg"
 } >"$cfg"
 expect_fail "G57j an unread nested port declaration is fatal" \
@@ -1713,10 +1723,10 @@ port="$(airlock_config get apps.g57nested.listener.port)"
 test "$port" -gt 0
 EOF
 chmod +x "$pkg/install.sh"
-sed -i 's/port = 19904/port = 19902/' "$cfg"
+sed -i 's/port = 29904/port = 19902/' "$cfg"
 expect_fail "G57k a nested port collides with a top-level port" \
   "port 19902 is used twice" run "$cfg" validate
-sed -i 's/port = 19902/port = 19904/' "$cfg"
+sed -i 's/port = 19902/port = 29904/' "$cfg"
 expect_ok "G57l moving the nested port turns the fixture green" \
   run "$cfg" validate
 

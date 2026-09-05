@@ -1,0 +1,37 @@
+{
+  "schema": "airlock.student-harness-provenance/v1",
+  "harness": {
+    "ask_rules": 14,
+    "deny_rules": 4,
+    "files": 64,
+    "hooks": 3,
+    "projection_sha256": "b70cd2c6c0d99fd576c274fe9bba902e72c4c6381a2fbfb9c753ff4878610ff1",
+    "skills": 29,
+    "executable_paths": [
+      "hooks/secret-guard.sh",
+      "hooks/session-close-reminder.sh",
+      "hooks/session-start-restore.sh",
+      "skills/cad-read/scripts/cadread.py",
+      "skills/crawling-scraping/scripts/yt-transcript.py",
+      "skills/excel-io/scripts/xlsx.py",
+      "skills/session-close/scripts/retire-worktree.sh",
+      "skills/share-docs/scripts/css-collision-lint.py",
+      "skills/share-docs/scripts/doc-contract-lint.py",
+      "skills/worktree/scripts/create-worktree.sh"
+    ],
+    "source_archive_bytes": 332773,
+    "source_archive_sha256": "a83d6e8c67fa13c0762a60c1c503f19781219ee2f273d5099cd293a7dafbbb34",
+    "source_revision": "8e91faac6928ab0d4e9acd8f52d3452428c1644a"
+  },
+  "starter": {
+    "files": 32,
+    "projection_sha256": "3bb28e3fe88581d32bd0f7bbc93ea5f36ebb2aceea41b048b93112b2e74b776f",
+    "executable_paths": [
+      ".claude/hooks/secret-scan.sh",
+      ".claude/hooks/typecheck.sh",
+      ".claude/hooks/verify-turn.sh",
+      "setup.sh"
+    ],
+    "source_revision": "b9df44b1a9131a005fe782419461c0f72445a069"
+  }
+}

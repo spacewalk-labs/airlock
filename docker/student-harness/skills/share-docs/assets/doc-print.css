@@ -1,0 +1,169 @@
+/* doc-print.css — 종이(A4·PDF 저장)용 조판. 선택 사항.
+ *
+ * 쓰는 법: doc.css **다음에** 인쇄 전용으로 겁니다.
+ *   <link rel="stylesheet" href="doc.css">
+ *   <link rel="stylesheet" href="doc-print.css" media="print">
+ * 그리고 브라우저에서 인쇄(Ctrl+P) → "PDF 로 저장".
+ *
+ * 🔴 이 파일은 색·글꼴 값을 **직접 적지 않습니다.** var(--doc-*) 만 씁니다 — 실제 값은
+ *    doc.css 의 :root 가 줍니다. 그래야 팔레트를 바꿀 때 종이도 같이 따라옵니다.
+ *    여기에 #1d1d1f 같은 값을 복사해 두면 화면만 바뀌고 종이는 옛 색으로 남습니다.
+ */
+
+@page {
+  size: A4;
+  margin: 17mm 15mm 16mm;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: var(--doc-font-sans, 'NanumGothic', 'WenQuanYi Zen Hei', sans-serif);
+  font-size: 10.5pt;
+  line-height: 1.62;
+  color: var(--doc-text);
+  background: #fff;
+  margin: 0;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+/* ---------- 표지·메타 ---------- */
+.pdf-meta {
+  color: var(--doc-muted);
+  font-size: 9pt;
+  margin: 2pt 0 14pt;
+  padding-bottom: 8pt;
+  border-bottom: 1px solid var(--doc-border);
+}
+.pdf-lead { font-size: 11.5pt; color: var(--doc-text); margin: 0 0 12pt; }
+
+/* ---------- 제목 ---------- */
+h1 { font-size: 21pt; letter-spacing: -0.02em; margin: 0 0 6pt; line-height: 1.25; }
+h2 {
+  font-size: 15pt; letter-spacing: -0.015em;
+  border-top: 1px solid var(--doc-border);
+  padding-top: 11pt; margin: 22pt 0 8pt;
+  page-break-after: avoid; break-after: avoid;
+}
+h3 { font-size: 12.5pt; margin: 15pt 0 5pt; page-break-after: avoid; break-after: avoid; }
+h4 { font-size: 11pt; margin: 11pt 0 3pt; color: var(--doc-muted); page-break-after: avoid; break-after: avoid; }
+h1, h2, h3, h4 { -webkit-column-break-after: avoid; }
+
+/* ---------- 본문 ---------- */
+p { margin: 5pt 0; orphans: 2; widows: 2; }
+strong { font-weight: 700; }
+a { color: var(--doc-accent); text-decoration: none; }
+/* 링크는 색만 남기고 그대로 둡니다 — 종이에서도 주소를 아는 편이 낫고,
+   PDF 로 저장하면 클릭도 살아 있습니다. */
+
+ul, ol { margin: 5pt 0 5pt 18pt; padding: 0; }
+li { margin: 2.5pt 0; }
+
+hr { border: none; border-top: 1px solid var(--doc-border); margin: 14pt 0; }
+
+code {
+  font-family: var(--doc-font-mono, 'WenQuanYi Zen Hei Mono', monospace);
+  background: var(--doc-surface-soft);
+  padding: 1pt 3pt; border-radius: 3px; font-size: 9pt;
+}
+pre {
+  background: var(--doc-surface-soft);
+  border: 1px solid var(--doc-border-muted);
+  border-radius: 5px;
+  padding: 7pt 9pt; margin: 8pt 0;
+  font-size: 8.6pt; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;   /* 종이에는 가로 스크롤이 없습니다 */
+  page-break-inside: avoid; break-inside: avoid;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+
+/* ---------- 표 ---------- */
+table {
+  border-collapse: collapse; width: 100%;
+  margin: 9pt 0; font-size: 9.3pt;
+  page-break-inside: avoid; break-inside: avoid;
+}
+/* 한 쪽을 넘는 큰 표는 통째 회피가 오히려 빈 페이지를 만듭니다 — 행 단위로 끊습니다. */
+table.pdf-long { page-break-inside: auto; break-inside: auto; }
+table.pdf-long tr { page-break-inside: avoid; break-inside: avoid; }
+table.pdf-long thead { display: table-header-group; }   /* 쪽마다 머리행 반복 */
+th, td { border: 1px solid var(--doc-border); padding: 4.5pt 7pt; text-align: left; vertical-align: top; }
+th { background: var(--doc-surface-soft); font-weight: 600; }
+
+/* ---------- 인용·콜아웃 ---------- */
+blockquote {
+  margin: 9pt 0; padding: 7pt 12pt;
+  background: var(--doc-surface-soft);
+  border-left: 3px solid var(--doc-accent);
+  border-radius: 0 6px 6px 0;
+  page-break-inside: avoid; break-inside: avoid;
+}
+blockquote p { margin: 0; }
+
+.note, .why, .case, .ok, .caution, .warn {
+  margin: 9pt 0; padding: 7pt 10pt;
+  border-left: 3px solid var(--doc-accent);
+  background: var(--doc-surface-soft);
+  border-radius: 0 6px 6px 0;
+  page-break-inside: avoid; break-inside: avoid;
+}
+.ok      { border-left-color: var(--doc-success); }
+.caution { border-left-color: var(--doc-warning); }
+.warn    { border-left-color: var(--doc-danger); }
+.note .label, .why .label, .case .label,
+.ok .label, .caution .label, .warn .label {
+  font-weight: 700; font-size: 8.6pt; margin-right: 5pt;
+  color: var(--doc-muted); text-transform: none;
+}
+
+/* ---------- 그림 ---------- */
+figure, .fig { margin: 9pt 0 10pt; page-break-inside: avoid; break-inside: avoid; }
+figure img, .fig img, img {
+  max-width: 82%; height: auto; display: block; margin: 0 auto 2pt;
+  border: 1px solid var(--doc-border-muted); border-radius: 4px;
+}
+figcaption, p.cap {
+  text-align: center; font-size: 8.7pt; color: var(--doc-muted);
+  margin: 0 0 4pt;
+}
+/* 인라인 SVG(Mermaid 사전 렌더 포함) */
+svg { max-width: 100%; height: auto; display: block; margin: 8pt auto; }
+
+/* ---------- 수치·비교 ---------- */
+.stat-band {
+  display: flex; flex-wrap: wrap; gap: 8pt;
+  margin: 9pt 0; page-break-inside: avoid; break-inside: avoid;
+}
+.stat-band .stat {
+  flex: 1 1 22%; border: 1px solid var(--doc-border);
+  border-radius: 5px; padding: 6pt 8pt; text-align: center;
+}
+.stat-band .stat b { display: block; font-size: 14pt; color: var(--doc-accent); }
+.stat-band .stat span { font-size: 8.4pt; color: var(--doc-muted); }
+
+.before-after {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8pt;
+  margin: 9pt 0; page-break-inside: avoid; break-inside: avoid;
+}
+.before-after > * {
+  border: 1px solid var(--doc-border); border-radius: 5px; padding: 7pt 9pt;
+}
+.before-after h4 { margin: 0 0 4pt; }
+.before-after p { margin: 0; }
+
+/* ---------- 문서 구분 (합본) ---------- */
+.pdf-break { page-break-before: always; break-before: page; }
+.pdf-break:first-of-type { page-break-before: avoid; break-before: avoid; }
+
+/* ---------- 변환 손실 고지 ----------
+   화면 전용 요소를 뺐다는 사실을 종이에도 남깁니다. 빠진 것을 모른 채 첨부하는 일이
+   가장 흔한 사고입니다. */
+.pdf-omitted {
+  margin: 12pt 0 0; padding: 6pt 9pt;
+  border: 1px dashed var(--doc-border-strong);
+  border-radius: 5px;
+  font-size: 8.4pt; color: var(--doc-muted);
+  page-break-inside: avoid; break-inside: avoid;
+}
+.pdf-omitted b { color: var(--doc-text); }

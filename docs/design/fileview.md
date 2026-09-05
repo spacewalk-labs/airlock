@@ -15,10 +15,26 @@ the same API.
 
 ## The five decisions worth keeping
 
-### 1. The scope is the unix account, and there is no setting for it
+### 1. The scope is the account's home, and there is no setting for it
 
-filebrowser runs `--root /`. There is no `code_root`, no `browse_root`, no start
-path, and no bookmarks — the only key the app has is its port.
+filebrowser runs `--root %h`: the tree is the home directory of the account the user
+service runs as, and nothing above it is served. There is no `code_root`, no
+`browse_root`, no start path, and no bookmarks — the only key the app has is its
+port.
+
+**This is a change (2026-09-04), and the reasoning it replaced is kept below rather
+than deleted.** The app shipped with `--root /` on purpose: serving everything meant
+the app had no boundary of its own to get wrong, and what bounded it was the unix
+account alone — one line, drawn by the kernel, impossible to misconfigure. That
+analysis was right and is still in force; the account is still the outer boundary.
+What changed is the requirement. Landing on `/` read as chaos to the person using it
+("루트부터 보여 정신없다"), and the operator chose a hard scope over a starting
+position: home, with above-home not visible at all. So there are two boundaries now,
+an outer one the kernel draws and an inner one the server enforces, and the inner one
+is measured rather than asserted — `install/test-fileview-home-scope.sh` runs the
+pinned binary and checks that `..` chains, encoded `..`, absolute paths and symlinks
+leaving the tree return no content, next to a positive control that reads a file
+inside home in the same server.
 
 This is the correction of a specific mistake. `[paths].code_root` was never a
 designed setting: **markserv took a directory argument and filebrowser takes
@@ -29,14 +45,21 @@ key's reason to exist, and it went to `RETIRED_KEYS` in `bin/airlock-config` (be
 `paths.mount_exclude`, which had the same shape: a key that named a protection
 nobody implemented).
 
-What bounds the app now is the unix account its user service runs as — and that is
-the whole boundary, on purpose. **fileview is the viewer of the account it runs as.**
-The unit names no `User=`; it runs as whoever installed it, so the kernel draws the
-line and the app has no way to express it, argue with it, or offer it as a choice.
-Measured on the box it was built on: `~/.ssh/id_ed25519` and
-`~/.claude/.credentials.json` are readable **and writable**, `/etc/passwd` is
-readable, `/etc/shadow` and `/var/log/syslog` are not. Adding a collaborator while
-fileview is enabled hands them that account.
+Narrowing the root to home does **not** bring the key back, and that is the part to
+hold on to: `%h` is systemd's own specifier for the running account's home, so the
+root is still a fact about the account rather than a value somebody types. A key
+pointing at home would be the same mistake in a nicer place.
+
+What bounds the app is the unix account its user service runs as, and then the home
+of that same account. **fileview is the viewer of the account it runs as.** The unit
+names no `User=`; it runs as whoever installed it, so the kernel draws the outer line
+and the app has no way to express it, argue with it, or offer it as a choice — and
+`%h` follows that account, which is why a `User=` line would now move the scope as
+well as the permissions. Inside home the reach is unchanged and still total:
+`~/.ssh/id_ed25519` and `~/.claude/.credentials.json` are readable **and writable**.
+Outside it there is nothing: `/etc/passwd`, readable to the account, is not
+addressable through this app. Adding a collaborator while fileview is enabled still
+hands them that account's home, which is where the credentials are.
 
 Running it as a dedicated system account was considered and rejected: almost
 everything the owner actually wants to look at is `0600`/`0700`, so the app would
@@ -44,7 +67,12 @@ stop being a viewer of their work and become a viewer of what they had remembere
 share with it.
 
 Both halves of that are pinned by `install/test-fileview-root.sh` (in CI), which
-fails if a variable is threaded back into `--root` or if the unit grows a `User=`.
+fails if a variable is threaded back into `--root`, if the root reverts to `/`, or if
+the unit grows a `User=`. What the scope does at runtime is a different question and
+has its own suites: `install/test-fileview-home-scope.sh` (the server, real binary),
+`install/test-fileview-scope.mjs` (the client translation and its refusals) and
+`apps/devterm/test-fileview-scope.py` (the terminal's file-open, which must refuse an
+out-of-home path as `outside_home` rather than "not found").
 
 ### 2. Nothing is hidden — and that is enforced in two places
 
@@ -164,18 +192,24 @@ publishes `aria-valuenow`, and every tappable control — toolbar buttons, tree 
 the splitter — grows to at least 44px on the touch layout. Changing the icons without this would
 have been a repaint of a mouse-only app.
 
-### 4. It opens where you work, and the root is still above it
+### 4. It opens where you work, because that is now all there is
 
-The tree is rooted at `/` and always will be — that is decision 1 and a CI gate
-holds it. But a filesystem root is a correct place to *start* and a useless one:
-`/bin`, `/boot`, `/dev`, and the directory you actually keep things in is four rows
-down and closed. So the tree opens with the running account's home already
-expanded and scrolled to, with `/` and every sibling exactly where they were.
+This decision used to be about landing: the tree was rooted at `/`, which is a
+correct place to *start* and a useless one — `/bin`, `/boot`, `/dev`, and the
+directory you actually keep things in four rows down and closed — so the app expanded
+a chain down to the running account's home and scrolled to it. The scope change made
+the chain unnecessary: home is the tree.
 
-The home path is a fact about the account, not a setting. There is no key, nothing
-reads config, and the installer writes `$HOME` into the page the same way it writes
-asset hashes — the shipped HTML carries an empty value, so a checkout never has
-somebody's box baked into it, and a file served unstamped simply lands at the root.
+The home path is still written into the page, and it is still a fact about the
+account rather than a setting. There is no key, nothing reads config, and the
+installer writes `$HOME` into the HTML the same way it writes asset hashes — the
+shipped HTML carries an empty value, so a checkout never has somebody's box baked
+into it. What the value does changed: the API speaks paths relative to the server's
+root while the UI speaks absolute paths (the bar, the deep link and the move dialog
+all name the real path on the box), so `app.js` translates between the two in exactly
+one function — and because it is one function, it is also the one place that can say
+"this path is not under home" instead of asking the server for something it will not
+answer. A page served unstamped falls back to the pre-scope behaviour.
 
 That distinction is load-bearing, because this is precisely the shape
 `[paths].code_root` had: a directory the installer had to write somewhere, which
@@ -281,7 +315,7 @@ sets the scope to it; clicking the scope label widens it back.
 
 `fetchTextGuarded` reads the body through a reader and cancels at the cap instead of
 buffering it and measuring afterwards. It was the other way round at first, filed as
-an accepted residual risk — until the review pointed out what `--root /` does to it:
+an accepted residual risk — until the review pointed out what serving `/` did to it:
 a path with no honest `Content-Length` (a device, a pipe) makes "check the size after
 `r.text()`" a check that never runs. Measured, the pinned filebrowser serves those
 files as zero bytes, so the hazard did not reproduce; the cap is enforced by

@@ -71,6 +71,12 @@ cat >"$SHIM/systemctl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$AIRLOCK_TEST_TMP/systemctl.log"
 case "$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left airlock-update-detect.timer airlock-update-detect.service' ;; esac
+# The platform account surface is a SERVICE, so its installer asks systemd whether it is
+# running rather than whether a timer is scheduled ("installed" and "active" are
+# different claims and only one serves a request). Answer it, for the same reason
+# list-timers above is answered: an unanswered verb reads as a dead unit and the
+# installer dies.
+case "$*" in *is-active*) printf '%s\n' active ;; esac
 exit 0
 STUB
 cat >"$SHIM/loginctl" <<'STUB'

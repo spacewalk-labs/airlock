@@ -9,5 +9,9 @@ orb -m airlock -u root tailscale up --hostname airlock --ssh
 orb -m airlock -u root tailscale status
 orb -m airlock test -f /mnt/macTMP/repo/install/airlock-install.sh
 orb -m airlock test -f /mnt/macTMP/repo/airlock.toml
-orb -m airlock bash -lc cd\ \'/mnt/macTMP/repo\'\ \&\&\ bash\ install/airlock-install.sh
+orb -m airlock bash -lc printf\ %s\ \"\$HOME\"
+orb -m airlock bash -c $'\nset -e\nsrc="$1"; home="$2"; dst="$home/workspace/airlock"\nworkspace="$home/workspace"\n[ ! -L "$workspace" ] && { [ ! -e "$workspace" ] || [ -d "$workspace" ]; }\nmkdir -p "$workspace" "$home/.local/state/airlock/checkout-backups"\nstage="$workspace/.airlock.$$.staging"\n[ ! -e "$stage" ] && [ ! -L "$stage" ]\ncp -a "$src" "$stage"\nbackup=""\nif [ -e "$dst" ] || [ -L "$dst" ]; then\n  backup="$home/.local/state/airlock/checkout-backups/$(date -u +%Y%m%dT%H%M%S).$$-launcher"\n  mv "$dst" "$backup"\nfi\nif ! mv "$stage" "$dst"; then\n  [ -z "$backup" ] || mv "$backup" "$dst" || true\n  exit 1\nfi\n' _ /mnt/macTMP/repo /home/airlockuser
+orb -m airlock bash -lc cd\ \'/home/airlockuser/workspace/airlock\'\ \&\&\ bash\ install/airlock-install.sh
 orb -m airlock -u root tailscale status --json
+orb -m airlock -u root bash /home/airlockuser/workspace/airlock/install/install-agent-tools.sh airlockuser
+orb -m airlock env HOME=/home/airlockuser python3 /home/airlockuser/workspace/airlock/install/install-student-harness.py --home /home/airlockuser --fqdn airlock.example.ts.net

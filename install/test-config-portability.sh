@@ -44,7 +44,7 @@ name = "PortableBundle"
 
 [auth]
 provider = "tailscale"
-owner = "operator@teamspwk.com"
+owner = "operator@sample.dev"
 
 [apps.hub]
 [apps.alpha]

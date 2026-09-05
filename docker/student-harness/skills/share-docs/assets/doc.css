@@ -1,0 +1,1944 @@
+/* ============================================================
+   doc.css — 발행 문서 공용 스타일 (developer.apple.com 문서 미감)
+
+   디자인 원칙
+   1. 팔레트 = 단일 토큰 계층 --doc-* (아래 :root). 배경 #fff / 본문 #1d1d1f
+      / accent 애플 블루 #0066cc. SF Pro, 본문 17px / lh 1.5 / 자간 -0.022em.
+      h1 40(hero) h2 26(상단 hairline) h3 20 h4 16. 표 zebra 없음(hairline 행).
+   2. 색은 블루 주도 — 정보·정상=blue, amber(주의)·red(위험)만 예약색.
+   3. 레이아웃·크롬은 doc.js 가 자동 주입 — 우측 플로팅 목차 + hero
+      band + sticky topbar(테마) + 메모지. 다크모드 OS 자동 + 토글.
+   4. 컴포넌트(칩·카드·figure·decision-form·퀴즈 등)는 모두 --doc-* 를 참조하므로
+      토큰만 바꾸면 톤이 따라옵니다. 페이지에서 색을 새로 발명하지 마세요.
+
+   사용: 문서 HTML 과 같은 폴더에 doc.css · doc.js 를 두고
+
+         <link rel="stylesheet" href="doc.css">
+         <script type="module" src="doc.js"></script>
+
+   발행 전에는 이 둘을 문서 안으로 인라인합니다 (templates/README.md "발행 전에
+   CSS·JS 를 문서 안에 넣기").
+   ============================================================ */
+
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.7;
+  letter-spacing: -0.003em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover, a:focus { color: var(--accent-hover); text-decoration: underline; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ============================================================
+   레이아웃 컨테이너 — 본문 폭·여백
+   ============================================================ */
+.doc {
+  max-width: 110ch;
+  margin: var(--sp-8) auto var(--sp-12);
+  padding: var(--sp-8) var(--sp-6) var(--sp-12);
+  background: var(--bg-elev);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+}
+@media (max-width: 1100px) {
+  .doc { max-width: 96ch; padding: var(--sp-6) var(--sp-4); }
+}
+
+/* ============================================================
+   본문 위계
+   ============================================================ */
+.doc h1, .doc h2, .doc h3, .doc h4, .doc h5, .doc h6 {
+  color: var(--text);
+  font-weight: var(--fw-semibold);
+  line-height: 1.3;
+  letter-spacing: -0.02em;
+  margin: var(--sp-8) 0 var(--sp-3);
+}
+.doc h1 {
+  font-size: 1.875rem;       /* 30px */
+  line-height: 1.2;
+  margin-top: 0;
+  border-bottom: 1px solid var(--border-muted);
+  padding-bottom: var(--sp-2);
+}
+.doc h2 {
+  font-size: 1.5rem;          /* 24px */
+  line-height: 1.25;
+  margin-top: var(--sp-10);
+  border-bottom: 1px solid var(--border-muted);
+  padding-bottom: var(--sp-2);
+}
+.doc h3 { font-size: 1.25rem; line-height: 1.3; }     /* 20px */
+.doc h4 { font-size: 1.125rem; line-height: 1.4; }    /* 18px */
+.doc h5 { font-size: 1rem; color: var(--text-muted); }
+.doc h6 {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.doc p { margin: 0 0 var(--sp-4); }
+.doc strong { font-weight: var(--fw-semibold); }
+.doc em { font-style: italic; }
+
+/* === Lists === */
+.doc ul, .doc ol { padding-left: var(--sp-5); margin: 0 0 var(--sp-4); }
+.doc li { margin: 0 0 var(--sp-1); }
+.doc li > ul, .doc li > ol { margin-top: var(--sp-1); margin-bottom: 0; }
+.doc li > p { margin: 0 0 var(--sp-2); }
+.doc dl { padding: 0; margin: 0 0 var(--sp-4); }
+.doc dl dt { font-style: italic; font-weight: var(--fw-semibold); margin-top: var(--sp-4); }
+.doc dl dd { padding: 0 var(--sp-4); margin-bottom: var(--sp-4); }
+
+.doc hr {
+  height: 1px;
+  padding: 0;
+  margin: var(--sp-6) 0;
+  background-color: var(--border-muted);
+  border: 0;
+}
+
+.doc img { max-width: 100%; box-sizing: content-box; border: 0; }
+
+/* ============================================================
+   blockquote
+   ============================================================ */
+.doc blockquote {
+  border-left: 3px solid var(--border);
+  color: var(--text-muted);
+  margin: var(--sp-4) 0;
+  padding: var(--sp-1) var(--sp-4);
+  background: transparent;
+}
+.doc blockquote > :first-child { margin-top: 0; }
+.doc blockquote > :last-child { margin-bottom: 0; }
+
+/* ============================================================
+   코드
+   ============================================================ */
+.doc code,
+.doc kbd,
+.doc pre,
+.doc samp { font-family: var(--font-mono); }
+
+.doc code {
+  background: var(--code-bg);
+  color: var(--text);
+  font-size: 0.875em;
+  padding: 0.15em 0.4em;
+  border-radius: var(--r-sm);
+}
+.doc pre {
+  background: var(--code-bg);
+  color: var(--text);
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+  margin: var(--sp-4) 0;
+  overflow-x: auto;
+  font-size: 0.875em;
+  line-height: 1.55;
+  position: relative;
+}
+.doc pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 1em;
+  display: inline;
+  white-space: pre;
+  border: 0;
+}
+.doc kbd {
+  display: inline-block;
+  padding: 3px 5px;
+  font-size: 0.85em;
+  line-height: 10px;
+  color: var(--text);
+  background-color: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+/* code copy button */
+.copy-btn {
+  position: absolute; top: 8px; right: 8px;
+  background: var(--bg-elev);
+  color: var(--text-muted);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--r-sm);
+  padding: 2px 8px;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s, background .15s, color .15s;
+  font-family: var(--font-sans);
+}
+pre:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { background: var(--bg-hover); color: var(--text); }
+.copy-btn.copied { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); opacity: 1; }
+
+/* ============================================================
+   표 — 상하 굵은 line + hairline, zebra 없음
+   ============================================================ */
+.doc table {
+  display: table;
+  width: 100%;
+  max-width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0;
+  margin: var(--sp-5) 0;
+  font-size: 0.95em;
+  background: transparent;
+  border-top: 1.5px solid var(--text-muted);
+  border-bottom: 1.5px solid var(--text-muted);
+}
+.doc table th, .doc table td {
+  padding: 10px 14px;
+  border-top: none;
+  border-left: none;
+  border-right: none;
+  border-bottom: 1px solid var(--text-muted);
+  background: transparent;
+  vertical-align: top;
+  text-align: left;
+}
+.doc table th {
+  color: var(--text);
+  font-weight: var(--fw-semibold);
+  border-bottom: 1.5px solid var(--text-muted);
+}
+.doc table tr:last-child td { border-bottom: none; }
+/* zebra 명시적으로 제거 */
+.doc table tr,
+.doc table tr:nth-child(even),
+.doc table tr:nth-child(odd) { background: transparent; }
+
+/* ============================================================
+   메타 / lead — 본문 위에 얹는 박스
+   ============================================================ */
+.doc-meta {
+  background: var(--bg-elev);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--r-md);
+  padding: var(--sp-3) var(--sp-4);
+  margin: var(--sp-4) 0 var(--sp-5);
+  font-size: 0.87em;
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-6);
+  letter-spacing: 0;
+}
+.doc-meta strong { color: var(--text); font-weight: var(--fw-semibold); }
+
+.lead {
+  font-size: 1.1em;
+  color: var(--text);
+  border-left: 4px solid var(--accent);
+  padding: var(--sp-2) 0 var(--sp-2) var(--sp-4);
+  margin: var(--sp-5) 0;
+  line-height: 1.6;
+}
+
+/* ============================================================
+   Callout 박스 — 이름 6개, 실제 색은 3계열입니다
+   - note · why · case · ok : 파랑 (정보·근거·핵심·정상)
+   - caution                : amber (주의·보류)
+   - warn                   : 빨강 (실패·위험)
+   상태색은 실제 상태에만 씁니다. 장식으로 쓰지 마세요.
+   ============================================================ */
+.note, .case, .why, .ok, .warn {
+  border-left: 4px solid;
+  padding: var(--sp-3) var(--sp-4);
+  margin: var(--sp-4) 0;
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+.note    { background: var(--color-info-bg);      border-left-color: var(--color-info); }
+.why     { background: var(--color-tip-bg);       border-left-color: var(--color-tip); }
+.ok      { background: var(--color-success-bg);   border-left-color: var(--color-success); }
+.case    { background: var(--color-important-bg); border-left-color: var(--color-important); }
+.warn    { background: var(--color-danger-bg);    border-left-color: var(--color-danger); }
+
+.note > .label, .case > .label, .why > .label, .ok > .label, .warn > .label {
+  display: inline-block;
+  font-weight: var(--fw-semibold);
+  font-size: var(--fs-md);
+  letter-spacing: 0.02em;
+  margin-right: var(--sp-2);
+}
+.note > .label  { color: var(--color-info); }
+.why > .label   { color: var(--color-tip); }
+.ok > .label    { color: var(--color-success); }
+.case > .label  { color: var(--color-important); }
+.warn > .label  { color: var(--color-danger); }
+
+.note p:last-child, .case p:last-child, .why p:last-child,
+.ok p:last-child, .warn p:last-child { margin-bottom: 0; }
+
+/* ============================================================
+   Before / After 비교
+   ============================================================ */
+.before-after {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-4);
+  margin: var(--sp-5) 0;
+}
+.before-after > div {
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+  border: 1px solid var(--border-muted);
+}
+.before-after .before { border-left: 4px solid var(--text-muted); }
+.before-after .after  { border-left: 4px solid var(--accent); }
+.before-after h4 {
+  margin: 0 0 var(--sp-2); font-size: var(--fs-xs);
+  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.before-after .after h4 { color: var(--accent); }
+.before-after ul { margin: var(--sp-1) 0; padding-left: var(--sp-5); }
+.before-after li { margin: 2px 0; }
+
+@media (max-width: 700px) {
+  .before-after { grid-template-columns: 1fr; }
+}
+
+/* ============================================================
+   Mermaid
+   ============================================================ */
+.mermaid {
+  background: var(--bg-elev);
+  padding: var(--sp-4);
+  border-radius: var(--r-md);
+  border: 1px solid var(--border-muted);
+  text-align: center;
+  margin: var(--sp-4) 0;
+}
+
+/* ============================================================
+   details / summary
+   ============================================================ */
+details {
+  margin: var(--sp-4) 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--r-md);
+  padding: var(--sp-1) var(--sp-3);
+}
+summary { cursor: pointer; color: var(--accent); padding: var(--sp-2) 0; font-weight: var(--fw-medium); }
+details[open] { padding-bottom: var(--sp-3); }
+
+/* ============================================================
+   푸터
+   ============================================================ */
+.doc-footer {
+  margin-top: var(--sp-12);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border-muted);
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+small.meta { color: var(--text-muted); }
+
+
+/* ============================================================
+   팔레트 — 흰 배경 + 파랑 강조
+   실제 값은 아래 :root 토큰 한 곳에만 있습니다. 색을 바꾸려면 여기만 고치세요.
+   ============================================================ */
+
+:root {
+  /* Neutral ramp — 중립 회색 계열입니다. 문서 배경, 표면, 선, 본문 위계에만 씁니다. */
+  --doc-bg: #ffffff;             /* Apple 페이지 배경 (developer.apple.com). */
+  --doc-surface: #f5f5f7;        /* 사이드바·카드·코드·sticky 표면 (Apple gray). */
+  --doc-surface-soft: #f5f5f7;   /* code, muted panel, 비활성 면. */
+  --doc-surface-hover: #ececf0;  /* hover/selected 전 단계. */
+  --doc-text: #1d1d1f;           /* Apple 잉크 — 본문, 제목, primary label. */
+  --doc-muted: #6e6e73;          /* 보조 텍스트, table strong line. */
+  --doc-subtle: #86868b;         /* tab idle, caption, tertiary label. */
+  --doc-border: #d2d2d7;         /* 기본 line (Apple hairline). */
+  --doc-border-muted: #e8e8ed;   /* doc/meta/card hairline. */
+  --doc-border-strong: #86868b;  /* 표 상하 line. */
+
+  /* Accent scale — 강조색 원값입니다. 페이지에서는 이 둘을 직접 쓰지 말고 아래 --doc-accent* 를 쓰세요. */
+  --doc-blue-deep: #004499;     /* 진한 파랑 — hover/pressed. */
+  --doc-blue-primary: #0066cc;  /* 기본 파랑 — 링크, CTA, 핵심 구조 강조. */
+
+  /* Accent aliases — 페이지가 실제로 참조하는 이름입니다. */
+  --doc-accent: var(--doc-blue-primary);
+  --doc-accent-hover: var(--doc-blue-deep);
+  --doc-accent-bg: #eaf3fc;      /* blue soft — badge, note/why/case subtle fill. */
+  --doc-accent-border: #b9d9f4;  /* blue soft border — accent card/chip border. */
+  --doc-accent-contrast: #ffffff;
+
+  /* Semantic - blue-dominant. 정상(success)=blue 로 흡수, 경고=amber·위험=red 만 예약색. */
+  --doc-success: #0066cc;        /* 정상·통과 = blue (색 최소화). */
+  --doc-success-bg: #eaf3fc;
+  --doc-success-border: #b9d9f4;
+  --doc-warning: #a05a00;        /* 주의·보류 = amber (Light 대비 확보한 짙은 amber). */
+  --doc-warning-bg: #fbf0e6;
+  --doc-warning-border: #f0d9bf;
+  --doc-danger: #d70015;         /* 장애·실패 = red (Apple system red). */
+  --doc-danger-bg: #fdecec;
+  --doc-danger-border: #f5c6c6;
+
+  /* Typography */
+  --doc-font-sans: 'SF Pro Text', 'SF Pro Display', system-ui, -apple-system, BlinkMacSystemFont,
+                   'Pretendard', 'Apple SD Gothic Neo', 'Segoe UI',
+                   'Noto Sans KR', sans-serif;
+  --doc-font-mono: 'SF Mono', ui-monospace, SFMono-Regular, Menlo,
+                   'JetBrains Mono', 'Cascadia Code', Consolas, 'D2Coding', monospace;
+  --doc-fs-xs: 11px;
+  --doc-fs-sm: 12px;
+  --doc-fs-md: 14px;
+  --doc-fs-base: 16px;
+  --doc-fs-lg: 18px;
+  --doc-fs-xl: 20px;
+  --doc-fs-2xl: 24px;
+  --doc-fs-3xl: 30px;
+  --doc-lh-tight: 1.25;
+  --doc-lh-normal: 1.5;
+  --doc-lh-loose: 1.7;
+  --doc-fw-normal: 400;
+  --doc-fw-medium: 500;
+  --doc-fw-semibold: 600;
+  --doc-fw-bold: 700;
+
+  /* Spacing/radius/elevation - 4px grid, 카드 radius는 8px 이하. */
+  --doc-sp-0: 0;
+  --doc-sp-1: 4px;
+  --doc-sp-2: 8px;
+  --doc-sp-3: 12px;
+  --doc-sp-4: 16px;
+  --doc-sp-5: 20px;
+  --doc-sp-6: 24px;
+  --doc-sp-8: 32px;
+  --doc-sp-10: 40px;
+  --doc-sp-12: 48px;
+  --doc-r-sm: 6px;
+  --doc-r-md: 12px;
+  --doc-r-lg: 18px;
+  --doc-r-pill: 999px;
+  --doc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --doc-shadow-md: 0 4px 20px rgba(0, 0, 0, 0.08), 0 1px 3px rgba(0, 0, 0, 0.06);
+
+  /* 짧은 별칭 — 아래 규칙들이 이 이름으로 참조합니다. 값은 위 --doc-* 가 정본입니다. */
+  --bg: var(--doc-bg);
+  --bg-elev: var(--doc-surface);
+  --bg-hover: var(--doc-surface-hover);
+  --text: var(--doc-text);
+  --text-muted: var(--doc-muted);
+  --border: var(--doc-border);
+  --border-muted: var(--doc-border-muted);
+  --accent: var(--doc-accent);
+  --accent-hover: var(--doc-accent-hover);
+  --accent-contrast: var(--doc-accent-contrast);
+  --code-bg: var(--doc-surface-soft);
+  --badge-bg: var(--doc-accent-bg);
+  --badge-text: var(--doc-accent-hover);
+  --shadow-sm: var(--doc-shadow-sm);
+  --shadow-md: var(--doc-shadow-md);
+  --font-sans: var(--doc-font-sans);
+  --font-mono: var(--doc-font-mono);
+  --fs-xs: var(--doc-fs-xs);
+  --fs-sm: var(--doc-fs-sm);
+  --fs-md: var(--doc-fs-md);
+  --fs-lg: var(--doc-fs-base);
+  --fs-xl: var(--doc-fs-xl);
+  --fs-2xl: var(--doc-fs-2xl);
+  --lh-tight: var(--doc-lh-tight);
+  --lh-normal: var(--doc-lh-normal);
+  --lh-loose: var(--doc-lh-loose);
+  --fw-normal: var(--doc-fw-normal);
+  --fw-medium: var(--doc-fw-medium);
+  --fw-semibold: var(--doc-fw-semibold);
+  --fw-bold: var(--doc-fw-bold);
+  --sp-0: var(--doc-sp-0);
+  --sp-1: var(--doc-sp-1);
+  --sp-2: var(--doc-sp-2);
+  --sp-3: var(--doc-sp-3);
+  --sp-4: var(--doc-sp-4);
+  --sp-5: var(--doc-sp-5);
+  --sp-6: var(--doc-sp-6);
+  --sp-8: var(--doc-sp-8);
+  --sp-10: var(--doc-sp-10);
+  --sp-12: var(--doc-sp-12);
+  --r-sm: var(--doc-r-sm);
+  --r-md: var(--doc-r-md);
+  --r-lg: var(--doc-r-lg);
+  --r-pill: var(--doc-r-pill);
+
+  /* callout 별칭 — note/why/case 를 강조색 계열로 모읍니다. */
+  --color-info: var(--doc-accent);
+  --color-info-bg: var(--doc-accent-bg);
+  --color-tip: var(--doc-accent);
+  --color-tip-bg: var(--doc-accent-bg);
+  --color-important: var(--doc-accent);
+  --color-important-bg: var(--doc-accent-bg);
+  --color-success: var(--doc-success);
+  --color-success-bg: var(--doc-success-bg);
+  --color-warning: var(--doc-warning);
+  --color-warning-bg: var(--doc-warning-bg);
+  --color-danger: var(--doc-danger);
+  --color-danger-bg: var(--doc-danger-bg);
+}
+
+body {
+  background: var(--doc-bg);
+  color: var(--doc-text);
+  font-family: var(--doc-font-sans);
+  font-size: var(--doc-fs-base);
+  line-height: var(--doc-lh-loose);
+  letter-spacing: 0;
+}
+
+/* Callouts — 이름은 6개지만 의미 색은 3계열로 줄여 씁니다. */
+.note,
+.why,
+.case,
+.ok,
+.warn,
+.caution {
+  border-left: 4px solid;
+  padding: var(--doc-sp-3) var(--doc-sp-4);
+  margin: var(--doc-sp-4) 0;
+  border-radius: 0 var(--doc-r-sm) var(--doc-r-sm) 0;
+}
+
+.note,
+.why {
+  background: var(--doc-accent-bg);
+  border-left-color: var(--doc-accent);
+}
+
+.case {
+  background: var(--doc-surface);
+  border: 1px solid var(--doc-accent-border);
+  border-left: 4px solid var(--doc-accent);
+}
+
+.ok {
+  background: var(--doc-success-bg);
+  border-left-color: var(--doc-success);
+}
+
+.caution {
+  background: var(--doc-warning-bg);
+  border-left-color: var(--doc-warning);
+}
+
+.warn {
+  background: var(--doc-danger-bg);
+  border-left-color: var(--doc-danger);
+}
+
+.note > .label,
+.why > .label,
+.case > .label,
+.ok > .label,
+.warn > .label,
+.caution > .label {
+  display: inline-block;
+  font-weight: var(--doc-fw-semibold);
+  font-size: var(--doc-fs-md);
+  letter-spacing: 0;
+  margin-right: var(--doc-sp-2);
+}
+
+.note > .label,
+.why > .label,
+.case > .label { color: var(--doc-accent); }
+.ok > .label { color: var(--doc-success); }
+.caution > .label { color: var(--doc-warning); }
+.warn > .label { color: var(--doc-danger); }
+
+/* Sticky link nav — 색인 문서가 직접 두는 상단 목차(.cat-toc)입니다.
+   링크만으로 동작하며 스크립트가 필요 없습니다. 현재 항목에 aria-current="true" 를 답니다.
+   탭 전환 컴포넌트는 아래 `.doc-tabs`·`.rca-tabs`·`.essay-tabs` 를 씁니다. */
+body > .cat-toc {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: var(--doc-bg);
+  border-bottom: 1px solid var(--doc-border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  padding: 6px max(16px, calc((100vw - 110ch) / 2));
+}
+
+.cat-toc a {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--doc-r-sm) var(--doc-r-sm) 0 0;
+  color: var(--doc-subtle);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.92rem;
+  font-weight: var(--doc-fw-semibold);
+  letter-spacing: 0;
+  margin-bottom: -1px;
+  padding: 9px 14px;
+  text-decoration: none;
+}
+
+.cat-toc a:hover {
+  background: var(--doc-surface-hover);
+  color: var(--doc-text);
+  text-decoration: none;
+}
+
+.cat-toc a[aria-current="true"] {
+  background: var(--doc-surface);
+  border-bottom-color: var(--doc-accent);
+  color: var(--doc-accent);
+}
+
+/* Sticky tabs — 한 페이지를 두 갈래 이상으로 나눠 보여줄 때(요약/상세, 쉬운 설명/기술 상세).
+   `.doc-tabs`·`.rca-tabs`·`.essay-tabs` 는 같은 규격이고, 이름만 문서 성격에 맞춰 고릅니다.
+   버튼의 `data-target` 과 pane 의 `id` 가 같아야 하고, 활성 pane 에만 `data-active` 를 둡니다.
+   전환은 `doc.js` 의 tab 컨트롤러가 맡습니다(마크업만 맞추면 되고 페이지 스크립트는 필요 없습니다). */
+body > .doc-tabs,
+body > .rca-tabs,
+body > .essay-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: var(--doc-bg);
+  border-bottom: 1px solid var(--doc-border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  padding: 6px max(16px, calc((100vw - 110ch) / 2));
+}
+
+.doc-tabs button,
+.doc-tabs a,
+.rca-tabs button,
+.essay-tabs button {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--doc-r-sm) var(--doc-r-sm) 0 0;
+  color: var(--doc-subtle);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.92rem;
+  font-weight: var(--doc-fw-semibold);
+  letter-spacing: 0;
+  margin-bottom: -1px;
+  padding: 9px 14px;
+  text-decoration: none;
+}
+
+.doc-tabs button:hover,
+.doc-tabs a:hover,
+.rca-tabs button:hover,
+.essay-tabs button:hover {
+  background: var(--doc-surface-hover);
+  color: var(--doc-text);
+  text-decoration: none;
+}
+
+.doc-tabs button[aria-selected="true"],
+.doc-tabs a[aria-current="page"],
+.rca-tabs button[aria-selected="true"],
+.essay-tabs button[aria-selected="true"] {
+  background: var(--doc-surface);
+  border-bottom-color: var(--doc-accent);
+  color: var(--doc-accent);
+}
+
+.rca-pane,
+.essay-pane,
+.tab-pane {
+  display: none;
+}
+
+.rca-pane[data-active],
+.essay-pane[data-active],
+.tab-pane[data-active] {
+  display: block;
+}
+
+.essay-tabs button .num,
+.doc-tabs .num {
+  display: inline-block;
+  min-width: 1.4em;
+  height: 1.4em;
+  border-radius: var(--doc-r-pill);
+  background: var(--doc-surface-hover);
+  color: var(--doc-muted);
+  text-align: center;
+  line-height: 1.4em;
+  font-size: 0.8em;
+  margin-right: 0.5em;
+  font-weight: var(--doc-fw-bold);
+}
+
+.essay-tabs button[aria-selected="true"] .num,
+.doc-tabs button[aria-selected="true"] .num {
+  background: var(--doc-accent);
+  color: var(--doc-accent-contrast);
+}
+
+/* Sticky subnav - 런북의 단계형 목차. */
+body > .doc-subnav,
+body > .rb-nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: var(--doc-bg);
+  border-bottom: 1px solid var(--doc-border);
+}
+
+.doc-subnav-inner,
+.rb-nav-inner {
+  max-width: 110ch;
+  margin: 0 auto;
+  padding: 5px var(--doc-sp-8);
+  display: flex;
+  gap: 0;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.doc-subnav strong,
+.rb-nav strong {
+  color: var(--doc-accent);
+  margin-right: 0.6rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.doc-subnav a,
+.rb-nav a {
+  color: var(--doc-subtle);
+  text-decoration: none;
+  padding: 7px 12px;
+  font-weight: var(--doc-fw-semibold);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  border-radius: var(--doc-r-sm) var(--doc-r-sm) 0 0;
+  font-size: 0.9rem;
+  letter-spacing: 0;
+}
+
+.doc-subnav a:hover,
+.rb-nav a:hover {
+  color: var(--doc-text);
+  background: var(--doc-surface-hover);
+  text-decoration: none;
+}
+
+/* Chip/pill — 상태 badge 입니다. 새 색을 만들지 말고 아래 이름을 쓰세요. */
+.chip,
+.pill,
+.phase-chip,
+.cat-toc .cnt {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-r-pill);
+  background: var(--doc-surface-soft);
+  color: var(--doc-muted);
+  font-size: var(--doc-fs-sm);
+  font-weight: var(--doc-fw-semibold);
+  line-height: 1.35;
+  padding: 2px 8px;
+  letter-spacing: 0;
+}
+
+.phase-chip,
+.chip[data-tone="accent"],
+.pill[data-tone="accent"],
+.chip.info,
+.pill.info {
+  background: var(--doc-accent-bg);
+  border-color: var(--doc-accent-border);
+  color: var(--doc-accent);
+}
+
+.chip[data-tone="success"],
+.pill[data-tone="success"],
+.chip.ok,
+.pill.ok {
+  background: var(--doc-success-bg);
+  border-color: var(--doc-success-border);
+  color: var(--doc-success);
+}
+
+.chip[data-tone="warning"],
+.pill[data-tone="warning"],
+.chip.warn,
+.pill.warn {
+  background: var(--doc-warning-bg);
+  border-color: var(--doc-warning-border);
+  color: var(--doc-warning);
+}
+
+.chip[data-tone="danger"],
+.pill[data-tone="danger"],
+.chip.crit,
+.pill.crit {
+  background: var(--doc-danger-bg);
+  border-color: var(--doc-danger-border);
+  color: var(--doc-danger);
+}
+
+.chip[data-tone="muted"],
+.pill[data-tone="muted"],
+.chip.dim,
+.pill.dim,
+.chip.human,
+.pill.human {
+  background: var(--doc-surface-soft);
+  border-color: var(--doc-border);
+  color: var(--doc-subtle);
+}
+
+/* Cards and stat bands — 반복되는 정보 덩어리용입니다. 본문 section 을 카드로 감싸지 마세요. */
+.doc .card,
+.doc-card,
+.landing-card,
+.stat-card,
+.statband .sc,
+.stat-band .stat {
+  background: var(--doc-surface);
+  border: 1px solid var(--doc-border-muted);
+  border-radius: var(--doc-r-md);
+  box-shadow: none;
+}
+
+.doc .card,
+.doc-card {
+  padding: var(--doc-sp-4);
+  margin: var(--doc-sp-4) 0;
+}
+
+.landing-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--doc-sp-3);
+  margin: var(--doc-sp-5) 0 var(--doc-sp-6);
+}
+
+.landing-card {
+  border-left: 4px solid var(--doc-border);
+  cursor: pointer;
+  padding: var(--doc-sp-3) var(--doc-sp-4);
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+}
+
+.landing-card:hover {
+  border-left-color: var(--doc-accent);
+  box-shadow: var(--doc-shadow-sm);
+  transform: translateY(-1px);
+}
+
+.landing-card .card-num,
+.doc-card .eyebrow {
+  font-size: var(--doc-fs-xs);
+  font-weight: var(--doc-fw-bold);
+  color: var(--doc-subtle);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.landing-card h4,
+.doc-card h4 {
+  margin: var(--doc-sp-1) 0 var(--doc-sp-2);
+  font-size: var(--doc-fs-base);
+  color: var(--doc-text);
+  border: 0;
+  padding: 0;
+}
+
+.landing-card p,
+.doc-card p {
+  margin: 0;
+  font-size: 0.9em;
+  color: var(--doc-muted);
+  line-height: var(--doc-lh-normal);
+}
+
+.statband,
+.stat-band {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: var(--doc-sp-3);
+  margin: var(--doc-sp-5) 0;
+}
+
+.statband .sc,
+.stat-band .stat,
+.stat-card {
+  padding: var(--doc-sp-3) var(--doc-sp-4);
+}
+
+.statband .sc b,
+.stat-band .stat b,
+.stat-card b {
+  display: block;
+  font-size: 1.65rem;
+  line-height: 1.1;
+  color: var(--doc-accent);
+  font-weight: var(--doc-fw-bold);
+}
+
+.statband .sc span,
+.stat-band .stat span,
+.stat-card span {
+  font-size: var(--doc-fs-sm);
+  color: var(--doc-subtle);
+}
+
+/* Figure - 이미지/스크린샷/도면 증거. */
+.fig,
+.doc-figure,
+figure.doc-figure {
+  margin: var(--doc-sp-6) 0;
+}
+
+.fig img,
+.doc-figure img,
+figure.doc-figure img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-r-sm);
+  background: var(--doc-surface);
+  box-sizing: border-box;
+}
+
+.fig figcaption,
+.fig .caption,
+.doc-figure figcaption,
+figure.doc-figure figcaption {
+  font-size: 0.9rem;
+  color: var(--doc-subtle);
+  margin-top: 0.55rem;
+  line-height: var(--doc-lh-normal);
+}
+
+.fig-narrow,
+.doc-figure.narrow {
+  max-width: 820px;
+}
+
+/* Evidence swatches — 증거 이미지의 범례 전용입니다. 화면 크롬에는 쓰지 마세요. */
+.swatch {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  border-radius: 2px;
+  vertical-align: baseline;
+  margin-right: 0.25em;
+  border: 1px solid rgba(33, 36, 31, 0.18);
+}
+
+.swatch[data-tone="a"],
+.sw-accent { background: var(--doc-accent); }
+.swatch[data-tone="b"],
+.sw-warning { background: var(--doc-warning); }
+.swatch[data-tone="c"],
+.sw-danger { background: var(--doc-danger); }
+.swatch[data-tone="ok"],
+.sw-success { background: var(--doc-success); }
+
+/* Decision form - 사람 입력을 markdown으로 넘기는 페이지 표준. */
+.decision-form {
+  background: var(--doc-surface);
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-r-md);
+  padding: var(--doc-sp-4);
+  margin: var(--doc-sp-5) 0;
+}
+
+.decision-form h4 {
+  margin: 0 0 var(--doc-sp-3);
+  font-size: var(--doc-fs-md);
+  color: var(--doc-accent);
+  letter-spacing: 0;
+}
+
+.decision-form label {
+  display: block;
+  margin: var(--doc-sp-2) 0;
+  font-size: var(--doc-fs-md);
+}
+
+.decision-form .fld {
+  margin: var(--doc-sp-3) 0;
+}
+
+.decision-form .fld > span {
+  display: block;
+  font-weight: var(--doc-fw-semibold);
+  margin-bottom: var(--doc-sp-1);
+  color: var(--doc-text);
+}
+
+.decision-form input[type="text"],
+.decision-form textarea,
+#md-output {
+  width: 100%;
+  font: inherit;
+  font-size: 0.92rem;
+  line-height: var(--doc-lh-normal);
+  color: var(--doc-text);
+  background: var(--doc-bg);
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-r-sm);
+  padding: 0.55em 0.65em;
+  box-sizing: border-box;
+}
+
+.decision-form textarea {
+  min-height: 3.2em;
+  resize: vertical;
+}
+
+.commit-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 40;
+  background: var(--doc-surface);
+  border-top: 2px solid var(--doc-accent);
+  padding: 0;
+  margin: var(--doc-sp-6) 0 0;
+  box-shadow: 0 -4px 16px rgba(33, 36, 31, 0.08);
+}
+
+.commit-bar-inner,
+.commit-bar {
+  display: flex;
+  gap: var(--doc-sp-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.commit-bar-inner {
+  max-width: 110ch;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0.65rem var(--doc-sp-8);
+}
+
+.commit-bar .status,
+.commit-bar .cb-label {
+  font-weight: var(--doc-fw-semibold);
+  color: var(--doc-subtle);
+  font-size: 0.9rem;
+  margin-right: auto;
+}
+
+.commit-bar button,
+.decision-form button,
+.btn {
+  font: inherit;
+  font-size: 0.92rem;
+  font-weight: var(--doc-fw-semibold);
+  padding: 0.5em 1.05em;
+  border-radius: var(--doc-r-sm);
+  border: 1px solid var(--doc-border);
+  background: var(--doc-surface);
+  color: var(--doc-text);
+  cursor: pointer;
+}
+
+.commit-bar button.primary,
+.commit-bar button:not(.secondary):not(.clear),
+.decision-form button.primary,
+.btn.primary {
+  background: var(--doc-accent);
+  color: var(--doc-accent-contrast);
+  border-color: var(--doc-accent);
+}
+
+.commit-bar button.secondary,
+.commit-bar button.ghost,
+.btn.secondary {
+  background: var(--doc-surface);
+  color: var(--doc-accent);
+  border-color: var(--doc-accent);
+}
+
+/* decision-form 부품 — .dec / .opt / .rec / #toast.
+   decision.html 의 결정 폼이 쓰는 이름이라 페이지 <style> 없이 그대로 동작합니다. */
+.dec {
+  margin: var(--doc-sp-6) 0;
+}
+
+.dec h3 .tag,
+.decision-form .tag {
+  display: inline-block;
+  font-family: var(--doc-font-mono);
+  font-size: 0.78rem;
+  font-weight: var(--doc-fw-bold);
+  padding: 0.12em 0.5em;
+  margin-right: 0.4em;
+  border-radius: var(--doc-r-sm);
+  background: var(--doc-accent);
+  color: var(--doc-accent-contrast);
+  vertical-align: 0.1em;
+}
+
+.decision-form label.opt {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5em;
+  padding: 0.42em 0.6em;
+  border-radius: var(--doc-r-sm);
+  cursor: pointer;
+}
+
+.decision-form label.opt:hover {
+  background: var(--doc-surface-hover);
+}
+
+.decision-form label.opt:has(input:checked) {
+  background: var(--doc-accent-bg);
+  font-weight: var(--doc-fw-semibold);
+}
+
+.decision-form .rec {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: var(--doc-fw-bold);
+  letter-spacing: 0.02em;
+  padding: 0.1em 0.5em;
+  border-radius: 999px;
+  background: var(--doc-accent);
+  color: var(--doc-accent-contrast);
+  white-space: nowrap;
+}
+
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: 4.5rem;
+  transform: translateX(-50%) translateY(0.6rem);
+  z-index: 60;
+  padding: 0.6em 1.1em;
+  border-radius: var(--doc-r-md);
+  background: var(--doc-text);
+  color: var(--doc-bg);
+  font-size: 0.9rem;
+  font-weight: var(--doc-fw-semibold);
+  box-shadow: 0 6px 20px rgba(33, 36, 31, 0.22);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+#toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.commit-bar button.clear,
+.btn.danger {
+  color: var(--doc-danger);
+  border-color: var(--doc-danger-border);
+}
+
+.commit-bar button:hover,
+.decision-form button:hover,
+.btn:hover {
+  border-color: var(--doc-accent-hover);
+  color: var(--doc-accent-hover);
+}
+
+.commit-bar button.primary:hover,
+.commit-bar button:not(.secondary):not(.clear):hover,
+.decision-form button.primary:hover,
+.btn.primary:hover {
+  background: var(--doc-accent-hover);
+  border-color: var(--doc-accent-hover);
+  color: var(--doc-accent-contrast);
+}
+
+#md-output {
+  display: none;
+  max-width: 110ch;
+  min-height: 9em;
+  margin: var(--doc-sp-2) auto 0;
+  font-family: var(--doc-font-mono);
+  font-size: 0.82rem;
+}
+
+.rb-toast,
+.doc-toast {
+  position: fixed;
+  bottom: 5.2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--doc-text);
+  color: var(--doc-accent-contrast);
+  padding: 0.6em 1.2em;
+  border-radius: var(--doc-r-sm);
+  opacity: 0;
+  transition: opacity 0.2s;
+  z-index: 60;
+  pointer-events: none;
+  font-weight: var(--doc-fw-semibold);
+  font-size: 0.92rem;
+}
+
+.rb-toast.show,
+.doc-toast.show {
+  opacity: 1;
+}
+
+/* TOC - 긴 essay의 sticky 목차. */
+.doc-layout {
+  display: block;
+}
+
+.doc-content {
+  min-width: 0;
+}
+
+.toc {
+  display: none;
+}
+
+@media (min-width: 1200px) {
+  main.doc.doc-wide,
+  main.doc:has(.doc-layout) {
+    max-width: 1280px;
+  }
+
+  .doc-layout {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: var(--doc-sp-8);
+    align-items: start;
+  }
+
+  .toc {
+    display: block;
+    position: sticky;
+    top: 64px;
+    max-height: calc(100vh - 80px);
+    overflow-y: auto;
+    font-size: var(--doc-fs-sm);
+    padding-right: var(--doc-sp-2);
+  }
+}
+
+.toc h4 {
+  margin: 0 0 var(--doc-sp-2);
+  font-size: var(--doc-fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--doc-subtle);
+  font-weight: var(--doc-fw-semibold);
+}
+
+.toc ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.toc li {
+  margin: 0;
+}
+
+.toc a {
+  display: block;
+  padding: 5px 0 5px 11px;
+  color: var(--doc-subtle);
+  text-decoration: none;
+  border-left: 2px solid var(--doc-border-muted);
+  font-size: var(--doc-fs-sm);
+  line-height: 1.45;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toc a:hover {
+  color: var(--doc-text);
+  background: var(--doc-surface-hover);
+  border-left-color: var(--doc-border);
+  text-decoration: none;
+}
+
+.toc a.active {
+  border-left-color: var(--doc-accent);
+  color: var(--doc-accent);
+  background: var(--doc-surface);
+  font-weight: var(--doc-fw-semibold);
+}
+
+.toc a[data-level="h4"] {
+  padding-left: 24px;
+}
+
+/* Catalog index IA - wide rail, narrow group chips, search/filter chrome. */
+.toc-rail {
+  display: none;
+}
+
+@media (min-width: 1200px) {
+  .toc-rail {
+    display: block;
+    position: sticky;
+    top: 64px;
+    max-height: calc(100vh - 80px);
+    overflow-y: auto;
+    padding: var(--doc-sp-2) var(--doc-sp-3) var(--doc-sp-4) 0;
+    border-right: 1px solid var(--doc-border-muted);
+    font-size: var(--doc-fs-sm);
+  }
+}
+
+.toc-rail .toc-group,
+.toc-rail .group {
+  margin: 0 0 var(--doc-sp-4);
+}
+
+.toc-rail h3,
+.toc-rail .group-title {
+  margin: 0 0 var(--doc-sp-2);
+  font-size: var(--doc-fs-xs);
+  font-weight: var(--doc-fw-bold);
+  line-height: var(--doc-lh-tight);
+  color: var(--doc-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.toc-rail ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.toc-rail li {
+  margin: 0;
+}
+
+.toc-rail a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--doc-sp-2);
+  min-width: 0;
+  padding: 6px 0 6px var(--doc-sp-3);
+  border-left: 2px solid var(--doc-border-muted);
+  color: var(--doc-subtle);
+  text-decoration: none;
+  line-height: 1.35;
+}
+
+.toc-rail a:hover {
+  color: var(--doc-text);
+  background: var(--doc-surface-hover);
+  border-left-color: var(--doc-border);
+  text-decoration: none;
+}
+
+.toc-rail a.active,
+.toc-rail a[aria-current="true"],
+.toc-rail a[aria-current="page"] {
+  color: var(--doc-accent);
+  background: var(--doc-accent-bg);
+  border-left-color: var(--doc-accent);
+  font-weight: var(--doc-fw-semibold);
+}
+
+.toc-rail .count,
+.toc-rail .cnt {
+  flex: 0 0 auto;
+  min-width: 1.45em;
+  padding: 0 6px;
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-r-pill);
+  background: var(--doc-surface-soft);
+  color: var(--doc-muted);
+  font-size: var(--doc-fs-xs);
+  font-weight: var(--doc-fw-semibold);
+  line-height: 1.45;
+  text-align: center;
+}
+
+.group-nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: flex;
+  gap: var(--doc-sp-2);
+  overflow-x: auto;
+  padding: var(--doc-sp-2) max(var(--doc-sp-4), calc((100vw - 110ch) / 2));
+  border-bottom: 1px solid var(--doc-border);
+  background: var(--doc-bg);
+  scrollbar-width: thin;
+}
+
+@media (min-width: 1100px) {
+  .group-nav {
+    display: none;
+  }
+}
+
+.group-nav a,
+.group-nav button {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-r-pill);
+  background: var(--doc-surface);
+  color: var(--doc-muted);
+  font: inherit;
+  font-size: var(--doc-fs-sm);
+  font-weight: var(--doc-fw-semibold);
+  line-height: 1.3;
+  letter-spacing: 0;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.group-nav a:hover,
+.group-nav button:hover {
+  border-color: var(--doc-accent-border);
+  background: var(--doc-surface-hover);
+  color: var(--doc-accent);
+  text-decoration: none;
+}
+
+.group-nav a.active,
+.group-nav a[aria-current="true"],
+.group-nav button[aria-pressed="true"],
+.group-nav button[aria-selected="true"] {
+  border-color: var(--doc-accent-border);
+  background: var(--doc-accent-bg);
+  color: var(--doc-accent);
+}
+
+.group-nav .count,
+.group-nav .cnt {
+  color: var(--doc-subtle);
+  font-size: var(--doc-fs-xs);
+  font-weight: var(--doc-fw-bold);
+}
+
+.filterbar {
+  display: flex;
+  align-items: center;
+  gap: var(--doc-sp-3);
+  flex-wrap: wrap;
+  margin: var(--doc-sp-5) 0 var(--doc-sp-4);
+  padding: var(--doc-sp-3) 0;
+  border-top: 1px solid var(--doc-border-muted);
+  border-bottom: 1px solid var(--doc-border-muted);
+}
+
+.filterbar label {
+  flex: 1 1 280px;
+  min-width: min(100%, 280px);
+}
+
+.filterbar input[type="search"],
+.filterbar input[type="text"] {
+  width: 100%;
+  min-height: 38px;
+  box-sizing: border-box;
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-r-sm);
+  background: var(--doc-surface);
+  color: var(--doc-text);
+  font: inherit;
+  font-size: var(--doc-fs-md);
+  line-height: var(--doc-lh-normal);
+  padding: 0.55em 0.7em;
+}
+
+.filterbar input[type="search"]::placeholder,
+.filterbar input[type="text"]::placeholder {
+  color: var(--doc-subtle);
+}
+
+.filterbar input[type="search"]:focus,
+.filterbar input[type="text"]:focus {
+  outline: 2px solid var(--doc-accent-border);
+  outline-offset: 2px;
+  border-color: var(--doc-accent);
+}
+
+.filterbar .result-count,
+.filterbar .count {
+  color: var(--doc-muted);
+  font-size: var(--doc-fs-sm);
+  font-weight: var(--doc-fw-semibold);
+  white-space: nowrap;
+}
+
+.repo-tag {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 1.65em;
+  padding: 1px 7px;
+  border: 1px solid var(--doc-border);
+  border-radius: var(--doc-r-pill);
+  background: var(--doc-surface-soft);
+  color: var(--doc-muted);
+  font-family: var(--doc-font-mono);
+  font-size: var(--doc-fs-xs);
+  font-weight: var(--doc-fw-semibold);
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.doc-row.rep,
+.doc-row.is-rep {
+  border-left: 3px solid var(--doc-accent);
+  background: var(--doc-accent-bg);
+}
+
+.doc-row .rep-star {
+  display: inline-flex;
+  align-items: center;
+  color: var(--doc-accent);
+  font-size: var(--doc-fs-xs);
+  font-weight: var(--doc-fw-bold);
+  line-height: 1;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+tr.rep > th,
+tr.rep > td {
+  background: var(--doc-accent-bg);
+}
+
+tr.rep > th:first-child,
+tr.rep > td:first-child {
+  border-left: 3px solid var(--doc-accent);
+}
+
+.cat-sec h2,
+.doc-section h2 {
+  display: flex;
+  align-items: baseline;
+  gap: var(--doc-sp-2);
+  flex-wrap: wrap;
+}
+
+.cat-sec h2 .h2cnt,
+.cat-sec h2 .count,
+.doc-section h2 .count,
+.section-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.7em;
+  padding: 1px 8px;
+  border: 1px solid var(--doc-accent-border);
+  border-radius: var(--doc-r-pill);
+  background: var(--doc-accent-bg);
+  color: var(--doc-accent);
+  font-size: var(--doc-fs-sm);
+  font-weight: var(--doc-fw-bold);
+  line-height: 1.45;
+}
+
+.group-divider {
+  margin: var(--doc-sp-8) 0 var(--doc-sp-4);
+  border: 0;
+  border-top: 1px solid var(--doc-border);
+}
+
+.group-kicker {
+  display: block;
+  margin: var(--doc-sp-6) 0 var(--doc-sp-2);
+  color: var(--doc-muted);
+  font-size: var(--doc-fs-xs);
+  font-weight: var(--doc-fw-bold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Hero diagram - 페이지 상단 핵심 도식 1회용. */
+.hero-diagram {
+  background: var(--doc-surface);
+  border: 1px solid var(--doc-border-muted);
+  border-left: 4px solid var(--doc-accent);
+  border-radius: var(--doc-r-md);
+  padding: var(--doc-sp-4) var(--doc-sp-5);
+  margin: var(--doc-sp-5) 0 var(--doc-sp-6);
+}
+
+.hero-diagram .diagram-title {
+  font-size: var(--doc-fs-xs);
+  font-weight: var(--doc-fw-bold);
+  color: var(--doc-accent);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--doc-sp-2);
+}
+
+.hero-diagram .diagram-caption {
+  font-size: 0.9em;
+  color: var(--doc-muted);
+  margin: var(--doc-sp-2) 0 0;
+}
+
+/* Runbook helpers - 절차형 문서 전용. */
+.step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.7em;
+  height: 1.7em;
+  border-radius: 50%;
+  background: var(--doc-accent);
+  color: var(--doc-accent-contrast);
+  font-weight: var(--doc-fw-bold);
+  font-size: 0.8em;
+  margin-right: 0.45em;
+  vertical-align: 0.1em;
+}
+
+ul.check {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.6rem 0;
+}
+
+ul.check li {
+  padding: 0.25em 0 0.25em 1.9em;
+  position: relative;
+}
+
+ul.check li::before {
+  content: "☐";
+  position: absolute;
+  left: 0.25em;
+  color: var(--doc-accent);
+  font-weight: var(--doc-fw-bold);
+  font-size: 1.1em;
+}
+
+@media (max-width: 700px) {
+  body > .doc-tabs,
+  body > .rca-tabs,
+  body > .essay-tabs,
+  body > .cat-toc {
+    padding-left: var(--doc-sp-4);
+    padding-right: var(--doc-sp-4);
+  }
+
+  .doc-subnav-inner,
+  .rb-nav-inner,
+  .commit-bar-inner {
+    padding-left: var(--doc-sp-4);
+    padding-right: var(--doc-sp-4);
+  }
+
+  .commit-bar,
+  .commit-bar-inner {
+    align-items: stretch;
+  }
+
+  .commit-bar button {
+    flex: 1 1 auto;
+  }
+}
+
+/* ============================================================
+   APPLE LAYER — 토큰 재지정 위에 구조/밀도/크롬만 override.
+   기존 컴포넌트(탭·decision-form·landing-card 등)는 재토큰화로 자동 애플화됨.
+   ============================================================ */
+
+/* ---------- Apple-specific tokens (light) ---------- */
+:root{
+  --doc-hero-a:#f5f9ff; --doc-hero-b:#eaf1fb;
+  --doc-topbar-glass:rgba(255,255,255,.72);
+  --doc-shadow-lg:0 12px 40px rgba(0,0,0,.14);
+  --doc-side:264px; --doc-topbar-h:48px;
+}
+/* ---------- DARK (Apple true-black) — OS 자동 + data-theme 수동 ---------- */
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --doc-bg:#000000; --doc-surface:#1d1d1f; --doc-surface-soft:#161617; --doc-surface-hover:#2c2c2e;
+  --doc-text:#f5f5f7; --doc-muted:#a1a1a6; --doc-subtle:#86868b;
+  --doc-border:#424245; --doc-border-muted:#2c2c2e; --doc-border-strong:#a1a1a6;
+  --doc-blue-deep:#64b5ff; --doc-blue-primary:#2997ff;
+  --doc-accent-bg:#0e2740; --doc-accent-border:#1e4a70; --doc-accent-contrast:#ffffff;
+  --doc-success:#2997ff; --doc-success-bg:#0e2740; --doc-success-border:#1e4a70;
+  --doc-warning:#ffb84d; --doc-warning-bg:#2a1c06; --doc-warning-border:#4d3d20;
+  --doc-danger:#ff453a; --doc-danger-bg:#2c0f0e; --doc-danger-border:#5c1f1c;
+  --doc-hero-a:#0a1420; --doc-hero-b:#0c1830; --doc-topbar-glass:rgba(0,0,0,.6);
+  --doc-shadow-sm:0 1px 2px rgba(0,0,0,.5); --doc-shadow-md:0 4px 20px rgba(0,0,0,.5);
+  --doc-shadow-lg:0 16px 50px rgba(0,0,0,.6);
+}}
+:root[data-theme="dark"]{
+  --doc-bg:#000000; --doc-surface:#1d1d1f; --doc-surface-soft:#161617; --doc-surface-hover:#2c2c2e;
+  --doc-text:#f5f5f7; --doc-muted:#a1a1a6; --doc-subtle:#86868b;
+  --doc-border:#424245; --doc-border-muted:#2c2c2e; --doc-border-strong:#a1a1a6;
+  --doc-blue-deep:#64b5ff; --doc-blue-primary:#2997ff;
+  --doc-accent-bg:#0e2740; --doc-accent-border:#1e4a70; --doc-accent-contrast:#ffffff;
+  --doc-success:#2997ff; --doc-success-bg:#0e2740; --doc-success-border:#1e4a70;
+  --doc-warning:#ffb84d; --doc-warning-bg:#2a1c06; --doc-warning-border:#4d3d20;
+  --doc-danger:#ff453a; --doc-danger-bg:#2c0f0e; --doc-danger-border:#5c1f1c;
+  --doc-hero-a:#0a1420; --doc-hero-b:#0c1830; --doc-topbar-glass:rgba(0,0,0,.6);
+  --doc-shadow-sm:0 1px 2px rgba(0,0,0,.5); --doc-shadow-md:0 4px 20px rgba(0,0,0,.5);
+  --doc-shadow-lg:0 16px 50px rgba(0,0,0,.6);
+}
+:root{ color-scheme: light dark; }
+
+/* ---------- base ---------- */
+/* 🔴 배율은 `html` 과 `body` 두 곳에 겁니다 — 제목·캡션 다수는 `rem`(= html 기준)이고 본문은
+   `body` 의 px 라, 한쪽만 걸면 본문만 커지거나 제목만 커집니다. A−/A+ 컨트롤을 켜지 않은
+   문서는 `--doc-fs-scale` 이 없어 fallback 1 = 기본 크기 그대로입니다. */
+html{ font-size:calc(16px * var(--doc-fs-scale, 1)); }
+body{ font-size:calc(17px * var(--doc-fs-scale, 1)); line-height:1.5; letter-spacing:-.022em; padding-top:var(--doc-topbar-h); }
+/* 목차 = 플로팅(우상단)이라 좌측 컬럼 예약 없음 — 본문은 중앙 정렬 유지 */
+
+/* ---------- doc container: Apple 콘텐츠 컬럼 (카드 크롬 제거) ---------- */
+.doc{
+  max-width:860px; margin:0 auto; padding:8px 44px 80px;
+  background:transparent; border:none; border-radius:0; box-shadow:none;
+}
+@media (max-width:1100px){ .doc{ max-width:860px; padding:8px 24px 72px; } }
+
+/* ---------- sticky topbar ---------- */
+.doc-topbar{ position:fixed; top:0; left:0; right:0; z-index:50; height:var(--doc-topbar-h);
+  display:flex; align-items:center; gap:14px; padding:0 22px;
+  background:var(--doc-topbar-glass); -webkit-backdrop-filter:saturate(180%) blur(20px); backdrop-filter:saturate(180%) blur(20px);
+  border-bottom:1px solid var(--doc-border-muted); }
+.doc-topbar .crumb{ font-size:14px; color:var(--doc-muted); }
+.doc-topbar .crumb b{ color:var(--doc-text); font-weight:600; }
+.doc-topbar .sp{ flex:1; }
+.doc-topbar button{ width:34px; height:34px; border-radius:50%; display:grid; place-items:center;
+  background:transparent; border:1px solid transparent; color:var(--doc-muted); cursor:pointer; padding:0; }
+.doc-topbar button:hover{ background:var(--doc-surface); color:var(--doc-text); }
+.doc-topbar button svg{ width:18px; height:18px; }
+/* 글자 크기 컨트롤(opt-in) — 상단바 우측, 테마 버튼 왼쪽 */
+.doc-fs{ display:flex; align-items:center; gap:2px; }
+.doc-fs button{ width:auto; min-width:30px; height:28px; padding:0 8px; border-radius:14px;
+  font:600 13px/1 var(--doc-font-sans); }
+.doc-fs .fs-val{ min-width:46px; font-weight:500; font-size:12px; font-variant-numeric:tabular-nums; }
+.doc-fs button:disabled{ opacity:.35; cursor:default; background:transparent; color:var(--doc-muted); }
+
+/* ---------- hero band (JS 가 h1+doc-meta+lead 를 감쌈) ---------- */
+.doc-hero{ background:linear-gradient(150deg,var(--doc-hero-a),var(--doc-hero-b));
+  border-bottom:1px solid var(--doc-border-muted); padding:40px 0 30px; margin:0 0 4px; position:relative; overflow:hidden; }
+.doc-hero-inner{ max-width:860px; margin:0 auto; padding:0 44px; position:relative; z-index:1; }
+.doc-hero .eyebrow{ font-size:calc(12px * var(--doc-fs-scale, 1)); font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--doc-muted); margin:0 0 10px; }
+.doc-hero h1{ font-size:calc(40px * var(--doc-fs-scale, 1)); line-height:1.08; font-weight:700; letter-spacing:-.015em; margin:0 0 14px; border:none; padding:0; }
+.doc-hero .doc-meta{ margin:14px 0 0; border:none; padding:0; background:none; display:flex; flex-wrap:wrap; gap:0; font-size:calc(14px * var(--doc-fs-scale, 1)); color:var(--doc-muted); }
+.doc-hero .doc-meta > *{ padding:0 15px; border-left:1px solid var(--doc-border); margin:0; }
+.doc-hero .doc-meta > *:first-child{ padding-left:0; border-left:none; }
+.doc-hero .lead{ font-size:calc(19px * var(--doc-fs-scale, 1)); line-height:1.36; color:var(--doc-muted); font-weight:400; letter-spacing:-.012em; margin:0; max-width:56ch; }
+@media (max-width:1000px){ .doc-hero-inner{ padding:0 24px; } .doc-hero h1{ font-size:calc(34px * var(--doc-fs-scale, 1)); } }
+
+/* ---------- 본문 위계 (Apple 스케일) ---------- */
+.doc h1{ font-size:calc(34px * var(--doc-fs-scale, 1)); line-height:1.1; font-weight:700; letter-spacing:-.015em; border:none; padding:0; margin:0 0 14px; }
+.doc h2{ font-size:calc(26px * var(--doc-fs-scale, 1)); line-height:1.2; font-weight:700; letter-spacing:-.014em;
+  margin:40px 0 14px; padding-top:14px; border-top:1px solid var(--doc-border-muted); border-bottom:none; }
+.doc h2:first-of-type{ border-top:none; padding-top:0; margin-top:20px; }
+.doc h3{ font-size:calc(20px * var(--doc-fs-scale, 1)); line-height:1.26; font-weight:600; letter-spacing:-.01em; margin:26px 0 10px; }
+.doc h4{ font-size:calc(16px * var(--doc-fs-scale, 1)); line-height:1.4; font-weight:600; margin:20px 0 7px; }
+.doc p{ margin:0 0 13px; }
+.doc ul, .doc ol{ margin:0 0 13px; }
+.doc li{ margin:0 0 5px; }
+
+/* ---------- callouts: 3px 좌측선 + Apple radius (색은 토큰서) ---------- */
+.note, .case, .why, .ok, .warn, .caution{
+  border-left-width:3px; border-radius:0 var(--doc-r-md) var(--doc-r-md) 0;
+  padding:11px 16px; margin:15px 0; }
+.note > .label, .case > .label, .why > .label, .ok > .label, .warn > .label, .caution > .label{ font-size:calc(14px * var(--doc-fs-scale, 1)); }
+
+/* ---------- table: Apple hairline (heavy line 제거) ---------- */
+.doc table{ margin:15px 0; font-size:calc(15.5px * var(--doc-fs-scale, 1)); border-collapse:collapse; }
+.doc thead th{ border-top:none !important; border-bottom:1px solid var(--doc-border) !important;
+  background:transparent; font-weight:600; padding:8px 13px; }
+.doc tbody td{ border-bottom:1px solid var(--doc-border-muted) !important; padding:8px 13px; }
+.doc tbody tr:last-child td{ border-bottom:none !important; }
+
+/* ---------- code: Apple rounded surface ---------- */
+.doc pre{ background:var(--doc-surface); border:1px solid var(--doc-border-muted); border-radius:var(--doc-r-md);
+  padding:13px 16px; margin:15px 0; font-size:calc(13.5px * var(--doc-fs-scale, 1)); }
+.doc code{ background:var(--doc-surface); border-radius:6px; }
+
+/* ---------- density: 카드/통계 여백 축소 ---------- */
+.doc .grid{ gap:14px; margin:16px 0; }
+.doc .card{ border-radius:var(--doc-r-lg); padding:16px 20px; box-shadow:var(--doc-shadow-md); }
+.stat-band, .doc .stat-band{ gap:12px; margin:16px 0; }
+.hr, .doc hr{ margin:28px 0; }
+
+/* ---------- 플로팅 목차 (우상단 glass 패널 + 접기) ---------- */
+#doc-toc{ position:fixed; top:calc(var(--doc-topbar-h) + 16px); right:18px; width:250px;
+  max-height:calc(100vh - var(--doc-topbar-h) - 40px); overflow-y:auto; padding:13px 15px 15px; z-index:57;
+  background:var(--doc-topbar-glass); -webkit-backdrop-filter:saturate(180%) blur(20px); backdrop-filter:saturate(180%) blur(20px);
+  border:1px solid var(--doc-border-muted); border-radius:var(--doc-r-md); box-shadow:0 8px 28px rgba(0,0,0,.14);
+  transition:width .2s ease, height .2s ease, padding .2s ease; }
+#doc-toc .doc-toc-head{ font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--doc-subtle); margin:0 0 10px; padding-right:26px; }
+#doc-toc nav{ display:flex; flex-direction:column; gap:1px; }
+#doc-toc a{ display:block; padding:5px 9px; border-radius:8px; color:var(--doc-muted); text-decoration:none;
+  font-size:13.5px; line-height:1.35; letter-spacing:-.006em;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; transition:background .12s,color .12s; }
+#doc-toc a:hover{ background:var(--doc-surface); color:var(--doc-text); }
+#doc-toc a.active{ background:var(--doc-surface); color:var(--doc-accent); font-weight:600; }
+#doc-toc a.lvl3{ padding-left:22px; font-size:12.5px; }
+#doc-toc .doc-toc-toggle{ position:absolute; top:9px; right:9px; width:26px; height:26px; display:grid; place-items:center;
+  background:transparent; border:none; border-radius:7px; color:var(--doc-muted); cursor:pointer; padding:0; }
+#doc-toc .doc-toc-toggle svg{ width:16px; height:16px; }
+#doc-toc .doc-toc-toggle:hover{ background:var(--doc-surface); color:var(--doc-accent); }
+#doc-toc.collapsed{ width:42px; height:42px; padding:0; overflow:hidden; }
+#doc-toc.collapsed .doc-toc-head, #doc-toc.collapsed nav{ display:none; }
+#doc-toc.collapsed .doc-toc-toggle{ top:0; right:0; width:42px; height:42px; border-radius:var(--doc-r-md); }
+@media (max-width:900px){ #doc-toc{ display:none; } }
+
+/* ---------- 메모지 + floating (크게·크기조정) ---------- */
+.doc-fab{ position:fixed; right:22px; bottom:22px; z-index:60; display:flex; flex-direction:column-reverse; gap:12px; align-items:center; }
+.doc-fab button{ width:52px; height:52px; border-radius:50%; display:grid; place-items:center;
+  background:var(--doc-surface); color:var(--doc-muted); border:1px solid var(--doc-border-muted);
+  box-shadow:var(--doc-shadow-md); cursor:pointer; padding:0; transition:transform .12s,color .15s,border-color .15s; }
+.doc-fab button:hover{ color:var(--doc-accent); border-color:var(--doc-accent); transform:translateY(-2px); }
+.doc-fab button svg{ width:23px; height:23px; }
+.doc-fab .doc-note-btn.open{ background:var(--doc-accent); color:#fff; border-color:var(--doc-accent); }
+.doc-notepad{ position:fixed; right:22px; bottom:86px; z-index:59;
+  width:440px; max-width:calc(100vw - 44px); min-width:300px; min-height:300px;
+  max-height:calc(100vh - var(--doc-topbar-h) - 104px);
+  display:flex; flex-direction:column; resize:none; overflow:hidden;
+  background:color-mix(in srgb, var(--doc-surface) 90%, transparent);
+  -webkit-backdrop-filter:saturate(180%) blur(24px); backdrop-filter:saturate(180%) blur(24px);
+  border:1px solid var(--doc-border); border-radius:var(--doc-r-lg); box-shadow:var(--doc-shadow-lg);
+  opacity:0; transform:translateY(10px) scale(.985); pointer-events:none; transition:opacity .2s,transform .2s cubic-bezier(.2,.7,.3,1); }
+.doc-notepad.open{ opacity:1; transform:none; pointer-events:auto; }
+/* 좌상단 리사이즈 핸들 — 우하단 고정이라 좌상단으로 확대 */
+.doc-notepad-resize{ position:absolute; top:0; left:0; width:20px; height:20px; z-index:2;
+  cursor:nwse-resize; touch-action:none; }
+.doc-notepad-resize::before{ content:""; position:absolute; top:6px; left:6px; width:7px; height:7px;
+  border-top:2px solid var(--doc-subtle); border-left:2px solid var(--doc-subtle); border-top-left-radius:3px;
+  transition:border-color .12s; }
+.doc-notepad-resize:hover::before{ border-color:var(--doc-accent); }
+.doc-notepad-head{ display:flex; align-items:center; gap:9px; padding:14px 16px; border-bottom:1px solid var(--doc-border-muted); font-size:15px; font-weight:600; flex:none; }
+.doc-notepad-head .t{ display:flex; align-items:center; gap:8px; }
+.doc-notepad-head svg{ width:16px; height:16px; color:var(--doc-accent); }
+.doc-notepad-head .doc-saved{ margin-left:auto; font-size:12px; font-weight:400; color:var(--doc-subtle); }
+.doc-notepad textarea{ flex:1; border:none; resize:none; padding:16px; background:transparent; color:var(--doc-text);
+  font-family:var(--doc-font-mono); font-size:15px; line-height:1.6; outline:none; width:100%; min-height:150px; }
+.doc-notepad textarea::placeholder{ color:var(--doc-subtle); }
+.doc-notepad-foot{ display:flex; gap:10px; padding:12px 16px; border-top:1px solid var(--doc-border-muted); flex:none; }
+.doc-notepad-foot button{ flex:1; padding:9px 12px; border-radius:10px; cursor:pointer; font-size:14px; font-weight:500;
+  font-family:var(--doc-font-sans); border:1px solid var(--doc-border); background:var(--doc-surface); color:var(--doc-text);
+  display:inline-flex; align-items:center; justify-content:center; gap:7px; transition:background .12s,border-color .12s,color .12s; }
+.doc-notepad-foot button svg{ width:15px; height:15px; }
+.doc-notepad-foot .doc-note-copy{ background:var(--doc-accent); color:#fff; border-color:var(--doc-accent); }
+.doc-notepad-foot .doc-note-clear:hover{ border-color:var(--doc-danger); color:var(--doc-danger); }
+@media print{ .doc-fab, .doc-notepad, #doc-toc, .doc-topbar{ display:none !important; } }
+
+/* ---------- quiz (이해 점검 — 상세 기술/원리 설명) ---------- */
+.doc-quiz{ border:1px solid var(--doc-border-muted); border-radius:var(--doc-r-lg);
+  background:var(--doc-surface); padding:20px 22px; margin:26px 0; }
+.doc-quiz > .doc-quiz-title:first-child{ margin-top:0; }
+.doc-quiz-title{ font-size:calc(18px * var(--doc-fs-scale, 1)); font-weight:600; margin:0 0 4px; border:none; padding:0; }
+.doc-quiz-sub{ margin:0 0 16px; font-size:calc(14px * var(--doc-fs-scale, 1)); color:var(--doc-muted); }
+.doc-quiz-list{ list-style:none; margin:0; padding:0; counter-reset:docq; }
+.doc-q{ margin:0 0 18px; padding:0 0 18px; border-bottom:1px solid var(--doc-border-muted); counter-increment:docq; }
+.doc-q:last-child{ border-bottom:none; padding-bottom:0; margin-bottom:0; }
+.doc-q-stem{ font-weight:600; margin:0 0 11px; }
+.doc-q-stem::before{ content:"Q" counter(docq) ". "; color:var(--doc-accent); font-weight:700; }
+.doc-q-opts{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
+.doc-q-opts > li{ padding:10px 14px; border:1px solid var(--doc-border); border-radius:10px;
+  cursor:pointer; font-size:calc(15px * var(--doc-fs-scale, 1)); line-height:1.4; display:flex; align-items:center; gap:11px;
+  transition:background .12s,border-color .12s,color .12s; }
+.doc-q-opts > li::before{ content:""; width:15px; height:15px; border-radius:50%;
+  border:1.5px solid var(--doc-subtle); flex:none; box-sizing:border-box; }
+.doc-q-opts > li:hover{ border-color:var(--doc-accent); background:var(--doc-surface-hover); }
+.doc-q.answered .doc-q-opts > li{ cursor:default; }
+.doc-q.answered .doc-q-opts > li:hover:not(.correct):not(.wrong){ border-color:var(--doc-border); background:transparent; }
+.doc-q-opts > li.correct{ border-color:var(--doc-success); background:var(--doc-accent-bg); color:var(--doc-text); }
+.doc-q-opts > li.correct::before{ border-color:var(--doc-success); background:var(--doc-success); box-shadow:inset 0 0 0 2.5px var(--doc-surface); }
+.doc-q-opts > li.wrong{ border-color:var(--doc-danger); background:var(--doc-danger-bg); }
+.doc-q-opts > li.wrong::before{ border-color:var(--doc-danger); background:var(--doc-danger); box-shadow:inset 0 0 0 2.5px var(--doc-surface); }
+.doc-q-explain{ margin:11px 0 0; padding:11px 14px; font-size:calc(14px * var(--doc-fs-scale, 1)); line-height:1.5;
+  border-left:3px solid var(--doc-accent); background:var(--doc-accent-bg);
+  border-radius:0 8px 8px 0; display:none; }
+.doc-q.answered .doc-q-explain{ display:block; }
+.doc-quiz-score{ margin:16px 0 0; font-size:calc(15px * var(--doc-fs-scale, 1)); font-weight:600; color:var(--doc-accent); min-height:1.2em; }
+
+/* ---------- 연작(series) 네비 — 문서를 여러 장으로 나눴을 때 (선택) ----------
+   .doc-series      상단 sticky 장 목록. 현재 장에 aria-current="page" 를 답니다.
+   .doc-series-nav  본문 끝의 이전/다음. 제목까지 적어야 갈지 말지 정할 수 있습니다.
+   둘 다 링크만으로 동작합니다(스크립트 불필요).
+   장 목록을 직접 만든 문서는 `<body data-no-toc>` 로 공유 플로팅 목차를 끄세요 — 안 끄면 겹칩니다. */
+.doc-series{
+  position:sticky; top:0; z-index:60;
+  display:flex; align-items:center; gap:.5rem;
+  flex-wrap:nowrap; overflow-x:auto; scrollbar-width:thin;
+  background:var(--doc-bg); border-bottom:1px solid var(--doc-border);
+  padding:7px max(16px, calc((100vw - 1180px) / 2));
+}
+.doc-series .home{
+  flex:0 0 auto; font-weight:700; color:var(--doc-accent); text-decoration:none;
+  font-size:.92rem; white-space:nowrap;
+  padding-right:.6rem; border-right:1px solid var(--doc-border);
+}
+.doc-series a.ch{
+  flex:0 0 auto; display:inline-flex; align-items:center; gap:.35em;
+  padding:4px 9px; border-radius:var(--doc-r-pill);
+  color:var(--doc-subtle); text-decoration:none;
+  font-size:.82rem; font-weight:600; white-space:nowrap; border:1px solid transparent;
+}
+.doc-series a.ch .n{
+  display:inline-flex; align-items:center; justify-content:center;
+  min-width:1.5em; height:1.5em; border-radius:var(--doc-r-pill);
+  background:var(--doc-surface-hover); color:var(--doc-muted);
+  font-size:.78em; font-weight:700;
+}
+.doc-series a.ch:hover{ background:var(--doc-surface-hover); color:var(--doc-text); }
+.doc-series a.ch[aria-current="page"]{
+  background:var(--doc-accent-bg); color:var(--doc-accent); border-color:var(--doc-accent-border);
+}
+.doc-series a.ch[aria-current="page"] .n{ background:var(--doc-accent); color:#fff; }
+
+.doc-series-nav{
+  display:flex; justify-content:space-between; gap:var(--doc-sp-4);
+  margin:var(--doc-sp-8) 0 var(--doc-sp-6);
+  border-top:1px solid var(--doc-border); padding-top:var(--doc-sp-5);
+}
+.doc-series-nav a{
+  display:flex; flex-direction:column; gap:2px; text-decoration:none;
+  padding:var(--doc-sp-3) var(--doc-sp-4);
+  border:1px solid var(--doc-border); border-radius:var(--doc-r-md);
+  background:var(--doc-surface); min-width:0; flex:1 1 0;
+}
+.doc-series-nav a:hover{ border-color:var(--doc-accent-border); background:var(--doc-surface-hover); }
+.doc-series-nav a.next{ text-align:right; }
+.doc-series-nav .dir{ font-size:var(--doc-fs-xs); color:var(--doc-subtle); font-weight:600; }
+.doc-series-nav .ttl{ color:var(--doc-text); font-weight:600; }
+@media print{ .doc-series, .doc-series-nav{ display:none; } }

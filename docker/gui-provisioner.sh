@@ -110,6 +110,7 @@ actual_bundle_sha="$(sha256sum "$AIRLOCK_GUI_BUNDLE" | awk '{print $1}')"
 scratch="$(mktemp -d /run/airlock-gui-extract.XXXXXX)" || die "could not create extraction directory"
 auth_cleanup=""
 release_staging=""
+workspace_staging=""
 cleanup() {
   rm -rf "$scratch"
   [ -z "$auth_cleanup" ] || rm -f "$auth_cleanup"
@@ -118,6 +119,11 @@ cleanup() {
     /opt/airlock-gui/releases/.*) rm -rf -- "$release_staging" ;;
     '') ;;
     *) say "refusing unsafe release-staging cleanup path: $release_staging" ;;
+  esac
+  case "$workspace_staging" in
+    */workspace/.airlock.*.staging) rm -rf -- "$workspace_staging" ;;
+    '') ;;
+    *) say "refusing unsafe workspace-staging cleanup path: $workspace_staging" ;;
   esac
 }
 trap cleanup EXIT
@@ -145,6 +151,26 @@ fi
 if [ ! -f "$catalog" ] || [ -L "$catalog" ]; then
   die "GUI catalog is missing or unsafe"
 fi
+harness_provenance="$payload/docker/student-harness-provenance.json"
+harness_installer="$payload/install/install-student-harness.py"
+if [ ! -f "$harness_provenance" ] || [ -L "$harness_provenance" ] \
+  || [ ! -f "$harness_installer" ] || [ -L "$harness_installer" ]; then
+  die "student harness payload is missing or unsafe"
+fi
+harness_meta="$(python3 - "$manifest" <<'PY'
+import json, re, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+path = d.get("harness_provenance_path", "")
+digest = d.get("harness_provenance_sha256", "")
+if path != "docker/student-harness-provenance.json" or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+    raise SystemExit("bad student harness manifest binding")
+print(digest)
+PY
+)" || die "bundle does not bind the student harness provenance"
+[ "$(sha256sum "$harness_provenance" | awk '{print $1}')" = "$harness_meta" ] \
+  || die "student harness provenance digest does not match the bundle manifest"
+python3 "$harness_installer" --check >/dev/null \
+  || die "student harness projection does not match its pinned provenance"
 selection_helper="$payload/docker/gui_selection.py"
 if [ ! -f "$selection_helper" ] || [ -L "$selection_helper" ]; then
   die "GUI selection validator is missing or unsafe"
@@ -221,7 +247,9 @@ if [ -e "$release" ]; then
     || [ ! -f "$release/docker/gui-default-profile.json" ] \
     || [ ! -f "$release/docker/gui-catalog.json" ] \
     || [ ! -f "$release/docker/gui_selection.py" ] \
-    || [ ! -f "$release/install/airlock-install.sh" ]; then
+    || [ ! -f "$release/install/airlock-install.sh" ] \
+    || [ ! -f "$release/install/install-student-harness.py" ] \
+    || [ ! -f "$release/install/install-agent-tools.sh" ]; then
     die "existing release is incomplete: $release"
   fi
   cmp -s "$release/gui-provisioner-manifest.json" "$manifest" \
@@ -232,6 +260,11 @@ if [ -e "$release" ]; then
   existing_catalog_sha="$(sha256sum "$release/docker/gui-catalog.json" 2>/dev/null | awk '{print $1}')"
   expected_catalog_sha="$(sha256sum "$catalog" | awk '{print $1}')"
   [ "$existing_catalog_sha" = "$expected_catalog_sha" ] || die "existing release catalog differs from the bundle"
+  existing_harness_sha="$(sha256sum "$release/docker/student-harness-provenance.json" 2>/dev/null | awk '{print $1}')"
+  [ "$existing_harness_sha" = "$harness_meta" ] \
+    || die "existing release student harness provenance differs from the bundle"
+  python3 "$release/install/install-student-harness.py" --check >/dev/null \
+    || die "existing release student harness projection is incomplete or changed"
 else
   install -d -m 0755 /opt/airlock-gui/releases
   release_staging="$(mktemp -d "/opt/airlock-gui/releases/.${source_sha}.XXXXXX")" \
@@ -257,8 +290,31 @@ uid="$(id -u "$user")"
 usermod -aG sudo "$user"
 printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" > "/etc/sudoers.d/90-$user"
 chmod 0440 "/etc/sudoers.d/90-$user"
-install -d -o "$user" -g "$user" -m 0755 "$home/code"
-chown -R "$user:$user" "$release"
+workspace="$home/workspace"
+workspace_repo="$workspace/airlock"
+if [ -L "$workspace" ] || { [ -e "$workspace" ] && [ ! -d "$workspace" ]; }; then
+  die "workspace path is unsafe: $workspace"
+fi
+install -d -o "$user" -g "$user" -m 0755 "$workspace"
+workspace_staging="$workspace/.airlock.${source_sha}.$$.staging"
+[ ! -e "$workspace_staging" ] && [ ! -L "$workspace_staging" ] \
+  || die "workspace staging path already exists: $workspace_staging"
+cp -a "$release" "$workspace_staging" || die "could not stage the Airlock workspace checkout"
+chown -R "$user:$user" "$workspace_staging"
+workspace_backup=""
+if [ -e "$workspace_repo" ] || [ -L "$workspace_repo" ]; then
+  checkout_backups="$home/.local/state/airlock/checkout-backups"
+  install -d -o "$user" -g "$user" -m 0700 "$checkout_backups"
+  workspace_backup="$checkout_backups/$(date -u +%Y%m%dT%H%M%S.%NZ)-$source_sha"
+  mv "$workspace_repo" "$workspace_backup" \
+    || die "could not back up the previous Airlock workspace"
+fi
+if ! mv "$workspace_staging" "$workspace_repo"; then
+  [ -z "$workspace_backup" ] || mv "$workspace_backup" "$workspace_repo" || true
+  die "could not publish the Airlock workspace checkout"
+fi
+workspace_staging=""
+source_root="$workspace_repo"
 
 loginctl enable-linger "$user" || die "could not enable linger for $user"
 systemctl start "user@${uid}.service" || die "could not start user manager for $user"
@@ -271,7 +327,7 @@ systemctl is-active --quiet "user@${uid}.service" || die "user manager is not ac
 emit account-ready user "$user"
 
 bootstrap_config="/run/airlock-gui-bootstrap.toml"
-"$release/bin/airlock-config" init \
+"$source_root/bin/airlock-config" init \
   --owner bootstrap@example.invalid \
   --site-name "$AIRLOCK_GUI_HOSTNAME" \
   --apps "$install_apps" > "$bootstrap_config" || die "could not generate bootstrap config"
@@ -280,7 +336,7 @@ chown "$user:$user" "$bootstrap_config"
 say "executing the selected manifests' prerequisite fixes"
 set_failure prerequisites prerequisite-failed "선택한 앱에 필요한 프로그램을 준비하지 못했습니다." "인터넷 연결을 확인한 뒤 다시 시도해 주세요." /var/log/airlock-gui-prerequisites.log
 fixes="$(su - "$user" -c \
-  "cd '$release' && AIRLOCK_CONFIG='$bootstrap_config' python3 bin/airlock-config prereqs" \
+  "cd '$source_root' && AIRLOCK_CONFIG='$bootstrap_config' python3 bin/airlock-config prereqs" \
   | awk -F '\t' 'NF >= 5 && $5 != "" && $5 != "-" {print $5}' | sort -u)" \
   || die "could not resolve manifest prerequisites"
 [ -n "$fixes" ] || die "selected manifests returned no prerequisite fixes"
@@ -383,23 +439,41 @@ emit tailnet-ready fqdn "$fqdn"
 
 set_failure configuration config-generation-failed "선택한 앱 설정을 만들지 못했습니다." "앱 선택을 확인한 뒤 다시 시도해 주세요."
 config="$home/airlock.toml"
-"$release/bin/airlock-config" init \
+"$source_root/bin/airlock-config" init \
   --owner "$owner" --site-name "$AIRLOCK_GUI_HOSTNAME" --apps "$install_apps" > "$config" \
   || die "could not generate final Airlock config"
 chown "$user:$user" "$config"
-actual_apps="$(AIRLOCK_CONFIG="$config" "$release/bin/airlock-config" apps | paste -sd, -)"
-expected_apps="$(AIRLOCK_CONFIG="$bootstrap_config" "$release/bin/airlock-config" apps | paste -sd, -)"
+actual_apps="$(AIRLOCK_CONFIG="$config" "$source_root/bin/airlock-config" apps | paste -sd, -)"
+expected_apps="$(AIRLOCK_CONFIG="$bootstrap_config" "$source_root/bin/airlock-config" apps | paste -sd, -)"
 [ "$actual_apps" = "$expected_apps" ] || die "generated config app set drifted: got $actual_apps, expected $expected_apps"
 
 emit installer-start source_sha "$source_sha"
 install_log=/var/log/airlock-gui-install.log
 set_failure installer stock-installer-failed "Airlock 앱 설치를 끝내지 못했습니다." "다시 시도해 주세요. 계속 실패하면 자세히의 오류 코드와 설치 기록을 담당자에게 보여 주세요." "$install_log"
 if ! su - "$user" -c \
-  "cd '$release' && export AIRLOCK_CONFIG='$config' XDG_RUNTIME_DIR='/run/user/$uid' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/$uid/bus'; bash install/airlock-install.sh" \
+  "cd '$source_root' && export AIRLOCK_CONFIG='$config' XDG_RUNTIME_DIR='/run/user/$uid' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/$uid/bus'; bash install/airlock-install.sh" \
   >"$install_log" 2>&1; then
   tail -80 "$install_log" >&2
   die "stock installer failed (full log: $install_log)"
 fi
+
+emit harness-start home "$home"
+agent_tools_log=/var/log/airlock-gui-agent-tools.log
+set_failure harness agent-tools-failed "AI 개발 도구를 준비하지 못했습니다." "자세히의 오류 코드와 설치 기록을 담당자에게 보여 주세요." "$agent_tools_log"
+if ! bash "$source_root/install/install-agent-tools.sh" "$user" >"$agent_tools_log" 2>&1; then
+  tail -80 "$agent_tools_log" >&2
+  die "agent tool install failed (full log: $agent_tools_log)"
+fi
+
+harness_log=/var/log/airlock-gui-harness.log
+set_failure harness harness-install-failed "에이전트 기본 설정을 놓지 못했습니다." "다시 시도해 주세요. 계속 실패하면 자세히의 오류 코드와 설치 기록을 담당자에게 보여 주세요." "$harness_log"
+if ! runuser -u "$user" -- env HOME="$home" \
+    python3 "$source_root/install/install-student-harness.py" --home "$home" --fqdn "$fqdn" \
+    >"$harness_log" 2>&1; then
+  tail -80 "$harness_log" >&2
+  die "student harness install failed (full log: $harness_log)"
+fi
+emit harness-ready home "$home"
 
 install -d -m 0755 /var/lib/airlock-gui-provisioner
 STATE_PATH=/var/lib/airlock-gui-provisioner/state.json \

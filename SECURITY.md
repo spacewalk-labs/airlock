@@ -8,7 +8,8 @@ a caller gets remote code execution as the box owner.
 The rest of the suite sits one tier down, reachable by the configured
 **collaborators** as well — including read **and write** access to files. See
 [Two tiers, and what a collaborator actually gets](#two-tiers-and-what-a-collaborator-actually-gets)
-before you add a collaborator — fileview serves the whole account to them.
+before you add a collaborator — fileview serves the whole of that account's home to
+them, which is where its credentials are.
 
 An admitted package's `install.sh` runs arbitrary bash as the operator, including sudo (D4).
 A package that is admitted at all can therefore edit config, write system files and bind
@@ -106,16 +107,30 @@ settable key at all: the only way to serve collaborators is to say so. This is
 deliberately fail-closed — reach used to be an accident of being inside the hub
 server, which meant a package could widen its own audience by omission.
 
-- **fileview → the whole filesystem, `owner` by default.** filebrowser runs with
-  `--root /` and serves it read **and write**. There is no root setting to point
-  somewhere narrower: `[paths].code_root` is retired (`bin/airlock-config`'s
-  `RETIRED_KEYS` says so and tells you to delete the line). **The boundary is the
-  unix account the user service runs as** — `/etc` and `/var/log` read, `/root`
-  does not, and everything the owner's own account can write is writable here. That
-  is why fileview declares `audience = "owner"`: a whole-filesystem read/write
-  surface is not something a box hands to a collaborator by inheriting the hub tier.
-  Setting `[apps.fileview] audience = "shared"` opens it, and everything below is
-  what you are accepting when you do.
+- **fileview → the account's whole home, `owner` by default.** filebrowser runs with
+  `--root %h` and serves that home read **and write**. There is no root setting: the
+  root is systemd's specifier for the running account's home, and `[paths].code_root`
+  stays retired (`bin/airlock-config`'s `RETIRED_KEYS` says so and tells you to delete
+  the line). **Two boundaries, and both hold.** The outer one is the unix account the
+  user service runs as — the kernel draws it, the app cannot express it. The inner one
+  is `--root`: nothing above home is addressable, over `..` chains, encoded `..`,
+  absolute paths, or symlinks that leave the tree (measured against the pinned binary
+  by `install/test-fileview-home-scope.sh`, with a positive control reading a file
+  inside home in the same server). Everything the owner's own account can write
+  **inside home** is writable here.
+
+  **This changed on 2026-09-04, and the earlier reasoning is kept rather than
+  deleted.** fileview served `--root /` deliberately: with no boundary of its own to
+  get wrong, the unix account was the whole boundary and could not be misconfigured.
+  That is still true of the outer boundary. The operator then chose a hard home scope
+  — home visible, above home not visible at all — so the app now carries an inner
+  boundary as well, and it is asserted by tests rather than by this paragraph.
+
+  That is why fileview declares `audience = "owner"`: a whole-home read/write surface
+  is not something a box hands to a collaborator by inheriting the hub tier, and
+  narrowing the root does not change that — `~/.ssh` and every agent credential are
+  inside home. Setting `[apps.fileview] audience = "shared"` opens it, and everything
+  below is what you are accepting when you do.
 
   **Nothing is hidden.** No ignore list, no dotfile rule, no exclusion mechanism.
   `.env` lists, opens, edits and saves through exactly the same path as any other
@@ -155,18 +170,20 @@ Consequences to plan around:
   owner runs what is in that tree is also an execution path. The `owner` default
   breaks this chain: it takes an explicit `audience = "shared"` to reach it. If that
   is not what you mean, do not open fileview's audience.
-- **Scope is the service account, and only the service account.** fileview runs as a
-  `systemctl --user` unit with no `User=` of its own, so it reaches exactly what the
-  installing account reaches — the kernel draws that line and the app cannot express
-  it, so there is no setting to get wrong. Measured on one box: `~/.ssh/id_ed25519`
-  and `~/.claude/.credentials.json` are readable **and writable**; `/etc/passwd` is
-  readable; `/etc/shadow` and `/var/log/syslog` are not. If that reach is wrong for
-  a box, the lever is which account installs it — not a path, and not a config key.
+- **Scope is the service account's home, and only that.** fileview runs as a
+  `systemctl --user` unit with no `User=` of its own, so it runs as the installing
+  account and serves that account's home — the kernel draws the outer line, `%h`
+  follows the same account, and neither is a setting to get wrong. Measured on one
+  box: `~/.ssh/id_ed25519` and `~/.claude/.credentials.json` are readable **and
+  writable**; `/etc/passwd` is readable *to the account* but is **not addressable
+  through fileview**, and neither is anything else above home. If that reach is wrong
+  for a box, the lever is which account installs it — not a path, and not a config
+  key.
 - **`~/.devterm-secrets` is no longer out of reach.** The secret drop used to be
   described as "deliberately not under `code_root`". That sentence died with
-  `code_root`: the viewer reaches every directory the account reaches, so what
-  protects those files is their mode (`0700`/`0600`) and their TTL, and placement
-  protects nothing.
+  `code_root`, and the home scope does not revive it: the drop is in home, so the
+  viewer reaches it. What protects those files is their mode (`0700`/`0600`) and
+  their TTL; placement protects nothing.
 - **Disabling an app does not retract it — but the ledger does.** The sentence that
   stood here predates the installed-state ledger. Today `install/airlock-install.sh`
   runs `bin/airlock-ledger plan` on every run, and a committed app whose package
@@ -204,11 +221,12 @@ It is **on by default** when devterm is enabled, so here is exactly what that me
 
 Two boundaries worth stating plainly:
 
-- **Its protection is the mode and the TTL, not its location.** fileview serves the
-  filesystem read **and write** to the owner *and* every collaborator, so there is no
-  directory a secret could be written to that a file viewer could not reach. This
-  bullet used to say the drop sits outside `code_root`; that stopped being true when
-  the viewer stopped having a root.
+- **Its protection is the mode and the TTL, not its location.** The drop lives at
+  `~/.devterm-secrets`, which is inside the tree fileview serves read **and write**,
+  so moving it does not protect it. This bullet used to say the drop sits outside
+  `code_root`; that stopped being true when the viewer stopped having a configurable
+  root, and the home scope does not bring it back — home is exactly where the drop
+  is.
 - **An `export` outlives the file.** Once a value is exported into a shell it lives in
   that shell and every child process, regardless of the TTL. The UI says so at the point
   of the click; the TTL protects the file, not your environment.

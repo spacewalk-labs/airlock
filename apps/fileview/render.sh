@@ -6,6 +6,9 @@
 # moves (P1b).
 
 # render_fileview_unit_filebrowser FB_PORT FB_BIN FB_DB
+# The heredoc below is UNQUOTED (it interpolates the three arguments), so no comment
+# inside it may carry a backtick — it would run as a command at install time, which
+# is how three words once vanished from every rendered paseo unit.
 render_fileview_unit_filebrowser() {
   local FB_PORT="$1" FB_BIN="$2" FB_DB="$3"
   cat <<UNIT
@@ -20,16 +23,21 @@ Type=simple
 # before ExecStart, so on a box with no leftover filebrowser directory the service
 # never started at all. Boxes that had one hid the bug.
 WorkingDirectory=%h/.config/airlock-fileview
-# --root /: the tree is the filesystem. There is no configured boundary any more —
-# what bounds this is the unix account the user service runs as (see SECURITY.md).
+# --root %h: the tree is the home directory of the account this user service runs
+# as, and nothing above it is served. %h is systemd's own specifier for that
+# account's home — it is not a value anybody chooses, which is what keeps this from
+# becoming the config key paths.code_root used to be (see SECURITY.md).
+# TWO boundaries now, and both are needed: the account still bounds what the process
+# could reach at all (the kernel draws that line), and --root bounds what the server
+# will address inside it. --followExternalSymlinks=false is what closes the third
+# door: a symlink pointing out of home answers 403 rather than following.
 # --disableTypeDetectionByHeader: without it, building a directory listing OPENS
 # every file whose MIME the extension does not settle, to read its first bytes.
 # Measured with strace on the pinned binary — one listing of three extension-less
 # files: 3 opens with detection on, 0 with this flag, 0 with it off in the stored
-# config (so the flag does override the config). Under --root / that is a listing of
-# /dev opening device nodes. The viewer decides how to render by extension anyway,
-# so the server-side sniff buys nothing and costs that.
-ExecStart=${FB_BIN} --database ${FB_DB} --root / --address 127.0.0.1 --port ${FB_PORT} --followExternalSymlinks=false --disableTypeDetectionByHeader
+# config (so the flag does override the config). The viewer decides how to render by
+# extension anyway, so the server-side sniff buys nothing and costs that.
+ExecStart=${FB_BIN} --database ${FB_DB} --root %h --address 127.0.0.1 --port ${FB_PORT} --followExternalSymlinks=false --disableTypeDetectionByHeader
 Restart=on-failure
 RestartSec=3
 

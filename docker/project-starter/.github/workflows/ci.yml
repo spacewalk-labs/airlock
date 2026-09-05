@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # 기본값 360분(6시간)이라 걸리면 잡 하나가 $2.16 을 태운다.
+    # 이 값은 실측 기반이다 — 이 레포 최근 성공 잡 p95 의 3배(표본 없으면 60분).
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      # ── 시크릿 스캔은 프로젝트 초기화 여부와 무관하게 항상 돈다 ──
+      # AI 도구가 co-author 인 커밋의 시크릿 유출률은 GitHub 평균의 약 2배다.
+      #
+      # ⚠️ gitleaks/gitleaks-action 은 쓰지 않는다 — organization 계정에는 유료 라이선스를
+      #    요구해서 (`missing gitleaks license`) CI 가 무조건 실패한다.
+      #    gitleaks CLI 자체는 MIT 이므로 릴리스 바이너리를 직접 받아 쓴다.
+      #
+      # 범위: 작업 트리(dir) — 매 push 마다 전체 이력을 훑지 않는다.
+      #       전체 이력은 secret-sweep.yml(주간 TruffleHog)이 담당한다.
+      - name: Secret scan (gitleaks)
+        run: |
+          set -euo pipefail
+          VER=$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)
+          echo "gitleaks $VER"
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/${VER}/gitleaks_${VER#v}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks dir . --redact --no-banner --exit-code 1
+
+      - name: Check if project is initialized
+        id: check
+        run: |
+          if [ ! -f "package.json" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "⏭️ package.json 없음 — setup.sh 실행 전 템플릿 상태. 빌드 검증 스킵."
+          fi
+
+      - uses: pnpm/action-setup@v6
+        if: steps.check.outputs.skip != 'true'
+        with:
+          version: latest
+      - uses: actions/setup-node@v6
+        if: steps.check.outputs.skip != 'true'
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+        if: steps.check.outputs.skip != 'true'
+
+      # 순서에 의미가 있다: 싼 검사부터 → 실패를 빨리 알린다.
+      - name: Typecheck
+        if: steps.check.outputs.skip != 'true'
+        run: pnpm typecheck
+
+      - name: Lint
+        if: steps.check.outputs.skip != 'true'
+        run: pnpm lint
+
+      - name: Unit tests (Vitest)
+        if: steps.check.outputs.skip != 'true'
+        run: pnpm test -- --run
+
+      - name: Build
+        if: steps.check.outputs.skip != 'true'
+        run: pnpm build
+
+  e2e:
+    runs-on: ubuntu-latest
+    # 기본값 360분(6시간)이라 걸리면 잡 하나가 $2.16 을 태운다.
+    # 이 값은 실측 기반이다 — 이 레포 최근 성공 잡 p95 의 3배(표본 없으면 60분).
+    timeout-minutes: 15
+    needs: verify
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check if e2e is set up
+        id: check
+        run: |
+          if [ ! -f "playwright.config.ts" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "⏭️ playwright.config.ts 없음 — E2E 미설정. 스킵."
+          fi
+
+      - uses: pnpm/action-setup@v6
+        if: steps.check.outputs.skip != 'true'
+        with:
+          version: latest
+      - uses: actions/setup-node@v6
+        if: steps.check.outputs.skip != 'true'
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+        if: steps.check.outputs.skip != 'true'
+      - run: pnpm exec playwright install --with-deps chromium
+        if: steps.check.outputs.skip != 'true'
+      - run: pnpm test:e2e
+        if: steps.check.outputs.skip != 'true'
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() && steps.check.outputs.skip != 'true' }}
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

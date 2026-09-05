@@ -32,6 +32,13 @@ install -m 0644 "$HERE/gui_installer_core.py" "$repo/docker/gui_installer_core.p
 install -m 0644 "$HERE/gui_selection.py" "$repo/docker/gui_selection.py"
 install -m 0644 "$HERE/org.airlock.Installer.desktop" "$repo/docker/org.airlock.Installer.desktop"
 install -m 0644 "$HERE/org.airlock.Installer.policy" "$repo/docker/org.airlock.Installer.policy"
+rm -rf "$repo/docker/student-harness" "$repo/docker/project-starter"
+cp -a "$HERE/student-harness" "$repo/docker/student-harness"
+cp -a "$HERE/project-starter" "$repo/docker/project-starter"
+install -m 0644 "$HERE/student-harness-provenance.json" "$repo/docker/student-harness-provenance.json"
+install -m 0644 "$ROOT/install/install-student-harness.py" "$repo/install/install-student-harness.py"
+install -m 0644 "$ROOT/install/install-agent-tools.sh" "$repo/install/install-agent-tools.sh"
+install -m 0644 "$ROOT/install/check-internal-leaks.sh" "$repo/install/check-internal-leaks.sh"
 # Development runs happen before these files have a repository revision. Make that
 # exact candidate a temporary commit so the builder still consumes committed bytes;
 # after merge this also proves omission of the guest runner from the archive.
@@ -40,6 +47,9 @@ git -C "$repo" add docker/build-gui-provisioner-bundle.sh docker/gui-default-pro
   docker/gui-provisioner-entrypoint.sh docker/gui-installer.py docker/gui_installer_core.py
 git -C "$repo" add docker/gui_selection.py
 git -C "$repo" add docker/org.airlock.Installer.desktop docker/org.airlock.Installer.policy
+git -C "$repo" add docker/student-harness docker/project-starter \
+  docker/student-harness-provenance.json install/install-student-harness.py \
+  install/install-agent-tools.sh install/check-internal-leaks.sh
 if ! git -C "$repo" diff --cached --quiet; then
   git -C "$repo" -c user.name=gui-bundle-test -c user.email=gui-bundle-test@example.invalid \
     commit -q -m 'gui bundle test candidate'
@@ -65,6 +75,8 @@ if [ -f "$one" ] && tar -xzf "$one" -C "$extract" \
     && [ -f "$extract/airlock/docker/gui-installer.py" ] \
     && [ -f "$extract/airlock/docker/gui_selection.py" ] \
     && [ -f "$extract/airlock/docker/gui-version-relation.py" ] \
+    && [ -f "$extract/airlock/docker/student-harness-provenance.json" ] \
+    && [ -f "$extract/airlock/install/install-student-harness.py" ] \
     && bash -n "$extract/airlock/docker/gui-provisioner.sh"; then
   ok "archive contains the manifest and runnable provisioner/version gate"
 else
@@ -84,6 +96,8 @@ profile_path = root / manifest["profile_path"]
 profile_bytes = profile_path.read_bytes()
 catalog_path = root / manifest["catalog_path"]
 catalog_bytes = catalog_path.read_bytes()
+provenance_path = root / manifest["harness_provenance_path"]
+provenance_bytes = provenance_path.read_bytes()
 assert manifest["schema"] == "airlock.gui-provisioner-bundle/v1"
 assert manifest["source_sha"] == want_sha and len(want_sha) == 40
 assert isinstance(manifest["source_epoch"], int) and manifest["source_epoch"] > 0
@@ -91,6 +105,8 @@ assert manifest["profile_path"] == "docker/gui-default-profile.json"
 assert manifest["profile_sha256"] == hashlib.sha256(profile_bytes).hexdigest()
 assert manifest["catalog_path"] == "docker/gui-catalog.json"
 assert manifest["catalog_sha256"] == hashlib.sha256(catalog_bytes).hexdigest()
+assert manifest["harness_provenance_path"] == "docker/student-harness-provenance.json"
+assert manifest["harness_provenance_sha256"] == hashlib.sha256(provenance_bytes).hexdigest()
 profile = json.loads(profile_bytes)
 assert profile == {
     "schema": "airlock.gui-default-profile/v1",
@@ -108,6 +124,16 @@ then
   ok "manifest binds the full source SHA and exact profile/catalog digests"
 else
   bad "manifest/profile contract is wrong"
+fi
+
+if python3 "$extract/airlock/install/install-student-harness.py" --check >/dev/null \
+  && bash "$extract/airlock/install/check-internal-leaks.sh" \
+       --subset "$extract/airlock/docker/student-harness" >/dev/null \
+  && bash "$extract/airlock/install/check-internal-leaks.sh" \
+       --subset "$extract/airlock/docker/project-starter" >/dev/null; then
+  ok "bundle contains the pinned leak-clean harness and starter projections"
+else
+  bad "bundled harness/starter projection failed provenance or leak validation"
 fi
 
 public_repo="$scratch/public-repo"

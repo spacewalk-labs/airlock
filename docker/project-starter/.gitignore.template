@@ -1,0 +1,18 @@
+node_modules/
+.next/
+out/
+dist/
+.env
+.env.local
+.env.*.local
+!.env.example
+.DS_Store
+*.tsbuildinfo
+.vercel
+coverage/
+
+# 테스트 산출물
+playwright-report/
+test-results/
+blob-report/
+.playwright/

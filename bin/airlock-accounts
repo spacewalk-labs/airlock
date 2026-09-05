@@ -364,9 +364,21 @@ def cmd_login_code(pasted):
         creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
             (time.time() + resp["refresh_token_expires_in"]) * 1000)
     first = _get_active() is None
-    n = _store_account(creds, set_active=first)
     if first:
-        print(f"  registered '{n}' (first account -> active)")
+        # A box with no `.active` may still have a live file (someone ran `claude` and
+        # logged in outside airlock-accounts). Preserve it into the pool NOW, before the
+        # new record lands — if it is the same identity, doing it after would overwrite
+        # the tokens just issued with the older ones.
+        _saveback()
+    n = _store_account(creds)
+    if first:
+        # Pool + `.active` is not a login: Claude reads ~/.claude/.credentials.json, and
+        # on a pristine box nothing else ever writes it. Go through the same atomic
+        # switch a later swap uses (minus its save-back, done above), so live and the
+        # pool share one lineage from the first minute and the panel's "active" row is
+        # the account actually in use.
+        _switch_core(n, saveback=False)
+        print(f"  registered '{n}' (first account -> active, installed as live)")
     elif _refresh_live_if_same(n, creds):
         print(f"  renewed '{n}' — it is the account in use, so live was replaced too.")
         print("    (running sessions are unaffected; the next `claude` start picks it up)")
@@ -716,13 +728,15 @@ def _saveback():
         print(f"  warn: save-back failed ({e}) — continuing", file=sys.stderr)
 
 
-def _switch_core(name):
+def _switch_core(name, saveback=True):
     _ensure_pool()
     target = _pool_path(name)
     if not os.path.isfile(target):
         die(f"'{name}' is not in the pool. Check 'airlock-accounts list'")
-    # 1) save the current account back (rotation-safe)
-    if _get_active() != name:
+    # 1) save the current account back (rotation-safe). A caller that has ALREADY saved
+    #    live back — and then stored a newer record for the same identity — passes
+    #    saveback=False, or this step would overwrite that newer record with the old live.
+    if saveback and _get_active() != name:
         _saveback()
     # 2) load the target, refreshing directly if it is about to expire
     creds = _load(target)

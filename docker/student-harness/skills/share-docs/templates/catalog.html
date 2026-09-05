@@ -1,0 +1,77 @@
+<!doctype html>
+<!--
+  catalog — 색인 · 허브 · 묶음 발행 표지. 독자가 읽고 끝나는 게 아니라 **다음 문서로 갑니다.**
+
+  이 유형의 실패는 "제목만 나열한 것"입니다. 제목은 무엇이 들어 있는지 알려주지
+  않습니다. 항목마다 "무엇이 답해지나 · 언제 여나" 를 한 줄 답니다.
+
+  🔴 색인을 공개할 거라면 **묶음 발행**을 쓰십시오. 이 색인을 표지로 잡고 발행 창의
+  `Linked documents` 에서 문서를 골라 함께 올리면, 여기 건 href 를 발행 앱이 자동으로
+  고쳐 줍니다. 문서를 하나씩 따로 발행하면 slug 가 갈라져 링크가 전부 깨집니다.
+  절차와 제약(local 모드 · 갱신 시 Refresh 금지)은 ../SKILL.md "묶음 발행" 참조.
+
+  ■ 섞어 써도 됩니다
+    긴 문서의 진입점으로 .landing-cards 만 떼어 report.html 상단에 얹어도 됩니다.
+    반대로 색인에 요약 수치가 필요하면 report.html 의 .stat-band 를 가져다 씁니다.
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{무엇의 색인인가}</title>
+  <meta name="description" content="{한 줄 — 여기서 무엇을 찾을 수 있나}">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="{프로젝트 또는 조직}">
+  <meta property="og:title" content="{무엇의 색인인가}">
+  <meta property="og:description" content="{한 줄 — 여기서 무엇을 찾을 수 있나}">
+  <meta name="twitter:card" content="summary">
+  <meta name="doc-label" content="{예: 내 프로젝트 · 색인}">
+  <link rel="stylesheet" href="doc.css">
+</head>
+<body>
+  <main class="doc">
+    <h1>{제목}</h1>
+    <div class="doc-meta">
+      <span><strong>대상</strong> {독자}</span>
+      <span><strong>갱신</strong> {YYYY-MM-DD}</span>
+      <span><strong>원본</strong> <code>{이 문서의 원본 파일 경로}</code></span>
+    </div>
+    <p class="lead">{여기서 무엇을 찾을 수 있는지 한 줄. 없는 것도 밝히면 더 좋습니다.}</p>
+
+    <!--
+      .landing-cards 의 자식은 .landing-card 입니다. 카드는 항상 <a> 로 만듭니다 —
+      다른 문서면 href="other-doc.html", 같은 페이지 안의 섹션이면 그 제목에 id 를 직접 달고
+      href="#그-id". 카드를 움직이는 JS 는 없습니다. href 가 없으면 눌러도 아무 일이 없습니다.
+    -->
+    <div class="landing-cards">
+      <a class="landing-card" href="{경로}.html">
+        <div class="card-num">01</div>
+        <h4>{문서 제목}</h4>
+        <p>{무엇이 답해지나 · 언제 여나}</p>
+      </a>
+      <a class="landing-card" href="{경로}.html">
+        <div class="card-num">02</div>
+        <h4>{문서 제목}</h4>
+        <p>{무엇이 답해지나 · 언제 여나}</p>
+      </a>
+    </div>
+
+    <h2>{묶음 · 분류 이름}</h2>
+
+    <table>
+      <thead><tr><th>문서</th><th>무엇이 답해지나</th><th>언제 여나</th></tr></thead>
+      <tbody>
+        <tr><td><a href="{경로}.html">{제목}</a></td><td>{}</td><td>{}</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">
+      <span class="label">정보</span>
+      {여기 없는 것은 어디에 있나 — 이웃 색인으로 보내는 한 줄. 막다른 색인을 만들지 않습니다.}
+    </div>
+
+    <div class="doc-footer">원본: <code>{이 문서의 원본 파일 경로}</code></div>
+  </main>
+  <script type="module" src="doc.js"></script>
+</body>
+</html>

@@ -69,6 +69,8 @@ cat >"$SHIM/systemctl" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TMP/systemctl.log"
 case "\$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left airlock-update-detect.timer airlock-update-detect.service' ;; esac
+# See the note in test-operator-surface.sh: a service installer asserts is-active.
+case "\$*" in *is-active*) printf '%s\n' active ;; esac
 case "\$*" in *daemon-reload*) [ -e "$TMP/reload-fails" ] && exit 1 ;; esac
 # Real systemd's \`disable\` REMOVES a symlinked unit file itself. Opt-in seam
 # (flag file) so a test can model that; every other test sees the old shim.

@@ -210,10 +210,10 @@ EOF
     else
       bad "fileview: stop-before-migration ordering absent (events: $(tr '\n' ';' <"$log"))"
     fi
-    if [ "$(grep -c '^filebrowser config set$' "$log")" -eq 4 ]; then
+    if [ "$(grep -c '^filebrowser config set$' "$log")" -eq 5 ]; then
       ok "fileview: every filebrowser migration acquired the released DB"
     else
-      bad "fileview: expected four successful config-set calls (baseURL, hideDotfiles, perm.share, type detection)"
+      bad "fileview: expected five successful config-set calls (baseURL, root, hideDotfiles, perm.share, type detection)"
     fi
     if grep -q '^systemctl restart airlock-fileview.service$' "$log"; then
       ok "fileview: candidate restart is reached after migration"

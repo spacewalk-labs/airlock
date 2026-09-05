@@ -277,6 +277,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             "prerequisites-ready": (0.56, "기본 프로그램 준비 완료"),
             "tailnet-ready": (0.68, "Tailscale 연결 완료"),
             "installer-start": (0.74, "선택한 앱 설치 중"),
+            "harness-start": (0.86, "개발 도구와 에이전트 설정 준비 중"),
+            "harness-ready": (0.92, "개발 도구와 에이전트 설정 준비 완료"),
         }
         if name in labels:
             fraction, text = labels[name]

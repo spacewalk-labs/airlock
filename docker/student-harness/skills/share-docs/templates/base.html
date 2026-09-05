@@ -1,0 +1,43 @@
+<!doctype html>
+<!--
+  골격입니다. 유형을 고르지 않습니다 — 여기서 시작해 필요한 조각만 붙입니다.
+  결정을 받으려면 snippets/decision.html, 이해 점검은 snippets/quiz.html.
+
+  쓰는 법: 이 파일을 문서 폴더로 복사하고, **같은 폴더에 doc.css · doc.js 를 같이 복사**
+  합니다(스킬 폴더의 assets/). {중괄호}는 전부 채우거나 지웁니다:
+      grep -nE '\{[^{}]{0,80}\}' mydoc.html
+  🔴 반드시 **CSS·JS 인라인 전 원본에서** 돌리십시오 — 인라인 뒤에는 스타일 안의 중괄호가
+     같이 잡혀 0 이 될 수 없습니다. 인라인 방법은 README.md.
+
+  css·js 두 줄은 지우지 마십시오 — 화면은 멀쩡해 보이는데
+  문서 폭·메모지·목차·테마·퀴즈·결정폼이 한꺼번에 죽습니다.
+  og:* 도 지우지 마십시오 — 링크를 채팅에 붙였을 때 미리보기가 여기서 나옵니다.
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{문서 제목}</title>
+  <meta property="og:title" content="{문서 제목}">
+  <meta property="og:description" content="{한 줄 요약 — 채팅 링크 미리보기에 뜹니다}">
+  <meta name="doc-label" content="{상단 띠에 뜰 한 마디 — 예: 내 프로젝트 · 진단}">
+  <link rel="stylesheet" href="doc.css">
+  <!--
+    페이지 <style> 은 특수 레이아웃·SVG·인쇄처럼 doc.css 가 못 맡는 것만.
+    새 클래스에는 반드시 문서 고유 접두사를 붙입니다 (.xx-step). doc.css 가 이미 쓰는 이름
+    (.step .swatch .toc .btn .pill …) 을 자손 셀렉터로 부분 재정의하면 레이아웃이
+    조용히 깨집니다 — scripts/css-collision-lint.py 가 이것을 봅니다.
+  -->
+</head>
+<body>
+  <main class="doc">
+    <h1>{제목 — 결론이 드러나게}</h1>
+    <p class="lead">{한 줄 요약}</p>
+
+    <!-- 여기부터 자유입니다. 그림이 본문이고 글은 거들 뿐입니다.
+         결정을 받으려면 snippets/decision.html, 이해 점검은 snippets/quiz.html 을 붙입니다. -->
+
+  </main>
+  <script type="module" src="doc.js"></script>
+</body>
+</html>

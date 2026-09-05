@@ -479,7 +479,18 @@ async def _serve_static(path, cw):
 
 
 def _secret_origin_ok(headers):
-    """Same-origin guard for the secret endpoints.
+    """Same-origin guard for every endpoint on this gate that WRITES.
+
+    Named for the secret drop because that is what it was written for; it now guards
+    every write on this gate — the secret drop, the account mutations, and the terminal
+    itself (sessions, uploads, layout, prefs). 🔴 Until 2026-09-04 it guarded ONE of the six
+    (/acct-login-code) and /acct-switch, /acct-remove, /acct-login-url and
+    /codex-logout were reachable cross-origin. The identity header is injected by the
+    ingress, not the browser, so a request that arrives here already carries the owner's
+    identity whichever page caused it — another origin could make the owner's browser
+    switch or delete an account. Found while porting these routes to the platform
+    surface, which guards all of them; the owner chose to close the live exposure here
+    too rather than wait for these routes to retire.
 
     Unlike the read-only alert, these WRITE. The identity header cannot be forged from
     the tailnet (this gate is loopback-only), but a page on another origin could still
@@ -1040,6 +1051,9 @@ async def _serve_orca_repo_add(cr, headers, leftover, cw):
 
 
 async def _serve_upload_image(cr, headers, leftover, cw):
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     body = await _read_body(cr, headers, leftover)
     if body is None:
         await _send_json(cw, b"413 Payload Too Large", {"ok": False, "error": "body missing/too large"})
@@ -1057,6 +1071,9 @@ async def _serve_upload_image(cr, headers, leftover, cw):
 async def _serve_list_dir(cr, headers, leftover, cw):
     """Directory listing for the folder-picker GUI. Read-only (the owner has shell
     access anyway)."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     d = await _read_json_body(cr, headers, leftover)
     req = (d or {}).get("path", "")
     base = os.path.expanduser(req) if req else os.path.expanduser("~")
@@ -1082,15 +1099,37 @@ async def _serve_list_dir(cr, headers, leftover, cw):
 
 
 # ---- terminal file-path click -> open in fileview — optional ----
-def _map_to_viewer(realpath):
-    """absolute realpath -> the same path, if it is a file. None otherwise.
+# fileview serves ONE tree: the home directory of the account it runs as
+# (filebrowser --root %h, 2026-09-04). devterm hands it absolute paths, and a
+# terminal can name anything the account can read — /etc/nginx/nginx.conf, a file in
+# another account's home, a worktree mounted elsewhere. Those are not openable, so
+# they are refused HERE, with a reason the terminal can show, rather than sent as a
+# link that lands on a viewer that cannot address them.
+#
+# This is the same boundary the viewer applies to a hand-typed ?path= (app.js,
+# toApiPath) and the same one the server enforces (a .. chain or an out-of-home
+# symlink returns no file). Three doors, one rule; this one exists so the terminal
+# says why.
+FILEVIEW_HOME = os.path.realpath(os.path.expanduser("~"))
 
-    This used to walk code_root's entries to express the file as a path relative to
-    whichever symlink contained it, and returned None for anything outside. fileview
-    serves the filesystem now (filebrowser --root /), so a file's absolute path IS
-    its address and "outside" no longer names anything.
+
+def _under_fileview_home(realpath):
+    """Is this resolved path inside the tree fileview serves?"""
+    if not realpath:
+        return False
+    return realpath == FILEVIEW_HOME or realpath.startswith(FILEVIEW_HOME + os.sep)
+
+
+def _map_to_viewer(realpath):
+    """absolute realpath -> the same path, if it is a file fileview can open.
+
+    None for anything that is not a file, and for anything outside fileview's home
+    scope. It used to return every existing file: fileview served `/` then, so a
+    file's absolute path was always its address. It is not any more.
     """
     if not realpath or not os.path.isfile(realpath):
+        return None
+    if not _under_fileview_home(os.path.realpath(realpath)):
         return None
     return realpath
 
@@ -1335,9 +1374,13 @@ async def _resolve_to_fileview(p, session):
         hits.sort(key=lambda h: h["mtime"], reverse=True)                  # newest first
         return {"ok": False, "reason": "ambiguous", "count": len(hits),
                 "hits": [{"rel": h["rel"], "url": _mw(h["rel"])} for h in hits[:20]]}
-    # subdivide notfound so the client can show 'why'. The old 'outside_code' branch
-    # is gone with the boundary it reported: a path that exists is now openable, so
-    # a candidate that resolved would already have returned above.
+    # subdivide notfound so the client can show 'why'. A path that EXISTS but sits
+    # outside fileview's home scope is its own answer: "not found" would send the
+    # person looking for a typo in a path that is right and simply not openable.
+    for c in cands:
+        if os.path.isfile(os.path.realpath(c)):
+            return {"ok": False, "reason": "outside_home",
+                    "path": c, "home": FILEVIEW_HOME}
     if not cwd and not (p.startswith("~") or p.startswith("/")):
         return {"ok": False, "reason": "no_cwd", "path": p}                # relative but the session pane cwd was unreadable
     return {"ok": False, "reason": "notfound",
@@ -1361,6 +1404,9 @@ _LAYOUTS = {"even-horizontal", "even-vertical", "tiled", "main-vertical", "main-
 async def _serve_layout(cr, headers, leftover, cw):
     """tmux select-layout — arrange the active window's panes. even-horizontal = equal
     widths. Remote (RMT__) sessions supported when host is in REMOTE_HOSTS."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     d = await _read_json_body(cr, headers, leftover)
     host, sess_raw, valid = _parse_remote_session((d or {}).get("session", ""))
     if not valid:
@@ -1410,6 +1456,9 @@ async def _serve_pane(cr, headers, leftover, cw):
     action: zoom / next / split-h / split-v / kill / zoom-next / zoom-prev /
             capture (active pane text -> copy modal) / buffer (paste buffer) / state.
     Remote (RMT__<host>__<sess>) supported via ssh when host is in REMOTE_HOSTS."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     d = await _read_json_body(cr, headers, leftover) or {}
     raw = d.get("session", "")
     action = d.get("action", "state")
@@ -1506,6 +1555,9 @@ async def _serve_get_prefs(cw):
 
 async def _serve_put_prefs(cr, headers, leftover, cw):
     """Store tab prefs (atomic rename). dict JSON only, size-capped."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     obj = await _read_json_body(cr, headers, leftover, limit=PREFS_MAX)
     ok = False
     if obj is not None:
@@ -1523,6 +1575,9 @@ async def _serve_put_prefs(cr, headers, leftover, cw):
 
 async def _serve_kill_session(cr, headers, leftover, cw):
     """Kill a tmux session (destructive). Client confirms first. Name is sanitized."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     d = await _read_json_body(cr, headers, leftover)
     name = _safe_name((d or {}).get("name", ""))       # exec arg (not shell) + sanitize = no injection
     if not name:
@@ -1535,6 +1590,9 @@ async def _serve_kill_session(cr, headers, leftover, cw):
 
 async def _serve_rename_session(cr, headers, leftover, cw):
     """Rename a tmux session. from/to both sanitized. Re-attach is handled client-side via URL."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     d = await _read_json_body(cr, headers, leftover) or {}
     frm = _safe_name(d.get("from", ""))
     to = _safe_name(d.get("to", ""))
@@ -1548,6 +1606,9 @@ async def _serve_rename_session(cr, headers, leftover, cw):
 
 async def _serve_upload_file(cr, headers, leftover, cw):
     """Arbitrary file raw upload -> ~/uploads/fileNNN.ext. Original name in X-Filename (extension only)."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     body = await _read_body(cr, headers, leftover)
     if body is None:
         await _send_json(cw, b"413 Payload Too Large", {"ok": False, "error": "body missing/too large"})
@@ -1872,6 +1933,9 @@ async def _serve_acct_alert(headers, cw, _generation_retry=False):
 async def _serve_acct_switch(cr, headers, leftover, cw):
     """Switch the active Claude account — run `claude-switch swap <name>` server-side.
     Replaces the live credential; a running `claude` picks it up on --continue restart."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     if not _accounts_enabled():
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "accounts disabled"})
         return
@@ -1946,7 +2010,7 @@ async def _codex_auth_lifecycle(action):
     return payload[key], None
 
 
-async def _serve_codex_login_start(cw):
+async def _serve_codex_login_start(headers, cw):
     """Codex re-login 1/2 — ask the platform to start `codex login --device-auth`.
 
     device-auth needs no port-forward/callback: the user opens the link in any browser
@@ -1954,6 +2018,9 @@ async def _serve_codex_login_start(cw):
     live in `airlock-accounts codex-auth login-start`; this endpoint hands its two
     display strings to the panel and nothing else.
     """
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     _invalidate_codex_usage_cache()   # login wipes auth.json: cached numbers are void
     # The capture polls for up to ~10s inside the platform CLI, so this wait has to
     # clear that ceiling; too short would report a failure for a login that started.
@@ -1969,9 +2036,12 @@ async def _serve_codex_login_start(cw):
     await _send_json(cw, b"200 OK", {"ok": True, "url": url, "code": code})
 
 
-async def _serve_codex_login_cancel(cw):
+async def _serve_codex_login_cancel(headers, cw):
     """Codex re-login cancel — stop the pending device-auth and restore the previous
     login. Re-login logs out immediately, so this undoes an abandoned attempt."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     payload, error = await _codex_auth_call("login-cancel", 15)
     if error:
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": error})
@@ -1986,9 +2056,12 @@ async def _serve_codex_login_cancel(cw):
     await _send_json(cw, b"200 OK", {"ok": True, "restored": restored})
 
 
-async def _serve_codex_logout(cw):
+async def _serve_codex_logout(headers, cw):
     """Codex logout — removes auth.json. Codex is single-account, so this is
     'remove account'; the re-login button reconnects."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     _payload, error = await _codex_auth_call("logout", 30)
     if error:
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": error})
@@ -2294,6 +2367,9 @@ async def _serve_xai_logout(headers, cw):
 async def _serve_acct_remove(cr, headers, leftover, cw):
     """Remove an account slot — `claude-switch remove <name> --yes` server-side.
     Not reversible, but name = id, so re-login revives the same slot."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     if not _accounts_enabled():
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "accounts disabled"})
         return
@@ -2968,16 +3044,27 @@ async def _serve_claude_usage(head, cw):
     await _run_probe(cw, ["--usage", slot])
 
 
+async def _serve_codex_status(cw):
+    """`GET /codex-status` — this box's Codex login identity, read locally from
+    auth.json (email/plan/account id, never a token). Answers in the time it takes to
+    read one file, so the panel's Codex row paints at once; /claude-status stays the
+    full network-verified probe and is no longer on the panel's first-paint path."""
+    await _run_probe(cw, ["--codex"])
+
+
 async def _serve_claude_status(cw):
     """`GET /claude-status` — which account this box is logged in as + health. No
     secrets. Usage is NOT queried here (per-account API call risks 429)."""
     await _run_probe(cw)
 
 
-async def _serve_acct_usage_now(cw):
+async def _serve_acct_usage_now(headers, cw):
     """Query the live (active) account's usage right now — the popup wants the value
     as of the moment it opened, while the collector runs on its own slower cadence.
     Only the active account (querying all would risk 429)."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     status, payload = await _run_probe_result(["--usage", "live"])
     # Keep the read-modify-prune-write inline on the single gate loop; the response is
     # still the probe payload verbatim, and a cache failure must not fail this reading.
@@ -2985,8 +3072,11 @@ async def _serve_acct_usage_now(cw):
     await _send_json(cw, status, payload)
 
 
-async def _serve_acct_login_url(cw):
+async def _serve_acct_login_url(headers, cw):
     """Add account 1/2 — issue a login link (PKCE). The verifier stays server-side."""
+    if not _secret_origin_ok(headers):
+        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
+        return
     if not _accounts_enabled():
         await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "accounts disabled"})
         return
@@ -3083,12 +3173,14 @@ async def handle(cr, cw):
             await _serve_accounts(cw)
         elif path == b"/claude-status" and method == b"GET":
             await _serve_claude_status(cw)
+        elif path == b"/codex-status" and method == b"GET":
+            await _serve_codex_status(cw)
         elif path == b"/claude-usage-store" and method == b"GET":
             await _serve_usage_store(cw)
         elif path == b"/claude-usage" and method == b"GET":
             await _serve_claude_usage(head, cw)
         elif path == b"/acct-usage-now" and method == b"POST":
-            await _serve_acct_usage_now(cw)
+            await _serve_acct_usage_now(headers, cw)
         elif path == b"/codex-usage" and method == b"GET":
             await _serve_codex_usage(headers, cw)
         elif path == b"/acct-alert" and method == b"GET":
@@ -3100,7 +3192,7 @@ async def handle(cr, cw):
         elif path == b"/secret-del" and method == b"POST":
             await _serve_secret_del(cr, headers, leftover, cw)
         elif path == b"/acct-login-url" and method == b"POST":
-            await _serve_acct_login_url(cw)
+            await _serve_acct_login_url(headers, cw)
         elif path == b"/acct-login-code" and method == b"POST":
             await _serve_acct_login_code(cr, headers, leftover, cw)
         elif path == b"/acct-switch" and method == b"POST":
@@ -3108,11 +3200,11 @@ async def handle(cr, cw):
         elif path == b"/acct-remove" and method == b"POST":
             await _serve_acct_remove(cr, headers, leftover, cw)
         elif path == b"/codex-login-start" and method == b"POST":
-            await _serve_codex_login_start(cw)
+            await _serve_codex_login_start(headers, cw)
         elif path == b"/codex-login-cancel" and method == b"POST":
-            await _serve_codex_login_cancel(cw)
+            await _serve_codex_login_cancel(headers, cw)
         elif path == b"/codex-logout" and method == b"POST":
-            await _serve_codex_logout(cw)
+            await _serve_codex_logout(headers, cw)
         elif path == b"/xai-status" and method == b"GET":
             await _serve_xai_status(cw)
         elif path == b"/xai-login-start" and method == b"POST":

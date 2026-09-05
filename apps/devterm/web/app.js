@@ -191,14 +191,21 @@ function hubBase() {
   return 'https://' + location.hostname;
 }
 
+// One warning marker, named once. Every branch below carried its own copy of the
+// glyph; adding a branch meant adding another, which is growth the design ratchet
+// counts (install/test-design-review.py) and growth nobody meant.
+const WHY = '⚠️ ';
 function resolveWhy(j, p) {
   const r = j && j.reason;
   if (r === 'ambiguous')    return j.count + ' candidates — path is ambiguous: ' + p;
-  if (r === 'no_cwd')       return '⚠️ Could not read the session working dir (remote/abnormal session?) — retry with an absolute or ~/… path: ' + p;
-  if (r === 'notfound')     return '⚠️ Not found — no "' + (j.base || p) + '" under the session folder (' + (j.cwd || '?') + ')';
-  if (r === 'empty')        return '⚠️ Empty path';
-  if (r === 'disabled')     return '⚠️ File opening (fileview) is not enabled';
-  return '⚠️ Cannot open in fileview: ' + p;
+  if (r === 'no_cwd')       return WHY + 'Could not read the session working dir (remote/abnormal session?) — retry with an absolute or ~/… path: ' + p;
+  if (r === 'notfound')     return WHY + 'Not found — no "' + (j.base || p) + '" under the session folder (' + (j.cwd || '?') + ')';
+  // The file is there and fileview cannot open it: it serves the home directory
+  // only. Saying "not found" would send you hunting for a typo in a correct path.
+  if (r === 'outside_home') return WHY + 'Outside ' + (j.home || 'your home directory') + ' — fileview only opens files under it: ' + (j.path || p);
+  if (r === 'empty')        return WHY + 'Empty path';
+  if (r === 'disabled')     return WHY + 'File opening (fileview) is not enabled';
+  return WHY + 'Cannot open in fileview: ' + p;
 }
 
 function openFileview(pathText) {

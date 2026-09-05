@@ -72,7 +72,9 @@ browser --https--> tailscale serve :https_port --(identity)--> nginx owner-gate
   expiry means OpenCode will refresh it on use, not that the sign-in is dead. This is
   labelled **OpenCode xAI** because Orca uses a separate `~/.grok/auth.json` login.
 - **fileview file-open**: click a file path in the terminal to open it in fileview.
-  Turns on automatically when `[apps.fileview]` is enabled.
+  Turns on automatically when `[apps.fileview]` is enabled. fileview serves the
+  account's home only, so a path outside it is refused with "Outside <home>" rather
+  than opened — the terminal can name files the viewer cannot address.
 - **Orca worktree sidebar** (`orca_shim`): an experimental layout showing Orca's
   worktrees with per-worktree agent launchers. Needs the Orca CLI shim; falls back to
   the top-tab layout otherwise.

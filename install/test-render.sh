@@ -106,6 +106,33 @@ grep -q 'friend@example.com' <<<"$(grep -A3 '\$owner_ok {' <<<"$SITE")" && bad "
 ) && ok "audience: fileview guard tracks the declared audience, unknown fails closed" \
   || bad "audience: fileview guard does not track the declared audience"
 
+# ==== platform account surface: the guard IS the audience declaration ====
+# An app package declares its audience twice — manifest [audience] and the location's own
+# $owner_ok (SECURITY.md). The hub is platform core and has no manifest, so for this
+# surface the location is the ONLY place the claim exists. These checks are therefore not
+# "does the renderer still emit what it emitted yesterday"; they are the audience
+# contract itself.
+ACCT_LOC="$(awk '/location \/airlock-accounts\/ \{/{f=1} f{print} f&&/^    \}/{exit}' <<<"$SITE")"
+[ -n "$ACCT_LOC" ] && ok "account surface: the prefix location is rendered" \
+  || bad "account surface: no /airlock-accounts/ location in the hub block"
+grep -q 'if ($owner_ok = 0) { return 403; }' <<<"$ACCT_LOC" \
+  && ok "account surface: owner guard present (the hub gate admits collaborators)" \
+  || bad "account surface: NO owner guard — \$hub_ok admits collaborators, so this location is open to them"
+# $hub_ok here would be the fail-open spelling: it is what the server block already
+# applied, so writing it would look like a guard and gate nothing further.
+grep -q 'hub_ok' <<<"$ACCT_LOC" \
+  && bad "account surface: guard keys on \$hub_ok, which admits collaborators" \
+  || ok "account surface: guard does not key on \$hub_ok"
+# The trailing slash strips the prefix so the backend keeps its own route names.
+grep -qE 'proxy_pass http://127\.0\.0\.1:[0-9]+/;' <<<"$ACCT_LOC" \
+  && ok "account surface: proxy_pass keeps its prefix-stripping trailing slash" \
+  || bad "account surface: proxy_pass has no trailing slash — every route would 404 in the backend"
+# Prefix, not per-route: one guard instead of eighteen, and out of `location /`'s
+# try_files (which would answer an unserved route with index.html and HTTP 200).
+[ "$(grep -c 'location /airlock-accounts/' <<<"$SITE")" = 1 ] \
+  && ok "account surface: exactly one location carries the whole surface" \
+  || bad "account surface: more than one account location — each would need its own guard"
+
 grep -q 'listen 127.0.0.1:19903;'                  <<<"$SITE" && ok "hub redirect loopback port (default)" || bad "hub redirect port"
 # the authority must be the pinned FQDN — NOT $host (client-controlled = open
 # redirect) and not the short hostname (no cert).

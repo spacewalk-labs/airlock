@@ -12,12 +12,24 @@
 # inherit it and an identity that is neither the owner nor a collaborator gets the
 # wrong-owner page. filebrowser binds loopback only.
 #
-# SCOPE. filebrowser runs with `--root /`: the tree is the filesystem, and there is
-# no configured boundary to set. What bounds this is the unix account the user
-# service runs as — /etc and /var/log are readable, /root is not. That is stated in
-# SECURITY.md, and it is the whole reason `[paths].code_root` no longer exists: the
-# key was never a designed setting, it was the argument markserv and filebrowser
-# each demand, promoted into config because the installer had to write it somewhere.
+# SCOPE. filebrowser runs with `--root` set to the HOME of the account this user
+# service runs as (`%h` in the unit, `$HOME` for the short-lived first-run process
+# below). Nothing above home is addressable: a request for /etc, a `..` chain, or a
+# symlink leaving the tree does not return a file. That is a hard scope, not a
+# starting position — the operator asked for "home, and above home not visible at
+# all" (2026-09-04).
+#
+# This REPLACES `--root /`, which was deliberate and is worth stating rather than
+# deleting: serving `/` meant the app had no boundary of its own to get wrong, and
+# what bounded it was the unix account alone. That reasoning is still true and still
+# in force — the account is the outer boundary and --root is now an inner one. What
+# changed is the requirement, not the analysis. SECURITY.md carries both.
+#
+# It is still NOT a config key. `[paths].code_root` was retired for being a value
+# somebody had to choose, which was then read as a boundary it never enforced; the
+# fix is not to bring it back but to keep the root a fact about the account. There
+# is no key, nothing reads config for it, and install/test-fileview-root.sh fails if
+# a variable is ever threaded back into --root.
 #
 # NOTHING IS HIDDEN. There is no ignore list and no dotfile rule. `.env` is an
 # ordinary file: it lists, opens, edits and saves through the same path as any
@@ -25,9 +37,10 @@
 # the installer pins it false rather than relying on the default, and smoke.sh
 # asserts a dotfile comes back from a listing.
 #
-# Symlinks out of the tree no longer mean anything special now that the root is /,
-# but filebrowser stays pinned to a version with `followExternalSymlinks` and the
-# flag is still passed explicitly.
+# Symlinks out of the tree are refused: filebrowser stays pinned to a version with
+# `followExternalSymlinks`, the flag is passed explicitly as false, and a symlink in
+# home pointing at /etc answers 403 (measured against the pinned binary — see
+# install/test-fileview-home-scope.sh, which asserts it rather than trusting it).
 #
 # Config from airlock.toml ([apps.fileview]). Honors AIRLOCK_DRY_RUN=1.
 set -euo pipefail
@@ -108,7 +121,7 @@ provision_filebrowser
 # form left none. The RENDER_DIR branch stays real-dir-free (redirected UNIT_DIR
 # only) — it must only emit text.
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -z "${AIRLOCK_RENDER_DIR:-}" ]; then
-  log "[dry] write $UNIT_DIR/airlock-fileview.service (127.0.0.1:$FB_PORT, root /)"
+  log "[dry] write $UNIT_DIR/airlock-fileview.service (127.0.0.1:$FB_PORT, root %h)"
 elif [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
   install -d "$UNIT_DIR"
   render_fileview_unit_filebrowser "$FB_PORT" "$FB_BIN" "$FB_DB" >"$UNIT_DIR/airlock-fileview.service"
@@ -136,7 +149,7 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
     # Same flags as the unit: this process is short-lived but it is a real server
     # on a real port, and "the 2-second one is different" is how a difference
     # outlives the two seconds.
-    "$FB_BIN" --database "$FB_DB" --root / --address 127.0.0.1 --port "$FB_PORT" --noauth \
+    "$FB_BIN" --database "$FB_DB" --root "$HOME" --address 127.0.0.1 --port "$FB_PORT" --noauth \
       --followExternalSymlinks=false --disableTypeDetectionByHeader &
     qs=$!; sleep 2; kill "$qs" 2>/dev/null || true; wait "$qs" 2>/dev/null || true
   fi
@@ -150,6 +163,12 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   #                  WITHOUT authentication once a share exists. Nothing proxies
   #                  those paths, but that is one wildcard include away from being
   #                  wrong, and turning the permission off costs one command.
+  #   root         — home. The unit already passes --root %h and the flag wins over
+  #                  the stored value (measured against the pinned binary: a db
+  #                  created with one root, served with another, lists the served
+  #                  one — which is also why a box upgrading from `--root /` needs
+  #                  no db migration). Storing it too keeps `filebrowser config cat`
+  #                  from telling a future reader that this server hands out `/`.
   #   type detection — off. The unit already passes the flag and the flag wins
   #                  (measured with strace: listing a directory of extension-less
   #                  files opens 3 of 3 with detection on, 0 of 3 with the serve
@@ -161,6 +180,7 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
     *"Base URL: /fileview"*) ;;
     *) log "filebrowser baseURL migration"; "$FB_BIN" config set --baseURL /fileview -d "$FB_DB" >/dev/null ;;
   esac
+  "$FB_BIN" config set --root "$HOME" -d "$FB_DB" >/dev/null
   "$FB_BIN" config set --hideDotfiles=false -d "$FB_DB" >/dev/null
   "$FB_BIN" config set --perm.share=false -d "$FB_DB" >/dev/null
   "$FB_BIN" config set --disableTypeDetectionByHeader=true -d "$FB_DB" >/dev/null
@@ -259,13 +279,13 @@ else
   for f in tokens.css hljs-theme.css app.js highlight.min.js marked.min.js purify.min.js; do
     sed -i "s|/__fv/${f}\"|/__fv/${f}?v=$(asset_v "$WEBROOT/__fv/$f")\"|g" "$vhtml"
   done
-  # Where the tree opens: the home directory of the account this service runs as.
-  # It is written here, from $HOME, and read nowhere else — there is no config key
-  # for it and there is not going to be one. The last time this app had a
-  # directory in its config it was `[paths].code_root`, which existed because the
-  # installer had to put the renderer's argument somewhere and was then read as a
-  # boundary it never enforced. The scope is still `/` (install/test-fileview-root.sh
-  # holds that), so this changes where you land and nothing about what you can see.
+  # Where the tree opens AND what it is rooted at: the home directory of the account
+  # this service runs as. It is written here, from $HOME, and read nowhere else —
+  # there is no config key for it and there is not going to be one (the same $HOME
+  # the unit gives filebrowser as `%h`). The client needs the value because the API
+  # speaks paths relative to the server's root while the UI speaks absolute paths:
+  # this meta is how app.js translates between the two, and how it refuses a deep
+  # link that points outside home instead of silently asking for the wrong file.
   sed -i "s|<meta name=\"fileview-home\" content=\"\">|<meta name=\"fileview-home\" content=\"$HOME\">|" "$vhtml"
   stamp_shared "$vhtml"
   install -m644 "$vhtml" "$WEBROOT/__fv/viewer.html"; rm -f "$vhtml"

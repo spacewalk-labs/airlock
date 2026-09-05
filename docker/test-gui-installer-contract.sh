@@ -93,5 +93,14 @@ else
   bad "structured human-readable failure contract drifted"
 fi
 
+if grep -Fq '"harness-start": (0.86, "개발 도구와 에이전트 설정 준비 중")' "$GUI" \
+  && grep -Fq '"harness-ready": (0.92, "개발 도구와 에이전트 설정 준비 완료")' "$GUI" \
+  && grep -Fq 'emit harness-start' "$PROVISIONER" \
+  && grep -Fq 'emit harness-ready' "$PROVISIONER"; then
+  ok "long agent-tool and harness work has distinct visible start/ready progress"
+else
+  bad "the GUI cannot distinguish long harness work from a stalled app install"
+fi
+
 printf '\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

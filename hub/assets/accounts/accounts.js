@@ -277,9 +277,14 @@ function renderCodexSection(list, reflow, parentAlive) {
       && (!parentAlive || parentAlive()) && document.body.contains(box);
   };
   const reaskState = { scheduled: false };
-  fetch(API + 'claude-status').then(function (x) { return x.json(); }).then(function (s) {
+  // /codex-status is this box's Codex login read from auth.json (email, plan, account
+  // id) — one file, no network. It used to be /claude-status here, which probes every
+  // Claude slot against the API first; the Codex row waited seconds for numbers that
+  // were on disk. Whether the login is still honoured is what the usage probe finds out
+  // right after (an `auth` error there turns the row into "sign-in revoked").
+  fetch(API + 'codex-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (cx) {
     if (!alive()) return;
-    const cx = (s && s.codex) || { state: 'unknown' };
+    cx = (cx && cx.state) ? cx : { state: 'unknown' };
     const identity = setCodexIdentity(cx);
     renderCodexBody(box, cx, _codexUsage);       // cached numbers first (stay snappy)
     if (reflow) reflow();          // the Codex section changes the height -> re-place
@@ -643,15 +648,31 @@ function fillAcctList(list, opts) {
   const reflow = opts.reflow, reopen = opts.reopen;
   const alive = opts.alive || function () { return true; };
   const onSwitched = opts.onSwitched || function () {};
+  // The Claude rows live in their own box so a usage refresh can redraw them alone.
+  // Redrawing the whole list used to recreate the Codex and xAI sections too, which
+  // re-ran both status probes and flickered every section on every refresh.
+  // Build the shell NOW, before any request answers. /accounts runs the account CLI
+  // (up to 15 s) and then the fleet store; the Codex and xAI rows do not depend on
+  // it and must not wait for it — they paint from their own local status calls.
+  list.textContent = '';
+  const claudeBox = document.createElement('div'); claudeBox.className = 'claude-box';
+  const loading = document.createElement('div'); loading.className = 'sep'; loading.textContent = 'Loading accounts / usage…';
+  claudeBox.appendChild(loading);
+  list.appendChild(claudeBox);
+  // Codex and xAI are this box's own logins, independent of the Claude pool — they are
+  // drawn whether or not account switching is enabled here.
+  renderCodexSection(list, reflow, alive);
+  renderXaiSection(list, reflow, alive);
   const render = function (j) {
-    list.textContent = '';
+    claudeBox.textContent = '';
     if (j && j.enabled === false) {
-      const d = document.createElement('div'); d.className = 'sep'; d.textContent = 'Account switching is disabled';
-      list.appendChild(d); renderXaiSection(list, reflow, alive); reflow(); return;
+      const d = document.createElement('div'); d.className = 'sep';
+      d.textContent = 'Claude account switching is off in this app (accounts = false)';
+      claudeBox.appendChild(d); reflow(); return;
     }
     const hd = document.createElement('div'); hd.className = 'hd';
     hd.textContent = 'Switch account · right = 5h / 7d usage';
-    list.appendChild(hd);
+    claudeBox.appendChild(hd);
     const accts = (j && j.accounts) || [];
     accts.forEach(function (a) {
       const dead = a.health && a.health.state === 'dead';
@@ -725,7 +746,7 @@ function fillAcctList(list, opts) {
       b.addEventListener('pointerdown', function (e) { e.preventDefault(); });
       b.onclick = function () {
         // dead account = switching would fail. Send to re-login instead — name = id, same slot revives.
-        if (dead) { startAddAcct(list, b, reflow); return; }
+        if (dead) { startAddAcct(claudeBox, b, reflow); return; }
         if (a.active) { onSwitched(); flash('Already using ' + a.name, 1400); return; }
         onSwitched();
         postJson(API + 'acct-switch', { name: a.name }).then(function (res) {
@@ -734,16 +755,13 @@ function fillAcctList(list, opts) {
           else flash('Switch failed' + (res && res.error ? ': ' + res.error : ''), 2800);
         }).catch(function () { flash('Switch request failed', 2000); });
       };
-      list.appendChild(b);
+      claudeBox.appendChild(b);
     });
-    const sep = document.createElement('div'); sep.className = 'sep'; list.appendChild(sep);
     const add = document.createElement('button'); add.className = 'addacct';
     add.textContent = '+ Add account (login)';
     add.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-    add.onclick = function () { add.disabled = true; add.textContent = 'Getting login link…'; startAddAcct(list, add, reflow); };
-    list.appendChild(add);
-    renderCodexSection(list, reflow, alive);   // Codex (ChatGPT) section under the Claude accounts
-    renderXaiSection(list, reflow, alive);
+    add.onclick = function () { add.disabled = true; add.textContent = 'Getting login link…'; startAddAcct(claudeBox, add, reflow); };
+    claudeBox.appendChild(add);
     reflow();                           // re-place at the full rendered height (flip above from a bottom key bar)
   };
   fetch(API + 'accounts').then(function (x) { return x.json(); }).then(function (j) {
@@ -753,7 +771,9 @@ function fillAcctList(list, opts) {
     // the value at the moment it opened — the timer polls active every minute, so it can be up to 1 min stale.
     postJson(API + 'acct-usage-now', {}).then(function (fresh) {
       if (!alive()) return;                                  // already closed -> drop
-      if (list.querySelector('.addform') || _codexOperationPending || _xaiOperationPending) return;
+      // A login form in progress owns the Claude box; the provider sections are no longer
+      // touched by this redraw, so their pending operations need no guard here.
+      if (claudeBox.querySelector('.addform')) return;
       // Both login flows temporarily own the section. Re-rendering the whole list here
       // can erase a captured device code (or a pending logout) after auth already moved.
       if (!fresh || !fresh.usage || fresh.usage.err

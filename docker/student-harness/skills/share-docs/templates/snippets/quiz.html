@@ -1,0 +1,20 @@
+<!--
+  이해 점검. 마크업만 쓰면 보기 셔플·채점·해설은 같은 폴더의 doc.js 가 합니다.
+  정답은 문항마다 정확히 하나(data-correct).
+  🔴 오답도 정답과 같은 길이·같은 문형으로 씁니다 — 셔플은 위치 단서만 없애고
+     길이 단서는 남습니다. "가장 긴 것"이 정답이면 이해 점검이 아니라 길이 맞히기입니다.
+-->
+<section class="doc-quiz">
+  <h2 class="doc-quiz-title">이해 점검</h2>
+  <ol class="doc-quiz-list">
+    <li class="doc-q">
+      <p class="doc-q-stem">{질문}</p>
+      <ul class="doc-q-opts">
+        <li>{그럴듯한 오해}</li>
+        <li data-correct>{정답}</li>
+        <li>{인접 개념 혼동}</li>
+      </ul>
+      <p class="doc-q-explain">{왜 그런가}</p>
+    </li>
+  </ol>
+</section>

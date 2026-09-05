@@ -59,8 +59,51 @@ var mtimeEl  = document.getElementById('ms-mtime');
 var resizeHandle = document.getElementById('ms-resize');
 var toastEl  = document.getElementById('ms-toast');
 
+// ---- SCOPE ----
+// One tree, and it is the home directory of the account the server runs as
+// (filebrowser --root %h — apps/fileview/render.sh). Nothing above home is served:
+// a `..` chain, an absolute path outside it, and a symlink leaving it are all
+// refused by the server, measured against the pinned binary in
+// install/test-fileview-home-scope.sh.
+//
+// The UI keeps speaking ABSOLUTE paths — the bar, the deep link and the move dialog
+// all name the real path on the box — while the API speaks paths relative to that
+// root. toApiPath is the single translation, and because it is single it is also the
+// only place that can decide a path is out of scope. It throws there rather than
+// asking the server for something it will not answer, so the failure reads as "not
+// under home" instead of a bare 404. Every API URL is built through apiUrl, which
+// calls it; the destination of a rename/move goes through it too.
+//
+// An UNSTAMPED page (the repo file opened directly, never a real install) has no
+// home meta and falls back to ROOT = '/', which is the behaviour this app had
+// before the scope existed. The installer always stamps it and
+// install/test-fileview-root.sh fails if it stops.
+function accountHome() {
+  var m = document.querySelector('meta[name="fileview-home"]');
+  var v = m && m.getAttribute('content');
+  return v && v.charAt(0) === '/' && v !== '/' ? v.replace(/\/+$/, '') : null;
+}
+var ROOT = accountHome() || '/';
+/* TESTABLE:scope — the two functions the whole boundary rests on are extracted and
+   run against a fabricated ROOT by install/test-fileview-scope.mjs, including the
+   negative cases (.., an absolute path outside home, a prefix that only looks like
+   home). A grep for "underRoot appears in apiUrl" would pass on a rename; running
+   them does not. */
+function underRoot(path) {
+  if (!path) return false;
+  if (ROOT === '/') return String(path).charAt(0) === '/';
+  return path === ROOT || String(path).indexOf(ROOT + '/') === 0;
+}
+function toApiPath(path) {
+  var p = String(path);
+  if (!underRoot(p)) throw new Error('outside ' + ROOT + ': ' + p);
+  if (ROOT === '/') return p;
+  return p === ROOT ? '/' : p.slice(ROOT.length);
+}
+/* :TESTABLE */
+
 // ---- STATE ----
-var currentPath = '/';           // current viewer path
+var currentPath = ROOT;          // current viewer path
 var currentMd   = null;          // last opened file path (for the Edit toggle)
 var currentView = null;          // current file's descriptor.v (for the Raw toggle re-render)
 var rawOverride = false;         // force a structured view (json/csv) to show as raw text
@@ -229,7 +272,7 @@ function cacheDrop(dirPath) { store.del(cacheKey(dirPath)); }
 // Drop the cache entry for the directory holding `path`. Called after every write:
 // a rename or a delete that left a stale row behind is worse than a slow paint.
 function cacheDropParent(path) {
-  var parent = path.replace(/\/[^/]*$/, '') || '/';
+  var parent = path.replace(/\/[^/]*$/, '') || ROOT;
   cacheDrop(parent);
 }
 // Which directories were expanded when the tab was last used. Restoring these is
@@ -304,7 +347,7 @@ function getJwt() {
 function fetchListing(dirPath, gen) {
   var startedAt = gen;
   return getJwt().then(function (jwt) {
-    var url = apiUrl('resources', dirPath === '/' ? '/' : dirPath);
+    var url = apiUrl('resources', dirPath);
     if (!url.endsWith('/')) url += '/';
     return fetch(url, { headers: { 'X-Auth': jwt } });
   }).then(function (r) {
@@ -571,6 +614,7 @@ function descriptorFor(path) {
 // traversal/control-char block, so a name containing a space, '#', '%' or '?'
 // survives the round trip. Every API call site below goes through this — they
 // used to concatenate the raw path, which broke listing/read/save on such names.
+/* TESTABLE:url */
 function encPath(path) {
   var segs = String(path).split('/');
   for (var i = 0; i < segs.length; i++) {
@@ -579,10 +623,13 @@ function encPath(path) {
   }
   return segs.map(function (s) { return encodeURIComponent(s); }).join('/');
 }
-// filebrowser API URL for a path (kind = 'resources' | 'raw' | 'files').
+// filebrowser API URL for a path (kind = 'resources' | 'raw' | 'files'). The path
+// is absolute here and root-relative in the URL — toApiPath does that, and throws
+// for anything outside home, the same way encPath throws for an unsafe segment.
 function apiUrl(kind, path, query) {
-  return '/fileview/api/' + kind + encPath(path) + (query ? '?' + query : '');
+  return '/fileview/api/' + kind + encPath(toApiPath(path)) + (query ? '?' + query : '');
 }
+/* :TESTABLE */
 
 var TEXT_MAX_BYTES = 3 * 1024 * 1024;   // text-preview ceiling (over it, offer a download)
 var HLJS_MAX_BYTES = 256 * 1024;        // above this, skip highlighting -> plain <pre> (avoids locking the parent thread)
@@ -1108,9 +1155,12 @@ function slugify(text, used) {
   return slug;
 }
 // Resolve a document-relative reference against the directory of `fromPath`.
-// Returns an absolute path in filebrowser's namespace, or null if it escapes it.
+// Returns an absolute path, or null if it escapes the served tree. A reference that
+// starts with '/' is document-absolute: it resolves against the ROOT of the tree
+// (home), not the filesystem root, because that is the only namespace this viewer
+// can address at all.
 function resolveRelPath(fromPath, ref) {
-  var base = ref.charAt(0) === '/' ? [] : fromPath.replace(/\/[^/]*$/, '').split('/');
+  var base = ref.charAt(0) === '/' ? ROOT.split('/') : fromPath.replace(/\/[^/]*$/, '').split('/');
   var out = [];
   var parts = base.concat(ref.split('/'));
   for (var i = 0; i < parts.length; i++) {
@@ -1119,7 +1169,8 @@ function resolveRelPath(fromPath, ref) {
     if (seg === '..') { if (!out.length) return null; out.pop(); continue; }
     out.push(seg);
   }
-  return '/' + out.join('/');
+  var abs = '/' + out.join('/');
+  return underRoot(abs) ? abs : null;
 }
 function isExternalHref(href) { return /^[a-z][a-z0-9+.-]*:/i.test(href) || href.indexOf('//') === 0; }
 
@@ -1339,7 +1390,7 @@ function openFile(path, hash) {
 // Show the last-modified time (fb api/resources/<path> .modified).
 function updateMtime(path) {
   mtimeEl.textContent = '';
-  if (!path || path === '/') return;
+  if (!path || path === ROOT) return;
   getJwt().then(function (jwt) {
     return fetch(apiUrl('resources', path), { headers: { 'X-Auth': jwt } });
   }).then(function (r) { return r.ok ? r.json() : null; })
@@ -1463,13 +1514,13 @@ window.addEventListener('beforeunload', function (ev) {
 // matched too. Extensionless files being treated worse than dotfiles is the exact
 // inequality this app exists to not have.
 function pathIsFile(path) {
-  if (!path || path === '/') return false;
+  if (!path || path === ROOT) return false;
   var node = tree.querySelector('.ms-node[data-path="' + cssEscape(path) + '"]');
   if (node) return node.dataset.isdir !== '1';
   return null;   // not painted yet — the caller knows, or has to ask the API
 }
 function updateBarPath(path, isEdit, known) {
-  pathEl.textContent = path || '/';
+  pathEl.textContent = path || ROOT;
   var isFile = known;
   if (isFile == null) isFile = pathIsFile(path);
   if (isFile) {
@@ -1501,7 +1552,7 @@ function updateBarPath(path, isEdit, known) {
 
 // Copy / Download wiring (any file — .md/.json/.env/.gitignore, etc.)
 function fetchCurrentRaw() {
-  if (!currentPath || currentPath === '/') return Promise.resolve(null);
+  if (!currentPath || currentPath === ROOT) return Promise.resolve(null);
   return getJwt().then(function (jwt) {
     return fetch(apiUrl('raw', currentPath, 'algo=none'), { headers: { 'X-Auth': jwt } });
   }).then(function (r) { return r.ok ? r.text() : null; });
@@ -1574,7 +1625,7 @@ var REVALIDATE_AFTER_MS = 30 * 1000;
 var hiddenSince = 0;
 function revalidateVisible() {
   var open = openDirsUnder(tree);
-  return paintDir(tree, '/', true).then(function () { return reopenDirs(tree, open); });
+  return paintDir(tree, ROOT, true).then(function () { return reopenDirs(tree, open); });
 }
 document.addEventListener('visibilitychange', function () {
   if (document.visibilityState !== 'visible') { hiddenSince = Date.now(); return; }
@@ -1626,7 +1677,7 @@ document.addEventListener('keydown', function (ev) {
 // current text file if it opened before they were ready (deep-link early open —
 // code colouring / ipynb md cells).
 function reRenderIfStructured() {
-  if (!inEditMode && currentPath && currentPath !== '/' && descriptorFor(currentPath).t === 'text') {
+  if (!inEditMode && currentPath && currentPath !== ROOT && descriptorFor(currentPath).t === 'text') {
     renderStructured(currentPath, currentView);
   }
 }
@@ -1659,7 +1710,7 @@ rawToggleBtn.addEventListener('click', function () {
 
 // ---- tree bootstrap ----
 function bootstrapTree() {
-  return paintDir(tree, '/', true).then(function () {
+  return paintDir(tree, ROOT, true).then(function () {
     return reopenDirs(tree, loadOpenDirs());
   });
 }
@@ -1668,22 +1719,24 @@ function bootstrapTree() {
 // something changed outside this tab and the eye does not believe the screen.
 function refreshTree() {
   var open = openDirsUnder(tree);
-  cacheDrop('/');
+  cacheDrop(ROOT);
   for (var i = 0; i < open.length; i++) cacheDrop(open[i]);
   return revalidateVisible().then(function () {
-    if (currentPath && currentPath !== '/') highlightActive(currentPath);
+    if (currentPath && currentPath !== ROOT) highlightActive(currentPath);
     showToast('Tree refreshed');
   });
 }
 
 // ---- deep link path expand ----
 function expandPathChain(targetPath) {
-  // /a/b/c.md -> ['/a', '/a/b'] (directories only)
+  // /home/me/a/b/c.md -> ['/home/me/a', '/home/me/a/b'] (directories only, and
+  // only the ones inside the tree — the segments of ROOT itself are not rows).
   var parts = targetPath.split('/').filter(Boolean);
   if (parts.length <= 1) return Promise.resolve();   // root file
   var chain = [];
   for (var i = 0; i < parts.length - 1; i++) {
-    chain.push('/' + parts.slice(0, i + 1).join('/'));
+    var dir = '/' + parts.slice(0, i + 1).join('/');
+    if (underRoot(dir) && dir !== ROOT) chain.push(dir);
   }
   var p = Promise.resolve();
   chain.forEach(function (dirPath) {
@@ -1731,16 +1784,20 @@ function apiWrite(method, kind, path, query, body, headers, retried) {
 function revealPath(path) { return expandPathChain(path).then(function () { highlightActive(path); }); }
 function afterMutation(paths) {
   var dirs = {};
-  paths.forEach(function (p) { dirs[p.replace(/\/[^/]*$/, '') || '/'] = true; });
+  paths.forEach(function (p) { dirs[p.replace(/\/[^/]*$/, '') || ROOT] = true; });
   Object.keys(dirs).forEach(cacheDrop);
   Object.keys(dirs).forEach(function (d) {
-    if (d === '/') return paintDir(tree, '/', true);
+    if (d === ROOT) return paintDir(tree, ROOT, true);
     var node = tree.querySelector('.ms-node[data-path="' + cssEscape(d) + '"]');
     var kids = node && node.querySelector(':scope > .ms-children');
     if (kids) paintDir(kids, d, true);
   });
 }
-function parentOf(path) { return path.replace(/\/[^/]*$/, '') || '/'; }
+// The parent of a path, and never above the tree: at ROOT the answer is ROOT.
+function parentOf(path) {
+  var p = path.replace(/\/[^/]*$/, '') || '/';
+  return underRoot(p) ? p : ROOT;
+}
 function isUnder(path, dir) { return path === dir || path.indexOf(dir + '/') === 0; }
 // What the viewer should do when `path` was renamed/moved to `dest` (or deleted, if
 // dest is null). Checking `currentPath === path` alone was wrong for directories:
@@ -1754,7 +1811,7 @@ function followMutation(path, dest) {
     if (viewer.hasAttribute('srcdoc')) viewer.removeAttribute('srcdoc');
     lastSrcdoc = null;
     viewer.src = 'about:blank';
-    updateBarPath('/', false, false);
+    updateBarPath(ROOT, false, false);
     return;
   }
   var moved = dest + currentPath.slice(path.length);
@@ -1793,7 +1850,7 @@ function opRename(path) {
   if (!name || name === old) return;
   if (name.indexOf('/') >= 0) return showToast('Use Move… to change the folder');
   var target = joinPath(parentOf(path), name);
-  apiWrite('PATCH', 'resources', path, 'action=rename&destination=' + encodeURIComponent(target))
+  apiWrite('PATCH', 'resources', path, 'action=rename&destination=' + encodeURIComponent(toApiPath(target)))
     .then(function () {
       afterMutation([path, target]);
       followMutation(path, target);
@@ -1805,6 +1862,7 @@ function opRename(path) {
 // person nothing about what they did wrong.
 function badDestination(path, target, isDir) {
   if (target.charAt(0) !== '/') return 'Give an absolute path, starting with /';
+  if (!underRoot(target)) return 'Outside ' + ROOT + ' — this viewer only serves your home directory';
   var segs = target.split('/');
   for (var i = 0; i < segs.length; i++) {
     if (segs[i] === '.' || segs[i] === '..') return 'Give a plain path — no "." or ".." segments';
@@ -1820,7 +1878,7 @@ function opMove(path, isDir) {
   if (!target || target === path) return;
   var bad = badDestination(path, target, isDir);
   if (bad) return showToast(bad);
-  apiWrite('PATCH', 'resources', path, 'action=rename&destination=' + encodeURIComponent(target))
+  apiWrite('PATCH', 'resources', path, 'action=rename&destination=' + encodeURIComponent(toApiPath(target)))
     .then(function () {
       afterMutation([path, target]);
       followMutation(path, target);
@@ -1828,8 +1886,8 @@ function opMove(path, isDir) {
     }).catch(function (e) { showToast('Could not move: ' + e.message); });
 }
 function opDelete(path, isDir) {
-  // The confirm names the full path, not the file name. At `--root /` "delete src?"
-  // is not enough information to answer.
+  // The confirm names the full path, not the file name: "delete src?" is not enough
+  // information to answer when several directories are called src.
   if (!confirm('Delete this ' + (isDir ? 'folder and everything in it' : 'file') + '?\n\n' + path)) return;
   apiWrite('DELETE', 'resources', path)
     .then(function () {
@@ -2057,21 +2115,21 @@ tree.addEventListener('drop', function (ev) {
 // descends /proc and /sys and does not come back — measured still running at 12 s.
 // So a search is always scoped to one directory, the scope is shown, and the request
 // is abortable. Searching at `/` asks first, and says why.
-var searchScope = '/';
+var searchScope = ROOT;
 var searchAbort = null;
 function setScope(dir) {
-  searchScope = dir || '/';
+  searchScope = dir || ROOT;
   scopeEl.textContent = '';
   var label = document.createElement('span');
   label.textContent = 'search in ' + searchScope;
   scopeEl.appendChild(label);
-  scopeEl.title = searchScope === '/'
-    ? 'Search looks under the whole filesystem'
-    : 'Search looks under this directory only — click to widen it back to /';
-  if (searchScope === '/') {
+  scopeEl.title = searchScope === ROOT
+    ? 'Search looks under everything this viewer serves (' + ROOT + ')'
+    : 'Search looks under this directory only — click to widen it back to ' + ROOT;
+  if (searchScope === ROOT) {
     var w = document.createElement('span');
     w.className = 'warn';
-    w.textContent = 'whole disk';
+    w.textContent = 'everything';
     scopeEl.appendChild(document.createTextNode(' — '));
     scopeEl.appendChild(w);
   }
@@ -2082,9 +2140,9 @@ function runSearch(q) {
   // scope instead left the tree rooted somewhere the user never asked to be rooted,
   // with no way back to /.
   if (!q) { bootstrapTree(); return; }
-  if (searchScope === '/' &&
-      !confirm('Search the whole disk?\n\nThere is no index, so this walks every '
-             + 'directory under / and can take a long time. Right-click a folder and '
+  if (searchScope === ROOT &&
+      !confirm('Search all of ' + ROOT + '?\n\nThere is no index, so this walks every '
+             + 'directory under it and can take a long time. Right-click a folder and '
              + 'choose "Search here" to scope it.')) return;
   var ac = new AbortController();
   searchAbort = ac;
@@ -2114,8 +2172,9 @@ function renderSearchHits(hits, q) {
   head.textContent = hits.length + ' match' + (hits.length === 1 ? '' : 'es') + ' for "' + q + '"';
   tree.appendChild(head);
   hits.slice(0, 500).forEach(function (h) {
-    // filebrowser returns paths relative to the search root.
-    var abs = searchScope === '/' ? '/' + h.path : joinPath(searchScope, h.path);
+    // filebrowser returns paths relative to the search root — and the search root
+    // is the scope directory, whatever it is, so one join covers both cases.
+    var abs = joinPath(searchScope, h.path.replace(/^\//, ''));
     tree.appendChild(renderNode({ name: abs, path: abs, isDir: !!h.dir }, 0));
   });
   if (hits.length > 500) {
@@ -2138,13 +2197,13 @@ searchEl.addEventListener('keydown', function (ev) {
 // "Here" is the folder you are looking at, in the order you would say it out loud:
 // the directory you have selected, or the one holding the file you have open, and
 // only then the search scope. Using the search scope alone made both buttons point
-// at `/` until you had narrowed a search — so "New file here" meant "new file in
-// the filesystem root", which fails, and deserved to.
+// at the tree's root until you had narrowed a search — so "New file here" meant
+// "new file in the root", which was the wrong folder every time.
 function currentDir() {
   var active = tree.querySelector('.ms-row.active');
   var node = active && active.parentNode;
   if (node && node.dataset.isdir === '1') return node.dataset.path;
-  if (currentPath && currentPath !== '/') {
+  if (currentPath && currentPath !== ROOT) {
     var known = pathIsFile(currentPath);
     if (known === false) return currentPath;          // a directory is open
     if (known === true) return parentOf(currentPath);  // a file is open
@@ -2169,46 +2228,36 @@ newFileBtn.addEventListener('click', function () { opNewFile(currentDir()); });
 newDirBtn.addEventListener('click', function () { opNewFolder(currentDir()); });
 tree.addEventListener('click', function () { setTimeout(announceNewTargets, 0); });
 announceNewTargets();
-// One click back to the whole filesystem. Without it a narrowed scope is a one-way
-// door — the only control that sets it is a menu item on a row you may have scrolled
-// away from.
+// One click back to the whole tree. Without it a narrowed scope is a one-way door —
+// the only control that sets it is a menu item on a row you may have scrolled away
+// from.
 scopeEl.addEventListener('click', function () {
-  if (searchScope === '/') return;
-  setScope('/');
+  if (searchScope === ROOT) return;
+  setScope(ROOT);
   if (searchEl.value.trim()) runSearch(searchEl.value.trim());
-  showToast('Search scope: /');
+  showToast('Search scope: ' + ROOT);
 });
-setScope('/');
+setScope(ROOT);
 cachedDirs = countCachedDirs();
-
-// The home directory of the account this app runs as, written into the page by the
-// installer. Not a setting — there is no key, nothing reads config, and a box that
-// serves the file unstamped simply lands at the root.
-function accountHome() {
-  var m = document.querySelector('meta[name="fileview-home"]');
-  var v = m && m.getAttribute('content');
-  return v && v.charAt(0) === '/' && v !== '/' ? v.replace(/\/+$/, '') : null;
-}
-function landAtHome() {
-  var home = accountHome();
-  if (!home) return Promise.resolve();
-  // expandPathChain opens every directory ABOVE its argument, so give it a child
-  // that does not need to exist — the same trick opNewFolder uses to reveal a
-  // freshly created directory.
-  return expandPathChain(home + '/x').then(function () {
-    var node = tree.querySelector('.ms-node[data-path="' + cssEscape(home) + '"]');
-    if (!node) return;
-    var row = node.querySelector(':scope > .ms-row');
-    if (row && row.scrollIntoView) row.scrollIntoView({ block: 'center' });
-    setTabStop(row);
-    announceNewTargets();
-  }).catch(function () {});
-}
 
 // ---- start ----
 bootstrapTree().then(function () {
   var qs   = new URLSearchParams(location.search);
   var DEEP = qs.get('path');
+  if (DEEP && !underRoot(DEEP)) {
+    // A deep link out of scope is answered, not attempted. devterm refuses these at
+    // its own end too (apps/devterm/backend/devterm-gate.py, _map_to_viewer), so this
+    // is the second of two closed doors rather than the only one — a hand-typed or
+    // bookmarked URL arrives here.
+    updateBarPath(DEEP, false, false);
+    sandboxViewer();
+    commitSrcdoc(docShell('text', '',
+      'html,body{height:100%;}' +
+      'body{margin:0;padding:0;max-width:none;display:flex;align-items:center;justify-content:center;background:var(--bg);}' +
+      '.empty{color:var(--text-muted);font-family:var(--font-sans);font-size:var(--fs-md);text-align:center;}',
+      '<div class="empty">Outside ' + escapeHTML(ROOT) + ' — this viewer only serves your home directory.</div>'));
+    return;
+  }
   if (DEEP) {
     return expandPathChain(DEEP).then(function () {
       // File or directory is a fact, not a naming convention. expandPathChain has
@@ -2235,12 +2284,11 @@ bootstrapTree().then(function () {
       });
     });
   } else {
-    // No deep link: open at the running account's home. A filesystem root is a
-    // correct place to start and a useless one — /bin, /boot, /dev, and the
-    // directory you actually keep things in is four rows down and closed. The
-    // root and every sibling stay exactly where they were; this only decides
-    // where the tree is already open when it appears.
-    landAtHome();
+    // No deep link: the tree is already open at home, because home is the tree.
+    // This used to expand a chain down to it from a filesystem root that was
+    // served but useless — /bin, /boot, /dev, and the directory you actually keep
+    // things in four rows down and closed. The scope removed the chain.
+    //
     // The pane that has no file in it says so, quietly and in one line — an ASCII
     // rocket reading "M A R K W A N D" used to sit here, from the markdown viewer
     // this app grew out of, and it was both the wrong product's name and the

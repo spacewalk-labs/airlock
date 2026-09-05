@@ -1,0 +1,58 @@
+<!-- BEGIN:nextjs-agent-rules -->
+
+# Next.js: ALWAYS read docs before coding
+
+Before any Next.js work, find and read the relevant doc in `node_modules/next/dist/docs/`. Your training data is outdated — the docs are the source of truth.
+
+<!-- END:nextjs-agent-rules -->
+
+# {{PROJECT_NAME}}
+
+{{PROJECT_DESCRIPTION}}
+
+응답은 항상 한국어 존댓말.
+
+## Commands
+
+| 명령 | 용도 |
+|---|---|
+| `pnpm dev` | 개발 서버 (Turbopack, :3000) |
+| `pnpm typecheck` | `tsc --noEmit` |
+| `pnpm lint` | ESLint (flat config, 직접 호출 — Next 16 은 `next lint` 없음) |
+| `pnpm test` | Vitest (unit) |
+| `pnpm test:e2e` | Playwright (E2E) |
+| `pnpm build` | 프로덕션 빌드 |
+
+## Code
+
+- Server Components 우선. `"use client"` 는 상호작용이 필요할 때만.
+- 스타일은 Tailwind 만. 인라인 `style` 금지.
+- 컴포넌트는 함수 선언(`function`) 방식.
+- 새 패키지 설치 전 이유와 대안을 먼저 설명한다.
+- Next API 세부(동적 API 의 async 여부, 미들웨어 파일명 등)는 **추측하지 말고** 위 번들 docs 를 읽는다.
+
+## Tests
+
+- **Vitest** = Server Actions · 스키마 · 순수 로직 · 동기 컴포넌트.
+- **Playwright** = async Server Components · 인증 · 라우팅 · 폼. Vitest 는 async Server Component 를 렌더할 수 없다(러너 역량 한계, 우회 불가).
+- 버그를 고치면 그 버그를 재현하는 테스트를 먼저 남긴다.
+
+## Done 의 정의
+
+`pnpm typecheck && pnpm lint && pnpm test && pnpm build` 가 모두 통과해야 "완료"다. 안 돌려봤으면 완료가 아니라 미검증이다.
+
+## Critical
+
+1. `.env*` 커밋 금지 — `.env.example` 만 커밋한다.
+2. 커밋·푸시는 **사람이 트리거**한다 (에이전트가 자발적으로 하지 않는다).
+3. main force push 금지.
+4. 파괴적 작업(삭제·리셋·DB 변경) 전 사용자 확인.
+5. 시크릿 값을 채팅·로그·커밋에 출력하지 않는다.
+
+## 규칙이 어디 사는가
+
+강제할 규칙 = `.claude/hooks/` · `.claude/settings.json`(deny) / 맥락 지식 = `.claude/skills/` / 항상 켜진 짧은 지침 = 이 파일.
+
+경로별 상세 규칙은 `paths:` 로 **자동 주입된다**(`Read`·`Edit`·`Write` 로 매칭 파일을 만질 때). 🔴 `Bash`(`cat`·`sed`)에는 안 걸리고 Codex 에도 없으므로, 그 경로를 위해 여기서도 링크한다 — `src/` 는 [`.claude/rules/src.md`](.claude/rules/src.md), 테스트는 [`.claude/rules/tests.md`](.claude/rules/tests.md). 🔴 rules 프론트매터는 **항상 `paths:`** 다. `globs:` 는 스코프가 무시되고 상시 로드된다.
+
+이 파일에 쓴 문장은 **요청**이고, 훅에 쓴 것만 **보장**이다.
