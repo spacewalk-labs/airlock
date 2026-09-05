@@ -168,6 +168,12 @@ include <tunables/global>
 
 profile airlock-orca ${SQUASHFS}/{AppRun,orca-ide} flags=(unconfined) {
   userns,
+  # userns alone is not enough. Once this label is attached (\`unconfined\` is a flag,
+  # not the absence of a profile), socket() answered EACCES for every family and the
+  # websocket transport never came up: "listen EACCES 0.0.0.0:19942", orca "ready"
+  # with no listener, the ledger never committed, and airlock-update refused to start
+  # because of it (2026-09-03..05). Reproduced with \`aa-exec -p airlock-orca\`.
+  network,
   include if exists <local/airlock-orca>
 }
 PROFILE

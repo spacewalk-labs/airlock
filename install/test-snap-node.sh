@@ -163,7 +163,7 @@ if [ "$rc" -eq 0 ] && [ -f "$unit" ]; then
   grep -q 'command not found' <<<"$out" \
     && bad "rendering the override reason executed something" \
     || ok "the reason text reached the unit literally"
-  grep -qx 'MemoryMax=22528M' "$unit" \
+  grep -qx 'MemoryMax=30720M' "$unit" \
     && ok "the override changed only the one directive (memory backstop intact)" \
     || { bad "the override moved something else"; grep -E '^(Memory|Tasks)' "$unit" | sed 's/^/    /'; }
   printf '%s' "$out" | grep -q 'WARNING: paseo is being installed against a snap-wrapped node' \

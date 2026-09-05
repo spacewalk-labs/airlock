@@ -36,7 +36,8 @@
 #   AIRLOCK_LIVE_POOL       storage pool (default: the host's default)
 #   AIRLOCK_LIVE_MEM        memory limit (default 8GiB) — 8 GiB is not arbitrary: it is
 #                           what the students' machines have, and it is the size paseo's
-#                           memory share was validated at (11/16 of 8 GiB = 5632M), and
+#                           memory share was validated at (then 11/16 of 8 GiB = 5632M;
+#                           15/16 = 7680M since 2026-09-05), and
 #                           what the 2026-08-07 defects surfaced on. Since the backstop is
 #                           a SHARE (2026-08-22) rather than a fixed number, a smaller
 #                           container is not refused and not degraded — it simply verifies

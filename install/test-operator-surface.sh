@@ -6,7 +6,7 @@
 # commands.
 set -uo pipefail
 # Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: the share is 11/16 of the
+# this suite depends on the RAM of whichever box runs it: the share is 15/16 of the
 # box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
 # whichever the runner happened to have. install/test-render-parity.sh gates that every
 # suite running a real app installer sets this — the gate does not reason about WHICH

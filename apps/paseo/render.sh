@@ -96,9 +96,10 @@ Restart=on-success
 RestartSec=3
 # Backstop, not a reservation (idle ~440M) — a ceiling this unit must never cross,
 # not memory set aside for it. The installer sizes it as a SHARE of whatever the box
-# was given: MemoryMax = 11/16 of RAM, MemoryHigh = 10/16 (owner, 2026-08-22). So an
-# 8GB machine gets 5632M/5120M and a 72 GiB dev box gets 50688M/46080M, instead of
-# both getting the same number off a fixed table. A runaway multi-session tree cannot
+# was given: MemoryMax = 15/16 of RAM, MemoryHigh = 14/16 (owner, 2026-08-22 for the
+# share, 2026-09-05 for these fractions). So an 8GB machine gets 7680M/7168M and a
+# 72 GiB dev box gets 69120M/64512M, instead of both getting the same number off a
+# fixed table. A runaway multi-session tree cannot
 # take the machine down with it, and no box is ever refused over this.
 #
 # MemoryHigh, a little under max, is the part that matters in practice. MemoryMax alone

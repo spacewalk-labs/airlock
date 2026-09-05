@@ -545,8 +545,8 @@ PASEO_BIN="/home/example/.npm-global/bin/paseo"; BACKEND_PORT=19701
 PY="/usr/bin/python3"; STALE_PID_GUARD="$APP/paseo-clear-stale-pid.py"
 # Fixed fixture values: the real numbers are the installer's share of the box, but the
 # renderer must stay a pure function of its args for the golden to be stable.
-# These are what a 32GiB box gets — 11/16 and 10/16 of 32 GiB.
-MEMMAX="22528M"; MEMHIGH="20480M"; TASKSMAX=infinity
+# These are what a 32GiB box gets — 15/16 and 14/16 of 32 GiB.
+MEMMAX="30720M"; MEMHIGH="28672M"; TASKSMAX=infinity
 
 f="$(out_file)"; render_to "$f" render_paseo_unit "$UNIT_PATH" "$HOME_VAL" "$FQDN" "$HTTPS_PORT" "$PASEO_BIN" "$BACKEND_PORT" \
   "$PY" "$STALE_PID_GUARD" "$MEMMAX" "$MEMHIGH" "$TASKSMAX"
@@ -1464,7 +1464,7 @@ run_installer_path paseo "" "" installer-path \
 
 # paseo memory cases — exercise the real installer's proportional sizing from tiny to
 # huge. The expectation is COMPUTED here from the same ratio the installer uses, so the
-# assertion is "11/16 and 10/16 of the rounded cap", not a list of remembered numbers.
+# assertion is "15/16 and 14/16 of the rounded cap", not a list of remembered numbers.
 # Neither half alone would be enough: an ordering check (`high < max`) passes with any
 # pair of numbers, and a fixed expected pair passes with any ratio. With the
 # non-whole-GiB caps below, the ratio, the rounding and the rendering are each pinned
@@ -1501,8 +1501,8 @@ paseo_memory_case() {
   # Deliberately NOT a copy of the installer's expression: spelled as MiB-per-GiB so a
   # mutation of either numerator in install.sh shows up here as a mismatch instead of
   # being mirrored into the expectation.
-  expect_max="$(( cap_gib * 704 ))M"   # 704 MiB = 11/16 GiB
-  expect_high="$(( cap_gib * 640 ))M"  # 640 MiB = 10/16 GiB
+  expect_max="$(( cap_gib * 960 ))M"   # 960 MiB = 15/16 GiB
+  expect_high="$(( cap_gib * 896 ))M"  # 896 MiB = 14/16 GiB
   WDIR="$(mktemp -d)"
   mkdir -p "$WDIR/home" "$WDIR/render" "$WDIR/shim"
   CFG="$WDIR/airlock.toml"
@@ -1592,7 +1592,7 @@ paseo_memory_case() {
           bad "paseo memory ${tag}: TasksMax is not the box maximum"
           grep -E '^TasksMax=' "$unit" | sed 's/^/    /'
         elif ! grep -qF "paseo memory share: cap=${cap_bytes} bytes" <<<"$out" \
-             || ! grep -qF "MemoryMax=${expect_max} (11/16) MemoryHigh=${expect_high} (10/16)" <<<"$out"; then
+             || ! grep -qF "MemoryMax=${expect_max} (15/16) MemoryHigh=${expect_high} (14/16)" <<<"$out"; then
           # The install log must name the same numbers the unit got, and name the ratio
           # it used. That log line is the only operator-visible explanation of why this
           # box got this share; a unit that is right while the log says something else
@@ -1600,7 +1600,7 @@ paseo_memory_case() {
           bad "paseo memory ${tag}: the install log does not report the share it wrote"
           printf '%s\n' "$out" | grep -i 'memory' | tail -4 | sed 's/^/    /'
         else
-          ok "paseo memory ${tag}: share ${expect_max}/${expect_high} = 11/16 and 10/16 of ${cap_gib}GiB, MemoryHigh < MemoryMax <= the raw cap, logged under 'paseo memory share:', TasksMax at the box maximum"
+          ok "paseo memory ${tag}: share ${expect_max}/${expect_high} = 15/16 and 14/16 of ${cap_gib}GiB, MemoryHigh < MemoryMax <= the raw cap, logged under 'paseo memory share:', TasksMax at the box maximum"
         fi
       fi
       ;;
@@ -1665,8 +1665,8 @@ paseo_memory_case 64 unbacked
 # Rounding cases — caps that are NOT whole GiB, which is what every real box reports.
 # Without these, floor / ceil / round-to-nearest are indistinguishable: every whole-GiB
 # cap above rounds to itself. A real machine reports under its own name, and rounding
-# first is what makes the published numbers exact (7.63 GiB -> 8 -> 5632M = 5.5 GiB,
-# the figure this was validated at; flooring would hand it 4928M).
+# first is what makes the published numbers exact (7.63 GiB -> 8 -> 7680M = 7.5 GiB;
+# flooring would hand it 6720M).
 paseo_memory_case 8  finite "" 8192650117    #  7.63 GiB, a real "8GB" box  -> 8
 paseo_memory_case 7  finite "" 8042326261    #  7.49 GiB, just under        -> 7
 paseo_memory_case 16 finite "" 16696685363   # 15.55 GiB, a real "16GB" box -> 16

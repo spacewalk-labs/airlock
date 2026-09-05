@@ -224,7 +224,7 @@ UNIT_PATH="/home/example/.npm-global/bin:/home/example/.local/bin:/usr/local/bin
 HOME_VAL="/home/example"; FQDN="box.example.ts.net"; HTTPS_PORT=19700
 PASEO_BIN="/home/example/.npm-global/bin/paseo"; BACKEND_PORT=19701
 PY="/usr/bin/python3"; STALE_PID_GUARD="$APP/paseo-clear-stale-pid.py"
-PASEO_UNIT_TEXT="$(render_paseo_unit "$UNIT_PATH" "$HOME_VAL" "$FQDN" "$HTTPS_PORT" "$PASEO_BIN" "$BACKEND_PORT" "$PY" "$STALE_PID_GUARD" "22528M" "20480M" 24576)"
+PASEO_UNIT_TEXT="$(render_paseo_unit "$UNIT_PATH" "$HOME_VAL" "$FQDN" "$HTTPS_PORT" "$PASEO_BIN" "$BACKEND_PORT" "$PY" "$STALE_PID_GUARD" "30720M" "28672M" 24576)"
 ingest_unit user "airlock-paseo.service" "$PASEO_UNIT_TEXT"
 
 BROWSE_HOST_UNIT_TEXT="$(extract_browse_host_unit)"

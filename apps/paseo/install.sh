@@ -80,14 +80,26 @@ UISTATE_PORT="${AIRLOCK_PASEO_UISTATE_PORT:?}"
 # broke the large one: a 72 GiB dev box got the same 14G ceiling as a 16 GiB laptop.
 #
 # Owner decision, 2026-08-22: size it in PROPORTION to what the box was given.
+# Owner decision, 2026-09-05: raise that proportion to nearly all of the box.
 #
-#   MemoryMax  = 11/16 of the box   (68.75%)
-#   MemoryHigh = 10/16 of the box   (62.50%)
+#   MemoryMax  = 15/16 of the box   (93.75%)
+#   MemoryHigh = 14/16 of the box   (87.50%)
 #
-# The two fractions are not invented — they are the owner's measured 8GiB case read as
-# ratios. 5.5 GiB of 8 is exactly 11/16, and 5 GiB of 8 is exactly 10/16, so a student's
-# 8GB machine still lands on 5632M/5120M, the numbers this was validated at, while a
-# 72 GiB dev box gets 49.5G/45G instead of the same 14G a laptop got.
+# The proportion is unchanged as a mechanism; only the fractions moved, 11/16 -> 15/16
+# and 10/16 -> 14/16. What that trades is worth stating plainly, because the earlier
+# fractions were not arbitrary: 11/16 and 10/16 were the owner's measured 8GiB case read
+# as ratios (5.5 GiB of 8 is exactly 11/16, 5 GiB exactly 10/16), so an 8GB machine
+# landed on the 5632M/5120M it was validated at. That anchor is now gone by choice — the
+# same 8GB machine gets 7680M/7168M and keeps only ~0.5 GiB for everything else on it.
+#
+# The occasion was a 32 GiB box throttling at a 12G ceiling (49 processes stuck in
+# mem_cgroup_handle_over_high, load 74, memory PSI some=99.8%) — that box was still on
+# the pre-2026-08-22 tier table, so the share already fixed it and 22G/20G would have
+# been enough. The owner chose the larger share anyway, for headroom on the big boxes
+# where paseo is the only thing that matters. On such a box that is the right call; on a
+# small shared one it leaves little room, and the reason it is acceptable is that the
+# throttle band still exists — MemoryHigh slows the unit down a whole GiB before
+# MemoryMax refuses anything.
 #
 # What the proportion also deletes: there is no tier edge left to fall off, and no "the
 # ceiling is bigger than the box" case — a share of the box is inside the box by
@@ -139,16 +151,16 @@ if [ $(( _cap % 1073741824 )) -ge 536870912 ]; then _cap_gib=$(( _cap_gib + 1 ))
 # always a whole GiB (a 3 GiB box gets 2112M = 2.0625 GiB). One integer expression, no
 # decimal formatting, and nothing downstream has to parse a fraction. 1024*11 and
 # 1024*10 are both divisible by 16, so the division is exact — no truncation anywhere.
-_memmax_mib=$(( _cap_gib * 1024 * 11 / 16 ))
-_memhigh_mib=$(( _cap_gib * 1024 * 10 / 16 ))
+_memmax_mib=$(( _cap_gib * 1024 * 15 / 16 ))
+_memhigh_mib=$(( _cap_gib * 1024 * 14 / 16 ))
 # ...but never above the box itself. Rounding UP is what makes the published numbers
 # exact, and on a sub-GiB box it is also what would hand a 600 MiB machine a 704M
 # ceiling — above the box, which is precisely the case this design claims to have made
 # impossible. Below a whole GiB, take the share off the raw figure instead.
 _cap_mib=$(( _cap / 1048576 ))
 if [ "$_memmax_mib" -gt "$_cap_mib" ]; then
-  _memmax_mib=$(( _cap_mib * 11 / 16 ))
-  _memhigh_mib=$(( _cap_mib * 10 / 16 ))
+  _memmax_mib=$(( _cap_mib * 15 / 16 ))
+  _memhigh_mib=$(( _cap_mib * 14 / 16 ))
 fi
 # Under ~3 MiB both shares round to the same number, or to 0, and MemoryHigh must stay
 # strictly below MemoryMax for the throttle band to exist at all. Nothing real is this
@@ -174,7 +186,7 @@ else
   PASEO_MEMMAX="${_memmax_mib}M"
   PASEO_MEMHIGH="${_memhigh_mib}M"
   log "paseo memory share: cap=${_cap} bytes (~${_cap_gib} GiB) -> MemoryMax=${PASEO_MEMMAX} \
-(11/16) MemoryHigh=${PASEO_MEMHIGH} (10/16)"
+(15/16) MemoryHigh=${PASEO_MEMHIGH} (14/16)"
 fi
 
 PASEO_PKG="@getpaseo/cli"
