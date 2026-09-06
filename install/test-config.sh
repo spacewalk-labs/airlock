@@ -30,6 +30,7 @@ product = "Airlock"
 [apps.devterm]
 font_size = 16
 xai = true
+compat_https_enabled = true
 [apps.fileview]
 TOML
 
@@ -78,6 +79,32 @@ pt="$(run "$TMP/good.toml" plaintext 2>/dev/null | tr '\t' ':' | sort | tr '\n' 
 # plus any still-declared plaintext_redirect (none on shipped devterm).
 known="$(run "$TMP/good.toml" plaintext-known 2>/dev/null | sort -n | tr '\n' ',')"
 [ "$known" = "19901," ] && ok "plaintext-known: hub only" || bad "plaintext-known: got '$known'"
+
+# Both devterm HTTPS listeners are platform-rendered to the same owner gate.
+# The 8443 compatibility route used to live only in mutable tailscaled state,
+# which let it drift to an unrelated development server without any owner.
+devterm_https="$(run "$TMP/good.toml" package-info 2>/dev/null | python3 -c '
+import json, sys
+mappings = json.load(sys.stdin)["packages"]["devterm"]["serve_mappings"]
+print(",".join(sorted(
+    "{}:{}".format(mapping["listen"], mapping["target"])
+    for mapping in mappings.values()
+    if mapping["mode"] == "https"
+)))
+')"
+[ "$devterm_https" = "19910:19911,8443:19911" ] \
+  && ok "devterm serve: primary and compatibility HTTPS share the owner gate" \
+  || bad "devterm serve: got '$devterm_https'"
+
+sed '/compat_https_enabled = true/d' "$TMP/good.toml" >"$TMP/devterm-default.toml"
+devterm_default_https="$(run "$TMP/devterm-default.toml" package-info 2>/dev/null | python3 -c '
+import json, sys
+mappings = json.load(sys.stdin)["packages"]["devterm"]["serve_mappings"]
+print(",".join(str(mapping["listen"]) for mapping in mappings.values()))
+')"
+[ "$devterm_default_https" = "19910" ] \
+  && ok "devterm serve: compatibility HTTPS is opt-in" \
+  || bad "devterm serve: disabled default rendered '$devterm_default_https'"
 
 # 3d. webjson carries the measured FQDN so the launcher's cross-port links match
 # the cert regardless of the origin the page was opened from — and omits it when

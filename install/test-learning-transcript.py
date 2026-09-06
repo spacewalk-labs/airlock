@@ -70,6 +70,25 @@ def main():
     module = load()
     passed = True
 
+    # 유튜브가 한국어 영상에 language=en 을 달아 둔 실물이 있었다. 그때 원어 자막이
+    # 멀쩡히 있어도 영어 기계번역을 받아 요약이 번역본에서 만들어진다.
+    passed &= check(
+        "원어는 language 필드가 아니라 -orig 자막이 정한다",
+        module.source_language({"language": "en",
+                                "automatic_captions": {"en": [], "ko": [], "ko-orig": []}}) == "ko",
+        module.source_language({"language": "en",
+                                "automatic_captions": {"en": [], "ko-orig": []}}))
+    passed &= check(
+        "사람 자막만 있으면 그 목록을 믿는다",
+        module.source_language({"language": "ko", "subtitles": {"ko": [], "en": []}}) == "ko"
+        and module.source_language({"subtitles": {"ja": []}}) == "ja",
+        None)
+    passed &= check(
+        "자막 목록이 없으면 language 필드로 물러선다",
+        module.source_language({"language": "fr"}) == "fr"
+        and module.source_language({}) is None,
+        None)
+
     passed &= check(
         "영상 언어를 먼저, en 은 대비책으로",
         module.language_rounds("ko") == (["ko", "ko-orig"], ["en"])
@@ -124,6 +143,47 @@ def main():
     passed &= check("429 가 아닌 실패는 재시도하지 않는다",
                     len(calls) == 1 and naps == [] and outcome.returncode == 1,
                     (len(calls), naps))
+
+    # 기다려도 안 풀리는 스로틀에는 다른 클라이언트로 청한다. web 이 막힌 동안 android 가
+    # 통과한 실물이 있었다 (2026-09-04, lpFevXDUAxg).
+    seen, naps = [], []
+    module.time = types.SimpleNamespace(sleep=naps.append)
+
+    def throttled_until_android(argv, **kwargs):
+        seen.append(argv)
+        if "youtube:player_client=android" in argv:
+            passing = result(0)
+            passing.stdout = b'{"id": "x", "language": "ko"}'   # metadata() 가 읽을 몫
+            return passing
+        return result(1, RATE_LIMITED)
+
+    module.run = throttled_until_android
+    outcome = module.run_patiently(["yt-dlp", "--dump-json"])
+    passed &= check("429 가 안 풀리면 android 클라이언트로 한 번 더 청한다",
+                    outcome.returncode == 0
+                    and len(seen) == len(module.YT_DLP_RETRY_DELAYS) + 2
+                    and seen[-1][-2:] == module.YT_DLP_LAST_RESORT,
+                    (len(seen), seen[-1][-2:] if seen else None))
+
+    # 마지막 수단이 또 429 면 거기서 끝난다. 같은 문을 무한히 두드리지 않는다.
+    seen.clear()
+    module.run = lambda argv, **kwargs: (seen.append(argv), result(1, RATE_LIMITED))[1]
+    outcome = module.run_patiently(["yt-dlp", "--dump-json"])
+    passed &= check("마지막 수단까지 막히면 멈춘다",
+                    outcome.returncode == 1
+                    and len(seen) == len(module.YT_DLP_RETRY_DELAYS) + 2, len(seen))
+
+    # 영상 정보 조회도 같은 레이트리밋을 맞는다. 거기서 한 번에 죽으면 자막은 시작도 못 한다.
+    seen.clear()
+    module.run = throttled_until_android
+    try:
+        info = module.metadata("yt-dlp", "https://example.invalid/v")
+    except SystemExit:
+        info = {}   # 한 방에 포기하면 여기서 죽는다. 그것이 이 검사가 잡는 결함이다.
+    passed &= check("영상 정보 조회도 429 를 견딘다",
+                    info.get("id") == "x"
+                    and any("youtube:player_client=android" in argv for argv in seen),
+                    len(seen))
 
     print("PASS" if passed else "FAIL")
     return 0 if passed else 1

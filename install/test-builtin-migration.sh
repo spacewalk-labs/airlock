@@ -3183,9 +3183,39 @@ case "$out" in
   *) bad "B13: undefaulted-serve-key exclusion -> $out" ;;
 esac
 out2="$(p4_run "$P4CFG" adopt-write alpha6 2>&1)"; rc2=$?
-[ "$rc2" != 0 ] && grep -qF "cannot be adopted" <<<"$out2" && ! grep -qF "Traceback" <<<"$out2" \
-  && ok "B13: a forced --adopt refuses cleanly (no traceback) for the same reason" \
-  || { bad "B13: forced adopt-write should refuse cleanly (rc=$rc2)"; failure_detail "$out2"; }
+b13_forced_ok=0
+if [ "$rc2" != 0 ] && grep -qF "cannot be adopted" <<<"$out2" \
+   && ! grep -qF "Traceback" <<<"$out2"; then
+  b13_forced_ok=1
+fi
+
+# B13b) a default-off conditional HTTPS listener stays absent when a shipped
+# package is adopted. The ordinary resolver already omits it; adoption must
+# not synthesize the HTTPS mapping back into the ledger from defaults.
+p4_reset
+mkdir -p "$P4APPS/alpha7"
+pkg_manifest "$P4APPS/alpha7" 'contract = 1' 'id = "alpha7"' \
+  '[config.defaults]' 'listen = 19607' 'target = 19608' 'enabled = false' \
+  '[artifacts]' 'files = ["~/.local/bin/alpha7-bin"]' 'serve_ports = ["listen"]' \
+  '[serve.https]' 'listen = { target = "target", enabled = "enabled" }'
+scripts_ok "$P4APPS/alpha7"
+mkdir -p "$FAKEHOME/.local/bin"; : > "$FAKEHOME/.local/bin/alpha7-bin"
+p4_cfg_hubonly "$P4CFG"
+out="$(p4_run "$P4CFG" adopt-write alpha7 2>&1)"; rc=$?
+adopted_conditional="$(python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))["entries"]["alpha7"]["intent"]
+print(len(r["serve_mappings"]), len(r["serve_port_values"]),
+      len(r["artifacts_declared"]["serve_ports"]))
+' "$STATE/app-ledger.json" 2>/dev/null)"
+if [ "$b13_forced_ok" = 1 ] && [ "$rc" = 0 ] \
+   && [ "$adopted_conditional" = "0 0 0" ]; then
+  ok "B13/B13b: forced adoption fails cleanly and default-off serve stays unclaimed"
+else
+  bad "B13/B13b: adoption contract drifted (forced_rc=$rc2 off_rc=$rc shape=$adopted_conditional)"
+  failure_detail "$out2"
+  failure_detail "$out"
+fi
 
 # B14) admission/scan unification (round-2 review): the on-disk existence
 # probe (expand_declared) used to run ONLY inside cmd_adopt_scan — a

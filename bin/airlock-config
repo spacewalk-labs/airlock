@@ -811,9 +811,10 @@ def cmd_validate(cfg: dict) -> "None":
     # the value checked for global uniqueness can differ from the listener.
     strict_scan = os.environ.get("AIRLOCK_STRICT_CONFIG_SCAN") == "1"
     for pid, spec in specs.items():   # F12: declared vs actually-read keys
-        port_scalars, port_tables = _port_contract_keys(spec)
+        port_scalars, port_tables, platform_scalars = _port_contract_keys(spec)
         _scan_config_reads(pid, Path(spec["dir"]), spec["schema"],
                            spec["audience"], port_scalars, port_tables,
+                           platform_scalars,
                            strict=(strict_scan and
                                    "strict-config-scan" in spec["certifications"]))
     print("ok: config valid")
@@ -1040,6 +1041,21 @@ def _validate_ports(cfg: dict) -> "None":
     """
     seen: dict = {}
     resolved_apps = resolved(cfg).get("apps", {})
+    resolved_packages = packages_resolved(cfg)
+    specs = package_specs(cfg)
+    inactive_listener_keys = set()
+    for pid, spec in specs.items():
+        active_listeners = set(resolved_packages[pid]["serve"])
+        other_owned_roles = set(spec["plaintext_redirect"])
+        other_owned_roles.update(spec["plaintext_redirect"].values())
+        other_owned_roles.update(
+            mapping["target_key"] for mapping in spec["serve"].values())
+        other_owned_roles.update(
+            span["base"] for span in spec["schema"]["port_spans"])
+        inactive_listener_keys.update(
+            (pid, key)
+            for key in set(spec["serve"]) - active_listeners - other_owned_roles
+        )
     for app, table in sorted(resolved_apps.items()):
         port_values = []
         for key, val in sorted((table or {}).items()):
@@ -1048,7 +1064,11 @@ def _validate_ports(cfg: dict) -> "None":
                                    for leaf, nested in sorted(val.items())
                                    if _is_port_config_key(leaf))
             elif _is_port_config_key(key):
-                port_values.append((key, val))
+                # A conditional listener owns no port while disabled.  Keep
+                # keys with another declared role (target, redirect, span)
+                # in the pool; only the inactive listener-only role vanishes.
+                if (app, key) not in inactive_listener_keys:
+                    port_values.append((key, val))
         for key, val in port_values:
             if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 65535:
                 die(f"apps.{app}.{key} must be a port number 1-65535 (got {val!r})")
@@ -1061,7 +1081,7 @@ def _validate_ports(cfg: dict) -> "None":
     # Packaged serve values join the same pool: a serve key not ending in
     # _port (the grammar allows any [a-z0-9_]+ name) must not dodge the
     # sweep, and 443 is the platform's TLS entrypoint, never an app's.
-    for pid, pkg in sorted(packages_resolved(cfg).items()):
+    for pid, pkg in sorted(resolved_packages.items()):
         for key, val in sorted(pkg["serve_port_values"].items()):
             if val == 443:
                 die(f"packages.{pid} serve key {key!r} claims port 443 — the "
@@ -1079,7 +1099,7 @@ def _validate_ports(cfg: dict) -> "None":
         # target while still hiding that target's actual port from collision
         # checks.
         semantic_keys = {
-            mapping["target_key"] for mapping in pkg["serve"].values()
+            mapping["target_key"] for mapping in specs[pid]["serve"].values()
         }
         semantic_keys.update(pkg["plaintext_redirect"])
         semantic_keys.update(pkg["plaintext_redirect"].values())
@@ -1317,7 +1337,7 @@ def _validate_artifacts(pid: str, raw) -> tuple[dict, dict]:
     return out, unit_scopes
 
 
-def _validate_mappings(pid: str, raw, declared: set[str], arts: dict) -> dict:
+def _validate_mappings(pid: str, raw, schema: dict, arts: dict) -> dict:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict) or set(raw) - set(_SERVE_KEYS):
@@ -1325,13 +1345,33 @@ def _validate_mappings(pid: str, raw, declared: set[str], arts: dict) -> dict:
     https = raw.get("https", {})
     if not isinstance(https, dict):
         _mf_die(pid, "[serve.https] must be a table")
+    declared = set(schema["required"]) | set(schema["defaults"])
     mappings = {}
-    for key, target in https.items():
-        if key not in declared or not isinstance(target, str) or target not in declared:
+    for key, raw_mapping in https.items():
+        if isinstance(raw_mapping, str):
+            target = raw_mapping
+            enabled_key = None
+        elif (isinstance(raw_mapping, dict)
+              and set(raw_mapping) == {"target", "enabled"}
+              and isinstance(raw_mapping.get("target"), str)
+              and isinstance(raw_mapping.get("enabled"), str)):
+            target = raw_mapping["target"]
+            enabled_key = raw_mapping["enabled"]
+        else:
+            _mf_die(pid, "serve.https values must be a declared target key or "
+                        "{target = <key>, enabled = <boolean-default-key>}")
+        if key not in declared or target not in declared:
             _mf_die(pid, "serve.https keys and targets must name declared config keys")
         if key not in arts["serve_ports"]:
             _mf_die(pid, f"serve.https key '{key}' must be declared in artifacts.serve_ports")
+        if enabled_key is not None:
+            enabled_default = schema["defaults"].get(enabled_key)
+            if not isinstance(enabled_default, bool):
+                _mf_die(pid, f"serve.https key '{key}' enabled key '{enabled_key}' "
+                        "must be a boolean [config.defaults] key")
         mappings[key] = {"mode": "https", "target_key": target}
+        if enabled_key is not None:
+            mappings[key]["enabled_key"] = enabled_key
     return mappings
 
 
@@ -2446,14 +2486,16 @@ def _line_of(text: str, pos: int) -> int:
     return text.count("\n", 0, pos) + text.count("\x00", 0, pos) + 1
 
 
-def _port_contract_keys(spec: dict) -> tuple[set[str], set[tuple[str, str]]]:
+def _port_contract_keys(spec: dict) -> tuple[
+        set[str], set[tuple[str, str]], set[str]]:
     """Config scalars that the package must consume to own its listeners.
 
     The name convention catches ordinary loopback listeners. Explicit serve,
     redirect, and span declarations are semantic claims even when their keys
     use arbitrary names. The platform itself consumes HTTPS/redirect LISTEN
-    keys, so those stay in global uniqueness validation but do not require a
-    fake package read. Their TARGET keys remain package-owned and fail closed.
+    keys and optional enable controls, so those stay platform-owned and do not
+    require a fake package read. Active listens still enter global uniqueness;
+    TARGET keys remain package-owned and fail closed.
     """
     schema = spec["schema"]
     declared = set(schema["required"]) | set(schema["defaults"])
@@ -2470,16 +2512,21 @@ def _port_contract_keys(spec: dict) -> tuple[set[str], set[tuple[str, str]]]:
     package_targets.update(spec["plaintext_redirect"].values())
     platform_listens = set(spec["serve"])
     platform_listens.update(spec["plaintext_redirect"])
+    platform_controls = {
+        mapping["enabled_key"] for mapping in spec["serve"].values()
+        if mapping.get("enabled_key") is not None
+    }
     # A key may be the platform listen for one mapping and the package target
     # for another. Target ownership wins; only listen/public-only keys are
     # exempt from package-read proof.
     scalar_keys.difference_update(platform_listens - package_targets)
-    return scalar_keys, table_keys
+    return scalar_keys, table_keys, platform_listens | platform_controls
 
 
 def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
                        port_contract_keys: set[str],
                        port_contract_table_keys: set[tuple[str, str]],
+                       platform_config_keys: set[str],
                        strict: bool = False) -> "None":
     """F12: compare the manifest's declared key space with the reads the
     package's own files actually contain, and report findings. Port
@@ -2840,7 +2887,7 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
             "variable rather than reading it — list the full env-var name in "
             "[config].runtime_env.")
 
-    unread_scalars = scalar_declared - read_scalars
+    unread_scalars = scalar_declared - read_scalars - platform_config_keys
     unread_port_contract = sorted(
         (scalar_declared - port_read_scalars) & port_contract_keys
     )
@@ -3222,7 +3269,7 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
             else _validate_icon_source(pid, pdir, tile["icon"]))
     audience = _validate_audience(pid, m.get("audience"))
     declared = set(schema["required"]) | set(schema["defaults"])
-    serve = _validate_mappings(pid, m.get("serve"), declared, arts)
+    serve = _validate_mappings(pid, m.get("serve"), schema, arts)
     plaintext_redirect = _validate_plaintext_redirect(pid, m.get("plaintext_redirect"), declared)
     for key in arts["serve_ports"]:
         if key not in declared:
@@ -3336,8 +3383,23 @@ def packages_resolved(cfg: dict) -> dict:
     out = {}
     for pid, spec in specs.items():
         app_table = r_apps.get(pid) or {}
+        active_serve = {}
+        inactive_serve_keys = set()
+        for key, mapping in spec["serve"].items():
+            enabled_key = mapping.get("enabled_key")
+            if enabled_key is not None:
+                enabled = app_table.get(enabled_key)
+                if not isinstance(enabled, bool):
+                    die(f"package '{pid}' serve enabled key "
+                        f"apps.{pid}.{enabled_key} is not a boolean")
+                if not enabled:
+                    inactive_serve_keys.add(key)
+                    continue
+            active_serve[key] = mapping
         spv = {}
         for key in spec["artifacts"]["serve_ports"]:
+            if key in inactive_serve_keys:
+                continue
             val = app_table.get(key)
             if not isinstance(val, int) or isinstance(val, bool) or not 1 <= val <= 65535:
                 die(f"package '{pid}' declares serve_ports key '{key}' but "
@@ -3346,7 +3408,7 @@ def packages_resolved(cfg: dict) -> dict:
             spv[key] = val
         serve_mappings = {key: {"listen": val, "mode": "http", "target": val}
                           for key, val in spv.items()}
-        for key, mapping in spec["serve"].items():
+        for key, mapping in active_serve.items():
             target = app_table.get(mapping["target_key"])
             if not isinstance(target, int) or isinstance(target, bool) or not 1 <= target <= 65535:
                 die(f"package '{pid}' serve target apps.{pid}.{mapping['target_key']} is not a port")
@@ -3399,6 +3461,10 @@ def packages_resolved(cfg: dict) -> dict:
                     f"past port 65535 (base {base})")
             spans.append([span["base"], base, count])
         arts_out = {c: list(spec["artifacts"][c]) for c in ARTIFACT_CLASSES}
+        arts_out["serve_ports"] = [
+            key for key in arts_out["serve_ports"]
+            if key not in inactive_serve_keys
+        ]
         if spec["icon"] is not None:
             # F4: the staged icon directory is synthesized into the DECLARED
             # artifacts before anything is journaled — the intent names the
@@ -3406,7 +3472,7 @@ def packages_resolved(cfg: dict) -> dict:
             # child-2 repair paths already know how to reclaim. Id-scoped, so
             # cross-app collisions are impossible by construction.
             arts_out["webroot"] = arts_out["webroot"] + [f"assets/apps/{pid}"]
-        out[pid] = dict(spec, artifacts=arts_out,
+        out[pid] = dict(spec, artifacts=arts_out, serve=active_serve,
                         serve_port_values=spv, serve_mappings=serve_mappings,
                         port_span_values=spans,
                         # The resolved plaintext_redirect ports (public AND
@@ -3830,10 +3896,17 @@ def _shipped_default_serve_mappings(spec: dict) -> dict:
     defaults = spec["schema"]["defaults"]
     mappings = {}
     for key in spec["artifacts"]["serve_ports"]:
+        mapping = spec["serve"].get(key)
+        enabled_key = mapping.get("enabled_key") if mapping else None
+        if enabled_key is not None and defaults[enabled_key] is False:
+            continue
         val = defaults.get(key)
         if isinstance(val, int) and not isinstance(val, bool):
             mappings[key] = {"listen": val, "mode": "http", "target": val}
     for key, mapping in spec["serve"].items():
+        enabled_key = mapping.get("enabled_key")
+        if enabled_key is not None and defaults[enabled_key] is False:
+            continue
         listen = defaults.get(key)
         target = defaults.get(mapping["target_key"])
         if (isinstance(listen, int) and not isinstance(listen, bool)
@@ -3899,6 +3972,7 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
         name: list(spec["artifacts"][name])
         for name in ledger_mod.ARTIFACT_CLASSES
     }
+    ledger_artifacts["serve_ports"] = sorted(serve_mappings)
     container_declarations = list(spec["artifacts"]["containers"])
     # expand_declared is airlock-ledger's own function and expects its own
     # STRING-valued root set (`_current_roots()`), not airlock-config's
@@ -3928,7 +4002,13 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
     # keeps the invariant exact: a printed --adopt line must never be
     # refused for a reason detection could not already see, and an
     # unconstructable record is exactly such a reason.
-    missing_defaults = set(spec["artifacts"]["serve_ports"]) - set(serve_mappings)
+    default_active_keys = {
+        key for key in spec["artifacts"]["serve_ports"]
+        if not (spec["serve"].get(key, {}).get("enabled_key") is not None
+                and spec["schema"]["defaults"][
+                    spec["serve"][key]["enabled_key"]] is False)
+    }
+    missing_defaults = default_active_keys - set(serve_mappings)
     if missing_defaults:
         return True, False, (f"serve key(s) {sorted(missing_defaults)} have no "
                         "[config.defaults] value to assume — --adopt can only "

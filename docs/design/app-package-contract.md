@@ -156,6 +156,9 @@ name = "api_token"             # there is no default value to infer it from
 type = "string"                # one of: string | integer | boolean
 [config.defaults]
 backend_port = 18900           # value doubles as the type declaration
+https_port = 19990
+compat_https = 8443
+compat_enabled = false
                                # (a key may not be both required and defaulted)
 [config.tables.public_target]
 allowed_keys = ["mode", "base_url"]
@@ -185,10 +188,17 @@ files = ["~/.local/bin/my-app"]           # any other managed path (absolute or
                                           #   installer writes outside the classes
                                           #   above; app *data* is deliberately
                                           #   not declared and never torn down
-serve_ports = ["backend_port"]            # config keys whose port values the
+serve_ports = ["https_port", "compat_https"] # config keys whose port values the
                                           #   platform maps via `tailscale serve`
                                           #   and reclaims on removal (the
                                           #   plaintext_known mechanism)
+
+[serve.https]
+https_port = "backend_port"               # legacy always-on listener → target
+compat_https = { target = "backend_port", enabled = "compat_enabled" }
+                                          # optional listener; enabled must name
+                                          # a boolean [config.defaults] key.
+                                          # false omits render and ledger claim.
 
 [tile]                         # replaces this app's entry in hub/index.html APPS;
 label = "My App"               # omit the whole table for a no-tile app (as
@@ -245,7 +255,11 @@ and the SECURITY.md section says so.
 Three manifest surfaces the built-ins need and third parties inherit (except
 where marked):
 
-- `serve.https = {port_key -> target_key}` — the platform executes the exact
+- `serve.https = {port_key -> target_key}` — or
+  `{port_key = {target = target_key, enabled = boolean_default_key}}` for an
+  operator opt-in listener. A false gate omits the mapping from rendering and
+  from the ledger claim; the gate must be a boolean `[config.defaults]` key so
+  an omitted operator value is deterministic. The platform executes the exact
   mapping the four owner apps run by hand today
   (`sudo tailscale serve --bg --https=$LISTEN http://127.0.0.1:$TARGET`) and
   the ledger retires it. Mapping identity is `(mode, listen, target)`; the
@@ -1050,10 +1064,11 @@ is explicitly discarded are also not consumption evidence: both can be added wit
 changing any rendered/runtime value, which would recreate the incident's escape hatch.
 Package CI must additionally bind its concrete unit/backend/ingress artifacts to the
 same declaration and exercise mutations that change the runtime port after assignment.
-Keys used as the listen side of `[serve.https]` or the public side of
-`[plaintext_redirect]` are different: the platform itself renders those listeners.
-They remain in the global uniqueness pool, but do not require a meaningless package
-read. Their target-side keys are package-owned and retain the fatal consumption gate.
+Keys used as the listen side of `[serve.https]`, its optional boolean control,
+or the public side of `[plaintext_redirect]` are different: the platform itself
+consumes those values. Active listeners remain in the global uniqueness pool,
+but these platform-owned keys do not require a meaningless package read. Their
+target-side keys are package-owned and retain the fatal consumption gate.
 
 Be precise about what is and is not enforced as a result. An undeclared read
 usually surfaces on its own — `airlock-config get apps.<id>.<undeclared>`

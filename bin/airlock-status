@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""airlock-status — one question, two answers: is this box OK?
+""":"
+printf '%s\n' 'airlock-status is Python; run: python3 bin/airlock-status [--json]' >&2
+exit 2
+":"""
+
+__doc__ = """airlock-status — one question, two answers: is this box OK?
 
 Until now, answering that meant typing a handful of separate commands
 (skills/airlock-doctor/SKILL.md walks nine read-only probes down the request
@@ -11,7 +16,7 @@ one from prose.
     python3 bin/airlock-status --json   # the same run, as a document (v1)
 
 Not marked executable, and invoked through python3 like bin/airlock-config
-beside it: policy/airlock-cutline reserves `000000 -> 100755` under bin/ for
+beside it: policy/airlock-cutline reserves '000000 -> 100755' under bin/ for
 paths the catalog names one by one, and adding a new one there is a governance
 change, not a status-surface change.
 
@@ -36,14 +41,14 @@ green report in front of a dead box happens.
 WHY THE ROSTER IS FIXED
 -----------------------
 Every run emits every check id in CHECKS, always, in that order. A probe that
-cannot run emits `unchecked` with the reason; it never disappears from the
+cannot run emits 'unchecked' with the reason; it never disappears from the
 report. This is structural, not stylistic. bin/airlock-smoke's false success
 (measured 2026-08-29, docs/worklog/2026-08-29-live-check-emulation-and-live-drift.md)
-is the shape it forecloses: `airlock_config validate` failed, `airlock_config
-apps` then yielded nothing, zero apps were checked, and the run reported "all 0
+is the shape it forecloses: 'airlock_config validate' failed, 'airlock_config
+apps' then yielded nothing, zero apps were checked, and the run reported "all 0
 app smoke(s) passed" with rc=0. An empty result set had become a pass. Here an
 empty inventory cannot be silent — apps.enabled fails on it, and the checks that
-depended on it say `unchecked`, so the run cannot exit 0.
+depended on it say 'unchecked', so the run cannot exit 0.
 
 This tool is READ-ONLY. It mutates nothing, takes no ledger lock, and needs no
 privilege beyond what the probes themselves need.

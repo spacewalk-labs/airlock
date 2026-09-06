@@ -362,4 +362,5 @@ content	apps/fileview/static/app.js
 #    as a second round, and backs off on 429 in the first round only. Same shape as
 #    batches 1, 13, 14, 16, 17 and 18: work is the live consumer of apps/ and the
 #    published copy is behind until the next publish sync, not a designed split.
-content	apps/learning/skill/transcript.py
+#    2026-09-05: synced — airlock-apps#16 merged the same fix, so this path healed and
+#    its entry is gone. The batch is kept for the trail, not for a live split.

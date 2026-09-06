@@ -86,6 +86,21 @@ fi
 STATUS="$ROOT/bin/airlock-status"
 SMOKE="$ROOT/bin/airlock-smoke"
 
+# A status file is intentionally mode 0644 and documented as a Python entry point.
+# In practice, that refusal naturally sends an operator to `bash bin/airlock-status`.
+# The old module docstring let Bash interpret Markdown backticks before it reached a
+# syntax error; the `-> 100755` example therefore created an empty file named 100755
+# in the checkout.  Keep that observed invocation fail-closed and side-effect-free.
+status_bash_out="$(cd "$ROOT" && bash bin/airlock-status 2>&1)"; status_bash_rc=$?
+if [ "$status_bash_rc" = 2 ] \
+   && printf '%s' "$status_bash_out" | grep -q 'python3 bin/airlock-status' \
+   && (cd "$ROOT" && test ! -e 100755); then
+  ok "P bash invocation refuses safely without creating 100755"
+else
+  bad "P bash invocation left a side effect or no Python guidance (rc=$status_bash_rc)"
+  note "$(printf '%s' "$status_bash_out" | head -1)"
+fi
+
 # ---- the fixture box --------------------------------------------------------
 # Ports are allocated by the kernel, never hardcoded. A fixed port is host state:
 # anything else on the box holding 44402 turns this suite red for a reason that

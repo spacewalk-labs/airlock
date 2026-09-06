@@ -1647,6 +1647,110 @@ chmod +x "$pkg/install.sh"
 expect_ok "G57g platform-owned listen needs no fake package read; consumed target is green" \
   run "$cfg" validate
 
+# A compatibility listener may be opt-in for one operator without becoming a
+# default route on every box that installs the app. The platform consumes the
+# boolean gate and omits the listener from both render intent and ledger claims
+# while false; malformed or mistyped gates fail closed.
+reset_box
+pkg="$PKGROOT/g57-conditional-serve"; mkpkg "$pkg" g57conditional
+pkg_manifest "$pkg" 'contract = 1' 'id = "g57conditional"' \
+  '[config.defaults]' 'listen = 18840' 'target = 18841' 'enabled = false' \
+  '[artifacts]' 'serve_ports = ["listen"]' \
+  '[serve.https]' 'listen = { target = "target", enabled = "enabled" }'
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+target="${AIRLOCK_G57CONDITIONAL_TARGET:?}"
+test "$target" -gt 0
+EOF
+chmod +x "$pkg/install.sh"
+cfg="$CFGROOT/g57-conditional-off.toml"
+make_pkg_cfg "$cfg" g57conditional "$pkg"
+conditional_off="$(run "$cfg" package-info 2>/dev/null | python3 -c '
+import json, sys
+p = json.load(sys.stdin)["packages"]["g57conditional"]
+print(len(p["serve_mappings"]), len(p["artifacts"]["serve_ports"]))
+')"
+target_pkg="$PKGROOT/g57-conditional-target"; mkpkg "$target_pkg" g57conditionaltarget
+pkg_manifest "$target_pkg" 'contract = 1' 'id = "g57conditionaltarget"' \
+  '[config.defaults]' 'listen = 18845' 'target = 19902' 'enabled = false' \
+  '[artifacts]' 'serve_ports = ["listen"]' \
+  '[serve.https]' 'listen = { target = "target", enabled = "enabled" }'
+cat >"$target_pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+target="${AIRLOCK_G57CONDITIONALTARGET_TARGET:?}"
+test "$target" -gt 0
+EOF
+chmod +x "$target_pkg/install.sh"
+target_cfg="$CFGROOT/g57-conditional-target.toml"
+make_pkg_cfg "$target_cfg" g57conditionaltarget "$target_pkg"
+target_msg="$(run "$target_cfg" validate 2>&1)"; target_rc=$?
+sed -i 's/target = 19902/target_port = 19902/; s/target = "target"/target = "target_port"/' \
+  "$target_pkg/airlock-app.toml"
+sed -i 's/_TARGET:?}/_TARGET_PORT:?}/' "$target_pkg/install.sh"
+target_port_msg="$(run "$target_cfg" validate 2>&1)"; target_port_rc=$?
+if [ "$conditional_off" = "0 0" ] \
+    && [ "$target_rc" -ne 0 ] && grep -Fq 'port 19902 is used twice' <<<"$target_msg" \
+    && [ "$target_port_rc" -ne 0 ] && grep -Fq 'port 19902 is used twice' <<<"$target_port_msg"; then
+  ok "G57g3 disabled conditional omits listener claim but retains target ownership"
+else
+  bad "G57g3 disabled conditional ownership split (claims=$conditional_off target_rc=$target_rc target_port_rc=$target_port_rc)"
+fi
+cfg="$CFGROOT/g57-conditional-on.toml"
+make_pkg_cfg "$cfg" g57conditional "$pkg" 'enabled = true'
+conditional_on="$(run "$cfg" package-info 2>/dev/null | python3 -c '
+import json, sys
+p = json.load(sys.stdin)["packages"]["g57conditional"]
+m = p["serve_mappings"]["listen"]
+print(m["listen"], m["target"], p["artifacts"]["serve_ports"][0])
+')"
+[ "$conditional_on" = "18840 18841 listen" ] \
+  && ok "G57g4 enabled conditional serve renders and enters the ledger" \
+  || bad "G57g4 enabled conditional serve was not rendered: $conditional_on"
+cfg="$CFGROOT/g57-conditional-bad-type.toml"
+make_pkg_cfg "$cfg" g57conditional "$pkg" 'enabled = "yes"'
+expect_fail "G57g5 conditional serve rejects a non-boolean operator value" \
+  "must be a boolean" run "$cfg" validate
+
+badpkg="$PKGROOT/g57-conditional-malformed"; mkpkg "$badpkg" g57badconditional
+pkg_manifest "$badpkg" 'contract = 1' 'id = "g57badconditional"' \
+  '[config.defaults]' 'listen = 18842' 'target = 18843' 'enabled = false' \
+  '[artifacts]' 'serve_ports = ["listen"]' \
+  '[serve.https]' 'listen = { target = "target" }'
+badcfg="$CFGROOT/g57-conditional-malformed.toml"
+make_pkg_cfg "$badcfg" g57badconditional "$badpkg"
+expect_fail "G57g6 incomplete conditional serve declaration is fatal" \
+  "serve.https values must be" run "$badcfg" validate
+
+# A disabled conditional listener does not own its configured port, even when
+# the key has the conventional *_port spelling that the global sweep sees.
+# Keep the non-port spelling as a control: before this regression was fixed it
+# passed only because the sweep missed it, while the equivalent *_port key was
+# falsely treated as an active owner and collided with hub.http_port.
+reset_box
+pkg="$PKGROOT/g57-conditional-port"; mkpkg "$pkg" g57conditionalport
+pkg_manifest "$pkg" 'contract = 1' 'id = "g57conditionalport"' \
+  '[config.defaults]' 'compat_port = 19901' 'target = 18844' 'enabled = false' \
+  '[artifacts]' 'serve_ports = ["compat_port"]' \
+  '[serve.https]' 'compat_port = { target = "target", enabled = "enabled" }'
+cat >"$pkg/install.sh" <<'EOF'
+#!/usr/bin/env bash
+target="${AIRLOCK_G57CONDITIONALPORT_TARGET:?}"
+test "$target" -gt 0
+EOF
+chmod +x "$pkg/install.sh"
+cfg="$CFGROOT/g57-conditional-port-off.toml"
+make_pkg_cfg "$cfg" g57conditionalport "$pkg"
+expect_ok "G57g7 disabled conditional *_port listener does not claim hub port" \
+  run "$cfg" validate
+sed -i 's/compat_port/compat/g' "$pkg/airlock-app.toml"
+expect_ok "G57g8 disabled conditional non-port listener remains the control" \
+  run "$cfg" validate
+sed -i 's/compat/compat_port/g' "$pkg/airlock-app.toml"
+cfg="$CFGROOT/g57-conditional-port-on.toml"
+make_pkg_cfg "$cfg" g57conditionalport "$pkg" 'enabled = true'
+expect_fail "G57g9 enabled conditional *_port listener still collides with hub" \
+  "claims serve port 19901" run "$cfg" validate
+
 # A key can be platform-owned as one HTTPS mapping's listen and package-owned
 # as another mapping's target. Target ownership must win over the listen
 # exemption or role overlap recreates the unread-listener escape.

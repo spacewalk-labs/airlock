@@ -132,6 +132,9 @@ accounts_port = 19904   # loopback backend for the platform account surface. Unl
 # redirect_port and the manifest no longer declares them, so validate rejects
 # both as unknown keys. devterm is HTTPS only.
 https_port    = 19910 # secure-context https (clipboard, OSC52, full PWA)
+# Optional compatibility ingress. Leave the manifest default false unless
+# this box explicitly owns the legacy listener.
+# compat_https_enabled = true
 gate_port    = 19911  # loopback nginx owner-gate
 backend_port = 19913  # loopback devterm-gate (serves the custom client + API, proxies to ttyd)
 ttyd_port    = 19912  # loopback ttyd (pure PTY backend)

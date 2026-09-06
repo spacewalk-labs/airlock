@@ -5,6 +5,10 @@ id = "devterm"
 # D-DEVTERM-9900 retired public_port/redirect_port. HTTPS only.
 [config.defaults]
 https_port = 19910
+# Optional compatibility ingress for consumers that retain a legacy port.
+# Keep it disabled unless this box explicitly owns that listener.
+compat_https = 8443
+compat_https_enabled = false
 gate_port = 19911
 ttyd_port = 19912
 backend_port = 19913
@@ -91,10 +95,11 @@ fragments = ["servers.d/devterm.conf"]
 files = ["~/.local/bin/ttyd", "~/.local/bin/devterm-shell",
          "~/.local/bin/claude-switch", "~/.local/bin/claude-status",
          "~/.local/share/airlock-devterm/"]
-serve_ports = ["https_port"]
+serve_ports = ["https_port", "compat_https"]
 
 [serve.https]
 https_port = "gate_port"
+compat_https = { target = "gate_port", enabled = "compat_https_enabled" }
 
 # From hub/index.html's APPS table (devterm row).
 [tile]

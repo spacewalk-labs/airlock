@@ -44,6 +44,11 @@ YT_DLP_TIMEOUT_SECONDS = 300
 #    한 번 맞고 포기하면 되는 영상이 "자막 없음" 으로 기록된다 — 몇십 초 기다리면 대개
 #    통과한다(실측 2026-09-04~05: 429 8건 중 6건이 재시도·우회로 결국 성공).
 YT_DLP_RETRY_DELAYS = (5, 15, 45)
+# 🔴 기다려도 안 되면 **다른 문으로** 청한다. 유튜브의 스로틀은 클라이언트마다 따로 걸리고,
+#    web 이 막힌 동안 android 는 통과한다 (실측 2026-09-04: 429 로 두 번 죽은 영상이
+#    이 인자 하나로 자막을 냈다. ios·tv 는 같은 영상에서 포맷 오류를 냈다 — 그래서
+#    후보를 늘리지 않고 실제로 통과한 하나만 쓴다).
+YT_DLP_LAST_RESORT = ["--extractor-args", "youtube:player_client=android"]
 # 영상 id 는 URL 이 무엇이든 이 모양이다. 저장 헬퍼의 프론트매터 검사와 같은 문자 집합.
 VIDEO_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 
@@ -85,7 +90,37 @@ def run_patiently(argv, sleep=None):
         if result.returncode == 0 or not rate_limited(result.stderr):
             return result
         sleep(delay)
-    return run(argv)
+    result = run(argv)
+    if result.returncode == 0 or not rate_limited(result.stderr):
+        return result
+    if YT_DLP_LAST_RESORT[0] in argv:
+        return result
+    return run(argv + YT_DLP_LAST_RESORT)
+
+
+def source_language(info):
+    """이 영상이 실제로 말하는 언어. 없으면 None.
+
+    🔴 `language` 필드를 믿지 않는다. 유튜브는 한국어 영상에 `en` 을 달아 두기도 하고
+       (실측 2026-09-04: lpFevXDUAxg 가 그랬다), 그러면 원어 자막이 멀쩡히 있는데도
+       영어 **기계번역**을 받아 요약이 번역본에서 만들어진다.
+
+    자막 목록이 더 정직하다. 자동자막은 원어 하나만 `<언어>-orig` 로 오고 나머지 백여
+    개는 그것을 번역한 것이라, `-orig` 가 붙은 키가 곧 원어의 이름이다. 사람 자막밖에
+    없으면 그건 사람이 올린 것이니 그대로 믿는다.
+    """
+    auto = info.get("automatic_captions")
+    if isinstance(auto, dict):
+        for name in sorted(auto):
+            if name.endswith("-orig"):
+                return name[: -len("-orig")]
+    manual = info.get("subtitles")
+    if isinstance(manual, dict) and manual:
+        declared = info.get("language")
+        if declared in manual:
+            return declared
+        return sorted(manual)[0]
+    return info.get("language")
 
 
 def language_rounds(language):
@@ -106,8 +141,8 @@ def metadata(binary, url):
     # 🔴 `--no-playlist` 가 없으면 `list=` 가 붙은 평범한 watch 주소에서 yt-dlp 가 영상마다
     #    JSON 을 한 줄씩 내고 `json.loads` 가 죽는다. 재생목록에서 복사한 주소는 흔하고,
     #    접수는 그것을 통과시킨다 — 앱이 받아 놓고 워커가 이해 못 할 문장으로 실패한다.
-    result = run([binary, "--skip-download", "--dump-json", "--no-playlist",
-                  "--no-warnings", url])
+    result = run_patiently([binary, "--skip-download", "--dump-json", "--no-playlist",
+                            "--no-warnings", url])
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace").strip()
         # 🔴 낡은 yt-dlp 는 여기서 403 을 낸다. 그 경우 원인은 URL 이 아니라 도구다.
@@ -218,7 +253,7 @@ def main(argv=None):
     failures = []
     with tempfile.TemporaryDirectory(prefix="airlock-learning-subs-") as workdir:
         events, kind = subtitle_events(binary, args.url, workdir,
-                                       info.get("language"), failures)
+                                       source_language(info), failures)
     if not events:
         if failures:
             die("자막을 받지 못했습니다 — " + " / ".join(failures))
