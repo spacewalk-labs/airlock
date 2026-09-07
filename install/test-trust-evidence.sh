@@ -52,19 +52,19 @@ assert f'skip "{allowed_skip.removeprefix("SKIP ")}"' in (
     root / "install/test-builtin-migration.sh"
 ).read_text()
 assert evidence.suite_summary(
-    "builtin-capability-migration", 181, 0, f"{allowed_skip}\n---\npassed=180 failed=0\n"
-) == (180, 1)
+    "builtin-capability-migration", 182, 0, f"{allowed_skip}\n---\npassed=181 failed=0\n"
+) == (181, 1)
 for returncode, output in (
     (0, "---\npassed=180 failed=0\n"),
     (0, "SKIP E: unrelated environmental check\n---\npassed=180 failed=0\n"),
-    (0, f"{allowed_skip}\n---\npassed=181 failed=0\n"),
+    (0, f"{allowed_skip}\n---\npassed=182 failed=0\n"),
     (0, f"{allowed_skip}\n{allowed_skip}\n---\npassed=179 failed=0\n"),
     (0, f"{allowed_skip}\nSKIP E: unrelated environmental check\n---\npassed=179 failed=0\n"),
-    (1, "---\npassed=181 failed=0\n"),
-    (0, "---\npassed=181 failed=1\n"),
+    (1, "---\npassed=182 failed=0\n"),
+    (0, "---\npassed=182 failed=1\n"),
 ):
     try:
-        evidence.suite_summary("builtin-capability-migration", 181, returncode, output)
+        evidence.suite_summary("builtin-capability-migration", 182, returncode, output)
     except evidence.EvidenceError:
         pass
     else:
@@ -175,7 +175,7 @@ make_fake_suite() {
   chmod +x "$path"
 }
 make_fake_suite "$REPO/install/test-operator-surface.sh" 71
-make_fake_suite "$REPO/install/test-builtin-migration.sh" 181
+make_fake_suite "$REPO/install/test-builtin-migration.sh" 182
 make_fake_suite "$REPO/install/test-ledger-system-unit.sh" 7
 make_fake_suite "$REPO/install/test-live-verdict.sh" 44
 
@@ -209,7 +209,7 @@ import json,os,sys
 d=json.load(sys.stdin)
 assert d["candidate_sha"] == os.environ["SHA"]
 assert d["result"] == "passed"
-assert [row["passed"] for row in d["suites"]] == [71, 181, 7, 44]
+assert [row["passed"] for row in d["suites"]] == [71, 182, 7, 44]
 assert [row["skipped"] for row in d["suites"]] == [0, 0, 0, 0]
 ' <<<"$suite_a"; then
   ok "offline suite result is deterministic and candidate-bound"

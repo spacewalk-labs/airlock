@@ -104,14 +104,20 @@ def _token_hours(name, default):
 TOKEN_WARN_HOURS = _token_hours('AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS', 24)
 TOKEN_STALE_HOURS = _token_hours('AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS', 24)
 HOME = os.path.expanduser('~')
-# Origins that count as "this box, another port" for the unread badge. The installer
-# measures the tailnet FQDN and passes it; without it we still know our own hostname,
-# so the badge keeps working from a short-name origin and nothing else is admitted.
-CORS_HOSTS = frozenset(
-    h.strip().lower()
-    for h in ([socket.gethostname(), socket.gethostname().split('.')[0]]
-              + os.environ.get('AIRLOCK_DEV_MONITOR_CORS_HOSTS', '').split(','))
-    if h.strip()
+# The exact origins allowed to read the unread badge. The installer names them
+# scheme+host+PORT — one per badge-drawing tool listener — and an empty set is a
+# working state: no cross-origin read, badge only on the hub itself.
+#
+# The port is the whole point. Comparing hostnames admitted EVERY port of this box,
+# including the one that serves published documents — thousands of generated HTML
+# pages, some carrying externally sourced content. One `fetch` in any of them read
+# the owner's whole message preview, because the ingress injects the reader's
+# identity and we echoed the origin back. No cookie is involved; that is what makes
+# it ambient authority rather than CSRF.
+CORS_ORIGINS = frozenset(
+    o.strip().lower()
+    for o in os.environ.get('AIRLOCK_DEV_MONITOR_CORS_ORIGINS', '').split(',')
+    if o.strip()
 )
 
 # Message feature config, loaded by _start_messages. None keeps owner routes
@@ -947,28 +953,34 @@ def _token_state():
 # ---- HTTP handler ----
 class Handler(BaseHTTPRequestHandler):
     def _cors_origin(self):
-        """The request Origin if it is *this box on another port*, else None.
+        """The request Origin if it is a listener allowed to draw the badge, else None.
 
         Why this exists: the Airlock return widget is injected into tools that run on
         their own ports, and it reads the owner message preview from here to draw the
         unread badge. Without an echoed ACAO that fetch fails silently and the badge
         simply never appears — which reads as "no unread messages".
 
-        The comparison is against a WHOLE hostname, never a label. An earlier version
-        compared only the first label, which let `<boxname>.attacker.example` pass: the
-        identity here is injected by the ingress, so any origin we echo can read owner
-        data with the owner's own authority — ambient authority, even though the request
-        carries no cookie. CORS_HOSTS is the exact set the installer measured (short name
-        and tailnet FQDN); nothing else is same-box.
+        The comparison is a WHOLE ORIGIN — scheme, host AND port — against the set the
+        installer measured. Two earlier versions were each one step too loose. The first
+        compared only the hostname's first label, which let `<boxname>.attacker.example`
+        pass. The second compared the whole hostname, which was still every PORT of this
+        box: the document port serves generated HTML by the thousand, so a script in any
+        published page could read the owner's message preview with the owner's own
+        authority. Neither needed a cookie — the ingress injects the identity, and an
+        echoed ACAO hands the response to whatever asked.
+
+        The badge is drawn by the shell-grade tools only. The document port is
+        deliberately absent from the allowed set: it is the one surface here whose
+        content is bulk-generated, so it is the one that must not be able to ask.
         """
-        origin = self.headers.get('Origin') or ''
-        if not origin:
-            return None
-        try:
-            h = (urllib.parse.urlsplit(origin).hostname or '').lower()
-        except ValueError:
-            return None
-        return origin if h and h in CORS_HOSTS else None
+        origin = (self.headers.get('Origin') or '').strip().lower()
+        # Echo the NORMALISED value, not what arrived. Matching already folds case and
+        # trims padding, so returning the raw header would put caller-chosen bytes into a
+        # security response header for free. A browser always sends the normalised form,
+        # so this is byte-identical for every real caller and only closes the gap for
+        # hand-made requests — which are not bound by CORS anyway, but should still not
+        # get to choose what we say back.
+        return origin if origin in CORS_ORIGINS else None
 
     def _json(self, status, payload, cors=False):
         """cors=True only where a cross-origin read is a feature. It is off by default
@@ -1108,12 +1120,18 @@ class Handler(BaseHTTPRequestHandler):
         """
         return urllib.parse.unquote(value)
 
-    def _owner_ready(self):
-        """Return 404 when messages are disabled; otherwise require the owner gate."""
+    def _owner_ready(self, cors=False):
+        """Return 404 when messages are disabled; otherwise require the owner gate.
+
+        cors is threaded through to both the 404 and the owner-gate 403 so that
+        messages/preview — the one route a non-owner tailnet viewer legitimately
+        polls cross-origin — can be read as a real rejection instead of an opaque
+        CORS failure. Every other caller leaves it False.
+        """
         if OWNER_CONFIG is None:
-            self._json(404, {'ok': False, 'error': 'messages feature not enabled'})
+            self._json(404, {'ok': False, 'error': 'messages feature not enabled'}, cors=cors)
             return False
-        return devmon_owner.require_owner(self, OWNER_CONFIG)
+        return devmon_owner.require_owner(self, OWNER_CONFIG, cors=cors)
 
     def _updates_owner_ready(self):
         """Updates keep their owner gate when messages are deliberately off."""
@@ -1148,11 +1166,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._owner_harness_run()
             return
-        if not self._owner_ready():
+        # The one route a separate-port tool reads cross-origin: the return widget's
+        # unread badge. tailnet_view means the caller is often NOT the owner, so the
+        # gate's rejection has to be readable too (cors=True on both), not just the
+        # 200 — otherwise a non-owner viewer's badge poll fails as an opaque CORS
+        # error instead of the "not owner, real zero" the widget already expects.
+        # Everything else stays same-origin only.
+        is_preview = path == '/api/owner/messages/preview'
+        if not self._owner_ready(cors=is_preview):
             return
-        if path == '/api/owner/messages/preview':
-            # The one route a separate-port tool reads cross-origin: the return widget's
-            # unread badge. Everything else stays same-origin only.
+        if is_preview:
             self._json(200, MSG.preview(), cors=True)
             return
         if path == '/api/owner/messages':

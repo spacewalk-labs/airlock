@@ -13,7 +13,7 @@
 # merge into resolved config (bin/airlock-config's resolved()) and be exported, and
 # for two of them that CHANGES BEHAVIOUR: AIRLOCK_PASEO_ALLOW_UNBACKED_MEM is
 # compared against the literal `1`, so a bool declaration exports "true" and stops
-# matching; AIRLOCK_DEV_MONITOR_CORS_HOSTS is measured by the installer from the
+# matching; AIRLOCK_DEV_MONITOR_CORS_ORIGINS is measured by the installer from the
 # box's FQDN, so a declaration creates a knob that does nothing.
 #
 # So: a declaration space that is explicitly NOT config. The cases below are mostly

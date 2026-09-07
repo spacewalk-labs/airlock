@@ -27,6 +27,12 @@ claude_switch = ""
 claude_status = ""
 fleet_store = ""
 fleet_store_url = ""
+# Fleet read-open. Empty (the default) means the gate is owner-only end to end.
+# Set to a domain ("example.com") to let any identity in that domain read the four
+# account-state routes (/claude-status, /claude-usage, /claude-usage-store,
+# /codex-usage) so a central console can poll this box. Login state is not a secret
+# here: those routes emit no token and no hash. Nothing that writes is opened.
+fleet_read_domain = ""
 orca_shim = ""
 
 # Transcribed from install/prerequisites.tsv's seven devterm rows (F11).

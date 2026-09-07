@@ -33,13 +33,20 @@
  * only in the backend, so there is no second copy here to drift. A failed poll clears
  * the ring: no reading is not a warning.
  *
- * Needs-action badge (all modes): polls Dev Monitor's owner message preview every 30s
- * and shows the "still needs a person" count (falling back to the older unread count
- * against a not-yet-upgraded backend) as a small grey circle. Hidden for non-owner and
- * for a genuinely disabled messages backend (404/403) — those are real zeros. A fetch
- * that fails for any other reason (5xx, network, bad JSON) leaves the badge exactly as
- * it was: overwriting it to 0 on a backend error would read as "nothing to do" when the
- * truth is "do not know", and that is the one distinction this badge exists to preserve.
+ * Needs-action badge (all modes unless data-badge="0"): polls Dev Monitor's owner
+ * message preview every 30s and shows the "still needs a person" count (falling back to
+ * the older unread count against a not-yet-upgraded backend) as a small grey circle.
+ * Hidden for non-owner and for a genuinely disabled messages backend (404/403) — those
+ * are real zeros, but only where the hub's own identity gate lets the request reach
+ * dev-monitor far enough to answer with one (the exact origins in CORS_ORIGINS). A page
+ * whose audience is wider than that gate (the publish document port under
+ * tailnet_view — any tailnet member, not just the box owner) sets data-badge="0" and
+ * skips the poll: the request would fail for most visitors before dev-monitor ever
+ * sees it, and a browser logs a CORS-blocked fetch to the console on every such
+ * attempt regardless of how the rejection is handled in JS. A fetch that fails for any
+ * other reason (5xx, network, bad JSON) leaves the badge exactly as it was: overwriting
+ * it to 0 on a backend error would read as "nothing to do" when the truth is "do not
+ * know", and that is the one distinction this badge exists to preserve.
  *
  * Interaction (robust on iOS): navigation is a click (fires reliably on tap in
  * iOS Safari). Dragging (floating) uses pointer events on window listeners
@@ -84,6 +91,17 @@
   // and a tap navigates as before (no dead menu entries).
   var wantMenu = false;
   var panelBase = "";
+  // data-badge="0": skip the unread-badge poll entirely. Set only where the page's
+  // audience is wider than who UNREAD_URL will ever answer for (the publish document
+  // port under tailnet_view: any tailnet member can open the document, but the badge
+  // source is the box OWNER's private message feed, gated well before it reaches this
+  // widget). For that audience the poll cannot succeed for most visitors, and the
+  // browser logs a CORS-blocked-fetch console error on every failed attempt that no
+  // application code can suppress (it is the browser's own security log, not a
+  // catchable JS event) — so the fix is to not send the request, not to catch its
+  // rejection quietter. Everywhere else (hub-served subpaths, devterm/code-server/
+  // orca/paseo) the visitor is always the owner, so the poll stays on by default.
+  var wantBadge = true;
   try {
     var self = document.currentScript ||
       document.querySelector('script[src^="/airlock-return.js"]');
@@ -93,6 +111,7 @@
       if (self.dataset.anchor === "bottom-right") anchor = "bottom-right";
       if (self.dataset.menu === "1") wantMenu = true;
       if (self.dataset.panel) panelBase = String(self.dataset.panel).replace(/\/+$/, "") + "/";
+      if (self.dataset.badge === "0") wantBadge = false;
     }
   } catch (e) {}
   var useMenu = wantMenu && !!panelBase;
@@ -507,8 +526,10 @@
     } else {
       (document.body || document.documentElement).appendChild(btn);
     }
-    pollUnread();
-    setInterval(pollUnread, POLL_MS);
+    if (wantBadge) {
+      pollUnread();
+      setInterval(pollUnread, POLL_MS);
+    }
     if (ALERT_URL) {
       pollAlert();
       setInterval(pollAlert, POLL_MS);

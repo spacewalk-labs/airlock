@@ -46,6 +46,7 @@ CLAUDE_SWITCH_CFG="${AIRLOCK_DEVTERM_CLAUDE_SWITCH:-}"
 CLAUDE_STATUS_CFG="${AIRLOCK_DEVTERM_CLAUDE_STATUS:-}"
 FLEET_STORE="${AIRLOCK_DEVTERM_FLEET_STORE:-}"
 FLEET_STORE_URL="${AIRLOCK_DEVTERM_FLEET_STORE_URL:-}"
+FLEET_READ_DOMAIN="${AIRLOCK_DEVTERM_FLEET_READ_DOMAIN:-}"
 ORCA_SHIM_CFG="${AIRLOCK_DEVTERM_ORCA_SHIM:-}"
 WEB_ROOT="$HOME/.local/share/airlock-devterm/web"
 # The subscription account panel is a platform asset (hub/assets/accounts), deployed
@@ -272,6 +273,10 @@ add_env DEVTERM_ACCOUNTS "$ACCOUNTS"
 add_env DEVTERM_XAI "$XAI"
 add_env DEVTERM_REMOTE_HOSTS "$REMOTE_HOSTS"
 add_env DEVTERM_ORCA_SHIM "$ORCA_SHIM"
+# The gate re-checks identity itself, so the read-open has to be known at BOTH layers
+# or nginx would forward a request the gate then 403s — a widened route that answers
+# 403 anyway is worse than a closed one, because the config says it is open.
+add_env DEVTERM_FLEET_READ_DOMAIN "$FLEET_READ_DOMAIN"
 # Always hand the non-overridable platform account path to the Codex lifecycle
 # endpoints. DEVTERM_CLAUDE_SWITCH may intentionally name an operator compatibility
 # tool, which is not required to know the platform-only codex-auth verb.
@@ -319,7 +324,7 @@ fi
 # Written unconditionally: it is config the renderer includes, not a system mutation.
 frag="$CONFD/servers.d/devterm.conf"
 install -d "$CONFD/servers.d"
-render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR" > "$frag"
+render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR" "$FLEET_READ_DOMAIN" > "$frag"
 log "wrote nginx fragment: $frag"
 
 # --- 6. tailscale serve: HTTPS carries devterm ---

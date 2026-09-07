@@ -28,6 +28,11 @@ FAIL = 0
 
 WIDGET = "/airlock-return.js"
 TAG = '<script src="/airlock-return.js" data-mode="corner" defer></script>'
+# The dedicated document port's own copy carries an extra placeholder — the render
+# substitutes it with data-badge="0" only when tailnet_view widens this port's
+# audience past who the widget's unread-badge poll can ever answer for (see
+# install/render-nginx.sh PUBLISH_WIDGET_BADGE_ATTR). Same tag, one more token.
+DEDICATED_TAG = '<script src="/airlock-return.js" data-mode="corner"@@BADGEATTR@@ defer></script>'
 
 
 def ok(name):
@@ -100,7 +105,8 @@ def main(argv):
     check("전용 문서 포트 블록을 소스에서 찾는다", dedicated is not None)
     if dedicated:
         body = dedicated.group(1)
-        check("전용 포트의 문서에도 주입한다", body.count(TAG) == 2, str(body.count(TAG)))
+        check("전용 포트의 문서에도 주입한다",
+              body.count(DEDICATED_TAG) == 2, str(body.count(DEDICATED_TAG)))
         check("전용 포트가 위젯 자체를 서빙한다 — 안 그러면 주입은 404 를 가리킨다",
               "location = /airlock-return.js" in body)
 

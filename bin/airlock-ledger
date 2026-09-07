@@ -2670,7 +2670,7 @@ def command_commit(store: dict[str, Any], info: dict[str, Any], app_id: str,
     # Validate the candidate BEFORE the destructive record diff: a store the
     # write gate would refuse must fail before anything is torn down.
     _validate_store(result, ledger_path())
-    if old_committed is not None and not old_committed["lifecycle"]["deactivate"]:
+    if old_committed is not None:
         old_artifacts = _committed_artifacts(old_committed)
         diff = _artifact_difference(old_artifacts, new_artifacts)
         # The OLD committed record's mappings the NEW one no longer names,

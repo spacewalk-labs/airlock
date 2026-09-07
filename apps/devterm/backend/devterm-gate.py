@@ -29,6 +29,8 @@ degrade to a clean "disabled" response when their dependencies are absent.
 Env:
   AIRLOCK_IDENTITY_HEADER  identity header name (e.g. Tailscale-User-Login)
   AIRLOCK_OWNER            comma-separated allow-list of logins (owner)
+  DEVTERM_FLEET_READ_DOMAIN  empty (default) = owner-only; a domain opens the four
+                           FLEET_READ_PATHS to identities in it (see below)
   DEVTERM_LISTEN_HOST/PORT this gate's loopback bind (default 127.0.0.1:19913)
   DEVTERM_TTYD_HOST/PORT   ttyd backend (default 127.0.0.1:19912)
   DEVTERM_WEB              web root to serve (the custom client)
@@ -157,6 +159,29 @@ MAX_BODY = 210 * 1024 * 1024         # inbound body cap — accommodates a 200MB
 LOGIN_CODE_BODY_MAX = 1024            # one <=400-byte code plus small JSON framing
 IDENT_HEADER = os.environ.get("AIRLOCK_IDENTITY_HEADER", "").strip().lower().encode("latin1")
 TTYD_PATHS = (b"/ws", b"/token")
+# Fleet read-open ([apps.devterm] fleet_read_domain, rendered as the nginx
+# $devterm_fleet_ok map in render.sh — keep the two path lists identical). These four
+# report WHICH account this box is logged in as and how much quota is left; they emit
+# no token and no hash, which is what lets a central console poll every box. 🔴 Never
+# put a write path here, and never add a path here without adding the matching nginx
+# location: nginx is the gate, this is the re-check, and a path in only one of them is
+# either an open route with no guard in front of it or a 403 that the config claims
+# is open.
+FLEET_READ_PATHS = frozenset({b"/claude-status", b"/claude-usage",
+                              b"/claude-usage-store", b"/codex-usage"})
+FLEET_READ_DOMAIN = os.environ.get("DEVTERM_FLEET_READ_DOMAIN", "").strip().lower().removeprefix("@")
+
+
+def _fleet_read_ok(login, path):
+    """True when `login` may read `path` without being the owner.
+
+    Deliberately the same shape as the nginx regex `^[^@]+@<domain>$`: exactly one
+    "@", a non-empty local part, and the domain matched whole. Anything looser and
+    the two layers disagree — the layer that says yes is the one that decides."""
+    if not FLEET_READ_DOMAIN or path not in FLEET_READ_PATHS:
+        return False
+    local, sep, domain = login.partition("@")
+    return bool(local) and sep == "@" and domain == FLEET_READ_DOMAIN
 DEVTERM_STATE_DIR = os.path.expanduser("~/.local/share/airlock-devterm/state")
 XAI_LOGIN_OUT = os.path.join(DEVTERM_STATE_DIR, "xai-login.out")
 _xai_login_process = None
@@ -3036,12 +3061,16 @@ def _fetch_fleet_store():
     return {}
 
 
-async def _serve_claude_usage(head, cw):
+async def _serve_claude_usage(head, cw, read_only=False):
     """`GET /claude-usage?slot=<account|live>` — query just the one asked-for account.
-    (Querying all accounts at once risks 429 when several boxes poll together.)"""
+    (Querying all accounts at once risks 429 when several boxes poll together.)
+
+    read_only: same credential-write reason as _serve_claude_status. The upstream usage
+    call itself still happens — that is what was asked for — but an expired slot is
+    reported rather than revived."""
     q = urllib.parse.parse_qs(_request_query(head).decode("utf-8", "replace"))
     slot = (q.get("slot") or ["live"])[0]
-    await _run_probe(cw, ["--usage", slot])
+    await _run_probe(cw, ["--usage", slot] + (["--no-refresh"] if read_only else []))
 
 
 async def _serve_codex_status(cw):
@@ -3052,10 +3081,16 @@ async def _serve_codex_status(cw):
     await _run_probe(cw, ["--codex"])
 
 
-async def _serve_claude_status(cw):
+async def _serve_claude_status(cw, read_only=False):
     """`GET /claude-status` — which account this box is logged in as + health. No
-    secrets. Usage is NOT queried here (per-account API call risks 429)."""
-    await _run_probe(cw)
+    secrets. Usage is NOT queried here (per-account API call risks 429).
+
+    read_only is set for a caller who cleared the fleet read-open instead of the owner
+    gate. 🔴 It is not cosmetic: without it this "status" call refreshes an expired pool
+    slot and writes the rotated credential back to disk (airlock-accounts-status
+    `_describe` -> `_refresh_pool`/`_mark_dead`), so a non-owner could rotate the
+    owner's credentials merely by polling. The probe then reports the slot as stale."""
+    await _run_probe(cw, ["--no-refresh"] if read_only else [])
 
 
 async def _serve_acct_usage_now(headers, cw):
@@ -3136,8 +3171,15 @@ async def handle(cr, cw):
         method = head.split(b" ", 1)[0]
         # Defense-in-depth: the nginx owner-gate already gated identity, but re-check
         # here (this gate binds loopback-only, so the injected header cannot be spoofed
-        # from the tailnet). Fail-closed: no owner match -> 403.
-        if login not in ALLOW:
+        # from the tailnet). Fail-closed: no owner match -> 403, unless this is one of
+        # the fleet read paths and the caller is an identity in the configured domain.
+        # The "@" is part of the comparison and the local part must be non-empty, so
+        # "evil.com" cannot pass as a suffix of "@example.com" and a missing header
+        # (login == "") cannot pass at all.
+        # A caller admitted by the read-open is NOT the owner, and two of those four
+        # routes write credentials unless told not to. Carry that fact to them.
+        read_only = login not in ALLOW
+        if read_only and not _fleet_read_ok(login, path):
             cw.write(_resp(b"403 Forbidden", _FORBIDDEN))
             await cw.drain()
             return
@@ -3172,13 +3214,13 @@ async def handle(cr, cw):
         elif path == b"/accounts" and method == b"GET":
             await _serve_accounts(cw)
         elif path == b"/claude-status" and method == b"GET":
-            await _serve_claude_status(cw)
+            await _serve_claude_status(cw, read_only)
         elif path == b"/codex-status" and method == b"GET":
             await _serve_codex_status(cw)
         elif path == b"/claude-usage-store" and method == b"GET":
             await _serve_usage_store(cw)
         elif path == b"/claude-usage" and method == b"GET":
-            await _serve_claude_usage(head, cw)
+            await _serve_claude_usage(head, cw, read_only)
         elif path == b"/acct-usage-now" and method == b"POST":
             await _serve_acct_usage_now(headers, cw)
         elif path == b"/codex-usage" and method == b"GET":

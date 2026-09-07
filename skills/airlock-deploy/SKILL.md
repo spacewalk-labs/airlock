@@ -41,6 +41,21 @@ AIRLOCK_DRY_RUN=1 bash install/airlock-install.sh
 bash install/airlock-install.sh
 ```
 
+🔴 **Do not stop any `airlock-*` unit yourself before running the installer.** The
+installer already stops and restarts what it manages, and it does that from a
+transient scope it moves itself into first (`airlock_escape_selfkill_cgroup` in
+`install/lib.sh`), precisely so a run hosted by one of those units survives the
+restart it asked for. A stop you issue beforehand happens **outside** that guard:
+it kills your own session, and the installer never starts, so the box is left with
+the unit down and nothing to bring it back.
+
+That is not hypothetical. On 2026-09-07 a rollout prepended
+`systemctl --user stop airlock-paseo.service;` to this command and sent it to two
+boxes at once over ssh. Both daemons went down within four seconds of each other
+(08:47:06Z and 08:47:10Z), the ssh connections died with the session that opened
+them, the installer never ran on either box, and every agent session on both was
+lost. One box stayed down for three minutes; the other for 93.
+
 The orchestrator is **idempotent** — re-run it after any `airlock.toml` edit. It
 validates config → runs each enabled app's installer (which drops an nginx
 fragment) → renders the site → `nginx -t` + reload → `tailscale serve` for the hub

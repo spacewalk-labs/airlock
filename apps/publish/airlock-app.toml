@@ -35,6 +35,22 @@ https_port = 19920
 backend_port = 19922
 gate_port = 19925
 share_dir = "/opt/airlock/share"
+# Directory whose CONTENTS this installer stages into <share_dir>/_assets, the
+# root-absolute /_assets/ route render.sh serves. Empty = stage nothing and leave
+# whatever is there alone (the pre-2026-09-07 behaviour).
+#
+# The route has always been the product's; the directory it points at was not
+# owned by anything, so each box grew its own hand-made shape — one a symlink into
+# a home checkout, one a hand-copied directory, one a symlink whose target sat
+# under a 0700 ancestor that nginx could not traverse. That last box answered 403
+# to every document asset, including files that do not exist, which is
+# indistinguishable from the identity gate's own 403. Staging a real copy the
+# installer owns removes both the drift and the dependency on home permissions.
+#
+# It is a COPY on purpose: a symlink is only as good as the traversal bits of
+# every ancestor of its target, and those live in a user's home where this
+# installer has no business widening anything.
+assets_dir = ""
 # A box may opt into the tailnet-member document-view tier. False keeps the
 # dedicated port behind the existing owner+collaborators gate.
 tailnet_view = false

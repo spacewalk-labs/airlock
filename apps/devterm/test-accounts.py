@@ -2579,5 +2579,89 @@ check("...while another origin does not",
       not g._secret_origin_ok(_hdr(origin=b"https://evil.example",
                                    host=b"box.example.invalid:8443")))
 
+# ---- fleet read-open ([apps.devterm] fleet_read_domain) ----
+# Two layers have to agree: nginx decides who reaches the gate, the gate re-checks.
+# A path in only one of them is either an unguarded route or a route the config
+# advertises as open that answers 403 — both fail silently, so pin them equal.
+_render = open("apps/devterm/render.sh").read()
+_render_paths = set(re.search(r"for path in ([^;]+); do", _render).group(1).split())
+check("nginx read-open paths == the gate's FLEET_READ_PATHS",
+      _render_paths == {p.decode() for p in g.FLEET_READ_PATHS})
+# The list is a security boundary, not a convenience list: name it here so widening it
+# has to be a deliberate edit in two places.
+check("read-open is exactly the four account-STATE routes",
+      {p.decode() for p in g.FLEET_READ_PATHS} ==
+      {"/claude-status", "/claude-usage", "/claude-usage-store", "/codex-usage"})
+check("no write route and no /acct-alert leaked into read-open",
+      not [p for p in g.FLEET_READ_PATHS
+           if p.startswith((b"/acct-", b"/secret-", b"/xai-"))])
+
+_saved_domain = g.FLEET_READ_DOMAIN
+try:
+    g.FLEET_READ_DOMAIN = ""
+    check("unset domain: nothing is read-open (shipped default is owner-only)",
+          not g._fleet_read_ok("anyone@example.com", b"/claude-status"))
+    g.FLEET_READ_DOMAIN = "example.com"
+    check("in-domain non-owner may read a read-open route",
+          g._fleet_read_ok("someone@example.com", b"/claude-status"))
+    check("...but not a route outside the set",
+          not g._fleet_read_ok("someone@example.com", b"/acct-alert"))
+    check("no identity header at all is refused",
+          not g._fleet_read_ok("", b"/claude-status"))
+    check("an empty local part is refused",
+          not g._fleet_read_ok("@example.com", b"/claude-status"))
+    # The suffix trap the nginx anchor also closes: a domain that merely ENDS with the
+    # configured one is a different domain.
+    check("a look-alike parent domain is refused",
+          not g._fleet_read_ok("someone@evil-example.com", b"/claude-status"))
+    check("a subdomain is refused (the domain is matched whole)",
+          not g._fleet_read_ok("someone@sub.example.com", b"/claude-status"))
+    check("a second @ is refused (matches nginx's ^[^@]+@domain$)",
+          not g._fleet_read_ok("a@b@example.com", b"/claude-status"))
+finally:
+    g.FLEET_READ_DOMAIN = _saved_domain
+
+# ---- the read-open must not be able to WRITE a credential ----
+# /claude-status and /claude-usage are named like reads and are not: an expired pool
+# slot is refreshed and the rotated credential written back. Opening them to a non-owner
+# without this would let anyone in the domain rotate the owner's credentials by polling.
+with tempfile.TemporaryDirectory() as _td:
+    _slot = os.path.join(_td, "someone.json")
+    _cred = {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt",
+                               "expiresAt": int((time.time() - 3600) * 1000),
+                               "refreshTokenExpiresAt": int((time.time() + 86400 * 20) * 1000),
+                               "subscriptionType": "max"}}
+    def _write_slot():
+        with open(_slot, "w") as fh:
+            json.dump(_cred, fh)
+        return os.path.getmtime(_slot), open(_slot).read()
+
+    _before_mtime, _before_text = _write_slot()
+    _refresh_calls = []
+    _real_refresh = cs._refresh_pool
+    cs._refresh_pool = lambda path, creds: (_refresh_calls.append(path), (False, "transient"))[1]
+    try:
+        _ro = cs._describe(_slot, is_live=False, allow_refresh=False)
+        check("read-only probe reports an expired pool slot as stale",
+              _ro.get("state") == "stale")
+        check("read-only probe never calls the refresher", not _refresh_calls)
+        check("read-only probe leaves the credential file byte-identical",
+              open(_slot).read() == _before_text)
+        # Positive control: the SAME input refreshes when the caller is the owner, so the
+        # check above is measuring the flag and not a slot that could never refresh.
+        cs._describe(_slot, is_live=False, allow_refresh=True)
+        check("...positive control: the owner path does reach the refresher",
+              _refresh_calls == [_slot])
+    finally:
+        cs._refresh_pool = _real_refresh
+
+# The flag has to actually leave the gate, not just exist on the CLI.
+check("the gate passes --no-refresh on a read-open /claude-status",
+      "--no-refresh" in inspect.getsource(g._serve_claude_status))
+check("the gate passes --no-refresh on a read-open /claude-usage",
+      "--no-refresh" in inspect.getsource(g._serve_claude_usage))
+check("--no-refresh is a real CLI flag, not a silently ignored argument",
+      "--no-refresh" in inspect.getsource(cs.main))
+
 print(("\nFAILED: " + ", ".join(fails)) if fails else "\nall contract checks passed")
 sys.exit(1 if fails else 0)

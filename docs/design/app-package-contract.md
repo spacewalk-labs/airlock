@@ -200,6 +200,33 @@ compat_https = { target = "backend_port", enabled = "compat_enabled" }
                                           # a boolean [config.defaults] key.
                                           # false omits render and ledger claim.
 
+[[serve.https_registry]]                  # variable-size, operator-owned JSON
+path = "~/.config/my-app/instances.json" # regular file confined below HOME
+entries = "instances"                    # dotted path to the entry array
+key = "id"                               # stable row identity
+enabled = "enabled"                      # disabled rows own no route
+listen = "ingress.https_port"            # dotted per-row port fields
+target = "ingress.gate_port"
+optional = false                          # true makes an absent file an empty set
+fields = { path = "path", backend_port = "backend.port" }
+                                          # extra point-in-time values the installer
+                                          # needs; carried in package-info rows.
+                                          # A projected name `port` or `*_port`
+                                          # is a globally unique semantic port.
+
+[[registry]]                              # point-in-time lifecycle data only;
+name = "sync_instances"                  # unique stable projection name
+path = "~/.config/my-app/instances.json" # shares the exact-byte cache above
+entries = "instances"
+key = "id"
+enabled = "sync"
+enabled_default = false                   # optional default for a missing field
+optional = false
+fields = { path = "path" }
+                                          # package-info.registry_projections
+                                          # carries {source,present,digest,rows};
+                                          # this declares no serve route.
+
 [tile]                         # replaces this app's entry in hub/index.html APPS;
 label = "My App"               # omit the whole table for a no-tile app (as
 sub = "one line"               # feedback is today, hub/index.html:211)
@@ -214,6 +241,16 @@ icon = "assets/icon.svg"       # image staged from the package (containment-chec
 supported = ["shared", "owner"]
 default = "shared"
 ```
+
+Registry rows and their source digest are part of the point-in-time
+`package-info` authority used by both the ledger and lifecycle. Named
+`[[registry]]` projections are additive lifecycle inputs independent of HTTPS
+ownership; the stable name avoids binding a consumer to declaration order, and
+an optional absent source retains `{present:false, source_sha256:null, rows:[]}`.
+All declarations for one canonical source share one exact-byte cache. The
+complete projection is capped at the platform's safe environment-transport
+size; an oversized registry is rejected before reconcile mutates installed
+state.
 
 The manifest schema expresses everything the validator enforces today, not just
 key names: per-key TOML type (declared by the default's own type; `required`
@@ -1006,7 +1043,7 @@ way to say *written, not read*, so it said the only thing it could.
 Declaring them as config keys would have been worse than the warnings, and for
 two of them it changes behaviour: `AIRLOCK_PASEO_ALLOW_UNBACKED_MEM` is compared
 against the literal `1`, so a boolean declaration exports `"true"` and stops
-matching; `AIRLOCK_DEV_MONITOR_CORS_HOSTS` is measured by the installer from the
+matching; `AIRLOCK_DEV_MONITOR_CORS_ORIGINS` is measured by the installer from the
 box's own FQDN, so declaring it creates a knob that does nothing.
 
 So `runtime_env` is a field of `[config]` — inheriting the fail-closed unknown-key

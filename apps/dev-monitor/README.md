@@ -45,9 +45,16 @@ say so, and gives you one place to act on it from a phone.
 Two axes, deliberately separated:
 
 - **Messages.** A producer drops a JSON file in a spool. It becomes a *card*. Cards
-  coalesce by `group_key` inside a 24h window, so a job that fails hourly is one card with
-  a count, not twenty-four notifications. Urgent cards are also delivered to Slack if a
-  webhook is configured.
+  coalesce by `group_key`, so a job that fails hourly is one card with a count, not
+  twenty-four notifications. The window is chosen by the occurrence's severity: `page` and
+  `attention` get one card a day, `record` and `digest` one a week — a quiet condition that
+  restates itself daily should not cost a card a day. Urgent cards are also delivered to
+  Slack if a webhook is configured.
+
+  The window is measured from when the card was *received*, not from the `created_at` its
+  producer stamped. Those agree within seconds for live traffic and diverge by days for a
+  spool that sat: filtering on the producer's clock turned coalescing off entirely on a
+  drained backlog, which is the one moment a flood is guaranteed.
 - **Actions.** A card may carry a `recommended_action` — a working directory plus either a
   skill name, a prompt, or an argv list. It does nothing until you approve it. Approving
   derives a canonical plan and hashes it; executing runs that plan in a tmux window you can

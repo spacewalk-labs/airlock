@@ -68,25 +68,43 @@ class _FakeHandler(DM.Handler):
 
 class CorsTest(unittest.TestCase):
     """Identity here is injected by the ingress, so an echoed origin can read owner data
-    with the owner's authority. The comparison must be against a whole hostname."""
+    with the owner's authority. The comparison must be against a whole ORIGIN — scheme,
+    host and port — because every listener on this box shares the hostname and one of
+    them serves bulk-generated documents."""
 
     def setUp(self):
-        self._saved = DM.CORS_HOSTS
-        DM.CORS_HOSTS = frozenset({'box', 'box.tailnet.example'})
+        self._saved = DM.CORS_ORIGINS
+        DM.CORS_ORIGINS = frozenset({'https://box:19910', 'https://box.tailnet.example:19910'})
 
     def tearDown(self):
-        DM.CORS_HOSTS = self._saved
+        DM.CORS_ORIGINS = self._saved
 
     def _origin(self, value):
         return _FakeHandler(value)._cors_origin()
 
-    def test_same_box_any_port_is_echoed(self):
-        self.assertEqual(self._origin('https://box.tailnet.example:8443'),
-                         'https://box.tailnet.example:8443')
-        self.assertEqual(self._origin('http://box:9900'), 'http://box:9900')
+    def test_listed_origin_is_echoed(self):
+        self.assertEqual(self._origin('https://box.tailnet.example:19910'),
+                         'https://box.tailnet.example:19910')
+        self.assertEqual(self._origin('https://box:19910'), 'https://box:19910')
 
-    def test_case_is_not_a_boundary(self):
-        self.assertEqual(self._origin('https://BOX.Tailnet.Example'), 'https://BOX.Tailnet.Example')
+    def test_another_port_on_this_box_is_refused(self):
+        # The defect this test exists for. Every listener here shares the hostname, so a
+        # host-only comparison handed the owner's message preview to the publish document
+        # port — thousands of generated pages, any one of which could ask.
+        self.assertIsNone(self._origin('https://box.tailnet.example:8000'))
+        self.assertIsNone(self._origin('https://box:8000'))
+
+    def test_scheme_is_a_boundary(self):
+        self.assertIsNone(self._origin('http://box.tailnet.example:19910'))
+
+    def test_case_is_not_a_boundary_and_the_echo_is_normalised(self):
+        # Matching folds case; the echo must be the folded value. Returning the raw header
+        # would let a caller put its own bytes into a security response header.
+        self.assertEqual(self._origin('https://BOX.Tailnet.Example:19910'),
+                         'https://box.tailnet.example:19910')
+
+    def test_padding_is_trimmed_in_both_match_and_echo(self):
+        self.assertEqual(self._origin('  https://box:19910\t'), 'https://box:19910')
 
     def test_no_origin_is_not_echoed(self):
         self.assertIsNone(self._origin(None))

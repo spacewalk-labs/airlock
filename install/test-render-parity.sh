@@ -242,7 +242,7 @@ done
 # dev-monitor — apps/dev-monitor/render.sh
 # Branch: MESSAGES (true vs false) adds the owner_location NGXOWNER block to
 # the nginx fragment and changes the unit's Environment=...MESSAGES=
-# literal. Sets: messages-off, messages-on. Plus a cors_hosts="" variant
+# literal. Sets: messages-off, messages-on. Plus a cors_origins="" variant
 # (FQDN unresolved — install.sh:59-69) since it is a real, cheap-to-cover
 # value case for the same unit heredoc.
 #
@@ -294,7 +294,7 @@ done
 for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
   BACKEND_PORT=19200; IDENTITY_HEADER="Tailscale-User-Login"
   DEVMON_ENV="/home/example/.config/airlock/dev-monitor.env"
-  cors_hosts="box.example.ts.net,box"
+  cors_origins="https://box.example.ts.net:19910,https://box:19910"
   hdr_var="$(printf '%s' "${IDENTITY_HEADER//-/_}" | tr '[:upper:]' '[:lower:]')"
   DEVMON_SECRET="deadbeefcafef00d"
   TOKEN_ARGS=()
@@ -303,14 +303,14 @@ for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
     messages-on)
       MESSAGES=true
       ;;
-    messages-off-no-cors) MESSAGES=false; owner_location=""; cors_hosts="" ;;
+    messages-off-no-cors) MESSAGES=false; owner_location=""; cors_origins="" ;;
     token-freshness-on)
       MESSAGES=true
       TOKEN_ARGS=(true 6 12)
       ;;
   esac
 
-  f="$(out_file)"; render_to "$f" render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_hosts" "$DEVMON_ENV" ${TOKEN_ARGS[@]+"${TOKEN_ARGS[@]}"}
+  f="$(out_file)"; render_to "$f" render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_origins" "$DEVMON_ENV" ${TOKEN_ARGS[@]+"${TOKEN_ARGS[@]}"}
   golden_check_file "dev-monitor/$SET/unit.service" "$f"
 
   if [ "$MESSAGES" = true ]; then
@@ -784,6 +784,25 @@ if sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End pub
   ok "publish tailnet view: box opt-in selects the non-empty tailnet identity tier"
 else
   bad "publish tailnet view: box opt-in did not select tailnet_ok"
+fi
+# The widget's unread badge polls the hub's owner-only message preview
+# (hub/assets/airlock-return.js UNREAD_URL). Once tailnet_view admits any tailnet
+# member to this port, most visitors clear $tailnet_ok but not the hub's own
+# $hub_ok, so that poll fails for them before dev-monitor ever sees it — and the
+# browser logs a blocked-CORS-fetch console error no matter how the JS handles the
+# rejection. data-badge="0" turns the poll off in that render; the shipped default
+# (hub_ok, same audience the poll always answered for) must keep polling.
+if sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
+     "$NGTMP/site.conf" | grep -qF 'data-badge="0"'; then
+  bad "publish tailnet view: shipped default (hub_ok) disabled the unread badge poll"
+else
+  ok "publish tailnet view: shipped default keeps the unread badge poll on"
+fi
+if sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
+     "$NGTMP/site-tailnet-on.conf" | grep -qF 'data-mode="corner" data-badge="0" defer'; then
+  ok "publish tailnet view: box opt-in disables the unread badge poll (hub gate would 403 it pre-CORS)"
+else
+  bad "publish tailnet view: box opt-in did not disable the unread badge poll"
 fi
 
 # The golden above pins bytes; this live matrix pins meaning. The regression this

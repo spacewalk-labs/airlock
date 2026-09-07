@@ -2601,5 +2601,365 @@ else
   failure_detail "$out50b"
 fi
 
+# H62: a package may project an arbitrary-size HTTPS mapping set from one
+# operator-owned JSON registry. The exact rows, including extra installer
+# fields and the source digest, ride in package-info; the ledger therefore
+# owns the same point-in-time mapping the lifecycle consumes.
+reset_box
+pkg="$PKGROOT/h62-registry-https"; mkpkg "$pkg" h62
+pkg_manifest "$pkg" 'contract = 1' 'id = "h62"' \
+  '[[serve.https_registry]]' \
+  'path = "~/.config/h62/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"' \
+  'fields = { path = "path", backend_port = "editor.backend_port" }'
+mkdir -p "$FAKEHOME/.config/h62"
+cat >"$FAKEHOME/.config/h62/vaults.json" <<'EOF'
+{"vaults":[
+  {"id":"read-only","path":"$HOME/wiki","writable":false,"editor":null},
+  {"id":"personal","path":"$HOME/notes","writable":true,
+   "editor":{"https_port":28448,"gate_port":28823,"backend_port":26769}},
+  {"id":"shared","path":"$HOME/shared","writable":true,
+   "editor":{"https_port":28449,"gate_port":28824,"backend_port":26770}}
+]}
+EOF
+cfg="$CFGROOT/h62.toml"; make_pkg_cfg "$cfg" h62 "$pkg"
+h62_info="$(run "$cfg" package-info 2>/dev/null)"; h62_rc=$?
+h62_projection="$(printf '%s' "$h62_info" | python3 -c '
+import hashlib,json,pathlib,sys
+p=json.load(sys.stdin)["packages"]["h62"]
+rows=p["serve_registry_rows"]
+assert [r["key"] for r in rows] == ["personal", "shared"]
+assert rows[0]["fields"] == {"path":"$HOME/notes", "backend_port":26769}
+assert rows[0]["source_sha256"] == hashlib.sha256(
+    (pathlib.Path.home()/".config/h62/vaults.json").read_bytes()).hexdigest()
+assert p["serve_mappings"][rows[1]["mapping_key"]] == {
+    "listen":28449,"mode":"https","target":28824}
+assert p["serve_port_values"] == {
+    row["mapping_key"]:row["listen"] for row in rows}
+assert p["artifacts"]["serve_ports"] == sorted(p["serve_port_values"])
+assert all(__import__("re").fullmatch(r"[a-z0-9_]+", key)
+           for key in p["serve_port_values"])
+print("ok")
+' 2>/dev/null)"
+if [ "$h62_rc" = 0 ] && [ "$h62_projection" = ok ]; then
+  ok "H62 registry HTTPS projects exact enabled rows into package-info"
+else
+  bad "H62 registry HTTPS package-info projection (rc=$h62_rc)"
+fi
+
+h62_intent="$(ledger_run "$h62_info" intent h62 2>&1)"; h62_intent_rc=$?
+h62_commit=""
+if [ "$h62_intent_rc" = 0 ]; then
+  h62_commit="$(ledger_run "$h62_info" commit h62 2>&1)"; h62_commit_rc=$?
+else
+  h62_commit_rc=1
+fi
+if [ "$h62_intent_rc" = 0 ] && [ "$h62_commit_rc" = 0 ]; then
+  cat >"$FAKEHOME/.config/h62/vaults.json" <<'EOF'
+{"vaults":[
+  {"id":"read-only","path":"$HOME/wiki","writable":false,"editor":null},
+  {"id":"personal","path":"$HOME/notes","writable":true,
+   "editor":{"https_port":28448,"gate_port":28823,"backend_port":26769}}
+]}
+EOF
+  h62_reduced_info="$(run "$cfg" package-info 2>/dev/null)"
+  : >"$TMP/tailscale.log"
+  h62_reintent="$(ledger_run "$h62_reduced_info" intent h62 2>&1)"; h62_reintent_rc=$?
+  h62_recommit="$(ledger_run "$h62_reduced_info" commit h62 2>&1)"; h62_recommit_rc=$?
+  if [ "$h62_reintent_rc" = 0 ] && [ "$h62_recommit_rc" = 0 ] \
+      && grep -Fq 'serve --https=28449 off' "$TMP/tailscale.log" \
+      && ! grep -Fq 'serve --https=28448 off' "$TMP/tailscale.log"; then
+    ok "H62b same-package registry shrink retracts only the dropped mapping"
+  else
+    bad "H62b registry shrink teardown (intent=$h62_reintent_rc commit=$h62_recommit_rc)"
+    failure_detail "$h62_reintent"
+    failure_detail "$h62_recommit"
+  fi
+  drop_info='{"config_path":"fixture","order":[],"packages":{}}'
+  : >"$TMP/tailscale.log"
+  h62_remove="$(ledger_run "$drop_info" remove h62 2>&1)"; h62_remove_rc=$?
+  if [ "$h62_remove_rc" = 0 ] \
+      && grep -Fq 'serve --https=28448 off' "$TMP/tailscale.log" \
+      && ! grep -Fq 'serve --https=28449 off' "$TMP/tailscale.log"; then
+    ok "H62b2 package removal retracts every remaining registry HTTPS mapping"
+  else
+    bad "H62b2 registry HTTPS ledger teardown (rc=$h62_remove_rc)"
+    failure_detail "$h62_remove"
+  fi
+else
+  bad "H62b registry HTTPS ledger setup"
+  failure_detail "$h62_intent"
+  failure_detail "$h62_commit"
+fi
+
+reset_box
+pkg="$PKGROOT/h62-optional"; mkpkg "$pkg" h62optional
+pkg_manifest "$pkg" 'contract = 1' 'id = "h62optional"' \
+  '[[serve.https_registry]]' 'path = "~/.config/h62/missing.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"' 'optional = true'
+cfg="$CFGROOT/h62-optional.toml"; make_pkg_cfg "$cfg" h62optional "$pkg"
+h62_optional="$(run "$cfg" package-info 2>/dev/null | python3 -c '
+import json,sys
+p=json.load(sys.stdin)["packages"]["h62optional"]
+print(len(p["serve_mappings"]), len(p["serve_registry_rows"]))
+')"
+[ "$h62_optional" = "0 0" ] \
+  && ok "H62c an explicitly optional absent registry is an empty projection" \
+  || bad "H62c optional registry projection was $h62_optional"
+
+reset_box
+optional_pkg="$PKGROOT/h62-optional-first"; mkpkg "$optional_pkg" h62optionalfirst
+pkg_manifest "$optional_pkg" 'contract = 1' 'id = "h62optionalfirst"' \
+  '[[serve.https_registry]]' 'path = "~/.config/h62/shared-missing.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"' 'optional = true'
+required_pkg="$PKGROOT/h62-required-second"; mkpkg "$required_pkg" h62requiredsecond
+pkg_manifest "$required_pkg" 'contract = 1' 'id = "h62requiredsecond"' \
+  '[[serve.https_registry]]' 'path = "~/.config/h62/shared-missing.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"'
+cfg="$CFGROOT/h62-required-after-optional.toml"
+{
+  base_config
+  printf '[apps.h62optionalfirst]\n[apps.h62requiredsecond]\n'
+  printf '[packages.h62optionalfirst]\npath = "%s"\n' "$optional_pkg"
+  printf '[packages.h62requiredsecond]\npath = "%s"\n' "$required_pkg"
+} >"$cfg"
+expect_fail "H62c2 optional cache cannot suppress a required registry" \
+  "HTTPS registry is missing" run "$cfg" package-info
+
+reset_box
+pkg="$PKGROOT/h62-oversize"; mkpkg "$pkg" h62oversize
+pkg_manifest "$pkg" 'contract = 1' 'id = "h62oversize"' \
+  '[[serve.https_registry]]' 'path = "~/.config/h62/large.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"' \
+  'fields = { payload = "payload" }'
+mkdir -p "$FAKEHOME/.config/h62"
+python3 - "$FAKEHOME/.config/h62/large.json" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({"vaults": [{
+    "id": "large", "writable": True, "payload": "x" * 100000,
+    "editor": {"https_port": 28448, "gate_port": 28823},
+}]}))
+PY
+cfg="$CFGROOT/h62-oversize.toml"; make_pkg_cfg "$cfg" h62oversize "$pkg"
+expect_fail "H62c3 oversized projection fails before environment export" \
+  "safe environment transport limit" run "$cfg" package-info
+
+reset_box
+pkg="$PKGROOT/h62-bad"; mkpkg "$pkg" h62bad
+pkg_manifest "$pkg" 'contract = 1' 'id = "h62bad"' \
+  '[[serve.https_registry]]' 'path = "/etc/passwd"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"'
+cfg="$CFGROOT/h62-bad.toml"; make_pkg_cfg "$cfg" h62bad "$pkg"
+expect_fail "H62d registry source is confined to a literal home path" \
+  "must be a literal ~/ path" run "$cfg" validate
+
+reset_box
+pkg="$PKGROOT/h62-fifo"; mkpkg "$pkg" h62fifo
+pkg_manifest "$pkg" 'contract = 1' 'id = "h62fifo"' \
+  '[[serve.https_registry]]' 'path = "~/.config/h62/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"'
+mkdir -p "$FAKEHOME/.config/h62"
+mkfifo "$FAKEHOME/.config/h62/vaults.json"
+cfg="$CFGROOT/h62-fifo.toml"; make_pkg_cfg "$cfg" h62fifo "$pkg"
+set +e
+h62_fifo="$(timeout 3 env AIRLOCK_CONFIG="$cfg" python3 "$CFG" package-info 2>&1)"
+h62_fifo_rc=$?
+set -e
+if [ "$h62_fifo_rc" != 0 ] && [ "$h62_fifo_rc" != 124 ] \
+    && grep -Fq "must be a regular non-symlink file" <<<"$h62_fifo"; then
+  ok "H62d2 a FIFO registry is rejected without blocking preflight"
+else
+  bad "H62d2 FIFO registry rejection (rc=$h62_fifo_rc)"
+  failure_detail "$h62_fifo"
+fi
+
+reset_box
+pkg="$PKGROOT/h62-collision"; mkpkg "$pkg" h62collision
+pkg_manifest "$pkg" 'contract = 1' 'id = "h62collision"' \
+  '[[serve.https_registry]]' 'path = "~/.config/h62/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"'
+mkdir -p "$FAKEHOME/.config/h62"
+cat >"$FAKEHOME/.config/h62/vaults.json" <<'EOF'
+{"vaults":[
+  {"id":"one","writable":true,
+   "editor":{"https_port":28448,"gate_port":28823}},
+  {"id":"two","writable":true,
+   "editor":{"https_port":28449,"gate_port":28823}}
+]}
+EOF
+cfg="$CFGROOT/h62-collision.toml"; make_pkg_cfg "$cfg" h62collision "$pkg"
+expect_fail "H62e registry targets enter global port uniqueness" \
+  "port 28823 is used twice" run "$cfg" validate
+
+reset_box
+pkg="$PKGROOT/h62-field-collision"; mkpkg "$pkg" h62fieldcollision
+pkg_manifest "$pkg" 'contract = 1' 'id = "h62fieldcollision"' \
+  '[[serve.https_registry]]' 'path = "~/.config/h62/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"' \
+  'fields = { backend_port = "editor.backend_port" }'
+mkdir -p "$FAKEHOME/.config/h62"
+cat >"$FAKEHOME/.config/h62/vaults.json" <<'EOF'
+{"vaults":[
+  {"id":"one","writable":true,
+   "editor":{"https_port":28448,"gate_port":28823,"backend_port":26769}},
+  {"id":"two","writable":true,
+   "editor":{"https_port":28449,"gate_port":28824,"backend_port":26769}}
+]}
+EOF
+cfg="$CFGROOT/h62-field-collision.toml"; make_pkg_cfg "$cfg" h62fieldcollision "$pkg"
+expect_fail "H62g projected backend ports enter global uniqueness" \
+  "port 26769 is used twice" run "$cfg" validate
+
+# H62f: the orchestrator carries its first package-info projection into the
+# pre-reconcile preflight. A registry replacement between those two processes
+# must stop before ledger deactivation instead of mixing old ownership with a
+# new package plan.
+reset_box
+pkg="$PKGROOT/h62-snapshot"; mkpkg "$pkg" h62snapshot
+pkg_manifest "$pkg" 'contract = 1' 'id = "h62snapshot"' \
+  '[[serve.https_registry]]' 'path = "~/.config/h62/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"'
+mkdir -p "$FAKEHOME/.config/h62"
+cat >"$FAKEHOME/.config/h62/vaults.json" <<'EOF'
+{"vaults":[{"id":"one","writable":true,
+ "editor":{"https_port":28448,"gate_port":28823}}]}
+EOF
+cfg="$CFGROOT/h62-snapshot.toml"; make_pkg_cfg "$cfg" h62snapshot "$pkg"
+h62_before="$(run "$cfg" package-info)"
+cat >"$FAKEHOME/.config/h62/vaults.json" <<'EOF'
+{"vaults":[{"id":"one","writable":true,
+ "editor":{"https_port":28449,"gate_port":28824}}]}
+EOF
+set +e
+h62_changed="$(printf '%s' "$h62_before" \
+  | run "$cfg" install-preflight --package-info-stdin 2>&1)"; h62_changed_rc=$?
+set -e
+if [ "$h62_changed_rc" != 0 ] \
+    && grep -Fq "differs from the orchestrator snapshot" <<<"$h62_changed"; then
+  ok "H62f a registry replacement is refused before reconcile"
+else
+  bad "H62f registry replacement was not refused (rc=$h62_changed_rc)"
+  failure_detail "$h62_changed"
+fi
+h62_before_sha="$(printf '%s' "$h62_before" | sha256sum | awk '{print $1}')"
+h62_frozen="$(AIRLOCK_PKG_INFO="$h62_before" \
+  AIRLOCK_INSTALL_PKG_INFO_SHA256="$h62_before_sha" run "$cfg" package-info 2>/dev/null)"
+if python3 - "$h62_before" "$h62_frozen" <<'PY'
+import json, sys
+assert json.loads(sys.argv[1]) == json.loads(sys.argv[2])
+PY
+then
+  ok "H62f2 post-gate consumers reuse frozen registry package-info"
+else
+  bad "H62f2 frozen registry authority changed after live replacement"
+fi
+expect_fail "H62f3 a changed frozen package-info authority is rejected" \
+  "authority is missing or has changed" env AIRLOCK_PKG_INFO="$h62_before" \
+  AIRLOCK_INSTALL_PKG_INFO_SHA256="0000000000000000000000000000000000000000000000000000000000000000" \
+  AIRLOCK_CONFIG="$cfg" python3 "$CFG" package-info
+
+# H63: lifecycle data such as sync=true is a separate question from HTTPS
+# ownership. A package can project those rows through the same frozen
+# package-info authority without inventing a route or re-reading live JSON.
+reset_box
+pkg="$PKGROOT/h63-registry-data"; mkpkg "$pkg" h63
+pkg_manifest "$pkg" 'contract = 1' 'id = "h63"' \
+  '[[serve.https_registry]]' \
+  'path = "~/.config/h63/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "writable"' \
+  'listen = "editor.https_port"' 'target = "editor.gate_port"' \
+  '[[registry]]' 'name = "sync_vaults"' 'path = "~/.config/h63/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "sync"' 'enabled_default = false' \
+  'fields = { path = "path" }'
+mkdir -p "$FAKEHOME/.config/h63"
+cat >"$FAKEHOME/.config/h63/vaults.json" <<'EOF'
+{"vaults":[
+  {"id":"read-only-sync","path":"$HOME/wiki","writable":false,"sync":true,"editor":null},
+  {"id":"write-no-sync","path":"$HOME/notes","writable":true,"sync":false,
+   "editor":{"https_port":28448,"gate_port":28823}},
+  {"id":"both","path":"$HOME/shared","writable":true,"sync":true,
+   "editor":{"https_port":28449,"gate_port":28824}},
+  {"id":"neither","path":"$HOME/archive","writable":false,"editor":null}
+]}
+EOF
+cfg="$CFGROOT/h63.toml"; make_pkg_cfg "$cfg" h63 "$pkg"
+h63_info="$(run "$cfg" package-info 2>/dev/null)"; h63_rc=$?
+h63_projection="$(printf '%s' "$h63_info" | python3 -c '
+import hashlib,json,pathlib,sys
+p=json.load(sys.stdin)["packages"]["h63"]
+projections=p["registry_projections"]
+assert set(projections) == {"sync_vaults"}
+projection=projections["sync_vaults"]
+assert projection["source"] == "~/.config/h63/vaults.json"
+assert projection["present"] is True
+assert projection["source_sha256"] == hashlib.sha256(
+    (pathlib.Path.home()/".config/h63/vaults.json").read_bytes()).hexdigest()
+assert projection["rows"] == [
+    {"key":"read-only-sync", "fields":{"path":"$HOME/wiki"}},
+    {"key":"both", "fields":{"path":"$HOME/shared"}}]
+assert [row["key"] for row in p["serve_registry_rows"]] == ["write-no-sync", "both"]
+assert {row["source_sha256"] for row in p["serve_registry_rows"]} == {
+    projection["source_sha256"]}
+print("ok")
+' 2>/dev/null)"
+if [ "$h63_rc" = 0 ] && [ "$h63_projection" = ok ]; then
+  ok "H63 lifecycle sync and HTTPS writable projections stay independent on one snapshot"
+else
+  bad "H63 lifecycle registry projection (rc=$h63_rc)"
+fi
+
+cat >"$FAKEHOME/.config/h63/vaults.json" <<'EOF'
+{"vaults":[{"id":"none","path":"$HOME/none","writable":false,"sync":false,"editor":null}]}
+EOF
+h63_empty="$(run "$cfg" package-info 2>/dev/null | python3 -c '
+import json,sys
+p=json.load(sys.stdin)["packages"]["h63"]["registry_projections"]
+projection=p["sync_vaults"]
+print(len(p), len(projection["rows"]), bool(projection["source_sha256"]))
+')"
+[ "$h63_empty" = "1 0 True" ] \
+  && ok "H63 empty enabled set retains its source digest" \
+  || bad "H63 empty projection lost source authority: $h63_empty"
+
+reset_box
+pkg="$PKGROOT/h63-optional"; mkpkg "$pkg" h63optional
+pkg_manifest "$pkg" 'contract = 1' 'id = "h63optional"' \
+  '[[registry]]' 'name = "optional_rows"' \
+  'path = "~/.config/h63/absent.json"' 'entries = "rows"' \
+  'key = "id"' 'enabled = "enabled"' 'optional = true'
+cfg="$CFGROOT/h63-optional.toml"; make_pkg_cfg "$cfg" h63optional "$pkg"
+h63_optional="$(run "$cfg" package-info 2>/dev/null | python3 -c '
+import json,sys
+p=json.load(sys.stdin)["packages"]["h63optional"]["registry_projections"]
+assert p["optional_rows"] == {
+    "source":"~/.config/h63/absent.json", "present":False,
+    "source_sha256":None, "rows":[]}
+print("ok")
+')"
+[ "$h63_optional" = ok ] \
+  && ok "H63 optional absent registry retains its named empty envelope" \
+  || bad "H63 optional projection envelope was $h63_optional"
+
+reset_box
+pkg="$PKGROOT/h63-duplicate"; mkpkg "$pkg" h63duplicate
+pkg_manifest "$pkg" 'contract = 1' 'id = "h63duplicate"' \
+  '[[registry]]' 'name = "same"' 'path = "~/.config/h63/a.json"' \
+  'entries = "rows"' 'key = "id"' 'enabled = "enabled"' \
+  '[[registry]]' 'name = "same"' 'path = "~/.config/h63/b.json"' \
+  'entries = "rows"' 'key = "id"' 'enabled = "enabled"'
+cfg="$CFGROOT/h63-duplicate.toml"; make_pkg_cfg "$cfg" h63duplicate "$pkg"
+expect_fail "H63 projection names are unique" "name must be a unique safe name" \
+  run "$cfg" validate
+
 printf 'passed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

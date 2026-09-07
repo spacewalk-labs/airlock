@@ -27,7 +27,7 @@ airlock_escape_selfkill_cgroup "$0" "$@"
 # ledger lock below. Never trust a value inherited from a parent shell as
 # proof of lock ownership.
 unset AIRLOCK_LEDGER_LOCK_HELD AIRLOCK_CONFIG_SNAPSHOT \
-  AIRLOCK_CONFIG_SNAPSHOT_SHA256
+  AIRLOCK_CONFIG_SNAPSHOT_SHA256 AIRLOCK_INSTALL_PKG_INFO_SHA256
 
 # The exceptional path is one exact, package-scoped argv value.  Do not add an
 # environment alias: an exported value would silently remain active for later
@@ -330,6 +330,14 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
     | airlock_config install-preflight --package-info-stdin)" || exit 2
   [ "$_candidate_preflight_now" = "$_candidate_preflight" ] \
     || die "install candidate changed before reconcile — no recorded app was deactivated"
+  # The two unfrozen preflights above proved that the live registry still
+  # matches the original package plan immediately before teardown. From this
+  # boundary onward every config child reuses that exact plan instead of
+  # reopening a mutable registry after installed state has been disturbed.
+  AIRLOCK_INSTALL_PKG_INFO_SHA256="$(printf '%s' "$AIRLOCK_PKG_INFO" \
+    | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
+    || die "cannot hash frozen package plan"
+  export AIRLOCK_INSTALL_PKG_INFO_SHA256
   # Computed only on ledger-touching runs: a built-in-only box must see the
   # exact byte stream it saw before packages existed.
   _active_ports="$(airlock_config plaintext | awk '{print $2}' | tr '\n' ' ')"
@@ -338,6 +346,12 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
     [ "$_rc" = 3 ] && die "a recorded app without a deactivator blocks this change (see above) — the one exit is the explicit teardown command it names"
     die "installed-state ledger plan failed (rc=$_rc)"
   }
+  # Snapshot the report-only adoption sweep before the first teardown.  Some
+  # shipped manifests project mutable operator registries; reopening one after
+  # reconcile would introduce a second candidate revision and could abort only
+  # after an old package had already been deactivated.
+  _adopt_scan="$(airlock_config adopt-scan)" \
+    || die "known-builtin adoption sweep failed (rc=$?)"
   # 🔴 One package's failed teardown must not strand the others. This loop
   # deactivates EVERY changed package before ANY of them reinstalls (so a port
   # an old install still holds is free before the new one binds), which means
@@ -375,7 +389,6 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
   # (not `done < <(...)`): a process-substitution's exit status is invisible
   # to `set -e` — a failing sweep would otherwise vanish silently instead of
   # aborting the run.
-  _adopt_scan="$(airlock_config adopt-scan)" || die "known-builtin adoption sweep failed (rc=$?)"
   while IFS=$'\t' read -r _kind _kid _detail; do
     [ -n "${_kind:-}" ] || continue
     case "$_kind" in

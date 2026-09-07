@@ -3217,6 +3217,30 @@ else
   failure_detail "$out"
 fi
 
+# B13c) an unrecorded dynamic-registry install cannot be reconstructed from
+# current mutable bytes. In particular, a missing required registry must not
+# wedge the whole adoption sweep after hub rendering; report a scoped EXCLUDE
+# and leave the artifact for explicit cleanup.
+p4_reset
+mkdir -p "$P4APPS/alpha8"
+pkg_manifest "$P4APPS/alpha8" 'contract = 1' 'id = "alpha8"' \
+  '[artifacts]' 'files = ["~/.local/bin/alpha8-bin"]' \
+  '[[serve.https_registry]]' \
+  'path = "~/.config/alpha8/missing.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "enabled"' \
+  'listen = "https_port"' 'target = "gate_port"'
+scripts_ok "$P4APPS/alpha8"
+mkdir -p "$FAKEHOME/.local/bin"; : > "$FAKEHOME/.local/bin/alpha8-bin"
+p4_cfg_hubonly "$P4CFG"
+out="$(p4_run "$P4CFG" adopt-scan 2>&1)"; rc=$?
+if [ "$rc" = 0 ] \
+   && [[ "$out" == EXCLUDE$'\t'alpha8$'\t'*"dynamic HTTPS registry mappings"* ]] \
+   && [[ "$out" != *"HTTPS registry is missing"* ]]; then
+  ok "B13c: dynamic-registry legacy artifact is scoped EXCLUDE, never a sweep-wide registry failure"
+else
+  bad "B13c: dynamic registry adoption handling (rc=$rc out=$out)"
+fi
+
 # B14) admission/scan unification (round-2 review): the on-disk existence
 # probe (expand_declared) used to run ONLY inside cmd_adopt_scan — a
 # symlinked intermediate directory that makes a glob match escape its
@@ -3535,9 +3559,17 @@ grep -q "install/test-render-parity.sh" "$ROOT/.github/workflows/ci.yml" \
 # `done < <(...)` process substitution — bash never propagates a process
 # substitution's exit status through `set -e`, so a failing sweep would
 # otherwise vanish with no error at all.
-grep -qF '_adopt_scan="$(airlock_config adopt-scan)" || die' "$ROOT/install/airlock-install.sh" \
-  && ok "E: the F15 sweep's failure is checked explicitly, not silently dropped by set -e" \
-  || bad "E: F15 sweep output is not captured with an explicit failure check"
+python3 - "$ROOT/install/airlock-install.sh" <<'PYEOF'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+capture = text.index('_adopt_scan="$(airlock_config adopt-scan)"')
+teardown = text.index("while IFS=$'\\t' read -r _action _id")
+assert '|| die "known-builtin adoption sweep failed' in text[capture:capture + 240]
+assert capture < teardown
+PYEOF
+[ "$?" = 0 ] \
+  && ok "E: the F15 sweep fails loudly and is snapshotted before teardown" \
+  || bad "E: F15 sweep is not safely captured before ledger teardown"
 
 grep -q "^## Package trust (D4)" "$ROOT/SECURITY.md" \
   && ok "E: SECURITY.md carries the D4 package-trust section" \

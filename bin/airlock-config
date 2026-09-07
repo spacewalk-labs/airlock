@@ -100,6 +100,7 @@ AGENT_PROVIDER_DEFAULT = "claude"
 # later commands and turn an exceptional, package-scoped act into ambient
 # process state.
 _DANGEROUS_ADMIT_UNVERIFIED: str | None = None
+_HTTPS_REGISTRY_CACHE: dict[str, bytes | None] = {}
 
 # App names cross a line-oriented shell boundary (`airlock-config apps`). Keep
 # custom/local app names available, but reject control characters and shell/path
@@ -233,8 +234,15 @@ _CONTAINER_DECL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\*?\Z")
 # Full manifest schema (D2). Unknown fields anywhere in the manifest are fatal —
 # fail-closed applies to the manifest too (F10).
 _MANIFEST_KEYS = ("contract", "id", "dependencies", "config", "prerequisites",
-                  "artifacts", "tile", "audience", "serve", "plaintext_redirect")
-_SERVE_KEYS = ("https",)
+                  "artifacts", "tile", "audience", "serve", "registry",
+                  "plaintext_redirect")
+_SERVE_KEYS = ("https", "https_registry")
+_HTTPS_REGISTRY_FIELDS = ("path", "entries", "key", "enabled", "listen",
+                          "target", "optional", "fields")
+_DATA_REGISTRY_FIELDS = ("name", "path", "entries", "key", "enabled",
+                         "enabled_default", "optional", "fields")
+_REGISTRY_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\Z")
+_PACKAGE_INFO_ENV_LIMIT = 96 * 1024
 _CONFIG_SCHEMA_KEYS = ("required", "defaults", "tables", "port_spans",
                        "runtime_env", "deprecated")
 _TILE_KEYS = ("label", "sub", "cat", "path", "icon", "glyph")
@@ -1118,6 +1126,38 @@ def _validate_ports(cfg: dict) -> "None":
                 die(f"port {val} is used twice: apps.{seen[val]} and "
                     f"packages.{pid} semantic port key {key!r}. Ports must be unique.")
             seen[val] = f"{pid}.{key} (semantic)"
+        # Registry-projected targets are real loopback listeners even though
+        # they are not operator TOML keys. Their public listens entered the
+        # pool through serve_port_values above; add the other half explicitly
+        # so a registry cannot hide a gate/backend collision from validation.
+        for row in pkg.get("serve_registry_rows") or []:
+            val = row["target"]
+            if val == 443:
+                die(f"packages.{pid} HTTPS registry target for {row['key']!r} "
+                    "claims port 443 — the platform's TLS entrypoint is never "
+                    "an app's port.")
+            if val in seen:
+                die(f"port {val} is used twice: apps.{seen[val]} and "
+                    f"packages.{pid} HTTPS registry target for {row['key']!r}. "
+                    "Ports must be unique.")
+            seen[val] = f"{pid}.{row['key']} (HTTPS registry target)"
+            # Extra projected values whose output name is port-shaped are
+            # package listeners too (SilverBullet's backend_port is the first
+            # consumer). They must not become a side door around the same
+            # global uniqueness sweep merely because they are not ingress.
+            for field_name, field_value in sorted(row["fields"].items()):
+                if not _is_port_config_key(field_name):
+                    continue
+                if field_value == 443:
+                    die(f"packages.{pid} HTTPS registry field {field_name!r} for "
+                        f"{row['key']!r} claims port 443 — the platform's TLS "
+                        "entrypoint is never an app's port.")
+                if field_value in seen:
+                    die(f"port {field_value} is used twice: apps.{seen[field_value]} "
+                        f"and packages.{pid} HTTPS registry field {field_name!r} "
+                        f"for {row['key']!r}. Ports must be unique.")
+                seen[field_value] = (
+                    f"{pid}.{row['key']}.{field_name} (HTTPS registry field)")
         # Declared port spans: ports base..base+count-1 ALL enter the global
         # uniqueness pool, not just the declared scalar (D2). The base scalar
         # itself may already be in the pool under this app's own key — that
@@ -1337,7 +1377,117 @@ def _validate_artifacts(pid: str, raw) -> tuple[dict, dict]:
     return out, unit_scopes
 
 
-def _validate_mappings(pid: str, raw, schema: dict, arts: dict) -> dict:
+def _validate_registry_field(pid: str, value, where: str) -> str:
+    if (not isinstance(value, str) or not value
+            or any(_REGISTRY_FIELD_RE.fullmatch(part) is None
+                   for part in value.split("."))):
+        _mf_die(pid, f"{where} must be a dotted JSON field path")
+    return value
+
+
+def _validate_https_registries(pid: str, raw) -> list[dict]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(row, dict) for row in raw):
+        _mf_die(pid, "[[serve.https_registry]] must be an array of tables")
+    out = []
+    for index, row in enumerate(raw):
+        bad = sorted(set(row) - set(_HTTPS_REGISTRY_FIELDS))
+        if bad:
+            _mf_die(pid, f"unknown [[serve.https_registry]] key(s): {', '.join(bad)}")
+        path = row.get("path")
+        if (not isinstance(path, str) or not path.startswith("~/")
+                or any(part in ("", ".", "..") for part in path[2:].split("/"))
+                or any(char in path for char in "*?[\x00\n\r")):
+            _mf_die(pid, f"serve.https_registry[{index}].path must be a literal ~/ path")
+        optional = row.get("optional", False)
+        if not isinstance(optional, bool):
+            _mf_die(pid, f"serve.https_registry[{index}].optional must be boolean")
+        fields = row.get("fields", {})
+        if (not isinstance(fields, dict)
+                or any(not isinstance(name, str)
+                       or _REGISTRY_FIELD_RE.fullmatch(name) is None
+                       for name in fields)
+                or any(name in ("key", "listen", "target", "enabled") for name in fields)):
+            _mf_die(pid, f"serve.https_registry[{index}].fields must map safe, non-reserved names")
+        projected = {}
+        for name, field_path in fields.items():
+            projected[name] = _validate_registry_field(
+                pid, field_path, f"serve.https_registry[{index}].fields.{name}")
+        out.append({
+            "path": path,
+            "entries": _validate_registry_field(
+                pid, row.get("entries"), f"serve.https_registry[{index}].entries"),
+            "key": _validate_registry_field(
+                pid, row.get("key"), f"serve.https_registry[{index}].key"),
+            "enabled": _validate_registry_field(
+                pid, row.get("enabled"), f"serve.https_registry[{index}].enabled"),
+            "listen": _validate_registry_field(
+                pid, row.get("listen"), f"serve.https_registry[{index}].listen"),
+            "target": _validate_registry_field(
+                pid, row.get("target"), f"serve.https_registry[{index}].target"),
+            "optional": optional,
+            "fields": projected,
+        })
+    return out
+
+
+def _validate_data_registries(pid: str, raw) -> list[dict]:
+    """Validate point-in-time registry projections that own no serve route."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(row, dict) for row in raw):
+        _mf_die(pid, "[[registry]] must be an array of tables")
+    out = []
+    seen_names = set()
+    for index, row in enumerate(raw):
+        bad = sorted(set(row) - set(_DATA_REGISTRY_FIELDS))
+        if bad:
+            _mf_die(pid, f"unknown [[registry]] key(s): {', '.join(bad)}")
+        name = row.get("name")
+        if (not isinstance(name, str) or _REGISTRY_FIELD_RE.fullmatch(name) is None
+                or name in seen_names):
+            _mf_die(pid, f"registry[{index}].name must be a unique safe name")
+        seen_names.add(name)
+        path = row.get("path")
+        if (not isinstance(path, str) or not path.startswith("~/")
+                or any(part in ("", ".", "..") for part in path[2:].split("/"))
+                or any(char in path for char in "*?[\x00\n\r")):
+            _mf_die(pid, f"registry[{index}].path must be a literal ~/ path")
+        optional = row.get("optional", False)
+        if not isinstance(optional, bool):
+            _mf_die(pid, f"registry[{index}].optional must be boolean")
+        enabled_default = row.get("enabled_default")
+        if enabled_default is not None and not isinstance(enabled_default, bool):
+            _mf_die(pid, f"registry[{index}].enabled_default must be boolean")
+        fields = row.get("fields", {})
+        if (not isinstance(fields, dict)
+                or any(not isinstance(name, str)
+                       or _REGISTRY_FIELD_RE.fullmatch(name) is None
+                       for name in fields)
+                or any(name in ("key", "enabled") for name in fields)):
+            _mf_die(pid, f"registry[{index}].fields must map safe, non-reserved names")
+        projected = {}
+        for field_name, field_path in fields.items():
+            projected[field_name] = _validate_registry_field(
+                pid, field_path, f"registry[{index}].fields.{field_name}")
+        out.append({
+            "name": name,
+            "path": path,
+            "entries": _validate_registry_field(
+                pid, row.get("entries"), f"registry[{index}].entries"),
+            "key": _validate_registry_field(
+                pid, row.get("key"), f"registry[{index}].key"),
+            "enabled": _validate_registry_field(
+                pid, row.get("enabled"), f"registry[{index}].enabled"),
+            "optional": optional,
+            "enabled_default": enabled_default,
+            "fields": projected,
+        })
+    return out
+
+
+def _validate_mappings(pid: str, raw, schema: dict, arts: dict) -> tuple[dict, list[dict]]:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict) or set(raw) - set(_SERVE_KEYS):
@@ -1372,7 +1522,216 @@ def _validate_mappings(pid: str, raw, schema: dict, arts: dict) -> dict:
         mappings[key] = {"mode": "https", "target_key": target}
         if enabled_key is not None:
             mappings[key]["enabled_key"] = enabled_key
-    return mappings
+    return mappings, _validate_https_registries(pid, raw.get("https_registry"))
+
+
+_NO_REGISTRY_DEFAULT = object()
+
+
+def _json_field(value, path: str, where: str, default=_NO_REGISTRY_DEFAULT):
+    current = value
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            if default is not _NO_REGISTRY_DEFAULT:
+                return default
+            die(f"{where}: missing JSON field {path!r}")
+        current = current[part]
+    return current
+
+
+def _resolve_https_registries(pid: str, declarations: list[dict]) -> tuple[dict, list[dict]]:
+    """Resolve operator registry bytes once into both ledger mappings and installer rows.
+
+    The package consumes the rows carried in package-info; it never re-reads the live
+    registry during this install.  That keeps gate, instance, and ledger state on one
+    point-in-time projection even if the registry is atomically replaced mid-run.
+    """
+    mappings = {}
+    rows = []
+    home = Path.home().resolve()
+    for registry_index, declaration in enumerate(declarations):
+        source = home / declaration["path"][2:]
+        cache_key = os.fspath(source)
+        if cache_key not in _HTTPS_REGISTRY_CACHE:
+            if not os.path.lexists(source):
+                if declaration["optional"]:
+                    _HTTPS_REGISTRY_CACHE[cache_key] = None
+                else:
+                    die(f"package '{pid}' HTTPS registry is missing: {source}")
+            else:
+                try:
+                    # O_RDONLY on a FIFO waits for a writer before fstat can
+                    # reject it.  Open non-blocking so every non-regular source
+                    # fails closed during preflight instead of wedging install.
+                    descriptor = os.open(
+                        source,
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                    )
+                    with os.fdopen(descriptor, "rb") as handle:
+                        metadata = os.fstat(handle.fileno())
+                        if not stat.S_ISREG(metadata.st_mode):
+                            die(f"package '{pid}' HTTPS registry must be a regular non-symlink file: {source}")
+                        if metadata.st_size > 4 * 1024 * 1024:
+                            die(f"package '{pid}' HTTPS registry exceeds 4 MiB: {source}")
+                        try:
+                            Path(f"/proc/self/fd/{handle.fileno()}").resolve(strict=True).relative_to(home)
+                        except (OSError, ValueError) as exc:
+                            die(f"package '{pid}' HTTPS registry escapes HOME: {source} ({exc})")
+                        _HTTPS_REGISTRY_CACHE[cache_key] = handle.read()
+                except OSError as exc:
+                    die(f"package '{pid}' HTTPS registry is unreadable: {source} ({exc})")
+        raw = _HTTPS_REGISTRY_CACHE[cache_key]
+        if raw is None:
+            if not declaration["optional"]:
+                die(f"package '{pid}' HTTPS registry is missing: {source}")
+            continue
+        try:
+            document = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            die(f"package '{pid}' HTTPS registry is unreadable JSON: {source} ({exc})")
+        entries = _json_field(document, declaration["entries"],
+                              f"package '{pid}' HTTPS registry {source}")
+        if not isinstance(entries, list):
+            die(f"package '{pid}' HTTPS registry field {declaration['entries']!r} must be an array")
+        if len(entries) > 1024:
+            die(f"package '{pid}' HTTPS registry has more than 1024 entries: {source}")
+        source_digest = hashlib.sha256(raw).hexdigest()
+        seen_entry_keys = set()
+        for entry_index, entry in enumerate(entries):
+            where = f"package '{pid}' HTTPS registry {source} entry {entry_index}"
+            enabled = _json_field(entry, declaration["enabled"], where)
+            if not isinstance(enabled, bool):
+                die(f"{where}: enabled field must be boolean")
+            entry_key = _json_field(entry, declaration["key"], where)
+            if (not isinstance(entry_key, str) or APP_NAME_RE.fullmatch(entry_key) is None):
+                die(f"{where}: key field must be a safe non-empty id")
+            if entry_key in seen_entry_keys:
+                die(f"{where}: duplicate key {entry_key!r}")
+            seen_entry_keys.add(entry_key)
+            if not enabled:
+                continue
+            listen = _json_field(entry, declaration["listen"], where)
+            target = _json_field(entry, declaration["target"], where)
+            if (not isinstance(listen, int) or isinstance(listen, bool)
+                    or not 1 <= listen <= 65535
+                    or not isinstance(target, int) or isinstance(target, bool)
+                    or not 1 <= target <= 65535):
+                die(f"{where}: listen and target fields must be ports 1-65535")
+            # Keep the synthetic ownership key inside the ledger v6 grammar
+            # so a rollback to an older v6 reader can still load and retract
+            # the route. The unhashed id remains in the installer row.
+            mapping_key = (
+                f"registry_{registry_index}_"
+                f"{hashlib.sha256(entry_key.encode('utf-8')).hexdigest()}"
+            )
+            fields = {name: _json_field(entry, field_path, where)
+                      for name, field_path in declaration["fields"].items()}
+            for name, value in fields.items():
+                if (_is_port_config_key(name)
+                        and (not isinstance(value, int) or isinstance(value, bool)
+                             or not 1 <= value <= 65535)):
+                    die(f"{where}: projected field {name!r} must be a port 1-65535")
+            mappings[mapping_key] = {"listen": listen, "mode": "https", "target": target}
+            rows.append({
+                "mapping_key": mapping_key,
+                "registry_index": registry_index,
+                "source": declaration["path"],
+                "source_sha256": source_digest,
+                "key": entry_key,
+                "listen": listen,
+                "target": target,
+                "fields": fields,
+            })
+    return mappings, rows
+
+
+def _resolve_data_registries(pid: str, declarations: list[dict]) -> dict[str, dict]:
+    """Resolve non-routing registry projections from the shared byte cache.
+
+    The cache is deliberately the same one used by HTTPS registry projection:
+    two packages naming the same source therefore consume exactly the same
+    bytes during one package-info resolution, even if the operator atomically
+    replaces the file between package declarations.
+    """
+    projections = {}
+    home = Path.home().resolve()
+    for declaration in declarations:
+        source = home / declaration["path"][2:]
+        cache_key = os.fspath(source)
+        if cache_key not in _HTTPS_REGISTRY_CACHE:
+            if not os.path.lexists(source):
+                if declaration["optional"]:
+                    _HTTPS_REGISTRY_CACHE[cache_key] = None
+                else:
+                    die(f"package '{pid}' registry is missing: {source}")
+            else:
+                try:
+                    descriptor = os.open(
+                        source,
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                    )
+                    with os.fdopen(descriptor, "rb") as handle:
+                        metadata = os.fstat(handle.fileno())
+                        if not stat.S_ISREG(metadata.st_mode):
+                            die(f"package '{pid}' registry must be a regular non-symlink file: {source}")
+                        if metadata.st_size > 4 * 1024 * 1024:
+                            die(f"package '{pid}' registry exceeds 4 MiB: {source}")
+                        try:
+                            Path(f"/proc/self/fd/{handle.fileno()}").resolve(strict=True).relative_to(home)
+                        except (OSError, ValueError) as exc:
+                            die(f"package '{pid}' registry escapes HOME: {source} ({exc})")
+                        _HTTPS_REGISTRY_CACHE[cache_key] = handle.read()
+                except OSError as exc:
+                    die(f"package '{pid}' registry is unreadable: {source} ({exc})")
+        raw = _HTTPS_REGISTRY_CACHE[cache_key]
+        if raw is None:
+            if not declaration["optional"]:
+                die(f"package '{pid}' registry is missing: {source}")
+            projections[declaration["name"]] = {
+                "source": declaration["path"],
+                "present": False,
+                "source_sha256": None,
+                "rows": [],
+            }
+            continue
+        try:
+            document = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            die(f"package '{pid}' registry is unreadable JSON: {source} ({exc})")
+        entries = _json_field(document, declaration["entries"],
+                              f"package '{pid}' registry {source}")
+        if not isinstance(entries, list):
+            die(f"package '{pid}' registry field {declaration['entries']!r} must be an array")
+        if len(entries) > 1024:
+            die(f"package '{pid}' registry has more than 1024 entries: {source}")
+        rows = []
+        seen_entry_keys = set()
+        for entry_index, entry in enumerate(entries):
+            where = f"package '{pid}' registry {source} entry {entry_index}"
+            enabled = _json_field(entry, declaration["enabled"], where,
+                                  declaration["enabled_default"])
+            if not isinstance(enabled, bool):
+                die(f"{where}: enabled field must be boolean")
+            entry_key = _json_field(entry, declaration["key"], where)
+            if (not isinstance(entry_key, str) or APP_NAME_RE.fullmatch(entry_key) is None):
+                die(f"{where}: key field must be a safe non-empty id")
+            if entry_key in seen_entry_keys:
+                die(f"{where}: duplicate key {entry_key!r}")
+            seen_entry_keys.add(entry_key)
+            if not enabled:
+                continue
+            rows.append({
+                "key": entry_key,
+                "fields": {name: _json_field(entry, field_path, where)
+                           for name, field_path in declaration["fields"].items()},
+            })
+        projections[declaration["name"]] = {
+            "source": declaration["path"],
+            "present": True,
+            "source_sha256": hashlib.sha256(raw).hexdigest(),
+            "rows": rows,
+        }
+    return projections
 
 
 def _validate_plaintext_redirect(pid: str, raw, declared: set[str]) -> dict:
@@ -3269,7 +3628,8 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
             else _validate_icon_source(pid, pdir, tile["icon"]))
     audience = _validate_audience(pid, m.get("audience"))
     declared = set(schema["required"]) | set(schema["defaults"])
-    serve = _validate_mappings(pid, m.get("serve"), schema, arts)
+    serve, https_registries = _validate_mappings(pid, m.get("serve"), schema, arts)
+    data_registries = _validate_data_registries(pid, m.get("registry"))
     plaintext_redirect = _validate_plaintext_redirect(pid, m.get("plaintext_redirect"), declared)
     for key in arts["serve_ports"]:
         if key not in declared:
@@ -3306,7 +3666,7 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
     surfaces = set(requested)
     if arts["serve_ports"]:
         surfaces.add("serve-port")
-    if serve:
+    if serve or https_registries:
         surfaces.add("serve-https")
     surfaces = sorted(surfaces)
     surface_classifications = {
@@ -3357,6 +3717,8 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
         "artifacts": arts,
         "unit_scopes": unit_scopes,
         "serve": serve,
+        "https_registries": https_registries,
+        "data_registries": data_registries,
         "plaintext_redirect": plaintext_redirect,
         "source_class": source_class,
         "requested_capabilities": sorted(requested),
@@ -3376,6 +3738,21 @@ def packages_resolved(cfg: dict) -> dict:
     """PackageSpecs cross-checked against the resolved config: serve-port
     values, port-span values, and disjoint ownership (D1/D2). Fatal on any
     violation; {} when no packages are configured."""
+    frozen_digest = os.environ.get("AIRLOCK_INSTALL_PKG_INFO_SHA256", "")
+    if frozen_digest:
+        raw = os.environ.get("AIRLOCK_PKG_INFO", "")
+        if (re.fullmatch(r"[0-9a-f]{64}", frozen_digest) is None
+                or hashlib.sha256(raw.encode("utf-8")).hexdigest() != frozen_digest):
+            die("frozen install package-info authority is missing or has changed")
+        try:
+            frozen = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            die(f"frozen install package-info is invalid JSON: {exc}")
+        if (not isinstance(frozen, dict)
+                or set(frozen) != {"config_path", "order", "packages"}
+                or not isinstance(frozen.get("packages"), dict)):
+            die("frozen install package-info has an invalid shape")
+        return frozen["packages"]
     specs = package_specs(cfg)
     if not specs:
         return {}
@@ -3383,6 +3760,10 @@ def packages_resolved(cfg: dict) -> dict:
     out = {}
     for pid, spec in specs.items():
         app_table = r_apps.get(pid) or {}
+        registry_mappings, registry_rows = _resolve_https_registries(
+            pid, spec["https_registries"])
+        registry_projections = _resolve_data_registries(
+            pid, spec["data_registries"])
         active_serve = {}
         inactive_serve_keys = set()
         for key, mapping in spec["serve"].items():
@@ -3414,6 +3795,11 @@ def packages_resolved(cfg: dict) -> dict:
                 die(f"package '{pid}' serve target apps.{pid}.{mapping['target_key']} is not a port")
             serve_mappings[key] = {"listen": spv[key], "mode": mapping["mode"],
                                    "target": target}
+        for key, mapping in registry_mappings.items():
+            if key in serve_mappings:
+                die(f"package '{pid}' HTTPS registry mapping key collision: {key}")
+            serve_mappings[key] = mapping
+            spv[key] = mapping["listen"]
         # Two 301 pairs whose PUBLIC keys resolve to the same port (Minor
         # N2): only one could ever be the live listener — the other's row
         # is silently dropped by cmd_plaintext's per-app dedup table, so
@@ -3465,6 +3851,7 @@ def packages_resolved(cfg: dict) -> dict:
             key for key in arts_out["serve_ports"]
             if key not in inactive_serve_keys
         ]
+        arts_out["serve_ports"].extend(sorted(registry_mappings))
         if spec["icon"] is not None:
             # F4: the staged icon directory is synthesized into the DECLARED
             # artifacts before anything is journaled — the intent names the
@@ -3474,6 +3861,8 @@ def packages_resolved(cfg: dict) -> dict:
             arts_out["webroot"] = arts_out["webroot"] + [f"assets/apps/{pid}"]
         out[pid] = dict(spec, artifacts=arts_out, serve=active_serve,
                         serve_port_values=spv, serve_mappings=serve_mappings,
+                        serve_registry_rows=registry_rows,
+                        registry_projections=registry_projections,
                         port_span_values=spans,
                         # The resolved plaintext_redirect ports (public AND
                         # redirect — a redirect target is a real bound
@@ -3960,7 +4349,6 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
         path list, for the printed candidate line)."""
     roots = _artifact_roots()
     claims = _pattern_claims(spec["artifacts"], roots, spec["unit_scopes"])
-    serve_mappings = _shipped_default_serve_mappings(spec)
 
     ledger_mod = _ledger_module()
     # Container declarations are package inputs, but their durable runtime
@@ -3972,7 +4360,10 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
         name: list(spec["artifacts"][name])
         for name in ledger_mod.ARTIFACT_CLASSES
     }
-    ledger_artifacts["serve_ports"] = sorted(serve_mappings)
+    # Port mappings are irrelevant to the existence probe. In particular,
+    # do not resolve a required registry for every unselected shipped app on
+    # a clean box: only an app with an artifact to adopt may consult it.
+    ledger_artifacts["serve_ports"] = []
     container_declarations = list(spec["artifacts"]["containers"])
     # expand_declared is airlock-ledger's own function and expects its own
     # STRING-valued root set (`_current_roots()`), not airlock-config's
@@ -3991,6 +4382,21 @@ def _known_builtin_admission(pid: str, spec: dict, cfg: dict) -> tuple:
                     for p in expanded.get(cls, [])})
     if not found:
         return False, False, None, None
+
+    # Adoption reconstructs an unrecorded legacy install from durable static
+    # defaults. A mutable registry is neither durable nor necessarily present
+    # after the package was removed from config, so guessing its old routes
+    # could turn off unrelated current listeners. New dynamic installs always
+    # have a ledger record; legacy dynamic artifacts require explicit cleanup.
+    if spec.get("https_registries"):
+        return True, False, (
+            "dynamic HTTPS registry mappings cannot be reconstructed safely "
+            "for an unrecorded install; remove the reported legacy artifacts "
+            "explicitly instead of using --adopt"
+        ), None
+
+    serve_mappings = _shipped_default_serve_mappings(spec)
+    ledger_artifacts["serve_ports"] = sorted(serve_mappings)
 
     # Every declared serve_ports key MUST resolve to a mapping: a v3 intent
     # record requires serve_port_values' keys to equal
@@ -4436,11 +4842,20 @@ def cmd_prereqs(cfg: dict) -> "None":
 def cmd_package_info(cfg: dict) -> "None":
     """Everything bash needs about [packages.*], as one JSON object. Consumed
     by the orchestrator and bin/airlock-ledger (which parses no TOML)."""
-    print(json.dumps({
+    rendered = json.dumps({
         "config_path": str(find_config()),
         "order": app_order(cfg),
         "packages": packages_resolved(cfg),
-    }, indent=2, sort_keys=True))
+    }, indent=2, sort_keys=True)
+    # The orchestrator exports this as one AIRLOCK_PKG_INFO environment
+    # string. Linux rejects any individual argv/env string around 128 KiB,
+    # before ARG_MAX is relevant; fail here with a diagnosis instead of
+    # letting the first child process die later with opaque E2BIG.
+    if len(rendered.encode("utf-8")) > _PACKAGE_INFO_ENV_LIMIT:
+        die(f"package-info exceeds the {_PACKAGE_INFO_ENV_LIMIT}-byte safe "
+            "environment transport limit; reduce registry projections or "
+            "package metadata", code=2)
+    print(rendered)
 
 
 def cmd_install_preflight(cfg: dict, expected_package_info: dict | None = None) -> "None":

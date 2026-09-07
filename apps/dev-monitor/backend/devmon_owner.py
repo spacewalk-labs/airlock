@@ -65,10 +65,19 @@ def load_gate_config():
     return {'owner': present['DEV_MONITOR_OWNER'], 'secret': present['DEV_MONITOR_PROXY_SECRET']}
 
 
-def require_owner(handler, config):
+def require_owner(handler, config, cors=False):
     """Constant-time compare of BOTH the proxy secret and the owner. Writes 403 and returns
     False on failure. The secret is the one that has to be constant-time; the owner is
-    compared the same way because there is no reason to have two comparison styles here."""
+    compared the same way because there is no reason to have two comparison styles here.
+
+    cors=True only for the one route a non-owner tailnet viewer legitimately calls
+    cross-origin (the return widget's badge poll against messages/preview, since
+    tailnet_view opened the document itself to every tailnet member, not just the
+    owner). The 403 body carries no data either way ({'ok': False}) — cors=True just
+    lets that empty rejection be READ by the caller's JS instead of surfacing as an
+    opaque CORS failure; it does not admit a new origin to anything the 200 path
+    returns, and every other owner route keeps cors=False.
+    """
     # Compared as BYTES: hmac.compare_digest refuses a str with non-ASCII characters, and
     # http.server hands us headers decoded as latin-1. One accented character in a header —
     # or in the configured owner — otherwise raised before either comparison finished.
@@ -81,7 +90,7 @@ def require_owner(handler, config):
     ok_owner = hmac.compare_digest(_b(owner), _b(config['owner']))
     if not (ok_secret and ok_owner):
         # No data and no hint in the body — a 403 must not say which check failed.
-        handler._json(403, {'ok': False})
+        handler._json(403, {'ok': False}, cors=cors)
         return False
     return True
 

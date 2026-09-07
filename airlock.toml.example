@@ -153,6 +153,15 @@ font_size    = 15
 #                                             # running claude-fleet: "~/.claude-accounts/.fleet-usage.json".
 #                                             # Unset on a box that HAS a collector = no per-account usage.
 # fleet_store_url = ""                        # URL of a shared usage store (optional; no host is hardcoded)
+# fleet_read_domain = "example.com"           # empty (default) = this gate is owner-only end to end.
+#                                             # Set to a domain and any identity in it may read four
+#                                             # account-STATE routes — /claude-status, /claude-usage,
+#                                             # /claude-usage-store, /codex-usage — so a central console
+#                                             # can poll this box. They emit no token and no hash. Every
+#                                             # other route, including /acct-alert and everything that
+#                                             # writes, stays owner-only. Only this box's Tailscale Serve
+#                                             # can reach the gate, so the identity is authenticated
+#                                             # ingress, not a client assertion (SECURITY.md).
 # remote_hosts = "hostA,hostB"               # comma-separated ssh hosts whose tmux sessions also appear as tabs
 # orca_shim  = "~/.config/orca/linux-orca-cli-shim/orca"  # Orca CLI shim -> enables the worktree sidebar
 # The terminal file-path -> fileview link turns on automatically when

@@ -33,7 +33,23 @@ OWNER_RE = re.compile(r'^@?[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z')
 MAX_PAYLOAD = 16 * 1024                                # 16KB
 MAX_URL = 2048                                         # upper bound for link.url
 APPROVAL_TTL = timedelta(minutes=5)                   # approval nonce lifetime
-COALESCE_WINDOW = timedelta(hours=24)                 # one card per group_key in 24h (per day)
+# ---- coalescing cadence (owner decision 2026-09-02) ----
+# One card per group_key per window. The window is chosen by the INCOMING occurrence's
+# severity, not by the card it might join: a `record` repeat looks a week back for an open
+# card, so a quiet condition that restates itself every day becomes one card a week instead of
+# seven. `page` keeps the daily window on purpose — the first time something wakes a person is
+# the one that must not be folded into last week's card.
+#
+# Measured on one box over 48h (2026-09-02): 142 occurrences already collapsed into 19 cards
+# under the flat 24h rule, and 9 of those 19 were `record` restating the same standing
+# condition on consecutive days. Those nine are what this turns into two.
+COALESCE_WINDOW = timedelta(hours=24)                 # default, and what an unknown severity gets
+COALESCE_WINDOWS = {
+    'page':      timedelta(hours=24),
+    'attention': timedelta(hours=24),
+    'record':    timedelta(days=7),
+    'digest':    timedelta(days=7),
+}
 FLOOD_WINDOW = timedelta(minutes=10)
 FLOOD_THRESHOLD = 20
 FLOOD_COOLDOWN = timedelta(minutes=30)
@@ -228,6 +244,16 @@ def route(severity):
         return ROUTING[severity]
     except KeyError:
         raise ValueError('no routing for severity %r' % (severity,))
+
+
+def coalesce_window(severity):
+    """How far back an occurrence of this severity looks for an open card to join.
+
+    Unknown severities get the daily default rather than raising: this runs inside the ingest
+    transaction, and a cadence lookup is not the place to lose a message that already passed
+    validation.
+    """
+    return COALESCE_WINDOWS.get(severity, COALESCE_WINDOW)
 
 
 def set_enabled_channels(channels):
@@ -532,6 +558,14 @@ def _ensure_lane_columns_and_indexes(conn):
         'NOT ' + created_valid + ' AND NOT ' + next_attempt_valid + ')')
     conn.execute(
         'CREATE INDEX IF NOT EXISTS idx_cards_probe ON cards(group_key, created_at)')
+    # The ingest coalesce lookup, which filters `group_key` and then `received_at >= ?` and
+    # takes the newest. Without it SQLite scans every card ever written for a noisy group_key
+    # and sorts them — inside `BEGIN IMMEDIATE`, so the cost is paid in write-lock time by
+    # every other producer waiting to ingest. The pre-existing `idx_cards_probe` covers
+    # `created_at`, which is no longer what this reads.
+    conn.execute(
+        'CREATE INDEX IF NOT EXISTS idx_cards_group_received '
+        'ON cards(group_key, received_at)')
     conn.execute(
         'CREATE INDEX IF NOT EXISTS idx_cards_watchdog_group_created '
         "ON cards(group_key, created_at, card_id) WHERE source='dev-monitor-watchdog'")
@@ -723,15 +757,27 @@ def ingest(payload):
         if seen is not None:
             return 'duplicate'
         # 2) Coalesce target: an open card with the same group_key, action_digest and owner,
-        #    created within 24h (the one-card-per-day rule). Owner is part of the identity
-        #    (P4's invariant) — `owner IS ?` rather than `=` because SQLite's `=` never
-        #    matches NULL against NULL, and two undeclared occurrences of the same group_key
-        #    must still coalesce with each other.
-        cutoff = iso(now - COALESCE_WINDOW)
+        #    RECEIVED within the window. Owner is part of the identity (P4's invariant) —
+        #    `owner IS ?` rather than `=` because SQLite's `=` never matches NULL against
+        #    NULL, and two undeclared occurrences of the same group_key must still coalesce
+        #    with each other.
+        #
+        #    `received_at`, not `created_at` (2026-09-06). The cutoff is derived from `now`,
+        #    which is the ingest clock; filtering on the producer's clock compares two
+        #    different timelines. Live they agree within seconds and nothing shows. On a
+        #    drained BACKLOG they diverge by however long the spool sat, every candidate falls
+        #    outside the window, and coalescing turns off entirely — at the one moment a flood
+        #    is guaranteed. Measured: six spool files sharing a group_key and digest, ingested
+        #    in the same second, became six cards because their `created_at` was 13 days old.
+        #
+        #    `received_at` is set once at insert and never refreshed, so the daily and weekly
+        #    roll-overs behave exactly as before for live traffic — a long-lived card cannot
+        #    extend its own window by being seen again.
+        cutoff = iso(now - coalesce_window(severity))
         card = conn.execute(
             'SELECT * FROM cards WHERE group_key=? AND action_digest=? AND owner IS ? '
-            'AND dismissed_at IS NULL AND archived_at IS NULL AND created_at>=? '
-            'ORDER BY created_at DESC LIMIT 1',
+            'AND dismissed_at IS NULL AND archived_at IS NULL AND received_at>=? '
+            'ORDER BY received_at DESC LIMIT 1',
             (group_key, digest, owner, cutoff)).fetchone()
         escalated = False
         new_severity = severity

@@ -72,7 +72,84 @@ WantedBy=default.target
 UNIT
 }
 
-# render_devterm_nginx GATE_PORT BACKEND_PORT [ACCOUNT_PANEL_DIR]
+# render_devterm_fleet_read DOMAIN MAP_VAR [OWNER_LOGIN...]
+# Prints the http-context map half of the read-open (render_devterm_fleet_locations
+# prints the other half). A servers.d fragment is included at http level, so a `map`
+# here is legal and needs no edit to the platform renderer.
+#
+# 🔴 Four routes, and the boundary is "does it emit a secret", not "is it a GET".
+# /claude-status, /claude-usage, /claude-usage-store and /codex-usage report WHICH
+# account this box is logged in as and how much of its quota is left. No token, no
+# refresh token, no hash. /acct-alert is a GET too and is NOT here: it is the owner's
+# own alert state. Everything that writes — /acct-login-*, /acct-switch,
+# /acct-remove, /secret-* — stays behind `location /`.
+#
+# Per-location guards, not a wider map on `location /`: an nginx `if` covers only the
+# location it is written in, so opening these four cannot leak into the terminal, the
+# secret drop or the panel. The trade is that a route added later is closed by
+# default, which is the direction we want to fail in.
+#
+# The map is anchored `^[^@]+@<domain>$`. An unanchored match would accept
+# "owner@evil.example.com-attacker.invalid", and the empty header (no identity at
+# all) must fall to `default 0` rather than matching a bare suffix.
+#
+# The owner logins are listed exactly as well, and nginx prefers an exact match over
+# a regex. Without them an owner whose login sits outside the fleet domain would be
+# 403ed on their OWN box's status route by a key meant only to widen access.
+render_devterm_fleet_read() {
+  local DOMAIN="$1" MAPVAR="$2"; shift 2
+  local ident escaped login
+  ident="$(ident_var "${AIRLOCK_IDENTITY_HEADER:?render_devterm_fleet_read: AIRLOCK_IDENTITY_HEADER not set}")"
+  DOMAIN="${DOMAIN#@}"
+  # Validated here, the one place it reaches nginx: the value is pasted into a regex
+  # and a config file, so anything outside a hostname's character set is refused
+  # rather than escaped into something that still parses.
+  if ! printf '%s' "$DOMAIN" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'; then
+    printf 'render_devterm_fleet_read: refusing malformed fleet_read_domain %s\n' "$DOMAIN" >&2
+    return 1
+  fi
+  escaped="${DOMAIN//./\\.}"
+  printf 'map $%s $%s {\n    default 0;\n' "$ident" "$MAPVAR"
+  for login in "$@"; do
+    [ -n "$login" ] && printf '    "%s" 1;\n' "$login"
+  done
+  printf '    "~*^[^@]+@%s$" 1;\n}\n' "$escaped"
+}
+
+# render_devterm_fleet_locations MAP_VAR BACKEND_PORT — the location half (see above).
+# QUOTED heredoc + sed placeholders, the convention this file and gate/nginx-lib.sh
+# state: $http_host is an nginx runtime variable and must reach the config verbatim.
+render_devterm_fleet_locations() {
+  local MAPVAR="$1" BACKEND_PORT="$2"
+  local path
+  printf '\n    # fleet read-open (fleet_read_domain) — account STATE, never a credential.\n'
+  for path in /claude-status /claude-usage /claude-usage-store /codex-usage; do
+    sed -e "s|@@PATH@@|${path}|g" \
+        -e "s|@@UPSTREAM@@|127.0.0.1:${BACKEND_PORT}|g" \
+        -e "s/@@MAP@@/${MAPVAR}/g" <<'NGINX'
+    location = @@PATH@@ {
+        if ($@@MAP@@ = 0) { return 403; }
+        proxy_pass http://@@UPSTREAM@@;
+        proxy_http_version 1.1;
+        # $http_host for the same reason location / uses it (see emit_owner_gate).
+        # No proxy_set_header for the identity: nginx forwards the client's headers
+        # unchanged, which is how the gate gets the value it re-checks.
+        proxy_set_header Host $http_host;
+        # 60s, not location /'s 86400s: these are probes, not a terminal WebSocket,
+        # and /claude-usage can sit on a slow upstream API call.
+        proxy_read_timeout 60s;
+    }
+NGINX
+  done
+}
+
+# render_devterm_nginx GATE_PORT BACKEND_PORT [ACCOUNT_PANEL_DIR] [FLEET_READ_DOMAIN]
+#
+# FLEET_READ_DOMAIN (optional, [apps.devterm] fleet_read_domain) opens the four
+# account-state read routes to any identity in that domain, so a central console can
+# poll this box. Empty — the shipped default — emits nothing at all, and the gate stays
+# owner-only end to end. See render_devterm_fleet_read below for why these four and
+# why a per-location guard rather than widening the map on `location /`.
 # Trailing args beyond those are ignored: D-DEVTERM-9900 retired the plaintext redirect.
 #
 # ACCOUNT_PANEL_DIR (optional) is the platform's account-panel asset directory in the
@@ -84,7 +161,7 @@ UNIT
 # location it is written in, so a location added beside `location /` inherits nothing
 # from it, and the account panel is not a thing to hand to a passing collaborator.
 render_devterm_nginx() {
-  local GATE_PORT="$1" BACKEND_PORT="$2" PANEL_DIR="${3:-}"
+  local GATE_PORT="$1" BACKEND_PORT="$2" PANEL_DIR="${3:-}" FLEET_DOMAIN="${4:-}"
   local extra=""
   if [ -n "$PANEL_DIR" ]; then
     extra="$(mktemp)"
@@ -110,7 +187,18 @@ render_devterm_nginx() {
     }
 NGINX
   fi
+  if [ -n "$FLEET_DOMAIN" ]; then
+    [ -n "$extra" ] || extra="$(mktemp)"
+    render_devterm_fleet_locations devterm_fleet_ok "$BACKEND_PORT" >>"$extra"
+  fi
   echo "# devterm owner gate — generated by apps/devterm/install.sh"
+  if [ -n "$FLEET_DOMAIN" ]; then
+    # AIRLOCK_OWNER is the same comma-separated list emit_identity_map takes for
+    # $owner_ok; splitting it here keeps one source for who the owner is.
+    local _owners
+    IFS=',' read -r -a _owners <<<"${AIRLOCK_OWNER:-}"
+    render_devterm_fleet_read "$FLEET_DOMAIN" devterm_fleet_ok "${_owners[@]}" || return 1
+  fi
   emit_owner_gate "$GATE_PORT" "127.0.0.1:${BACKEND_PORT}" owner_ok "" "" "$extra"
   [ -n "$extra" ] && rm -f "$extra"
   return 0

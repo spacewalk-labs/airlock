@@ -110,12 +110,20 @@ def _profile(token):
             "tier": org.get("rate_limit_tier")}, None
 
 
-def _describe(path, with_usage=False, is_live=True):
+def _describe(path, with_usage=False, is_live=True, allow_refresh=True):
     """One credential file -> identity + health (never the token itself).
 
     with_usage is off by default on purpose: it costs one extra usage call per account,
     and querying live + every pool slot on each status call turns several boxes polling
-    at once into a burst that earns a 429. Usage is asked for one account at a time."""
+    at once into a burst that earns a 429. Usage is asked for one account at a time.
+
+    allow_refresh=False makes this the read-only probe its name suggests. 🔴 The default
+    is NOT read-only: an expired pool slot is refreshed here and the rotated credential
+    is written back (`_refresh_pool`), and a rejected one is marked dead on disk
+    (`_mark_dead`). A caller who is not the box owner — the fleet console asking every
+    box what it is logged in as — must not be able to rotate or overwrite the owner's
+    credentials, so that caller passes --no-refresh and an expired slot reports "stale"
+    instead of being revived. The owner's own panel keeps the refresh."""
     try:
         creds = json.load(open(path))
     except Exception as e:
@@ -136,6 +144,12 @@ def _describe(path, with_usage=False, is_live=True):
             # break that lineage.
             out.update(state="stale",
                        reason="accessToken expired (refreshToken alive — Claude Code renews it)")
+            return out
+        if not allow_refresh:
+            # A read-only caller. Report what the file says and change nothing: no
+            # refresh request, no rotated credential written back, no dead marking.
+            out.update(state="stale",
+                       reason="accessToken expired (read-only probe did not refresh)")
             return out
         # pool slots have no other refresher, so this box is it. Without this the
         # accessToken dies after 8h and identity/usage can never be queried again.
@@ -788,6 +802,10 @@ def main():
     # `--usage <slot>` asks for *one* account's usage, at the moment it is requested.
     # Without it no usage call is made at all.
     args = sys.argv[1:]
+    # --no-refresh: answer from what is on disk and write nothing. The gate passes it
+    # for a caller that cleared the fleet read-open rather than the owner gate.
+    allow_refresh = "--no-refresh" not in args
+    args = [a for a in args if a != "--no-refresh"]
     if args and args[0] == "raw-deadlines":
         if any(arg != "--json" for arg in args[1:]):
             print("usage: airlock-accounts-status raw-deadlines --json", file=sys.stderr)
@@ -820,14 +838,15 @@ def main():
         if not p:
             json.dump({"error": f"no such account: {slot}"}, sys.stdout, ensure_ascii=False)
             print(); return
-        json.dump(dict(slot=slot, **_describe(p, with_usage=True, is_live=(slot == "live"))),
+        json.dump(dict(slot=slot, **_describe(p, with_usage=True, is_live=(slot == "live"),
+                                              allow_refresh=allow_refresh)),
                   sys.stdout, ensure_ascii=False)
         print(); return
 
     r = {"host": os.uname().nodename, "user": os.environ.get("USER") or "?",
          "ts": int(time.time()),
          "hasClaudeSwitch": bool(shutil.which("claude-switch"))}
-    r["live"] = _describe(LIVE) if os.path.isfile(LIVE) else {
+    r["live"] = _describe(LIVE, allow_refresh=allow_refresh) if os.path.isfile(LIVE) else {
         "state": "none", "reason": "never logged in (no live credential)"}
     # The .active slot is the same account as live, but its pool copy is a snapshot from
     # swap time: once Claude Code refreshed live, that copy's refreshToken is already
@@ -847,7 +866,8 @@ def main():
                 pool.append(dict(r["live"], slot=slot, isActive=True))
             else:
                 pool.append(dict(slot=slot,
-                                 **_describe(os.path.join(POOL, f), is_live=False)))
+                                 **_describe(os.path.join(POOL, f), is_live=False,
+                                             allow_refresh=allow_refresh)))
     r["pool"] = pool
     r["codex"] = _codex_status()
     r["xai"] = _xai_status()

@@ -71,7 +71,24 @@ if [ "${AIRLOCK_DEVTERM_XAI:-false}" = true ]; then
   xai_note=" | xai enabled=${xai_ok}/1 deny=${c_xdeny}/403"
 fi
 
-echo "[devterm smoke] ttyd=${c_ttyd}/200 | backend owner=${c_bown}/200 deny=${c_bdeny}/403 no=${c_bno}/403 sessions=${c_sess}/200 | gate owner=${c_gown}/200 deny=${c_gdeny}/403 no=${c_gno}/403${acct_note}${xai_note}"
+# fleet read-open (only when fleet_read_domain is set): the four account-STATE routes
+# must answer an in-domain non-owner, and NOTHING else may. /claude-usage-store is the
+# probe because it is a local file read — /claude-status and /claude-usage each make a
+# live API call and would turn a gate assertion into a network flake. /acct-alert is
+# the spread check: it is a GET on the same feature, so if the widening ever leaks past
+# the four locations it shows up here first.
+fleet_note=""
+if [ -n "${AIRLOCK_DEVTERM_FLEET_READ_DOMAIN:-}" ]; then
+  FDOM="${AIRLOCK_DEVTERM_FLEET_READ_DOMAIN#@}"
+  c_fin=$(code   -H "${HDR}: airlock-smoke@${FDOM}"      "http://127.0.0.1:${GATE}/claude-usage-store")
+  c_fout=$(code  -H "${HDR}: airlock-smoke@invalid.test" "http://127.0.0.1:${GATE}/claude-usage-store")
+  c_fno=$(code                                            "http://127.0.0.1:${GATE}/claude-usage-store")
+  c_fspread=$(code -H "${HDR}: airlock-smoke@${FDOM}"    "http://127.0.0.1:${GATE}/acct-alert")
+  c_fbin=$(code  -H "${HDR}: airlock-smoke@${FDOM}"      "http://127.0.0.1:${BACKEND}/claude-usage-store")
+  fleet_note=" | fleet-read in=${c_fin}/200 out=${c_fout}/403 no=${c_fno}/403 spread=${c_fspread}/403 backend=${c_fbin}/200"
+fi
+
+echo "[devterm smoke] ttyd=${c_ttyd}/200 | backend owner=${c_bown}/200 deny=${c_bdeny}/403 no=${c_bno}/403 sessions=${c_sess}/200 | gate owner=${c_gown}/200 deny=${c_gdeny}/403 no=${c_gno}/403${acct_note}${xai_note}${fleet_note}"
 fail=0
 if [ "${AIRLOCK_DEVTERM_ACCOUNTS:-false}" = true ]; then
   [ "${acct_ok:-0}" = 1 ] || { echo "FAIL /accounts reports disabled (claude-switch missing?)"; fail=1; }
@@ -81,6 +98,13 @@ fi
 if [ "${AIRLOCK_DEVTERM_XAI:-false}" = true ]; then
   [ "${xai_ok:-0}" = 1 ] || { echo "FAIL /xai-status reports disabled (claude-status missing/broken?)"; fail=1; }
   [ "${c_xdeny:-}" = 403 ] || { echo "FAIL /xai-status other identity not denied (GATE HOLE)"; fail=1; }
+fi
+if [ -n "${AIRLOCK_DEVTERM_FLEET_READ_DOMAIN:-}" ]; then
+  [ "${c_fin:-}"     = 200 ] || { echo "FAIL fleet read-open in-domain identity denied (the console cannot poll this box)"; fail=1; }
+  [ "${c_fout:-}"    = 403 ] || { echo "FAIL fleet read-open out-of-domain identity allowed (GATE HOLE)"; fail=1; }
+  [ "${c_fno:-}"     = 403 ] || { echo "FAIL fleet read-open missing header allowed (GATE HOLE)"; fail=1; }
+  [ "${c_fspread:-}" = 403 ] || { echo "FAIL /acct-alert reachable by a non-owner (read-open SPREAD)"; fail=1; }
+  [ "${c_fbin:-}"    = 200 ] || { echo "FAIL fleet read-open stops at the gate's own re-check (nginx says open, backend says 403)"; fail=1; }
 fi
 [ "$c_ttyd"  = 200 ] || { echo "FAIL ttyd direct"; fail=1; }
 [ "$c_bown"  = 200 ] || { echo "FAIL backend owner not allowed"; fail=1; }

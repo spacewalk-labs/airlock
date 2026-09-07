@@ -49,6 +49,17 @@ if airlock_config apps | grep -qx publish; then
     PUBLISH_GATE="tailnet_ok"
   fi
 fi
+# The injected widget's unread badge polls the HUB's owner-only message preview
+# (hub/assets/airlock-return.js UNREAD_URL) — a route this box's own $hub_ok gate
+# protects. When PUBLISH_GATE is hub_ok, every visitor here already cleared that
+# same gate, so the badge poll can only succeed or fail the way it always has.
+# When tailnet_view widens PUBLISH_GATE to tailnet_ok, most visitors are NOT
+# owner/collaborator and the badge poll would hit the hub gate's 403 before ever
+# reaching dev-monitor — data-badge="0" turns the poll off rather than firing a
+# request that cannot succeed and that the browser logs as a blocked-CORS-fetch
+# console error no matter how the rejection is handled in JS.
+PUBLISH_WIDGET_BADGE_ATTR=""
+[ "$PUBLISH_GATE" = "tailnet_ok" ] && PUBLISH_WIDGET_BADGE_ATTR=' data-badge="0"'
 
 # hub is reachable by owner + collaborators; privileged apps stay owner-only.
 hub_logins=("$AIRLOCK_OWNER")
@@ -217,7 +228,8 @@ if [ "$PUBLISH_ENABLED" = true ]; then
       -e "s/@@HTTPS_PORT@@/${PUBLISH_HTTPS_PORT}/g" \
       -e "s/@@GATE@@/${PUBLISH_GATE}/g" \
       -e "s|@@WEBROOT@@|${WEBROOT}|g" \
-      -e "s|@@SHARE@@|${PUBLISH_SHARE_SED}|g" <<'NGINX'
+      -e "s|@@SHARE@@|${PUBLISH_SHARE_SED}|g" \
+      -e "s|@@BADGEATTR@@|${PUBLISH_WIDGET_BADGE_ATTR}|g" <<'NGINX'
 # ==== Publish dedicated document-view gate ====
 # tailscale serve --https=@@HTTPS_PORT@@ targets this loopback server.
 server {
@@ -257,7 +269,7 @@ server {
         # covered rather than assumed, and the assumption costs nothing if it holds:
         # the widget draws only in a standalone window, so a document that opened
         # with chrome gets no second control.
-        sub_filter '</body>' '<script src="/airlock-return.js" data-mode="corner" defer></script></body>';
+        sub_filter '</body>' '<script src="/airlock-return.js" data-mode="corner"@@BADGEATTR@@ defer></script></body>';
         sub_filter_once on;
     }
     location /publish/files/ {
@@ -272,7 +284,7 @@ server {
         # covered rather than assumed, and the assumption costs nothing if it holds:
         # the widget draws only in a standalone window, so a document that opened
         # with chrome gets no second control.
-        sub_filter '</body>' '<script src="/airlock-return.js" data-mode="corner" defer></script></body>';
+        sub_filter '</body>' '<script src="/airlock-return.js" data-mode="corner"@@BADGEATTR@@ defer></script></body>';
         sub_filter_once on;
     }
     # The widget itself. This port serves the share dir and nothing else, so it has

@@ -70,7 +70,7 @@ AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE=${SLACK_WEBHOOK_ROUTINE}
 ENVF
 }
 
-# render_dev_monitor_unit BACKEND_PORT MESSAGES IDENTITY_HEADER cors_hosts DEVMON_ENV \
+# render_dev_monitor_unit BACKEND_PORT MESSAGES IDENTITY_HEADER cors_origins DEVMON_ENV \
 #                         [TOKEN_FRESHNESS TOKEN_WARN_HOURS TOKEN_STALE_HOURS
 #                          SPOOL_HARDENING ACCOUNTS_STATUS_BIN AGENT_PROVIDER AGENT_BIN]
 # The token arguments default rather than being required: this function is called by
@@ -78,7 +78,7 @@ ENVF
 # and an unset positional under `set -u` would turn a missing argument into an unbound
 # variable error rather than the feature simply being off.
 render_dev_monitor_unit() {
-  local BACKEND_PORT="$1" MESSAGES="$2" IDENTITY_HEADER="$3" cors_hosts="$4" DEVMON_ENV="$5"
+  local BACKEND_PORT="$1" MESSAGES="$2" IDENTITY_HEADER="$3" cors_origins="$4" DEVMON_ENV="$5"
   local TOKEN_FRESHNESS="${6:-false}" TOKEN_WARN_HOURS="${7:-24}" TOKEN_STALE_HOURS="${8:-24}"
   local SPOOL_HARDENING="${9:-false}" guard=""
   local ACCOUNTS_STATUS_BIN="${10:-${AIRLOCK_ACCOUNTS_STATUS_BIN:-}}"
@@ -103,7 +103,7 @@ Type=simple
 Environment=AIRLOCK_DEV_MONITOR_BACKEND_PORT=${BACKEND_PORT}
 Environment=AIRLOCK_DEV_MONITOR_MESSAGES=${MESSAGES}
 Environment=AIRLOCK_IDENTITY_HEADER=${IDENTITY_HEADER}
-Environment=AIRLOCK_DEV_MONITOR_CORS_HOSTS=${cors_hosts}
+Environment=AIRLOCK_DEV_MONITOR_CORS_ORIGINS=${cors_origins}
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS=${TOKEN_FRESHNESS}
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS=${TOKEN_WARN_HOURS}
 Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS=${TOKEN_STALE_HOURS}

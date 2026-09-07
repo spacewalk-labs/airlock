@@ -90,7 +90,7 @@ AGENT_PROVIDER="${AIRLOCK_AGENT_PROVIDER:-}"
 #                             -> ExecStartPre={ path=/bin/echo ; argv[]=/bin/echo INJECTED ; … }
 #
 # A space or a `%` stays inside the value the same way it does for the existing
-# ACCOUNTS_STATUS_BIN and cors_hosts lines. Only a newline can start a new DIRECTIVE.
+# ACCOUNTS_STATUS_BIN and cors_origins lines. Only a newline can start a new DIRECTIVE.
 for _pair in "agent.provider:$AGENT_PROVIDER" "AIRLOCK_AGENT_BIN:$AIRLOCK_AGENT_BIN"; do
   case "${_pair#*:}" in
     *[$'\n\r']*) die "resolved ${_pair%%:*} must not contain newlines — it is written onto a systemd Environment= line" ;;
@@ -216,21 +216,81 @@ bash "$HERE/install-spool-hardening.sh" --state "$DEVMON_STATE" \
 # different ports). That path matches the OWNER location in the fragment below, not the
 # general one, because nginx picks the longest matching prefix. So the echo has to come
 # from the backend — which is also the only place that knows this particular route is
-# the badge's rather than the owner's data. All we do here is name the hosts that count
-# as this box; everything else the backend serves stays same-origin only.
+# the badge's rather than the owner's data.
 #
-# With no measurable FQDN we pass nothing: the backend still recognises its own hostname,
-# so a short-name origin keeps working and the badge degrades instead of breaking.
+# We name the exact ORIGINS, port included. Naming hosts admitted every listener on this
+# box, and one of them — the publish document port — serves generated HTML by the
+# thousand. A script in any published page could then read the owner's message preview:
+# the ingress injects the reader's identity, and an echoed ACAO hands back the response.
+# The document port is therefore absent from this list on purpose. It is the surface
+# whose content is bulk-generated, so it is the one that must not be able to ask.
+#
+# BADGE_APPS is the list from the paragraph above, not "every app with a port". Adding an
+# app here grants its pages the owner's message preview; that is a decision, not upkeep.
+BADGE_APPS="devterm code-server orca paseo"
 FQDN="${AIRLOCK_TS_FQDN:-}"
 # Two statements, not `$(... || true)`: ts_fqdn ends in `die`, and an `exit` inside a
 # command substitution kills the substitution before `|| true` can run. Same trap
 # install/render-nginx.sh documents.
 [ -n "$FQDN" ] || FQDN="$(ts_fqdn 2>/dev/null)" || FQDN=""
-cors_hosts=""
+cors_origins=""
 if [ -n "$FQDN" ]; then
-  cors_hosts="${FQDN},${FQDN%%.*}"
+  # Ports come from the platform's own package-info, so a box that does not install a
+  # tool grants nothing for it, and a re-configured port cannot drift away from reality.
+  #
+  # package-info is exported by install/airlock-install.sh; a standalone app install has
+  # to ask for it. It is the SAME projection either way — one method, so the two entry
+  # points cannot answer differently. An earlier draft re-derived the ports here from
+  # individual config keys and got it wrong twice: it granted `compat_https` even when
+  # that listener is disabled (only serve_port_values knows), and it swallowed lookup
+  # failures into a short list nobody was told about.
+  _pkg_info="${AIRLOCK_PKG_INFO:-}"
+  if [ -z "$_pkg_info" ]; then
+    log "note: package-info absent (standalone app install) — asking airlock-config for it"
+    _pkg_info="$(airlock_config package-info)" \
+      || die "could not read package-info; badge origins are unresolvable"
+  fi
+  # An empty projection would reach the parser as `json.loads("")`, whose message names a
+  # column rather than a cause. Say the cause here instead.
+  [ -n "$_pkg_info" ] || die "package-info was empty; badge origins are unresolvable"
+  cors_origins="$(BADGE_APPS="$BADGE_APPS" FQDN="$FQDN" AIRLOCK_PKG_INFO="$_pkg_info" \
+    python3 - <<'DEVMON_CORS_PY'
+import json, os, sys
+# No `or "{}"`: an empty projection here is a bug upstream, not a quiet empty set.
+info = json.loads(os.environ["AIRLOCK_PKG_INFO"])
+packages = info.get("packages") or {}
+fqdn = os.environ["FQDN"].strip().lower()
+hosts = [fqdn]
+short = fqdn.split(".")[0]
+if short and short != fqdn:
+    hosts.append(short)
+out = []
+for app in os.environ["BADGE_APPS"].split():
+    pkg = packages.get(app)
+    if not pkg:
+        continue                                  # not installed -> grants nothing
+    # BADGE_APPS names the SHIPPED tools. An operator may point [packages.<id>] at a
+    # local tree that takes one of those ids, and that package is not the audited thing
+    # the name refers to — it is whatever is on disk, on whatever port it declares.
+    # Matching by id alone would hand it the owner's message preview by inheritance.
+    if pkg.get("source_class") != "shipped":
+        sys.stderr.write(
+            "skip %s: a local package shadows this id, so it is not the shipped tool "
+            "this grant is for\n" % app)
+        continue
+    for port in sorted(set((pkg.get("serve_port_values") or {}).values())):
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            continue
+        out += ["https://%s:%d" % (h, port) for h in hosts]
+# dict.fromkeys: stable order, not a set shuffle, so the rendered unit is
+# byte-identical across runs and the golden stays meaningful.
+sys.stdout.write(",".join(dict.fromkeys(out)))
+DEVMON_CORS_PY
+)"
+  [ -n "$cors_origins" ] \
+    || log "WARN: no badge-drawing tool is installed — the unread badge stays hub-only"
 else
-  log "WARN: tailnet FQDN unresolved — the unread badge is reachable only from a short-name origin"
+  log "WARN: tailnet FQDN unresolved — the unread badge stays hub-only (no cross-origin read)"
 fi
 
 # --- 0. owner gate + optional message/action console state ---
@@ -365,7 +425,7 @@ if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -z "${AIRLOCK_RENDER_DIR:-}" ]; then
   log "[dry] write $UNIT_DIR/airlock-dev-monitor.service (127.0.0.1:$BACKEND_PORT, messages=$MESSAGES)"
 else
   install -d "$UNIT_DIR"
-  render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_hosts" "$DEVMON_ENV" \
+  render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_origins" "$DEVMON_ENV" \
     "$TOKEN_FRESHNESS" "$TOKEN_WARN_HOURS" "$TOKEN_STALE_HOURS" "$MESSAGES" \
     "$ACCOUNTS_STATUS_BIN" "$AGENT_PROVIDER" "$AGENT_BIN" \
     >"$UNIT_DIR/airlock-dev-monitor.service"

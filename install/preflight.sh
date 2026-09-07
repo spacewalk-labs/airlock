@@ -50,6 +50,69 @@ airlock_preflight_version_ge() {
       && (( 10#$actual_minor >= 10#$expected_minor )); }
 }
 
+airlock_preflight_keyring_pressure() {
+  # Docker/LXC may fail to create a session keyring near the per-UID key quota
+  # and report the misleading text "disk quota exceeded".  The governing
+  # sysctl is host-wide for the container, so this is deliberately diagnostic:
+  # an unprivileged in-container installer must never try to change it.
+  local proc_root="${1:?}" uid="${2:?}" control="kernel.keys.maxkeys"
+  local control_path="$proc_root/sys/kernel/keys/maxkeys"
+  local sysctl_limit usage_pair="" row_uid key_fields=()
+  local used row_limit limit percent map_inside="" map_outside="" map_count=""
+  local namespaced_root=0 uid_description="uid $uid"
+  if [ "$uid" = 0 ] && [ -r "$proc_root/self/uid_map" ]; then
+    IFS=$' \t' read -r map_inside map_outside map_count < "$proc_root/self/uid_map" || true
+    if [[ "$map_inside" = 0 && "$map_outside" =~ ^[1-9][0-9]*$ \
+        && "$map_count" =~ ^[1-9][0-9]*$ ]]; then
+      namespaced_root=1
+      uid_description="uid 0 (mapped host uid $map_outside)"
+    fi
+  fi
+  # Namespace root is an ordinary host UID and consumes maxkeys. Only real
+  # initial-namespace root is governed by root_maxkeys.
+  if [ "$uid" = 0 ] && [ "$namespaced_root" = 0 ] \
+      && [ -r "$proc_root/sys/kernel/keys/root_maxkeys" ]; then
+    control="kernel.keys.root_maxkeys"
+    control_path="$proc_root/sys/kernel/keys/root_maxkeys"
+  fi
+  [ -r "$control_path" ] && [ -r "$proc_root/key-users" ] || return 0
+  IFS= read -r sysctl_limit < "$control_path" || return 0
+  # Do not depend on awk here: this check runs before prerequisite discovery,
+  # including in deliberately minimal bootstrap environments.
+  while IFS=$' \t' read -r -a key_fields; do
+    row_uid="${key_fields[0]:-}"
+    usage_pair="${key_fields[3]:-}"
+    [ "$row_uid" = "$uid:" ] && break
+    usage_pair=""
+  done < "$proc_root/key-users"
+  [ -n "$usage_pair" ] || return 0
+  used="${usage_pair%/*}"; row_limit="${usage_pair#*/}"
+  [[ "$sysctl_limit" =~ ^[1-9][0-9]*$ && "$used" =~ ^[0-9]+$ \
+    && "$row_limit" =~ ^[1-9][0-9]*$ ]] || return 0
+  limit="$sysctl_limit"
+  # qnkeys' displayed denominator follows maxkeys even for host root on some
+  # kernels; root's enforceable quota is root_maxkeys, so only non-root rows
+  # use the smaller displayed bound as a defensive consistency check.
+  if [ "$uid" != 0 ] || [ "$namespaced_root" = 1 ]; then
+    [ "$row_limit" -ge "$limit" ] || limit="$row_limit"
+  fi
+  [ "$used" -le "$limit" ] || used="$limit"
+  # 90% leaves enough warning room before a container start consumes the last
+  # few keys; the observed default-limit failure was 1997/2000.
+  (( used * 100 >= limit * 90 )) || return 0
+  percent=$((used * 100 / limit))
+  log "WARN: kernel key quota for $uid_description is near saturation: $used/$limit (${percent}%; $control=$sysctl_limit). Container startup can fail with 'unable to join session keyring: ... disk quota exceeded'; this is key quota, not disk space. The limit cannot be repaired from inside this container: on its host, raise $control persistently under /etc/sysctl.d/ and apply it with sysctl --system."
+}
+
+airlock_preflight_userns_root_host_uid() {
+  local proc_root="${1:?}" map_inside="" map_outside="" map_count=""
+  [ -r "$proc_root/self/uid_map" ] || return 1
+  IFS=$' \t' read -r map_inside map_outside map_count < "$proc_root/self/uid_map" || return 1
+  [[ "$map_inside" = 0 && "$map_outside" =~ ^[1-9][0-9]*$ \
+    && "$map_count" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$map_outside"
+}
+
 airlock_preflight_bootstrap() {
   local py version
   py="$(airlock_preflight_find python3)" || py=""
@@ -77,6 +140,14 @@ airlock_preflight() {
   [ "$#" -le 1 ] || { log "preflight: invalid invocation"; return 2; }
   [ "$#" -eq 0 ] || [ "${1:-}" = "--quiet" ] \
     || { log "preflight: invalid option: ${1:-}"; return 2; }
+  airlock_preflight_keyring_pressure /proc "$UID"
+  # In an LXC user namespace Docker runs as namespace root, which maps to an
+  # ordinary host subuid and has its own key quota row. Check that consumer as
+  # well as the interactive installer; otherwise a healthy user row masks the
+  # exact quota that prevents Docker from creating a session keyring.
+  if [ "$UID" != 0 ] && airlock_preflight_userns_root_host_uid /proc >/dev/null; then
+    airlock_preflight_keyring_pressure /proc 0
+  fi
   [ -r "$AIRLOCK_PREREQUISITES" ] \
     || { log "preflight: declaration file not readable: $AIRLOCK_PREREQUISITES"; return 2; }
 

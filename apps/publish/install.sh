@@ -209,6 +209,46 @@ else
   mkdir_nginx_path "$SHARE_DIR" no        # user-owned path (e.g. ~/public_html)
 fi
 airlock_run mkdir -p "$UPLOADS_DIR"
+
+# --- shared document assets: <share>/_assets ---------------------------------
+# render.sh serves `location /_assets/` out of this directory because published
+# documents call their stylesheet by ROOT-ABSOLUTE path. The route was added in
+# #299; the directory it aliases was left to the operator, and an unowned piece of
+# wiring grows a different shape on every box. Measured 2026-09-07 across three:
+# a symlink into a permissive home (200), a hand-copied directory (200), and a
+# symlink whose target sat under a 0700 ancestor (403 for every asset, including
+# names that do not exist — the same 403 the identity gate returns, which is what
+# hid the cause). Now the installer owns it.
+#
+# A COPY, not a symlink: nginx runs as another user, so a symlink only works when
+# every ancestor of its target carries o+x. Those ancestors are in someone's home,
+# and widening them is not this installer's call.
+ASSETS_SRC="${AIRLOCK_PUBLISH_ASSETS_DIR:-}"
+ASSETS_SRC="${ASSETS_SRC/#\~/$HOME}"
+if [ -n "$ASSETS_SRC" ]; then
+  [ -d "$ASSETS_SRC" ] || die "publish assets_dir is not a directory: $ASSETS_SRC"
+  assets_dst="$SHARE_DIR/_assets"
+  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+    log "[dry] stage $ASSETS_SRC/. -> $assets_dst (replacing whatever is there)"
+  else
+    assets_tmp="$assets_dst.staging.$$"
+    rm -rf "$assets_tmp"
+    mkdir -p "$assets_tmp"
+    # -L dereferences: the source may itself be a symlink farm, and a copied
+    # symlink would reintroduce exactly the traversal dependency this replaces.
+    cp -aL "$ASSETS_SRC/." "$assets_tmp/"
+    chmod -R a+rX "$assets_tmp"
+    # rm-then-mv, because the old entry may be a symlink, a directory, or absent,
+    # and `mv` onto a symlink writes THROUGH it. The window is one rename wide.
+    rm -rf "$assets_dst"
+    mv "$assets_tmp" "$assets_dst"
+    # Provenance lives outside the served root — everything under share_dir is
+    # reachable by anyone the gate lets in, and this records a host path.
+    airlock_run mkdir -p "$STATE_DIR"
+    printf '%s\n' "$ASSETS_SRC" > "$STATE_DIR/publish-assets-source"
+    log "staged document assets: $ASSETS_SRC -> $assets_dst"
+  fi
+fi
 # local public target: the backend (systemd --user) writes it, nginx only reads.
 # 0755 so the nginx worker can traverse/read regardless of the service umask.
 if [ "$PUBLIC_MODE" = local ]; then

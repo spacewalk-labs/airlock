@@ -639,4 +639,57 @@ else
   bad "ambient AIRLOCK_PREFLIGHT_SBIN_DIRS survived sourcing (got '$out')"
 fi
 
+# Container key quota is a warning, never a mutation or a false disk diagnosis.
+# The fixture exercises both a known-positive saturated UID and a healthy UID
+# through the same parser used for /proc/key-users.
+KEYPROC="$TMP/keyproc"
+mkdir -p "$KEYPROC/sys/kernel/keys" "$KEYPROC/self"
+printf '2000\n' > "$KEYPROC/sys/kernel/keys/maxkeys"
+printf '1000000\n' > "$KEYPROC/sys/kernel/keys/root_maxkeys"
+printf '         0          0 4294967295\n' > "$KEYPROC/self/uid_map"
+cat > "$KEYPROC/key-users" <<'EOF'
+ 1000:  1997 1997/1997 1997/2000 9000/20000
+ 1001:    97 97/97 97/2000 1000/20000
+    0:  950000 950000/950000 950000/2000 9000000/20000000
+EOF
+log() { printf '%s\n' "$*" >&2; }
+key_warn="$(airlock_preflight_keyring_pressure "$KEYPROC" 1000 2>&1)"
+if [[ "$key_warn" == *"1997/2000"* ]] \
+    && [[ "$key_warn" == *"disk quota exceeded"* ]] \
+    && [[ "$key_warn" == *"not disk space"* ]] \
+    && [[ "$key_warn" == *"on its host"*"kernel.keys.maxkeys"*"sysctl --system"* ]]; then
+  ok "keyring pressure warns with the measured quota, true cause, and host-side remedy"
+else
+  bad "keyring pressure warning was incomplete: $key_warn"
+fi
+key_healthy="$(airlock_preflight_keyring_pressure "$KEYPROC" 1001 2>&1)"
+if [ -z "$key_healthy" ]; then
+  ok "healthy keyring quota stays quiet"
+else
+  bad "healthy keyring quota emitted a warning: $key_healthy"
+fi
+key_root="$(airlock_preflight_keyring_pressure "$KEYPROC" 0 2>&1)"
+if [[ "$key_root" == *"950000/1000000"* ]] \
+    && [[ "$key_root" == *"kernel.keys.root_maxkeys=1000000"* ]] \
+    && [[ "$key_root" != *"raise kernel.keys.maxkeys"* ]]; then
+  ok "root keyring pressure uses root_maxkeys and its matching remedy"
+else
+  bad "root keyring pressure used the non-root control: $key_root"
+fi
+printf '         0    1000000 1000000000\n' > "$KEYPROC/self/uid_map"
+cat > "$KEYPROC/key-users" <<'EOF'
+ 1000:    97 97/97 97/2000 1000/20000
+    0:  1997 1997/1997 1997/2000 9000/20000
+EOF
+key_userns_root="$(airlock_preflight_keyring_pressure "$KEYPROC" 0 2>&1)"
+key_mapped_uid="$(airlock_preflight_userns_root_host_uid "$KEYPROC")"
+if [[ "$key_userns_root" == *"uid 0 (mapped host uid 1000000)"* ]] \
+    && [[ "$key_userns_root" == *"1997/2000"* ]] \
+    && [[ "$key_userns_root" == *"kernel.keys.maxkeys=2000"* ]] \
+    && [ "$key_mapped_uid" = 1000000 ]; then
+  ok "LXC namespace root checks the mapped Docker UID against maxkeys"
+else
+  bad "LXC namespace root quota was missed: warning='$key_userns_root' mapped='$key_mapped_uid'"
+fi
+
 echo "---"; echo "passed=$pass failed=$fail"; [ "$fail" -eq 0 ]

@@ -342,6 +342,83 @@ class TestIngest(unittest.TestCase):
         self.assertEqual(self._count('deliveries'), 0)
 
 
+
+class TestCoalesceCadence(unittest.TestCase):
+    """The window an occurrence looks back through is chosen by its severity (2026-09-02)."""
+
+    def setUp(self):
+        fresh_db()
+
+    def _count(self, table):
+        return MSG._conn().execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+
+    def _at(self, when, payload):
+        with unittest.mock.patch.object(MSG, 'now_utc', return_value=when):
+            return MSG.ingest(payload)
+
+    def test_record_coalesces_across_days(self):
+        # The point of the change: a quiet condition restating itself daily is one card, not
+        # one a day. Three days apart is well past the old flat 24h window.
+        t0 = MSG.now_utc()
+        self._at(t0, msg2(event_id='e1', group_key='g', created=MSG.iso(t0)))
+        t1 = t0 + timedelta(days=3)
+        self.assertEqual(
+            self._at(t1, msg2(event_id='e2', group_key='g', created=MSG.iso(t1))), 'coalesced')
+        self.assertEqual(self._count('cards'), 1)
+
+    def test_page_still_gets_a_new_card_the_next_day(self):
+        # A page must NOT inherit the weekly window: the first time something wakes a person
+        # is exactly what may not be folded into an older card.
+        t0 = MSG.now_utc()
+        self._at(t0, msg2(event_id='e1', group_key='g', severity='page', created=MSG.iso(t0)))
+        t1 = t0 + timedelta(hours=25)
+        self.assertEqual(
+            self._at(t1, msg2(event_id='e2', group_key='g', severity='page',
+                              created=MSG.iso(t1))), 'inserted')
+        self.assertEqual(self._count('cards'), 2)
+
+    def test_record_stops_coalescing_past_the_week(self):
+        t0 = MSG.now_utc()
+        self._at(t0, msg2(event_id='e1', group_key='g', created=MSG.iso(t0)))
+        t1 = t0 + timedelta(days=8)
+        self.assertEqual(
+            self._at(t1, msg2(event_id='e2', group_key='g', created=MSG.iso(t1))), 'inserted')
+        self.assertEqual(self._count('cards'), 2)
+
+    def test_a_drained_backlog_coalesces_although_the_payloads_are_old(self):
+        # The regression this pins: six spool files carrying one group_key, written days
+        # earlier and ingested in the same second, became six separate cards. The window
+        # belongs to the ingest clock; filtering on the producer's clock compared two
+        # timelines and put every card outside it.
+        old = MSG.now_utc() - timedelta(days=13)
+        drain = MSG.now_utc()
+        self.assertEqual(
+            self._at(drain, msg2(event_id='e1', group_key='g', created=MSG.iso(old))),
+            'inserted')
+        self.assertEqual(
+            self._at(drain, msg2(event_id='e2', group_key='g',
+                                 created=MSG.iso(old + timedelta(hours=2)))),
+            'coalesced')
+        self.assertEqual(self._count('cards'), 1)
+
+    def test_an_old_page_backlog_coalesces_too(self):
+        # `page` has the short window, so this is the case most likely to regress: the guard
+        # has to be that both payloads ARRIVED together, not that they were written together.
+        old = MSG.now_utc() - timedelta(days=13)
+        drain = MSG.now_utc()
+        self._at(drain, msg2(event_id='e1', group_key='g', severity='page',
+                             created=MSG.iso(old)))
+        self.assertEqual(
+            self._at(drain, msg2(event_id='e2', group_key='g', severity='page',
+                                 created=MSG.iso(old + timedelta(hours=2)))),
+            'coalesced')
+        self.assertEqual(self._count('cards'), 1)
+
+    def test_unknown_severity_falls_back_to_the_daily_default(self):
+        # Ingest must not raise on a cadence lookup for a value validation already accepted.
+        self.assertEqual(MSG.coalesce_window('no-such-severity'), MSG.COALESCE_WINDOW)
+
+
 class TestLaneSchemaMigration(unittest.TestCase):
     def test_additive_migration_backfill_indexes_and_old_inserts(self):
         path = old_lane_db([('slack', 'pending')])
@@ -490,6 +567,18 @@ class TestLaneSchemaMigration(unittest.TestCase):
         owner_status, owner_body = handler._json.call_args.args
         self.assertEqual(owner_status, 404)
         self.assertEqual(owner_body['error'], 'messages feature not enabled')
+        self.assertFalse(handler._json.call_args.kwargs.get('cors', False))
+
+        # messages/preview is the one route a non-owner tailnet viewer (tailnet_view)
+        # legitimately polls cross-origin, so its 404 must be readable too — see
+        # airlock-dev-monitor.py _handle_owner_get / _owner_ready.
+        handler.path = '/api/owner/messages/preview'
+        handler._json.reset_mock()
+        handler.do_GET()
+        preview_status, preview_body = handler._json.call_args.args
+        self.assertEqual(preview_status, 404)
+        self.assertEqual(preview_body['error'], 'messages feature not enabled')
+        self.assertTrue(handler._json.call_args.kwargs.get('cors'))
 
         server = unittest.mock.MagicMock()
         server.__enter__.return_value = server
@@ -4335,10 +4424,12 @@ class FakeHandler:
         self.headers = FakeHeaders(headers)
         self.status = None
         self.payload = None
+        self.cors = None
 
-    def _json(self, status, payload):
+    def _json(self, status, payload, cors=False):
         self.status = status
         self.payload = payload
+        self.cors = cors
 
 
 class TestOwnerGate(unittest.TestCase):
@@ -4401,11 +4492,21 @@ class TestOwnerGate(unittest.TestCase):
         self.assertFalse(devmon_owner.require_owner(h, self.CFG))
         self.assertEqual(h.status, 403)
         self.assertNotIn('error', h.payload)                # zero response-body data
+        self.assertFalse(h.cors)                            # default caller: no cross-origin echo
 
     def test_require_owner_wrong_owner_fails(self):
         h = FakeHandler({'X-Devmon-Proxy-Secret': 's3cr3t',
                          'X-Devmon-Owner': 'attacker@evil.com'})
         self.assertFalse(devmon_owner.require_owner(h, self.CFG))
+
+    def test_require_owner_cors_echoed_on_403_when_requested(self):
+        # messages/preview passes cors=True so a non-owner tailnet viewer (tailnet_view)
+        # gets a readable rejection instead of an opaque CORS failure — see
+        # apps/dev-monitor/backend/airlock-dev-monitor.py _handle_owner_get.
+        h = FakeHandler({'X-Devmon-Owner': 'someone-else@example.test'})
+        self.assertFalse(devmon_owner.require_owner(h, self.CFG, cors=True))
+        self.assertEqual(h.status, 403)
+        self.assertTrue(h.cors)
 
     def test_csrf_good_origin(self):
         h = FakeHandler({'Origin': 'https://monitor.example.test', 'Host': 'monitor.example.test',
