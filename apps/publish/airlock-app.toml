@@ -31,7 +31,14 @@ runtime_env = [
 ]
 
 [config.defaults]
-https_port = 19920
+# The document-view port sits OUTSIDE the 199xx block the rest of this product
+# uses, on purpose: it is the one port a human types or pastes into a chat, so it
+# is chosen to be short and memorable rather than collision-free. The cost is
+# real — 8000 is the most contended port on a dev box, and this installer does
+# NOT probe for a holder before handing the port to `tailscale serve` (publish
+# calls no airlock_handover_user_resource). A box that already runs something on
+# 8000 should set [apps.publish] https_port in its own airlock.toml.
+https_port = 8000
 backend_port = 19922
 gate_port = 19925
 share_dir = "/opt/airlock/share"

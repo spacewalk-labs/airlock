@@ -131,7 +131,7 @@ server {
 }
 
 # ==== Publish dedicated document-view gate ====
-# tailscale serve --https=19920 targets this loopback server.
+# tailscale serve --https=8000 targets this loopback server.
 server {
     listen 127.0.0.1:19925;
     server_name _;

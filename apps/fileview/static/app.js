@@ -100,6 +100,20 @@ function toApiPath(path) {
   if (ROOT === '/') return p;
   return p === ROOT ? '/' : p.slice(ROOT.length);
 }
+// The way back. Every path the API HANDS US is root-relative — the `path` on each
+// listing item is '/.claude', not '/home/josh/.claude' — and the UI speaks absolute
+// everywhere, so the two have to meet at a boundary. This is that boundary's other
+// half: without it a listing's own items are unusable, because feeding '/.claude'
+// back to toApiPath is exactly the "outside home" case it refuses. That is what
+// happened once ROOT stopped being '/' — the root listing painted, and then every
+// expand and every file click threw. Unit tests of the two functions alone cannot
+// see it; the round trip is what tells.
+function fromApiPath(path) {
+  if (ROOT === '/') return String(path);
+  var p = String(path);
+  if (p === '' || p === '/') return ROOT;
+  return ROOT + (p.charAt(0) === '/' ? p : '/' + p);
+}
 /* :TESTABLE */
 
 // ---- STATE ----
@@ -245,7 +259,12 @@ function cacheGet(dirPath) {
   if (!raw) return null;
   try {
     var v = JSON.parse(raw);
-    return (v && Array.isArray(v.items)) ? v : null;
+    if (!v || !Array.isArray(v.items)) return null;
+    // Entries written by a build that stored the API's root-relative paths are
+    // unusable now: painting them puts rows in the tree that throw the moment they
+    // are clicked. Drop them rather than showing a tree that looks fine and is not.
+    if (v.items.length && !underRoot(v.items[0].path)) { store.del(cacheKey(dirPath)); return null; }
+    return v;
   } catch (_) { store.del(cacheKey(dirPath)); return null; }
 }
 var cachedDirs = 0;
@@ -364,6 +383,13 @@ function fetchListing(dirPath, gen) {
     return r.json();
   }).then(function (data) {
     var items = data.items || [];
+    // A retry resolves to items that have already been through here; mapping them
+    // again would prefix ROOT twice. Same guard as the cache write below.
+    if (!data.retried) items = items.map(function (i) {
+      var out = {}; for (var k in i) out[k] = i[k];
+      out.path = fromApiPath(i.path);
+      return out;
+    });
     // The retry already cached under its own call; caching again is harmless but
     // pointless, and skipping it keeps "one write per fetch" true.
     if (!data.retried && (startedAt === undefined || startedAt === paintGen)) cacheSet(dirPath, items);

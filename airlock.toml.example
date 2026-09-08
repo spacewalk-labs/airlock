@@ -171,7 +171,7 @@ font_size    = 15
 filebrowser_port = 19921
 
 [apps.publish]
-https_port = 19920  # dedicated document-view port
+https_port = 8000   # dedicated document-view port (the one port humans paste)
 backend_port = 19922
 gate_port    = 19925  # loopback nginx document gate
 # false (default): owner + collaborators only, matching the hub.

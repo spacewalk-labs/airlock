@@ -33,12 +33,12 @@ function load(root) {
   const context = { ROOT: root };
   vm.runInNewContext(
     region('scope') + region('url') +
-    '\nthis.api = { underRoot, toApiPath, apiUrl, encPath };', context);
+    '\nthis.api = { underRoot, toApiPath, fromApiPath, apiUrl, encPath };', context);
   return context.api;
 }
 
 const HOME = '/home/example';
-const { underRoot, toApiPath, apiUrl } = load(HOME);
+const { underRoot, toApiPath, fromApiPath, apiUrl } = load(HOME);
 
 // --- positive control: the check is alive and says yes to the ordinary case ---
 assert.equal(underRoot(HOME), true, 'home itself is in scope');
@@ -50,6 +50,21 @@ assert.equal(apiUrl('resources', HOME + '/notes/a.md'),
 assert.equal(apiUrl('raw', HOME + '/name with space #1.md', 'algo=none'),
   '/fileview/api/raw/name%20with%20space%20%231.md?algo=none',
   'awkward names still round-trip through the encoder');
+
+// --- the round trip: what the API hands back has to be addressable again ---
+// A listing's items carry root-relative paths ('/.claude'), and the tree stores
+// them as the absolute paths it clicks on later. Translating only one way left the
+// second hop feeding '/.claude' back into toApiPath, which correctly called it
+// out of home — so the root listing painted and then nothing under it opened.
+for (const rel of ['/', '/.claude', '/notes/a.md', '/name with space #1.md']) {
+  const abs = fromApiPath(rel);
+  assert.equal(underRoot(abs), true, 'an API path must land inside home: ' + rel);
+  assert.equal(toApiPath(abs), rel === '/' ? '/' : rel,
+    'API path -> absolute -> API path must round-trip: ' + rel);
+}
+assert.equal(fromApiPath('/.claude'), HOME + '/.claude', 'the prefix is added exactly once');
+assert.doesNotThrow(() => apiUrl('resources', fromApiPath('/.claude')),
+  'expanding a directory straight out of a listing must build a URL');
 
 // --- the refusals ---
 const outside = [
@@ -91,6 +106,7 @@ for (const p of [HOME + '/../../etc/passwd', HOME + '/..', '/etc/../etc/passwd']
   const root = load('/');
   assert.equal(root.underRoot('/etc/passwd'), true, 'unstamped: everything absolute is in scope');
   assert.equal(root.toApiPath('/etc/passwd'), '/etc/passwd', 'unstamped: paths pass through');
+  assert.equal(root.fromApiPath('/etc/passwd'), '/etc/passwd', 'unstamped: and back the same way');
 }
 
 console.log('ok fileview scope: home is the only namespace the client can address');

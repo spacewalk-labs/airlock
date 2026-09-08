@@ -30,7 +30,7 @@
     "publish": {
       "audience": "shared",
       "packaged": true,
-      "port": 19920,
+      "port": 8000,
       "source_class": "shipped",
       "tile": {
         "cat": "docs",
