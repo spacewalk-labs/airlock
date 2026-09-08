@@ -139,6 +139,13 @@ CODEX_USAGE_TTL = 300        # 5 min. The weekly window moves a couple of % per 
 CODEX_USAGE_WAIT = 20        # how long a /codex-usage request waits for a fresh reading
 CODEX_USAGE_RETRY = 30       # retry backoff after a failure — a failure must not buy
                              # itself a full TTL of silence
+CODEX_USAGE_SWEEP = CODEX_USAGE_TTL   # how often the gate refreshes Codex usage with
+                             # nobody watching. Tied to the TTL on purpose: at any
+                             # shorter period the extra spawns buy a value the cache
+                             # already considers fresh, and at any longer one the panel
+                             # opens on "(last value)" and pays the CODEX_USAGE_WAIT.
+                             # The sweep forces its refresh — see _codex_usage_sweeper
+                             # for why equality here needs that to mean what it says.
 # Must be comfortably larger than claude-status's own CODEX_REAP_GRACE (0.5s): that
 # script promotes SIGTERM to SIGKILL itself, and we only step in if it never got there.
 PROBE_KILL_GRACE = 3.0
@@ -2991,6 +2998,42 @@ async def _codex_usage_cached(force=False, wait=False, wait_valued=False,
         return dict(payload, stale=True) if task is not None else dict(payload)
 
 
+async def _codex_usage_sweeper():
+    """Keep the Codex reading moving whether or not anyone has the panel open.
+
+    Every refresh above is demand-driven, so on a box where nobody opened the Codex
+    section the number simply stopped: after one restart the state file did not exist
+    for 7.5 hours. The Claude rows do not have this problem because their collector is
+    a timer that does not care whether anyone is looking. This is that timer, kept
+    inside the gate — the cache, the state file and the auth-generation invalidation
+    then keep their single owner, and periodically kicking the existing path needs no
+    second one.
+
+    `force=True` is required, and the reason is a phase trap. Without it the tick asks
+    `_codex_usage_refresh_due`, which declines while `now - valueAt <= CODEX_USAGE_TTL`.
+    A reading taken at the previous tick lands at `valueAt = tick + probe_duration`, so
+    one sweep period later the age is `SWEEP - probe_duration` — a hair UNDER the TTL,
+    every time. The tick is skipped and the value is only refreshed on the tick after
+    that: the effective interval is 2x the period, and for half of it the panel reads a
+    value the gate itself calls stale. Measured before this was fixed: ticks at
+    1000/1300/1600/1900/2200 produced probes at 1000/1600/2200.
+
+    Forcing costs nothing in rate: the sweeper's own period is the rate limit, and at
+    300s it is far slower than the CODEX_USAGE_RETRY (30s) backoff being bypassed — so
+    a box with a dead Codex login is still probed once per sweep, not more."""
+    while True:
+        try:
+            await _codex_usage_cached(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A sweep is background work: it reports and keeps its schedule rather than
+            # letting one bad reading end the loop for the life of the process.
+            print("devterm-gate: codex usage sweep failed: "
+                  f"{type(exc).__name__}", flush=True)
+        await asyncio.sleep(CODEX_USAGE_SWEEP)
+
+
 async def _serve_codex_usage(headers, cw):
     # The first panel read returns a remembered value immediately. Its one follow-up
     # opts into waiting for the shared refresh task, so it cannot race the 12 s probe
@@ -3348,11 +3391,19 @@ async def main():
     except (NotImplementedError, RuntimeError):
         signal_wait = False
     server = await asyncio.start_server(handle, LISTEN_HOST, LISTEN_PORT)
+    # Started only once the listener is bound. Its first act is a login-generation
+    # read, which is a blocking subprocess; ahead of the bind that would hold the port
+    # closed for the length of its timeout on every restart.
+    # Both binaries are required for a sweep: one reports the login generation, the
+    # other takes the reading. Without them every sweep would be a no-op subprocess.
+    sweeper = (asyncio.create_task(_codex_usage_sweeper())
+               if PLATFORM_ACCOUNTS and CLAUDE_STATUS else None)
     where = ", ".join(str(s.getsockname()) for s in server.sockets)
     print(f"devterm-gate on {where} -> ttyd {TTYD_HOST}:{TTYD_PORT}; web={WEB_ROOT}; "
           f"accounts={_accounts_enabled()}; xai={_xai_enabled()}; "
           f"fileview={FILEVIEW}; orca={bool(ORCA_SHIM)}; "
-          f"secret_cli={bool(PLATFORM_SECRET)}", flush=True)
+          f"secret_cli={bool(PLATFORM_SECRET)}; "
+          f"codex_usage_sweep={CODEX_USAGE_SWEEP if sweeper else 'off'}", flush=True)
     try:
         async with server:
             if signal_wait:
@@ -3360,6 +3411,12 @@ async def main():
             else:
                 await server.serve_forever()
     finally:
+        if sweeper is not None:
+            sweeper.cancel()
+            try:
+                await sweeper
+            except asyncio.CancelledError:
+                pass
         # The unit intentionally uses KillMode=process so Codex device auth survives a
         # redeploy. xAI keeps the old credential during re-login, so its detached poller
         # has the opposite contract: stop the exact tracked group before this gate exits.

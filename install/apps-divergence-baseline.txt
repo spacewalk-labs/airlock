@@ -364,3 +364,13 @@ content	apps/fileview/static/app.js
 #    published copy is behind until the next publish sync, not a designed split.
 #    2026-09-05: synced — airlock-apps#16 merged the same fix, so this path healed and
 #    its entry is gone. The batch is kept for the trail, not for a live split.
+# 20) 2026-09-07 Codex usage sweep: devterm's Codex reading was refreshed only when a
+#    panel asked for it, so on a box where nobody opened the Codex section the number
+#    stopped moving — one observed gate restart left no state file for 7.5 hours. The
+#    gate now sweeps it on the cache TTL, and gained one offline suite for the sweeper's
+#    contract (keeps asking · never passes force · survives a raising reading · lets
+#    CancelledError through). Same shape as batches 1, 13, 14, 16, 17 and 18: work is
+#    the live consumer of apps/ and the published copy is behind until the next publish
+#    sync, not a designed split. devterm-gate.py itself is already content drift in
+#    batch 2 and keeps its kind.
+only-work	apps/devterm/test-codex-usage-sweep.py
