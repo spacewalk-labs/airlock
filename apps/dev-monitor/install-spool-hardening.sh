@@ -104,7 +104,10 @@ if [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
   exit 0
 fi
 
-require_cmd getent id sudo systemctl stat grep cut awk install mktemp mv setpriv
+# coreutils, grep and awk are platform assumptions (install/prerequisites.tsv),
+# while these commands name extra packages or privileged mutation boundaries and
+# therefore must be bound to the preflight receipt.
+require_cmd getent groupadd nft sudo systemctl setpriv useradd
 [ -x "$NFT" ] || die "nft executable is missing"
 [ -x "$USERADD" ] || die "useradd executable is missing"
 [ -x "$GROUPADD" ] || die "groupadd executable is missing"

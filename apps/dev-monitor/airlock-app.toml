@@ -85,6 +85,48 @@ expected = "-"
 fix = "sudo apt-get update && sudo apt-get install -y curl"
 note = "Smoke check"
 
+[[prerequisites]]
+command = "getent"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y libc-bin"
+note = "Writer identity lookup"
+
+[[prerequisites]]
+command = "groupadd"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y passwd"
+note = "Writer group provisioning"
+
+[[prerequisites]]
+command = "nft"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y nftables"
+note = "Writer egress firewall"
+
+[[prerequisites]]
+command = "sudo"
+predicate = "present"
+expected = "-"
+fix = "su -c 'apt-get update && apt-get install -y sudo'"
+note = "Writer boundary provisioning"
+
+[[prerequisites]]
+command = "setpriv"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y util-linux"
+note = "Writer privilege verification"
+
+[[prerequisites]]
+command = "useradd"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y passwd"
+note = "Writer account provisioning"
+
 # Appendix: one user unit, one hub-locations fragment, the dashboard webroot
 # page, and the env file the unit's EnvironmentFile= line reads. The spool
 # (~/.local/state/airlock/dev-monitor/) is retained operator data — never

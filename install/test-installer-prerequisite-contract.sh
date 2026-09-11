@@ -83,6 +83,56 @@ receipt_drift() {
   fi
 }
 
+devmon_receipt_roundtrip() {
+  local b="$TMP/devmon-bin" cfg="$TMP/devmon.toml" receipt="$TMP/devmon.receipt"
+  local cmd found preflight_rc=0 require_rc=0 receipt_ok=1
+  local -a declared=() required=()
+  mkdir -p "$b"
+  cat >"$cfg" <<EOF
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+[apps.dev-monitor]
+messages = true
+EOF
+  AIRLOCK_CONFIG="$cfg"
+  export AIRLOCK_CONFIG
+  AIRLOCK_PKG_INFO="$(airlock_config package-info)" || {
+    bad "devmon-receipt: package-info failed"
+    return
+  }
+  mapfile -t declared < <(airlock_config prereqs | awk -F '\t' \
+    '$1 == "core" || $1 == "dev-monitor" {print $2}' | sort -u)
+  mapfile -t required < <(sed -n 's/^[[:space:]]*require_cmd[[:space:]]\+//p' \
+    "$ROOT/apps/dev-monitor/install-spool-hardening.sh" | tr ' ' '\n' | sort -u)
+  for cmd in "${declared[@]}"; do
+    found="$(type -P "$cmd" 2>/dev/null || true)"
+    if [ -n "$found" ]; then
+      ln -s "$found" "$b/$cmd"
+    else
+      make_exec "$b/$cmd"
+    fi
+  done
+  AIRLOCK_PREFLIGHT_SBIN_DIRS="$b"
+  AIRLOCK_PREREQ_RECEIPT="$receipt"
+  AIRLOCK_PREREQ_CONTEXT="fixture=devmon"
+  (PATH="$b:/usr/bin:/bin"; airlock_preflight --quiet) >/dev/null 2>&1 || preflight_rc=$?
+  AIRLOCK_INSTALL_PKG_INFO_SHA256="$(printf 'c%.0s' {1..64})"
+  (PATH="$b:/usr/bin:/bin"; require_cmd "${required[@]}") \
+    >/dev/null 2>&1 || require_rc=$?
+  for cmd in "${required[@]}"; do
+    grep -q "^${cmd}"$'\t' "$receipt" || receipt_ok=0
+  done
+  unset AIRLOCK_CONFIG AIRLOCK_PKG_INFO AIRLOCK_PREFLIGHT_SBIN_DIRS \
+    AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT AIRLOCK_INSTALL_PKG_INFO_SHA256
+  if [ "$preflight_rc" = 0 ] && [ "$require_rc" = 0 ] && [ "$receipt_ok" = 1 ]; then
+    ok "devmon-receipt: real preflight receipt approves every spool lifecycle command"
+  else
+    bad "devmon-receipt failed (preflight_rc=$preflight_rc require_rc=$require_rc receipt_ok=$receipt_ok)"
+  fi
+}
+
 receipt_roundtrip() {
   local b="$TMP/receipt-bin" receipt="$TMP/roundtrip.receipt" inv="$TMP/prerequisites.tsv"
   mkdir -p "$b"
@@ -124,12 +174,14 @@ case "$case_name" in
   sbin-absent) sbin_absent ;;
   hidden-node) hidden_node ;;
   receipt-drift) receipt_drift ;;
+  devmon-receipt-roundtrip) devmon_receipt_roundtrip ;;
   receipt-roundtrip) receipt_roundtrip ;;
   all)
     sbin_present
     sbin_absent
     hidden_node
     receipt_drift
+    devmon_receipt_roundtrip
     receipt_roundtrip
     ;;
   *) bad "unknown case: $case_name" ;;

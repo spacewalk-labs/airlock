@@ -467,14 +467,14 @@ fi
 
 # Defensive require_cmd declarations may be stricter than the aggregate check,
 # but each command must retain that app as an explicit owner in the inventory.
-discover_installers() {
-  find "$1" -type f -name install.sh -print0
+discover_require_cmd_consumers() {
+  find "$1" -type f -name '*.sh' -print0
 }
 
 drift=0
 drift_checked=0
 INSTALLER_LIST="$TMP/installer-files"
-if discover_installers "$ROOT/apps" >"$INSTALLER_LIST"; then
+if discover_require_cmd_consumers "$ROOT/apps" >"$INSTALLER_LIST"; then
   while IFS= read -r -d '' installer; do
     relative="${installer#"$ROOT/apps/"}"
     owner="${relative%%/*}"
@@ -503,7 +503,7 @@ if awk -F '\t' '$1 == "devterm" && $2 == "definitely-not-declared" { found=1 } E
 else
   ok "require_cmd drift oracle rejects an undeclared command"
 fi
-if discover_installers "$TMP/definitely-not-an-apps-directory" \
+if discover_require_cmd_consumers "$TMP/definitely-not-an-apps-directory" \
   >"$TMP/unexpected-installers" 2>/dev/null; then
   bad "require_cmd discovery oracle accepted a missing tree"
 else
