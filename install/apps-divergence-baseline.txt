@@ -58,6 +58,7 @@ only-work	apps/paseo/browse-host/bin/patch-web-ui.test.js
 #    work-ahead package files, while the three existing backend/test paths are expected
 #    content splits until the next public mirror synchronization.
 only-work	apps/dev-monitor/install-spool-hardening.sh
+only-work	apps/dev-monitor/migration-lifecycle.sh
 only-work	apps/dev-monitor/test-migrate-legacy-state.py
 only-apps	apps/code-server/bin/migrate-legacy-state
 only-apps	apps/code-server/tests/lifecycle.sh

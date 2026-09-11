@@ -232,23 +232,31 @@ no additional launcher or ExecStartPre protection is claimed.
 
 ## Offline database conversion and rollback
 
-An old schema is not converted during service startup. Observation remains
-available and message health reports `off: schema` until offline conversion.
-Do this after stopping the service and producers; never use a live webhook as a
-failure stub.
+An old schema is never converted during service startup. When `messages = true`, the
+installer classifies the database before rendering or restarting the service. A legacy
+database is converted inside that existing lifecycle: the backend and repository-owned
+producer units are stopped and verified, cross-UID spool publishing is fenced, WAL is
+checkpointed, and a private `messages.db.pre-endstate` backup is retained. Conversion is
+performed on a temporary clone; row counts, canonical columns and SQLite integrity must
+pass before the clone atomically replaces the old database. The normal spool hardener and
+service restart then restore the configured runtime. A current database is a no-op, so a
+retry does not create or overwrite another backup.
 
-1. Stop `airlock-dev-monitor.service`. Stop producers and mask their timers,
-   including heartbeat, token freshness and any external publishers. Record their
-   existing enabled/masked state and confirm they are inactive.
-2. From the repository root run
-   `python3 apps/dev-monitor/migrate-legacy-state.py --endstate <state>/messages.db --offline`.
-   It checkpoints WAL, makes a private `messages.db.pre-endstate`, maps an offline
-   temporary file, checks rows/identities/integrity, and atomically replaces the DB.
-   An existing backup is refused. No parallel running DB or feature flag is used.
-3. Compare old `occurrences` with new `ledger` and old/new card counts. Run
-   `python3 apps/dev-monitor/migrate-legacy-state.py --verify <state>/messages.db`.
-4. Start the service, restore the producers' prior timer state, and start one
-   heartbeat. Confirm the card and actual webhook arrival.
+The backup has adjacent private manifest/target receipts used to distinguish a resumable
+failed attempt from an unrelated file. An outer install also keeps one durable migration
+receipt beside its existing package checkpoint; app success does not remove it, and final
+transaction commit removes the checkpoint. On a later nginx/smoke failure or crash retry,
+the outer installer re-fences producers and restores the DB only when the target marker
+proves that the converted database has not received later writes. It records the failed
+transaction and restores the old package only after DB compensation succeeds. The backup
+is retained. A changed DB or failed restore is preserved as degraded state with the old
+incompatible writers stopped and the receipt available for retry. Never use a live webhook
+as a failure stub.
+
+For an explicitly offline maintenance run, stop the service and producers and run
+`python3 apps/dev-monitor/migrate-legacy-state.py --endstate <state>/messages.db --offline`.
+Use `--schema-state <state>/messages.db` for a read-only `legacy`/`canonical`
+classification and `--verify <state>/messages.db` for the canonical row/integrity check.
 
 Every old card and receipt is preserved. Receiptless historical cards do not get
 invented ledger rows. Pending/claimed deliveries become due cards and drain;

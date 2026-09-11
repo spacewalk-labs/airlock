@@ -109,6 +109,21 @@ def main(argv):
               body.count(DEDICATED_TAG) == 3, str(body.count(DEDICATED_TAG)))
         check("전용 포트가 위젯 자체를 서빙한다 — 안 그러면 주입은 404 를 가리킨다",
               "location = /airlock-return.js" in body)
+        manager_get = block(body, "location ~ ^/publish/api/(list|public-list)$")
+        manager_post = block(body, "location ~ ^/publish/api/(publish-public|public-revoke|public-set-expiry)$")
+        check("문서함이 같은 origin 에서 필요한 publish API 만 부른다",
+              manager_get is not None and manager_post is not None)
+        for label, manager_api, method in (("조회", manager_get, "GET"),
+                                           ("외부 공유 변경", manager_post, "POST")):
+            if manager_api:
+                check(f"문서함 {label} API 는 {method}만 받는다",
+                      f"limit_except {method}" in manager_api)
+                check(f"문서함 {label} API 는 tailnet_view 와 무관하게 hub 사용자로 제한한다",
+                      "if ($hub_ok = 0) { return 403; }" in manager_api)
+                check(f"문서함 {label} API 가 검증된 identity 를 백엔드에 전달한다",
+                      "proxy_set_header @@IDENT_HEADER@@ $@@IDENT@@;" in manager_api)
+                check(f"문서함 {label} API 는 publish 백엔드만 가리킨다",
+                      "proxy_pass http://127.0.0.1:@@BACKEND@@;" in manager_api)
         root_listing = block(body, "location = /")
         ordinary_docs = block(body, "location /")
         check("전용 포트 루트는 남은 legacy index.html 대신 실시간 목록을 연다",

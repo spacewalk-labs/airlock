@@ -27,8 +27,10 @@ AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-dev-monitor}"
 . "$HERE/render.sh"
 # shellcheck source=/dev/null
 . "$HERE/secret-check.sh"
+# shellcheck source=/dev/null
+. "$HERE/migration-lifecycle.sh"
 
-require_cmd python3 systemctl journalctl realpath
+require_cmd python3 systemctl journalctl realpath timeout
 
 airlock_load dev-monitor
 BACKEND_PORT="${AIRLOCK_DEV_MONITOR_BACKEND_PORT:?}"
@@ -202,6 +204,139 @@ _devmon_state_parent="$(dirname "$DEVMON_STATE")"
 if [ -d "$_devmon_state_parent" ]; then
   chmod o+x "$_devmon_state_parent" \
     || die "cannot make $_devmon_state_parent traversable for the spool writer"
+fi
+
+# A legacy messages DB cannot be opened by the current backend.  Convert it here, inside
+# the existing install lifecycle, after the platform has deactivated an upgraded package
+# and before this script renders or starts the replacement.  Reinstall plans do not run a
+# deactivator, so this boundary also stops and verifies every in-repository DB writer and
+# producer itself.  The dedicated cross-UID publisher is fenced at the spool directories
+# while the DB snapshot is made; queued files are retained and need no conversion.
+_devmon_migration_state=idle
+_devmon_outer_receipt_durable=0
+
+devmon_migration_finish() {
+  local outcome="$1" rc="${2:-0}" recovery_ready=1
+  [ "$outcome" = success ] || trap - EXIT
+  if [ "$outcome" = failure ] && [ "$_devmon_outer_receipt_durable" = 1 ]; then
+    log "dev-monitor database compensation deferred to the install transaction"
+    exit "$rc"
+  fi
+  if [ "$outcome" = failure ]; then
+    devmon_migration_quiesce || recovery_ready=0
+    if [ "$recovery_ready" = 1 ] && [ "$_devmon_migration_state" = converted ]; then
+      devmon_migration_restore_db unconditional "$DEVMON_DB" \
+        "$HERE/migrate-legacy-state.py" || recovery_ready=0
+    fi
+    [ "$recovery_ready" != 1 ] \
+      || devmon_migration_restore_spool "$DEVMON_STATE" || recovery_ready=0
+    [ "$recovery_ready" != 1 ] \
+      || devmon_migration_start_saved all || recovery_ready=0
+    [ "$recovery_ready" = 1 ] \
+      || log "FATAL: dev-monitor database compensation degraded after installer rc=$rc; legacy backup retained"
+    exit "$rc"
+  fi
+  # Backend and heartbeat are reconciled by the normal install path. Token
+  # freshness is separate, so only its formerly-active units resume here.
+  devmon_migration_start_saved unmanaged \
+    || die "cannot restore previously-active migration units"
+  _devmon_migration_state=idle
+  trap - EXIT
+}
+
+devmon_write_outer_receipt() {
+  local receipt="${AIRLOCK_DEVMON_MIGRATION_RECEIPT:-}"
+  local transaction_id="${AIRLOCK_INSTALL_TRANSACTION_ID:-}" expected
+  [ -n "$receipt$transaction_id" ] || return 0
+  [[ "$transaction_id" =~ ^[0-9a-f]{32}$ ]] \
+    || die "invalid outer install transaction id"
+  expected="${AIRLOCK_STATE_DIR:?outer transaction state is missing}/install-checkpoints/$transaction_id/dev-monitor-migration.json"
+  [ "$receipt" = "$expected" ] \
+    || die "outer dev-monitor migration receipt path does not match its transaction"
+  python3 - "$receipt" "$transaction_id" "$DEVMON_DB" "$SPOOL_WRITER_USER" \
+    "$DEVMON_MIGRATION_TMP_MODE" "$DEVMON_MIGRATION_NEW_MODE" \
+    "${DEVMON_MIGRATION_ACTIVE[@]}" <<'PY' \
+    || die "cannot persist outer dev-monitor migration receipt"
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+transaction_id, database, writer, tmp_mode, new_mode = sys.argv[2:7]
+if path.is_symlink() or path.exists():
+    raise SystemExit('migration receipt already exists')
+if path.parent.is_symlink() or not path.parent.is_dir():
+    raise SystemExit('migration checkpoint directory is unsafe')
+payload = {
+    'version': 1,
+    'transaction_id': transaction_id,
+    'database': database,
+    'writer_user': writer,
+    'spool_modes': {
+        'tmp': None if tmp_mode == '-' else tmp_mode,
+        'new': None if new_mode == '-' else new_mode,
+    },
+    'active_units': sys.argv[7:],
+}
+fd, raw = tempfile.mkstemp(prefix='.dev-monitor-migration.', dir=path.parent)
+temp = Path(raw)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write('\n')
+        handle.flush()
+        os.fchmod(handle.fileno(), 0o600)
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    if temp.exists():
+        temp.unlink()
+PY
+  _devmon_outer_receipt_durable=1
+}
+
+DEVMON_DB="$DEVMON_STATE/messages.db"
+if [ "$MESSAGES" = true ] && { [ -e "$DEVMON_DB" ] || [ -L "$DEVMON_DB" ]; }; then
+  _devmon_schema="$(python3 "$HERE/migrate-legacy-state.py" --schema-state "$DEVMON_DB")" \
+    || die "cannot classify the existing messages database"
+  case "$_devmon_schema" in
+    canonical) log "messages database already uses the current schema" ;;
+    legacy)
+      if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+        log "[dry] would quiesce dev-monitor writers/producers and convert the legacy messages database"
+      else
+        # Record the pre-migration state before the first mutation. A standalone app
+        # keeps it in memory; the outer transaction persists the same facts beside its
+        # package checkpoint so a crash or a later nginx/smoke failure can compensate.
+        devmon_migration_snapshot "$DEVMON_STATE" \
+          || die "cannot inspect DB writers, producers, or spool lanes"
+        _devmon_migration_state=quiesced
+        trap 'devmon_migration_finish failure $?' EXIT
+        devmon_write_outer_receipt
+
+        devmon_migration_quiesce \
+          || die "cannot stop and verify DB writers or spool producers"
+        # The identity check closes the receipt-write interval without another walk.
+        devmon_migration_fence "$DEVMON_STATE" "$SPOOL_WRITER_USER" true \
+          || die "cannot fence and verify cross-UID spool publishing"
+
+        _devmon_conversion_receipt="$(python3 "$HERE/migrate-legacy-state.py" \
+          --endstate "$DEVMON_DB" --offline)" \
+          || die "legacy messages database conversion failed; original/backup retained"
+        [ "$_devmon_conversion_receipt" = 'converted=1 backup_retained=1' ] \
+          || die "legacy messages database conversion returned no completion receipt"
+        _devmon_migration_state=converted
+      fi
+      ;;
+    *) die "unknown messages database schema classification" ;;
+  esac
 fi
 
 # Establish (or remove, when messages=false) the system-scope writer boundary before
@@ -505,4 +640,5 @@ render_dev_monitor_nginx "$BACKEND_PORT" "$updates_location" "$owner_location" >
 log "wrote nginx fragment: $frag"
 
 # NOTE: smoke runs from the orchestrator AFTER nginx reload (gate not live before).
+devmon_migration_finish success
 log "dev-monitor installed (owner: ${AIRLOCK_OWNER}; messages: ${MESSAGES})"

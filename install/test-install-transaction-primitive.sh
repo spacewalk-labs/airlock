@@ -22,12 +22,35 @@ setup_case() {
   SHIM="$TMP/$name/shim"
   mkdir -p "$STATE" "$WEB/app/tree" "$CONFD/servers.d" "$UU" "$US" \
     "$FAKEHOME/files" "$ETC" "$OPT" "$SHIM" "$CASE/pkg"
+  chmod 700 "$STATE"
   export AIRLOCK_STATE_DIR="$STATE" AIRLOCK_WEBROOT="$WEB" AIRLOCK_CONFD="$CONFD"
   export AIRLOCK_UNIT_DIR_USER="$UU" AIRLOCK_UNIT_DIR_SYSTEM="$US"
   export AIRLOCK_PLATFORM_ETC="$ETC" AIRLOCK_PLATFORM_OPT="$OPT" HOME="$FAKEHOME"
+  export AIRLOCK_TEST_CASE="$CASE" AIRLOCK_TEST_LEDGER="$ROOT/bin/airlock-ledger"
+  unset AIRLOCK_TEST_PRIVILEGED_PATH AIRLOCK_TEST_SUDO_DENY
   export AIRLOCK_CONFIG_SNAPSHOT_SHA256="$(printf 'a%.0s' {1..64})"
   export AIRLOCK_INSTALL_PKG_INFO_SHA256="$(printf 'b%.0s' {1..64})"
-  printf '#!/usr/bin/env bash\nexec "$@"\n' > "$SHIM/sudo"
+  cat > "$SHIM/sudo" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AIRLOCK_TEST_CASE/sudo.log"
+if [ "${1:-}" = "$AIRLOCK_TEST_LEDGER" ] \
+    && [ "${2:-}" = _checkpoint-helper ] \
+    && [ "${3:-}" = archive ] \
+    && [ "${8:-}" = "${AIRLOCK_TEST_PRIVILEGED_PATH:-}" ]; then
+  [ "${AIRLOCK_TEST_SUDO_DENY:-0}" != 1 ] || exit 77
+  if [ -e "$8" ]; then
+    mode="$(stat -c %a -- "$8")" || exit
+    if [ -d "$8" ]; then chmod 700 -- "$8"; else chmod 600 -- "$8"; fi
+  else
+    mode=""
+  fi
+  "$@"
+  rc=$?
+  [ -z "$mode" ] || chmod "$mode" -- "$8"
+  exit "$rc"
+fi
+exec "$@"
+STUB
   cat > "$SHIM/systemctl" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$CASE/systemctl.log"
@@ -82,12 +105,125 @@ record = {
 with open(ledger, "w", encoding="utf-8") as fh:
     json.dump({"version": 6, "entries": {"fixture": {"committed": record}}, "events": []}, fh)
 PY
+  chmod 600 "$STATE/app-ledger.json"
 }
 
 begin_fixture() {
   "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture >/dev/null
   "$ROOT/bin/airlock-ledger" transaction-touch fixture
   "$ROOT/bin/airlock-ledger" transaction-deactivated fixture
+}
+
+checkpoint_archive_for_path() {
+  python3 - "$STATE/install-transaction.json" "$1" "$STATE/install-checkpoints" <<'PY'
+import json, os, sys
+transaction, wanted, root = sys.argv[1:]
+value = json.load(open(transaction, encoding="utf-8"))
+for checkpoint in value["checkpoints"].values():
+    for item in checkpoint["artifacts"]:
+        if item["path"] == wanted:
+            print(os.path.join(root, value["id"], item["archive"]))
+            raise SystemExit
+raise SystemExit(f"no checkpoint receipt for {wanted}")
+PY
+}
+
+direct_read_fails() {
+  ! python3 - "$1" 2>/dev/null <<'PY'
+import sys
+with open(sys.argv[1], "rb") as fh:
+    fh.read(1)
+PY
+}
+
+make_socket() {
+  python3 - "$1" <<'PY'
+import socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
+}
+
+containerize_fixture() {
+  local runtime="$FAKEHOME/files/runtime"
+  AIRLOCK_TEST_CONTAINER_ID="$(printf 'd%.0s' {1..64})"
+  export AIRLOCK_TEST_CONTAINER_ID
+  export AIRLOCK_TEST_CONTAINER_NONCE="fixture_nonce_0001"
+  export AIRLOCK_TEST_CONTAINER_NAME="airlock-fixture-old"
+  mkdir -p "$runtime/sockets"
+  printf 'runtime-v1\n' > "$runtime/state"
+  make_socket "$runtime/sockets/fpm.sock"
+  python3 - "$STATE/app-ledger.json" "$runtime" \
+    "$AIRLOCK_TEST_CONTAINER_ID" "$AIRLOCK_TEST_CONTAINER_NONCE" \
+    "$AIRLOCK_TEST_CONTAINER_NAME" <<'PY'
+import json, sys
+ledger, runtime, object_id, nonce, name = sys.argv[1:]
+value = json.load(open(ledger, encoding="utf-8"))
+record = value["entries"]["fixture"]["committed"]
+record["artifacts"]["files"] = [runtime]
+record["container_runtime"] = {
+    "runtime": "docker", "daemon_identity": "docker:fixture-daemon",
+    "install_nonce": nonce, "declarations": ["airlock-fixture-*"],
+    "objects": [{"id": object_id, "name": name}],
+}
+with open(ledger, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PY
+  cat > "$SHIM/docker" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AIRLOCK_TEST_CASE/docker.log"
+case "${1:-}" in
+  info)
+    [ "${2:-}" != --format ] || printf '%s\n' fixture-daemon
+    exit 0
+    ;;
+  ps)
+    printf '%s\n' "$AIRLOCK_TEST_CONTAINER_ID"
+    exit 0
+    ;;
+  inspect)
+    [ "${2:-}" = "$AIRLOCK_TEST_CONTAINER_ID" ] || exit 91
+    printf '[{"Id":"%s","Name":"/%s","Config":{"Labels":{"io.airlock.package":"fixture","io.airlock.install-nonce":"%s"}}}]\n' \
+      "$AIRLOCK_TEST_CONTAINER_ID" "$AIRLOCK_TEST_CONTAINER_NAME" \
+      "$AIRLOCK_TEST_CONTAINER_NONCE"
+    exit 0
+    ;;
+esac
+exit 91
+STUB
+  chmod +x "$SHIM/docker"
+}
+
+add_transient_intent() {
+  python3 - "$STATE/app-ledger.json" <<'PY'
+import copy, json, sys
+ledger = sys.argv[1]
+value = json.load(open(ledger, encoding="utf-8"))
+committed = value["entries"]["fixture"]["committed"]
+runtime = committed["container_runtime"]
+value["entries"]["fixture"]["intent"] = {
+    "path": committed["path"], "digest": committed["digest"],
+    "artifacts_declared": {
+        "units": ["airlock-fixture.service"],
+        "fragments": ["servers.d/fixture.conf"],
+        "webroot": ["app/tree"],
+        "files": ["~/files/runtime"],
+        "rooted": [committed["artifacts"]["rooted"][0]],
+        "serve_ports": ["https_port"],
+    },
+    "serve_port_values": {"https_port": 19443},
+    "lifecycle": copy.deepcopy(committed["lifecycle"]),
+    "roots": copy.deepcopy(committed["roots"]), "deps": [], "anchors": {},
+    "serve_mappings": copy.deepcopy(committed["serve_mappings"]),
+    "unit_scopes": {"airlock-fixture.service": "user"}, "order": 1,
+    "source_class": "shipped", "capabilities": copy.deepcopy(committed["capabilities"]),
+    "container_runtime": {key: copy.deepcopy(runtime[key]) for key in
+                          ("runtime", "daemon_identity", "install_nonce", "declarations")},
+}
+with open(ledger, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PY
 }
 
 mutate_fixture() {
@@ -113,9 +249,11 @@ roundtrip() {
       && grep -qx web-v1 "$WEB/app/tree/index.html" \
       && [ "$link" = "$FAKEHOME/files/target" ] \
       && grep -qx rooted-v1 "$ETC/fixture.conf" && [ "$mode" = 640 ] \
+      && grep -Fqx "$ROOT/bin/airlock-ledger _checkpoint-helper archive fixture rooted - $STATE $ETC/fixture.conf" \
+        "$CASE/sudo.log" \
       && grep -q 'enable airlock-fixture.service' "$CASE/systemctl.log" \
       && grep -q -- '--https=19443 http://127.0.0.1:19444' "$CASE/tailscale.log"; then
-    ok "roundtrip: units/fragments/webroot/files/symlink/rooted/mode/unit state/mapping restore"
+    ok "roundtrip: rooted class selects sudo; all bytes/modes/unit state/mapping restore"
   else
     bad "roundtrip: restore oracle failed (rc=$rc phase=${phase:-none} link=${link:-none} mode=${mode:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
   fi
@@ -141,10 +279,12 @@ corrupt() {
 permission_denied() {
   setup_case permission
   chmod 000 "$WEB/app/tree/index.html"
-  "$ROOT/bin/airlock-ledger" transaction-begin fixture >/dev/null 2>&1
+  "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1
   local rc=$?
   chmod 0644 "$WEB/app/tree/index.html"
   if [ "$rc" != 0 ] && [ ! -e "$STATE/install-transaction.json" ] \
+      && grep -q 'checkpoint artifact is unreadable' "$CASE/checkpoint.log" \
       && grep -qx web-v1 "$WEB/app/tree/index.html"; then
     ok "permission: unreadable artifact refuses checkpoint before transaction publication"
   else
@@ -155,9 +295,12 @@ permission_denied() {
 space_denied() {
   setup_case space
   dd if=/dev/zero of="$WEB/app/tree/large" bs=4096 count=1 status=none
-  (ulimit -f 1; "$ROOT/bin/airlock-ledger" transaction-begin fixture >/dev/null 2>&1)
+  (ulimit -f 1; "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1)
   local rc=$?
   if [ "$rc" != 0 ] && [ ! -e "$STATE/install-transaction.json" ] \
+      && grep -Eq 'File too large|File size limit exceeded|cannot create checkpoint archive' \
+        "$CASE/checkpoint.log" \
       && grep -qx web-v1 "$WEB/app/tree/index.html"; then
     ok "space: archive write limit refuses checkpoint before mutation"
   else
@@ -169,13 +312,315 @@ symlink_redirect() {
   setup_case redirect
   mv "$CONFD/servers.d" "$CONFD/real-servers.d"
   ln -s "$CONFD/real-servers.d" "$CONFD/servers.d"
-  "$ROOT/bin/airlock-ledger" transaction-begin fixture >/dev/null 2>&1
+  "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1
   local rc=$?
   if [ "$rc" != 0 ] && [ ! -e "$STATE/install-transaction.json" ] \
+      && grep -q 'is now a symlink' "$CASE/checkpoint.log" \
       && grep -qx fragment-v1 "$CONFD/real-servers.d/fixture.conf"; then
     ok "symlink-redirect: existing containment gate refuses redirected ancestor"
   else
     bad "symlink-redirect: checkpoint did not fail closed (rc=$rc)"
+  fi
+}
+
+privileged_redirect() {
+  setup_case privileged-redirect
+  mkdir -p "$OPT/real-tree"
+  printf 'redirected\n' > "$OPT/real-tree/file"
+  ln -s "$OPT/real-tree" "$OPT/link-tree"
+  python3 - "$STATE/app-ledger.json" "$OPT/link-tree/file" <<'PY'
+import json, sys
+ledger, path = sys.argv[1:]
+value = json.load(open(ledger, encoding="utf-8"))
+value["entries"]["fixture"]["committed"]["artifacts"]["rooted"] = [path]
+with open(ledger, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PY
+  export AIRLOCK_TEST_PRIVILEGED_PATH="$OPT/link-tree/file"
+  # The caller intentionally owns the output file; sudo only reads the source.
+  # shellcheck disable=SC2024
+  sudo "$ROOT/bin/airlock-ledger" _checkpoint-helper archive \
+    fixture rooted - "$STATE" "$OPT/link-tree/file" \
+    >"$CASE/archive.tar" 2>"$CASE/checkpoint.log"
+  local rc=$?
+  if [ "$rc" != 0 ] && grep -q 'redirected' "$CASE/checkpoint.log"; then
+    ok "privileged-redirect: sudo helper refuses a redirected ancestor"
+  else
+    bad "privileged-redirect: helper followed a redirected ancestor (rc=$rc); $(tr '\n' ';' < "$CASE/checkpoint.log")"
+  fi
+}
+
+privileged_file() {
+  setup_case privileged-file
+  chmod 000 "$ETC/fixture.conf"
+  export AIRLOCK_TEST_PRIVILEGED_PATH="$ETC/fixture.conf"
+  direct_read_fails "$ETC/fixture.conf" || {
+    bad "privileged-file: fixture is readable without sudo"
+    return
+  }
+  "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1
+  local rc=$? archive=""
+  archive="$(checkpoint_archive_for_path "$ETC/fixture.conf" 2>/dev/null || true)"
+  if [ "$rc" = 0 ] && [ -n "$archive" ] \
+      && tar -xOf "$archive" payload 2>/dev/null | grep -qx rooted-v1 \
+      && grep -Fqx "$ROOT/bin/airlock-ledger _checkpoint-helper archive fixture rooted - $STATE $ETC/fixture.conf" \
+        "$CASE/sudo.log"; then
+    ok "privileged-file: unreadable rooted artifact is checkpointed through the sudo helper"
+  else
+    bad "privileged-file: checkpoint failed or bypassed sudo (rc=$rc); $(tr '\n' ';' < "$CASE/checkpoint.log")"
+  fi
+}
+
+privileged_directory() {
+  setup_case privileged-directory
+  mkdir -p "$OPT/private-tree"
+  printf 'private-child\n' > "$OPT/private-tree/child"
+  python3 - "$STATE/app-ledger.json" "$OPT/private-tree" <<'PY'
+import json, sys
+path, rooted = sys.argv[1:]
+value = json.load(open(path, encoding="utf-8"))
+value["entries"]["fixture"]["committed"]["artifacts"]["rooted"] = [rooted]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PY
+  chmod 000 "$OPT/private-tree"
+  export AIRLOCK_TEST_PRIVILEGED_PATH="$OPT/private-tree"
+  if python3 - "$OPT/private-tree" 2>/dev/null <<'PY'
+import os, sys
+next(os.scandir(sys.argv[1]), None)
+PY
+  then
+    bad "privileged-directory: fixture can be enumerated without sudo"
+    return
+  fi
+  "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1
+  local rc=$? archive=""
+  archive="$(checkpoint_archive_for_path "$OPT/private-tree" 2>/dev/null || true)"
+  if [ "$rc" = 0 ] && [ -n "$archive" ] \
+      && tar -xOf "$archive" payload/child 2>/dev/null | grep -qx private-child \
+      && grep -Fqx "$ROOT/bin/airlock-ledger _checkpoint-helper archive fixture rooted - $STATE $OPT/private-tree" \
+        "$CASE/sudo.log"; then
+    ok "privileged-directory: unreadable rooted directory is enumerated through the sudo helper"
+  else
+    bad "privileged-directory: checkpoint failed or bypassed sudo (rc=$rc); $(tr '\n' ';' < "$CASE/checkpoint.log")"
+  fi
+}
+
+privileged_system_unit() {
+  setup_case privileged-system-unit
+  mv "$UU/airlock-fixture.service" "$US/airlock-fixture.service"
+  python3 - "$STATE/app-ledger.json" "$US/airlock-fixture.service" <<'PY'
+import json, sys
+path, unit = sys.argv[1:]
+value = json.load(open(path, encoding="utf-8"))
+record = value["entries"]["fixture"]["committed"]
+record["artifacts"]["units"] = [unit]
+record["unit_scopes"] = {"airlock-fixture.service": "system"}
+record["capabilities"].append("system-unit")
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PY
+  chmod 000 "$US/airlock-fixture.service"
+  export AIRLOCK_TEST_PRIVILEGED_PATH="$US/airlock-fixture.service"
+  direct_read_fails "$US/airlock-fixture.service" || {
+    bad "privileged-system-unit: fixture is readable without sudo"
+    return
+  }
+  "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1
+  local rc=$? archive=""
+  archive="$(checkpoint_archive_for_path "$US/airlock-fixture.service" 2>/dev/null || true)"
+  if [ "$rc" = 0 ] && [ -n "$archive" ] \
+      && tar -xOf "$archive" payload 2>/dev/null | grep -qx unit-v1 \
+      && grep -Fqx "$ROOT/bin/airlock-ledger _checkpoint-helper archive fixture units system $STATE $US/airlock-fixture.service" \
+        "$CASE/sudo.log"; then
+    ok "privileged-system-unit: unreadable system unit is checkpointed through sudo"
+  else
+    bad "privileged-system-unit: checkpoint failed or bypassed sudo (rc=$rc); $(tr '\n' ';' < "$CASE/checkpoint.log")"
+  fi
+}
+
+privileged_denied() {
+  setup_case privileged-denied
+  chmod 000 "$ETC/fixture.conf"
+  export AIRLOCK_TEST_PRIVILEGED_PATH="$ETC/fixture.conf" AIRLOCK_TEST_SUDO_DENY=1
+  "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1
+  local rc=$?
+  if [ "$rc" != 0 ] && [ ! -e "$STATE/install-transaction.json" ] \
+      && grep -q 'sudo could not capture checkpoint artifact' "$CASE/checkpoint.log"; then
+    ok "privileged-denied: sudo read failure refuses checkpoint"
+  else
+    bad "privileged-denied: checkpoint did not fail closed (rc=$rc); $(tr '\n' ';' < "$CASE/checkpoint.log")"
+  fi
+}
+
+missing_recorded() {
+  setup_case missing-recorded
+  rm -f "$ETC/fixture.conf"
+  "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1
+  local rc=$?
+  if [ "$rc" != 0 ] && [ ! -e "$STATE/install-transaction.json" ] \
+      && grep -q 'checkpoint artifact is missing' "$CASE/checkpoint.log"; then
+    ok "missing-recorded: absent committed artifact refuses checkpoint"
+  else
+    bad "missing-recorded: absence was accepted or misclassified (rc=$rc); $(tr '\n' ';' < "$CASE/checkpoint.log")"
+  fi
+}
+
+privileged_arbitrary_path() {
+  setup_case privileged-arbitrary
+  printf 'not-recorded\n' > "$OPT/not-recorded"
+  export AIRLOCK_TEST_PRIVILEGED_PATH="$OPT/not-recorded"
+  # The caller intentionally owns the output file; sudo only reads the source.
+  # shellcheck disable=SC2024
+  sudo "$ROOT/bin/airlock-ledger" _checkpoint-helper archive \
+    fixture rooted - "$STATE" "$OPT/not-recorded" \
+    >"$CASE/archive.tar" 2>"$CASE/checkpoint.log"
+  local rc=$?
+  if [ "$rc" != 0 ] \
+      && grep -q 'not an exact committed artifact' "$CASE/checkpoint.log"; then
+    ok "privileged-arbitrary: sudo helper refuses a path absent from the committed class"
+  else
+    bad "privileged-arbitrary: helper accepted an uncommitted path (rc=$rc)"
+  fi
+}
+
+top_level_socket() {
+  setup_case top-level-socket
+  rm -f "$FAKEHOME/files/link"
+  make_socket "$FAKEHOME/files/link"
+  "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture \
+    >"$CASE/checkpoint.log" 2>&1
+  local rc=$?
+  if [ "$rc" != 0 ] && [ ! -e "$STATE/install-transaction.json" ] \
+      && grep -q 'top-level Unix socket' "$CASE/checkpoint.log"; then
+    ok "top-level-socket: a socket declared directly remains unsupported"
+  else
+    bad "top-level-socket: direct socket was accepted (rc=$rc)"
+  fi
+}
+
+unsupported_special() {
+  setup_case unsupported-special
+  mkfifo "$WEB/app/tree/live.fifo"
+  python3 - "$ROOT/bin/airlock-ledger" "$WEB/app/tree" "$CASE" <<'PY' \
+    >"$CASE/checkpoint.log" 2>&1
+import pathlib, runpy, sys, tarfile
+ledger_path, fifo_tree, output = sys.argv[1:]
+ledger = runpy.run_path(ledger_path)
+cases = (("descendant FIFO", fifo_tree), ("device node", "/dev/null"))
+for index, (label, source) in enumerate(cases):
+    try:
+        with tarfile.open(pathlib.Path(output) / f"special-{index}.tar", "x") as bundle:
+            ledger["_capture_checkpoint_tree"](bundle, source, privileged=True)
+    except ledger["LedgerError"] as exc:
+        if "unsupported checkpoint artifact type" in str(exc):
+            continue
+        print(f"{label}: wrong refusal: {exc}")
+    else:
+        print(f"{label}: accepted")
+    raise SystemExit(23)
+PY
+  local rc=$?
+  if [ "$rc" = 0 ]; then
+    ok "unsupported-special: descendant FIFO and device node remain refused by one type guard"
+  else
+    bad "unsupported-special: FIFO/device table found an unguarded type (rc=$rc); $(tr '\n' ';' < "$CASE/checkpoint.log")"
+  fi
+}
+
+container_intact_after_intent() {
+  setup_case container-intact
+  containerize_fixture
+  local socket_before
+  socket_before="$(stat -c '%d:%i' "$FAKEHOME/files/runtime/sockets/fpm.sock")"
+  "$ROOT/bin/airlock-ledger" transaction-begin reinstall:fixture \
+    >"$CASE/checkpoint.log" 2>&1 || {
+      bad "container-intact: checkpoint creation failed; $(tr '\n' ';' < "$CASE/checkpoint.log")"
+      return
+    }
+  local receipt
+  receipt="$("$ROOT/bin/airlock-ledger" transaction-show | python3 -c \
+    'import json,sys; tx=json.load(sys.stdin); print(tx["checkpoints"]["fixture"]["artifacts"][3]["ephemeral_sockets"][0])' \
+    2>/dev/null || true)"
+  "$ROOT/bin/airlock-ledger" transaction-touch fixture
+  add_transient_intent
+  "$ROOT/bin/airlock-ledger" transaction-fail install fixture
+  "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/restore.log" 2>&1
+  local rc=$? phase intent_present committed_id
+  phase="$("$ROOT/bin/airlock-ledger" transaction-show | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')"
+  read -r intent_present committed_id < <(python3 - "$STATE/app-ledger.json" <<'PY'
+import json, sys
+entry=json.load(open(sys.argv[1],encoding="utf-8"))["entries"]["fixture"]
+print("yes" if "intent" in entry else "no", entry["committed"]["container_runtime"]["objects"][0]["id"])
+PY
+)
+  if [ "$rc" = 0 ] && [ "$phase" = rolled_back ] \
+      && [ "$receipt" = sockets/fpm.sock ] && [ -S "$FAKEHOME/files/runtime/sockets/fpm.sock" ] \
+      && [ "$(stat -c '%d:%i' "$FAKEHOME/files/runtime/sockets/fpm.sock")" = "$socket_before" ] \
+      && [ "$intent_present" = no ] && [ "$committed_id" = "$AIRLOCK_TEST_CONTAINER_ID" ] \
+      && ! grep -Eq '^(rm|stop|kill) ' "$CASE/docker.log"; then
+    ok "container-intact: transient intent rollback preserves exact old container and socket"
+  else
+    bad "container-intact: intact fast path failed (rc=$rc phase=${phase:-none} receipt=${receipt:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
+  fi
+}
+
+container_regular_changed() {
+  setup_case container-changed
+  containerize_fixture
+  "$ROOT/bin/airlock-ledger" transaction-begin reinstall:fixture \
+    >"$CASE/checkpoint.log" 2>&1 || {
+      bad "container-changed: checkpoint creation failed; $(tr '\n' ';' < "$CASE/checkpoint.log")"
+      return
+    }
+  "$ROOT/bin/airlock-ledger" transaction-touch fixture
+  add_transient_intent
+  printf 'runtime-v2\n' > "$FAKEHOME/files/runtime/state"
+  "$ROOT/bin/airlock-ledger" transaction-fail install fixture
+  "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/restore.log" 2>&1
+  local rc=$? phase
+  phase="$("$ROOT/bin/airlock-ledger" transaction-show | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')"
+  if [ "$rc" != 0 ] && [ "$phase" = degraded ] \
+      && grep -qx runtime-v2 "$FAKEHOME/files/runtime/state" \
+      && [ -S "$FAKEHOME/files/runtime/sockets/fpm.sock" ] \
+      && grep -q 'existing runtime was preserved for manual recovery' "$CASE/restore.log" \
+      && ! grep -Eq '^(rm|stop|kill) ' "$CASE/docker.log"; then
+    ok "container-changed: non-socket drift degrades before destroying old runtime"
+  else
+    bad "container-changed: drift was reported as restored or runtime was touched (rc=$rc phase=${phase:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
+  fi
+}
+
+container_identity_changed() {
+  setup_case container-identity-changed
+  containerize_fixture
+  "$ROOT/bin/airlock-ledger" transaction-begin reinstall:fixture \
+    >"$CASE/checkpoint.log" 2>&1 || {
+      bad "container-identity-changed: checkpoint creation failed; $(tr '\n' ';' < "$CASE/checkpoint.log")"
+      return
+    }
+  "$ROOT/bin/airlock-ledger" transaction-touch fixture
+  add_transient_intent
+  AIRLOCK_TEST_CONTAINER_ID="$(printf 'e%.0s' {1..64})"
+  export AIRLOCK_TEST_CONTAINER_ID
+  "$ROOT/bin/airlock-ledger" transaction-fail install fixture
+  "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/restore.log" 2>&1
+  local rc=$? phase
+  phase="$("$ROOT/bin/airlock-ledger" transaction-show | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')"
+  if [ "$rc" != 0 ] && [ "$phase" = degraded ] \
+      && grep -qx runtime-v1 "$FAKEHOME/files/runtime/state" \
+      && [ -S "$FAKEHOME/files/runtime/sockets/fpm.sock" ] \
+      && grep -q 'existing runtime was preserved for manual recovery' "$CASE/restore.log" \
+      && ! grep -Eq '^(rm|stop|kill) ' "$CASE/docker.log"; then
+    ok "container-identity-changed: exact ID mismatch degrades before runtime teardown"
+  else
+    bad "container-identity-changed: mismatch touched runtime or claimed restore (rc=$rc phase=${phase:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
   fi
 }
 
@@ -198,17 +643,40 @@ crash_reenter() {
   setup_case crash
   begin_fixture || { bad "crash-reenter: checkpoint creation failed"; return; }
   mutate_fixture
-  # A new process, with no shell-local state, consumes only the durable record.
+  "$ROOT/bin/airlock-ledger" transaction-fail install fixture
+  local failed_phase failed_error degraded_commit_rc degraded_touch_rc
+  read -r failed_phase failed_error < <(
+    "$ROOT/bin/airlock-ledger" transaction-show | python3 -c \
+      'import json,sys; tx=json.load(sys.stdin); print(tx["phase"], tx["error"]["phase"])')
+  "$ROOT/bin/airlock-ledger" transaction-finish committed \
+    >"$CASE/degraded-commit.log" 2>&1
+  degraded_commit_rc=$?
+  "$ROOT/bin/airlock-ledger" transaction-touch fixture \
+    >"$CASE/degraded-touch.log" 2>&1
+  degraded_touch_rc=$?
+  # A new process, with no shell-local state, consumes the durable degraded record.
   env AIRLOCK_STATE_DIR="$STATE" AIRLOCK_WEBROOT="$WEB" AIRLOCK_CONFD="$CONFD" \
     AIRLOCK_UNIT_DIR_USER="$UU" AIRLOCK_UNIT_DIR_SYSTEM="$US" \
     AIRLOCK_PLATFORM_ETC="$ETC" AIRLOCK_PLATFORM_OPT="$OPT" HOME="$FAKEHOME" \
     PATH="$PATH" "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/restore.log" 2>&1
-  local rc=$? phase
+  local rc=$? phase committed_fail_rc committed_restore_rc
   phase="$("$ROOT/bin/airlock-ledger" transaction-show | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')"
-  if [ "$rc" = 0 ] && [ "$phase" = rolled_back ] && grep -qx web-v1 "$WEB/app/tree/index.html"; then
-    ok "crash-reenter: a fresh process restores the durable checkpoint"
+  "$ROOT/bin/airlock-ledger" transaction-begin reinstall:fixture >/dev/null
+  "$ROOT/bin/airlock-ledger" transaction-finish committed >/dev/null
+  "$ROOT/bin/airlock-ledger" transaction-fail smoke fixture \
+    >"$CASE/committed-fail.log" 2>&1
+  committed_fail_rc=$?
+  "$ROOT/bin/airlock-ledger" transaction-restore \
+    >"$CASE/committed-restore.log" 2>&1
+  committed_restore_rc=$?
+  if [ "$failed_phase" = degraded ] && [ "$failed_error" = install ] \
+      && [ "$degraded_commit_rc" != 0 ] && [ "$degraded_touch_rc" != 0 ] \
+      && [ "$rc" = 0 ] && [ "$phase" = rolled_back ] \
+      && grep -qx web-v1 "$WEB/app/tree/index.html" \
+      && [ "$committed_fail_rc" != 0 ] && [ "$committed_restore_rc" != 0 ]; then
+    ok "crash-reenter: fail is durably degraded, fresh restore works, terminal transitions stay closed"
   else
-    bad "crash-reenter: durable recovery failed (rc=$rc phase=${phase:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
+    bad "crash-reenter: failure transition contract broke (failed=${failed_phase:-none} restore=$rc/$phase committed=$committed_fail_rc/$committed_restore_rc); $(tr '\n' ';' < "$CASE/restore.log")"
   fi
 }
 
@@ -219,6 +687,18 @@ case "$case_name" in
   space) space_denied ;;
   symlink-redirect) symlink_redirect ;;
   checkpoint-parent-redirect) checkpoint_parent_redirect ;;
+  privileged-file) privileged_file ;;
+  privileged-directory) privileged_directory ;;
+  privileged-system-unit) privileged_system_unit ;;
+  privileged-redirect) privileged_redirect ;;
+  privileged-denied) privileged_denied ;;
+  missing-recorded) missing_recorded ;;
+  privileged-arbitrary) privileged_arbitrary_path ;;
+  top-level-socket) top_level_socket ;;
+  fifo-descendant|device-top-level|unsupported-special) unsupported_special ;;
+  container-intact) container_intact_after_intent ;;
+  container-changed) container_regular_changed ;;
+  container-identity-changed) container_identity_changed ;;
   crash-reenter) crash_reenter ;;
   all)
     roundtrip
@@ -227,6 +707,18 @@ case "$case_name" in
     space_denied
     symlink_redirect
     checkpoint_parent_redirect
+    privileged_file
+    privileged_directory
+    privileged_system_unit
+    privileged_redirect
+    privileged_denied
+    missing_recorded
+    privileged_arbitrary_path
+    top_level_socket
+    unsupported_special
+    container_intact_after_intent
+    container_regular_changed
+    container_identity_changed
     crash_reenter
     ;;
   *) bad "unknown case: $case_name" ;;

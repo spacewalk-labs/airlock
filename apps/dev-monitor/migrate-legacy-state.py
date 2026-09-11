@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Import legacy dev-monitor state without mutating its database.
+"""Import or convert legacy dev-monitor state with a retained rollback backup.
 
-Database migration is deliberately copy based: after the caller attests that DB writers
-and spool producers are stopped, take a SQLite backup, clone that backup to a temporary
-target, migrate the clone, then atomically publish it.  The backup is retained as the
-rollback artifact.
+Relocation never mutates its source. In-place endstate conversion is also copy based:
+after the caller attests that DB writers and spool producers are stopped, take a SQLite
+backup, migrate a temporary clone, validate it, then atomically publish it. The backup is
+retained as the rollback artifact.
 """
 from __future__ import annotations
 
@@ -35,6 +35,17 @@ class MigrationError(RuntimeError):
 
 def _resolved(path: str | Path) -> Path:
     return Path(path).expanduser().resolve(strict=False)
+
+
+def _endstate_path(raw: str | Path) -> Path:
+    """Resolve the installed DB without accepting a redirected leaf."""
+    path = Path(raw).expanduser()
+    if path.is_symlink():
+        raise MigrationError('database source must be a regular non-symlink file')
+    resolved = path.resolve(strict=False)
+    if not resolved.is_file():
+        raise MigrationError('database source does not exist')
+    return resolved
 
 
 def _contains(parent: Path, child: Path) -> bool:
@@ -382,7 +393,8 @@ def _migrate_clone(path: Path) -> None:
 
 
 def _publish_clone(source: Path, target: Path, migrate: bool,
-                   target_marker_backup: Path | None = None) -> None:
+                   target_marker_backup: Path | None = None,
+                   expected_counts: dict[str, int] | None = None) -> None:
     _mkdir_private(target.parent)
     fd, raw_temp = tempfile.mkstemp(prefix='.messages.', suffix='.db', dir=target.parent)
     os.close(fd)
@@ -391,8 +403,15 @@ def _publish_clone(source: Path, target: Path, migrate: bool,
     try:
         _sqlite_backup(source, temp, exclusive=False)
         if migrate:
+            # _migrate_clone finishes by making and integrity-checking a standalone DB.
             _migrate_clone(temp)
-        _integrity(temp)
+        else:
+            _integrity(temp)
+        if expected_counts is not None:
+            _require_canonical_columns(temp)
+            if _counts(temp) != expected_counts:
+                raise MigrationError(
+                    'row counts changed during conversion; backup retained')
         if target_marker_backup is not None:
             _write_target_marker(target_marker_backup, _file_sha256(temp))
         os.replace(temp, target)
@@ -571,6 +590,27 @@ def verify(raw: str) -> int:
     return 0
 
 
+def schema_state(raw: str) -> int:
+    """Classify an installed DB from metadata without running conversion gates."""
+    path = _endstate_path(raw)
+    conn = _open_source(path)
+    try:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+    if 'ledger' in tables:
+        _require_canonical_columns(path)
+        print('canonical')
+    elif set(TABLES) <= tables:
+        print('legacy')
+    else:
+        raise MigrationError('database is missing required tables')
+    return 0
+
+
 def backup_only(source_raw: str, backup_raw: str) -> int:
     """Take a consistent online rollback snapshot without claiming writers are stopped."""
     source = _resolved(source_raw)
@@ -608,18 +648,36 @@ def restore(backup_raw: str, target_raw: str, offline: bool = False) -> int:
     return 0
 
 
+def compensate_endstate(raw: str, offline: bool = False) -> int:
+    """Restore only an unchanged conversion result; never discard later writes."""
+    if not offline:
+        raise MigrationError(
+            '--offline is required: stop all target database users before compensation')
+    target = _endstate_path(raw)
+    backup = target.with_name(target.name + '.pre-endstate')
+    counts = _counts(target)
+    if 'ledger' not in counts:
+        _integrity(target)
+        print('compensated=0 already_legacy=1')
+        return 0
+    if backup.is_symlink() or not backup.is_file():
+        raise MigrationError('database backup is not a regular file')
+    _integrity(backup)
+    _verify_target_marker(backup, target)
+    return restore(str(backup), str(target), offline=True)
+
+
 def endstate(raw: str, offline: bool = False) -> int:
     if not offline:
         raise MigrationError('--offline is required: stop service and mask producer timers first')
-    source = _resolved(raw)
-    if not source.is_file():
-        raise MigrationError('database source does not exist')
-    backup = source.with_name(source.name+'.pre-endstate')
-    if backup.exists():
-        raise MigrationError('database backup already exists')
+    source = _endstate_path(raw)
+    backup = source.with_name(source.name + '.pre-endstate')
     counts = _counts(source)
     if 'ledger' in counts:
-        raise MigrationError('database is already converted')
+        _integrity(source)
+        _require_canonical_columns(source)
+        print('converted=0 backup_retained=%d' % backup.is_file())
+        return 0
     conn = sqlite3.connect(source)
     try:
         if conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]:
@@ -627,12 +685,21 @@ def endstate(raw: str, offline: bool = False) -> int:
         conn.execute('PRAGMA journal_mode=DELETE')
     finally:
         conn.close()
-    _sqlite_backup(source,backup,exclusive=True)
-    _publish_clone(backup,source,migrate=True)
-    _require_canonical_columns(source)
-    if _counts(source) != _expected_counts(counts):
-        raise MigrationError('row counts changed during conversion; backup retained')
-    print('integrity_check=ok cards=%d ledger=%d backup_retained=1' % (counts['cards'],counts['occurrences']))
+    if backup.exists():
+        if backup.is_symlink() or not backup.is_file():
+            raise MigrationError('database backup is not a regular file')
+        _verify_backup_manifest(backup, source)
+        _integrity(backup)
+        _verify_source_unchanged(source, backup)
+        if _counts(backup) != counts:
+            raise MigrationError('database backup does not match the legacy source')
+    else:
+        _sqlite_backup(source, backup, exclusive=True)
+        _write_backup_manifest(backup, source)
+    _publish_clone(
+        backup, source, migrate=True, target_marker_backup=backup,
+        expected_counts=_expected_counts(counts))
+    print('converted=1 backup_retained=1')
     return 0
 
 
@@ -643,7 +710,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--db-backup')
     result.add_argument('--backup-source', metavar='DB')
     result.add_argument('--verify', metavar='DB')
+    result.add_argument('--schema-state', metavar='DB')
     result.add_argument('--endstate', metavar='DB')
+    result.add_argument('--compensate-endstate', metavar='DB')
     result.add_argument('--restore-backup', metavar='DB')
     result.add_argument('--restore-to', metavar='DB')
     result.add_argument(
@@ -659,28 +728,46 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.endstate:
-            if any((args.legacy_root,args.canonical_root,args.db_backup,args.backup_source,
-                    args.verify,args.restore_backup,args.restore_to,args.resume)):
+            if any((args.legacy_root, args.canonical_root, args.db_backup,
+                    args.backup_source, args.verify, args.schema_state,
+                    args.compensate_endstate, args.restore_backup,
+                    args.restore_to, args.resume)):
                 raise MigrationError('--endstate cannot be combined with other operations')
-            return endstate(args.endstate,args.offline)
+            return endstate(args.endstate, args.offline)
+        if args.compensate_endstate:
+            if any((args.legacy_root, args.canonical_root, args.db_backup,
+                    args.backup_source, args.verify, args.schema_state,
+                    args.restore_backup, args.restore_to, args.resume)):
+                raise MigrationError(
+                    '--compensate-endstate cannot be combined with other operations')
+            return compensate_endstate(args.compensate_endstate, args.offline)
+        if args.schema_state:
+            if any((args.legacy_root, args.canonical_root, args.db_backup,
+                    args.backup_source, args.verify, args.endstate,
+                    args.compensate_endstate, args.restore_backup,
+                    args.restore_to, args.resume, args.offline)):
+                raise MigrationError('--schema-state cannot be combined with other operations')
+            return schema_state(args.schema_state)
         if args.verify:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
-                    args.backup_source, args.restore_backup, args.restore_to, args.resume,
-                    args.offline)):
+                    args.backup_source, args.schema_state,
+                    args.compensate_endstate, args.restore_backup,
+                    args.restore_to, args.resume, args.offline)):
                 raise MigrationError('--verify cannot be combined with migration or restore')
             return verify(args.verify)
         if args.backup_source:
             if not args.db_backup:
                 raise MigrationError('--backup-source requires --db-backup')
             if any((args.legacy_root, args.canonical_root, args.restore_backup,
-                    args.restore_to, args.resume, args.offline)):
+                    args.restore_to, args.compensate_endstate, args.resume,
+                    args.offline)):
                 raise MigrationError('online backup cannot be combined with migration or restore')
             return backup_only(args.backup_source, args.db_backup)
         if args.restore_backup or args.restore_to:
             if not args.restore_backup or not args.restore_to:
                 raise MigrationError('--restore-backup and --restore-to are required together')
             if any((args.legacy_root, args.canonical_root, args.db_backup,
-                    args.backup_source,
+                    args.backup_source, args.compensate_endstate,
                     args.resume)):
                 raise MigrationError('restore cannot be combined with migration')
             return restore(args.restore_backup, args.restore_to, args.offline)

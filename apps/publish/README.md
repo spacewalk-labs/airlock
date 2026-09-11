@@ -15,6 +15,13 @@ publish a page to a public URL.
 
 Everything above is **local** and needs no configuration beyond `[apps.publish]`.
 
+The dedicated document-view port also proxies only the external-share list,
+publish, expiry and revoke API routes used by a generated document library at its
+root. Those routes keep the hub's owner-and-collaborator gate even when
+`tailnet_view = true` widens document reading to the tailnet. Wider readers get
+403, while local deletion, repair, batch and upload routes remain absent from this
+origin. The `/publish/` manager page is not served on the document port either.
+
 ## Optional: external publishing (two modes)
 
 If you configure `[apps.publish.public_target]`, an HTML page in the share

@@ -1476,15 +1476,32 @@ PY
         /publish/ "$NGTMP/publish-on-manager.body")"
       list_status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
         /publish/api/list "$NGTMP/publish-on-list.body")"
+      revoke_status="$(publish_post "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        /publish/api/public-revoke "$NGTMP/publish-on-revoke.body")"
       upload_status="$(publish_post "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
         /publish/api/upload-file "$NGTMP/publish-on-upload.body")"
       delete_status="$(publish_post "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
         /publish/api/unpublish-direct "$NGTMP/publish-on-delete.body")"
-      if [ "$manager_status" = 404 ] && [ "$list_status" = 404 ] \
-        && [ "$upload_status" = 404 ] && [ "$delete_status" = 404 ]; then
-        ok "publish tailnet view: manager UI and list/upload/delete APIs are absent from the dedicated port"
+      if [ "$manager_status" = 404 ] && [ "$list_status" = 403 ] \
+        && [ "$revoke_status" = 403 ] && [ "$upload_status" = 404 ] \
+        && [ "$delete_status" = 404 ]; then
+        ok "publish tailnet view: wider readers are denied external controls and unrelated manager APIs stay absent"
       else
-        bad "publish tailnet view: dedicated port exposed manager=$manager_status list=$list_status upload=$upload_status delete=$delete_status"
+        bad "publish tailnet view: dedicated-port boundary manager=$manager_status list=$list_status revoke=$revoke_status upload=$upload_status delete=$delete_status"
+      fi
+
+      list_status="$(publish_get "$NGSOCKDIR/publish-on.sock" friend@fixture.dev \
+        /publish/api/list "$NGTMP/publish-on-friend-list.body")"
+      revoke_status="$(publish_post "$NGSOCKDIR/publish-on.sock" friend@fixture.dev \
+        /publish/api/public-revoke "$NGTMP/publish-on-friend-revoke.body")"
+      upload_status="$(publish_post "$NGSOCKDIR/publish-on.sock" friend@fixture.dev \
+        /publish/api/upload-file "$NGTMP/publish-on-friend-upload.body")"
+      if [ "$list_status" = 200 ] && [ "$revoke_status" = 200 ] \
+        && [ "$upload_status" = 404 ] \
+        && grep -qF '"public_enabled"' "$NGTMP/publish-on-friend-list.body"; then
+        ok "publish document library: collaborator gets external controls but not unrelated manager APIs"
+      else
+        bad "publish document library: collaborator list=$list_status revoke=$revoke_status upload=$upload_status"
       fi
 
       status="$(hub_get friend@fixture.dev /publish/files/readable.html "$NGTMP/friend-readable.body")"

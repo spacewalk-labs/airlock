@@ -230,10 +230,11 @@ messages     = false  # owner-only message/action console; default off
 # (spool + SQLite, 0700) and mints a fresh nginx->backend proxy secret on every real install.
 # Anything that can write the spool can post a card, including an `action` card — but
 # an action still has to be approved by the owner and runs against a hash-pinned plan.
-# slack_webhook_urgent_env = "DEVMON_SLACK_WEBHOOK_URGENT"   # env var NAME, not URL
-# slack_webhook_routine_env = "DEVMON_SLACK_WEBHOOK_ROUTINE" # either lane may be empty
-# slack_webhook_env = "DEVMON_SLACK_WEBHOOK" # legacy urgent alias; remove by 2026-09-07
-#                                                feed and cards work with both lanes empty
+# One optional urgent webhook selector remains. This is an env var NAME, not a URL;
+# leave it empty to keep collection/feed/cards on with outbound Slack unconfigured.
+# slack_webhook_urgent_env = "DEVMON_SLACK_WEBHOOK"
+# Put the selected value in ~/.config/airlock/dev-monitor-secrets.env (mode 0600).
+# slack_webhook_routine_env and slack_webhook_env are retired and rejected by validation.
 # exec_cwd_root      = ""            # approved actions may only run STRICTLY below this
 #                                    # directory; empty = $HOME (the root itself is refused)
 # exec_session       = "devmon-exec" # tmux session the approved runs get their window in

@@ -22,6 +22,7 @@ import glob
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import secrets
@@ -58,6 +59,7 @@ ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "rooted", "serve_p
 LEGACY_ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "serve_ports")
 PACKAGE_ARTIFACT_CLASSES = ARTIFACT_CLASSES + ("containers",)
 PATH_CLASSES = ("units", "fragments", "webroot", "files", "rooted")
+PRIVILEGED_CHECKPOINT_CLASSES = frozenset((("units", "system"), ("rooted", None)))
 LIFECYCLE_KEYS = ("install", "smoke", "deactivate")
 DESTRUCTIVE_ACTIONS = frozenset(("remove", "teardown-intent", "upgrade-deactivate"))
 UNIT_SUFFIXES = (".service", ".socket", ".timer", ".path", ".target")
@@ -3255,57 +3257,226 @@ def _transaction_checkpoint_path(tx: dict[str, Any], relative: str) -> Path:
     return path
 
 
-def _supported_checkpoint_tree(path: str, *, privileged: bool) -> None:
-    """Reject sockets/devices and unreadable data before the mutation boundary."""
-    pending = [path]
-    while pending:
-        current = pending.pop()
+def _checkpoint_io_failure(path: str, exc: OSError) -> NoReturn:
+    if isinstance(exc, FileNotFoundError):
+        fail(f"checkpoint artifact is missing: {path}")
+    if isinstance(exc, PermissionError):
+        fail(f"checkpoint artifact is unreadable: {path}: {exc}")
+    fail(f"cannot inspect checkpoint artifact {path}: {exc}")
+
+
+def _capture_checkpoint_tree(bundle: tarfile.TarFile, source: str, *,
+                             privileged: bool) -> list[str]:
+    """Validate and archive one tree in a single recursive walk.
+
+    A descendant Unix socket is live IPC rather than restorable state. Record
+    its relative path and omit it; every top-level socket and every other
+    special type remains a hard failure.
+    """
+    ephemeral: list[str] = []
+    permitted_groups = {os.getegid(), *os.getgroups()}
+
+    def visit(path: str, arcname: str, relative: str) -> None:
         try:
-            item_stat = os.lstat(current)
+            item_stat = os.lstat(path)
         except OSError as exc:
-            fail(f"cannot inspect checkpoint artifact {current}: {exc}")
+            _checkpoint_io_failure(path, exc)
         mode = item_stat.st_mode
         if (not privileged and
-                (item_stat.st_uid != os.geteuid()
-                 or item_stat.st_gid not in {os.getegid(), *os.getgroups()})):
-            fail(f"checkpoint metadata for {current} cannot be restored by this user")
-        if stat.S_ISLNK(mode):
-            continue
+                (item_stat.st_uid != os.geteuid() or item_stat.st_gid not in permitted_groups)):
+            fail(f"checkpoint metadata for {path} cannot be restored by this user")
+        if stat.S_ISSOCK(mode):
+            if not relative:
+                fail(f"unsupported top-level Unix socket checkpoint artifact at {path}")
+            ephemeral.append(relative)
+            return
         if stat.S_ISREG(mode):
             if item_stat.st_nlink != 1:
-                fail(f"unsupported hard-linked checkpoint artifact at {current}")
+                fail(f"unsupported hard-linked checkpoint artifact at {path}")
             try:
-                with open(current, "rb") as fh:
-                    fh.read(1)
+                with open(path, "rb") as fh:
+                    opened = os.fstat(fh.fileno())
+                    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                        fail(f"checkpoint artifact changed type while being read: {path}")
+                    member = bundle.gettarinfo(fileobj=fh, arcname=arcname)
+                    if member is None or not member.isreg():
+                        fail(f"cannot describe checkpoint artifact {path}")
+                    bundle.addfile(member, fh)
+            except LedgerError:
+                raise
             except OSError as exc:
-                fail(f"checkpoint artifact is unreadable: {current}: {exc}")
-            continue
+                _checkpoint_io_failure(path, exc)
+            return
         if stat.S_ISDIR(mode):
             try:
-                with os.scandir(current) as entries:
-                    pending.extend(entry.path for entry in entries)
+                member = bundle.gettarinfo(path, arcname)
+                if member is None or not member.isdir():
+                    fail(f"checkpoint artifact changed type while being read: {path}")
+                bundle.addfile(member)
+                with os.scandir(path) as entries:
+                    children = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+            except LedgerError:
+                raise
             except OSError as exc:
-                fail(f"checkpoint directory is unreadable: {current}: {exc}")
-            continue
-        fail(f"unsupported checkpoint artifact type at {current}; only files, directories, and symlinks are transactional")
+                _checkpoint_io_failure(path, exc)
+            for entry in children:
+                child_relative = entry.name if not relative else f"{relative}/{entry.name}"
+                visit(entry.path, f"{arcname}/{entry.name}", child_relative)
+            return
+        if stat.S_ISLNK(mode):
+            try:
+                member = bundle.gettarinfo(path, arcname)
+            except OSError as exc:
+                _checkpoint_io_failure(path, exc)
+            if member is None or not member.issym():
+                fail(f"checkpoint artifact changed type while being read: {path}")
+            bundle.addfile(member)
+            return
+        fail(f"unsupported checkpoint artifact type at {path}; only files, directories, symlinks, and descendant Unix sockets are transactional")
+
+    visit(source, "payload", "")
+    return sorted(ephemeral, key=os.fsencode)
 
 
-def _write_checkpoint_archive(source: str, archive: Path, *, privileged: bool) -> str:
-    _supported_checkpoint_tree(source, privileged=privileged)
+def _validated_ephemeral_sockets(value: Any, where: str) -> list[str]:
+    if (not isinstance(value, list)
+            or any(not isinstance(path, str) for path in value)
+            or value != sorted(set(value), key=os.fsencode)
+            or any(not path or os.path.isabs(path)
+                   or os.path.normpath(path) != path
+                   or ".." in Path(path).parts for path in value)):
+        fail(f"invalid ephemeral socket receipt for {where}")
+    return value
+
+
+def _privileged_checkpoint_archive(app_id: str, artifact_class: str, scope: str | None,
+                                   source: str, archive: Path) -> list[str]:
+    try:
+        fd = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as output:
+            result = subprocess.run(
+                ["sudo", os.path.realpath(__file__), "_checkpoint-helper", "archive",
+                 app_id, artifact_class, scope or "-", str(state_dir()), source],
+                stdout=output,
+                stderr=subprocess.PIPE,
+                text=False,
+                check=False,
+            )
+    except OSError as exc:
+        fail(f"cannot invoke sudo checkpoint helper for {source}: {exc}")
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        fail(f"sudo could not capture checkpoint artifact {source} (rc={result.returncode}){suffix}")
+    try:
+        receipt = json.loads(result.stderr.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"sudo checkpoint helper returned an invalid receipt for {source}: {exc}")
+    if not isinstance(receipt, dict) or set(receipt) != {"ephemeral_sockets"}:
+        fail(f"sudo checkpoint helper returned an invalid receipt for {source}")
+    return _validated_ephemeral_sockets(receipt["ephemeral_sockets"], source)
+
+
+def _checkpoint_helper_state(requested: str) -> None:
+    """Bind helper authorization to the invoking operator's exact state store."""
+    owner_uid = os.geteuid()
+    if os.geteuid() == 0:
+        sudo_user = os.environ.get("SUDO_USER", "")
+        sudo_uid = os.environ.get("SUDO_UID", "")
+        if not sudo_user or not sudo_uid.isdigit() or int(sudo_uid) == 0:
+            fail("checkpoint helper requires a non-root sudo invoking user")
+        try:
+            account = pwd.getpwnam(sudo_user)
+        except KeyError:
+            fail("checkpoint helper cannot resolve the sudo invoking user")
+        if account.pw_uid != int(sudo_uid) or not os.path.isabs(account.pw_dir):
+            fail("checkpoint helper received an inconsistent sudo invoking user")
+        owner_uid = account.pw_uid
+        os.environ["HOME"] = account.pw_dir
+    if not os.path.isabs(requested) or requested != os.path.normpath(requested):
+        fail("checkpoint helper requires one normalized absolute state directory")
+    state = Path(requested)
+    ledger = state / LEDGER_FILENAME
+    try:
+        state_stat = os.lstat(state)
+        ledger_stat = os.lstat(ledger)
+    except OSError as exc:
+        fail(f"checkpoint helper cannot inspect the invoking state store: {exc}")
+    if (not stat.S_ISDIR(state_stat.st_mode)
+            or state_stat.st_uid != owner_uid or stat.S_IMODE(state_stat.st_mode) & 0o022):
+        fail("checkpoint helper state directory is not a private invoking-user directory")
+    if (not stat.S_ISREG(ledger_stat.st_mode)
+            or ledger_stat.st_uid != owner_uid or stat.S_IMODE(ledger_stat.st_mode) & 0o077):
+        fail("checkpoint helper ledger is not a private invoking-user regular file")
+    os.environ["AIRLOCK_STATE_DIR"] = requested
+
+
+def _authorize_checkpoint_helper(app_id: str, artifact_class: str,
+                                 scope: str | None, checkpoint_state: str,
+                                 source: str) -> None:
+    _checkpoint_helper_state(checkpoint_state)
+    if not _ID_RE.fullmatch(app_id):
+        fail("checkpoint helper received an invalid package id")
+    if (artifact_class, scope) not in PRIVILEGED_CHECKPOINT_CLASSES:
+        fail("checkpoint helper accepts only rooted artifacts and system units")
+    if not os.path.isabs(source) or source != os.path.normpath(source):
+        fail("checkpoint helper requires one normalized absolute artifact path")
+    store = load_store()
+    committed = (store["entries"].get(app_id) or {}).get("committed")
+    if committed is None:
+        fail(f"checkpoint helper has no committed record for {app_id}")
+    artifacts = _committed_artifacts(committed)
+    units = _preflight_teardown_artifacts(artifacts, committed["capabilities"])
+    allowed = (source in artifacts["rooted"] if artifact_class == "rooted"
+               else (source, "system") in units)
+    if not allowed:
+        fail(f"checkpoint helper path/class is not an exact committed artifact for {app_id}")
+
+
+def _checkpoint_helper_archive(app_id: str, artifact_class: str,
+                               scope: str | None, checkpoint_state: str,
+                               source: str) -> int:
+    """Privileged half of checkpoint capture; stdout is the archive bytes."""
+    _authorize_checkpoint_helper(
+        app_id, artifact_class, scope, checkpoint_state, source)
+    try:
+        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.PAX_FORMAT,
+                          dereference=False) as bundle:
+            ephemeral = _capture_checkpoint_tree(bundle, source, privileged=True)
+    except (OSError, tarfile.TarError) as exc:
+        fail(f"cannot create privileged checkpoint archive for {source}: {exc}")
+    sys.stderr.write(json.dumps({"ephemeral_sockets": ephemeral}, sort_keys=True) + "\n")
+    return 0
+
+
+def _write_checkpoint_archive(app_id: str, artifact_class: str, scope: str | None,
+                              source: str, archive: Path) -> tuple[str, list[str]]:
+    privileged = (artifact_class, scope) in PRIVILEGED_CHECKPOINT_CLASSES
     try:
         archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with tarfile.open(archive, "x", format=tarfile.PAX_FORMAT, dereference=False) as bundle:
-            bundle.add(source, arcname="payload", recursive=True)
+        if privileged:
+            ephemeral = _privileged_checkpoint_archive(
+                app_id, artifact_class, scope, source, archive)
+        else:
+            with tarfile.open(archive, "x", format=tarfile.PAX_FORMAT,
+                              dereference=False) as bundle:
+                ephemeral = _capture_checkpoint_tree(bundle, source, privileged=False)
         os.chmod(archive, 0o600)
         with archive.open("rb") as fh:
             os.fsync(fh.fileno())
+    except LedgerError:
+        try:
+            archive.unlink()
+        except OSError:
+            pass
+        raise
     except (OSError, tarfile.TarError) as exc:
         try:
             archive.unlink()
         except OSError:
             pass
         fail(f"cannot create checkpoint archive for {source}: {exc}")
-    return _sha256_file(archive)
+    return _sha256_file(archive), ephemeral
 
 
 def _capture_unit_state(name: str, scope: str) -> dict[str, bool]:
@@ -3341,14 +3512,14 @@ def _checkpoint_record(store: dict[str, Any], app_id: str, action: str, root: Pa
             seen.add(path)
             scope = unit_scope.get(path)
             item: dict[str, Any] = {"path": path, "class": artifact_class,
-                                    "scope": scope, "existed": os.path.lexists(path),
-                                    "archive": None, "sha256": None}
-            if item["existed"]:
-                relative = f"{app_id}/{index:06d}.tar"
-                archive = root / relative
-                item["archive"] = relative
-                privileged = artifact_class == "rooted" or (artifact_class == "units" and scope == "system")
-                item["sha256"] = _write_checkpoint_archive(path, archive, privileged=privileged)
+                                    "scope": scope, "existed": True,
+                                    "archive": None, "sha256": None,
+                                    "ephemeral_sockets": []}
+            relative = f"{app_id}/{index:06d}.tar"
+            archive = root / relative
+            item["archive"] = relative
+            item["sha256"], item["ephemeral_sockets"] = _write_checkpoint_archive(
+                app_id, artifact_class, scope, path, archive)
             captured.append(item)
             index += 1
     states: dict[str, dict[str, Any]] = {}
@@ -3403,7 +3574,8 @@ def _validate_checkpoint_archives(tx: dict[str, Any]) -> None:
         actual_items: list[tuple[str, str, str | None]] = []
         for item in checkpoint["artifacts"]:
             required = {"path", "class", "scope", "existed", "archive", "sha256"}
-            if not isinstance(item, dict) or set(item) != required:
+            allowed = (required, required | {"ephemeral_sockets"})
+            if not isinstance(item, dict) or set(item) not in allowed:
                 fail(f"transaction {tx['id']}: invalid artifact receipt for {app_id}")
             if (not isinstance(item["path"], str) or not os.path.isabs(item["path"])
                     or item["class"] not in PATH_CLASSES
@@ -3411,8 +3583,11 @@ def _validate_checkpoint_archives(tx: dict[str, Any]) -> None:
                     or item["scope"] not in (None, "user", "system")):
                 fail(f"transaction {tx['id']}: invalid artifact values for {app_id}")
             actual_items.append((item["path"], item["class"], item["scope"]))
+            ephemeral = _validated_ephemeral_sockets(
+                item.get("ephemeral_sockets", []), item["path"])
             if not item["existed"]:
-                if item["archive"] is not None or item["sha256"] is not None:
+                if (item["archive"] is not None or item["sha256"] is not None
+                        or ephemeral):
                     fail(f"transaction {tx['id']}: absent artifact has an archive")
                 continue
             if not isinstance(item["archive"], str) or not _is_hex_digest(item["sha256"]):
@@ -3536,6 +3711,7 @@ def command_transaction_fail(phase: str, app_id: str) -> int:
     message = os.environ.get("AIRLOCK_TRANSACTION_ERROR", "installer failed")
     tx["error"] = {"phase": phase, "app": None if app_id == "-" else app_id,
                    "message": message[:1000]}
+    tx["phase"] = "degraded"
     write_transaction(tx)
     return 0
 
@@ -3661,18 +3837,34 @@ def _restore_mappings(checkpoint: dict[str, Any]) -> bool:
     return ok
 
 
-def _committed_container_runtime_is_intact(app_id: str, record: dict[str, Any]) -> bool:
-    runtime = record.get("container_runtime")
-    if runtime is None:
-        return True
+def _container_runtime_is_intact(app_id: str, runtime: dict[str, Any]) -> bool:
     if _docker_daemon_identity() != runtime["daemon_identity"]:
         return False
-    expected = {obj["id"] for obj in runtime["objects"]}
-    actual = {obj["id"] for obj in _enumerate_containers()
+    expected = {(obj["id"], obj["name"]) for obj in runtime["objects"]}
+    actual = {(obj["id"], obj["name"]) for obj in _enumerate_containers()
               if obj["labels"].get(_PACKAGE_LABEL) == app_id
               and obj["labels"].get(_NONCE_LABEL) == runtime["install_nonce"]}
     return actual == expected
 
+
+def _checkpoint_item_matches_live(tx: dict[str, Any], app_id: str,
+                                  item: dict[str, Any]) -> bool:
+    """Re-capture through the same primitive and compare its two receipts."""
+    path = item["path"]
+    if not item["existed"]:
+        return not os.path.lexists(path)
+    archive = _transaction_checkpoint_path(tx, item["archive"])
+    temporary = Path(tempfile.mkdtemp(prefix="compare.", dir=archive.parent))
+    try:
+        current = temporary / "current.tar"
+        digest, ephemeral = _write_checkpoint_archive(
+            app_id, item["class"], item["scope"], path, current)
+        return (digest == item["sha256"]
+                and ephemeral == item.get("ephemeral_sockets", []))
+    except LedgerError:
+        return False
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
 
 def command_transaction_restore() -> int:
     tx = load_transaction()
@@ -3713,20 +3905,24 @@ def command_transaction_restore() -> int:
         try:
             current = load_store()
             saved_entry = saved_store["entries"].get(app_id)
+            saved_committed = (saved_entry or {}).get("committed")
+            current_entry = current["entries"].get(app_id) or {}
+            checkpoint = tx["checkpoints"].get(app_id) or {"artifacts": [], "units": {}, "mappings": {}}
             unchanged_committed = (app_id not in tx["deactivated"]
                                    and saved_entry is not None
-                                   and current["entries"].get(app_id) == saved_entry)
-            saved_committed = (saved_entry or {}).get("committed")
-            if (app_id in tx["deactivated"] and saved_committed is not None
+                                   and current_entry == saved_entry)
+            if (saved_committed is not None
                     and saved_committed.get("container_runtime") is not None):
-                if (current["entries"].get(app_id) == saved_entry
-                        and _committed_container_runtime_is_intact(app_id, saved_committed)):
+                if (current_entry.get("committed") == saved_committed
+                        and _container_runtime_is_intact(
+                            app_id, saved_committed["container_runtime"])
+                        and all(_checkpoint_item_matches_live(tx, app_id, item)
+                                for item in checkpoint["artifacts"])):
                     unchanged_committed = True
                 else:
-                    fail("committed container runtime changed and has no lossless checkpoint; manual recovery required")
+                    fail("committed container runtime or non-socket artifacts changed and have no lossless checkpoint; existing runtime was preserved for manual recovery")
             if current["entries"].get(app_id) and not unchanged_committed:
                 command_teardown(current, {}, app_id, None)
-            checkpoint = tx["checkpoints"].get(app_id) or {"artifacts": [], "units": {}, "mappings": {}}
             if not unchanged_committed:
                 for item in checkpoint["artifacts"]:
                     _restore_archive_item(tx, item)
@@ -3923,6 +4119,11 @@ def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if (len(raw_argv) == 7 and raw_argv[0] == "_checkpoint-helper"
+            and raw_argv[1] == "archive"):
+        scope = None if raw_argv[4] == "-" else raw_argv[4]
+        return _checkpoint_helper_archive(
+            raw_argv[2], raw_argv[3], scope, raw_argv[5], raw_argv[6])
     if raw_argv and raw_argv[0].startswith("transaction-"):
         return transaction_cli(raw_argv)
     command, app_id, for_upgrade, active_ports = parse_cli(raw_argv)

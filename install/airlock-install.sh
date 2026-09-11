@@ -17,13 +17,96 @@ ROOT="$(cd "$HERE/.." && pwd)"
 AIRLOCK_CONFIG_BIN="$ROOT/bin/airlock-config"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
+# shellcheck source=/dev/null
+. "$ROOT/apps/dev-monitor/migration-lifecycle.sh"
 
 # Never trust caller markers as proof of lock, snapshot, or transaction
 # ownership. This must precede self-kill escape so the re-exec cannot forward
 # stale authority into the recovered process.
 unset AIRLOCK_LEDGER_LOCK_HELD AIRLOCK_CONFIG_SNAPSHOT \
   AIRLOCK_CONFIG_SNAPSHOT_SHA256 AIRLOCK_INSTALL_PKG_INFO_SHA256 \
-  AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT
+  AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT \
+  AIRLOCK_INSTALL_TRANSACTION_ID AIRLOCK_DEVMON_MIGRATION_RECEIPT
+
+# A converted messages DB is retained operator data and therefore sits outside the
+# package checkpoint.  Its one app-specific receipt lives inside that checkpoint so
+# commit removes it, while failure and crash recovery can compensate it before the
+# old package is allowed to run.
+_airlock_devmon_compensate() {
+  local state_dir="$1" transaction_id="$2" receipt expected_db metadata
+  local database writer tmp_mode new_mode active_csv devmon_state
+  [[ "$transaction_id" =~ ^[0-9a-f]{32}$ ]] || {
+    log "WARN: invalid install transaction id for database compensation"
+    return 1
+  }
+  receipt="$state_dir/install-checkpoints/$transaction_id/dev-monitor-migration.json"
+  [ -e "$receipt" ] || [ -L "$receipt" ] || return 0
+  if [ ! -f "$receipt" ] || [ -L "$receipt" ]; then
+    log "WARN: dev-monitor migration receipt is not a regular non-symlink file"
+    return 1
+  fi
+  metadata="$(stat -c '%u:%a' "$receipt")" || return 1
+  if [ "$metadata" != "$(id -u):600" ]; then
+    log "WARN: dev-monitor migration receipt has unsafe ownership or mode"
+    return 1
+  fi
+  expected_db="$HOME/.local/state/airlock/dev-monitor/messages.db"
+  metadata="$(python3 - "$receipt" "$transaction_id" "$expected_db" <<'PY'
+import json
+import re
+import sys
+
+path, transaction_id, expected_db = sys.argv[1:]
+with open(path, encoding='utf-8') as handle:
+    receipt = json.load(handle)
+if set(receipt) != {'version', 'transaction_id', 'database', 'writer_user',
+                    'spool_modes', 'active_units'} or receipt['version'] != 1:
+    raise SystemExit('invalid dev-monitor migration receipt shape')
+if receipt['transaction_id'] != transaction_id or receipt['database'] != expected_db:
+    raise SystemExit('dev-monitor migration receipt does not match this transaction')
+writer = receipt['writer_user']
+if not isinstance(writer, str) or not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', writer):
+    raise SystemExit('invalid dev-monitor migration writer')
+modes = receipt['spool_modes']
+if not isinstance(modes, dict) or set(modes) != {'tmp', 'new'}:
+    raise SystemExit('invalid dev-monitor migration spool modes')
+for mode in modes.values():
+    if mode is not None and (not isinstance(mode, str)
+                             or not re.fullmatch(r'[0-7]{3,4}', mode)):
+        raise SystemExit('invalid dev-monitor migration spool mode')
+units = receipt['active_units']
+if (not isinstance(units, list) or len(units) != len(set(units))
+        or any(not isinstance(unit, str) or ',' in unit or '\t' in unit for unit in units)):
+    raise SystemExit('invalid dev-monitor migration unit list')
+print('\t'.join((expected_db, writer, modes['tmp'] or '-', modes['new'] or '-',
+                 ','.join(units))))
+PY
+)" || {
+    log "WARN: cannot validate dev-monitor migration receipt"
+    return 1
+  }
+  IFS=$'\t' read -r database writer tmp_mode new_mode active_csv <<<"$metadata"
+  devmon_state="${database%/messages.db}"
+  DEVMON_MIGRATION_TMP_MODE="$tmp_mode"
+  DEVMON_MIGRATION_NEW_MODE="$new_mode"
+  devmon_migration_load_active "$active_csv" || return 1
+  devmon_migration_quiesce || return 1
+  devmon_migration_fence "$devmon_state" "$writer" || return 1
+  devmon_migration_restore_db marker-safe "$database" \
+    "$ROOT/apps/dev-monitor/migrate-legacy-state.py" || return 1
+  devmon_migration_restore_spool "$devmon_state" || return 1
+  devmon_migration_start_saved unmanaged || return 1
+  rm -f -- "$receipt" || return 1
+  python3 - "$(dirname "$receipt")" <<'PY' || return 1
+import os
+import sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
 
 # Before anything is stopped: if this run is hosted by one of the units it is about
 # to restart, move it out of that cgroup so it survives its own teardown. Informs
@@ -58,12 +141,21 @@ if [ -e "$_airlock_early_state_dir/install-transaction.json" ] \
   fi
   AIRLOCK_LEDGER_LOCK_HELD=1
   export AIRLOCK_LEDGER_LOCK_HELD
-  _airlock_recovery_phase="$("$ROOT/bin/airlock-ledger" transaction-show \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')" \
+  _airlock_recovery_record="$("$ROOT/bin/airlock-ledger" transaction-show \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["id"]+"\t"+d["phase"])')" \
     || die "cannot read unfinished install transaction"
+  IFS=$'\t' read -r _airlock_recovery_id _airlock_recovery_phase \
+    <<<"$_airlock_recovery_record"
   case "$_airlock_recovery_phase" in
     prepared|installing|rolling_back|degraded)
       log "recovering unfinished install transaction before reading the new candidate"
+      if ! _airlock_devmon_compensate \
+          "$_airlock_early_state_dir" "$_airlock_recovery_id"; then
+        AIRLOCK_TRANSACTION_ERROR="dev-monitor database compensation failed during recovery" \
+          "$ROOT/bin/airlock-ledger" transaction-fail recovery dev-monitor >/dev/null 2>&1 \
+          || true
+        die "database compensation remains degraded; incompatible old writers were not restarted"
+      fi
       "$ROOT/bin/airlock-ledger" transaction-restore \
         || die "transaction recovery remains degraded; inspect bin/airlock-status before retrying"
       ;;
@@ -101,17 +193,26 @@ for _airlock_install_arg in "$@"; do
 done
 
 _airlock_cleanup_config_wrapper() {
-  local _exit_rc=$? _restore_rc=0 _restore_output="" _result=""
+  local _exit_rc=$? _db_restore_rc=0 _fail_rc=0 _restore_rc=0
+  local _restore_output="" _result="degraded"
   trap - EXIT INT TERM HUP
   if [ "${_airlock_transaction_active:-0}" = 1 ]; then
     [ "$_exit_rc" != 0 ] || _exit_rc=1
+    _airlock_devmon_compensate \
+      "${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}" \
+      "${_airlock_transaction_id:-}" || _db_restore_rc=$?
     AIRLOCK_TRANSACTION_ERROR="installer exited rc=$_exit_rc" \
       "$ROOT/bin/airlock-ledger" transaction-fail \
-        "${_airlock_failure_phase:-unknown}" "${_airlock_failure_app:--}" >/dev/null 2>&1 || true
-    _restore_output="$("$ROOT/bin/airlock-ledger" transaction-restore 2>&1)" || _restore_rc=$?
-    [ -z "$_restore_output" ] || printf '%s\n' "$_restore_output" >&2
-    _result="rolled_back"
-    [ "$_restore_rc" = 0 ] || _result="degraded"
+        "${_airlock_failure_phase:-unknown}" "${_airlock_failure_app:--}" \
+        >/dev/null 2>&1 || _fail_rc=$?
+    if [ "$_db_restore_rc" = 0 ] && [ "$_fail_rc" = 0 ]; then
+      _restore_output="$("$ROOT/bin/airlock-ledger" transaction-restore 2>&1)" \
+        || _restore_rc=$?
+      [ -z "$_restore_output" ] || printf '%s\n' "$_restore_output" >&2
+      [ "$_restore_rc" != 0 ] || _result="rolled_back"
+    elif [ "$_fail_rc" != 0 ]; then
+      log "WARN: failed to persist the install transaction failure"
+    fi
     log "FATAL: transaction=${_airlock_transaction_id:-unknown} phase=${_airlock_failure_phase:-unknown} app=${_airlock_failure_app:--} result=$_result; inspect: bin/airlock-status"
   fi
   [ -z "$_airlock_config_wrapper" ] || rm -f -- "$_airlock_config_wrapper"
@@ -458,6 +559,9 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
     _airlock_transaction_id="$("$ROOT/bin/airlock-ledger" transaction-begin "${_tx_specs[@]}")" \
       || die "could not create a verified install checkpoint — no app was deactivated"
     _airlock_transaction_active=1
+    AIRLOCK_INSTALL_TRANSACTION_ID="$_airlock_transaction_id"
+    AIRLOCK_DEVMON_MIGRATION_RECEIPT="${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}/install-checkpoints/$_airlock_transaction_id/dev-monitor-migration.json"
+    export AIRLOCK_INSTALL_TRANSACTION_ID AIRLOCK_DEVMON_MIGRATION_RECEIPT
     log "install transaction prepared: $_airlock_transaction_id"
   fi
 

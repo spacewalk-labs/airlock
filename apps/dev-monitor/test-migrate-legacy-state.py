@@ -128,6 +128,166 @@ class MigrationTests(unittest.TestCase):
         self.assertIn('--offline is required', result.stderr)
         self.assertFalse(self.backup.exists())
 
+    def test_endstate_classifies_converts_and_repeats_without_a_second_backup(self):
+        conn = make_legacy(self.legacy)
+        conn.close()
+        source = self.legacy / 'messages.db'
+
+        classified = self.run_script('--schema-state', source)
+        self.assertEqual(0, classified.returncode, classified.stderr)
+        self.assertEqual('legacy', classified.stdout.strip())
+
+        converted = self.run_script('--endstate', source, '--offline')
+        self.assertEqual(0, converted.returncode, converted.stderr)
+        self.assertEqual('converted=1 backup_retained=1', converted.stdout.strip())
+        backup = self.legacy / 'messages.db.pre-endstate'
+        self.assertTrue(backup.is_file())
+        self.assertTrue(Path(str(backup) + '.manifest.json').is_file())
+        self.assertTrue(Path(str(backup) + '.target.json').is_file())
+
+        classified = self.run_script('--schema-state', source)
+        self.assertEqual(0, classified.returncode, classified.stderr)
+        self.assertEqual('canonical', classified.stdout.strip())
+        before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in self.legacy.iterdir() if path.is_file()}
+        repeated = self.run_script('--endstate', source, '--offline')
+        after = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in self.legacy.iterdir() if path.is_file()}
+        self.assertEqual(0, repeated.returncode, repeated.stderr)
+        self.assertEqual('converted=0 backup_retained=1', repeated.stdout.strip())
+        self.assertEqual(before, after)
+
+    def test_endstate_publish_failure_retains_legacy_source_and_resumable_backup(self):
+        conn = make_legacy(self.legacy)
+        conn.close()
+        source = self.legacy / 'messages.db'
+        module = load_module()
+
+        with mock.patch.object(
+                module, '_publish_clone', side_effect=OSError('injected publish failure')):
+            with self.assertRaises(OSError):
+                module.endstate(str(source), offline=True)
+
+        backup = self.legacy / 'messages.db.pre-endstate'
+        self.assertTrue(backup.is_file())
+        self.assertTrue(Path(str(backup) + '.manifest.json').is_file())
+        legacy = sqlite3.connect(source)
+        try:
+            self.assertEqual(
+                {'occurrences', 'cards', 'runs', 'approvals', 'deliveries', 'events',
+                 'ingest_errors', 'sqlite_sequence'},
+                {row[0] for row in legacy.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")})
+            self.assertEqual('ok', legacy.execute('PRAGMA integrity_check').fetchone()[0])
+        finally:
+            legacy.close()
+
+        resumed = self.run_script('--endstate', source, '--offline')
+        self.assertEqual(0, resumed.returncode, resumed.stderr)
+        self.assertEqual('canonical', self.run_script(
+            '--schema-state', source).stdout.strip())
+
+    def test_endstate_count_failure_happens_before_publish_and_can_resume(self):
+        conn = make_legacy(self.legacy)
+        conn.close()
+        source = self.legacy / 'messages.db'
+        module = load_module()
+        actual_counts = module._counts
+
+        def mismatched_clone_counts(path):
+            counts = actual_counts(path)
+            if set(counts) == {'ledger', 'cards'}:
+                return dict(counts, ledger=counts['ledger'] + 1)
+            return counts
+
+        with mock.patch.object(module, '_counts', side_effect=mismatched_clone_counts):
+            with self.assertRaisesRegex(
+                    module.MigrationError, 'row counts changed during conversion'):
+                module.endstate(str(source), offline=True)
+
+        self.assertEqual('legacy', self.run_script(
+            '--schema-state', source).stdout.strip())
+        backup = self.legacy / 'messages.db.pre-endstate'
+        self.assertTrue(backup.is_file())
+        self.assertFalse(Path(str(backup) + '.target.json').exists())
+        resumed = self.run_script('--endstate', source, '--offline')
+        self.assertEqual(0, resumed.returncode, resumed.stderr)
+        self.assertEqual('canonical', self.run_script(
+            '--schema-state', source).stdout.strip())
+
+    def test_endstate_refuses_a_busy_writer_before_backup_or_publish(self):
+        conn = make_legacy(self.legacy)
+        source = self.legacy / 'messages.db'
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute("UPDATE cards SET title='uncommitted' WHERE card_id='card-safe'")
+        try:
+            result = self.run_script('--endstate', source, '--offline')
+            self.assertEqual(2, result.returncode)
+            self.assertFalse(self.legacy.joinpath(
+                'messages.db.pre-endstate').exists())
+            observer = sqlite3.connect(source)
+            try:
+                self.assertEqual('title', observer.execute(
+                    "SELECT title FROM cards WHERE card_id='card-safe'").fetchone()[0])
+            finally:
+                observer.close()
+        finally:
+            conn.rollback()
+            conn.close()
+
+    def test_endstate_refuses_a_redirected_database_leaf(self):
+        conn = make_legacy(self.legacy)
+        conn.close()
+        link = self.root / 'messages-link.db'
+        link.symlink_to(self.legacy / 'messages.db')
+        result = self.run_script('--endstate', link, '--offline')
+        self.assertEqual(2, result.returncode)
+        self.assertIn('regular non-symlink', result.stderr)
+        self.assertFalse(self.root.joinpath('messages-link.db.pre-endstate').exists())
+
+    def test_compensate_endstate_restores_once_and_is_idempotent(self):
+        conn = make_legacy(self.legacy)
+        conn.close()
+        source = self.legacy / 'messages.db'
+        converted = self.run_script('--endstate', source, '--offline')
+        self.assertEqual(0, converted.returncode, converted.stderr)
+
+        restored = self.run_script('--compensate-endstate', source, '--offline')
+        self.assertEqual(0, restored.returncode, restored.stderr)
+        self.assertEqual('restore=ok backup_retained=1', restored.stdout.strip())
+        self.assertEqual('legacy', self.run_script('--schema-state', source).stdout.strip())
+        self.assertTrue(self.legacy.joinpath('messages.db.pre-endstate').is_file())
+
+        repeated = self.run_script('--compensate-endstate', source, '--offline')
+        self.assertEqual(0, repeated.returncode, repeated.stderr)
+        self.assertEqual('compensated=0 already_legacy=1', repeated.stdout.strip())
+
+    def test_compensate_endstate_refuses_to_discard_later_writes(self):
+        conn = make_legacy(self.legacy)
+        conn.close()
+        source = self.legacy / 'messages.db'
+        converted = self.run_script('--endstate', source, '--offline')
+        self.assertEqual(0, converted.returncode, converted.stderr)
+        live = sqlite3.connect(source)
+        live.execute("UPDATE cards SET title='later-write' WHERE card_id='card-safe'")
+        live.commit()
+        live.close()
+
+        refused = self.run_script('--compensate-endstate', source, '--offline')
+        self.assertEqual(2, refused.returncode)
+        self.assertIn('does not match the backup', refused.stderr)
+        current = sqlite3.connect(source)
+        try:
+            self.assertEqual(
+                'later-write',
+                current.execute(
+                    "SELECT title FROM cards WHERE card_id='card-safe'").fetchone()[0])
+        finally:
+            current.close()
+        self.assertEqual('legacy', self.run_script(
+            '--schema-state', self.legacy / 'messages.db.pre-endstate').stdout.strip())
+
     def test_online_backup_captures_committed_wal_without_mutating_source(self):
         conn = make_legacy(self.legacy)
         conn.execute('PRAGMA journal_mode=WAL')
