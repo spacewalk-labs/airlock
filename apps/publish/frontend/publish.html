@@ -451,6 +451,7 @@ function load() {
     state.gatedEnabled = !!d.gated_enabled;
     state.gatedReason = d.gated_disabled_reason || "";
     state.root = d.root || "";
+    state.docURL = d.doc_url || "";
     state.publicListState = state.publicEnabled ? "loading" : "disabled";
     state.publicListError = "";
     state.pubBySrc = {};
@@ -557,7 +558,13 @@ function pubrowHTML(it) {
 }
 
 function rowHTML(it) {
-  var fileURL = "/publish/files/" + encodeURIComponent(it.name);
+  // The hub path works for whoever is looking at this page and 403s for everyone they
+  // send it to — same directory, different gate. When the box publishes a document port
+  // (tailnet_view on) that port's URL is the only one worth copying, so use it for both
+  // the name link and Copy. Without one, no link here is open to others; keep the hub
+  // path and do not offer Copy, rather than handing out a link that will not open.
+  var docURL = state.docURL ? state.docURL + "/" + encodeURIComponent(it.name) : "";
+  var fileURL = docURL || "/publish/files/" + encodeURIComponent(it.name);
   var pub = state.pubBySrc[it.name];
   var meta = '<span title="' + esc(it.mtime) + '">' + esc(relTime(it.mtime_epoch)) + "</span> · "
            + esc(it.type) + " · " + esc(it.size)
@@ -588,7 +595,9 @@ function rowHTML(it) {
     + '<input type="checkbox" class="rowchk" data-name="' + esc(it.name) + '"' + checked + ' aria-label="select ' + esc(it.name) + '">'
     + '<div class="main">'
     +   '<div class="nameline"><span class="icon">' + iconFor(it) + "</span>"
-    +     '<a class="name" href="' + fileURL + '" target="_blank" rel="noopener">' + esc(it.name) + "</a></div>"
+    +     '<a class="name" href="' + fileURL + '" target="_blank" rel="noopener">' + esc(it.name) + "</a>"
+    +     (docURL ? '<button class="pubact" data-act="copy-url" data-url="' + esc(docURL) + '">Copy link</button>' : "")
+    +     "</div>"
     +   '<div class="meta">' + meta + "</div>" + target + pubrowHTML(it)
     + "</div>"
     + '<div class="acts">' + acts + "</div>"

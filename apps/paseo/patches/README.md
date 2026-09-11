@@ -1,11 +1,14 @@
 # paseo patches — AGPL-3.0-only
 
-**License: `AGPL-3.0-only`** (not the repo's Apache-2.0).
+**License: `AGPL-3.0-only`** — marked separately from the repo's own AGPL-3.0,
+because the basis is different (see below).
 
 Paseo (`@getpaseo/cli`, upstream https://github.com/getpaseo/paseo) is licensed
 **AGPL-3.0**. The files in this directory modify Paseo's own bundle, so they are
-**derivative works of Paseo** and are licensed **AGPL-3.0-only**, independent of
-the Apache-2.0 license that covers the rest of Airlock.
+**derivative works of Paseo** and are licensed **AGPL-3.0-only** on that basis —
+independently of the licence the rest of Airlock happens to carry. Since
+2026-09-08 the rest of Airlock is also AGPL-3.0, but by the copyright holder's own
+choice; if that ever changed, these files would still be AGPL-3.0-only.
 
 ## What is here
 
@@ -137,15 +140,19 @@ not park over the composer; a coarse pointer gets the project row's `+` without 
 manufacturing a hover; one tap on a sidebar row navigates, instead of being eaten by
 the long-press/drag machinery web never arms); its optional `--browse` group contains
 the three live-panel edits. Both share fail-loud state classification, syntax gating,
-and content-hash cache busting. Everything else under `../browse-host/` is an independent Apache-2.0 sidecar.
+and content-hash cache busting. Everything else under `../browse-host/` is an independent sidecar, AGPL-3.0 like the rest of the repo.
 
-## Why the rest of Airlock can stay Apache-2.0
+## Why the rest of Airlock is not a derivative of Paseo
 
 Airlock runs Paseo as a **separate process** and communicates with it over
 IPC/WebSocket. The Airlock core and the `apps/paseo/` installer + `browse-host/`
 sidecar (our own code) do not incorporate Paseo's source, so they are *mere
-aggregation* and remain Apache-2.0. Only the modifications **to Paseo itself** (here) are
-AGPL-3.0.
+aggregation*: Paseo's licence does not reach them. Only the modifications **to
+Paseo itself** (here) are derivatives.
+
+Since 2026-09-08 the core is AGPL-3.0 too, chosen by the copyright holder rather
+than inherited. Keeping the two reasons apart still matters — it is what lets the
+holder relicense their own code later, which they could not do for these files.
 
 > This is not legal advice. Confirm against the AGPL-3.0 terms — and consider
 > asking the Paseo maintainers for explicit interop guidance — before publishing.

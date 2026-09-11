@@ -88,9 +88,10 @@ grep -q '@[A-Z]*@' "$TMP/control.service" \
   || bad "the placeholder assertion cannot detect a placeholder"
 
 if command -v systemd-analyze >/dev/null 2>&1; then
-  # --user, because these are user units; --recursive-errors=no keeps the verdict about
-  # THESE files rather than about whatever they happen to reference on the runner.
-  out="$(systemd-analyze --user verify --recursive-errors=no \
+  # Headless CI runners need an explicit private runtime directory for --user parsing;
+  # relying on a logged-in user's XDG_RUNTIME_DIR makes this offline check intermittent.
+  mkdir -m 700 "$TMP/runtime"
+  out="$(XDG_RUNTIME_DIR="$TMP/runtime" systemd-analyze --user verify --recursive-errors=no \
           "$TMP/airlock-token-freshness.service" \
           "$TMP/airlock-token-freshness.timer" \
           "$TMP/airlock-token-freshness-failed.service" 2>&1)"

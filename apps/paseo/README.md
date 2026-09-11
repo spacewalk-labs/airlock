@@ -84,13 +84,15 @@ reference / re-derivation copy of that edit.
 |---|---|---|
 | paseo daemon (`@getpaseo/cli`) | **AGPL-3.0** (upstream) | fetched via npm at install; not redistributed by Airlock |
 | `patches/` (our edits to paseo) | **AGPL-3.0** | derivative of paseo |
-| `install.sh`, `smoke.sh`, this README | Apache-2.0 (Airlock core) | our glue; runs paseo as a separate process (mere aggregation) |
-| `browse-host/` sidecar | **Apache-2.0** | independent loopback-WS sidecar; does not import paseo |
+| `install.sh`, `smoke.sh`, this README | AGPL-3.0 (Airlock core) | our glue; runs paseo as a separate process (mere aggregation) |
+| `browse-host/` sidecar | **AGPL-3.0** | independent loopback-WS sidecar; does not import paseo, but the core is AGPL by our own choice |
 | `browse-host/bin/patch-web-ui.js` | **AGPL-3.0** | encodes derivative edits to paseo's web-ui bundle |
 
 See the repo `NOTICE` and `patches/README.md`. Airlock talks to paseo over a
-separate process boundary, so the Airlock core stays Apache-2.0 (mere aggregation); only
-the modifications **to paseo itself** are AGPL. *This is not legal advice.*
+separate process boundary, so the core is not a derivative of paseo (mere
+aggregation). Since 2026-09-08 the core is AGPL-3.0 anyway, by the copyright
+holder's own choice — the aggregation argument now matters for attribution, not
+for which licence the core carries. *This is not legal advice.*
 
 ## browse-host live panels (config-gated)
 
@@ -116,7 +118,7 @@ Airlock gives it one:
 
 ```
 browser ──▶ tailscale serve ──▶ nginx owner gate ──┬─▶ /  ............ paseo daemon
-                                                   └─▶ /airlock-ui-state/<key>
+                                                   └─▶ /airlock-ui-state/v2/<key>
                                                              ▼
                                     airlock-paseo-uistate.service (127.0.0.1:19954)
                                     ~/.local/state/airlock/paseo-ui-state/<key>.json
@@ -132,13 +134,20 @@ Three properties are the design, not incidental:
   (draft reviews, a daemon registry, dismissed callouts); only the sidebar order is
   asked for here, and an unlisted key is 404 on every verb. A patched bundle cannot
   turn this into a general store for whatever upstream persists next.
-- **Local stays the fallback, not the loser.** The bundle patch reads the server
-  first and mirrors that value locally. Writes go through a local queue to a per-key
-  outbox immediately, independently of the serialized network queue; only a
-  successful 2xx for the newest
-  pending value clears it. A service outage therefore keeps the latest device order
-  and retries it when the device next reads, instead of letting an older server value
-  overwrite it after recovery.
+- **Local stays the offline fallback; revisions decide shared truth.** Reads carry a
+  persistent server revision. Writes first land in the device cache/outbox and then
+  use that observed revision as a compare-and-swap precondition. Consecutive changes
+  from one device are rebased onto its preceding successful revision, while a stale
+  tab or offline outbox gets 409 and rehydrates the newer shared value instead of
+  silently replacing it. Revisions stay per tab and outbox entries carry unique
+  operation IDs, so tabs sharing localStorage cannot borrow one another's revision or
+  clear one another's pending write. Delete tombstones keep revision history across
+  restart.
+- **Rolling updates fail safe.** The revision-aware adapter uses the versioned `/v2/`
+  route and sends no mutation until it has observed a revision-capable response. The
+  old backend therefore cannot accidentally accept a conditional request as an
+  unconditional write, while the new backend rejects writes from already-open legacy
+  tabs until those tabs reload the cache-busted bundle.
 
 What it deliberately does NOT do: push while a tab remains visible. The store reads
 the server when the page loads and whenever a hidden tab becomes visible again, and
@@ -149,7 +158,8 @@ mean holding a socket open for a list of strings and is not needed for device re
 The patch uses two anchors in the always-on group of
 `browse-host/bin/patch-web-ui.js`: `sidebar-order-shared-storage` swaps the storage of
 that ONE store, and `sidebar-order-rehydrate-on-visibility` refreshes it on device/tab
-return. No other persisted state changes hands.
+return or immediately after a stale write is rejected. No other persisted state
+changes hands.
 
 ## Files
 
@@ -160,4 +170,4 @@ return. No other persisted state changes hands.
 | `backend/airlock-paseo-uistate.py` | loopback store for the cross-device sidebar order (one JSON blob per allowlisted key) |
 | `test-uistate-backend.py` | offline checks for what that backend refuses: unlisted keys, traversal, oversized and non-JSON bodies |
 | `patches/` | the AGPL depth4 patch + its licensing note |
-| `browse-host/` | Apache-2.0 sidecar for agent browser tools + live panels (wired in when `browse = true`) |
+| `browse-host/` | AGPL-3.0 sidecar for agent browser tools + live panels (wired in when `browse = true`) |

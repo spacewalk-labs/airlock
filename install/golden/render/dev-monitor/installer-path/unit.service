@@ -14,9 +14,12 @@ Environment=AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS=24
 Environment=AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN=ROOT/bin/airlock-accounts-status
 Environment=AIRLOCK_AGENT_PROVIDER=claude
 Environment=AIRLOCK_AGENT_BIN=ROOT/bin/airlock-agent
+Environment="AIRLOCK_CONFIG=WDIR/airlock.toml"
 # This 0600 file always carries the update owner's ingress gate. With messages on it
 # also carries the optional spool/action configuration; secrets never enter the unit.
+EnvironmentFile=-%h/.config/airlock/dev-monitor-secrets.env
 EnvironmentFile=-WDIR/home/.config/airlock/dev-monitor.env
+Environment=DEVMON_SLACK_WEBHOOK_NAME=
 ExecStart=/usr/bin/python3 ROOT/apps/dev-monitor/backend/airlock-dev-monitor.py
 # always, not on-failure. On 2026-08-27 this backend exited with status 0 on its
 # own -- no crash, no stop command -- and on-failure does not restart a clean

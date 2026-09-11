@@ -37,14 +37,26 @@ PUBLISH_ENABLED=false
 PUBLISH_GATE="hub_ok"
 PUBLISH_HTTPS_PORT=""
 PUBLISH_GATE_PORT=""
+PUBLISH_BACKEND_PORT=""
 PUBLISH_SHARE_DIR=""
+PUBLISH_TITLE_META=false
+HUB_GATE="hub_ok"
+HUB_GATE_EXCEPTION=""
+HUB_EXACT_SCOPE=""
 if airlock_config apps | grep -qx publish; then
   eval "$(airlock_config env publish)"
   PUBLISH_ENABLED=true
   PUBLISH_HTTPS_PORT="${AIRLOCK_PUBLISH_HTTPS_PORT:?publish https_port missing}"
   PUBLISH_GATE_PORT="${AIRLOCK_PUBLISH_GATE_PORT:?publish gate_port missing}"
+  PUBLISH_BACKEND_PORT="${AIRLOCK_PUBLISH_BACKEND_PORT:?publish backend_port missing}"
   PUBLISH_SHARE_DIR="${AIRLOCK_PUBLISH_SHARE_DIR:?publish share_dir missing}"
   PUBLISH_SHARE_DIR="${PUBLISH_SHARE_DIR/#\~/$HOME}"
+  PUBLISH_TITLE_META="${AIRLOCK_PUBLISH_TITLE_META:-false}"
+  if [ "$PUBLISH_TITLE_META" = true ]; then
+    HUB_GATE="publish_hub_ok"
+    HUB_GATE_EXCEPTION=", except authenticated tailnet identities on the exact title metadata route"
+    HUB_EXACT_SCOPE=" for ordinary hub paths"
+  fi
   if [ "${AIRLOCK_PUBLISH_TAILNET_VIEW:-false}" = true ]; then
     PUBLISH_GATE="tailnet_ok"
   fi
@@ -73,6 +85,15 @@ emit_identity_map hub_ok "${hub_logins[@]}"
 emit_identity_map owner_ok "$AIRLOCK_OWNER"
 if [ "$PUBLISH_ENABLED" = true ]; then
   printf 'map $%s $tailnet_ok {\n    "" 0;\n    default 1;\n}\n' "$IDENT"
+fi
+if [ "$PUBLISH_TITLE_META" = true ]; then
+  cat <<'NGINX'
+map "$hub_ok:$tailnet_ok:$request_method:$uri" $publish_hub_ok {
+    default 0;
+    ~^1: 1;
+    "0:1:GET:/publish/api/meta" 1;
+}
+NGINX
 fi
 
 # Plaintext entrance -> canonical https. `tailscale serve --http=<http_port>`
@@ -109,6 +130,9 @@ ROLE_FIELD=',"role":"$airlock_role"'
 sed -e "s/@@PORT@@/${HUB_PORT}/g" \
     -e "s|@@WEBROOT@@|${WEBROOT}|g" \
     -e "s/@@IDENT@@/${IDENT}/g" \
+    -e "s/@@HUB_GATE@@/${HUB_GATE}/g" \
+    -e "s/@@HUB_GATE_EXCEPTION@@/${HUB_GATE_EXCEPTION}/g" \
+    -e "s/@@HUB_EXACT_SCOPE@@/${HUB_EXACT_SCOPE}/g" \
     -e "s|@@ROLE@@|${ROLE_FIELD}|g" \
     -e "s/@@ACCTPORT@@/${ACCOUNTS_PORT}/g" \
     -e "s|@@CONFD@@|${CONFD}|g" <<'NGINX'
@@ -124,17 +148,21 @@ server {
     # every location uniformly — including the subpath-app fragments included below
     # (an app can never forget its guard). This deliberately does NOT use a
     # per-location `if` + `try_files`, which do not gate reliably together.
-    # owner + collaborators pass ($hub_ok); everyone else gets the wrong-owner page.
-    if ($hub_ok = 0) { return 403; }
+    # owner + collaborators pass ($hub_ok); everyone else gets the wrong-owner page@@HUB_GATE_EXCEPTION@@.
+    if ($@@HUB_GATE@@ = 0) { return 403; }
     # No `=`: keep the honest 403 status. The server-rewrite gate runs before a
     # location is chosen, so a request with hub_ok=0 cannot reach any other 403
-    # source. That makes hub_ok an exact selector here: denied identities keep the
+    # source. That makes hub_ok an exact selector here@@HUB_EXACT_SCOPE@@: denied identities keep the
     # wrong-owner page, while a location/filesystem 403 reached by an allowed
     # identity gets an honest resource-error explanation instead.
     error_page 403 @denied;
     location @denied {
         root @@WEBROOT@@;
         default_type text/html;
+        # A named error location preserves the original method. Rewriting a
+        # denied POST/PUT/etc. to the static wrong-owner page would therefore
+        # let nginx's static handler replace the gate's 403 with 405.
+        if ($request_method !~ ^(GET|HEAD)$) { return 403; }
         if ($hub_ok = 1) {
             return 403 '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Resource forbidden</title></head><body><main><h1>Airlock cannot serve this resource</h1><p>Your access to this Airlock was verified, but the requested resource is forbidden.</p><p>This is not an Airlock ownership error. Check the resource access rules and every file and directory in its path.</p></main></body></html>';
         }
@@ -208,6 +236,29 @@ server {
         # are the whole point of asking.
         add_header Cache-Control "no-cache, no-store, must-revalidate" always;
     }
+NGINX
+
+if [ "$PUBLISH_TITLE_META" = true ]; then
+  sed -e "s|@@BACKEND@@|${PUBLISH_BACKEND_PORT}|g" \
+      -e "s|@@IDENT_HEADER@@|${AIRLOCK_IDENTITY_HEADER}|g" \
+      -e "s|@@IDENT@@|${IDENT}|g" <<'NGINX'
+
+    # This exception lives in the core site rather than the app fragment. If a
+    # fragment is missing or stale, the route therefore cannot fall through to
+    # the SPA and turn a gate exception into a 200 response with hub content.
+    location = /publish/api/meta {
+        limit_except GET { deny all; }
+        if ($tailnet_ok = 0) { return 403; }
+        proxy_pass http://127.0.0.1:@@BACKEND@@;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header @@IDENT_HEADER@@ $@@IDENT@@;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+    }
+NGINX
+fi
+
+sed -e "s|@@CONFD@@|${CONFD}|g" <<'NGINX'
 
     # the entrance itself
     location / {
@@ -244,6 +295,7 @@ server {
     location @publish_denied {
         root @@WEBROOT@@;
         default_type text/html;
+        if ($request_method !~ ^(GET|HEAD)$) { return 403; }
         if ($@@GATE@@ = 1) {
             return 403 '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Resource forbidden</title></head><body><main><h1>Airlock cannot serve this resource</h1><p>Your access to this Airlock was verified, but the requested resource is forbidden.</p><p>This is not an Airlock ownership error. Check the resource access rules and every file and directory in its path.</p></main></body></html>';
         }
@@ -257,6 +309,19 @@ server {
     # keep opening. /_assets/ is a directory inside the share dir and needs no
     # location of its own. The manager UI and /publish/api/ are not proxied here,
     # so they 404 like any other path that is not a file in the share dir.
+    # A migrated legacy share can still contain its generated index.html.  Nginx's
+    # index module runs before autoindex, so that stale file silently wins and new
+    # documents never appear on the port's front page.  Suppress index lookup only
+    # for the share root: nested bundles such as /plancritic/ must keep resolving
+    # their own index.html through the ordinary location below.
+    location = / {
+        root @@SHARE@@;
+        index .airlock-live-directory-index;
+        autoindex on;
+        add_header Cache-Control "no-cache" always;
+        sub_filter '</body>' '<script src="/airlock-return.js" data-mode="corner"@@BADGEATTR@@ defer></script></body>';
+        sub_filter_once on;
+    }
     location / {
         root @@SHARE@@;
         autoindex on;

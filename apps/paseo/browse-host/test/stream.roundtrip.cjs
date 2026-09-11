@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 "use strict";
 // Level 2 (§14.5/§14.8) live-stream transport e2e against real Chromium.
 // Proves: WS handshake -> ensureTab create-on-demand -> CDP jpeg screencast frame

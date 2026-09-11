@@ -7,11 +7,16 @@ so a drag on the Mac is invisible on the iPad. There is no server-side home for 
 upstream: the daemon exposes no general key/value route, and the order never
 crosses the wire at all.
 
-This is that home. One loopback HTTP service, one JSON blob per allowed key:
+This is that home. One loopback HTTP service, one revisioned JSON value per allowed key:
 
-    GET    /<key>   -> 200 the stored JSON text, or 404 when nothing is stored yet
-    PUT    /<key>   -> 204 (body is the JSON text the web UI would have kept local)
-    DELETE /<key>   -> 204 (idempotent)
+    GET    /v2/<key>   -> 200 JSON or 404, with X-Airlock-Revision
+    PUT    /v2/<key>   -> 204 when X-Airlock-Base-Revision still matches
+    DELETE /v2/<key>   -> 204 under the same compare-and-swap rule
+
+Stale mutations return 409 plus the current value/revision; missing preconditions
+return 428. Revisions and delete tombstones survive restart, so an old tab or offline
+outbox cannot silently replace a newer device's order. The old /<key> path remains
+readable for already-open clients, but its unconditional mutations are rejected.
 
 It binds 127.0.0.1 and carries no authentication of its own, exactly like the other
 airlock loopback backends: the paseo nginx owner gate in front of it answers 403 to
@@ -25,8 +30,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 # Only the keys airlock deliberately shares between the owner's devices. Paseo
 # persists more than this (draft reviews, dismissed callouts, a daemon registry);
@@ -37,6 +44,10 @@ ALLOWED_KEYS = frozenset({"sidebar-project-workspace-order"})
 # stops a broken or hostile client from filling the state directory; it is not a
 # tuning knob.
 MAX_BYTES = 256 * 1024
+REVISION_HEADER = "X-Airlock-Revision"
+BASE_REVISION_HEADER = "X-Airlock-Base-Revision"
+RECORD_FORMAT = 1
+STATE_LOCK = threading.Lock()
 
 
 def state_dir() -> Path:
@@ -63,6 +74,59 @@ def log(message: str) -> None:
     print(f"[paseo-uistate] {message}", flush=True)
 
 
+def read_record(path: Path) -> tuple[bytes | None, int]:
+    """Return the public JSON bytes and persistent revision.
+
+    Files written before revisions are the public JSON itself. They are revision 1
+    until the first conditional mutation rewrites them as an envelope. A tombstone
+    keeps its revision after DELETE, preventing an absent -> present ABA match.
+    """
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None, 0
+    value = json.loads(raw.decode("utf-8"))
+    if (
+        isinstance(value, dict)
+        and set(value) == {"_airlock_ui_state_format", "revision", "value"}
+        and value["_airlock_ui_state_format"] == RECORD_FORMAT
+        and isinstance(value["revision"], int)
+        and value["revision"] >= 1
+        and (value["value"] is None or isinstance(value["value"], str))
+    ):
+        public = value["value"]
+        if public is not None:
+            json.loads(public)
+            return public.encode("utf-8"), value["revision"]
+        return None, value["revision"]
+    return raw, 1
+
+
+def write_record(path: Path, value: bytes | None, revision: int) -> None:
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    record = json.dumps(
+        {
+            "_airlock_ui_state_format": RECORD_FORMAT,
+            "revision": revision,
+            "value": None if value is None else value.decode("utf-8"),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(record)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "airlock-paseo-uistate"
 
@@ -72,10 +136,21 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _key(self) -> str:
-        return self.path.lstrip("/").split("?", 1)[0]
+        key = unquote(self.path.lstrip("/").split("?", 1)[0])
+        if key.startswith("v2/"):
+            key = key[3:]
+        return key
 
-    def _send(self, status: int, body: bytes = b"", ctype: str = "application/json") -> None:
+    def _send(
+        self,
+        status: int,
+        body: bytes = b"",
+        ctype: str = "application/json",
+        revision: int | None = None,
+    ) -> None:
         self.send_response(status)
+        if revision is not None:
+            self.send_header(REVISION_HEADER, str(revision))
         if body:
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
@@ -86,21 +161,32 @@ class Handler(BaseHTTPRequestHandler):
         if body and self.command != "HEAD":
             self.wfile.write(body)
 
+    def _base_revision(self) -> int | None:
+        raw = self.headers.get(BASE_REVISION_HEADER, "")
+        if not raw.isdigit():
+            return None
+        return int(raw)
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib hook
         path = key_path(self._key())
         if path is None:
             self._send(404)
             return
         try:
-            body = path.read_bytes()
-        except FileNotFoundError:
-            self._send(404)
-            return
+            with STATE_LOCK:
+                body, revision = read_record(path)
         except OSError as exc:
             log(f"read failed: {exc}")
             self._send(500)
             return
-        self._send(200, body)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            log(f"stored record is invalid: {exc}")
+            self._send(500)
+            return
+        if body is None:
+            self._send(404, revision=revision)
+            return
+        self._send(200, body, revision=revision)
 
     def do_PUT(self) -> None:  # noqa: N802 - stdlib hook
         path = key_path(self._key())
@@ -125,25 +211,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400)
             return
         try:
-            directory = path.parent
-            directory.mkdir(parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
-            fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".tmp-")
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(raw)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.chmod(tmp, 0o600)
-                os.replace(tmp, path)
-            except BaseException:
-                os.unlink(tmp)
-                raise
+            with STATE_LOCK:
+                current, revision = read_record(path)
+                base = self._base_revision()
+                if base is None:
+                    self._send(428, current or b"", revision=revision)
+                    return
+                if base != revision:
+                    self._send(409, current or b"", revision=revision)
+                    return
+                revision += 1
+                write_record(path, raw, revision)
         except OSError as exc:
             log(f"write failed: {exc}")
             self._send(500)
             return
-        self._send(204)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            log(f"stored record is invalid: {exc}")
+            self._send(500)
+            return
+        self._send(204, revision=revision)
 
     def do_DELETE(self) -> None:  # noqa: N802 - stdlib hook
         path = key_path(self._key())
@@ -151,14 +238,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404)
             return
         try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+            with STATE_LOCK:
+                current, revision = read_record(path)
+                base = self._base_revision()
+                if base is None:
+                    self._send(428, current or b"", revision=revision)
+                    return
+                if base != revision:
+                    self._send(409, current or b"", revision=revision)
+                    return
+                revision += 1
+                write_record(path, None, revision)
         except OSError as exc:
             log(f"delete failed: {exc}")
             self._send(500)
             return
-        self._send(204)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            log(f"stored record is invalid: {exc}")
+            self._send(500)
+            return
+        self._send(204, revision=revision)
 
 
 def main() -> int:

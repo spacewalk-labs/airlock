@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 "use strict";
 // URL policy for the Paseo server-side browse host — deliberately PROPORTIONATE:
 // this is an owner-only tool on the owner's own box.

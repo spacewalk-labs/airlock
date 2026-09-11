@@ -1,0 +1,7 @@
+[Unit]
+Description=airlock dev-monitor daily heartbeat producer
+
+[Service]
+Type=oneshot
+ExecStart="/usr/bin/python3" "ROOT/apps/dev-monitor/heartbeat.py" --spool "/home/example/.local/state/airlock/dev-monitor/spool"
+TimeoutStartSec=30

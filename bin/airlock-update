@@ -129,8 +129,9 @@ main() {
       # changed).
       say "[미리보기] 이 폴더는 아직 git 저장소가 아닙니다 — 임시 저장소로 비교만 합니다."
       export GIT_DIR="$scratch/preview.git" GIT_WORK_TREE="$ROOT"
-      git init -q 2>/dev/null || git init -q --bare 2>/dev/null || true
-      git add -A 2>/dev/null || true
+      git init -q 2>/dev/null || git init -q --bare 2>/dev/null \
+        || die "미리보기용 임시 Git 저장소를 만들지 못했습니다"
+      git add -A 2>/dev/null || die "미리보기에서 현재 파일 상태를 읽지 못했습니다"
     else
       say "이 폴더는 아직 git 저장소가 아닙니다 — 되돌릴 수 있도록 지금 만듭니다."
       git init -q -b main 2>/dev/null || git init -q
@@ -166,21 +167,34 @@ main() {
   fi
   git fetch -q "$RELEASE_REMOTE" "$RELEASE_REF" \
     || die "배포본을 받지 못했습니다 — 인터넷 연결을 확인해 주세요. (레포는 공개라 로그인은 필요 없습니다)"
-  local new; new="$(git rev-parse FETCH_HEAD)" || die "받은 내용을 읽지 못했습니다"
-  local direction
+  local new; new="$(git rev-parse --verify 'FETCH_HEAD^{commit}')" \
+    || die "받은 내용을 commit 으로 읽지 못했습니다"
+  local direction direction_rc
   direction="$(release_direction "$new" "$installed_head" "$RELEASE_REF" "$RELEASE_URL")"
+  direction_rc=$?
   case "$direction" in
     rollback)
       say "받은 배포본은 현재 설치본보다 뒤입니다 — 업데이트로 보이지 않고 실행도 거부합니다."
       if [ "$dry" = 1 ]; then
-        [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && emit_update_json 0 0 "$new"
+        [ "${AIRLOCK_UPDATE_JSON:-0}" != 1 ] \
+          || emit_update_json 0 0 "$new" \
+          || die "업데이트 감지 JSON을 만들지 못했습니다"
         return 0
       fi
       die "뒤진 배포본으로는 갱신할 수 없습니다. 이전 버전으로 돌아가려면 별도 롤백 절차를 사용하세요." ;;
     ambiguous)
       say "받은 배포본이 현재 설치본보다 앞서는지 확인하지 못했습니다."
       if [ "$dry" = 1 ]; then
-        [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && emit_update_json 0 0 "$new"
+        # A semantic ambiguity (for example a release naming another source) is a
+        # measured non-update. Missing provenance is not: the daily collector must
+        # keep its last complete value and old checkedAt instead of replacing it with
+        # a fresh-looking zero.
+        if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && [ "$direction_rc" -ne 0 ]; then
+          die "배포본 방향을 재는 로컬 Git 증거가 없어 이전 감지값을 유지합니다."
+        fi
+        [ "${AIRLOCK_UPDATE_JSON:-0}" != 1 ] \
+          || emit_update_json 0 0 "$new" \
+          || die "업데이트 감지 JSON을 만들지 못했습니다"
         return 0
       fi
       die "배포본 방향이 모호해 파일을 바꾸지 않습니다." ;;
@@ -193,19 +207,27 @@ main() {
   # `-c core.quotePath=false` on every listing: without it git renders non-ASCII names
   # as octal escapes, and the one message that names the OPERATOR's OWN files is
   # exactly where that is least acceptable.
-  local release_paths changed_list changed stale
-  release_paths="$(git -c core.quotePath=false ls-tree -r --name-only "$new" | sort)"
+  local release_paths diff_paths tracked_paths changed_list changed stale
+  release_paths="$(git -c core.quotePath=false ls-tree -r --name-only "$new" | sort)" \
+    || die "받은 배포본의 파일 목록을 읽지 못했습니다"
   # Restricted to paths the RELEASE carries. Without that intersection the operator's
   # own tracked files read as differences and the script could never report an
   # up-to-date box — it would claim work to do forever.
-  changed_list="$(git -c core.quotePath=false diff --name-only "$new" -- . 2>/dev/null | sort \
-    | comm -12 - <(printf '%s\n' "$release_paths") || true)"
-  changed="$(printf '%s' "$changed_list" | grep -c . || true)"
+  diff_paths="$(git -c core.quotePath=false diff --name-only "$new" -- . 2>/dev/null | sort)" \
+    || die "현재 파일과 받은 배포본의 차이를 재지 못했습니다"
+  changed_list="$(comm -12 <(printf '%s\n' "$diff_paths") \
+    <(printf '%s\n' "$release_paths"))" \
+    || die "바뀔 파일 목록을 계산하지 못했습니다"
+  changed="$(awk 'NF { count++ } END { print count + 0 }' <<<"$changed_list")" \
+    || die "바뀔 파일 수를 계산하지 못했습니다"
   # Tracked here but absent from the release. NOT removed — a file we do not recognise
   # is at least as likely to be the operator's as it is to be ours, and deleting
   # someone else's work to tidy a directory listing is not a trade this script makes.
-  stale="$(comm -23 <(git -c core.quotePath=false ls-files | sort) \
-                    <(printf '%s\n' "$release_paths") 2>/dev/null || true)"
+  tracked_paths="$(git -c core.quotePath=false ls-files | sort)" \
+    || die "현재 checkout의 파일 목록을 읽지 못했습니다"
+  stale="$(comm -23 <(printf '%s\n' "$tracked_paths") \
+                    <(printf '%s\n' "$release_paths") 2>/dev/null)" \
+    || die "배포본에 없는 기존 파일 목록을 계산하지 못했습니다"
 
   # THE ONE THAT IS NOT OBVIOUS, AND THE ONE THAT ACTUALLY LOSES DATA.
   #
@@ -235,7 +257,9 @@ EOF
   if [ "$direction" = same ]; then
     say "이미 같은 배포본입니다 — 새 업데이트가 아닙니다."
     [ "$dry" != 1 ] || {
-      [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && emit_update_json 0 0 "$new"
+      [ "${AIRLOCK_UPDATE_JSON:-0}" != 1 ] \
+        || emit_update_json 0 0 "$new" \
+        || die "업데이트 감지 JSON을 만들지 못했습니다"
       return 0
     }
   fi
@@ -260,7 +284,7 @@ EOF
     say "[미리보기] 여기까지입니다. 아무것도 바꾸지 않았습니다."
     if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
       emit_update_json "$([ "$changed" -gt 0 ] && printf 1 || printf 0)" \
-        "$changed" "$new"
+        "$changed" "$new" || die "업데이트 감지 JSON을 만들지 못했습니다"
     fi
     return 0
   fi
@@ -470,7 +494,8 @@ is_checkout() {
 }
 
 emit_update_json() { # <available:0|1> <changed-count> <release-ref>
-  python3 - "$@" <<'PY'
+  local output=""
+  output="$(python3 - "$@" <<'PY'
 import json
 import sys
 
@@ -478,6 +503,8 @@ available, changed, ref = sys.argv[1:]
 print(json.dumps({"available": available == "1", "changedCount": int(changed),
                   "ref": ref}, separators=(",", ":")))
 PY
+)" || return 1
+  printf '%s\n' "$output"
 }
 
 release_tree_matches_state() { # <public-release-commit> <local-commit-or-empty-for-worktree>
@@ -501,11 +528,31 @@ repository_name_from_url() { # <repository-url-or-path>
   printf '%s' "${url##*/}"
 }
 
+resolve_object_prefix() { # <hex-object-prefix>
+  local prefix="$1" objects="" object="" resolved="" type="" count=0
+  objects="$(git rev-parse --disambiguate="$prefix" 2>/dev/null)" || return 2
+  while IFS= read -r object; do
+    [ -n "$object" ] || continue
+    count=$((count + 1))
+    [ "$count" -le 1 ] || return 2
+    resolved="$object"
+  done <<<"$objects"
+  [ "$count" = 1 ] || return 1
+  type="$(git cat-file -t "$resolved" 2>/dev/null)" || return 2
+  [ "$type" = commit ] || return 2
+  printf '%s\n' "$resolved"
+}
+
 release_direction() { # <candidate-public-commit> <installed-head-or-empty> <requested-ref> <release-url>
   local candidate="$1" installed_head="$2" requested_ref="$3" release_url="$4"
   local origin_url="" release_name="" private_name="" subject="" subject_label=""
   local source_token="" source_commit="" private_tip="" installed_source=""
-  local installed_release="" token="" ref=""
+  local installed_release="" history_subject="" history_label="" history_token=""
+  local history_source="" token="" ref="" first_parent_graph="" parent_line=""
+  local marker_history="" marker_subject=""
+  local first_parent="" side_parent="" candidate_history="" graph_rc=0 ancestor_rc=0
+  local source_rc=0 reverse_rc=0 origin_rc=0
+  local -a parents=()
 
   # A developer checkout has the private graph locally. Public release commits name
   # their source repository and SHA, so compare those commits rather than pretending
@@ -514,42 +561,201 @@ release_direction() { # <candidate-public-commit> <installed-head-or-empty> <req
   # Read the configured identity, not `remote get-url`: Git rewrites the latter via
   # url.*.insteadOf, which is transport routing and must not redefine repository
   # identity.  The tests use that distinction to route this canonical URL locally.
-  origin_url="$(git config --get remote.origin.url 2>/dev/null || true)"
+  origin_url="$(git config --get remote.origin.url 2>/dev/null)"
+  origin_rc=$?
+  if [ "$origin_rc" != 0 ] && [ "$origin_rc" != 1 ]; then
+    printf '%s' ambiguous
+    return 2
+  fi
   origin_url="${origin_url%/}"
   origin_url="${origin_url%.git}"
   release_name="$(repository_name_from_url "$release_url")"
   private_name="${release_name}-work"
   case "$origin_url" in
     "https://github.com/spacewalk-labs/$private_name"|"git@github.com:spacewalk-labs/$private_name"|"ssh://git@github.com/spacewalk-labs/$private_name")
-      # Deployment checkouts can have a local merge commit whose parents are the
-      # deployed private source point and a public release. Comparing the public
-      # source directly with HEAD would call the current release a rollback. The
-      # merge-base with a freshly fetched source main is the deployed source point.
-      if git fetch -q origin main >/dev/null 2>&1; then
-        private_tip="$(git rev-parse --verify -q FETCH_HEAD 2>/dev/null || true)"
+      # Deployment checkouts can have a local merge commit around the deployed
+      # private source point. Comparing the public source directly with HEAD would
+      # call the current release a rollback. The clone already records the private
+      # main tip used by that deployment, so use that local evidence; fetching origin
+      # here made one detector run contact two repositories. If the ref is absent or
+      # too old to decide, return ambiguous with a measurement-failure status so the
+      # collector retains its last successful snapshot and original checkedAt.
+      private_tip="$(git rev-parse --verify -q "refs/remotes/origin/main^{commit}" 2>/dev/null)"
+      source_rc=$?
+      if [ "$source_rc" != 0 ] && [ "$source_rc" != 1 ]; then
+        printf '%s' ambiguous
+        return 2
       fi
-      subject="$(git log -1 --format=%s "$candidate" 2>/dev/null || true)"
+      subject="$(git log -1 --format=%s "$candidate" 2>/dev/null)"
+      graph_rc=$?
+      if [ "$graph_rc" != 0 ]; then
+        printf '%s' ambiguous
+        return 2
+      fi
       if [[ "$subject" =~ ^release[[:space:]]from[[:space:]]([[:alnum:]_.-]+)[[:space:]]@[[:space:]]([0-9a-f]{7,40})$ ]]; then
         subject_label="${BASH_REMATCH[1]}"
         source_token="${BASH_REMATCH[2]}"
       fi
-      if [ "$subject_label" = "$private_name" ] && [ -n "$source_token" ] \
-         && [ -n "$installed_head" ] && [ -n "$private_tip" ]; then
-        source_commit="$(git rev-parse --verify -q "${source_token}^{commit}" 2>/dev/null || true)"
-        installed_source="$(git merge-base "$installed_head" "$private_tip" 2>/dev/null || true)"
-        if [ -n "$source_commit" ] && [ -n "$installed_source" ] \
-           && git merge-base --is-ancestor "$source_commit" "$private_tip" 2>/dev/null; then
+      if [ -z "$subject_label" ] || [ -z "$source_token" ]; then
+        printf '%s' ambiguous
+        return 2
+      fi
+      if [ "$subject_label" != "$private_name" ]; then
+        printf '%s' ambiguous
+        return 0
+      fi
+      if [ -n "$installed_head" ] && [ -n "$private_tip" ]; then
+        source_commit="$(resolve_object_prefix "$source_token")"
+        source_rc=$?
+        if [ "$source_rc" = 2 ]; then
+          printf '%s' ambiguous
+          return 2
+        fi
+
+        # Deployment is a first-parent sequence of private states, with the public
+        # release as a side parent of each deployment merge.  That topology records
+        # which release was installed last even when public histories diverge or
+        # commit timestamps are skewed.  A whole-graph log has neither property.
+        first_parent_graph="$(git rev-list --first-parent --parents "$installed_head" 2>/dev/null)"
+        graph_rc=$?
+        if [ "$graph_rc" != 0 ]; then
+          printf '%s' ambiguous
+          return 2
+        fi
+        while IFS= read -r parent_line; do
+          read -r -a parents <<<"$parent_line"
+          [ "${#parents[@]}" -gt 2 ] || continue
+          first_parent="${parents[1]}"
+          for side_parent in "${parents[@]:2}"; do
+            history_subject="$(git log -1 --format=%s "$side_parent" 2>/dev/null)"
+            graph_rc=$?
+            if [ "$graph_rc" != 0 ]; then
+              printf '%s' ambiguous
+              return 2
+            fi
+            history_label=""; history_token=""; history_source=""
+            if [[ "$history_subject" =~ ^release[[:space:]]from[[:space:]]([[:alnum:]_.-]+)[[:space:]]@[[:space:]]([0-9a-f]{7,40})$ ]]; then
+              history_label="${BASH_REMATCH[1]}"
+              history_token="${BASH_REMATCH[2]}"
+            fi
+            [ "$history_label" = "$private_name" ] || continue
+            history_source="$(resolve_object_prefix "$history_token")"
+            source_rc=$?
+            if [ "$source_rc" != 0 ] || [ -z "$history_source" ]; then
+              printf '%s' ambiguous
+              return 2
+            fi
+            git merge-base --is-ancestor "$history_source" "$first_parent" 2>/dev/null
+            ancestor_rc=$?
+            if [ "$ancestor_rc" = 0 ]; then
+              installed_release="$side_parent"
+              installed_source="$history_source"
+              break 2
+            fi
+            [ "$ancestor_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
+          done
+        done <<<"$first_parent_graph"
+
+        if [ -z "$installed_source" ]; then
+          installed_source="$(git merge-base "$installed_head" "$private_tip" 2>/dev/null)"
+          graph_rc=$?
+          if [ "$graph_rc" != 0 ] || [ -z "$installed_source" ]; then
+            printf '%s' ambiguous
+            return 2
+          fi
+          # With no deployment marker, a tracking tip strictly behind HEAD cannot
+          # distinguish private source progress from operator commits. Refuse to
+          # turn that stale evidence into a successful direction measurement.
+          git merge-base --is-ancestor "$private_tip" "$installed_head" 2>/dev/null
+          ancestor_rc=$?
+          if [ "$ancestor_rc" = 0 ] && [ "$private_tip" != "$installed_head" ]; then
+            printf '%s' ambiguous
+            return 2
+          fi
+          [ "$ancestor_rc" = 0 ] || [ "$ancestor_rc" = 1 ] \
+            || { printf '%s' ambiguous; return 2; }
+        fi
+
+        if [ -n "$source_commit" ] && [ -n "$installed_source" ]; then
+          git merge-base --is-ancestor "$source_commit" "$private_tip" 2>/dev/null
+          ancestor_rc=$?
+        else
+          ancestor_rc=1
+        fi
+        if [ "$ancestor_rc" = 0 ]; then
           [ "$source_commit" = "$installed_source" ] && { printf '%s' same; return 0; }
-          git merge-base --is-ancestor "$source_commit" "$installed_source" 2>/dev/null \
-            && { printf '%s' rollback; return 0; }
-          git merge-base --is-ancestor "$installed_source" "$source_commit" 2>/dev/null \
-            && { printf '%s' forward; return 0; }
+          git merge-base --is-ancestor "$source_commit" "$installed_source" 2>/dev/null
+          graph_rc=$?
+          [ "$graph_rc" = 0 ] && { printf '%s' rollback; return 0; }
+          [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
+          git merge-base --is-ancestor "$installed_source" "$source_commit" 2>/dev/null
+          graph_rc=$?
+          [ "$graph_rc" = 0 ] && { printf '%s' forward; return 0; }
+          [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
           printf '%s' ambiguous
           return 0
         fi
+        [ "$ancestor_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
+        # Both commits exist and diverge, so this is a measured off-main release,
+        # not a failed observation. A reverse ancestor means origin/main is merely
+        # stale, so public release ancestry remains the available ordering evidence.
+        if [ -n "$source_commit" ] && [ -n "$installed_source" ]; then
+          git merge-base --is-ancestor "$private_tip" "$source_commit" 2>/dev/null
+          reverse_rc=$?
+          if [ "$reverse_rc" = 1 ]; then
+            printf '%s' ambiguous
+            return 0
+          fi
+          [ "$reverse_rc" = 0 ] || { printf '%s' ambiguous; return 2; }
+        fi
+
+        # A quiet deployment does not fetch its private remote merely to detect an
+        # update. The source object for a later release can therefore be absent (or
+        # newer than the locally recorded private tip). Public releases already form
+        # a fetched ancestry and name their source digest. Find the release that names
+        # this checkout's deployed source, then compare public release ancestry. This
+        # keeps forward detection live without a second network fetch or a new version
+        # identifier. The divergent-object case above is deliberately excluded: when
+        # Git can prove a source is off private main, public ordering must not bless it.
+        candidate_history="$(git log --format='%H%x09%s' "$candidate" 2>/dev/null)"
+        graph_rc=$?
+        if [ "$graph_rc" != 0 ]; then
+          printf '%s' ambiguous
+          return 2
+        fi
+        while IFS=$'\t' read -r ref history_subject; do
+          history_label=""; history_token=""; history_source=""
+          if [[ "$history_subject" =~ ^release[[:space:]]from[[:space:]]([[:alnum:]_.-]+)[[:space:]]@[[:space:]]([0-9a-f]{7,40})$ ]]; then
+            history_label="${BASH_REMATCH[1]}"
+            history_token="${BASH_REMATCH[2]}"
+          fi
+          [ "$history_label" = "$private_name" ] || continue
+          history_source="$(resolve_object_prefix "$history_token")"
+          source_rc=$?
+          [ "$source_rc" != 1 ] || continue
+          if [ "$source_rc" != 0 ] || [ -z "$history_source" ]; then
+            printf '%s' ambiguous
+            return 2
+          fi
+          if [ "$history_source" = "$installed_source" ]; then
+            installed_release="$ref"
+            break
+          fi
+        done <<<"$candidate_history"
+        if [ -n "$installed_release" ]; then
+          [ "$installed_release" = "$candidate" ] && { printf '%s' same; return 0; }
+          git merge-base --is-ancestor "$installed_release" "$candidate" 2>/dev/null
+          graph_rc=$?
+          [ "$graph_rc" = 0 ] && { printf '%s' forward; return 0; }
+          [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
+          git merge-base --is-ancestor "$candidate" "$installed_release" 2>/dev/null
+          graph_rc=$?
+          [ "$graph_rc" = 0 ] && { printf '%s' rollback; return 0; }
+          [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
+        fi
       fi
       printf '%s' ambiguous
-      return 0
+      return 2
       ;;
   esac
 
@@ -557,11 +763,30 @@ release_direction() { # <candidate-public-commit> <installed-head-or-empty> <req
   # commit subject records the public release SHA.  Resolve the newest such marker
   # against the public objects retained by the airlock-release remote.
   if [ -n "$installed_head" ]; then
-    token="$(git log --format=%s "$installed_head" 2>/dev/null \
-      | sed -n 's/^airlock-update: 배포본 \([0-9a-f]\{12,40\}\) 으로 갱신$/\1/p' \
-      | head -1)"
-    [ -z "$token" ] \
-      || installed_release="$(git rev-parse --verify -q "${token}^{commit}" 2>/dev/null || true)"
+    # Read subjects without a truncating pipeline. With pipefail, `head -1`
+    # eventually turned a healthy git log into SIGPIPE on long-lived boxes. Git's
+    # --grep is not a substitute: it also searches commit bodies, so an operator note
+    # quoting marker text could hide the newest real marker.
+    marker_history="$(git log --format=%s "$installed_head" 2>/dev/null)"
+    graph_rc=$?
+    if [ "$graph_rc" != 0 ]; then
+      printf '%s' ambiguous
+      return 2
+    fi
+    while IFS= read -r marker_subject; do
+      if [[ "$marker_subject" =~ ^airlock-update:[[:space:]]배포본[[:space:]]([0-9a-f]{12,40})[[:space:]]으로[[:space:]]갱신$ ]]; then
+        token="${BASH_REMATCH[1]}"
+        break
+      fi
+    done <<<"$marker_history"
+    if [ -n "$token" ]; then
+      installed_release="$(resolve_object_prefix "$token")"
+      source_rc=$?
+      if [ "$source_rc" != 0 ] || [ -z "$installed_release" ]; then
+        printf '%s' ambiguous
+        return 2
+      fi
+    fi
   fi
 
   # Legacy first installs have no marker.  For the normal moving `main` ref, recover
@@ -572,7 +797,19 @@ release_direction() { # <candidate-public-commit> <installed-head-or-empty> <req
   # be mistaken for operator files.
   if [ -z "$installed_release" ] && [ "$requested_ref" = main ]; then
     if [ -n "$installed_head" ]; then
-      local local_ref match_rc lookup_failed=0
+      local local_ref match_rc lookup_failed=0 local_history="" release_history=""
+      local_history="$(git rev-list "$installed_head" 2>/dev/null)"
+      graph_rc=$?
+      if [ "$graph_rc" != 0 ]; then
+        printf '%s' ambiguous
+        return 2
+      fi
+      release_history="$(git rev-list "$candidate" 2>/dev/null)"
+      graph_rc=$?
+      if [ "$graph_rc" != 0 ]; then
+        printf '%s' ambiguous
+        return 2
+      fi
       while IFS= read -r ref; do
         while IFS= read -r local_ref; do
           if release_tree_matches_state "$ref" "$local_ref"; then
@@ -582,32 +819,42 @@ release_direction() { # <candidate-public-commit> <installed-head-or-empty> <req
             match_rc=$?
             [ "$match_rc" = 1 ] || { lookup_failed=1; break; }
           fi
-        done < <(git rev-list "$installed_head")
+        done <<<"$local_history"
         if [ "$lookup_failed" != 0 ] || [ -n "$installed_release" ]; then
           break
         fi
-      done < <(git rev-list "$candidate")
-      [ "$lookup_failed" = 0 ] || { printf '%s' ambiguous; return 0; }
+      done <<<"$release_history"
+      [ "$lookup_failed" = 0 ] || { printf '%s' ambiguous; return 2; }
     else
-      local match_rc
+      local match_rc release_history=""
+      release_history="$(git rev-list "$candidate" 2>/dev/null)"
+      graph_rc=$?
+      if [ "$graph_rc" != 0 ]; then
+        printf '%s' ambiguous
+        return 2
+      fi
       while IFS= read -r ref; do
         if release_tree_matches_state "$ref" ""; then
           installed_release="$ref"
           break
         else
           match_rc=$?
-          [ "$match_rc" = 1 ] || { printf '%s' ambiguous; return 0; }
+          [ "$match_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
         fi
-      done < <(git rev-list "$candidate")
+      done <<<"$release_history"
     fi
   fi
 
   [ -n "$installed_release" ] || { printf '%s' ambiguous; return 0; }
   [ "$installed_release" = "$candidate" ] && { printf '%s' same; return 0; }
-  git merge-base --is-ancestor "$installed_release" "$candidate" 2>/dev/null \
-    && { printf '%s' forward; return 0; }
-  git merge-base --is-ancestor "$candidate" "$installed_release" 2>/dev/null \
-    && { printf '%s' rollback; return 0; }
+  git merge-base --is-ancestor "$installed_release" "$candidate" 2>/dev/null
+  graph_rc=$?
+  [ "$graph_rc" = 0 ] && { printf '%s' forward; return 0; }
+  [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
+  git merge-base --is-ancestor "$candidate" "$installed_release" 2>/dev/null
+  graph_rc=$?
+  [ "$graph_rc" = 0 ] && { printf '%s' rollback; return 0; }
+  [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
   printf '%s' ambiguous
 }
 
@@ -1196,10 +1443,12 @@ report_list() {
   total="$(printf '%s' "$1" | grep -c .)"
   shown=12
   if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
-    printf '%s' "$1" | grep . | head -"$shown" | sed 's/^/         /' >&2
+    awk -v shown="$shown" 'length($0) > 0 { print "         " $0; if (++count >= shown) exit }' \
+      <<<"$1" >&2
     [ "$total" -gt "$shown" ] && printf '         … 그리고 %s 개 더\n' "$((total - shown))" >&2
   else
-    printf '%s' "$1" | grep . | head -"$shown" | sed 's/^/         /'
+    awk -v shown="$shown" 'length($0) > 0 { print "         " $0; if (++count >= shown) exit }' \
+      <<<"$1"
     [ "$total" -gt "$shown" ] && printf '         … 그리고 %s 개 더\n' "$((total - shown))"
   fi
   return 0
@@ -1258,9 +1507,9 @@ resolve_machine() {
   done <<EOF
 $(printf '%s\n' "$listing" | sed 's/[[:cntrl:]]\[[0-9;]*m//g' | awk '{printf "%s\t%s\n", $1, $2}')
 EOF
-  count="$(printf '%s' "$found" | grep -c . || true)"
+  count="$(awk 'NF { count++ } END { print count + 0 }' <<<"$found")"
   case "$count" in
-    1) name="$(printf '%s' "$found" | grep . | head -1)"
+    1) name="$(awk 'NF { print; exit }' <<<"$found")"
        say "찾았습니다: $name" >&2; printf '%s' "$name"; return 0 ;;
     0) die "돌고 있는 머신 중에 Airlock 이 설치된 것을 찾지 못했습니다.$(
          [ -n "$skipped" ] && printf '\n       %s' "멈춰 있어 확인하지 않은 머신: $(printf '%s' "$skipped" | tr '\n' ' ')"

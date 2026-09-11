@@ -319,59 +319,36 @@ def _counts(path: Path) -> dict[str, int]:
             row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")
         }
-        missing = set(TABLES) - present
+        expected = ('ledger','cards') if 'ledger' in present else TABLES
+        missing = set(expected) - present
         if missing:
             raise MigrationError('database is missing required tables')
         return {
             table: int(conn.execute('SELECT COUNT(*) FROM %s' % table).fetchone()[0])
-            for table in TABLES
+            for table in expected
         }
     finally:
         conn.close()
 
 
 def _require_canonical_columns(path: Path) -> None:
-    required = {
-        'cards': {
-            'severity': ('TEXT', 0, None), 'owner': ('TEXT', 0, None),
-            'needs_action': ('INTEGER', 0, None), 'task_state': ('TEXT', 0, None),
-            'snoozed_until': ('TEXT', 0, None), 'runbook': ('TEXT', 0, None),
-        },
-        'runs': {
-            'keep_requested': ('INTEGER', 1, '0'), 'kept_at': ('TEXT', 0, None),
-            'reclaimed_at': ('TEXT', 0, None),
-        },
-        'deliveries': {
-            'claimed_by': ('TEXT', 0, None), 'lease_until': ('TEXT', 0, None),
-            'created_at': ('TEXT', 0, None), 'last_error_at': ('TEXT', 0, None),
-        },
-    }
-    required_indexes = {
-        'ux_deliveries_open', 'idx_deliveries_claim', 'idx_deliveries_sent',
-        'idx_deliveries_watchdog_notice', 'idx_deliveries_health_sent_v3',
-        'idx_deliveries_health_error_valid_v3',
-        'idx_deliveries_health_failed_v3',
-        'idx_deliveries_health_bad_timestamp_v3', 'idx_cards_probe',
-        'idx_cards_watchdog_group_created', 'idx_events_card_kind',
-    }
     conn = _open_source(path)
     try:
-        for table, expected in required.items():
-            actual = {
-                row[1]: (str(row[2]).upper(), int(row[3]), row[4])
-                for row in conn.execute('PRAGMA table_info(%s)' % table)
-            }
-            if any(actual.get(name) != definition
-                   for name, definition in expected.items()):
-                raise MigrationError('database does not have the canonical schema')
-        indexes = {
-            row[0] for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'")
-        }
-        if not required_indexes.issubset(indexes):
-            raise MigrationError('database does not have the canonical indexes')
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if tables != {'ledger','cards'}:
+            raise MigrationError('canonical database requires exactly ledger and cards')
+        indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        if not {'cards_send','cards_group','ledger_received'} <= indexes:
+            raise MigrationError('canonical indexes missing')
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(cards)')}
+        if not {'ran_at','send_attempts','send_next_at','sent_at','run'} <= columns:
+            raise MigrationError('canonical cards columns missing')
     finally:
         conn.close()
+
+
+def _expected_counts(counts):
+    return {'ledger':counts.get('ledger',counts.get('occurrences',0)), 'cards':counts['cards']}
 
 
 def _load_messages():
@@ -384,36 +361,24 @@ def _load_messages():
 
 
 def _migrate_clone(path: Path) -> None:
-    messages = _load_messages()
-    messages.init_db(str(path))
-    conn = sqlite3.connect(path)
+    _load_messages()  # Set up the same app-only module resolution as the runtime.
+    sys.path.insert(0,str(Path(__file__).parent / 'backend'))
     try:
-        conn.execute('BEGIN IMMEDIATE')
-        unexpected = conn.execute(
-            "SELECT 1 FROM cards WHERE severity IS NULL "
-            "AND urgency NOT IN ('urgent','normal') LIMIT 1").fetchone()
-        if unexpected is not None:
-            raise MigrationError('legacy database has an unsupported urgency value')
-        conn.execute(
-            "UPDATE cards SET severity=CASE urgency "
-            "WHEN 'urgent' THEN 'page' ELSE 'record' END WHERE severity IS NULL")
-        conn.commit()
-        result = conn.execute('PRAGMA integrity_check').fetchone()
-        if result is None or result[0] != 'ok':
-            raise MigrationError('SQLite integrity check failed after migration')
-        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        conn.execute('PRAGMA journal_mode=DELETE')
-    except Exception:
-        conn.rollback()
-        raise
+        from devmon_migrate import convert
     finally:
-        conn.close()
-    for suffix in SQLITE_SIDECARS:
-        sidecar = Path(str(path) + suffix)
-        if sidecar.exists():
-            sidecar.unlink()
-    os.chmod(path, 0o600)
-    _fsync_file(path)
+        sys.path.pop(0)
+    fd, name = tempfile.mkstemp(prefix='.endstate.',suffix='.db',dir=path.parent)
+    os.close(fd)
+    target = Path(name)
+    try:
+        try:
+            convert(path,target)
+        except (ValueError,TypeError) as error:
+            raise MigrationError('invalid legacy data; original and backup retained') from error
+        _make_standalone(target)
+        os.replace(target,path)
+    finally:
+        target.unlink(missing_ok=True)
 
 
 def _publish_clone(source: Path, target: Path, migrate: bool,
@@ -563,7 +528,7 @@ def migrate(legacy_raw: str, canonical_raw: str, backup_raw: str | None,
         _integrity(target_db)
         _require_canonical_columns(target_db)
         _verify_target_marker(backup, target_db)
-        if _counts(target_db) != source_counts:
+        if _counts(target_db) != _expected_counts(source_counts):
             raise MigrationError('existing canonical database does not match the backup')
 
     stage = _stage_spool(entries, canonical_root)
@@ -578,7 +543,7 @@ def migrate(legacy_raw: str, canonical_raw: str, backup_raw: str | None,
                 backup, target_db, migrate=True, target_marker_backup=backup)
             migrated = 1
             published_here = True
-            if _counts(target_db) != source_counts:
+            if _counts(target_db) != _expected_counts(source_counts):
                 raise MigrationError('row counts changed during database migration')
             _require_canonical_columns(target_db)
         _publish_spool(stage, canonical_root)
@@ -620,7 +585,7 @@ def backup_only(source_raw: str, backup_raw: str) -> int:
     _sqlite_backup(source, backup, exclusive=True)
     _write_backup_manifest(backup, source)
     counts = _counts(backup)
-    print('backup=ok ' + ' '.join('%s=%d' % (table, counts[table]) for table in TABLES))
+    print('backup=ok ' + ' '.join('%s=%d' % item for item in sorted(counts.items())))
     return 0
 
 
@@ -643,6 +608,34 @@ def restore(backup_raw: str, target_raw: str, offline: bool = False) -> int:
     return 0
 
 
+def endstate(raw: str, offline: bool = False) -> int:
+    if not offline:
+        raise MigrationError('--offline is required: stop service and mask producer timers first')
+    source = _resolved(raw)
+    if not source.is_file():
+        raise MigrationError('database source does not exist')
+    backup = source.with_name(source.name+'.pre-endstate')
+    if backup.exists():
+        raise MigrationError('database backup already exists')
+    counts = _counts(source)
+    if 'ledger' in counts:
+        raise MigrationError('database is already converted')
+    conn = sqlite3.connect(source)
+    try:
+        if conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]:
+            raise MigrationError('database checkpoint busy; stop all database users')
+        conn.execute('PRAGMA journal_mode=DELETE')
+    finally:
+        conn.close()
+    _sqlite_backup(source,backup,exclusive=True)
+    _publish_clone(backup,source,migrate=True)
+    _require_canonical_columns(source)
+    if _counts(source) != _expected_counts(counts):
+        raise MigrationError('row counts changed during conversion; backup retained')
+    print('integrity_check=ok cards=%d ledger=%d backup_retained=1' % (counts['cards'],counts['occurrences']))
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument('legacy_root', nargs='?')
@@ -650,6 +643,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--db-backup')
     result.add_argument('--backup-source', metavar='DB')
     result.add_argument('--verify', metavar='DB')
+    result.add_argument('--endstate', metavar='DB')
     result.add_argument('--restore-backup', metavar='DB')
     result.add_argument('--restore-to', metavar='DB')
     result.add_argument(
@@ -664,6 +658,11 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.endstate:
+            if any((args.legacy_root,args.canonical_root,args.db_backup,args.backup_source,
+                    args.verify,args.restore_backup,args.restore_to,args.resume)):
+                raise MigrationError('--endstate cannot be combined with other operations')
+            return endstate(args.endstate,args.offline)
         if args.verify:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.restore_backup, args.restore_to, args.resume,

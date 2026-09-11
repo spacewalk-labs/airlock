@@ -42,12 +42,9 @@ if [ -n "${DEV_MONITOR_SPOOL:-}" ] && [ -d "$DEV_MONITOR_SPOOL/new" ]; then
     --spool "$DEV_MONITOR_SPOOL" \
     --source token-freshness \
     --group-key token-freshness:watchdog \
-    --kind info --urgency urgent \
+    --level urgent \
     --title "Credential freshness check FAILED — expiry is no longer being watched" \
-    --body "airlock-token-freshness.service failed at ${NOW}. See TOKEN-FRESHNESS-LAST-FAILURE in ${RESULT_DIR}." \
-    --outcome "The periodic credential check did not complete." \
-    --why "While it is down the dashboard card keeps showing the last verdict it managed to write, and that verdict ages silently." \
-    --followup "systemctl --user status airlock-token-freshness.service" \
+    --body "airlock-token-freshness.service failed at ${NOW}. See TOKEN-FRESHNESS-LAST-FAILURE in ${RESULT_DIR}. The periodic credential check did not complete. While it is down the dashboard card keeps showing the last verdict it managed to write, and that verdict ages silently. Follow up: systemctl --user status airlock-token-freshness.service" \
     >/dev/null 2>>"$RESULT_DIR/TOKEN-FRESHNESS-PUBLISH-FAILING" || true
 fi
 

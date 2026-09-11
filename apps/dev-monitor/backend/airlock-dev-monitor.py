@@ -11,6 +11,7 @@ process continues to serve observability.
 """
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -21,10 +22,16 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 # The owner ingress gate is smaller than the optional message/action console: update
 # detection needs it even on a box that intentionally has no message spool.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from devmon_secret_names import validate_config
+from devmon_secrets import slack_webhooks
+
+# Reject selector/control collisions before parsing any overridden control values.
+validate_config(os.environ)
 try:
     import devmon_owner
 except ImportError:
@@ -36,14 +43,14 @@ try:
     import devmon_messages as MSG
     import devmon_spool
     import devmon_slack
-    import devmon_email
+    import devmon_loop
     import action_runner
     _MESSAGES_AVAILABLE = devmon_owner is not None
 except ImportError:
     MSG = None
     devmon_spool = None
     devmon_slack = None
-    devmon_email = None
+    devmon_loop = None
     action_runner = None
     _MESSAGES_AVAILABLE = False
 
@@ -60,6 +67,21 @@ try:
     import devmon_updates as UPDATES
 except ImportError:
     UPDATES = None
+
+try:
+    import devmon_home_order as HOME_ORDER
+except ImportError:
+    HOME_ORDER = None
+
+try:
+    import devmon_apps as APPS
+except ImportError:
+    APPS = None
+
+try:
+    import devmon_company_catalog as COMPANY_CATALOG
+except ImportError:
+    COMPANY_CATALOG = None
 
 # Update EXECUTION is imported separately from update DETECTION so an older tree that
 # has the collector but not the runner degrades to a read-only panel instead of 500s.
@@ -139,22 +161,7 @@ _HARNESS_RUN_LOCK = threading.Lock()
 # more run of exactly this unit; nothing else on these routes starts a unit.
 UPDATE_DETECT_UNIT = 'airlock-update-detect.service'
 _MESSAGES_STATE = 'off'
-# The two lanes with a liveness probe and a watchdog. Email is deliberately not one of them:
-# a probe proves a lane by sending through it, and a mail probe on a timer is a scheduled
-# message to a person's inbox saying nothing. Its health comes from the ledger alone.
-MESSAGE_LANES = ('slack-urgent', 'slack-routine')
-# Every lane the settings screen shows, which is the routing table's set rather than the
-# probe's. A lane missing from this list is a lane whose silence nobody sees.
-HEALTH_LANES = MESSAGE_LANES + ('email',)
-# Per-lane wording, because the remedy differs: a Slack lane needs a webhook and the email
-# lane needs an SMTP transport. A screen that says "no webhook configured" under 이메일 sends
-# the operator looking for the wrong thing.
-_LANE_UNCONFIGURED = {
-    'slack-urgent': 'off: no webhook configured',
-    'slack-routine': 'off: no webhook configured',
-    'email': 'off: no transport configured',
-}
-_MESSAGE_LANE_WORKER_STATES = dict(_LANE_UNCONFIGURED)
+_SLACK_WORKER_ON = False
 _TMUX_LOCK = threading.Lock()
 # How long a run may sit in 'starting' with no window of its own name before the
 # reaper calls it a failed launch. Only has to outlast one _launch_run under the lock.
@@ -1089,7 +1096,9 @@ class Handler(BaseHTTPRequestHandler):
             # afterwards — smoke.sh included.
             self._json(200, {'ok': True, 'service': 'airlock-dev-monitor', 'port': PORT,
                              'messages': _messages_state(),
-                             'message_lanes': _message_lanes_health(),
+                             'slack': ('configured' if any(_slack_webhooks().values())
+                                       else 'not configured'),
+                             **_message_delivery_health(),
                              'messages_requested': MESSAGES_REQUESTED,
                              'token_freshness': _token_state(),
                              'cron': 'on' if CRON is not None else 'unavailable'})
@@ -1141,6 +1150,75 @@ class Handler(BaseHTTPRequestHandler):
         return devmon_owner.require_owner(self, UPDATES_OWNER_CONFIG)
 
     def _handle_owner_get(self, path, qs):
+        if path == '/api/owner/apps':
+            if APPS is None:
+                self._json(404, {'ok': False, 'error': 'app store not enabled'})
+                return
+            if not self._updates_owner_ready():
+                return
+            cfg = UPDATE_EXEC_CONFIG
+            if cfg is None:
+                self._json(404, {'ok': False, 'error': 'app store execution not enabled'})
+                return
+            updates = UPDATES.read_snapshot() if UPDATES is not None else None
+            try:
+                projection = APPS.list_apps(cfg['root'], updates)
+                try:
+                    config = APPS.config_path(cfg['root'])
+                except APPS.AppsError as exc:
+                    # list_apps intentionally has a review-only projection for this
+                    # exact failure.  A source-tree launch without AIRLOCK_CONFIG asks
+                    # package-info for the config path next, which is lock-strict too;
+                    # do not let the optional company lookup erase that projection.
+                    if (projection.get('degraded') != 'lock-mismatch'
+                            or exc.code != 'config_invalid'
+                            or 'package lock digest mismatch' not in exc.detail):
+                        raise
+                    projection['company'] = []
+                else:
+                    projection['company'] = (
+                        COMPANY_CATALOG.list_catalog(config)
+                        if COMPANY_CATALOG is not None else [])
+                self._json(200, projection)
+            except APPS.AppsError as exc:
+                sys.stderr.write(f'[apps] listing failed ({exc.code}): {exc.detail}\n')
+                self._json(500, {'ok': False, 'error': exc.code})
+            except COMPANY_CATALOG.CatalogError as exc:
+                sys.stderr.write(f'[apps] company catalog failed ({exc.code}): {exc.detail}\n')
+                self._json(500, {'ok': False, 'error': exc.code})
+            return
+        if path == '/api/owner/home/order':
+            if HOME_ORDER is None:
+                self._json(404, {'ok': False, 'error': 'home ordering not enabled'})
+                return
+            if not self._updates_owner_ready():
+                return
+            try:
+                try:
+                    cfg = UPDATE_EXEC_CONFIG
+                    manifest = HOME_ORDER.manifest_order(
+                        cfg['root'] if cfg is not None else None)
+                except RuntimeError as exc:
+                    # `airlock-config apps` resolves explicit package manifests and is
+                    # therefore lock-strict.  The update snapshot still names the only
+                    # reviewable tiles; use the same narrow degraded projection as the
+                    # app sheet, never a partial inventory for another config error.
+                    if (APPS is None or cfg is None
+                            or 'package lock digest mismatch' not in str(exc)):
+                        raise
+                    updates = UPDATES.read_snapshot() if UPDATES is not None else None
+                    try:
+                        projection = APPS.list_apps(cfg['root'], updates)
+                    except APPS.AppsError as projection_error:
+                        raise RuntimeError(str(projection_error)) from projection_error
+                    if projection.get('degraded') != 'lock-mismatch':
+                        raise
+                    manifest = [row['id'] for row in projection.get('installed', [])
+                                if isinstance(row, dict) and isinstance(row.get('id'), str)]
+                self._json(200, {'order': HOME_ORDER.read_order(manifest)})
+            except (OSError, RuntimeError):
+                self._json(500, {'ok': False, 'error': 'home order unavailable'})
+            return
         if path == '/api/owner/updates':
             # The update collector is optional in an already-installed older tree.
             # Return 404, never an empty list: an empty answer would look current while
@@ -1184,34 +1262,11 @@ class Handler(BaseHTTPRequestHandler):
                 scope = 'active'
             self._json(200, MSG.feed(scope))
             return
-        if path == '/api/owner/runs':
-            card_id = qs.get('card_id', [None])[0]
-            self._json(200, MSG.list_runs(card_id))
-            return
-        if path.startswith('/api/owner/runs/'):
-            parts = path.split('/')
-            if len(parts) == 5 and parts[4]:
-                run = MSG.get_run(self._seg(parts[4]))
-                self._json(200 if run else 404, run or {'ok': False, 'error': 'not_found'})
-                return
         self._json(404, {'ok': False, 'error': f'unknown owner path: {path}'})
 
-    # Every one of these answers 404 when the card refuses the transition, which is the same
-    # answer an unknown card already gives. The task actions refuse on a card that does not
-    # declare action, so "complete" is not reachable on a record even by hand-made request.
     _CARD_ACTIONS = {
         'read': lambda cid: MSG.mark_read(cid),
-        'pin': lambda cid: MSG.set_pin(cid, True),
-        'unpin': lambda cid: MSG.set_pin(cid, False),
         'archive': lambda cid: MSG.archive(cid),
-        'dismiss': lambda cid: MSG.dismiss(cid),
-        'undismiss': lambda cid: MSG.undismiss(cid),
-        'start': lambda cid: MSG.start_task(cid),
-        'complete': lambda cid: MSG.complete_task(cid),
-        'reopen': lambda cid: MSG.reopen_task(cid),
-        'snooze': lambda cid: MSG.snooze_task(cid),
-        'unsnooze': lambda cid: MSG.unsnooze_task(cid),
-        'not_task': lambda cid: MSG.not_task(cid),
     }
 
     def _handle_owner_post(self, path):
@@ -1230,9 +1285,62 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._owner_harness_execute(self._read_body())
             return
+        if path == '/api/owner/apps/package-preview':
+            if APPS is None or UPDATE_EXEC_CONFIG is None:
+                self._json(404, {'ok': False, 'error': 'app store not enabled'})
+                return
+            if not self._updates_owner_ready():
+                return
+            body = self._read_body()
+            package_path = body.get('path') if isinstance(body, dict) else None
+            if not isinstance(package_path, str) or not package_path.strip():
+                self._json(400, {'ok': False, 'error': 'bad_package_path'})
+                return
+            try:
+                self._json(200, APPS.package_preview(
+                    UPDATE_EXEC_CONFIG['root'], package_path))
+            except APPS.AppsError as exc:
+                sys.stderr.write(f'[apps] package preview failed ({exc.code}): '
+                                 f'{exc.detail}\n')
+                status = 400 if exc.code in ('bad_package_path', 'config_invalid') else 500
+                self._json(status, {'ok': False, 'error': exc.code})
+            return
+        parts = path.split('/')
+        if len(parts) == 6 and parts[:4] == ['', 'api', 'owner', 'apps']:
+            if not self._updates_owner_ready():
+                return
+            body = self._read_body()
+            if parts[5] == 'install-company':
+                self._owner_company_install(self._seg(parts[4]))
+            else:
+                self._owner_app_action(self._seg(parts[4]), parts[5], body)
+            return
+        if path == '/api/owner/home/order':
+            if HOME_ORDER is None:
+                self._json(404, {'ok': False, 'error': 'home ordering not enabled'})
+                return
+            if not self._updates_owner_ready():
+                return
+            body = self._read_body()
+            if not isinstance(body, dict) or not isinstance(body.get('order'), list):
+                self._json(400, {'ok': False, 'error': 'order must be an array'})
+                return
+            try:
+                cfg = UPDATE_EXEC_CONFIG
+                manifest = HOME_ORDER.manifest_order(
+                    cfg['root'] if cfg is not None else None)
+                order = HOME_ORDER.write_order(body['order'], manifest)
+            except (OSError, RuntimeError):
+                self._json(500, {'ok': False, 'error': 'home order unavailable'})
+                return
+            self._json(200, {'order': order})
+            return
         if not self._owner_ready():
             return
         body = self._read_body()
+        if path == '/api/owner/run':
+            self._owner_run(body)
+            return
         if path == '/api/owner/service/restart':
             name = body.get('name', '') if isinstance(body, dict) else ''
             ok, message = restart_svc(name)
@@ -1243,12 +1351,6 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.split('/')
         if len(parts) == 6 and parts[:4] == ['', 'api', 'owner', 'messages']:
             card_id, action = self._seg(parts[4]), parts[5]
-            if action == 'plan':
-                self._owner_plan(card_id)
-                return
-            if action == 'execute':
-                self._owner_execute(card_id, body)
-                return
             fn = self._CARD_ACTIONS.get(action)
             if fn is not None:
                 ok = fn(card_id)
@@ -1258,18 +1360,7 @@ class Handler(BaseHTTPRequestHandler):
                     'action': action,
                     # unread_count stays for the widget that has not been changed yet.
                     'unread_count': MSG.unread_count(),
-                    'needs_action_count': MSG.needs_action_count(),
                 })
-                return
-        if len(parts) == 6 and parts[:4] == ['', 'api', 'owner', 'runs']:
-            if parts[5] == 'keep':
-                self._owner_keep(self._seg(parts[4]))
-                return
-            if parts[5] == 'stop':
-                self._owner_stop(self._seg(parts[4]))
-                return
-            if parts[5] == 'view':
-                self._owner_view(self._seg(parts[4]))
                 return
         self._json(404, {'ok': False, 'error': f'unknown owner path: {path}'})
 
@@ -1328,38 +1419,244 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(400, {'ok': False, 'error': 'bad_action'})
             return
-        with _UPDATE_RUN_LOCK:
-            record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
-            if UPDATE_EXEC.active(record):
-                self._json(409, {'ok': False, 'error': 'run_active',
-                                 'run_id': record.get('runId')})
-                return
-            # Only a measured `True` blocks. An unmeasurable lock must not take the
-            # button away — the updater's own mutex refuses a second run regardless,
-            # and that refusal is visible in the pane and in the run's exit code.
-            if UPDATE_EXEC.updater_busy(cfg['root']) is True:
-                self._json(409, {'ok': False, 'error': 'updater_busy'})
-                return
-            run_id = UPDATE_EXEC.new_run_id()
-            try:
-                UPDATE_EXEC.ensure_dirs(cfg['dir'])
-                UPDATE_EXEC.sweep_plans(cfg['dir'])
-                # Written BEFORE the window exists so a click is never invisible: if the
-                # launch dies here, the panel shows a failed run instead of nothing.
-                UPDATE_EXEC.write_record(
-                    cfg['dir'], UPDATE_EXEC.start_record(run_id, action, app_id))
-            except OSError as exc:
-                sys.stderr.write(f'[update-exec] run record write failed: {exc}\n')
-                self._json(500, {'ok': False, 'error': 'state_unwritable'})
-                return
-            plan = UPDATE_EXEC.build_plan(cfg['root'], cfg['dir'], run_id, action, app_id)
-            outcome, _target = _launch_run(run_id, plan, cfg, run_id)
+        self._owner_update_launch(action, app_id)
+
+    def _owner_update_launch(self, action, app_id, response_action=None, lock_held=False,
+                             approved_digest=None, package_path=None, reapprove=False):
+        """Launch one already-authorized closed action through the shared scope."""
+        cfg = UPDATE_EXEC_CONFIG
+        if cfg is None:
+            self._json(404, {'ok': False, 'error': 'update execution not enabled'})
+            return
+        if not lock_held:
+            with _UPDATE_RUN_LOCK:
+                return self._owner_update_launch(action, app_id, response_action, True)
+        record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
+        if UPDATE_EXEC.active(record):
+            self._json(409, {'ok': False, 'error': 'run_active',
+                             'run_id': record.get('runId')})
+            return
+        # Only a measured `True` blocks. An unmeasurable lock must not take the
+        # button away — the updater's own mutex refuses a second run regardless,
+        # and that refusal is visible in the pane and in the run's exit code.
+        if UPDATE_EXEC.updater_busy(cfg['root']) is True:
+            self._json(409, {'ok': False, 'error': 'updater_busy'})
+            return
+        run_id = UPDATE_EXEC.new_run_id()
+        try:
+            UPDATE_EXEC.ensure_dirs(cfg['dir'])
+            UPDATE_EXEC.sweep_plans(cfg['dir'])
+            # Written BEFORE the window exists so a click is never invisible: if the
+            # launch dies here, the panel shows a failed run instead of nothing.
+            UPDATE_EXEC.write_record(
+                cfg['dir'], UPDATE_EXEC.start_record(run_id, action, app_id))
+        except OSError as exc:
+            sys.stderr.write(f'[update-exec] run record write failed: {exc}\n')
+            self._json(500, {'ok': False, 'error': 'state_unwritable'})
+            return
+        plan = UPDATE_EXEC.build_plan(
+            cfg['root'], cfg['dir'], run_id, action, app_id,
+            approved_digest=approved_digest, package_path=package_path,
+            reapprove=reapprove)
+        outcome, _target = _launch_run(run_id, plan, cfg, run_id)
         if outcome != 'ok':
             self._fail_update_record(cfg, run_id, outcome)
             self._json(503 if outcome == 'ambiguous' else 500,
                        {'ok': False, 'error': 'launch_failed', 'outcome': outcome})
             return
-        self._json(200, {'ok': True, 'run_id': run_id, 'action': action, 'id': app_id})
+        payload = {'ok': True, 'run_id': run_id,
+                   'action': response_action or action, 'id': app_id}
+        if response_action is not None:
+            payload['execution'] = action
+        self._json(200, payload)
+
+    def _owner_app_action(self, app_id, action, body=None):
+        """Mutate one app intent, then run the full installer outside this service."""
+        if APPS is None or UPDATE_EXEC_CONFIG is None:
+            self._json(404, {'ok': False, 'error': 'app store not enabled'})
+            return
+        if action not in ('enable', 'disable', 'remove', 'register', 'reapprove'):
+            self._json(404, {'ok': False, 'error': 'unknown app action'})
+            return
+        if not isinstance(app_id, str) or APPS.APP_ID.fullmatch(app_id) is None:
+            self._json(400, {'ok': False, 'error': 'bad_app_id'})
+            return
+        with _UPDATE_RUN_LOCK:
+            # Refuse before changing the operator's config. Otherwise a second click
+            # during a live installer would answer 409 only after leaving unapplied
+            # intent behind on disk.
+            cfg = UPDATE_EXEC_CONFIG
+            record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
+            if UPDATE_EXEC.active(record):
+                self._json(409, {'ok': False, 'error': 'run_active',
+                                 'run_id': record.get('runId')})
+                return
+            if UPDATE_EXEC.updater_busy(cfg['root']) is True:
+                self._json(409, {'ok': False, 'error': 'updater_busy'})
+                return
+            self._owner_app_action_locked(app_id, action, body)
+
+    def _owner_company_install(self, app_id):
+        """Stage one catalog pin, then reuse the canonical config writer and installer."""
+        if APPS is None or COMPANY_CATALOG is None or UPDATE_EXEC_CONFIG is None:
+            self._json(404, {'ok': False, 'error': 'company catalog not enabled'})
+            return
+        if not isinstance(app_id, str) or APPS.APP_ID.fullmatch(app_id) is None:
+            self._json(400, {'ok': False, 'error': 'bad_app_id'})
+            return
+        with _UPDATE_RUN_LOCK:
+            cfg = UPDATE_EXEC_CONFIG
+            record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
+            if UPDATE_EXEC.active(record):
+                self._json(409, {'ok': False, 'error': 'run_active',
+                                 'run_id': record.get('runId')})
+                return
+            if UPDATE_EXEC.updater_busy(cfg['root']) is True:
+                self._json(409, {'ok': False, 'error': 'updater_busy'})
+                return
+            try:
+                config = APPS.config_path(cfg['root'])
+                rows = COMPANY_CATALOG.list_catalog(config)
+                entry = next((row for row in rows if row['id'] == app_id), None)
+                if entry is None:
+                    self._json(404, {'ok': False, 'error': 'app_not_found'})
+                    return
+                if entry['installable'] is not True:
+                    self._json(409, {
+                        'ok': False, 'error': 'catalog_not_installable',
+                        'reason': entry['reason'],
+                    })
+                    return
+                package = COMPANY_CATALOG.stage_entry(cfg['root'], config, entry)
+                preview = APPS.package_preview(cfg['root'], str(package))
+                canonical_path = str(Path(preview.get('path', '')).resolve())
+                if (preview.get('id') != app_id
+                        or preview.get('digest') != entry['tree_digest']
+                        or Path(canonical_path) != package.resolve()):
+                    self._json(409, {'ok': False, 'error': 'package_preview_changed'})
+                    return
+                if preview.get('installable') is not True:
+                    self._json(409, {
+                        'ok': False, 'error': 'package_not_installable',
+                        'rejected_capabilities': preview.get('rejected_capabilities') or [],
+                        'conflict': preview.get('conflict'),
+                    })
+                    return
+                if preview.get('registered'):
+                    self._json(409, {'ok': False, 'error': 'package_already_registered'})
+                    return
+                APPS.register(config, app_id, {
+                    'path': canonical_path,
+                    'grant': preview.get('grants') or [],
+                })
+            except APPS.AppsError as exc:
+                sys.stderr.write(f'[apps] company register failed for {app_id!r} '
+                                 f'({exc.code}): {exc.detail}\n')
+                status = 400 if exc.code in ('bad_app_id', 'config_invalid') else 409 \
+                    if exc.code in ('config_conflict', 'package_already_registered') else 500
+                self._json(status, {'ok': False, 'error': exc.code})
+                return
+            except COMPANY_CATALOG.CatalogError as exc:
+                sys.stderr.write(f'[apps] company stage failed for {app_id!r} '
+                                 f'({exc.code}): {exc.detail}\n')
+                status = 409 if exc.code in (
+                    'digest_mismatch', 'catalog_not_installable') else 503 \
+                    if exc.code in ('catalog_unavailable', 'stage_unavailable') else 500
+                self._json(status, {'ok': False, 'error': exc.code})
+                return
+            self._owner_update_launch(
+                'install', app_id, response_action='install-company', lock_held=True,
+                approved_digest=entry['tree_digest'], package_path=canonical_path)
+
+    def _owner_app_action_locked(self, app_id, action, body=None):
+        cfg = UPDATE_EXEC_CONFIG
+        updates = UPDATES.read_snapshot() if UPDATES is not None else None
+        try:
+            if action in ('register', 'reapprove'):
+                package_path = body.get('path') if isinstance(body, dict) else None
+                approved_digest = body.get('digest') if isinstance(body, dict) else None
+                if (not isinstance(package_path, str) or not package_path.strip()
+                        or not isinstance(approved_digest, str)
+                        or re.fullmatch(r'[0-9a-f]{64}', approved_digest) is None):
+                    self._json(400, {'ok': False, 'error': 'bad_package_approval'})
+                    return
+                preview = APPS.package_preview(cfg['root'], package_path)
+                if preview.get('id') != app_id or preview.get('digest') != approved_digest:
+                    self._json(409, {'ok': False, 'error': 'package_preview_changed'})
+                    return
+                if preview.get('installable') is not True:
+                    self._json(409, {
+                        'ok': False, 'error': 'package_not_installable',
+                        'rejected_capabilities': preview.get('rejected_capabilities') or [],
+                        'conflict': preview.get('conflict'),
+                    })
+                    return
+                config = APPS.config_path(cfg['root'])
+                canonical_path = str(Path(preview['path']).resolve())
+                if action == 'register':
+                    if preview.get('registered'):
+                        self._json(409, {'ok': False, 'error': 'package_already_registered'})
+                        return
+                    APPS.register(config, app_id, {
+                        'path': canonical_path,
+                        'grant': preview.get('grants') or [],
+                    })
+                else:
+                    if APPS.registered_package_path(config, app_id) != Path(canonical_path):
+                        self._json(409, {'ok': False, 'error': 'package_path_changed'})
+                        return
+                    if preview.get('requires_reapproval') is not True:
+                        self._json(409, {'ok': False, 'error': 'reapproval_not_required'})
+                        return
+                self._owner_update_launch(
+                    'install', app_id, response_action=action, lock_held=True,
+                    approved_digest=approved_digest, package_path=canonical_path,
+                    reapprove=(action == 'reapprove'))
+                return
+
+            projection = APPS.list_apps(cfg['root'], updates)
+            installed = {row['id']: row for row in projection['installed']}
+            public = {row['id']: row for row in projection['public']}
+            if action == 'enable':
+                if app_id not in installed and app_id not in public:
+                    self._json(404, {'ok': False, 'error': 'app_not_found'})
+                    return
+                if app_id not in installed:
+                    config = APPS.config_path(cfg['root'])
+                    APPS.register(config, app_id)
+            else:
+                row = installed.get(app_id)
+                if app_id == 'hub' or app_id in projection['apps'] and row is None:
+                    self._json(409, {'ok': False, 'error': 'app_locked'})
+                    return
+                # Reconcile cannot remove a recorded package without its optional
+                # deactivator.  Refuse before changing config; the UI also disables
+                # the destructive control, but presentation is not the boundary.
+                if row is not None and not row.get('canRemove'):
+                    error = ('disable_unavailable' if action == 'disable'
+                             else 'remove_unavailable')
+                    self._json(409, {'ok': False, 'error': error})
+                    return
+                if row is not None:
+                    config = APPS.config_path(cfg['root'])
+                    APPS.mutate_enabled(config, app_id, False)
+        except APPS.AppsError as exc:
+            sys.stderr.write(f'[apps] {action} failed for {app_id!r} '
+                             f'({exc.code}): {exc.detail}\n')
+            if exc.code in ('bad_app_id', 'bad_package_path', 'bad_package_registration',
+                            'bad_package_grants', 'config_invalid', 'config_unsupported'):
+                status = 400
+            elif exc.code in ('config_conflict', 'app_already_registered',
+                              'package_already_registered', 'package_not_registered'):
+                status = 409
+            else:
+                status = 500
+            self._json(status, {'ok': False, 'error': exc.code})
+            return
+        # Current installer reconcile removes the committed artifacts, including
+        # units, for every canRemove app.  `teardown` remains a closed runner action
+        # for an explicit future caller; remove must not run it as well and double-act.
+        self._owner_update_launch('install', app_id, response_action=action, lock_held=True)
 
     @staticmethod
     def _fail_update_record(cfg, run_id, outcome):
@@ -1481,109 +1778,23 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             sys.stderr.write(f'[harness-exec] failure record write failed: {exc}\n')
 
-    def _owner_plan(self, card_id):
-        res = MSG.issue_approval(card_id, EXEC_CONFIG)
-        if res['ok']:
-            self._json(200, res)
+    def _owner_run(self, body):
+        card_id = body.get('card_id') if isinstance(body, dict) else None
+        if not isinstance(card_id, str):
+            self._json(400, {'ok': False, 'error': 'card_id required'})
             return
-        code = res['error']
-        status = 404 if code == 'card_not_found' else 409 if code == 'run_active' else 422
-        self._json(status, res)
-
-    def _owner_execute(self, card_id, body):
-        nonce = body.get('nonce') if isinstance(body, dict) else None
-        res = MSG.redeem_approval(card_id, nonce, EXEC_CONFIG)
-        if not res['ok']:
-            code = res['error']
-            status = 409 if code in ('plan_stale', 'nonce_used', 'expired', 'run_active', 'no_nonce') \
-                else 404 if code in ('no_approval', 'card_not_found') else 400
-            self._json(status, {'ok': False, 'error': code})
+        card = MSG.get_card(card_id)
+        if not card or not card['run']:
+            self._json(404, {'ok': False, 'error': 'run not found'})
             return
-        run_id = res['run_id']
-        outcome, target = _launch_run(run_id, res['plan'])
-        if outcome == 'nowindow':
-            MSG.run_fail(run_id, 'launch failed before window')
-            self._json(500, {'ok': False, 'error': 'launch_failed'})
+        try:
+            target = _launch_message(card, EXEC_CONFIG)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            sys.stderr.write('[message-run] launch failed: %s\n' % type(error).__name__)
+            self._json(502, {'ok': False, 'error': 'launch_failed'})
             return
-        if outcome == 'ambiguous':
-            # The window may exist, so retain the card lock to prevent a duplicate run.
-            sys.stderr.write(f'[exec] tmux launch ambiguous run={run_id}; retaining card lock\n')
-            self._json(503, {'ok': False, 'error': 'launch_uncertain', 'run_id': run_id})
-            return
-        if not MSG.run_mark_running(run_id, target):
-            if _tmux('kill-window', '-t', _win_id(target)) is None:
-                sys.stderr.write(f'[exec] orphan window kill failed run={run_id} target={target}\n')
-                self._json(500, {'ok': False, 'error': 'orphan_kill_failed', 'target': target})
-            else:
-                self._json(409, {'ok': False, 'error': 'run_superseded'})
-            return
-        self._json(200, {'ok': True, 'run_id': run_id, 'session': EXEC_CONFIG['session']})
-
-    _VIEW_ERR_STATUS = {
-        'not_found': 404,
-        'not_active': 409,
-        'launching': 409,
-        'stale_target_format': 409,
-        'stale_generation': 409,
-        'tmux_unavailable': 502,
-    }
-
-    def _owner_view(self, run_id):
-        """Create a view session only after generation-aware target validation."""
-        session = EXEC_CONFIG['session']
-        ok, res = MSG.run_view_request(MSG.get_run(run_id), _exec_alive_keys(session), session)
-        if not ok:
-            self._json(self._VIEW_ERR_STATUS.get(res, 409), {'ok': False, 'error': res})
-            return
-        if not _ensure_view_session(res['view'], session, res['window_id']):
-            self._json(502, {'ok': False, 'error': 'view_create_failed'})
-            return
-        # Recheck after session creation so a restarted tmux server cannot redirect a view.
-        ok2, res2 = MSG.run_view_request(MSG.get_run(run_id), _exec_alive_keys(session), session)
-        if not ok2 or res2['target'] != res['target']:
-            if _tmux('kill-session', '-t', res['view']) is None:
-                sys.stderr.write(f"[view] stale view kill failed view={res['view']}\n")
-            self._json(409, {'ok': False, 'error': 'stale_generation'})
-            return
-        self._json(200, {
-            'ok': True,
-            'arg': res['view'],
-            'window_id': res['window_id'],
-            'run_id': run_id,
-        })
-
-    def _owner_stop(self, run_id):
-        run = MSG.get_run(run_id)
-        if not run or run['status'] not in ('starting', 'running'):
-            self._json(404, {'ok': False, 'error': 'not_active'})
-            return
-        target = run.get('tmux_target')
-        if not target:
-            # Do not release the lock while a launch may still create a window.
-            self._json(409, {'ok': False, 'error': 'launching', 'retry_after': 1})
-            return
-        if ':' not in target:
-            self._json(409, {'ok': False, 'error': 'stale_target_format', 'target': target})
-            return
-        keys = _exec_alive_keys(EXEC_CONFIG['session'])
-        if keys is None:
-            self._json(502, {'ok': False, 'error': 'tmux_unavailable'})
-            return
-        if target in keys and _tmux('kill-window', '-t', _win_id(target)) is None:
-            self._json(502, {'ok': False, 'error': 'kill_failed'})
-            return
-        changed, _ = MSG.run_stop(run_id)
-        self._json(200 if changed else 409, {'ok': bool(changed), 'run_id': run_id})
-
-    def _owner_keep(self, run_id):
-        """Persist an owner's Keep choice under the same lock as tmux lifecycle changes."""
-        with _TMUX_LOCK:
-            ok, error = MSG.run_keep(run_id)
-        if ok:
-            self._json(200, {'ok': True, 'run_id': run_id, 'keep': True})
-            return
-        status = 404 if error == 'not_found' else 409
-        self._json(status, {'ok': False, 'run_id': run_id, 'error': error})
+        self._json(200, {'ok': True, 'card_id': card_id, 'target': target,
+                         'session': EXEC_CONFIG['session'], 'ran_at': MSG.mark_ran(card_id)})
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f'[airlock-dev-monitor] {self.address_string()} - {fmt % args}\n')
@@ -1626,44 +1837,6 @@ def _tmux_has_session(name):
         return None
 
 
-def _exec_alive_keys(session):
-    """Return current ``server_pid:window_id`` keys, or None if tmux is indeterminate."""
-    out = _tmux('list-windows', '-t', session, '-F', '#{pid}:#{window_id}', capture=True)
-    if out is None:
-        return set() if _tmux_has_session(session) == 1 else None
-    return {line.strip() for line in out.splitlines() if line.strip()}
-
-
-def _ensure_view_session(view, session, window_id, tmux=None):
-    """Ensure that a view session contains only the requested run window."""
-    command = tmux or _tmux
-    if _tmux_has_session(view) == 0:
-        return True
-    if command('new-session', '-d', '-s', view) is None:
-        return False
-    dummy = command('list-windows', '-t', view, '-F', '#{window_id}', capture=True)
-    if command('link-window', '-s', f'{session}:{window_id}', '-t', view + ':') is None:
-        command('kill-session', '-t', view)
-        return False
-    if dummy and command('kill-window', '-t', f'{view}:{dummy}') is None:
-        sys.stderr.write(f'[view] dummy window kill failed view={view} dummy={dummy}\n')
-    return True
-
-
-def _reap_view_sessions():
-    """Remove view sessions whose corresponding run is no longer active."""
-    out = _tmux('list-sessions', '-F', '#{session_name}', capture=True)
-    if out is None:
-        return
-    keep = MSG.active_view_sessions()
-    for name in out.splitlines():
-        name = name.strip()
-        if not name.startswith(MSG.VIEW_SESSION_PREFIX) or name in keep:
-            continue
-        if _tmux('kill-session', '-t', name) is None:
-            sys.stderr.write(f'[view] orphan view kill failed session={name}\n')
-
-
 def _launch_run(run_id, plan, cfg=None, window_name=None):
     """Persist a plan then launch its runner in a new tmux window.
 
@@ -1695,7 +1868,7 @@ def _launch_run(run_id, plan, cfg=None, window_name=None):
     command = ' '.join(shlex.quote(item) for item in [
         'python3', cfg['runner'], run_id, plan_file, cfg['sentinel_dir'],
     ])
-    window_name = window_name or MSG.run_window_name(run_id)
+    window_name = window_name or ('exec-' + run_id.split('-')[-1])
     session, cwd = cfg['session'], plan['cwd']
     with _TMUX_LOCK:
         has_session = _tmux_has_session(session) == 0
@@ -1713,372 +1886,69 @@ def _launch_run(run_id, plan, cfg=None, window_name=None):
     return ('ok', target)
 
 
-def _sentinel_watcher(stop_event, sentinel_dir):
-    """Apply runner completion sentinels and remove each file after processing."""
-    while not stop_event.is_set():
-        try:
-            for name in os.listdir(sentinel_dir):
-                if not name.endswith('.done'):
-                    continue
-                path = os.path.join(sentinel_dir, name)
-                try:
-                    with open(path) as f:
-                        data = json.load(f)
-                    MSG.run_finish(data['run_id'], int(data.get('exit_code', 1)))
-                except Exception as exc:
-                    sys.stderr.write(f'[sentinel] bad {name}: {exc}\n')
-                finally:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        stop_event.wait(2)
-
-
-def _runs_in_flight():
-    """Every run currently in 'starting' or 'running' — all of them, not a page.
-
-    devmon_messages.list_runs() exists for the UI and caps at 50 by design. The reaper
-    needs completeness, not recency, so it asks the store directly. Bounded anyway: a run
-    only stays in these two states while it is alive.
-    """
-    conn = MSG._conn()
-    rows = conn.execute(
-        "SELECT * FROM runs WHERE status IN ('starting','running')").fetchall()
-    return [dict(r) for r in rows]
-
-
-def _reap_stuck_starting(session):
-    """Fail runs that were approved but never produced a window, so the card unlocks.
-
-    devmon_messages.reap_runs deliberately leaves a run with no recorded tmux_target
-    alone: ending it on a guess would orphan a live process. That is right, but it left
-    no way out at all — a launch that failed after the run row was written kept its card
-    showing "running" with a Stop button that answers 409, forever.
-
-    The escape has to be proof, not a timeout. _launch_run names every window
-    deterministically, so the ABSENCE of a window with that name is proof that nothing
-    was started for this run. (A name collision could only make us keep the run, never
-    end a live one.) The grace period exists solely so we do not race a launch that is
-    still inside _TMUX_LOCK.
-    """
-    names = _tmux('list-windows', '-t', session, '-F', '#{window_name}', capture=True)
-    if names is None:
-        # Session absent = definitely no windows. tmux unreachable = we know nothing.
-        if _tmux_has_session(session) != 1:
-            return
-        live = set()
-    else:
-        live = {n.strip() for n in names.splitlines() if n.strip()}
-    cutoff = time.time() - STARTING_GRACE_S
-    # Not list_runs(): it pages at 50, and a stuck run is by definition an OLD one. With
-    # 50 newer runs on the box the escape hatch simply stopped existing.
-    for run in _runs_in_flight():
-        if run.get('status') != 'starting' or run.get('tmux_target'):
-            continue
-        created = run.get('created_at') or ''
-        try:
-            age_ok = datetime.strptime(created[:19], '%Y-%m-%dT%H:%M:%S').replace(
-                tzinfo=timezone.utc).timestamp() < cutoff
-        except ValueError:
-            continue
-        if not age_ok or MSG.run_window_name(run['run_id']) in live:
-            continue
-        MSG.run_fail(run['run_id'], 'launch never produced a window')
-        sys.stderr.write(f"[reaper] released stuck run={run['run_id']} (no window was ever created)\n")
-
-
-def _is_claude_run(run):
-    """Return whether a run used the interactive Claude path rather than direct exec."""
-    try:
-        plan = json.loads(run.get('plan_json') or '{}')
-    except (TypeError, ValueError):
-        # A malformed historical plan must not become an immortal process/window.
-        return True
-    return not (isinstance(plan.get('exec'), list) and plan['exec'])
-
-
-def _reap_completed_runs(alive_ids, now=None):
-    """Reclaim expired Claude runs as one process/window/sentinel lifecycle.
-
-    ``now`` is an intentionally narrow test seam so the 24-hour boundary can be asserted
-    without sleeping; it is not a supported retention override or configuration knob.
-    """
-    if not EXEC_CONFIG or action_runner is None or alive_ids is None:
-        return
-    clock_now = MSG.now_utc() if now is None else now
-    alive = set(alive_ids)
-    for run in MSG.reclaimable_runs():
-        if not _is_claude_run(run):
-            continue
-        try:
-            ended = MSG.parse_rfc3339(run['ended_at'])
-        except (TypeError, ValueError) as exc:
-            sys.stderr.write(f"[reaper] cannot age run={run.get('run_id')}: {exc}\n")
-            continue
-        age = (clock_now - ended).total_seconds()
-        if age < RUN_RETENTION_S:
-            continue
-
-        run_id = run['run_id']
-        target = run.get('tmux_target')
-        if target and ':' not in target:
-            # A legacy @N target cannot be matched to the current tmux server generation safely.
-            sys.stderr.write(f"[reaper] cannot reclaim run={run_id}: unsupported tmux target {target}\n")
-            continue
-
-        # Keep and automatic reclaim share this lock. The re-read closes the race where an
-        # owner presses Keep after the candidate query but before kill-window.
-        with _TMUX_LOCK:
-            latest = MSG.get_run(run_id)
-            if (latest is None or latest['status'] not in MSG.RUN_TERMINAL
-                    or latest.get('keep') or latest.get('reclaimed_at') is not None):
-                continue
-            target = latest.get('tmux_target')
-            if target and ':' not in target:
-                sys.stderr.write(f"[reaper] cannot reclaim run={run_id}: unsupported tmux target {target}\n")
-                continue
-
-            if target and target in alive:
-                if _tmux('kill-window', '-t', _win_id(target)) is None:
-                    sys.stderr.write(f"[reaper] expired run={run_id} window kill failed target={target}\n")
-                    continue
-                window_action = 'killed'
-            elif target:
-                window_action = 'already absent'
-            else:
-                window_action = 'no target'
-
-            failures = action_runner.cleanup_run_sentinels(
-                EXEC_CONFIG['sentinel_dir'], run_id)
-            if failures:
-                detail = '; '.join('%s: %s' % (path, exc) for path, exc in failures)
-                sys.stderr.write(f"[reaper] expired run={run_id} sentinel cleanup failed: {detail}\n")
-                continue
-            if not MSG.run_mark_reclaimed(run_id, reason='turn ended more than 24h ago'):
-                # Keep may have won a direct caller race; leave the reason visible rather than
-                # claiming that all three resources were reclaimed.
-                sys.stderr.write(f"[reaper] expired run={run_id} reclaim state changed before recording\n")
-                continue
-            sys.stderr.write(
-                f"[reaper] reclaimed expired run={run_id} reason=turn ended more than 24h ago; "
-                f"process=tmux-pane window={window_action} target={target or '-'} sentinels=removed\n")
-
-
-def _reap_plan_files():
-    """Delete the plan file of every run that is no longer active.
-
-    The plan is the approved cwd plus the prompt, skill or argv — the same content
-    devmon_messages.sweep() takes care to drop from `approvals` after a day so it is not
-    retained. Leaving a plaintext copy in plans/ forever would make that pointless.
-    """
-    cfg = EXEC_CONFIG
-    if not cfg:
-        return
-    # Must be the COMPLETE set of live runs. Derived from a paged list it would omit an
-    # active run and delete the plan file the runner is about to open — the approved action
-    # would then fail having never run.
-    active = {r['run_id'] for r in _runs_in_flight()}
-    for name in os.listdir(cfg['plan_dir']):
-        if not name.endswith('.json') or name[:-5] in active:
-            continue
-        try:
-            os.remove(os.path.join(cfg['plan_dir'], name))
-        except OSError as exc:
-            sys.stderr.write(f'[reaper] plan cleanup failed {name}: {exc}\n')
-
-
-def _reaper_loop(stop_event, session):
-    """Mark missing run windows only when tmux returns a definite live-key set."""
-    while not stop_event.is_set():
-        try:
-            keys = _exec_alive_keys(session)
-            if keys is None:
-                stop_event.wait(15)
-                continue
-            MSG.reap_runs(keys)
-            _reap_view_sessions()
-            _reap_stuck_starting(session)
-            _reap_completed_runs(keys)
-            _reap_plan_files()
-        except Exception as exc:
-            sys.stderr.write(f'[reaper] {exc}\n')
-        stop_event.wait(15)
-
-
-def _sweep_loop(stop_event):
-    """Run message retention and archival maintenance without stopping the monitor."""
-    while not stop_event.is_set():
-        try:
-            MSG.sweep()
-            for lane in MESSAGE_LANES:
-                MSG.maybe_enqueue_lane_probe(lane)
-        except Exception as exc:
-            sys.stderr.write(f'[airlock-dev-monitor] sweep error: {exc}\n')
-        stop_event.wait(900)
-
-
-def _lane_watchdog_once(webhooks, active_incidents=None, at=None, recovery_candidates=None):
-    """Record lane incidents and best-effort crossover notices with stable recovery."""
-    if active_incidents is None:
-        active_incidents = MSG.active_lane_watchdog_channels()
-    if recovery_candidates is None:
-        recovery_candidates = {}
-    observed_at = at or MSG.now_utc()
-    reasons = {}
-    evaluation_failed = set()
-    for lane in MESSAGE_LANES:
-        try:
-            reasons[lane] = MSG.lane_watchdog_reason(
-                lane, 'on' if webhooks.get(lane) else 'off: no webhook configured', observed_at)
-        except Exception as exc:  # isolate corrupt state to its lane
-            evaluation_failed.add(lane)
-            recovery_candidates.pop(lane, None)
-            sys.stderr.write(
-                f'[airlock-dev-monitor] lane watchdog {lane} evaluation error: '
-                f'{exc.__class__.__name__}: {exc}\n')
-    for lane, reason in reasons.items():
-        if reason is None:
-            if lane in active_incidents:
-                # Recovery is evidence from consecutive completed evaluations, not
-                # elapsed wall time.  A busy loop or process pause therefore cannot
-                # create a 15-second cliff or count unobserved time as health.
-                healthy_passes = recovery_candidates.get(lane, 0) + 1
-                recovery_candidates[lane] = healthy_passes
-                if healthy_passes < MSG.LANE_WATCHDOG_RECOVERY_HEALTHY_PASSES:
-                    continue
-                try:
-                    MSG.resolve_lane_watchdog(lane, observed_at)
-                    active_incidents.discard(lane)
-                    recovery_candidates.pop(lane, None)
-                except Exception as exc:
-                    sys.stderr.write(
-                        f'[airlock-dev-monitor] lane watchdog {lane} recovery error: {exc}\n')
-            else:
-                recovery_candidates.pop(lane, None)
-            continue
-        recovery_candidates.pop(lane, None)
-        try:
-            card_id, created = MSG.record_lane_watchdog(lane, reason, observed_at)
-            active_incidents.add(lane)
-            other_lane = next(candidate for candidate in MESSAGE_LANES if candidate != lane)
-            if webhooks.get(other_lane):
-                queued = MSG.enqueue_lane_watchdog_notice(card_id, other_lane, observed_at)
-                if queued and (other_lane in evaluation_failed
-                               or reasons.get(other_lane) is not None):
-                    sys.stderr.write(
-                        f'[airlock-dev-monitor] lane watchdog {lane}={reason["state"]}; '
-                        f'opposite Slack lane {other_lane} is unhealthy, '
-                        'queued best-effort notice\n')
-            elif created:
-                sys.stderr.write(
-                    f'[airlock-dev-monitor] lane watchdog {lane}={reason["state"]}; '
-                    'no configured opposite Slack lane for notice\n')
-        except Exception as exc:
-            sys.stderr.write(
-                f'[airlock-dev-monitor] lane watchdog {lane} persistence error: '
-                f'{exc.__class__.__name__}: {exc}\n')
-            continue
-    return active_incidents
-
-
-def _lane_watchdog_loop(stop_event, webhooks):
-    """Evaluate every lane independently of the webhook worker threads."""
-    active_incidents = None
-    recovery_candidates = {}
-    while not stop_event.is_set():
-        try:
-            if active_incidents is None:
-                active_incidents = MSG.active_lane_watchdog_channels()
-            _lane_watchdog_once(
-                webhooks, active_incidents, recovery_candidates=recovery_candidates)
-        except Exception as exc:
-            sys.stderr.write(f'[airlock-dev-monitor] lane watchdog error: {exc}\n')
-        stop_event.wait(5)
-
-
 def _build_exec_config():
-    """Build execution paths after a complete owner configuration has been loaded."""
-    state_dir = os.path.dirname(OWNER_CONFIG['db'])
-    plan_dir = os.path.join(state_dir, 'plans')
-    sentinel_dir = os.path.join(state_dir, 'sentinels')
-    for directory in (plan_dir, sentinel_dir):
-        os.makedirs(directory, exist_ok=True)
-        try:
-            os.chmod(directory, 0o700)
-        except OSError:
-            pass
     return {
-        # `or HOME`, not a default= — a systemd EnvironmentFile writes an empty value for
-        # an unset key, and canonical_plan reads a falsy root as 'no bound at all'.
         'cwd_root': os.environ.get('DEV_MONITOR_CWD_ROOT') or HOME,
         'session': os.environ.get('DEV_MONITOR_EXEC_SESSION', 'devmon-exec'),
-        # Carried to the runner through the PLAN, never the environment: a tmux window
-        # inherits the tmux SERVER's env, not ours. Resolution happens there (action_runner).
         'agent': {'provider': os.environ.get('AIRLOCK_AGENT_PROVIDER', ''),
                   'select_bin': os.environ.get('AIRLOCK_AGENT_BIN', '')},
         'runner': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'action_runner.py'),
-        'plan_dir': plan_dir,
-        'sentinel_dir': sentinel_dir,
     }
+
+
+def _launch_message(card, cfg):
+    run = card['run']
+    cwd = os.path.realpath(os.path.expanduser(run['cwd']))
+    root = os.path.realpath(os.path.expanduser(cfg['cwd_root']))
+    if not os.path.isdir(cwd) or not cwd.startswith(root + os.sep):
+        raise ValueError('cwd outside allowed root or missing')
+    prompt = run['prompt']
+    if card['count'] > 1:
+        prompt += '\n\nMessage context: last_at=%s count=%s' % (card['last_at'], card['count'])
+    agent = action_runner.resolve_agent(cfg.get('agent'))
+    agent['binary'] = action_runner.resolve_exe(
+        action_runner.build_argv({'prompt': prompt}, agent), action_runner.runtime_env())
+    # Multiple shell-command arguments make tmux exec them directly. The prompt is
+    # one argv element here and one argv element again when the runner calls the CLI.
+    command = [sys.executable, cfg['runner'], '--message', root, prompt, json.dumps(agent)]
+    session = cfg['session']
+    def tmux_arg(value):
+        # tmux parses a terminal semicolon even in argv form. One extra backslash
+        # quotes it for that parser; tmux removes exactly that extra backslash.
+        return value[:-1] + '\\;' if value.endswith(';') else value
+
+    def message_tmux(*args, **kwargs):
+        return _tmux(*(tmux_arg(value) for value in args), **kwargs)
+
+    with _TMUX_LOCK:
+        if _tmux_has_session(tmux_arg(session)) != 0:
+            if message_tmux('new-session', '-d', '-s', session) is None:
+                raise OSError('cannot create execution session')
+        target = message_tmux('new-window', '-d', '-t', session + ':', '-n', 'message', '-c', cwd,
+                              '-P', '-F', '#{pid}:#{window_id}', *command, capture=True)
+    if not target:
+        raise OSError('cannot create execution window')
+    return target
 
 
 def _messages_state():
     return _MESSAGES_STATE
 
 
-def _message_lanes_health():
-    """Return the stable per-lane health ABI, even while messages are unavailable."""
-    # 🔴 이 dict 는 `MSG.delivery_lane_health()` 가 내는 것과 **같은 키 집합**이어야 한다. 그게
-    #    docstring 이 말하는 "stable ABI" 의 전부다. 2026-08-18 실측 — 여기에만
-    #    `last_success_age_seconds` 가 빠져 있어서, messages 가 꺼진 설치에서는 lane 하나가 10키,
-    #    켜진 설치에서는 11키였다. 소비자는 켜고 끄는 것만으로 KeyError 를 만난다
-    #    (실제로 devmon_messages.py:721 이 그 키를 읽는다). 아래 시험이 두 경로의 키 집합을 맞댄다.
-    idle = {
-        'delivery_state': 'idle',
-        'last_success_at': None,
-        'last_success_age_seconds': None,
-        'pending_count': 0,
-        'oldest_pending_age_seconds': None,
-        'last_error': None,
-        'last_error_at': None,
-        'consecutive_failures': 0,
-        'terminal_failures_since_success': 0,
-        'ledger_error_count': 0,
-    }
-    health = {}
-    for lane in HEALTH_LANES:
-        delivery = dict(idle)
-        if _MESSAGES_STATE == 'on' and OWNER_CONFIG is not None:
-            try:
-                delivery = MSG.delivery_lane_health(lane)
-            except Exception as exc:
-                delivery['delivery_state'] = 'unknown'
-                delivery['last_error'] = 'health evaluation failed (%s)' % exc.__class__.__name__
-                sys.stderr.write(
-                    f'[airlock-dev-monitor] lane health {lane} evaluation error: '
-                    f'{exc.__class__.__name__}: {exc}\n')
-        health[lane] = {
-            'worker_state': _MESSAGE_LANE_WORKER_STATES[lane],
-            **delivery,
-        }
-    return health
+def _message_delivery_health():
+    if _MESSAGES_STATE != 'on' or OWNER_CONFIG is None:
+        return {'pending_count': 0, 'last_sent_at': None, 'failed_count': 0}
+    return MSG.delivery_health()
+
+
+def _slack_webhooks():
+    return slack_webhooks(os.environ)
 
 
 def _start_messages():
     """Start the optional message/action console while preserving observability on failure."""
-    global OWNER_CONFIG, EXEC_CONFIG, _MESSAGES_STATE
-    _MESSAGE_LANE_WORKER_STATES.update(_LANE_UNCONFIGURED)
-    # Fail closed, next to the worker states, and this is the only place that does it. Two
-    # jobs in one line: every early return below — not requested, unavailable, ConfigError,
-    # no owner gate, schema failure — leaves the two views of "which lanes work" agreeing,
-    # and on the success path nothing between here and the declaration further down can route
-    # a card against the module default. A second copy lower down was removed after a
-    # mutation showed no input could tell it apart from this one.
-    if MSG is not None:
-        MSG.set_enabled_channels(())
+    global OWNER_CONFIG, EXEC_CONFIG, _MESSAGES_STATE, _SLACK_WORKER_ON
+    _SLACK_WORKER_ON = False
     if not MESSAGES_REQUESTED:
         return
     if not _MESSAGES_AVAILABLE:
@@ -2099,8 +1969,7 @@ def _start_messages():
               '(DEV_MONITOR_OWNER/PROXY_SECRET/SPOOL/DB all unset) — observability only',
               flush=True)
         return
-    # Validate the spool synchronously. run_watcher() repeats this check defensively, but
-    # a first check only inside the daemon thread could die there while health still claimed
+    # Validate the spool before starting the loop; a daemon failure must not leave health
     # messages=on — especially if startup chmod drift broke the cross-UID boundary.
     try:
         devmon_spool.ensure_dirs(OWNER_CONFIG['spool'])
@@ -2124,22 +1993,7 @@ def _start_messages():
             f'[airlock-dev-monitor] messages schema failed '
             f'({exc.__class__.__name__}: {exc}) — observability only\n')
         return
-    # P4: the box's own identity for owner resolution. Not part of `_REQUIRED` (devmon_owner.py)
-    # — an empty DEV_MONITOR_ROSTER is "no roster on this box", a supported state, not a
-    # reason to disable the message feature that DEV_MONITOR_OWNER already gated above.
-    MSG.set_box_owner(OWNER_CONFIG['owner'])
-    MSG.set_roster_path(os.environ.get('DEV_MONITOR_ROSTER', '').strip())
-    legacy_webhook = os.environ.get('AIRLOCK_DEVMON_SLACK_WEBHOOK', '').strip()
-    webhooks = {
-        'slack-urgent': (
-            os.environ.get('AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT', '').strip()
-            or legacy_webhook),
-        'slack-routine': os.environ.get(
-            'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE', '').strip(),
-    }
-    # None means this box cannot send mail. The routing table still says page -> email;
-    # what changes is whether rows are written for a lane that has no worker to drain them.
-    email_config = devmon_email.config_from_env()
+    webhook = _slack_webhooks()['slack-urgent']
     console_url = os.environ.get('AIRLOCK_DEVMON_CONSOLE_URL', '').strip()
     stop = None
     # From here on, anything that fails is a generic failure of the OPTIONAL half: an
@@ -2148,65 +2002,23 @@ def _start_messages():
     try:
         EXEC_CONFIG = _build_exec_config()
         stop = threading.Event()
-        # --- delivery workers, before anything can enqueue for them ---
-        for lane, webhook in webhooks.items():
-            if not webhook:
-                continue
-            threading.Thread(
-                target=devmon_slack.run_worker, args=(lane, webhook, stop, console_url),
-                daemon=True, name=lane.replace('-', '_') + '_worker').start()
-            # Thread.start() returned: only now may health claim this lane is on.
-            _MESSAGE_LANE_WORKER_STATES[lane] = 'on'
-        if email_config is not None:
-            threading.Thread(
-                target=devmon_email.run_worker, args=(email_config, stop, console_url),
-                daemon=True, name='email_worker').start()
-            _MESSAGE_LANE_WORKER_STATES['email'] = 'on'
-        # ingest may only enqueue for lanes that have a running worker. Derived from the
-        # states just set rather than from the config a second time: two readings of "is
-        # this lane on" is how a queue starts filling for a thread that never started.
-        MSG.set_enabled_channels(
-            lane for lane in HEALTH_LANES if _MESSAGE_LANE_WORKER_STATES[lane] == 'on')
-        # --- only now the threads that can ingest ---
-        # The order is load-bearing, not tidiness. The spool watcher's first pass happens
-        # immediately and a restart normally finds files already waiting, so starting it
-        # before the line above would let a card be routed against the module default —
-        # rows written to a lane whose worker was never started, which is the 2026-07-30
-        # silence this whole phase exists to make impossible. The sentinel watcher and the
-        # reaper both ingest too, through _emit_run_result.
-        threading.Thread(
-            target=devmon_spool.run_watcher, args=(OWNER_CONFIG['spool'], stop),
-            daemon=True, name='spool_watcher').start()
-        threading.Thread(
-            target=_sweep_loop, args=(stop,), daemon=True, name='msg_sweep').start()
-        threading.Thread(
-            target=_lane_watchdog_loop, args=(stop, webhooks), daemon=True,
-            name='msg_lane_watchdog').start()
-        threading.Thread(
-            target=_sentinel_watcher, args=(stop, EXEC_CONFIG['sentinel_dir']),
-            daemon=True, name='exec_sentinel').start()
-        threading.Thread(
-            target=_reaper_loop, args=(stop, EXEC_CONFIG['session']),
-            daemon=True, name='exec_reaper').start()
+        _SLACK_WORKER_ON = bool(webhook)
+        threading.Thread(target=devmon_loop.run,
+                         args=(OWNER_CONFIG['spool'],webhook,stop,console_url),
+                         daemon=True,name='loop').start()
     except Exception as exc:  # noqa: BLE001 — an optional feature must not kill the monitor
         if stop is not None:
             stop.set()
         OWNER_CONFIG = None
         EXEC_CONFIG = None
         _MESSAGES_STATE = 'off'
-        _MESSAGE_LANE_WORKER_STATES.update(_LANE_UNCONFIGURED)
-        MSG.set_enabled_channels(())
+        _SLACK_WORKER_ON = False
         sys.stderr.write(f'[airlock-dev-monitor] messages failed to start ({exc.__class__.__name__}: '
                          f'{exc}) — observability only\n')
         return
     _MESSAGES_STATE = 'on'
-    print(f"[airlock-dev-monitor] messages feature: on owner={OWNER_CONFIG['owner']} "
-          f"spool={OWNER_CONFIG['spool']} db={OWNER_CONFIG['db']} "
-          f"exec_session={EXEC_CONFIG['session']} "
-          f"slack_urgent={_MESSAGE_LANE_WORKER_STATES['slack-urgent']} "
-          f"slack_routine={_MESSAGE_LANE_WORKER_STATES['slack-routine']} "
-          f"email={_MESSAGE_LANE_WORKER_STATES['email']} "
-          f"roster={'configured' if MSG.roster_path() else 'unconfigured'}", flush=True)
+    print(f"[airlock-dev-monitor] messages feature: on slack={_SLACK_WORKER_ON}", flush=True)
+
 
 
 def _start_updates_owner_gate():
@@ -2299,7 +2111,7 @@ def main():
     _start_harness_exec()
     _start_messages()
     print(f'[airlock-dev-monitor] listen=127.0.0.1:{PORT} messages={_messages_state()} '
-          f'message_lanes={json.dumps(_message_lanes_health(), sort_keys=True)}', flush=True)
+          f'delivery={json.dumps(_message_delivery_health(), sort_keys=True)}', flush=True)
     with ThreadingHTTPServer(('127.0.0.1', PORT), Handler) as server:
         try:
             server.serve_forever()

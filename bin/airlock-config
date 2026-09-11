@@ -21,6 +21,9 @@ Usage:
   airlock-config plaintext-known     # every plaintext port Airlock could own
   airlock-config plaintext-retirement-drop <port>
                                      # recovery: forget a manually verified intent
+  airlock-config package-preview <path>
+                                     # validate one local package as JSON without
+                                     #   changing config or package trust state
   airlock-config package-info        # resolved [packages.*] as JSON (see D1/D6)
   airlock-config install-snapshot <private-path>
                                      # ORCHESTRATOR-INTERNAL: freeze the exact
@@ -287,6 +290,9 @@ BUNDLE_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
     "orca": ("rooted-artifact", "system-unit"),
     "paseo": (),
     "publish": (),
+    # Outbound-only Socket Mode worker: one USER unit and code under the
+    # operator's ~/.local/share. No mediated elevated capability is needed.
+    "slack-unfurl": (),
 }
 SURFACE_CLASSIFICATIONS = {
     "rooted-artifact": "elevated-capability",
@@ -641,7 +647,7 @@ def load() -> dict:
                 die("install config snapshot digest changed during this run — "
                     "refusing the projection before reconcile", code=2)
         return tomllib.loads(data.decode("utf-8"))
-    except ValueError as e:
+    except (OSError, ValueError) as e:
         # ValueError, not just tomllib.TOMLDecodeError (a ValueError
         # subclass): tomllib decodes the bytes as UTF-8 before parsing, so
         # one invalid byte raises a plain UnicodeDecodeError first — missing
@@ -2002,6 +2008,13 @@ def _validate_disjoint(pkgs: dict, cfg: dict) -> "None":
         rec_paths, rec_ports = _recorded_claims(ledger, pid, roots)
         for ca in mine[pid]:
             for rid, cb in rec_paths:
+                # A recorded owner omitted from this candidate is a planned
+                # transaction handoff, not two desired owners. The ledger plan
+                # still refuses a non-removable record, and the orchestrator
+                # checkpoints then removes this exact owner immediately before
+                # the consumer. Desired-vs-desired conflicts remain fatal above.
+                if rid not in pkgs:
+                    continue
                 if _may_overlap(ca, cb):
                     die(f"package '{pid}' claims {ca!r}, which overlaps an artifact "
                         f"recorded under id '{rid}' in the installed-state ledger. "
@@ -2014,6 +2027,8 @@ def _validate_disjoint(pkgs: dict, cfg: dict) -> "None":
         span_ports = {v for _key, base, count in pkgs[pid]["port_span_values"]
                       for v in range(base, base + count)}
         for rid, port in rec_ports:
+            if rid not in pkgs:
+                continue
             if port in serve[pid]:
                 die(f"package '{pid}' claims serve port {port}, which is recorded "
                     f"under id '{rid}' in the installed-state ledger.")
@@ -2023,6 +2038,8 @@ def _validate_disjoint(pkgs: dict, cfg: dict) -> "None":
                     "ledger. The record owns it until removed — tear that app "
                     f"down first (bin/airlock-teardown {rid}).")
         for rid, recorded in _recorded_container_claims(ledger, pid):
+            if rid not in pkgs:
+                continue
             for declaration in containers[pid]:
                 if _container_claims_overlap(declaration, recorded):
                     die(f"package '{pid}' claims container namespace {declaration!r}, "
@@ -3568,9 +3585,35 @@ def package_specs(cfg: dict) -> dict:
     return out
 
 
+def _read_manifest_document(pid: str | None, pdir: Path) -> dict:
+    """Read one manifest for the canonical parser or the path preview.
+
+    Preview has to learn the id from the manifest, while configured packages already
+    know it from their table name.  Keeping the byte/TOML read here lets both paths
+    feed the same schema and capability parser instead of growing a second validator.
+    """
+    manifest = pdir / MANIFEST_NAME
+    label = f"package '{pid}'" if pid is not None else "package preview"
+    if not _regular_file(manifest):
+        if os.path.lexists(manifest):
+            die(f"{label}: {MANIFEST_NAME} at {pdir} must be a regular non-symlink "
+                "file — the D6 digest records only a symlink's target string, so a "
+                "symlinked manifest could change behind an unchanged digest.")
+        die(f"{label} has no {MANIFEST_NAME} at {pdir} — the manifest is required; "
+            "the ledger cannot record ownership without it (D2).")
+    try:
+        with manifest.open("rb") as fh:
+            return tomllib.load(fh)
+    except ValueError as e:
+        # ValueError (see load()'s identical fix): tomllib's UTF-8 decode happens
+        # before TOMLDecodeError's own error class does.
+        die(f"{manifest}: invalid TOML: {e}")
+
+
 def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
-                         bundle_principal=False,
-                         granted_capabilities=()) -> dict:
+                         bundle_principal=False, granted_capabilities=(), *,
+                         manifest_document: dict | None = None,
+                         preview=False) -> dict:
     """Parse + validate ONE manifest at `pdir` into the PackageSpec shape
     `package_specs` stores (child 4/P4: extracted so the known-builtins scan
     can parse a SHIPPED manifest the exact same way for an id that has no
@@ -3582,22 +3625,8 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
     UNCONFIGURED shipped id with a malformed manifest is simply excluded,
     best-effort, never a reason to crash the whole scan)."""
     manifest = pdir / MANIFEST_NAME
-    if not _regular_file(manifest):
-        if os.path.lexists(manifest):
-            die(f"package '{pid}': {MANIFEST_NAME} at {pdir} must be a "
-                "regular non-symlink file — the D6 digest records only a "
-                "symlink's target string, so a symlinked manifest could "
-                "change behind an unchanged digest.")
-        die(f"package '{pid}' has no {MANIFEST_NAME} at {pdir} — the "
-            "manifest is required; the ledger cannot record ownership "
-            "without it (D2).")
-    try:
-        with manifest.open("rb") as fh:
-            m = tomllib.load(fh)
-    except ValueError as e:
-        # ValueError (see load()'s identical fix): tomllib's UTF-8
-        # decode happens before TOMLDecodeError's own error class does.
-        die(f"{manifest}: invalid TOML: {e}")
+    m = (manifest_document if manifest_document is not None
+         else _read_manifest_document(pid, pdir))
     unknown = sorted(k for k in m if k not in _MANIFEST_KEYS)
     if unknown:
         _mf_die(pid, f"unknown key(s): {', '.join(unknown)}. The manifest "
@@ -3644,10 +3673,16 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
         requested.add("system-unit")
     if plaintext_redirect:
         requested.add("plaintext-redirect")
+    grants = set(granted_capabilities)
+    if preview:
+        # A click on "approve and install" is the grant for the two capabilities
+        # whose effects the ledger can verify.  Bundle-only capabilities remain
+        # refused and are returned as data so the sheet can disable its button.
+        grants |= requested & GRANTABLE_CAPABILITIES
     admitted, certifications = _bundle_admission(
-        pid, pdir, bundle_principal, granted_capabilities, requested)
+        pid, pdir, bundle_principal, grants, requested)
     refused = requested - admitted
-    if refused:
+    if refused and not preview:
         if "rooted-artifact" in refused:
             _mf_die(pid, "artifacts.rooted is available only to shipped packages "
                          "or an explicit package with a rooted-artifact grant")
@@ -3732,6 +3767,111 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
         "audience": audience,
         "lifecycle": lifecycle,
     }
+
+
+def cmd_package_preview(cfg: dict, raw_path: str) -> "None":
+    """Validate a local package against this box without mutating any authority.
+
+    The candidate is an in-memory copy of the current config.  Its PackageSpec is
+    produced by ``_parse_manifest_spec`` and injected into the ordinary projections,
+    so defaults, ports, dependencies and collision checks are the same ones that
+    ``package-info`` will use after registration.  The injection deliberately bypasses
+    only the current digest lock for this one id: a moved package must remain
+    previewable so an owner can see the new digest before deciding to re-approve it.
+    """
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        die("package-preview requires a non-empty package directory path", code=2)
+    path = _expanduser(raw_path.strip(), "package-preview path")
+    if not path.is_absolute():
+        path = find_config().parent / path
+    pdir = path.resolve()
+    if not pdir.is_dir():
+        die(f"package-preview path does not resolve to a directory: {pdir}", code=2)
+
+    document = _read_manifest_document(None, pdir)
+    pid = document.get("id")
+    if not isinstance(pid, str) or PACKAGE_ID_RE.fullmatch(pid) is None:
+        die("package-preview manifest 'id' must match "
+            "^[a-z0-9][a-z0-9-]{0,31}$", code=2)
+    if pid in RESERVED_PACKAGE_IDS:
+        die(f"package-preview id '{pid}' is reserved: {RESERVED_PACKAGE_IDS[pid]}",
+            code=2)
+    spec = _parse_manifest_spec(
+        pid, pdir, "explicit", manifest_document=document, preview=True)
+    requested = set(spec["requested_capabilities"])
+    grants = sorted(requested & GRANTABLE_CAPABILITIES)
+    rejected = sorted(requested - set(spec["effective_capabilities"]))
+    digest = _package_tree_digest(pid, pdir)
+
+    # Parse the rest of the live config normally, except for this candidate id. This
+    # makes a lock-mismatched installed package previewable without weakening another
+    # package's lock or manifest checks.
+    base = copy.deepcopy(cfg)
+    (base.get("apps") or {}).pop(pid, None)
+    (base.get("packages") or {}).pop(pid, None)
+    specs = dict(package_specs(base))
+    specs[pid] = spec
+
+    candidate = copy.deepcopy(cfg)
+    apps = candidate.setdefault("apps", {})
+    packages = candidate.setdefault("packages", {})
+    existing_app = apps.get(pid)
+    existing_package = packages.get(pid)
+    apps[pid] = copy.deepcopy(existing_app) if isinstance(existing_app, dict) else {}
+    packages[pid] = {"path": str(pdir)}
+    if grants:
+        packages[pid]["grant"] = grants
+    _SPEC_CACHE[id(candidate)] = (candidate, specs)
+
+    # Full candidate validation is still useful for a refused capability: the UI can
+    # show all other manifest/config problems before the owner edits that capability
+    # out. Ordinary registration reparses without preview mode and refuses it again.
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        cmd_validate(candidate)
+    package = packages_resolved(candidate)[pid]
+
+    package_lock = _read_package_lock()
+    recorded = package_lock.get(pid)
+    lock_state = ("missing" if recorded is None else
+                  "matches" if recorded == digest else "mismatch")
+    conflict = None
+    configured_path = None
+    if isinstance(existing_package, dict):
+        configured_raw = existing_package.get("path")
+        if isinstance(configured_raw, str) and configured_raw.strip():
+            configured = _expanduser(
+                configured_raw.strip(), f"packages.{pid}.path")
+            if not configured.is_absolute():
+                configured = find_config().parent / configured
+            configured_path = str(configured.resolve())
+    if existing_app is not None and existing_package is None:
+        conflict = "app_already_registered"
+    elif existing_package is not None and not isinstance(existing_package, dict):
+        conflict = "package_registration_invalid"
+    elif existing_package is not None and existing_app is None:
+        conflict = "package_registration_orphaned"
+    elif configured_path is None and existing_package is not None:
+        conflict = "package_registration_invalid"
+    elif configured_path is not None and configured_path != str(pdir):
+        conflict = "package_path_changed"
+
+    print(json.dumps({
+        "id": pid,
+        "path": str(pdir),
+        "digest": digest,
+        "package": package,
+        "requested_capabilities": sorted(requested),
+        "effective_capabilities": list(spec["effective_capabilities"]),
+        "grants": grants,
+        "rejected_capabilities": rejected,
+        "installable": not rejected and conflict is None,
+        "conflict": conflict,
+        "lock": {"state": lock_state, "recorded_digest": recorded},
+        "requires_reapproval": lock_state == "mismatch",
+        "registered": existing_package is not None and existing_app is not None,
+        "configured_path": configured_path,
+    }, indent=2, sort_keys=True))
 
 
 def packages_resolved(cfg: dict) -> dict:
@@ -5585,7 +5725,7 @@ def main(argv: list[str]) -> int:
     argv = _parse_global_args(argv)
     if not argv:
         die("usage: airlock-config "
-            "<validate|apps|catalog|init|plaintext|get|env|json> [arg]",
+            "<validate|apps|catalog|init|plaintext|get|env|json|package-preview> [arg]",
             code=2)
     cmd, rest = argv[0], argv[1:]
     # `catalog` runs BEFORE load(): it answers "what could I install?", which is
@@ -5682,6 +5822,13 @@ def main(argv: list[str]) -> int:
         cmd_json(cfg)
     elif cmd == "webjson":
         cmd_webjson(cfg)
+    elif cmd == "package-preview":
+        if len(rest) != 1:
+            die("package-preview requires exactly one package directory path", code=2)
+        if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+            die("--dangerously-admit-unverified has no meaning for package-preview: "
+                "preview mutates no trust state", code=2)
+        cmd_package_preview(cfg, rest[0])
     elif cmd == "package-info":
         cmd_package_info(cfg)
     elif cmd == "install-preflight":

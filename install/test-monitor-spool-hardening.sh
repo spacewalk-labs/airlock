@@ -98,7 +98,7 @@ PY
 install -m 755 "$ROOT/apps/dev-monitor/examples/emit_message.py" "$TMP/emit_message.py"
   sudo -n -u "$writer_user" python3 "$TMP/emit_message.py" \
   --spool "$state/spool" --source phase3 --group-key phase3:cross-uid \
-  --kind info --title 'cross uid probe' --event-id phase3-cross-uid >/dev/null
+  --level normal --title 'cross uid probe' --event-id phase3-cross-uid >/dev/null
 AIRLOCK_DEV_MONITOR_MESSAGES=true \
 PYTHONPATH="$ROOT/apps/dev-monitor/backend" python3 - "$state" <<'PY'
 import os, sys
@@ -110,7 +110,7 @@ spool.ensure_dirs(os.path.join(state, 'spool'))
 result = spool.scan_once(os.path.join(state, 'spool'))
 assert result['inserted'] == 1, result
 assert messages._conn().execute(
-    'SELECT COUNT(*) FROM occurrences WHERE event_id=?',
+    'SELECT COUNT(*) FROM ledger WHERE id=?',
     ('phase3-cross-uid',)).fetchone()[0] == 1
 PY
   if sudo -n -u "$writer_user" sh -c \

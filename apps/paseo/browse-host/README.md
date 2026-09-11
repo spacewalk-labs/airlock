@@ -71,10 +71,12 @@ questions it has not been asked.
 
 ## Licensing
 
-- **The sidecar is Apache-2.0.** `host.js`, `security.js`, `executor.js`,
+- **The sidecar is AGPL-3.0-only, like the rest of the repo.** `host.js`, `security.js`, `executor.js`,
   `stream-server.js`, `commands.js`, `bin/paseo-browse-host.js`, `web/*.js`, the
   tests, `install.sh`, and `smoke.sh` are an **independent** loopback-WS sidecar —
-  they do **not** import paseo. Each carries `SPDX-License-Identifier: Apache-2.0`.
+  they do **not** import paseo — that independence still matters for attribution,
+  but since the 2026-09-08 core relicensing it no longer changes which licence they
+  carry. Each carries `SPDX-License-Identifier: AGPL-3.0-only`.
 - **`bin/patch-web-ui.js` is AGPL-3.0-only.** It encodes derivative edits to
   paseo's own web-ui bundle, so it carries `SPDX-License-Identifier:
   AGPL-3.0-only` (same basis as `../patches/`). See `../patches/README.md`.
@@ -83,16 +85,16 @@ questions it has not been asked.
 
 | Path | Role | License |
 |---|---|---|
-| `bin/paseo-browse-host.js` | entry point | Apache-2.0 |
+| `bin/paseo-browse-host.js` | entry point | AGPL-3.0-only |
 | `bin/patch-web-ui.js` | paseo web-ui bundle patcher (live panel) | **AGPL-3.0-only** |
-| `src/host.js` | WS client: registers the browser host, answers execute requests | Apache-2.0 |
-| `src/executor.js` | Playwright command executor (tabs, refs, redaction) | Apache-2.0 |
-| `src/stream-server.js` | live-view CDP screencast + input transport | Apache-2.0 |
-| `src/security.js` | proportionate URL policy (SSRF guard) | Apache-2.0 |
-| `src/commands.js` | supported-command manifest | Apache-2.0 |
-| `web/browse-view-client.js` | web-ui companion (canvas + toolbar + roster dock) | Apache-2.0 |
-| `test/*` | unit + integration + e2e | Apache-2.0 |
-| `install.sh` / `smoke.sh` | manual install + ship-gate smoke | Apache-2.0 |
+| `src/host.js` | WS client: registers the browser host, answers execute requests | AGPL-3.0-only |
+| `src/executor.js` | Playwright command executor (tabs, refs, redaction) | AGPL-3.0-only |
+| `src/stream-server.js` | live-view CDP screencast + input transport | AGPL-3.0-only |
+| `src/security.js` | proportionate URL policy (SSRF guard) | AGPL-3.0-only |
+| `src/commands.js` | supported-command manifest | AGPL-3.0-only |
+| `web/browse-view-client.js` | web-ui companion (canvas + toolbar + roster dock) | AGPL-3.0-only |
+| `test/*` | unit + integration + e2e | AGPL-3.0-only |
+| `install.sh` / `smoke.sh` | manual install + ship-gate smoke | AGPL-3.0-only |
 
 ## Tests
 

@@ -52,36 +52,46 @@ done
 fails=0
 report() { printf '::error::%s\n%s\n' "$1" "$2" >&2; fails=$((fails+1)); }
 
-# Shell sources, found by SHEBANG as well as by extension. An earlier version of
-# this gate keyed on `*.sh` alone and silently skipped two real files —
+# App-authored sources, with shell found by SHEBANG as well as by extension. An
+# earlier version of this gate keyed on `*.sh` alone and silently skipped two real files —
 # apps/code-server/bin/airlock-code-server-slot and apps/devterm/bin/devterm-shell
 # are shell programs with no extension, and an app installs them. A gate that
 # reports "ok" over a set that excludes app-authored shell is worse than no gate,
 # because the zero it prints is indistinguishable from a clean tree.
 #
-# Non-shell app sources (.py/.mjs/.js) are still out of scope: the ABI is consumed
-# in shell, and backends are handed their paths by the unit their installer
-# renders. install/test-app-abi.sh asserts that this stays true, so widening the
-# gate further is a deliberate act rather than something someone must remember.
+# Non-shell sources are checked too. They do not consume the D5 platform ABI at
+# runtime: installers hand backends app-specific environment and paths. Tests may
+# write AIRLOCK_ROOT into a child process's environment to exercise an installer;
+# that is not a read. The non-shell rule below distinguishes those two operations
+# instead of trusting a filename to distinguish tests from runnable code.
 #
 # Vendored upstream trees (paseo's patches/, orca's bundles) are not app-authored
 # contract surface and are excluded by path, not by content.
-mapfile -t files < <(
+mapfile -d '' -t candidates < <(
   find "$SCAN" -type f -not -path '*/patches/*' -not -path '*/node_modules/*' \
-       -not -path '*/web-bundle/*' -print0 \
-  | while IFS= read -r -d '' f; do
-      case "$f" in
-        *.sh) printf '%s\n' "$f"; continue ;;
-        *.py|*.mjs|*.cjs|*.js|*.json|*.md|*.toml|*.html|*.css|*.png|*.svg) continue ;;
-      esac
-      # shebang probe, on the first line only
-      IFS= read -r first < "$f" || continue
-      case "$first" in
-        '#!'*sh|'#!'*sh\ *) printf '%s\n' "$f" ;;
-      esac
-    done | sort
+       -not -path '*/web-bundle/*' -print0 | sort -z
 )
-[ "${#files[@]}" -gt 0 ] || { echo "no shell files under $SCAN" >&2; exit 2; }
+
+shell_files=()
+nonshell_files=()
+for f in "${candidates[@]}"; do
+  case "$f" in
+    *.sh) shell_files+=("$f"); continue ;;
+    *.py|*.mjs|*.cjs|*.js)
+      nonshell_files+=("$f")
+      continue
+      ;;
+    *.json|*.md|*.toml|*.html|*.css|*.png|*.svg) continue ;;
+  esac
+  # shebang probe, on the first line only
+  IFS= read -r first < "$f" || continue
+  case "$first" in
+    '#!'*sh|'#!'*sh\ *) shell_files+=("$f") ;;
+    '#!'*python*|'#!'*node*) nonshell_files+=("$f") ;;
+  esac
+done
+[ "$(( ${#shell_files[@]} + ${#nonshell_files[@]} ))" -gt 0 ] \
+  || { echo "no app-authored runtime source files under $SCAN" >&2; exit 2; }
 
 # Before matching, each file is normalised: whole-line comments are dropped and
 # backslash line-continuations are joined into one logical line.
@@ -121,7 +131,7 @@ code_of() {
 # construction, and a new evasion is not a new hole because it is not on the list.
 ROOT_RE='["'"'"']?\$\{?(AIRLOCK_)?ROOT\}?["'"'"']?'
 
-for f in "${files[@]}"; do
+for f in "${shell_files[@]}"; do
   rel="${f#"$SCAN"/}"
   code="$(code_of "$f")"
 
@@ -184,6 +194,29 @@ for f in "${files[@]}"; do
     "$hit"
 done
 
+# Non-shell backends receive app-specific environment and paths from their unit;
+# AIRLOCK_ROOT and install/lib.sh are shell-orchestrator ABI, not backend ABI.
+# Merely writing the string as a quoted mapping key is allowed: app tests need
+# that to pass the ABI to lifecycle shell against a fake root. Every other source
+# occurrence is refused. This allowlist catches aliases and multiline reads too;
+# a list of known read APIs did not. Strip whole-line comments first so boundary
+# documentation is not a finding. As with the shell checks, this is a narrow
+# static gate, not a parser.
+for f in "${nonshell_files[@]}"; do
+  rel="${f#"$SCAN"/}"
+  code="$(grep -vE '^[[:space:]]*(#|//)' "$f")"
+  # Remove only the allowed key OCCURRENCE, not its whole line: a fixture can
+  # write the key and still perform a forbidden read in the value expression.
+  root_hit="$(printf '%s\n' "$code" \
+    | sed -E "s/[\"']AIRLOCK_ROOT[\"'][[:space:]]*://g" \
+    | grep -n 'AIRLOCK_ROOT' || true)"
+  path_hit="$(printf '%s\n' "$code" | grep -nE '/install/lib[.]sh' || true)"
+  hit="${root_hit}${root_hit:+$'\n'}${path_hit}"
+  [ -n "$hit" ] && report \
+    "apps/$rel: non-shell runtime source reaches the shell-only platform ABI. Pass app-specific values or paths through its rendered unit instead; AIRLOCK_ROOT and install/lib.sh belong to lifecycle shell." \
+    "$hit"
+done
+
 # WHAT THIS GATE DOES NOT DECIDE. Static reading of shell is not complete, and the
 # allowlist above narrows rather than closes that. It cannot see a path assembled
 # at runtime from data, a cwd-relative source with no variable in it, or anything
@@ -197,4 +230,5 @@ if [ "$fails" -gt 0 ]; then
   echo "FAIL check-app-abi: $fails violation(s) in $SCAN" >&2
   exit 1
 fi
-echo "ok check-app-abi: ${#files[@]} shell file(s) under $SCAN reach the platform only through the D5 ABI"
+total=$(( ${#shell_files[@]} + ${#nonshell_files[@]} ))
+echo "ok check-app-abi: $total runtime source file(s) under $SCAN respect the D5 ABI (${#shell_files[@]} shell, ${#nonshell_files[@]} non-shell)"

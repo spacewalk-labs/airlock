@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 /* paseo-browse-host — live browser panel companion (task doc §14.2).
  *
  * Loaded by the self-hosted paseo web-ui (index.html <script>, injected at

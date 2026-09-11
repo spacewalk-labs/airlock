@@ -1,0 +1,10 @@
+[Unit]
+Description=airlock dev-monitor daily heartbeat
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+Unit=airlock-devmon-heartbeat.service
+
+[Install]
+WantedBy=timers.target

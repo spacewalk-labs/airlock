@@ -352,11 +352,11 @@ if lane_sql_python_c_scan "$ROOT/apps/dev-monitor/smoke.sh"; then
 else
   ok "target lane SQL is absent from scanned scalar-assignment python3 -c hosts"
 fi
-if grep -n -- "messages.delivery_lane_health" "$ROOT/apps/dev-monitor/smoke.sh" >/dev/null \
-   && grep -n -- "python3 - .*<<'PY'" "$ROOT/apps/dev-monitor/smoke.sh" >/dev/null; then
-  ok "lane health calls the production backend inside a quoted heredoc"
+if grep -n -- "/api/health" "$ROOT/apps/dev-monitor/smoke.sh" >/dev/null \
+   && grep -n -- "python3 - .*<<'DEVMON_DELIVERY_PY'" "$ROOT/apps/dev-monitor/smoke.sh" >/dev/null; then
+  ok "delivery health calls the backend API inside a quoted heredoc"
 else
-  bad "production lane health or its quoted-heredoc host is missing from apps/dev-monitor/smoke.sh"
+  bad "delivery health API or its quoted-heredoc host is missing from apps/dev-monitor/smoke.sh"
 fi
 
 # Positive controls cover both ways this regression can be restored. The second

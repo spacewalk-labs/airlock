@@ -2,7 +2,7 @@
 
 Clean, generalized rewrite of an internal dev-tools suite into a reusable
 open-source project. Single monorepo, single release (all 9 apps + wiki/skills),
-config-driven, Apache-2.0 core (+ AGPL-3.0 for `apps/paseo/patches/`).
+config-driven, AGPL-3.0 core (Apache-2.0 until 2026-09-08).
 
 Full rationale + license analysis + multi-model review live in a separate internal
 design doc (kept out of this public repo).
@@ -14,8 +14,9 @@ design doc (kept out of this public repo).
 - **Auth = Tailscale, fail-closed** (see SECURITY.md). Header-value-only auth is
   unsafe; the installer verifies Tailscale is the ingress or refuses to start.
   Arbitrary header names are NOT a valid provider in v1.
-- **Licensing**: Apache-2.0 core. `apps/paseo/patches/` = AGPL-3.0 (paseo is AGPL-3.0;
-  patches are derivatives). orca is MIT (web patches publishable).
+- **Licensing**: AGPL-3.0 core (changed from Apache-2.0 on 2026-09-08).
+  `apps/paseo/patches/` is marked `AGPL-3.0-only` separately because paseo is
+  AGPL-3.0 and the patches are derivatives. orca is MIT (web patches publishable).
 - **v1 deploy** = single box, Tailscale-only. Multi-box / other auth providers = later.
 
 ## Milestone 1 = hub + devterm (installable by editing airlock.toml only)
@@ -118,7 +119,7 @@ and `:8443/` = 200. Live test found + fixed: (1) installer sudo for /etc paths,
       on `test-airlock`: daemon on 6767, `/:8447` tailnet=200, deny=403, and the
       depth4 patch confirmed applied to the installed paseo. **Licensing:** patches/
       = AGPL-3.0 (+ full AGPL text vendored at `patches/LICENSE`); `browse-host/`
-      shipped as labeled source (sidecar = Apache-2.0, `patch-web-ui.js` = AGPL) but NOT
+      shipped as labeled source (sidecar and `patch-web-ui.js` both AGPL) but NOT
       wired in v1 (Playwright + SHA-pinned web-ui patch = follow-up). Integration 14/14.
 - [x] **T12 — starter wiki + skills.** `skills/airlock-deploy/SKILL.md` (deploy +
       verify) and `skills/airlock-doctor/SKILL.md` (top-down gate/nginx/backend

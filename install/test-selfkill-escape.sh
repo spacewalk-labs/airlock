@@ -154,7 +154,9 @@ fi
 
 # ---------------------------------------------------------------- live
 # The half that actually proves the defect is fixed. Needs a user manager.
-if ! systemctl --user show-environment >/dev/null 2>&1 || ! command -v systemd-run >/dev/null 2>&1; then
+if [ "${AIRLOCK_SELFKILL_SKIP_LIVE:-0}" = 1 ]; then
+  skip "live reproduction (explicitly disabled; offline seams only)"
+elif ! systemctl --user show-environment >/dev/null 2>&1 || ! command -v systemd-run >/dev/null 2>&1; then
   skip "live reproduction (no systemd --user manager here)"
 else
   UNIT=airlock-selfkill-escape-test
@@ -239,6 +241,136 @@ EOF
       *)                 bad "guarded run died like the control ($axis); got: ${pos:-<empty>}" ;;
     esac
   done
+
+  # ------------------------------------------------- environment forwarding
+  # Surviving the restart is only half of transparency. The escaped run has to
+  # be the SAME run, and for a long time it was not: a --user transient unit
+  # inherits the user manager's environment, so every variable the operator
+  # exported was dropped. Exercise platform forwarding and unrelated exclusion.
+  ENVUNIT=airlock-selfkill-envfwd-test
+  envout="$TMP/envfwd.out"; rm -f "$envout"
+  cat > "$TMP/envprobe.sh" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+OUT="\$1"
+export AIRLOCK_ROOT="$ROOT"
+. "$ROOT/install/lib.sh"
+airlock_escape_selfkill_cgroup "\$0" "\$OUT" 2>/dev/null
+{
+  echo "escaped=\${AIRLOCK_SELFKILL_ESCAPED:-<unset>}"
+  echo "platform=\${AIRLOCK_SELFKILL_FIXTURE_MARK:-<unset>}"
+  echo "unrelated=\${SELFKILL_FIXTURE_UNRELATED:-<unset>}"
+} >> "\$OUT"
+EOF
+  chmod +x "$TMP/envprobe.sh"
+  # The outer unit gets the variables explicitly: systemd-run drops the caller's
+  # environment on the way IN too, which is the very behaviour under test.
+  systemd-run --user --unit="$ENVUNIT" --service-type=simple --quiet --collect \
+    --setenv=HOME="$HOME" \
+    --setenv=AIRLOCK_SELFKILL_FIXTURE_MARK=carried-across \
+    --setenv=SELFKILL_FIXTURE_UNRELATED=must-not-cross \
+    bash -c "'$TMP/envprobe.sh' '$envout' & wait" >/dev/null 2>&1
+  i=0
+  while [ $i -lt 25 ]; do
+    grep -q '^escaped=' "$envout" 2>/dev/null && break
+    sleep 1; i=$((i+1))
+  done
+  systemctl --user stop "${ENVUNIT}.service" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "${ENVUNIT}.service" >/dev/null 2>&1 || true
+  envtrace="$(cat "$envout" 2>/dev/null)"
+
+  # Positive control FIRST. Without proof that the move happened, every
+  # assertion below passes trivially on a run that never escaped.
+  if printf '%s\n' "$envtrace" | grep -qx 'escaped=1'; then
+    ok "env forwarding: the run really did move into a new unit"
+  else
+    bad "env forwarding: the run never escaped, so the rest proves nothing; got: ${envtrace:-<empty>}"
+  fi
+  if printf '%s\n' "$envtrace" | grep -qx 'platform=carried-across'; then
+    ok "env forwarding: an exported AIRLOCK_* input survives the move"
+  else
+    bad "env forwarding: platform input was dropped; got: ${envtrace:-<empty>}"
+  fi
+  # Negative control: forwarding is by rule, not wholesale. An unrelated variable
+  # must NOT appear, or this test would pass under a blanket copy that
+  # also carries the caller's unrelated environment into a unit.
+  if printf '%s\n' "$envtrace" | grep -qx 'unrelated=<unset>'; then
+    ok "negative control: an unrelated variable does not cross"
+  else
+    bad "negative control: an unrelated variable crossed; got: ${envtrace:-<empty>}"
+  fi
+
+  # ------------------------------------------------- the guard cannot be blanked
+  # systemd resolves duplicate --setenv by LAST ONE WINS (measured 2026-09-08).
+  # The guard is passed explicitly as =1 BEFORE the forwarded arguments, so any
+  # loop that also forwards AIRLOCK_SELFKILL_ESCAPED would overwrite it -- and a
+  # caller that exported it EMPTY still escapes (-n on "" is false), so the
+  # escaped run would blank its own guard and escape again, forever.
+  #
+  # Measured by counting how many escape units the run creates. A loop shows up
+  # as more than one; a bounded run shows exactly one.
+  ESCUNIT=airlock-selfkill-loopguard-test
+  loopout="$TMP/loopguard.out"; rm -f "$loopout"
+  cat > "$TMP/loopprobe.sh" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+OUT="\$1"
+export AIRLOCK_ROOT="$ROOT"
+. "$ROOT/install/lib.sh"
+airlock_escape_selfkill_cgroup "\$0" "\$OUT" 2>>"\$OUT.log"
+echo "ran" >> "\$OUT"
+EOF
+  chmod +x "$TMP/loopprobe.sh"
+  systemd-run --user --unit="$ESCUNIT" --service-type=simple --quiet --collect \
+    --setenv=AIRLOCK_SELFKILL_ESCAPED= \
+    --setenv=HOME="$HOME" \
+    bash -c "'$TMP/loopprobe.sh' '$loopout' & wait" >/dev/null 2>&1
+  i=0
+  while [ $i -lt 25 ]; do
+    grep -q '^ran' "$loopout" 2>/dev/null && break
+    sleep 1; i=$((i+1))
+  done
+  systemctl --user stop "${ESCUNIT}.service" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "${ESCUNIT}.service" >/dev/null 2>&1 || true
+  hops="$(grep -c 'moving to:' "$loopout.log" 2>/dev/null || echo 0)"
+  # POSITIVE CONTROL: the escape must have happened at all, or "no loop" is
+  # just "nothing ran" and this assertion is empty.
+  if [ "$hops" -ge 1 ]; then
+    ok "loop guard: an empty exported guard still escapes (the case under test is live)"
+  else
+    bad "loop guard: nothing escaped, so the loop assertion proves nothing (hops=$hops)"
+  fi
+  if [ "$hops" = 1 ]; then
+    ok "loop guard: an empty exported guard escapes exactly once, not forever"
+  else
+    bad "loop guard: the escape re-armed itself (hops=$hops, expected 1)"
+  fi
+
+  # ------------------------------------------------- and not through argv
+  # The forwarding above must not be bought by publishing the secret. A bare
+  # `--setenv=NAME` makes systemd-run read the value from its own environment;
+  # `--setenv=NAME=VALUE` puts it in argv, and /proc/<pid>/cmdline is readable
+  # by every local account unless the box mounts /proc with hidepid (measured
+  # 2026-09-08: this one does not). --wait keeps systemd-run alive for the
+  # whole install, so that is not a narrow window.
+  #
+  # The check is on the generated command line, not on /proc: a scan would have
+  # to win a race against the run it is watching, and losing that race looks
+  # exactly like a pass.
+  if grep -Fq -- '--setenv=${_n}=${!_n}' "$ROOT/install/lib.sh"; then
+    bad "the escape passes a VALUE on the command line — readable via /proc/<pid>/cmdline"
+  else
+    ok "the escape forwards by name, so no value reaches argv"
+  fi
+  # Positive control for the line above: the same grep must FIND the pattern in
+  # text that has it, or a rename would turn this assertion into a no-op that
+  # passes forever.
+  if printf '%s\n' 'esc_env+=("--setenv=${_n}=${!_n}")' \
+       | grep -Fq -- '--setenv=${_n}=${!_n}'; then
+    ok "positive control: the argv-form check can still see the pattern it forbids"
+  else
+    bad "positive control failed — the argv-form check is dead and would never fire"
+  fi
 fi
 
 echo

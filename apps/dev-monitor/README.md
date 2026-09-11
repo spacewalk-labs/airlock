@@ -1,7 +1,7 @@
 # dev-monitor
 
 Per-box observability — CPU, memory, services, scheduled jobs, network, storage, top
-processes and recent unit logs — served as a same-origin subpath under the hub at `/monitor/`. No agent, no
+processes and recent unit logs — served as a same-origin subpath under the hub at `/monitor/`. Observability needs no agent or
 `psutil`: the backend reads `/proc` and shells out to `systemctl`/`journalctl`, so it runs
 in a minimal container. Observability is visible to the owner and collaborators.
 
@@ -36,219 +36,276 @@ over SSH, which is where the rare emergency belongs. This does not depend on the
 console below — enabling messages must never quietly enable job control with it, so the
 write surface is absent rather than gated.
 
-## The message and action console
+## Messages: one spool, one loop, one webhook
 
-The problem it solves: an agent, a cron job or a build finishes something on the box and
-you find out when you next happen to look. The console gives those producers one place to
-say so, and gives you one place to act on it from a phone.
+A producer publishes a JSON file. The collector records the receipt and creates or
+updates a daily card in one SQLite transaction. Normal cards stay in the console;
+urgent cards are sent to the configured Slack webhook. The owner can read, archive
+or run a card. Reading and delivery are independent: Slack delivery does not mark
+something read, and reading does not cancel a queued delivery.
 
-Two axes, deliberately separated:
-
-- **Messages.** A producer drops a JSON file in a spool. It becomes a *card*. Cards
-  coalesce by `group_key`, so a job that fails hourly is one card with a count, not
-  twenty-four notifications. The window is chosen by the occurrence's severity: `page` and
-  `attention` get one card a day, `record` and `digest` one a week — a quiet condition that
-  restates itself daily should not cost a card a day. Urgent cards are also delivered to
-  Slack if a webhook is configured.
-
-  The window is measured from when the card was *received*, not from the `created_at` its
-  producer stamped. Those agree within seconds for live traffic and diverge by days for a
-  spool that sat: filtering on the producer's clock turned coalescing off entirely on a
-  drained backlog, which is the one moment a flood is guaranteed.
-- **Actions.** A card may carry a `recommended_action` — a working directory plus either a
-  skill name, a prompt, or an argv list. It does nothing until you approve it. Approving
-  derives a canonical plan and hashes it; executing runs that plan in a tmux window you can
-  then watch from devterm.
-
-### The storage split (why there are two tables)
-
-An **occurrence** is an immutable ledger row: this event arrived, at this time, with this
-payload. A **card** is a mutable projection: read/unread, pinned, archived, dismissed, with
-a count of the occurrences behind it. Producers only ever append occurrences; the console
-only ever mutates cards. Every state transition happens inside a `BEGIN IMMEDIATE`
-transaction with a conditional `UPDATE` plus an audit row, so two clicks racing each other
-cannot both win.
-
-### The spool
-
-Maildir-style, at `~/.local/state/airlock/dev-monitor/spool`:
-
-```
-spool/tmp/          write here first
-spool/new/          hard-link (or rename) here when the file is complete
-spool/processing/   the watcher's working area
-spool/bad/          rejected payloads, kept for inspection
+```text
+Producer → spool/new → loop (2 seconds) → ledger + cards → Slack
+                           ↑                 ↑
+                    heartbeat timer    owner dashboard/API
 ```
 
-Writing to `tmp/` and only then linking into `new/` is what makes a partially written file
-impossible to ingest. See `examples/emit_message.py` for a producer you can copy.
+The loop collects, sends one due card with a two-second HTTP timeout, and performs
+maintenance every 15 minutes. It retries without sleeping through collection.
+There are four permanent backend roles: the HTTP main thread, the message loop,
+and the two existing observation samplers. HTTP requests may briefly add a thread.
 
-Anything that can write the spool can post a card — treat that as equivalent to console
-access. The installer therefore creates a separate system writer identity: it can traverse
-the state directory and write only setgid+sticky `tmp/` and `new/`; `processing/`, `bad/`
-and the database remain collector-only. nftables permits that UID to use loopback and
-rejects every external egress attempt. A boot-enabled system unit reapplies the rule, and
-the collector service refuses to start unless that unit is active. Posting is still *not*
-equivalent to execution: see [SECURITY.md](../../SECURITY.md).
+### Message format
 
-### Configuration
+The current message has eight fields, with no schema version:
+
+```json
+{
+  "id": "backup:2026-09-10",
+  "group": "backup",
+  "source": "backup",
+  "level": "urgent",
+  "title": "Backup has not completed",
+  "body": "Check the latest backup before the next scheduled run.",
+  "link": "https://example.test/jobs/backup",
+  "run": {
+    "cwd": "/path/to/project",
+    "prompt": "Check the current backup state and recover it if needed."
+  }
+}
+```
+
+`id`, `group`, `source`, `level` and a nonempty `title` are required. `body` is text
+and defaults to empty; `link` and `run` are optional. IDs/groups/sources use 1–128
+ASCII letters, digits, dots, underscores, colons or hyphens. The `dev-monitor:` ID/group
+prefix remains reserved. Links must be absolute
+HTTP(S) URLs. A run contains exactly nonempty `cwd` and `prompt` strings. Files
+larger than 16 KiB, filename/ID mismatches and invalid payloads are quarantined.
+
+The transitional aliases `event_id`, `group_key` and `urgency` remain accepted;
+conflicting old/new names are rejected. A legacy optional `created_at` must be an
+aware timestamp and no more than five minutes in the future. Coalescing uses the
+collector's receipt time, so a delayed spool backlog still coalesces. New producers
+should use the eight-field format. The emitter's old kind/outcome/why/followup and
+skill/exec CLI options have been removed.
+
+Within 24 hours of the first receipt, an unarchived card with the same group, run
+and link is updated: its count grows, title/body and last receipt time advance,
+and it becomes unread. Different runs or links get separate cards. Urgency can
+rise from normal to urgent, which queues the card; another receipt for an already
+urgent card does not queue another notification. Repeating an ID never adds a
+receipt or delivery. Heartbeat IDs stay separate from ordinary same-group cards.
+
+Example from the repository root, using an already installed writable spool:
+
+```sh
+python3 apps/dev-monitor/examples/emit_message.py \
+  --spool "$DEV_MONITOR_SPOOL" --source backup --group-key backup \
+  --level urgent --title 'Backup has not completed' \
+  --body 'Inspect the current backup state.' \
+  --cwd /path/to/project --prompt 'Inspect and recover the backup if needed.'
+```
+
+The emitter writes to `tmp/` and hard-links a complete file into `new/`; it does
+not create a missing spool. “Queued” means published, not accepted or delivered.
+
+### Tap Run
+
+The Run button sends `POST /api/owner/run {"card_id":"…"}` through the existing
+owner gate. The backend resolves an existing working directory strictly below
+`exec_cwd_root` (default: the user's home), selects the configured agent, and opens
+a tmux window immediately. The prompt remains one argv element through tmux and
+the runner, including trailing semicolons, quotes and newlines. For a coalesced
+card the backend appends `last_at` and `count`; the agent checks current conditions
+before acting. Provider-specific CLI spelling and the agent fallback remain.
+
+`ran_at` records a successful window launch, not task completion. Failed launches
+leave it unchanged. tmux and an available agent CLI are needed for Run; their
+absence does not disable message collection or observation. No approval dialog,
+message plan, message execution table or message completion state machine exists.
+The shared runner's executable-plan/completion-file path remains solely for the
+separate update/harness features.
+
+The existing owner and proxy-secret checks apply on every request. Writes also
+check origin, content type and body size. Ordinary `/api/run` is not an execution
+route. Publishing a spool message does not authorize execution.
+
+### Storage, delivery and retention
+
+| Table | Columns |
+|---|---|
+| `ledger` | `id` PK, `group`, `source`, `received_at`, `payload` |
+| `cards` | `card_id`, `group`, `level`, `title`, `body`, `link`, `run`, `count`, `first_at`, `last_at`, `read_at`, `archived_at`, `ran_at`, `sent_at`, `send_attempts`, `send_next_at` |
+
+The ledger is append-only within its retention period. Owner actions mutate only
+cards. Receipt files and ledger rows expire after 180 days; cards expire when
+their last receipt is that old. If more than 20 cards are active, the maintenance
+pass can archive excess cards that have been read and idle for 48 hours.
+
+A non-null `send_next_at` denotes a pending notification. All failed HTTP attempts,
+including 500, 429 and other 4xx responses, retry up to **six total attempts,
+including the first POST**. Delay starts at 30 seconds plus jitter and doubles;
+a valid 429 Retry-After can lengthen it. After the sixth failure the card shows
+“Delivery failed”. No configured webhook means collection continues and new urgent
+cards remain pending. `/api/health` reports webhook configuration, pending count,
+last send time and failed count.
+
+Delivery is at least once. The loop POSTs before committing `sent_at`. If it dies
+after the remote response but before that commit, restarting sends again. The
+ledger ID still prevents a second receipt/card. There is no delivery claim table
+or separate sender thread.
+
+### Spool and heartbeat
+
+```text
+spool/tmp/          producer staging
+spool/new/          complete published files
+spool/processing/   private retained receipts for rollback
+spool/bad/          rejected files and adjacent .reason files
+```
+
+The installer creates a separate system writer identity. State/spool parents are
+0710; `tmp/` and `new/` are setgid+sticky 3770; `processing/`, `bad/` and the DB are
+collector-only. The collector snapshots accepted bytes into a private inode before
+committing, so an open producer descriptor cannot change a retained receipt.
+Permanent rejected input is quarantined once; SQLite busy/full errors preserve
+replayable files. Successful receipts remain until the 180-day cleanup, which
+removes files before ledger rows. The old collector can replay those files after
+a database rollback.
+
+The writer's nftables rule permits loopback and rejects external egress. A
+boot-enabled system unit restores that rule; the collector requires it to be
+active. See [SECURITY.md](../../SECURITY.md) for the publishing/execution boundary.
+
+With messages enabled, `airlock-devmon-heartbeat.timer` runs at **UTC midnight**
+(`OnCalendar=*-*-* 00:00:00 UTC`, `Persistent=true`). The producer and validator share
+[devmon_heartbeat.py](backend/devmon_heartbeat.py): daily ID `heartbeat:YYYY-MM-DD`,
+group/source `heartbeat`, level `urgent`, title `살아 있음 YYYY-MM-DD`, and the
+canonical body. Ordinary messages cannot claim a reserved heartbeat ID or replace
+its alive card through same-group coalescing.
+
+A legacy heartbeat `created_at` may reflect a retry or manual start at any time
+on that UTC day; its UTC date must match the ID. Same-day canonical republication
+is a duplicate. A new UTC day creates a new heartbeat even when less than 24 hours
+has elapsed. This is a shared content contract, not source authentication.
+The external timer demonstrates the whole spool-to-Slack path by arrival.
+
+## Configuration and app-specific secrets
 
 ```toml
 [apps.dev-monitor]
 backend_port = 19923
-messages     = true
-# slack_webhook_urgent_env = "DEVMON_SLACK_WEBHOOK_URGENT"   # env NAME, not URL
-# slack_webhook_routine_env = "DEVMON_SLACK_WEBHOOK_ROUTINE" # either lane may be empty
-# compat_env_path = "/absolute/operator-owned/legacy.env" # temporary producer bridge
-# slack_webhook_env = "DEVMON_SLACK_WEBHOOK" # legacy urgent alias; remove by 2026-09-07
-# exec_cwd_root     = ""                                # empty = $HOME
-# exec_session      = "devmon-exec"
-# spool_writer_user  = "airlock-dev-monitor-writer"  # system account name, not UID
+messages = true
+slack_webhook_urgent_env = "DEVMON_SLACK_WEBHOOK" # a name, never the URL
+# exec_cwd_root = ""                           # default: the user's home
+# exec_session = "devmon-exec"
+# spool_writer_user = "airlock-dev-monitor-writer"
 # spool_writer_group = "airlock-dev-monitor-writers"
 ```
 
-The installer creates the collector-only database and the isolated spool described above,
-mints a fresh nginx→backend proxy
-secret on every real install (a dry run reuses the deployed one and never rewrites an
-existing fragment), and writes `~/.config/airlock/dev-monitor.env` (`0600`). Turning
-`messages` back off removes that env file, so the console cannot come back on a restart.
-When retiring `compat_env_path`, keep its exact path configured for that `messages = false`
-install and clear the key only after the generated bridge is gone. Clearing the path first
-relinquishes ownership and intentionally leaves the old file untouched rather than risking
-deletion of an unrelated file at an untracked path.
+The installer creates the spool and generated `dev-monitor.env`, including the
+owner/proxy gate. Turning messages off removes that generated environment file.
+The only webhook configuration key is `slack_webhook_urgent_env`; an empty value
+leaves it unconfigured. The retired routine, roster, compatibility-path and old
+`slack_webhook_env` alias keys are rejected by configuration validation.
 
-Slack webhooks are bearer capabilities to post in their channels, so — like every other
-secret in Airlock — they are *named*, not stored. `slack_webhook_urgent_env` and
-`slack_webhook_routine_env` hold environment-variable names; the installer resolves them
-into separate urgent and routine lanes. Either lane may be unset without disabling cards
-or the feed. The old `slack_webhook_env` key is an urgent-only compatibility alias through
-2026-09-07; an explicit urgent key wins and any alias use emits a dated warning.
+Put the selected credential in `~/.config/airlock/dev-monitor-secrets.env`, a
+regular file owned by the installing user with exact mode 0600. The service loads
+that app-specific file with systemd EnvironmentFile semantics. The installer never
+copies secret values into generated configuration. It checks file ownership/mode,
+then uses a name-only lexer before a temporary systemd checker interprets values.
+Unselected assignments, app controls and execution-environment control names are
+rejected; the reserved-name definition is [devmon_secret_names.py](backend/devmon_secret_names.py).
+Even when messages are disabled, an existing secret file must pass these checks.
 
-Each lane proves itself without creating routine noise. The 15-minute maintenance pass
-adds a direct, already-read probe only when the routine lane has had no success for 24
-hours or the urgent lane has had none for seven days. A recent success suppresses the
-probe; a failed probe card also suppresses another until the lane's window expires.
+An unset/blank runtime selector permits the supported legacy direct variable
+`AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT`. A nonblank selector is authoritative:
+if its target is absent or whitespace-only, the webhook is unconfigured; it does
+not fall back. The old direct alias is not supported. The same resolver is used
+by the checker and backend. Dry-run validates names and metadata only and explicitly
+does not prove systemd-loaded value semantics. A real install requires the user
+systemd manager for that check.
 
-An independent five-second watchdog names a configured lane whose delivery is left open
-for 30 minutes, whose first terminal delivery fails before any success, whose terminal
-deliveries fail twice after the latest success, or whose last success is older than the
-probe window plus 25%. It writes one unpinned local incident card and audit marker before
-queueing an operational notice on the configured opposite lane. Continuing observations
-update that card without turning the five-second poll count into an occurrence count.
-Recovery is confirmed only after 24 consecutive successful health evaluations (nominally
-two minutes at the five-second cadence). A delayed pass contributes one observation rather
-than turning scheduler delay into either recovery evidence or a permanent 15-second cliff.
-Fewer healthy evaluations keep the same incident and its pending crossover notice open;
-a failure after a confirmed recovery creates a new card immediately without rewriting the
-archived card. Crossover publication is best-effort whenever the opposite webhook is
-configured, even when that lane's health is degraded. Terminally failed notices can be
-attempted again no more often than every 30 minutes across incident cards, while pending,
-claimed and sent notices remain deduplicated. Intentionally removing that lane's webhook
-is a non-incident observation and can satisfy the same 24-pass recovery confirmation.
-A watchdog evaluation exception is written to stderr but is not evidence of either lane
-failure or recovery, and it clears partial recovery evidence. Health timestamps are
-validated and ordered by one strict, portable SQL predicate shared by every health index
-and query; smoke calls that production health function instead of maintaining a second
-Python parser. A retained malformed value—including SQLite's permissive
-hour-24 and time-only forms—therefore becomes one coalesced `ledger-invalid` incident
-instead of throwing every five seconds or poisoning the latest-success boundary. Separately,
-`/api/health` reports `unknown` when its own lane-health evaluation fails. An acknowledged
-incident can also age through the existing idle sweep if the process stops before seeing
-recovery; if the same failure is observed after restart, that swept projection is reopened
-with the same card and notice ledger. Dismissing a card hides it from the feed but likewise
-does not re-arm the incident; only a later non-incident observation does. An intentionally
-empty lane remains a named startup and `/api/health` fact, not an incident. Loss of the
-whole generated environment is reported by the out-of-domain watchdog because this process
-cannot start its message half.
+After editing the secret file, rerun installer validation before restarting.
+A direct service restart loads the file without rerunning the name/metadata check;
+no additional launcher or ExecStartPre protection is claimed.
 
-The `dev-monitor:` prefix is reserved for direct-inserted system card IDs and groups, so
-producer payloads cannot collide with watchdog identity in either direction. When
-upgrading from the pre-correction cooldown behavior, the strongest existing notice
-outcome (`sent`, then claimed/pending, then `failed`) is adopted onto the oldest canonical card;
-redundant open deliveries are retired as `superseded` rather than posted again.
+## Offline database conversion and rollback
 
-Approved actions run in tmux, so the *action* half needs `tmux` — and only that half.
-Without it cards, coalescing, Slack and the whole feed work normally, and an approval is
-refused immediately with a line in the journal instead of leaving a card that looks like it
-is running. It is deliberately not an install prerequisite (that would fail the install of
-a monitor whose console is off); the installer and `smoke.sh` both warn instead.
+An old schema is not converted during service startup. Observation remains
+available and message health reports `off: schema` until offline conversion.
+Do this after stopping the service and producers; never use a live webhook as a
+failure stub.
 
-## Credential freshness (`token_freshness = true`, default off)
+1. Stop `airlock-dev-monitor.service`. Stop producers and mask their timers,
+   including heartbeat, token freshness and any external publishers. Record their
+   existing enabled/masked state and confirm they are inactive.
+2. From the repository root run
+   `python3 apps/dev-monitor/migrate-legacy-state.py --endstate <state>/messages.db --offline`.
+   It checkpoints WAL, makes a private `messages.db.pre-endstate`, maps an offline
+   temporary file, checks rows/identities/integrity, and atomically replaces the DB.
+   An existing backup is refused. No parallel running DB or feature flag is used.
+3. Compare old `occurrences` with new `ledger` and old/new card counts. Run
+   `python3 apps/dev-monitor/migrate-legacy-state.py --verify <state>/messages.db`.
+4. Start the service, restore the producers' prior timer state, and start one
+   heartbeat. Confirm the card and actual webhook arrival.
 
-Nothing on a dev box reads a credential's expiry until something fails. Claude Code
-refreshes its OAuth token *reactively*, after an HTTP 401/403; paseo's plan panel caches
-for five minutes and re-asks nobody; and no timer anywhere looks at `expiresAt`. So the
-first sign that a token died is a job that did not run.
+Every old card and receipt is preserved. Receiptless historical cards do not get
+invented ledger rows. Pending/claimed deliveries become due cards and drain;
+interrupted claimed rows at the old cap retain one possible attempt. Old failures
+stay failed. Historical cards that were never queued stay unqueued, even if urgent.
+Multiple open deliveries for a card become one due card on the single webhook.
+Original attempts and all old events/errors/approvals/runs remain only in the backup.
 
-Two halves, both off unless you turn them on, and deliberately switched on separately:
+To roll back, stop service/producers, checkpoint and close the current database,
+then run `python3 apps/dev-monitor/migrate-legacy-state.py --restore-backup
+<state>/messages.db.pre-endstate --restore-to <state>/messages.db --offline`
+as one command. Revert the Phase 6 change, then start the old service and producers.
+The old collector recovers retained `processing/` receipts and deduplicates against
+the restored DB. Keep the backup. The tool's existing relocation, backup, restore
+and resume safeguards remain available in `--help`.
 
-| | what it is | how it is turned on |
-|---|---|---|
-| the card | `GET /monitor/api/tokens` + a **Credentials** panel on the dashboard | `token_freshness = true` |
-| the check | `airlock-token-freshness.timer` (a `--user` timer) | `bash install-token-timer.sh` |
+## Credential freshness
 
-The config key makes the verdict *visible*; the timer makes it *happen*. A standing job on
-the operator's box is not something a config default should start, so the installer says so
-once instead of doing it.
+`token_freshness = true` enables the Credentials panel and `/api/tokens`; its timer
+is installed separately with `bash apps/dev-monitor/install-token-timer.sh`.
+The defaults `token_freshness_warn_hours = 24` and
+`token_freshness_stale_hours = 24` control warning thresholds. Use `--uninstall` to
+remove the timer; `--no-messages` explicitly permits a snapshot-only installation.
 
-```toml
-[apps.dev-monitor]
-token_freshness             = true
-# token_freshness_warn_hours  = 24   # claude: warn this long before the refresh deadline
-# token_freshness_stale_hours = 24   # codex: warn once last_refresh is this old
+The verdicts are ok, expiring-soon, expired and unknown. Missing or unreadable
+metadata is unknown. Claude's refresh-token deadline is used when available;
+Codex's last-refresh age indicates staleness and does not prove expiry. Credentials
+are read for timestamp/presence metadata; token values are never logged or published.
+
+The checker writes `token-freshness.json` and emits messages for unhealthy
+providers: expired is urgent; other non-OK verdicts are normal. Those messages
+coalesce by provider over 24 hours. Its OnFailure unit
+leaves local evidence and emits an urgent message if the checker itself fails.
+A failed optional message configuration never takes observation down; health
+reports what actually started.
+
+## Verification
+
+Run from the repository root. Tests use disposable state and local recorders.
+
+```sh
+python3 apps/dev-monitor/backend/test_devmon.py
+python3 apps/dev-monitor/test-backend.py
+python3 apps/dev-monitor/test-run-contract.py
+python3 apps/dev-monitor/test-loop-contract.py
+python3 apps/dev-monitor/test-migrate-legacy-state.py
+python3 apps/dev-monitor/test-heartbeat.py
+node apps/dev-monitor/test-frontend-contract.mjs
+python3 apps/dev-monitor/test-secret-resolution.py --systemd
+bash install/test-monitor-spool-hardening.sh
 ```
 
-```
-bash apps/dev-monitor/install-token-timer.sh [--oncalendar 'daily'] [--no-messages]
-bash apps/dev-monitor/install-token-timer.sh --uninstall
-```
-
-**Four verdicts, and `unknown` is not `ok`.** `ok` / `expiring-soon` / `expired` /
-`unknown`. A missing or unparseable credentials file is `unknown` and renders as a warning
-— a checker that scores an absent file green is worse than no checker.
-
-**Which field is the deadline.** For Claude the access token in `expiresAt` turns over by
-itself every few hours, so on its own it is noise; what needs a human is
-`refreshTokenExpiresAt`, and that drives the verdict when it is present. Codex's
-`auth.json` has no expiry field at all — `tokens.last_refresh` is the only field that
-proves the session is still alive, so the codex verdict is an *age* verdict and never
-claims `expired`, because staleness cannot prove death.
-
-**It never reads, logs or publishes a token value** — only field presence and timestamps.
-`test-backend.py` asserts that against a fixture whose token values are a sentinel string.
-
-**Where the warning goes.** Into the message console that already exists: a run publishes
-one `info` card per unhealthy provider to the spool, and the collector's 24-hour coalescing
-makes that one card per provider per day whatever the schedule. So this half wants
-`messages = true`; without it the timer still writes its snapshot and the dashboard card
-still shows the verdict, but nothing pushes — and `install-token-timer.sh` refuses to wire
-a timer whose loud channel is absent unless you pass `--no-messages` and mean it.
-
-**A dead checker is visible as staleness, not silence.** Every run writes
-`~/.local/state/airlock/dev-monitor/token-freshness.json` whatever the verdict, and the
-card shows how old it is (`never`, if the timer has not been wired). The unit also carries
-`OnFailure=airlock-token-freshness-failed.service`, which leaves evidence on the box and
-posts an urgent card — because a watchdog that dies quietly leaves the card showing its
-last verdict, and the last verdict was green.
-
-### Failure behaviour
-
-Nothing here is allowed to take observability down with it. A half-set gate, a corrupt or
-locked database, an unwritable state directory: each is logged with its reason, the owner
-routes return 404, and the monitor keeps serving. `messages` in the startup banner and in
-`GET /monitor/api/health` reports what actually started, not what the config asked for, so
-a half-configured install is visible to a script and not only in the boot log.
-
-### Tests
-
-```
-python3 backend/test_devmon.py                     # 209 offline checks, no install required
-python3 test-backend.py                            # the backend's own half, incl. credential freshness
-bash "$AIRLOCK_ROOT"/install/test-token-freshness-timer.sh  # timer templates, substitution, installer refusals
-#   (that suite lives in the PLATFORM checkout, not in this package — after the
-#    apps/ split there is no ../.. that reaches it)
-```
-
-Covers validation, dedup, coalescing, crash recovery, urgency promotion, read≠notified,
-sweep, flood detection, lane probes and watchdog crossover, the approval/run state
-machine and the Slack outbox.
+For V14, supply an explicit private DB **copy** and the preceding backend checkout:
+`python3 apps/dev-monitor/test-endstate-rehearsal.py --copy <copy.db> --old-backend
+<preceding-checkout>/apps/dev-monitor/backend` (one command). It checks row contents,
+local heartbeat delivery, exact backup restoration and replay by the old collector.
+Synthetic pending/claimed cases are tested separately from the real-data rehearsal.
+Local recorder/systemd checks do not establish a production reinstall or real Slack
+arrival. Campaign status, scope exceptions and exact PR evidence are in
+[the endstate task](../../docs/tasks/active/dev-monitor-endstate.md).

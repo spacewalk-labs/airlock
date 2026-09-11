@@ -52,8 +52,8 @@ from typing import Any
 SCHEMA_VERSION = 1
 
 # The same id grammar bin/airlock-config enforces for a package.  Used to refuse an
-# app id before it can reach a run record, not to authorize one: the id never reaches
-# a command line (see build_exec_argv — it is recorded, never passed).
+# app id before it can reach a run record. Reinstall actions only record it; the closed
+# teardown action is the sole action that passes the already-validated id to a command.
 APP_ID = re.compile(r"\A[a-z0-9][a-z0-9-]{0,31}\Z")
 
 # A status run probes tailscale, nginx, the gate and every unit; on a loaded box it is
@@ -283,37 +283,90 @@ def observed(record: dict[str, Any] | None,
 # ---------------------------------------------------------------- the plan ----
 
 def build_exec_argv(root: Path, directory: Path, run_id: str, action: str,
-                    app_id: str | None) -> list[str]:
+                    app_id: str | None, *, approved_digest: str | None = None,
+                    package_path: str | None = None,
+                    reapprove: bool = False) -> list[str]:
     """argv the action runner execs — element by element, no shell anywhere.
 
-    Note what is NOT here: the app id.  Both buttons run the same command because
+    For the existing ``app`` reinstall, note what is NOT here: the app id. Both
+    update buttons run the same command because
     there is no supported way to reinstall one app on its own (the installer has no
     per-app entry point; a single app's install is intent -> icon-stage -> install.sh
     -> serve render -> commit, and reproducing that outside would fork the ledger
-    protocol).  The id is recorded so the panel can say which row was pressed; it is
-    never an argument, so an id cannot reach a command line at all.
+    protocol). Personal-package installs do carry an id, approved digest and path to
+    this fixed wrapper; they are rechecked here and never forwarded to a shell. Only a
+    reapproval forwards the validated id, as the installer's exact package-scoped
+    break-glass flag.
     """
     argv = [sys.executable, str(Path(__file__).resolve()),
             "--root", str(root), "--dir", str(directory), "--run", run_id,
             "--action", action]
     if app_id:
         argv += ["--app", app_id]
+    if approved_digest is not None:
+        argv += ["--approved-digest", approved_digest]
+    if package_path is not None:
+        argv += ["--package-path", package_path]
+    if reapprove:
+        argv.append("--reapprove")
     return argv
 
 
 def build_plan(root: Path, directory: Path, run_id: str, action: str,
-               app_id: str | None) -> dict[str, Any]:
+               app_id: str | None, *, approved_digest: str | None = None,
+               package_path: str | None = None,
+               reapprove: bool = False) -> dict[str, Any]:
     """The action_runner plan file. `cwd` and `cwd_root` are both the checkout.
 
     The runner re-resolves cwd after chdir and refuses anything outside cwd_root, so
     pinning both to the checkout means a symlink swapped in after the click cannot
     move the run somewhere else.
     """
-    explain = ("Airlock 본체 업데이트" if action == "platform"
-               else "앱 '%s' 재설치 (본체 업데이트 경로로 수렴)" % app_id)
+    explain = {
+        "platform": "Airlock 본체 업데이트",
+        "app": "앱 '%s' 재설치 (본체 업데이트 경로로 수렴)" % app_id,
+        "install": "변경한 앱 설정 적용 (전체 설치기 재실행)",
+        "teardown": "앱 '%s' teardown (앱 데이터는 유지)" % app_id,
+    }[action]
     return {"cwd": str(root), "cwd_root": str(root),
-            "exec": build_exec_argv(root, directory, run_id, action, app_id),
+            "exec": build_exec_argv(
+                root, directory, run_id, action, app_id,
+                approved_digest=approved_digest, package_path=package_path,
+                reapprove=reapprove),
             "explain": explain}
+
+
+def approved_package_matches(root: Path, app_id: str, package_path: str,
+                             digest: str) -> tuple[bool, str]:
+    """Re-read a package immediately before install and bind the click to its digest."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(root / "bin" / "airlock-config"),
+             "package-preview", package_path], cwd=str(root),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=STATUS_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, "승인한 패키지를 다시 읽지 못했습니다: %s" % exc
+    if result.returncode:
+        return False, "승인한 패키지 재검증이 실패했습니다: %s" % result.stderr.strip()
+    try:
+        preview = json.loads(result.stdout)
+    except ValueError:
+        return False, "승인한 패키지 재검증이 JSON을 반환하지 않았습니다."
+    if not isinstance(preview, dict) or preview.get("id") != app_id:
+        return False, "승인 뒤 패키지 id가 바뀌었습니다."
+    try:
+        preview_path = str(Path(package_path).resolve())
+    except OSError as exc:
+        return False, "승인한 패키지 경로를 확인하지 못했습니다: %s" % exc
+    if (preview.get("registered") is not True
+            or preview.get("configured_path") != preview_path):
+        return False, "승인 뒤 airlock.toml의 패키지 경로가 바뀌었습니다."
+    if preview.get("digest") != digest:
+        return False, "승인 뒤 패키지 digest가 바뀌었습니다 — 다시 미리보기하십시오."
+    if preview.get("installable") is not True:
+        return False, "패키지에 승인할 수 없는 capability 또는 등록 충돌이 있습니다."
+    return True, ""
 
 
 def start_record(run_id: str, action: str, app_id: str | None) -> dict[str, Any]:
@@ -422,12 +475,16 @@ def _claim(directory: Path, run_id: str) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="run bin/airlock-update for the hub panel")
+    parser = argparse.ArgumentParser(description="run a closed Airlock lifecycle action")
     parser.add_argument("--root", type=Path, default=default_root())
     parser.add_argument("--dir", dest="directory", type=Path, default=default_dir())
     parser.add_argument("--run", required=True)
-    parser.add_argument("--action", required=True, choices=("platform", "app"))
+    parser.add_argument("--action", required=True,
+                        choices=("platform", "app", "install", "teardown"))
     parser.add_argument("--app", default=None)
+    parser.add_argument("--approved-digest", default=None)
+    parser.add_argument("--package-path", default=None)
+    parser.add_argument("--reapprove", action="store_true")
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
@@ -441,7 +498,46 @@ def main(argv: list[str] | None = None) -> int:
     record["before"] = status_summary(root)
     write_record(directory, record)
 
-    argv_update = ["bash", str(root / "bin" / "airlock-update")]
+    approved = (args.approved_digest, args.package_path)
+    if any(value is not None for value in approved) or args.reapprove:
+        if (args.action != "install" or not isinstance(args.app, str)
+                or APP_ID.fullmatch(args.app) is None
+                or not isinstance(args.approved_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", args.approved_digest) is None
+                or not isinstance(args.package_path, str) or not args.package_path):
+            record["status"] = "failed"
+            record["exitCode"] = 2
+            record["endedAt"] = now_iso()
+            record["note"] = "package approval requires install, app id, path and digest"
+            write_record(directory, record)
+            return 2
+        matches, note = approved_package_matches(
+            root, args.app, args.package_path, args.approved_digest)
+        if not matches:
+            record["status"] = "failed"
+            record["exitCode"] = 2
+            record["endedAt"] = now_iso()
+            record["note"] = note
+            write_record(directory, record)
+            return 2
+
+    if args.action in ("platform", "app"):
+        argv_update = ["bash", str(root / "bin" / "airlock-update")]
+    elif args.action == "install":
+        argv_update = ["bash", str(root / "install" / "airlock-install.sh")]
+        if args.reapprove:
+            argv_update.append("--dangerously-admit-unverified=%s" % args.app)
+    else:
+        if not isinstance(args.app, str) or APP_ID.fullmatch(args.app) is None:
+            record["status"] = "failed"
+            record["exitCode"] = 2
+            record["endedAt"] = now_iso()
+            record["note"] = "teardown action requires a valid app id"
+            write_record(directory, record)
+            return 2
+        argv_update = [str(root / "bin" / "airlock-teardown"), args.app]
+    subject = {"platform": "플랫폼 업데이트", "app": "앱 업데이트",
+               "install": "전체 설치기", "teardown": "앱 teardown"}[args.action]
     print("실행: %s" % " ".join(argv_update), flush=True)
     try:
         # stdout/stderr are inherited on purpose: the tmux pane the runner leaves open
@@ -449,10 +545,11 @@ def main(argv: list[str] | None = None) -> int:
         code = subprocess.call(argv_update, cwd=str(root), timeout=UPDATE_TIMEOUT)
     except subprocess.TimeoutExpired:
         code = 124
-        record["note"] = "업데이트가 %d초 안에 끝나지 않아 중단했습니다." % UPDATE_TIMEOUT
+        record["note"] = "%s가 %d초 안에 끝나지 않아 중단했습니다." % (
+            subject, UPDATE_TIMEOUT)
     except OSError as exc:
         code = 127
-        record["note"] = "업데이트를 실행하지 못했습니다: %s" % exc
+        record["note"] = "%s를 실행하지 못했습니다: %s" % (subject, exc)
 
     record["exitCode"] = code
     record["status"] = "done" if code == 0 else "failed"
@@ -461,8 +558,15 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n업데이트 뒤 상태를 확인합니다… (bin/airlock-status --json)", flush=True)
     record["after"] = status_summary(root)
-    if code != 0:
+    if code != 0 and args.action in ("platform", "app"):
         record["recovery"] = recovery_hint(root)
+    elif code != 0 and not record.get("note"):
+        record["note"] = ({
+            "install": ("전체 설치기가 실패했습니다. 실행 창의 출력을 확인하고, "
+                        "설정 변경 전 바이트가 필요하면 airlock.toml.bak을 확인하십시오."),
+            "teardown": ("앱 teardown이 실패했습니다. 실행 창의 출력을 확인하십시오. "
+                         "airlock-update 롤백은 이 작업의 복구 절차가 아닙니다."),
+        }[args.action])
     record["endedAt"] = now_iso()
     write_record(directory, record)
     return code

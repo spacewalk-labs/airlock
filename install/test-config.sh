@@ -262,128 +262,27 @@ else
 fi
 
 mk '[apps.dev-monitor]
-slack_webhook_urgent_env = "DEVMON_URGENT"
-slack_webhook_routine_env = "DEVMON_ROUTINE"
-slack_webhook_env = "DEVMON_LEGACY"'
+slack_webhook_urgent_env = "DEVMON_URGENT"'
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then
-  ok "dev-monitor: canonical webhook keys and legacy alias are accepted"
+  ok "dev-monitor: single webhook selector is accepted"
 else
-  bad "dev-monitor: canonical webhook keys and legacy alias are accepted"
-fi
-dm_warning="$(run "$TMP/t.toml" validate 2>&1 >/dev/null)"
-if [ "$(printf '%s\n' "$dm_warning" | grep -c 'apps.dev-monitor.slack_webhook_env is deprecated' || true)" = 1 ] \
-    && printf '%s\n' "$dm_warning" | grep -q 'apps.dev-monitor.slack_webhook_urgent_env' \
-    && printf '%s\n' "$dm_warning" | grep -q '2026-09-07'; then
-  ok "dev-monitor: legacy alias emits one dated config warning"
-else
-  bad "dev-monitor: legacy alias emits one dated config warning"
-fi
-dm_env_warning="$(run "$TMP/t.toml" env dev-monitor 2>&1 >/dev/null)"
-if [ "$(printf '%s\n' "$dm_env_warning" | grep -c 'apps.dev-monitor.slack_webhook_env is deprecated' || true)" = 1 ]; then
-  ok "dev-monitor: direct env export emits one alias warning"
-else
-  bad "dev-monitor: direct env export emits one alias warning"
+  bad "dev-monitor: single webhook selector is accepted"
 fi
 dm_env="$(run "$TMP/t.toml" env dev-monitor 2>/dev/null)"
-if printf '%s\n' "$dm_env" | grep -q '^AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT_ENV=DEVMON_URGENT$' \
-    && printf '%s\n' "$dm_env" | grep -q '^AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE_ENV=DEVMON_ROUTINE$' \
-    && printf '%s\n' "$dm_env" | grep -q '^AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ENV=DEVMON_LEGACY$'; then
-  ok "dev-monitor: webhook config keys export distinct names"
+if grep -qxF 'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT_ENV=DEVMON_URGENT' <<<"$dm_env"; then
+  ok "dev-monitor: single webhook selector exports its name"
 else
-  bad "dev-monitor: webhook config keys export distinct names"
+  bad "dev-monitor: single webhook selector exports its name"
 fi
-
-mk '[apps.dev-monitor]
-slack_webhook_urgent_env = "DEVMON_URGENT"
-slack_webhook_routine_env = "DEVMON_ROUTINE"
-slack_webhook_env = "   "'
-dm_clean="$(run "$TMP/t.toml" validate 2>&1 >/dev/null)"
-if ! printf '%s\n' "$dm_clean" | grep -q 'slack_webhook_env is deprecated'; then
-  ok "dev-monitor: canonical-only and whitespace-empty alias are warning-free"
-else
-  bad "dev-monitor: canonical-only and whitespace-empty alias are warning-free"
-fi
-
-# The email lane's keys, asserted the same way the webhook keys are: declared in the manifest
-# means accepted and exported under this package's own prefix, and a plausible neighbour that
-# is NOT declared still dies. Without the second half this only proves the config layer is
-# permissive, which would let install.sh drift away from the manifest unnoticed.
-mk '[apps.dev-monitor]
-smtp_host = "relay.example.com"
-smtp_port = 587
-smtp_from = "dev-monitor@example.com"
-smtp_to = "owner@fixture.dev"
-smtp_user = "devmon"
-smtp_password_env = "DEVMON_SMTP_PASSWORD"'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then
-  ok "dev-monitor: smtp keys are accepted once the manifest declares them"
-else
-  bad "dev-monitor: smtp keys are accepted once the manifest declares them"
-fi
-dm_smtp="$(run "$TMP/t.toml" env dev-monitor 2>/dev/null)"
-if printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_HOST=relay.example.com$' \
-    && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_PORT=587$' \
-    && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_FROM=dev-monitor@example.com$' \
-    && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_TO=owner@fixture.dev$' \
-    && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_USER=devmon$' \
-    && printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_PASSWORD_ENV=DEVMON_SMTP_PASSWORD$'; then
-  ok "dev-monitor: smtp config keys export the names install.sh reads"
-else
-  bad "dev-monitor: smtp config keys export the names install.sh reads"
-fi
-# The password itself is never a config key — only the name of the variable holding it.
-if printf '%s\n' "$dm_smtp" | grep -q '^AIRLOCK_DEV_MONITOR_SMTP_PASSWORD='; then
-  bad "dev-monitor: smtp password must not be a config key"
-else
-  ok "dev-monitor: smtp password is named, never held, in config"
-fi
-mk '[apps.dev-monitor]
-smtp_password = "hunter2"'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then
-  bad "dev-monitor: an undeclared smtp_password key must be rejected"
-else
-  ok "dev-monitor: an undeclared smtp_password key is rejected"
-fi
-mk '[apps.dev-monitor]
-smtp_port = "587"'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then
-  bad "dev-monitor: smtp_port must be a number, not a string"
-else
-  ok "dev-monitor: smtp_port must be a number, not a string"
-fi
-
-# The roster path (P4): a bare path, not a credential, so no *_env indirection — declared
-# means accepted and exported under this package's own prefix, same as every other
-# config.defaults key.
-mk '[apps.dev-monitor]
-roster_path = "/home/example/.local/state/roster/roster.json"'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then
-  ok "dev-monitor: roster_path is accepted once the manifest declares it"
-else
-  bad "dev-monitor: roster_path is accepted once the manifest declares it"
-fi
-dm_roster="$(run "$TMP/t.toml" env dev-monitor 2>/dev/null)"
-if printf '%s\n' "$dm_roster" | grep -q '^AIRLOCK_DEV_MONITOR_ROSTER_PATH=/home/example/.local/state/roster/roster.json$'; then
-  ok "dev-monitor: roster_path exports the name install.sh reads"
-else
-  bad "dev-monitor: roster_path exports the name install.sh reads"
-fi
-mk '[apps.dev-monitor]'
-dm_roster_default="$(run "$TMP/t.toml" env dev-monitor 2>/dev/null)"
-if printf '%s\n' "$dm_roster_default" | grep -q "^AIRLOCK_DEV_MONITOR_ROSTER_PATH=''$"; then
-  ok "dev-monitor: roster_path defaults to empty — no roster on this box is supported"
-else
-  bad "dev-monitor: roster_path defaults to empty — no roster on this box is supported"
-fi
-
-mk '[apps.dev-monitor]
-compat_env_path = "/srv/legacy/dev-monitor.env"'
-dm_compat="$(run "$TMP/t.toml" env dev-monitor 2>/dev/null)"
-if printf '%s\n' "$dm_compat" | grep -q '^AIRLOCK_DEV_MONITOR_COMPAT_ENV_PATH=/srv/legacy/dev-monitor.env$'; then
-  ok "dev-monitor: compat_env_path is explicit config, never a public hard-coded path"
-else
-  bad "dev-monitor: compat_env_path exports the name install.sh reads"
-fi
+for retired in slack_webhook_env slack_webhook_routine_env smtp_host smtp_port smtp_from smtp_to smtp_user smtp_password_env smtp_password roster_path compat_env_path; do
+  mk "[apps.dev-monitor]
+$retired = \"retired\""
+  if run "$TMP/t.toml" validate >/dev/null 2>&1; then
+    bad "dev-monitor: removed $retired accepted"
+  else
+    ok "dev-monitor: removed $retired rejected"
+  fi
+done
 
 mk '[apps.dev-monitor]
 spool_writer_user = "monitor-writer"

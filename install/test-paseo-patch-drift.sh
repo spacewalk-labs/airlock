@@ -117,11 +117,12 @@ if (!web.includes(`const PINNED_VERSION = "${manifest.web_ui.version}";`)) {
 // time on a box nobody tested. Order-insensitive on the edits within a shape, since
 // the eight edit sites are disjoint and the set is what identifies the bytes.
 const patcher = require(webPath);
-const shapeKey = (sha256, edits) => `${sha256}:${[...edits].sort().join("|")}`;
+const shapeKey = (sha256, edits, legacyShas = []) =>
+  `${sha256}:${[...legacyShas].sort().join(",")}:${[...edits].sort().join("|")}`;
 const manifestShapes = (manifest.web_ui.shapes ?? []).map((shape) =>
-  shapeKey(shape.sha256, shape.edits));
+  shapeKey(shape.sha256, shape.edits, shape.legacy_sha256s));
 const patcherShapes = patcher.KNOWN_BUNDLE_SHAPES.map((shape) =>
-  shapeKey(shape.sha, shape.edits));
+  shapeKey(shape.sha, shape.edits, shape.legacyShas));
 if (manifestShapes.length !== patcherShapes.length
     || [...manifestShapes].sort().join("\n") !== [...patcherShapes].sort().join("\n")) {
   throw new Error("anchor manifest shape table does not match patch-web-ui.js KNOWN_BUNDLE_SHAPES");

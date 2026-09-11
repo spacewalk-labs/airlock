@@ -4,9 +4,9 @@ Airlock — third-party components and licenses
 Airlock
 Copyright 2026 Sunghyeon Cho
 
-Licensed under the Apache License, Version 2.0. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0 — see LICENSE for the
-full text and for the AGPL-3.0 carve-out that applies to the paseo patches.
+Licensed under the GNU Affero General Public License, Version 3. You may obtain
+a copy of the License at https://www.gnu.org/licenses/agpl-3.0.html — see LICENSE
+for the full text, the scope note, and the trademark and network-use notes.
 
 Airlock is an installer/composer. It does NOT bundle the upstream tools below;
 each is fetched at install time from its own source. Airlock ships only its own
@@ -27,14 +27,14 @@ orca web client   github.com/stablyai/orca          MIT           vendored BUILT
 paseo (CLI)       github.com/getpaseo/paseo         AGPL-3.0      npm i @getpaseo/cli at install (not redistributed)
 paseo patches     apps/paseo/patches/               AGPL-3.0      our patches — derivative of paseo, see that dir
 paseo web-ui patcher apps/paseo/browse-host/bin/patch-web-ui.js  AGPL-3.0  encodes derivative edits of paseo's web-ui
-paseo browse-host apps/paseo/browse-host/ (ours)    Apache-2.0    loopback-WS sidecar; needs Playwright (follow-up, not wired in v1)
+paseo browse-host apps/paseo/browse-host/ (ours)    AGPL-3.0      loopback-WS sidecar; needs Playwright (follow-up, not wired in v1)
 Playwright/Chromium (only if browse-host used)      Apache-2.0 / (Chromium BSD)  downloaded at install
 
 Everything else under apps/ (hub, publish, notepad, dev-monitor backends/UIs, the
-gate, config layer, installers) is Airlock's own code under Apache-2.0 (repo root LICENSE).
+gate, config layer, installers) is Airlock's own code under AGPL-3.0 (repo root LICENSE).
 
 Orca web client (apps/orca/web-bundle/dist/) — derived from stablyai/orca, MIT,
-Copyright (c) 2026 Lovecast Inc.; local patches under this repo's Apache-2.0 license. Unlike
+Copyright (c) 2026 Lovecast Inc.; local patches under this repo's AGPL-3.0 license. Unlike
 the other upstream tools, this is a BUILT derivative we REDISTRIBUTE (it ships in the
 repo and is served at /orca-web/), which the upstream MIT license permits with this
 attribution. Provenance + patch summary: apps/orca/web-bundle/README.md.
@@ -50,12 +50,22 @@ Notes
   are NOT redistributed by Airlock; the installer fetches them from upstream and
   verifies sha256 where applicable. Operators accept the upstream terms of those
   binaries.
-- Mixed-license: the Airlock core is Apache-2.0. Paseo (@getpaseo/cli) is AGPL-3.0 and
+- Core license: the Airlock core is AGPL-3.0 (changed from Apache-2.0 on
+  2026-09-08 by the copyright holder). Paseo (@getpaseo/cli) is also AGPL-3.0 and
   runs as a SEPARATE PROCESS — the core talks to it over loopback IPC/WS, so the
-  core is not a derivative of paseo (mere aggregation). The paseo *patches* and the
-  *web-ui patcher* ARE derivatives of paseo and carry AGPL-3.0; the browse-host
-  sidecar is an independent program (no paseo imports) and is Apache-2.0. The full
-  AGPL-3.0 text is vendored at apps/paseo/patches/LICENSE. This is NOT legal advice.
+  core is not a derivative of paseo (mere aggregation). That separation still
+  matters for attribution even though both are now AGPL-3.0: the paseo *patches*
+  and the *web-ui patcher* ARE derivatives of paseo and are marked AGPL-3.0-only
+  for that reason, while the rest of this repository is AGPL-3.0 by the copyright
+  holder's own choice. The full AGPL-3.0 text is the repo root LICENSE (also
+  vendored at apps/paseo/patches/LICENSE). This is NOT legal advice.
+- Network use (AGPL-3.0 section 13): Airlock is network-interactive. An operator
+  who modifies Airlock and lets others use it over a network must offer those
+  users the Corresponding Source of the modified version. The hub footer carries
+  that offer — keep it working if you modify Airlock.
+- Trademarks: AGPL-3.0 has no clause equivalent to Apache-2.0 section 6, so the
+  trademark reservation is stated explicitly in LICENSE and in the branding note
+  below. The license covers the files; it does not grant use of the marks.
 - Vendored (redistributed) libraries: unlike the downloaded binaries above, the
   fileview viewer's client-side libraries — highlight.js (BSD-3-Clause), marked
   (MIT), and DOMPurify (Apache-2.0 OR MPL-2.0) — ARE redistributed in this repo
@@ -66,7 +76,7 @@ Notes
   staged by the platform from there now) are the upstream projects' own
   logos, vendored for the launcher tiles (nominative use — identifying the
   tool each tile opens), and are their respective trademarks, not
-  Apache-2.0-licensed Airlock code. The Airlock porthole mark
+  AGPL-3.0-licensed Airlock code. The Airlock porthole mark
   (hub/assets/apple-touch-icon.png, favicon.png;
   artwork bin/airlock-mark.png; generator bin/gen-hub-icons.py) is the
   author's own work, but it is ALSO a brand mark, and a brand mark is a

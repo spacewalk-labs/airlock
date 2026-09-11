@@ -149,7 +149,9 @@ class MigrationTests(unittest.TestCase):
         }
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(before, after)
-        self.assertIn('backup=ok occurrences=1 cards=2 runs=1', result.stdout)
+        self.assertIn('backup=ok', result.stdout)
+        for count in ('occurrences=1','cards=2','runs=1'):
+            self.assertIn(count,result.stdout)
         copy = sqlite3.connect(self.backup)
         try:
             self.assertEqual(2, copy.execute('SELECT COUNT(*) FROM events').fetchone()[0])
@@ -243,24 +245,11 @@ class MigrationTests(unittest.TestCase):
         db.row_factory = sqlite3.Row
         try:
             self.assertEqual('ok', db.execute('PRAGMA integrity_check').fetchone()[0])
-            self.assertEqual(2, db.execute('SELECT COUNT(*) FROM events').fetchone()[0])
-            card = db.execute(
-                "SELECT severity,owner,needs_action,task_state,runbook FROM cards "
-                "WHERE card_id='card-safe'").fetchone()
-            self.assertEqual('page', card['severity'])
-            self.assertIsNone(card['owner'])
-            self.assertIsNone(card['needs_action'])
-            self.assertIsNone(card['task_state'])
-            self.assertIsNone(card['runbook'])
-            normal = db.execute(
-                "SELECT severity FROM cards WHERE card_id='card-normal'").fetchone()
-            self.assertEqual('record', normal['severity'])
-            run = db.execute('SELECT keep_requested,kept_at,reclaimed_at FROM runs').fetchone()
-            self.assertEqual(0, run['keep_requested'])
-            self.assertIsNone(run['kept_at'])
-            delivery = db.execute('SELECT channel,claimed_by,lease_until,created_at,last_error_at FROM deliveries').fetchone()
-            self.assertEqual('slack-urgent', delivery['channel'])
-            self.assertIsNone(delivery['claimed_by'])
+            self.assertEqual(1, db.execute('SELECT COUNT(*) FROM ledger').fetchone()[0])
+            levels = dict(db.execute('SELECT card_id,level FROM cards'))
+            self.assertEqual({'card-safe':'urgent','card-normal':'normal'},levels)
+            self.assertIsNone(db.execute('SELECT ran_at FROM cards LIMIT 1').fetchone()[0])
+            self.assertEqual({'ledger','cards'}, {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")})
         finally:
             db.close()
         self.assertEqual('{}\n', (self.canonical / 'spool' / 'new' / 'one.json').read_text())
@@ -271,30 +260,19 @@ class MigrationTests(unittest.TestCase):
         backup_db = sqlite3.connect(self.backup)
         target_db = sqlite3.connect(target)
         try:
-            for table in ('occurrences', 'cards', 'runs', 'approvals',
-                          'deliveries', 'events', 'ingest_errors'):
-                source_count = backup_db.execute(
-                    'SELECT COUNT(*) FROM %s' % table).fetchone()[0]
-                target_count = target_db.execute(
-                    'SELECT COUNT(*) FROM %s' % table).fetchone()[0]
-                self.assertEqual(source_count, target_count, table)
-            old_card_columns = (
-                'card_id,group_key,source,kind,urgency,title,body,action_json,'
-                'link_json,action_digest,created_at,received_at,read_at,'
-                'slack_sent_at,pinned,archived_at,dismissed_at,occurrence_count,'
-                'last_seen,run_id')
-            self.assertEqual(
-                backup_db.execute(
-                    'SELECT %s FROM cards ORDER BY card_id' % old_card_columns).fetchall(),
-                target_db.execute(
-                    'SELECT %s FROM cards ORDER BY card_id' % old_card_columns).fetchall())
+            self.assertEqual(2,backup_db.execute('SELECT COUNT(*) FROM events').fetchone()[0])
+            self.assertEqual(1,backup_db.execute('SELECT COUNT(*) FROM runs').fetchone()[0])
+            self.assertEqual(backup_db.execute('SELECT event_id,group_key,received_at,payload_json FROM occurrences').fetchall(),
+                             target_db.execute('SELECT id,[group],received_at,payload FROM ledger').fetchall())
+            self.assertEqual(backup_db.execute('SELECT card_id,group_key,urgency,title,body,occurrence_count,last_seen FROM cards ORDER BY card_id').fetchall(),
+                             target_db.execute('SELECT card_id,[group],level,title,body,count,last_at FROM cards ORDER BY card_id').fetchall())
         finally:
             backup_db.close()
             target_db.close()
 
         db = sqlite3.connect(target)
         try:
-            db.execute('DROP INDEX idx_deliveries_claim')
+            db.execute('DROP INDEX cards_send')
             db.commit()
         finally:
             db.close()
@@ -302,16 +280,89 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(2, partial.returncode)
         self.assertIn('canonical indexes', partial.stderr)
 
-    def test_duplicate_open_delivery_fails_without_identifiers(self):
+    def test_duplicate_open_deliveries_become_one_due_card(self):
         conn = make_legacy(self.legacy, duplicate=True)
         conn.close()
-        result = self.run_script(
-            self.legacy, self.canonical, '--db-backup', self.backup, '--offline')
-        self.assertEqual(2, result.returncode)
-        self.assertNotIn('card-safe', result.stderr)
-        self.assertNotIn('slack-urgent', result.stderr)
-        self.assertTrue(self.backup.exists())
-        self.assertFalse((self.canonical / 'messages.db').exists())
+        result = self.run_script(self.legacy,self.canonical,'--db-backup',self.backup,'--offline')
+        self.assertEqual(0,result.returncode,result.stderr)
+        db=sqlite3.connect(self.canonical/'messages.db')
+        self.assertEqual(1,db.execute('SELECT COUNT(*) FROM cards WHERE send_next_at IS NOT NULL').fetchone()[0])
+        db.close()
+        backup=sqlite3.connect(self.backup)
+        self.assertEqual(2,backup.execute("SELECT COUNT(*) FROM deliveries WHERE status='pending'").fetchone()[0])
+        backup.close()
+
+    def test_pending_and_claimed_drain_failed_and_unqueued_history_stay(self):
+        import http.server
+        import threading
+        conn=make_legacy(self.legacy)
+        conn.execute('DELETE FROM deliveries')
+        template=dict(zip([c[1] for c in conn.execute('PRAGMA table_info(cards)')],
+                          conn.execute("SELECT * FROM cards WHERE card_id='card-safe'").fetchone()))
+        for name in ('failed','unqueued'):
+            row=dict(template,card_id=name,group_key=name)
+            conn.execute('INSERT INTO cards VALUES('+','.join('?' for _ in row)+')',tuple(row.values()))
+        for cid,status,attempts in (('card-safe','pending',2),('card-normal','claimed',6),('failed','failed',1)):
+            conn.execute('INSERT INTO deliveries(card_id,channel,status,attempts) VALUES(?,?,?,?)',
+                         (cid,'slack-urgent',status,attempts))
+        conn.commit();conn.close()
+        result=self.run_script(self.legacy,self.canonical,'--db-backup',self.backup,'--offline')
+        self.assertEqual(0,result.returncode,result.stderr)
+        sys.path.insert(0,str(HERE/'backend'))
+        import devmon_messages as messages
+        import devmon_loop as loop
+        messages._local=threading.local()
+        messages.init_db(str(self.canonical/'messages.db'))
+        self.assertEqual(messages.delivery_health()['pending_count'],2)
+        self.assertEqual(messages.get_card('failed')['delivery'],'failed')
+        self.assertEqual(messages.get_card('unqueued')['delivery'],'none')
+        posts=[]
+        class Recorder(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                posts.append(self.rfile.read(int(self.headers['Content-Length'])))
+                self.send_response(200);self.end_headers()
+            def log_message(self,*args): pass
+        server=http.server.HTTPServer(('127.0.0.1',0),Recorder)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            hook='http://127.0.0.1:%d/hook'%server.server_port
+            self.assertTrue(loop.deliver_once(hook));self.assertTrue(loop.deliver_once(hook))
+            self.assertFalse(loop.deliver_once(hook))
+            self.assertEqual(len(posts),2)
+            self.assertEqual(messages.delivery_health()['pending_count'],0)
+            self.assertEqual(messages.delivery_health()['failed_count'],1)
+            self.assertEqual(messages.get_card('card-normal')['level'],'normal')
+            self.assertEqual(messages.get_card('card-normal')['send_attempts'],6)
+            self.assertIsNone(messages.get_card('unqueued')['sent_at'])
+        finally:
+            messages._conn().close();messages._local=threading.local()
+            server.shutdown();server.server_close();thread.join()
+        backup=sqlite3.connect(self.backup)
+        self.assertEqual([('claimed',6),('failed',1),('pending',2)],
+                         backup.execute('SELECT status,attempts FROM deliveries ORDER BY status').fetchall())
+        backup.close()
+        print('SYNTHETIC DRAIN: pending1/claimed1 -> POST2 sent2; failed1 preserved; unqueued1 POST0; raw attempts in backup')
+
+    def test_converted_old_digest_keeps_same_daily_card_and_distinct_links(self):
+        import threading
+        conn=make_legacy(self.legacy)
+        conn.execute("UPDATE cards SET action_digest='retired-digest' WHERE card_id='card-safe'")
+        conn.commit();conn.close()
+        result=self.run_script(self.legacy,self.canonical,'--db-backup',self.backup,'--offline')
+        self.assertEqual(0,result.returncode,result.stderr)
+        sys.path.insert(0,str(HERE/'backend'))
+        import devmon_messages as messages
+        messages._local=threading.local();messages.init_db(str(self.canonical/'messages.db'))
+        now=messages.parse_rfc3339('2026-08-21T01:00:00Z')
+        with mock.patch.object(messages,'now_utc',return_value=now):
+            payload={'id':'next','group':'group-safe','source':'test','level':'urgent','title':'T','body':'B'}
+            self.assertEqual(messages.ingest(payload),'coalesced')
+            self.assertEqual(messages.get_card('card-safe')['count'],2)
+            self.assertEqual(messages.delivery_health()['pending_count'],0)
+            self.assertEqual(messages.ingest(dict(payload,id='link',link='https://example.test/new')),'inserted')
+            self.assertEqual(messages.ingest(dict(payload,id='run',run={'cwd':'/tmp/project','prompt':'Check'})),'inserted')
+        self.assertEqual(messages._conn().execute('SELECT COUNT(*) FROM cards').fetchone()[0],4)
+        messages._conn().close();messages._local=threading.local()
 
     def test_unexpected_urgency_fails_closed(self):
         conn = make_legacy(self.legacy)
@@ -321,7 +372,7 @@ class MigrationTests(unittest.TestCase):
         result = self.run_script(
             self.legacy, self.canonical, '--db-backup', self.backup, '--offline')
         self.assertEqual(2, result.returncode)
-        self.assertIn('unsupported urgency', result.stderr)
+        self.assertIn('invalid legacy data', result.stderr)
         self.assertTrue(self.backup.exists())
         self.assertFalse((self.canonical / 'messages.db').exists())
 
@@ -418,21 +469,9 @@ class MigrationTests(unittest.TestCase):
         conn = make_legacy(self.legacy)
         conn.close()
         module = load_module()
-        original = module._load_messages
-
-        class Broken:
-            @staticmethod
-            def init_db(_path):
-                raise RuntimeError('sentinel-secret-row')
-
-        module._load_messages = lambda: Broken
-        try:
+        with mock.patch.object(module,'_migrate_clone',side_effect=RuntimeError('synthetic conversion failure')):
             with self.assertRaises(RuntimeError):
-                module.migrate(
-                    str(self.legacy), str(self.canonical), str(self.backup),
-                    offline=True)
-        finally:
-            module._load_messages = original
+                module.migrate(str(self.legacy),str(self.canonical),str(self.backup),offline=True)
         self.assertTrue(self.backup.exists())
         self.assertFalse((self.canonical / 'messages.db').exists())
         resumed = self.run_script(
@@ -569,7 +608,7 @@ module.migrate(sys.argv[2], sys.argv[3], sys.argv[4], offline=True)
 
         legacy_verify = self.run_script('--verify', self.backup)
         self.assertEqual(2, legacy_verify.returncode)
-        self.assertIn('canonical schema', legacy_verify.stderr)
+        self.assertIn('exactly ledger and cards', legacy_verify.stderr)
 
     def test_restore_refuses_hot_rollback_journal_without_touching_it(self):
         conn = make_legacy(self.legacy)

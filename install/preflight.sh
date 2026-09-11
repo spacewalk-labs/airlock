@@ -8,9 +8,21 @@ AIRLOCK_PREREQUISITES="$AIRLOCK_ROOT/install/prerequisites.tsv"
 # discovery in production; the suite overrides it in-process after sourcing.
 AIRLOCK_PREFLIGHT_SBIN_DIRS="/usr/local/sbin /usr/sbin /sbin"
 
-airlock_preflight_find() {
-  local hit d
-  hit="$(command -v "$1" 2>/dev/null)" && { printf '%s\n' "$hit"; return 0; }
+airlock_find_cmd() {
+  local hit d base
+  # `type -P` admits executable files from PATH, not ambient shell functions or
+  # aliases. A prerequisite receipt must name something a fresh lifecycle child
+  # can execute too.
+  if hit="$(type -P "$1" 2>/dev/null)"; then
+    case "$hit" in
+      /*) ;;
+      */*) d="${hit%/*}"; base="${hit##*/}"
+           hit="$(cd -P -- "$d" && printf '%s/%s\n' "$PWD" "$base")" || return 1 ;;
+      *)   hit="$(cd -P -- . && printf '%s/%s\n' "$PWD" "$hit")" || return 1 ;;
+    esac
+    printf '%s\n' "$hit"
+    return 0
+  fi
   # System daemons (nginx, nft) live in the sbin directories, which are not on
   # an unprivileged PATH in every session. Without this fallback, preflight
   # reports an installed-and-running nginx as "missing" and the installer
@@ -20,6 +32,69 @@ airlock_preflight_find() {
     if [ -x "$d/$1" ]; then printf '%s\n' "$d/$1"; return 0; fi
   done
   return 1
+}
+
+# Compatibility name for callers and fixtures written before the resolver was
+# shared. There is deliberately no second implementation behind this name.
+airlock_preflight_find() { airlock_find_cmd "$@"; }
+
+airlock_prerequisite_receipt_lookup() {
+  local name="${1:?}" file="${AIRLOCK_PREREQ_RECEIPT:-}" row_cmd row_path predicate expected owners
+  [ -n "$file" ] && [ -r "$file" ] || return 1
+  while IFS=$'\t' read -r row_cmd row_path predicate expected owners; do
+    case "$row_cmd" in ''|\#*) continue ;; esac
+    if [ "$row_cmd" = "$name" ]; then
+      printf '%s\t%s\t%s\t%s\n' "$row_path" "$predicate" "$expected" "$owners"
+      return 0
+    fi
+  done < "$file"
+  return 1
+}
+
+airlock_prerequisite_path_is_current() {
+  local name="${1:?}" recorded="${2:?}" current=""
+  current="$(airlock_find_cmd "$name")" || return 1
+  [ "$current" = "$recorded" ] && [ -x "$recorded" ]
+}
+
+airlock_verify_prerequisite_receipt() {
+  local file="${AIRLOCK_PREREQ_RECEIPT:-}" row_cmd row_path predicate expected owners
+  local count=0 version="" context_seen=0 line=""
+  [ -n "$file" ] && [ -r "$file" ] || {
+    log "prerequisite receipt is missing or unreadable: ${file:-<unset>}"
+    return 2
+  }
+  while IFS= read -r line; do
+    case "$line" in
+      '# context='*)
+        [ "$line" = "# context=${AIRLOCK_PREREQ_CONTEXT:-standalone}" ] || {
+          log "prerequisite receipt belongs to a different install candidate"
+          return 1
+        }
+        context_seen=1
+        continue ;;
+    esac
+    IFS=$'\t' read -r row_cmd row_path predicate expected owners <<< "$line"
+    case "$row_cmd" in ''|\#*) continue ;; esac
+    count=$((count + 1))
+    airlock_prerequisite_path_is_current "$row_cmd" "$row_path" || {
+      log "prerequisite changed after preflight: $row_cmd (was $row_path)"
+      return 1
+    }
+    if [ "$predicate" = major-gte ]; then
+      version="$("$row_path" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || version=""
+      if [ "$row_cmd" != python3 ]; then
+        version="$("$row_path" -p 'process.versions.node.split(".")[0]' 2>/dev/null)" || version=""
+      fi
+      [[ "$version" =~ ^[0-9]+([.][0-9]+)?$ ]] || version=""
+      airlock_preflight_version_ge "${version:-0}" "$expected" || {
+        log "prerequisite version changed after preflight: $row_cmd (found ${version:-unknown}, need $expected)"
+        return 1
+      }
+    fi
+  done < "$file"
+  [ "$context_seen" = 1 ] || { log "prerequisite receipt has no candidate context"; return 2; }
+  [ "$count" -gt 0 ] || { log "prerequisite receipt contains no commands: $file"; return 2; }
 }
 
 airlock_load_nvm() {
@@ -193,7 +268,7 @@ airlock_preflight() {
 
   local declaration_count=0
   local row_key
-  local -A predicates=() expecteds=() fixes=() owners=() seen_rows=() all_fixes=()
+  local -A predicates=() expecteds=() fixes=() owners=() seen_rows=() all_fixes=() resolved_paths=()
   while IFS= read -r declaration_line || [ -n "$declaration_line" ]; do
     line_no=$((line_no + 1))
     case "$declaration_line" in ""|\#*) continue ;; esac
@@ -293,7 +368,7 @@ airlock_preflight() {
       case "$enabled" in *$'\n'"$owner"$'\n'*) selected_owners="${selected_owners:+$selected_owners,}$owner" ;; esac
     done
     [ -n "$selected_owners" ] || continue
-    path="$(airlock_preflight_find "$cmd")" || path=""
+    path="$(airlock_find_cmd "$cmd")" || path=""
     status=present; detected="$path"; req="$cmd"
     if [ -z "$path" ]; then
       status=missing; detected="-"
@@ -308,7 +383,11 @@ airlock_preflight() {
       airlock_preflight_version_ge "${version:-0}" "${expecteds[$cmd]}" \
         || status=wrong-version
     fi
-    [ "$status" = present ] || failures+=("$req"$'\t'"$detected"$'\t'"$status"$'\t'"${fixes[$cmd]}"$'\t'"$selected_owners")
+    if [ "$status" = present ]; then
+      resolved_paths[$cmd]="$path"
+    else
+      failures+=("$req"$'\t'"$detected"$'\t'"$status"$'\t'"${fixes[$cmd]}"$'\t'"$selected_owners")
+    fi
   done
 
   if [ "${#failures[@]}" -gt 0 ]; then
@@ -318,6 +397,27 @@ airlock_preflight() {
         "$req" "$detected" "$status" "$fix" "$selected_owners"
     done < <(printf '%s\n' "${failures[@]}" | sort)
     return 1
+  fi
+  if [ -n "${AIRLOCK_PREREQ_RECEIPT:-}" ]; then
+    local receipt_tmp
+    receipt_tmp="$(mktemp "${AIRLOCK_PREREQ_RECEIPT}.XXXXXX")" \
+      || { log "preflight: could not create prerequisite receipt"; return 2; }
+    chmod 0600 "$receipt_tmp" || { rm -f "$receipt_tmp"; return 2; }
+    {
+      printf '# airlock-prerequisite-receipt-v1\n'
+      printf '# context=%s\n' "${AIRLOCK_PREREQ_CONTEXT:-standalone}"
+      for cmd in "${!resolved_paths[@]}"; do
+        case "${resolved_paths[$cmd]}" in *$'\t'*|*$'\n'*)
+          log "preflight: resolved command path contains a control separator: $cmd"
+          rm -f "$receipt_tmp"
+          return 2 ;;
+        esac
+        printf '%s\t%s\t%s\t%s\t%s\n' "$cmd" "${resolved_paths[$cmd]}" \
+          "${predicates[$cmd]}" "${expecteds[$cmd]}" "${owners[$cmd]}"
+      done | LC_ALL=C sort
+    } > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 2; }
+    mv -f "$receipt_tmp" "$AIRLOCK_PREREQ_RECEIPT" \
+      || { rm -f "$receipt_tmp"; log "preflight: could not publish prerequisite receipt"; return 2; }
   fi
   [ "$quiet" = 1 ] || log "prerequisite preflight passed"
 }

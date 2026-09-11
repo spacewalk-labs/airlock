@@ -1,42 +1,26 @@
 #!/usr/bin/env python3
-"""devmon_spool — a Maildir-style atomic drop spool.
+"""Atomic producer spool; accepted receipts stay in processing/ for offline rollback.
 
-Layout: $SPOOL/{tmp,new,processing,bad}
-
-A producer publishes by writing to tmp/ with O_EXCL and then link()ing it to
-new/<event_id>.json — the appearance of a name in new/ is therefore atomic, and a
-half-written file can never be picked up.
-
-The collector is ONE watcher thread. It takes ownership by rename(new -> processing),
-which is what makes concurrent collectors and restarts safe: whoever wins the rename owns
-the file, and everyone else sees FileNotFoundError. Then it reads defensively (O_NOFOLLOW,
-fstat regular, bounded read), requires the filename to equal the payload's event_id,
-validates, and ingests. Anything that fails is quarantined in bad/ and recorded in
-ingest_errors — never dropped silently.
-
-The reader assumes nothing about the producer. In the default single-box install the producer
-is the same user, but the spool is also the one place an outside process can hand this service
-input, so it is read as if it were hostile: symlink, FIFO, device and directory are refused, a
-payload over MAX_PAYLOAD (16KB) is refused, a filename that disagrees with the payload is
-refused, and nothing ever clobbers existing evidence.
+The collector snapshots bytes into its own inode before committing them. Producers
+cannot alter that retained receipt through an already open descriptor. Old collectors
+replay processing/ after restoring the database backup. Receipt files expire with ledger.
 """
 import json
 import os
 import stat
-import threading
-import time
+import sqlite3
+import sys
+import tempfile
 
 import devmon_messages as M
 
 SUBDIRS = ('tmp', 'new', 'processing', 'bad')
-POLL_INTERVAL = 2.0
 
 
 def ensure_dirs(spool):
     """Create the spool, 0700 by default.
 
-    Pending payloads carry the prompt and argv of action cards that have not been approved
-    yet, so the directory mode is the thing protecting them. makedirs honours the umask and
+    Pending payloads carry agent prompts, so the directory mode protects them. makedirs honours the umask and
     exist_ok keeps an existing mode, so both are set explicitly — otherwise clearing the
     state directory and restarting silently left the whole spool at 0755.
 
@@ -98,92 +82,95 @@ def _read_regular_bounded(path):
         os.close(fd)
 
 
-def process_one(spool, filename):
-    """Process one new/<filename>. -> 'inserted'|'coalesced'|'duplicate'|'bad'."""
-    new_path = os.path.join(spool, 'new', filename)
-    proc_path = os.path.join(spool, 'processing', filename)
-    # 1) Take ownership with an atomic rename. Already gone = someone else has it.
+def _quarantine(path, spool, filename, error):
+    bad = _bad_name(spool, filename)
     try:
-        os.rename(new_path, proc_path)
-    except FileNotFoundError:
-        return 'duplicate'
-    except OSError as e:
-        M.record_ingest_error(filename, 'rename failed: %s' % e)
-        return 'bad'
-    # 2) Read defensively, validate, ingest.
-    try:
-        raw = _read_regular_bounded(proc_path)
-        payload = json.loads(raw.decode('utf-8'))
-        # The filename must equal the payload's event_id: otherwise a producer could
-        # publish one id under another's name and defeat the dedup below.
-        expect = None
-        if isinstance(payload, dict) and isinstance(payload.get('event_id'), str):
-            expect = payload['event_id'] + '.json'
-        if expect != filename:
-            raise ValueError('filename != payload event_id')
-        status = M.ingest(payload)             # may raise (validation included)
-    except Exception as e:  # noqa: BLE001 — any failure quarantines; nothing is silent
-        raw_head = ''
-        try:
-            raw_head = raw.decode('utf-8', 'replace')
-        except Exception:
-            pass
-        M.record_ingest_error(filename, '%s: %s' % (type(e).__name__, e), raw_head)
-        try:
-            os.rename(proc_path, _bad_name(spool, filename))
-        except OSError:
-            pass
-        return 'bad'
-    # 3) Success: drop the processing file. A crash between the commit and this unlink is
-    #    harmless — the occurrence UNIQUE constraint makes a re-ingest a duplicate.
-    try:
-        os.remove(proc_path)
+        os.rename(path, bad)
+        fd = os.open(bad+'.reason', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(type(error).__name__ + ': ' + str(error) + '\n')
     except OSError:
-        pass
-    return status
+        sys.stderr.write('[messages] quarantine failed; file retained for retry\n')
+    return 'bad'
+
+
+def process_one(spool, filename):
+    new = os.path.join(spool, 'new', filename)
+    processing = os.path.join(spool, 'processing')
+    retained = None
+    committed = False
+    try:
+        raw = _read_regular_bounded(new)
+        payload = json.loads(raw.decode('utf-8'))
+        normalized = M.validate_payload(payload)
+        if normalized['id']+'.json' != filename:
+            raise ValueError('filename != payload id')
+        if M.has_receipt(normalized['id']):
+            os.unlink(new)
+            return 'duplicate'
+        # Replace the producer inode with a private, durable snapshot BEFORE DB commit.
+        fd, snapshot = tempfile.mkstemp(prefix='.snapshot.', dir=processing)
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(snapshot, os.path.join(processing, filename))
+            retained = os.path.join(processing, filename)
+            directory = os.open(processing,os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if os.path.exists(snapshot):
+                os.unlink(snapshot)
+        status = M.ingest(payload)
+        committed = True
+        os.unlink(new)
+        return status
+    except sqlite3.Error:
+        # A busy/full database is not a rejected message; retry its retained file.
+        return 'deferred'
+    except (ValueError, UnicodeError, OSError) as error:
+        if retained is not None and not committed and isinstance(error, ValueError):
+            # Permanent input failure: its private snapshot must not replay forever.
+            # SQLite errors retain it above; a committed receipt is never removed here.
+            os.unlink(retained)
+        return _quarantine(new, spool, filename, error)
 
 
 def scan_once(spool, batch_max=500):
-    """Scan new/ once, after recovering anything left in processing/. -> counts dict."""
-    result = {'inserted': 0, 'coalesced': 0, 'duplicate': 0, 'bad': 0, 'dropped': 0}
-    # Recovery: a file left in processing/ means we died mid-flight, so put it back.
-    proc_dir = os.path.join(spool, 'processing')
-    try:
-        leftovers = os.listdir(proc_dir)
-    except OSError:
-        leftovers = []
-    for f in leftovers:
-        try:
-            os.rename(os.path.join(proc_dir, f), os.path.join(spool, 'new', f))
-        except OSError:
-            pass
-    new_dir = os.path.join(spool, 'new')
-    try:
-        files = sorted(os.listdir(new_dir))
-    except OSError:
-        return result
-    if len(files) > batch_max:
-        result['dropped'] = len(files) - batch_max      # backpressure, reported as a count
-        files = files[:batch_max]
-    for f in files:
-        if not f.endswith('.json'):
+    result = dict.fromkeys(('inserted','coalesced','duplicate','bad','dropped','deferred'),0)
+    processing = os.path.join(spool, 'processing')
+    for name in os.listdir(processing):
+        filename = name
+        if not filename.endswith('.json') or name.startswith('.snapshot.'):
             continue
-        status = process_one(spool, f)
-        result[status] = result.get(status, 0) + 1
+        if M.has_receipt(filename[:-5]):
+            continue
+        # Never overwrite a concurrent producer publication; both will be validated.
+        source = os.path.join(processing,name)
+        destination = os.path.join(spool,'new',filename)
+        try:
+            os.link(source,destination,follow_symlinks=False)
+            os.unlink(source)
+        except FileExistsError:
+            continue
+    files = sorted(f for f in os.listdir(os.path.join(spool,'new')) if f.endswith('.json'))
+    result['dropped'] = max(0,len(files)-batch_max)  # Deferred by backpressure, never deleted.
+    for filename in files[:batch_max]:
+        status = process_one(spool,filename)
+        result[status] += 1
     return result
 
 
-def run_watcher(spool, stop_event):
-    """The watcher thread: scan once at startup, then every POLL_INTERVAL."""
-    ensure_dirs(spool)
-    while not stop_event.is_set():
+def purge_receipts(spool):
+    # Files first, then ledger deletion: a crash cannot resurrect expired receipts.
+    cutoff = M.iso(M.now_utc()-M.RETENTION)
+    ids = M._conn().execute('SELECT id FROM ledger WHERE received_at<=?', (cutoff,))
+    for row in ids:
         try:
-            r = scan_once(spool)
-            if r.get('dropped'):
-                M.record_ingest_error('(batch)', 'backpressure dropped %d' % r['dropped'])
-        except Exception as e:  # noqa: BLE001 — the watcher must not die; retry next tick
-            try:
-                M.record_ingest_error('(watcher)', 'scan error: %s' % e)
-            except Exception:
-                pass
-        stop_event.wait(POLL_INTERVAL)
+            os.unlink(os.path.join(spool,'processing',row[0]+'.json'))
+        except FileNotFoundError:
+            pass

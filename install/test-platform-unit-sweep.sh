@@ -41,9 +41,18 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
+case "$*" in
+  '--user list-timers airlock-live-verify.timer --no-pager --no-legend')
+    printf 'Mon 2026-09-14 09:00:00 UTC 6 days left airlock-live-verify.timer\n'
+    ;;
+esac
 exit 0
 FAKE
-chmod +x "$TMP/bin/systemctl"
+cat > "$TMP/bin/loginctl" <<'FAKE'
+#!/usr/bin/env bash
+printf 'yes\n'
+FAKE
+chmod +x "$TMP/bin/systemctl" "$TMP/bin/loginctl"
 export PATH="$TMP/bin:$PATH"
 
 # ---- a unit directory holding one of each interesting kind ----
@@ -164,6 +173,89 @@ done
 [ "$t7_units" -ge 4 ] \
   || bad "T7: only $t7_units platform unit templates found — the glob is broken, not the tree"
 ok_if_clean "T7: all $t7_units shipped install/systemd units appear in the installer's declared set"
+
+# ---- live/install-timer.sh: drive the real installer against an isolated HOME ----
+# Copying live/ to a scratch repository does two things: it avoids this worktree's
+# deliberate installation refusal, and makes every path the installer can write or read
+# disposable. Fake systemctl/loginctl keep the user manager and linger checks offline.
+LIVE_REPO="$TMP/live-repo"
+LIVE_HOME="$TMP/live-home"
+LIVE_ENV="$LIVE_HOME/.config/airlock-live/env"
+LIVE_UD="$LIVE_HOME/.config/systemd/user"
+
+seed_live_install() {
+  rm -rf "$LIVE_REPO" "$LIVE_HOME"
+  mkdir -p "$LIVE_REPO" "$(dirname "$LIVE_ENV")" "$LIVE_UD"
+  cp -R "$ROOT/live" "$LIVE_REPO/live"
+  printf '%s\n' \
+    'AIRLOCK_LIVE_SSH=example.invalid' \
+    'AIRLOCK_LIVE_OWNER=example' \
+    'AIRLOCK_LIVE_TSKEY_FILE=/nonexistent/test-key' > "$LIVE_ENV"
+  chmod 600 "$LIVE_ENV"
+
+  # Ours, no longer declared: the positive case that proves the sweep does work.
+  printf '[Unit]\nX-Airlock-Owner=airlock-live\n' > "$LIVE_UD/airlock-live-retired.timer"
+  printf '[Unit]\nX-Airlock-Owner=airlock-live\n' > "$LIVE_UD/airlock-live-retired.service"
+  # Another installer and an app with the same prefix: both are out of reach.
+  printf '[Unit]\nX-Airlock-Owner=airlock-install\n' > "$LIVE_UD/airlock-secret-sweep.timer"
+  printf '[Unit]\nDescription=app unit\n' > "$LIVE_UD/airlock-devterm.service"
+}
+
+run_live_install() {
+  HOME="$LIVE_HOME" USER=airlock-test \
+    bash "$LIVE_REPO/live/install-timer.sh" --envfile "$LIVE_ENV"
+}
+
+: > "$FAKE_SYSTEMCTL_LOG"
+seed_live_install
+mark
+run_live_install >"$TMP/live.out" 2>&1 \
+  || bad "T8: live installer exited non-zero: $(cat "$TMP/live.out")"
+
+for u in airlock-live-retired.timer airlock-live-retired.service; do
+  [ ! -e "$LIVE_UD/$u" ] || bad "T8: $u survived the live sweep"
+  grep -q -- "--user disable --now $u" "$FAKE_SYSTEMCTL_LOG" \
+    || bad "T8: live sweep did not disable --now $u"
+done
+for u in airlock-secret-sweep.timer airlock-devterm.service; do
+  [ -e "$LIVE_UD/$u" ] || bad "T8: live sweep deleted protected unit $u"
+done
+live_t_line="$(grep -n -- 'disable --now airlock-live-retired.timer' "$FAKE_SYSTEMCTL_LOG" | cut -d: -f1 | head -1)"
+live_s_line="$(grep -n -- 'disable --now airlock-live-retired.service' "$FAKE_SYSTEMCTL_LOG" | cut -d: -f1 | head -1)"
+if [ -z "$live_t_line" ] || [ -z "$live_s_line" ] || [ "$live_t_line" -ge "$live_s_line" ]; then
+  bad "T8: live timer must be disabled before its service (timer=$live_t_line service=$live_s_line)"
+fi
+ok_if_clean "T8: live sweep removes only its undeclared marked units, timer first"
+
+mark
+# Derived from the shipped directory, so a newly added template cannot be silently
+# omitted from UNITS and then swept from an installed box.
+t9_units=0
+for f in "$ROOT"/live/systemd/*.service.in "$ROOT"/live/systemd/*.timer.in; do
+  [ -f "$f" ] || continue
+  u="$(basename "$f" .in)"
+  t9_units=$((t9_units + 1))
+  [ -f "$LIVE_UD/$u" ] \
+    || bad "T9: shipped live unit $u was not rendered by the installer's declared set"
+done
+[ "$t9_units" -ge 3 ] || bad "T9: only $t9_units live unit templates found — the glob is broken"
+ok_if_clean "T9: all $t9_units shipped live units are in the installer's declared set"
+
+# The control on the controls: mutate only the scratch copy to simulate a caller bug.
+# Refusal must happen before any marked unit can be removed.
+mark
+seed_live_install
+sed -i 's/^UNITS=(.*)$/UNITS=()/' "$LIVE_REPO/live/install-timer.sh"
+if run_live_install >"$TMP/live-empty.out" 2>&1; then
+  bad "T10: live installer accepted an empty declared set"
+else
+  grep -q 'refusing to sweep with an empty declared set' "$TMP/live-empty.out" \
+    || bad "T10: empty set failed without the sweep refusal diagnostic: $(cat "$TMP/live-empty.out")"
+  for u in airlock-live-retired.timer airlock-live-retired.service; do
+    [ -e "$LIVE_UD/$u" ] || bad "T10: $u was removed before empty-set refusal"
+  done
+fi
+ok_if_clean "T10: live empty declared set is refused before anything is touched"
 
 if [ "$fails" -gt 0 ]; then
   printf '\n%d check(s) failed\n' "$fails" >&2

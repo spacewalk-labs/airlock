@@ -13,9 +13,13 @@ set -uo pipefail
 export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-TMP="$(mktemp -d)" || { echo "FAIL could not create test directory" >&2; exit 1; }
+TMP="$(mktemp -d /tmp/airlock-integration.XXXXXX)" || { echo "FAIL could not create test directory" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 export AIRLOCK_STATE_DIR="$TMP/state"   # isolate the installed-state ledger from the dev box
+# Every real-orchestrator probe stays out of the production self-kill escape,
+# even when this suite is invoked directly by a developer.
+printf 'fixture scope\n' >"$TMP/cgroup"
+export AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup"
 pass=0 fail=0
 ok(){ printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
 bad(){ printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }

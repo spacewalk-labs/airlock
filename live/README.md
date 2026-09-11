@@ -81,6 +81,17 @@ an exact commit, and a result recorded against a SHA that is not what ran is a
 false attestation, not a rounding error. `AIRLOCK_LIVE_ALLOW_DIRTY=1` overrides it
 and says so in the record.
 
+## Installing the weekly timer
+
+`bash live/install-timer.sh` renders the units declared in that script and
+then removes obsolete unit files carrying `X-Airlock-Owner=airlock-live`. Units
+owned by the main installer and unmarked app units are not candidates; an empty
+declaration is refused before anything is removed.
+
+The recovery is not retroactive. It can see only units rendered after the owner
+marker was introduced, so a unit retired in the same revision that first added the
+marker would remain unmarked and cannot be recovered by this sweep.
+
 ## The exit code
 
 ```

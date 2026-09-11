@@ -20,6 +20,8 @@ Environment=AIRLOCK_PUBLISH_GATED_DIR=/opt/airlock/share-gated
 Environment=AIRLOCK_PUBLISH_HTPASSWD_DIR=/opt/airlock/publish-gated-auth
 Environment=AIRLOCK_PUBLISH_HTPASSWD_BIN=htpasswd
 Environment=AIRLOCK_PUBLISH_TOKEN_HEADER=X-Airlock-Publish-Token
+Environment=AIRLOCK_PUBLISH_DOC_URL=
+Environment=AIRLOCK_PUBLISH_DOC_AUDIENCE=owner
 ExecStart=/usr/bin/python3 ROOT/apps/publish/backend/airlock-publish.py
 Restart=on-failure
 RestartSec=3

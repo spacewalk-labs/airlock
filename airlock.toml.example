@@ -180,6 +180,10 @@ gate_port    = 19925  # loopback nginx document gate
 # https://<fqdn>:<https_port>/<name>.html. The manager UI and every
 # upload/delete API stay on the hub gate either way.
 tailnet_view = false
+# Slack title cards require this narrow endpoint on EACH publisher box whose
+# links should unfurl. It exposes only title metadata to authenticated tailnet
+# identities; every manager API and the document body keep their existing gate.
+title_meta = false
 # share_dir  = "~/public_html"   # the static-share directory this manages/serves
 # Optional external publishing. Omit this table = share manager only (the
 # external-publish buttons stay hidden). Two modes:
@@ -205,6 +209,17 @@ tailnet_view = false
 # ingest_url = "https://your-ingest.example"   # implements /ingest /list /revoke /set-expiry
 # base_url   = "https://docs.example"          # public URLs are <base_url>/<slug>/
 # token_env  = "AIRLOCK_PUBLISH_TOKEN"         # name of the env var holding the token
+
+# Outbound-only Slack Socket Mode worker for published-document title cards.
+# The domain is configuration because apps/ is public. Token VALUES belong in
+# ~/.config/airlock-slack-unfurl.env (mode 0600), under the env names below.
+# Also set title_meta=true in [apps.publish] on each publisher box. It remains
+# an explicit per-box opt-in; the central worker cannot safely alter other boxes.
+# [apps.slack-unfurl]
+# domain_suffix = "example.test"
+# dedicated_ports = "8000,19920"  # comma-separated dedicated document ports
+# bot_token_env = "SLACK_UNFURL_BOT_TOKEN"
+# app_token_env = "SLACK_UNFURL_APP_TOKEN"
 
 [apps.notepad]        # shares the publish backend (needs [apps.publish]); table = show the card
 

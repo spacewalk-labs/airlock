@@ -94,12 +94,19 @@ The renderer emits two identity maps (`install/render-nginx.sh`):
 |---|---|---|
 | `$owner_ok` | `owner` only | Every app on its own https port: **devterm**, **code-server**, **orca**, **paseo** — shells, an IDE, and agent runners. Plus every hub-subpath app whose audience is `owner`: **learning**, and **fileview** by default. |
 | `$hub_ok` | `owner` **+ `collaborators`** | The hub server, and the subpath apps that **declare** `audience = "shared"` — today **publish**, **notepad**, **dev-monitor**, **feedback**. |
+| `$tailnet_ok` | any authenticated tailnet identity | Only an explicit publish opt-in: the dedicated document-view port with `tailnet_view`, or the exact `GET /publish/api/meta` title-only route with `title_meta`. |
 
 Two things decide reach, and both must say yes. The hub server gate (`$hub_ok`) is
 asserted once at the server level, so no app can forget it or opt out of it. Then
 each app **declares who it serves** in its manifest's `[audience]`, and an app that
 declares `owner` emits its own `$owner_ok` check inside its location — because
 being inside the hub server is not by itself a claim about audience.
+
+`[apps.publish] title_meta = true` is the one narrow hub-server exception. The
+server selector admits `$tailnet_ok` only for the exact GET metadata URI; that
+exact core location repeats the identity check and the publish backend checks the
+identity header again. Every other hub path still requires `$hub_ok`, and the
+response contains only the selected basename, its HTML title, and mtime.
 
 **Declaring nothing is not the same as declaring `shared`.** A manifest with no
 `[audience]` block resolves to `owner`, and `audience` is then not an operator-

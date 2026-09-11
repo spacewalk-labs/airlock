@@ -29,21 +29,31 @@ grep -qF 'for (const sec of airlockTileSections(apps, names)) {' \
   || { echo "FAIL hub-filter: the airlockTileSections call site is gone from the render loop"; exit 1; }
 echo "ok   hub-filter: all three call sites are wired into the render loop"
 
-# The settings gear's wiring, same reasoning as the three above: the badge
-# arithmetic below is exercised in node against contract fixtures, and node
-# cannot tell whether anything on the page ever calls it. Each of these is a
-# deletion that would leave every assertion green and the launcher wrong.
-grep -qF 'const count = airlockUpdateCount(d);' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the gear badge no longer computes its count from airlockUpdateCount"; exit 1; }
+# The app-store entrance owns the update badge now. It counts platform + app
+# updates from the owner apps contract; Codex stays in the gear's harness section.
+grep -qF 'const count = updateCount(data);' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the app-store badge no longer reads the apps snapshot"; exit 1; }
 grep -qF 'badge.hidden = count === 0;' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the badge is no longer hidden at zero (a '0' badge is the bug)"; exit 1; }
+  || { echo "FAIL hub-filter: the app-store badge is no longer hidden at zero"; exit 1; }
+grep -qF 'fetch("/monitor/api/owner/apps", { cache: "no-store" })' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the app store no longer reads the owner apps API"; exit 1; }
+for action in enable disable remove; do
+  grep -qF "\"$action\", item.id" "$ROOT/hub/index.html" \
+    || { echo "FAIL hub-filter: the app store no longer wires $action"; exit 1; }
+done
+grep -qF 'button.disabled = !!disabled;' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: app-store actions no longer honor canRemove"; exit 1; }
+grep -qF '<li>전체 설치기 재실행</li>' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: app-store progress no longer names the full installer"; exit 1; }
 grep -qF 'function renderDots(d) { wanted = new Set(airlockUpdateAppIds(d)); paintDots(); }' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the tile dots no longer read the same app list as the badge"; exit 1; }
-# The panel rows read the SAME normaliser. `for (const a of d.apps)` on an
-# `apps: {}` throws after the badge has been rewritten and before the dots have,
-# which leaves a count and a set of dots that disagree and no error on screen.
-grep -qF 'for (const a of airlockUpdateApps(d)) {' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the panel rows no longer read the same app list as the badge"; exit 1; }
+# The update section moved to the app store. Keep the old settings renderer, hidden
+# cache DOM, run poller and execute handler out rather than maintaining a second
+# invisible update client behind the gear.
+if grep -qE 'store-update-cache|store-update-count-cache|store-run-cache|data-upd-action|function airlockUpd(Action|Status|Run)|function renderUpdates\(' "$ROOT/hub/index.html"; then
+  echo "FAIL hub-filter: dead settings update client returned"
+  exit 1
+fi
 # The strip's failure discipline, restated for this poller: 403/404 is the only
 # state that removes the gear; every other failure keeps the last render. A
 # collapsed `if (!r.ok)` would blank the badge on a 502 and read as "all done".
@@ -69,12 +79,6 @@ grep -qF 'new MutationObserver(paintDots).observe(secs, { childList: true, subtr
 # until reload, so only a DEFINITE non-owner answer stops the poll.
 grep -qF 'if (isOwner === false) { clearInterval(timer); return; }' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the settings poll no longer retries an unresolved identity"; exit 1; }
-# UPD_EXEC arms the panel's buttons. Which actions are armed is the pure function
-# exercised in node below; these prove it is what the DOM actually asks.
-grep -qF 'b.disabled = !airlockUpdActionArmed(o.action);' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: settings buttons no longer decide arming from airlockUpdActionArmed"; exit 1; }
-grep -qF 'const body = airlockUpdActionBody(button.dataset.updAction);' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the settings click handler no longer builds its body from airlockUpdActionBody"; exit 1; }
 # HARNESS_PANEL's four rows, same reasoning: node can check the line each row
 # prints, and cannot check that renderHarness still calls the function that
 # prints it. Each of these is a deletion that leaves every assertion green.
@@ -99,18 +103,10 @@ grep -qF 'b.disabled = !airlockHarnessActionArmed(b.dataset.harnessAction) || ha
 echo "ok   hub-filter: the harness section's call sites are wired"
 grep -qF 'if (!body) return;                         // drawn, but not ours to run' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: a button this build does not run can now reach the execute route"; exit 1; }
-# The whole reason completion is read from a record instead of from the response:
-# the installer reloads nginx and restarts dev-monitor, so the POST's own connection
-# is expected to die on a SUCCESSFUL run. A collapsed catch that reported failure
-# there would call every working update a failure.
-grep -qF 'scheduleRun(1500);                       // the answer was lost, not the request' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: a lost execute response is treated as a verdict again"; exit 1; }
-grep -qF 'catch (_) { scheduleRun(5000); return; }   // mid-update disconnect: try again soon' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the run poll no longer survives the mid-update disconnect"; exit 1; }
-# Rows are rebuilt from scratch on every snapshot render, which silently un-disables
-# every button unless the run gate is re-applied after the rebuild.
+# Harness rows are rebuilt from scratch on every snapshot render, which silently
+# un-disables every button unless its own run gate is re-applied after the rebuild.
 grep -qF 'applyRunState();' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the run gate is no longer re-applied after rows are rebuilt"; exit 1; }
+  || { echo "FAIL hub-filter: the harness run gate is no longer re-applied after rows are rebuilt"; exit 1; }
 # These are WIRING, not behaviour: they prove the call sites and guards are
 # present, not that the rendered page obeys them. The badge arithmetic below is
 # the behavioural half that node can run; the DOM half (dots cleared on 404,
@@ -118,7 +114,7 @@ grep -qF 'applyRunState();' "$ROOT/hub/index.html" \
 # contract fixtures, and is recorded in the PR rather than run here — CI has no
 # browser, and a suite that silently skips its only real assertion is worse than
 # one that says where the assertion lives.
-echo "ok   hub-filter: the settings gear, badge, dots and poll discipline are wired"
+echo "ok   hub-filter: settings harness and app-store badge/dots poll discipline are wired"
 
 # ACCT_OWN: the identity pill is the entrance to subscription accounts, and the
 # same three deletions apply — each would leave every node assertion below green
@@ -163,6 +159,69 @@ function sourceCheck(name, condition) {
 sourceCheck("recent launcher state and markup are absent",
   !/AIRLOCK_RECENTS|renderRecents|airlockRememberRecent|recent-apps|id="recent"/.test(html));
 
+const settingsMarkup = (html.match(/<div class="settings"[\s\S]*?<\/header>/) || [""])[0];
+sourceCheck("settings keeps no update section or badge",
+  !/id="settings-badge"|id="set-updates"|>업데이트\s*</.test(settingsMarkup));
+sourceCheck("app store exposes the four fixed tabs",
+  ["installed", "public", "company", "personal"]
+    .every(id => html.includes('data-store-tab="' + id + '"')));
+sourceCheck("company and personal tabs both have their live inputs",
+  html.includes('id="store-company"') &&
+  html.includes('const company = Array.isArray(data.company) ? data.company : [];') &&
+  html.includes('id="store-personal-path"') &&
+  html.includes('id="store-personal-preview"') &&
+  html.includes('"/monitor/api/owner/apps/package-preview"'));
+sourceCheck("an unreadable company catalog is an honest empty tab",
+  html.includes('if (!company.length) empty(companyEl, "이 박스에서 읽을 수 있는 사내 앱이 없습니다.");'));
+sourceCheck("company installability is carried into the action",
+  html.includes('item.installed === true || item.installable !== true,') &&
+  html.includes('"install-company", item.id, true,') &&
+  html.includes('"빌드 산출물이 필요함 (build_artifact)"') &&
+  html.includes('"설치 불가 · " + (companyReason(item) || "이유 없음")'));
+sourceCheck("an installed company entry cannot be installed twice",
+  html.includes('Object.assign({}, item, { installed: installedIds.has(item.id) })') &&
+  html.includes('item.installed === true ? "설치됨"') &&
+  html.includes('item.installed === true ? "이미 설치된 앱입니다."'));
+sourceCheck("company install reuses the owner app mutation route",
+  html.includes('const installs = personal || action === "install-company";') &&
+  html.includes('"/monitor/api/owner/apps/" + encodeURIComponent(id) + "/" + action'));
+sourceCheck("personal approval binds the preview path and digest",
+  html.includes('personal ? { path: selected.preview.path, digest: selected.preview.digest }') &&
+  html.includes('reapprove ? "재승인"') &&
+  html.includes('"승인하고 설치"'));
+sourceCheck("denied personal capabilities disable approval",
+  html.includes('value.installable !== true || (registered && !reapprove)') &&
+  html.includes('chip.dataset.denied = String(denied)') &&
+  html.includes('거부된 capability를 manifest에서 빼야 합니다'));
+sourceCheck("personal tiles use only the square tier mark",
+  html.includes('kind === "company" ? "company-mark" : "personal-mark"') &&
+  html.includes('border-radius: 1px;') &&
+  !html.includes('"Added app"'));
+sourceCheck("company tiles use only a dot beside the label",
+  html.includes('.company-mark { display: inline-block; width: 6px; height: 6px; margin-left: 4px;') &&
+  html.includes('border-radius: 50%;') &&
+  html.includes('airlockApplyCompanyCatalog(company);') &&
+  html.includes('kind === "company" || AIRLOCK_COMPANY_IDS.has(item.id)') &&
+  html.includes('kind === "company" ? "사내 앱" : "개인 앱"'));
+sourceCheck("detail progress ends with the full-installer truth",
+  /<li>전체 설치기 재실행<\/li>\s*<\/ol>/.test(html));
+sourceCheck("missing digest is qualified by source class",
+  html.includes('kind === "explicit" ? "이 응답에서 airlock.lock digest 확인 불가"') &&
+  html.includes('kind === "platform" || kind === "builtin" || kind === "shipped"'));
+sourceCheck("lock mismatch routes through a fresh personal path preview",
+  html.includes('value.action === "lock-mismatch"') &&
+  html.includes('actionButton("재승인", "personal-review"') &&
+  html.includes('패키지 경로를 다시 미리보기하면 새 digest를 확인하고 재승인할 수 있습니다.'));
+sourceCheck("lock mismatch degraded inventory stays visible and honest",
+  html.includes('data.degraded === "lock-mismatch"') &&
+  html.includes('전체 설치 목록을 읽지 못했습니다'));
+sourceCheck("home edit disable is gated by the live app-store API",
+  html.includes(':root[data-home-edit="1"][data-app-store="1"] .app .app-disable') &&
+  html.includes('encodeURIComponent(disable.dataset.disableApp) + "/disable"'));
+sourceCheck("no-deactivator apps expose neither disable path",
+  html.includes('button.disabled = !item || !item.canRemove;') &&
+  html.includes('actionButton("끄기", "disable", item.id, false, !item.canRemove'));
+
 // Descriptions stay in the tile model and DOM path, but the home screen hides
 // them by default. The root attribute is the one-line opt-in for a future
 // preference or long-press reveal; do not remove the data to obtain this look.
@@ -204,23 +263,6 @@ sourceCheck("search is icon-triggered and its controls meet the 44px target",
   html.includes('findOpen.addEventListener("click"') &&
   html.includes('findClose.addEventListener("click"') &&
   html.includes('if (!find.value.trim()) closeFind();'));
-// UPD_EXEC's arming decision. `review:` is the one that matters most: an external
-// package's lock re-approval is a terminal procedure (owner decision LOCK_UI_V1), and
-// this is the panel's half of refusing it. The backend refuses the same id too.
-const mUpdArmed = html.match(/function airlockUpdActionArmed\([\s\S]*?\n\}/);
-if (!mUpdArmed) { console.log("FAIL hub-filter: airlockUpdActionArmed not found in hub/index.html"); process.exit(1); }
-const airlockUpdActionArmed = eval("(" + mUpdArmed[0] + ")");
-const mUpdBody = html.match(/function airlockUpdActionBody\([\s\S]*?\n\}/);
-if (!mUpdBody) { console.log("FAIL hub-filter: airlockUpdActionBody not found in hub/index.html"); process.exit(1); }
-const airlockUpdActionBody = eval("(" + mUpdBody[0] + ")");
-const mUpdStatus = html.match(/function airlockUpdStatusText\([\s\S]*?\n\}/);
-if (!mUpdStatus) { console.log("FAIL hub-filter: airlockUpdStatusText not found in hub/index.html"); process.exit(1); }
-const mUpdRun = html.match(/function airlockUpdRunLine\([\s\S]*?\n\}/);
-if (!mUpdRun) { console.log("FAIL hub-filter: airlockUpdRunLine not found in hub/index.html"); process.exit(1); }
-// airlockUpdRunLine closes over airlockUpdStatusText, so both are evaluated together.
-const airlockUpdRunLine = eval(
-  "(function(){" + mUpdStatus[0] + "\n" + mUpdRun[0] + "\nreturn airlockUpdRunLine;})()");
-
 const m = html.match(/function airlockTileVisible\([\s\S]*?\n\}/);
 if (!m) { console.log("FAIL hub-filter: airlockTileVisible not found in hub/index.html"); process.exit(1); }
 const airlockTileVisible = eval("(" + m[0] + ")");
@@ -301,72 +343,7 @@ check("sections: no packages -> no empty Tools heading",
 check("sections: nothing to place -> nothing to draw",
       airlockTileSections(SEC, []).length, 0);
 
-// ---- UPD_EXEC: which buttons run, and what the run line says ----------------
-check("armed: the platform button runs",       airlockUpdActionArmed("platform"), true);
-check("armed: a built-in app button runs",     airlockUpdActionArmed("app:notes"), true);
-// The lock decision, as a test rather than a comment: an external package whose
-// source digest moved gets review only, in v1, by owner decision (LOCK_UI_V1).
-check("armed: a lock review button does NOT run", airlockUpdActionArmed("review:notes"), false);
-// The harness actions are a separate namespace with a separate route and a separate
-// run record: an airlock-update in flight must not take the Codex button away, and a
-// Codex upgrade must not report over an update. They are asserted further down.
-check("armed: a harness action is not an update action", airlockUpdActionArmed("harness:codex"), false);
-check("armed: an empty app id is not an app",  airlockUpdActionArmed("app:"), false);
-check("armed: an absent action runs nothing",  airlockUpdActionArmed(undefined), false);
-check("body: platform",  JSON.stringify(airlockUpdActionBody("platform")), '{"action":"platform"}');
-check("body: app id is carried whole",
-      JSON.stringify(airlockUpdActionBody("app:dev-monitor")),
-      '{"action":"app","id":"dev-monitor"}');
-check("body: an unarmed action has no body", airlockUpdActionBody("review:notes"), null);
-
-// The run line. `blocked` is what disables the buttons, so each of these is the
-// difference between a second update being startable and not.
-const RUNNING = { enabled: true, busy: null,
-                  run: { status: "running", action: "app", appId: "notes" } };
-check("run line: a run in flight blocks the buttons", airlockUpdRunLine(RUNNING).blocked, true);
-check("run line: a run in flight names the app",
-      airlockUpdRunLine(RUNNING).text.includes("notes"), true);
-// busy=true covers an update started in a terminal, or the daily detection timer:
-// both hold the updater's own mutex, and neither is ours to talk over.
-check("run line: someone else's updater blocks",
-      airlockUpdRunLine({ enabled: true, busy: true, run: null }).blocked, true);
-// 🔴 The asymmetry that matters: an UNMEASURABLE lock is not a free one and not a
-// held one. It must neither block the owner nor claim the box is idle.
-check("run line: an unmeasured lock does not block",
-      airlockUpdRunLine({ enabled: true, busy: null, run: null }).blocked, false);
-check("run line: an unmeasured lock says nothing reassuring",
-      airlockUpdRunLine({ enabled: true, busy: null, run: null }).text, "");
-check("run line: no execution on this box blocks and says so",
-      airlockUpdRunLine({ enabled: false, busy: null, run: null }).blocked, true);
-const DONE = { enabled: true, busy: false, run: { status: "done", exitCode: 0,
-  action: "platform", before: { revision: "1111111111111111" },
-  after: { revision: "2222222222222222", rc: 0, verdict: "ok",
-           counts: { fail: 0, warn: 0, unchecked: 0 } } } };
-check("run line: a finished run stops blocking", airlockUpdRunLine(DONE).blocked, false);
-check("run line: a moved revision is shown as a move",
-      airlockUpdRunLine(DONE).detail.includes("111111111111 → 222222222222"), true);
-const FAILED = { enabled: true, busy: false, run: { status: "failed", exitCode: 1,
-  action: "platform", note: "설치가 실패했습니다.",
-  recovery: { available: true, command: 'AIRLOCK_DIR="/r" bash "/g/airlock-update" --rollback' },
-  after: { rc: 1, verdict: "fail", counts: { fail: 2, warn: 0, unchecked: 0 } } } };
-// The card's second requirement: a failure has to put the recovery command on screen.
-check("run line: a failure carries the rollback command",
-      airlockUpdRunLine(FAILED).recovery.includes("--rollback"), true);
-check("run line: a failure reads as a failure", airlockUpdRunLine(FAILED).bad, true);
-check("run line: a failure does not block the next attempt",
-      airlockUpdRunLine(FAILED).blocked, false);
-// A window closed by hand leaves `running` on disk forever; the backend resolves it
-// to `interrupted`, and the panel has to offer recovery for that too.
-const INTERRUPTED = { enabled: true, busy: false, run: { status: "interrupted",
-  action: "platform", exitCode: null, note: "결과를 남기지 못했습니다.",
-  recovery: { available: false, command: "CMD", reason: "기준점 없음" } } };
-check("run line: an interrupted run still offers recovery",
-      airlockUpdRunLine(INTERRUPTED).recovery, "CMD");
-check("run line: an interrupted run repeats why recovery may not apply",
-      airlockUpdRunLine(INTERRUPTED).recoveryNote, "기준점 없음");
-check("run line: a null state is total", airlockUpdRunLine(null).blocked, false);
-
-// ---- the gear badge, against the update API's contract ---------------------
+// ---- the app-store badge, against the update API's contract ----------------
 // The badge is the one number on the launcher a person acts on, and the backend
 // that fills it (UPD_DETECT) is being written in parallel — so it is held here
 // against fixtures shaped by the published contract rather than by a live box.
@@ -384,7 +361,7 @@ const badge = eval("(function(){" + mN[0] + "\n" + mA[0] + "\n" + mX[0] + "\n" +
   "\nreturn {count: airlockUpdateCount, ids: airlockUpdateAppIds," +
   " apps: airlockUpdateApps, codex: airlockCodexOutdated};})()");
 
-// The confirmed mockup's own arithmetic: 본체 1 + 앱 2 + Codex CLI 1 = 4.
+// The store's arithmetic: 본체 1 + 앱 2 = 3. Codex belongs in the gear.
 const FULL = {
   checkedAt: "2026-09-01T09:20:00Z",
   platform: { available: true, changedCount: 12, ref: "a1b2c3d" },
@@ -393,7 +370,7 @@ const FULL = {
   harness: { codex: { installed: "0.144.4", latest: "0.151.0" },
              hooksDrift: 1, skillsWired: true },
 };
-check("badge: the confirmed mockup's payload", badge.count(FULL), 4);
+check("badge: platform and app updates only", badge.count(FULL), 3);
 check("badge: a lock-mismatch app is counted (it needs a person, not a button)",
       badge.ids(FULL).join(","), "notes,learning");
 
@@ -411,9 +388,11 @@ check("badge: hook drift alone does not raise the badge",
       badge.count({ platform: null, apps: [],
                     harness: { codex: null, hooksDrift: 3, skillsWired: false } }), 0);
 
-// Codex is the one harness binary that does not update itself — and the only
-// one the badge counts. "Could not check" must not look like "up to date" OR
-// like an update: an absent `latest` counts as nothing.
+// Codex is tested separately because its gear row still needs this comparison,
+// but it no longer contributes to the app-store badge.
+check("badge: an outdated Codex remains outside the store count",
+      badge.count({ platform: null, apps: [],
+                    harness: { codex: { installed: "0.144.4", latest: "0.151.0" } } }), 0);
 check("badge: codex at the latest version is not counted",
       badge.codex({ harness: { codex: { installed: "0.151.0", latest: "0.151.0" } } }), false);
 check("badge: codex with an unknown latest is not counted (check did not run)",
@@ -436,11 +415,11 @@ check("badge: apps as null does not throw", badge.count({ platform: null, apps: 
 check("badge: apps as a string does not throw", badge.count({ apps: "two" }), 0);
 check("badge: a platform that is not an object does not throw",
       badge.count({ platform: "yes", apps: [] }), 0);
-// The panel rows iterate this same list, so it has to be an ARRAY for every
-// junk shape — `for (const a of {})` throws where `{}.filter` also would.
+// App-store rows and launcher dots read this same list, so it has to be an ARRAY
+// for every junk shape — `for (const a of {})` would throw.
 check("apps normaliser: an object yields an empty array, never a throw",
       Array.isArray(badge.apps({ apps: {} })) && badge.apps({ apps: {} }).length, 0);
-check("apps normaliser: entries without an id are dropped before the rows see them",
+check("apps normaliser: entries without an id are dropped before consumers see them",
       badge.apps({ apps: [null, "notes", { action: "upgrade" }, { id: "notes" }] })
         .map(a => a.id).join(","), "notes");
 check("apps normaliser: ids and rows come from the same list",

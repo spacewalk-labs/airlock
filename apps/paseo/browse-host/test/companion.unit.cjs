@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 const assert = require("node:assert/strict");
 const { isTerminalCloseCode, applyRosterMessage, closeAction } = require("../web/browse-view-client.js");
 

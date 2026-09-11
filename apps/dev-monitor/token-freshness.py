@@ -9,7 +9,7 @@ run does two things, in this order:
      rather than as silence. This must happen even when step 2 cannot.
   2. Publish a card to the dev-monitor spool for anything that is not ok. That console
      already exists, already reaches the operator, and already coalesces one card per
-     group_key per day — which is exactly the cadence a daily expiry warning wants.
+     group per day — which is exactly the cadence a daily expiry warning wants.
 
 Step 2 is best effort and never fails the run on its own; step 1 is the run's job.
 
@@ -67,28 +67,20 @@ def wants_card(verdict):
 def card_for(verdict, now):
     """Build the spool payload. Every field here is derived from the verdict."""
     provider = verdict['provider']
-    urgency = 'urgent' if verdict['status'] == T.EXPIRED else 'normal'
+    level = 'urgent' if verdict['status'] == T.EXPIRED else 'normal'
     title = '%s credentials: %s — %s' % (provider, verdict['status'], verdict['detail'])
     body = 'Checked %s. Source: %s' % (verdict.get('checked_at') or T.iso(now),
                                        verdict.get('path') or '(unknown path)')
     return {
-        'schema_version': 1,
-        # A fresh event_id per run: the collector coalesces by group_key, so repeated
+        # A fresh id per run: the collector coalesces by group, so repeated
         # runs update one card instead of creating one per day per provider.
-        'event_id': '%s-%s-%s' % (SOURCE, now.strftime('%Y%m%dT%H%M%SZ'),
+        'id': '%s-%s-%s' % (SOURCE, now.strftime('%Y%m%dT%H%M%SZ'),
                                   uuid.uuid4().hex[:6]),
-        'group_key': '%s:%s' % (SOURCE, provider),
+        'group': '%s:%s' % (SOURCE, provider),
         'source': SOURCE,
-        'kind': 'info',
-        'urgency': urgency,
+        'level': level,
         'title': title,
-        'body': body,
-        'created_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
-        'outcome': verdict['detail'],
-        'why_it_matters': (
-            'Nothing else on this box reads a credential expiry. Left alone, the first '
-            'sign of this is an agent run that fails.'),
-        'followup': 'Re-authenticate this provider before the deadline.',
+        'body': body + '. ' + verdict['detail'] + '. Re-authenticate this provider before the deadline.',
     }
 
 

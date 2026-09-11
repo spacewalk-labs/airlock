@@ -117,15 +117,20 @@ design. Status: reviewed draft, not yet hardware-verified.
 
 ## License
 
-**Apache-2.0** (© 2026 Sunghyeon Cho) for the Airlock core and all app
-integrations, **except** `apps/paseo/patches/` and the web-ui patcher, which are
-**AGPL-3.0** (modifications to Paseo). See [`LICENSE`](LICENSE) and
-[`NOTICE`](NOTICE). Upstream tools keep their own licenses.
+**AGPL-3.0** (© 2026 Sunghyeon Cho) for the Airlock core and all app
+integrations. `apps/paseo/patches/` and the web-ui patcher are marked
+`AGPL-3.0-only` separately because they are modifications to Paseo. See
+[`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Upstream tools keep their own
+licenses.
 
-Apache-2.0 rather than MIT for two clauses MIT does not have: an express patent
-grant (§3), which is what an organisation's counsel looks for, and explicit
-trademark reservation (§6). The reasoning, and what is deliberately *not*
-licensed this way, is in
+Using Airlock — for yourself, or inside a company — costs nothing and requires
+nothing. AGPL-3.0 keeps an express patent grant (§11) and stays an OSI-approved
+open-source license, while §13 closes the one gap Apache-2.0 left open: someone
+repackaging Airlock as a service must publish their modified source. It does not
+grant trademark rights — see the trademark note in [`LICENSE`](LICENSE).
+
+Changed from Apache-2.0 on 2026-09-08. Versions already published under
+Apache-2.0 stay under it. The reasoning is in
 [`docs/design/commercialisation-and-license.md`](docs/design/commercialisation-and-license.md).
 
 ## Security

@@ -77,6 +77,8 @@ case "$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left a
 # list-timers above is answered: an unanswered verb reads as a dead unit and the
 # installer dies.
 case "$*" in *is-active*) printf '%s\n' active ;; esac
+# Ledger teardown verifies the stopped state before deleting any unit.
+case "$*" in *show*) printf 'LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n' ;; esac
 exit 0
 STUB
 cat >"$SHIM/loginctl" <<'STUB'
@@ -593,8 +595,9 @@ else
   failure_detail "$out"
 fi
 
-# Whole-run atomicity: B is allowed to commit to the ledger while A's smoke
-# fails, but neither pending first-use digest may enter the lock in that run.
+# Whole-run atomicity: both lifecycles may run before A's smoke failure is
+# reported, but transaction compensation removes B's provisional commit too.
+# Neither pending first-use digest may enter the lock in that failed run.
 reset_box; write_sentinel_lock
 MULTI="$TMP/multi"; mkdir -p "$MULTI"
 make_plain_package "$MULTI/a" a-fail
@@ -618,14 +621,23 @@ out="$(orch "$MULTI/airlock.toml" AIRLOCK_TEST_FAIL_SMOKE=a-fail 2>&1)" \
   && multi_rc=0 || multi_rc=$?
 lock_mentions_new=0
 if grep -Eq '^\[(a-fail|b-ok)\]$' "$LOCK" 2>/dev/null; then lock_mentions_new=1; fi
+multi_tx_phase="$(python3 - "$STATE/install-transaction.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8"))["phase"])
+except (OSError, KeyError, TypeError, ValueError):
+    print("")
+PY
+)"
 if [ "$multi_rc" -ne 0 ] \
    && marker_has a-fail install && marker_has a-fail smoke \
    && marker_has b-ok install && marker_has b-ok smoke \
-   && ledger_committed b-ok && [ "$lock_mentions_new" -eq 0 ] \
+   && ! ledger_committed a-fail && ! ledger_committed b-ok \
+   && [ "$multi_tx_phase" = rolled_back ] && [ "$lock_mentions_new" -eq 0 ] \
    && cmp -s "$TMP/multi-before" "$LOCK"; then
-  ok "lock: multi-package first use is whole-run atomic despite B ledger commit"
+  ok "lock: multi-package failure compensates B and keeps first-use lock atomic"
 else
-  bad "lock: multi-package atomicity has both lifecycle and B-commit witnesses (rc=$multi_rc)"
+  bad "lock: multi-package atomicity has lifecycle, rollback, and no-commit witnesses (rc=$multi_rc phase=${multi_tx_phase:-none})"
   failure_detail "$out"
 fi
 

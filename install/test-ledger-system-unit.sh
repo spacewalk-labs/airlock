@@ -257,6 +257,10 @@ expect_refusal \
   rooted-late "outside the rooted allowlist" \
   test ! -e "$TMP/deactivated" -a -e "$TMP/ordinary-marker" -a -e "$TMP/outside-rooted-marker"
 
+# Same CI entry point also exercises the actual two-stage teardown with
+# stateful systemctl faults, scratch fragments and persisted legacy records.
+python3 "$HERE/test-ledger-teardown.py" || exit 1
+
 echo "---"
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

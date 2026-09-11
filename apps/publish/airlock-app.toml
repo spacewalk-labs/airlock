@@ -17,6 +17,8 @@ id = "publish"
 # docs/design/app-package-contract.md.
 runtime_env = [
   "AIRLOCK_PUBLISH_BASE_URL",
+  "AIRLOCK_PUBLISH_DOC_AUDIENCE",
+  "AIRLOCK_PUBLISH_DOC_URL",
   "AIRLOCK_PUBLISH_GATED_DIR",
   "AIRLOCK_PUBLISH_HTPASSWD_BIN",
   "AIRLOCK_PUBLISH_HTPASSWD_DIR",
@@ -61,6 +63,9 @@ assets_dir = ""
 # A box may opt into the tailnet-member document-view tier. False keeps the
 # dedicated port behind the existing owner+collaborators gate.
 tailnet_view = false
+# Expose only GET /publish/api/meta to authenticated tailnet members. The
+# manager and every other /publish/api/ route keep the hub allowlist gate.
+title_meta = false
 
 [config.tables.public_target]
 allowed_keys = ["mode", "ingest_url", "base_url", "token_env", "token_header",

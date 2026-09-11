@@ -5,7 +5,7 @@
     "deny_rules": 4,
     "files": 64,
     "hooks": 3,
-    "projection_sha256": "7eeb877595f1a26f47b923f746169c8a6ecbffb100dd8be774a09190c6b123f6",
+    "projection_sha256": "8741093161d8fbe8715bbe7e9fd0cb38487b2a412d652d55ed4edd93413f67e2",
     "skills": 29,
     "executable_paths": [
       "hooks/secret-guard.sh",
@@ -25,7 +25,7 @@
   },
   "starter": {
     "files": 32,
-    "projection_sha256": "3bb28e3fe88581d32bd0f7bbc93ea5f36ebb2aceea41b048b93112b2e74b776f",
+    "projection_sha256": "1d622cd15f94b206bf78a9060725f57816d6fdf705d91a51a907ed2e5058d304",
     "executable_paths": [
       ".claude/hooks/secret-scan.sh",
       ".claude/hooks/typecheck.sh",

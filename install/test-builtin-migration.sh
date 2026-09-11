@@ -62,6 +62,8 @@ case "$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left a
 # list-timers above is answered: an unanswered verb reads as a dead unit and the
 # installer dies.
 case "$*" in *is-active*) printf '%s\n' active ;; esac
+# Ledger teardown verifies the stopped state before deleting any unit.
+case "$*" in *show*) printf 'LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n' ;; esac
 exit 0
 STUB
 cat >"$SHIM/tailscale" <<'STUB'
@@ -311,7 +313,7 @@ assert contract["bundle_entitlements"] == {
     "devterm": [], "feedback": [], "learning": [],
     "fileview": [], "notepad": [], "notes": [],
     "orca": ["rooted-artifact", "system-unit"],
-    "paseo": [], "publish": [],
+    "paseo": [], "publish": [], "slack-unfurl": [],
 }
 dev_monitor = contract["packages"]["dev-monitor"]
 assert dev_monitor == {
@@ -806,7 +808,7 @@ ledger_run "$info_sc2" intent sc-a >/dev/null 2>&1; rc_sc2=$?  # repair run
 sc_caps="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d["entries"]["sc-a"]["intent"]["capabilities"]))' "$STATE/app-ledger.json" 2>/dev/null)"
 if [ "$rc_sc1" = 0 ] && [ "$rc_sc2" = 0 ] && [ ! -e "$UU/sc-a.service" ] \
    && [ "$sc_caps" = '["system-unit"]' ] \
-   && grep -q -- '--user disable --now sc-a.service' "$TMP/systemctl.log"; then
+   && grep -q -- '--user disable --no-reload sc-a.service' "$TMP/systemctl.log"; then
   ok "MAJOR C: a unit scope flip (user -> system) between two crashed intents is caught"
 else
   bad "MAJOR C: unit-scope stale-intent regression (intent1=$rc_sc1 intent2=$rc_sc2 caps=$sc_caps unit=$([ -e "$UU/sc-a.service" ] && echo present || echo GONE))"
@@ -1024,7 +1026,7 @@ fi
 rm_tu="$(ledger_run "$info_tu" remove tu-sys 2>&1)"; rc_rm_tu=$?
 if [ "$rc_rm_tu" = 0 ] && [ ! -e "$US/tu-sys.service" ] \
    && [ -e "$UU/tu-sys.service" ] \
-   && grep -q -- '^disable --now tu-sys.service$' "$TMP/systemctl.log"; then
+   && grep -q -- '^disable --no-reload tu-sys.service$' "$TMP/systemctl.log"; then
   ok "typed units: a valid system-unit claim reaches remove and never touches the user decoy"
 else
   bad "typed units: claimed system-unit removal failed or crossed scope (rc=$rc_rm_tu)"
@@ -2997,7 +2999,7 @@ system_td="$(p4_teardown "$P4CFG" alpha-system 2>&1)"; system_td_rc=$?
 if grep -q $'^ADOPT\talpha-system\t' <<<"$system_scan" \
    && [ "$system_adopt_rc" = 0 ] && [ "$system_caps" = '["system-unit"]' ] \
    && [ "$system_td_rc" = 0 ] && [ ! -e "$US/alpha-system.service" ] \
-   && grep -q -- '^disable --now alpha-system.service$' "$TMP/systemctl.log"; then
+   && grep -q -- '^disable --no-reload alpha-system.service$' "$TMP/systemctl.log"; then
   ok "B1: system-unit adoption preserves the claim through ordinary teardown"
 else
   bad "B1: system-unit adopt/teardown (adopt=$system_adopt_rc caps=$system_caps teardown=$system_td_rc)"
@@ -3376,7 +3378,16 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$SHIM/nginx"; chmod +x "$SHIM/nginx"
 p4_reset; p4_mkalpha
 mkdir -p "$FAKEHOME/.local/bin"; : > "$FAKEHOME/.local/bin/alpha-bin"
 P4CFG_VALID="$TMP/p4-cfg-valid.toml"; p4_cfg_hubonly "$P4CFG_VALID"
-out="$(AIRLOCK_SHIPPED_APPS_ROOT="$P4APPS" AIRLOCK_CONFIG="$P4CFG_VALID" \
+# This assertion observes the orchestrator's own stderr and scratch HOME.  If
+# the suite itself is hosted by airlock-*.service, the unrelated self-kill
+# escape deliberately redirects that stderr to the journal and a transient
+# service receives the user's real HOME.  Pin only this invocation to the
+# escape's neutral cgroup test seam; the gate probe above stays unpinned and
+# continues to cover caller-environment forwarding across a real escape.
+printf '0::/user.slice/user-1000.slice/user@1000.service/session.slice/airlock-test.scope\n' \
+  >"$TMP/p4-neutral-cgroup"
+out="$(AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/p4-neutral-cgroup" \
+  AIRLOCK_SHIPPED_APPS_ROOT="$P4APPS" AIRLOCK_CONFIG="$P4CFG_VALID" \
   AIRLOCK_NGINX_SITE="$TMP/p4-nginx-site2.conf" bash "$ROOT/install/airlock-install.sh" 2>&1 || true)"
 grep -qF "pre-ledger artifact(s) found for known builtin 'alpha'" <<<"$out" \
   && grep -qF "bin/airlock-teardown --adopt alpha" <<<"$out" \

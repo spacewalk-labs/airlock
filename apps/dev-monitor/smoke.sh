@@ -120,10 +120,7 @@ if [ "$want" = true ]; then
   [ "$c_owner"  = 200 ] || { echo "FAIL owner cannot read the console through the hub"; fail=1; }
   [ "$c_other"  = 403 ] || { echo "FAIL a non-owner reached the console (GATE HOLE)"; fail=1; }
   [ "$c_forge"  = 200 ] || { echo "FAIL nginx did not replace a client-supplied X-Devmon-* header (GATE HOLE)"; fail=1; }
-  # A 200 says the gate let us in; it says nothing about what came back. The badge on every
-  # tool in this hub is drawn from this one response, so its SHAPE is the contract: a missing
-  # needs_action_count reads as zero at the widget and is indistinguishable from "nothing to
-  # do" — the exact failure this phase exists to remove.
+  # Verify the unread badge and the card contract through the authenticated API.
   preview_body=$(curl -s --max-time 6 -H "${HDR}: ${OWNER}" \
                  "http://127.0.0.1:${HUB}/monitor/api/owner/messages/preview" || true)
   # The body arrives as argv, not on stdin: the heredoc IS stdin for `python3 -`, so a pipe
@@ -134,26 +131,19 @@ try:
     d = json.loads(sys.argv[1])
 except Exception as e:
     print('FAIL preview is not JSON: %s' % e); raise SystemExit
-for key in ('needs_action_count', 'unread_count'):
-    if not isinstance(d.get(key), int) or isinstance(d.get(key), bool):
-        print('FAIL preview %s is %r, want an integer' % (key, d.get(key))); raise SystemExit
+if type(d.get('unread_count')) is not int or d['unread_count'] < 0:
+    print('FAIL preview unread_count must be a nonnegative integer'); raise SystemExit
 if not isinstance(d.get('messages'), list):
-    print('FAIL preview messages is %r, want a list' % type(d.get('messages'))); raise SystemExit
+    print('FAIL preview messages must be a list'); raise SystemExit
 for card in d['messages']:
-    for key in ('needs_action', 'task_state'):
-        if key not in card:
-            print('FAIL preview card %s has no %s' % (card.get('card_id'), key)); raise SystemExit
-    if card['needs_action'] not in (True, False, None):
-        print('FAIL preview needs_action is %r' % card['needs_action']); raise SystemExit
-# The preview is capped, so its cards cannot prove the total — but a total below what is
-# visible here can only be a broken count.
-visible = sum(1 for c in d['messages']
-              if c['needs_action'] and c.get('task_state') in (None, 'todo'))
-if d['needs_action_count'] < visible:
-    print('FAIL preview needs_action_count=%d but %d of the returned cards need a person'
-          % (d['needs_action_count'], visible)); raise SystemExit
-print('OK needs-me=%d unread=%d cards=%d' % (d['needs_action_count'], d['unread_count'],
-                                             len(d['messages'])))
+    if card.get('level') not in ('normal', 'urgent') or not isinstance(card.get('body'), str):
+        print('FAIL preview card level/body contract'); raise SystemExit
+    if any(key in card for key in ('needs_action', 'task_state', 'urgency')):
+        print('FAIL preview contains retired card fields'); raise SystemExit
+visible = sum(c.get('read_at') is None for c in d['messages'])
+if d['unread_count'] < visible:
+    print('FAIL preview unread count is below visible unread cards'); raise SystemExit
+print('OK unread=%d cards=%d' % (d['unread_count'], len(d['messages'])))
 PY
 )
   echo "[dev-monitor smoke] preview shape: ${preview_check}"
@@ -165,107 +155,33 @@ else
   [ "$c_off" = 404 ] || { echo "FAIL console is off but its route answered ${c_off}"; fail=1; }
 fi
 
-# The scalar above says whether the console started; this object proves each independent
-# delivery lane is wired and that its DB-derived values are internally consistent.
-lane_result=$(python3 - "$want" "$HOME/.config/airlock/dev-monitor.env" "$BACKEND" "$HERE/backend" 2>&1 <<'PY'
-import datetime as dt
+# Configuration presence and the single outbox state, without credential output.
+delivery_result=$(python3 - "$BACKEND" "$HOME/.config/airlock/dev-monitor.env" "$HERE/check-secrets.py" "$HOME/.config/airlock/dev-monitor-secrets.env" 2>&1 <<'DEVMON_DELIVERY_PY'
 import json
-import sqlite3
 import sys
-import time
 import urllib.request
-
-sys.path.insert(0, sys.argv[4])
-import devmon_email
-import devmon_messages as messages
-
+import subprocess
+from pathlib import Path
 configured = {}
-try:
-    with open(sys.argv[2], encoding="utf-8") as env_file:
-        for raw in env_file:
-            key, separator, value = raw.rstrip("\n").partition("=")
-            if separator:
-                configured[key] = value.strip()
-except FileNotFoundError:
-    pass
-off = "off: no webhook configured"
-expected_workers = {
-    "slack-urgent": off,
-    "slack-routine": off,
-    "email": "off: no transport configured",
-}
-if sys.argv[1] == "true":
-    if configured.get("AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT") or configured.get("AIRLOCK_DEVMON_SLACK_WEBHOOK"):
-        expected_workers["slack-urgent"] = "on"
-    if configured.get("AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE"):
-        expected_workers["slack-routine"] = "on"
-    if devmon_email.config_from_env(configured) is not None:
-        expected_workers["email"] = "on"
-fields = {
-    "worker_state", "delivery_state", "last_success_at", "last_success_age_seconds", "pending_count",
-    "oldest_pending_age_seconds", "last_error", "last_error_at",
-    "consecutive_failures", "terminal_failures_since_success",
-    "ledger_error_count",
-}
-
-def check_once():
-    now = dt.datetime.now(dt.timezone.utc)
-    expected_delivery = None
-    if sys.argv[1] == "true":
-        db_path = configured.get("DEV_MONITOR_DB")
-        assert db_path, "missing DB path"
-        messages._local.__dict__.clear()
-        messages._DB_PATH = db_path
-        try:
-            expected_delivery = {
-                lane: messages.delivery_lane_health(lane, now)
-                for lane in expected_workers
-            }
-        finally:
-            messages._local.__dict__.clear()
-    with urllib.request.urlopen(
-            "http://127.0.0.1:%s/api/health" % sys.argv[3], timeout=6) as response:
-        health = json.load(response)
-    lanes = health.get("message_lanes")
-    assert isinstance(lanes, dict) and set(lanes) == set(expected_workers), "lane keys"
-    for lane, worker in expected_workers.items():
-        value = lanes[lane]
-        assert isinstance(value, dict) and set(value) == fields, lane + " shape"
-        assert value["worker_state"] == worker, lane + " worker_state"
-        if expected_delivery is None:
-            expected = {
-                "delivery_state": "idle", "last_success_at": None,
-                "last_success_age_seconds": None,
-                "pending_count": 0, "oldest_pending_age_seconds": None,
-                "last_error": None, "last_error_at": None,
-                "consecutive_failures": 0,
-                "terminal_failures_since_success": 0,
-                "ledger_error_count": 0,
-            }
-        else:
-            expected = expected_delivery[lane]
-        for key, expected_value in expected.items():
-            actual = value[key]
-            if key == "oldest_pending_age_seconds" and actual is not None:
-                assert expected_value is not None and abs(actual - expected_value) <= 3, lane + " pending age"
-            else:
-                assert actual == expected_value, lane + " " + key
-
-failure = "unknown mismatch"
-for _ in range(3):
-    try:
-        check_once()
-        print("ok")
-        break
-    except (AssertionError, OSError, sqlite3.Error, ValueError) as exc:
-        failure = str(exc) or type(exc).__name__
-        time.sleep(0.1)
-else:
-    print(failure)
-    raise SystemExit(1)
-PY
+if Path(sys.argv[2]).exists():
+    for line in Path(sys.argv[2]).read_text().splitlines():
+        key, separator, value = line.partition('=')
+        if separator: configured[key] = value.strip()
+selector = configured.get('DEVMON_SLACK_WEBHOOK_NAME', '')
+command = [sys.executable, sys.argv[3], '--file', sys.argv[4], '--lane', 'slack-urgent', '--selector', selector]
+if selector: command += ['--allow', selector]
+result = subprocess.run(command, capture_output=True)
+assert result.returncode in (0, 1), 'cannot check app-only credential configuration'
+with urllib.request.urlopen('http://127.0.0.1:%s/api/health' % sys.argv[1], timeout=6) as response:
+    health = json.load(response)
+assert health['slack'] == ('configured' if result.returncode == 0 else 'not configured'), 'Slack configuration mismatch'
+for key in ('pending_count', 'failed_count'):
+    assert type(health[key]) is int and health[key] >= 0, key
+assert health['last_sent_at'] is None or isinstance(health['last_sent_at'], str)
+print('single Slack configuration/outbox shape ok')
+DEVMON_DELIVERY_PY
 )
-lane_rc=$?
-echo "[dev-monitor smoke] message lanes: ${lane_result}"
-[ "$lane_rc" = 0 ] || { echo "FAIL per-lane health shape/value mismatch"; fail=1; }
+delivery_rc=$?
+echo "[dev-monitor smoke] delivery: ${delivery_result}"
+[ "$delivery_rc" = 0 ] || { echo "FAIL delivery health shape mismatch"; fail=1; }
 [ "$fail" = 0 ]

@@ -58,10 +58,15 @@ PORT = int(os.environ.get('AIRLOCK_PUBLISH_BACKEND_PORT', '19922'))
 UPLOADS = os.path.expanduser(os.environ.get('AIRLOCK_PUBLISH_UPLOADS_DIR', '~/uploads'))
 HOME = os.path.expanduser('~')
 IDENTITY_HEADER = os.environ.get('AIRLOCK_IDENTITY_HEADER', 'Tailscale-User-Login')
+TITLE_META_ENABLED = os.environ.get('AIRLOCK_PUBLISH_TITLE_META', 'false').lower() == 'true'
 
 # ---- pluggable external publish target (all optional) ----
 INGEST_URL = os.environ.get('AIRLOCK_PUBLISH_INGEST_URL', '').rstrip('/')
 BASE_URL = os.environ.get('AIRLOCK_PUBLISH_BASE_URL', '').rstrip('/')
+# The openable link for a document in the share directory, or empty. The hub path
+# this UI used to hand out (/publish/files/<name>) is owner+collaborators only, so
+# a copied link 403s for everyone it is sent to while still working for the sender.
+DOC_URL = os.environ.get('AIRLOCK_PUBLISH_DOC_URL', '').rstrip('/')
 # The token lives in an env var whose NAME is configured (secret stays out of the
 # config file); default AIRLOCK_PUBLISH_TOKEN. The installer wires an EnvironmentFile.
 _TOKEN_ENV = os.environ.get('AIRLOCK_PUBLISH_TOKEN_ENV', 'AIRLOCK_PUBLISH_TOKEN')
@@ -392,10 +397,112 @@ _RE_HREF = re.compile(r'\bhref=["\']([^"\']+)["\']', re.I)
 _RE_JS = re.compile(r'<script\b([^>]*)\bsrc=["\']([^"\']+)["\']([^>]*)>\s*</script>', re.I)
 _RE_IMG = re.compile(r'(<img\b[^>]*\bsrc=)["\']([^"\']+)["\']', re.I)
 _RE_TITLE = re.compile(r'<title>([^<]*)</title>', re.I)
+_TITLE_SCAN_CHARS = 262_144
 _RE_SCHEME = re.compile(r'^[a-z]+:', re.I)
 # Non-greedy so each comment ends at its own '-->'. Unterminated comments run to
 # end of document, which is also how browsers treat them.
 _RE_COMMENT = re.compile(r'<!--.*?(?:-->|\Z)', re.S)
+
+
+class _HeadTitleParser(HTMLParser):
+    """Extract a real title element before body, ignoring comments/scripts."""
+
+    _VOID_ELEMENTS = frozenset({
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link',
+        'meta', 'param', 'source', 'track', 'wbr',
+    })
+    _HEAD_ELEMENTS = frozenset({
+        'base', 'basefont', 'bgsound', 'link', 'meta', 'noframes', 'script',
+        'style', 'template', 'title',
+    })
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.in_head = False
+        self.prologue_open = True
+        self.in_title = False
+        self.stack = []
+        self.parts = []
+        self.title = None
+
+    def handle_starttag(self, tag, _attrs):
+        tag = tag.lower()
+        if tag == 'head' and self.prologue_open:
+            self.in_head = True
+        elif tag == 'body':
+            self.prologue_open = False
+            self.in_head = False
+            self.in_title = False
+        elif (tag == 'title' and self.prologue_open and self.title is None
+              and (self.stack in ([], ['html'])
+                   or (self.in_head and self.stack[-1:] == ['head']))):
+            self.in_title = True
+            self.parts = []
+        elif tag == 'html' and not self.stack:
+            pass
+        elif (self.prologue_open and tag in self._HEAD_ELEMENTS
+              and (self.stack in ([], ['html'])
+                   or (self.in_head and self.stack[-1:] == ['head']))):
+            # HTML permits the head start/end tags to be omitted. Treat a
+            # top-level head element as opening that implicit head so metadata
+            # such as <meta>, <link>, <base>, or <script> can precede <title>.
+            self.in_head = True
+        else:
+            self.prologue_open = False
+            self.in_title = False
+        if tag not in self._VOID_ELEMENTS:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == 'title' and self.in_title:
+            self.title = ''.join(self.parts).strip()
+            self.in_title = False
+        elif tag == 'head':
+            self.in_head = False
+            self.prologue_open = False
+        if tag in self.stack:
+            del self.stack[len(self.stack) - 1 - self.stack[::-1].index(tag):]
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.parts.append(data)
+        elif data.strip() and not self.in_head:
+            self.prologue_open = False
+
+
+def _head_title(html):
+    parser = _HeadTitleParser()
+    parser.feed(html)
+    parser.close()
+    return parser.title
+
+
+def read_title_meta(name):
+    """Read one explicitly named share entry without offering enumeration.
+
+    ``safe_resolve`` is deliberately lexical: documents in the share directory
+    are commonly symlinks to their authoring location.  The security boundary is
+    the flat basename selected inside ROOT, not the symlink target; accepting a
+    slash or dot-prefixed entry would instead create a second path namespace.
+    """
+    if (not name or os.path.basename(name) != name or safe_resolve(name) is None
+            or not name.lower().endswith('.html')):
+        return 400, {'ok': False, 'error': 'name must be an HTML basename'}
+    path = safe_resolve(name)
+    try:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(name)
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            # A tailnet-wide metadata lookup must not allocate the entire shared
+            # document.  Titles belong in <head>; a bounded prefix keeps one
+            # pathological file from amplifying memory per request.
+            html = fh.read(_TITLE_SCAN_CHARS)
+            mtime = int(os.fstat(fh.fileno()).st_mtime)
+    except (OSError, ValueError):
+        return 404, {'ok': False, 'error': 'not found'}
+    title = _head_title(html) or name
+    return 200, {'name': name, 'title': title, 'mtime': mtime}
 
 
 def _read_share_file(ref, base_dir):
@@ -1831,11 +1938,27 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get(IDENTITY_HEADER, '')
 
     def do_GET(self):
-        path = self._strip(urllib.parse.urlparse(self.path).path)
+        parsed = urllib.parse.urlparse(self.path)
+        path = self._strip(parsed.path)
+        if path in ('/api/meta', '/meta'):
+            if not TITLE_META_ENABLED:
+                self._json(404, {'ok': False, 'error': f'unknown path: {path}'})
+                return
+            if not self._owner():
+                self._json(403, {'ok': False, 'error': 'identity header missing'})
+                return
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            names = query.get('name', [])
+            if len(names) != 1:
+                self._json(400, {'ok': False, 'error': 'exactly one name is required'})
+                return
+            status, payload = read_title_meta(names[0])
+            self._json(status, payload)
+            return
         if path in ('/api/list', '/list'):
             self._json(200, {'ok': True, 'items': list_items(), 'root': ROOT, 'public_enabled': PUBLIC_ENABLED,
                              'public_mode': PUBLIC_MODE, 'gated_enabled': GATED_ENABLED,
-                             'gated_disabled_reason': GATED_DISABLED_REASON})
+                             'gated_disabled_reason': GATED_DISABLED_REASON, 'doc_url': DOC_URL})
             return
         if path in ('/api/health', '/health', '/'):
             self._json(200, {'ok': True, 'service': 'airlock-publish', 'port': PORT, 'public_enabled': PUBLIC_ENABLED,

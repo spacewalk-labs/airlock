@@ -78,6 +78,7 @@ CHECKS = (
     ("config.validate",  "config",  "airlock.toml parses and passes validate"),
     ("config.owner",     "config",  "the gate has an owner identity to compare against"),
     ("install.ledger",   "install", "the install ledger is readable"),
+    ("install.transaction", "install", "the last install transaction reached a safe state"),
     ("install.drift",    "install", "every enabled app is committed in the ledger"),
     ("install.revision", "install", "the checkout revision this box is running"),
     ("ingress.backend",  "ingress", "tailscaled is up"),
@@ -299,6 +300,52 @@ def state_dir():
 
 def check_install(rep, cfg, enabled):
     ledger_path = state_dir() / "app-ledger.json"
+    transaction_path = state_dir() / "install-transaction.json"
+    if not os.path.lexists(transaction_path):
+        rep.record("install.transaction", OK, "no install transaction is pending")
+    else:
+        try:
+            if transaction_path.is_symlink():
+                raise ValueError("transaction record is a symlink")
+            transaction = json.loads(transaction_path.read_text())
+            phase = transaction.get("phase")
+            transaction_id = transaction.get("id")
+            if (not isinstance(transaction_id, str) or len(transaction_id) != 32
+                    or any(ch not in "0123456789abcdef" for ch in transaction_id)):
+                raise ValueError("invalid or missing transaction id")
+        except (OSError, json.JSONDecodeError, ValueError, AttributeError) as exc:
+            rep.record("install.transaction", FAIL,
+                       f"transaction record is unreadable: {exc}",
+                       "Preserve the state directory and repair the transaction record before installing.")
+        else:
+            short_id = transaction_id[:12]
+            if phase == "committed":
+                rep.record("install.transaction", OK,
+                           f"transaction {short_id} committed")
+            elif phase == "rolled_back":
+                rep.record("install.transaction", WARN,
+                           f"transaction {short_id} rolled back; the previous committed apps were restored",
+                           "Review the installer error before retrying the candidate.")
+            elif phase == "degraded":
+                failed = {name for name, result in
+                          (transaction.get("restore_results") or {}).items()
+                          if isinstance(result, dict) and result.get("status") == "failed"}
+                error = transaction.get("error") or {}
+                if isinstance(error, dict) and isinstance(error.get("app"), str):
+                    failed.add(error["app"])
+                failed = sorted(failed)
+                suffix = f"; restore failed for {', '.join(failed)}" if failed else ""
+                rep.record("install.transaction", FAIL,
+                           f"transaction {short_id} is degraded{suffix}",
+                           "Do not run a new candidate; preserve checkpoints and repair the named app first.")
+            elif phase in ("prepared", "installing", "rolling_back"):
+                rep.record("install.transaction", UNCHECKED,
+                           f"transaction {short_id} is {phase}; final availability is not established",
+                           "Let the installer finish, or re-run it so recovery runs before a new plan.")
+            else:
+                rep.record("install.transaction", FAIL,
+                           f"transaction {short_id} has unknown phase {phase!r}",
+                           "Preserve the state directory and repair the transaction record before installing.")
     committed = None
     if not ledger_path.exists():
         rep.record("install.ledger", FAIL,

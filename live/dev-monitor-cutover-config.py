@@ -2,7 +2,7 @@
 """Render the secret-free Airlock config used for a dev-monitor cutover.
 
 Site-specific values come from environment variables. Slack values do not: this config
-names the two environment variables the installer may resolve at cutover time, keeping
+names the webhook credential that systemd loads for the app, keeping
 bearer credentials out of the generated TOML and process output.
 """
 from __future__ import annotations
@@ -35,14 +35,8 @@ def q(raw: str) -> str:
 def main() -> None:
     owner = required('AIRLOCK_CUTOVER_OWNER')
     site_name = value('AIRLOCK_CUTOVER_SITE_NAME', 'Airlock')
-    roster = value('AIRLOCK_CUTOVER_ROSTER_PATH', '')
-    compat_env_path = value('AIRLOCK_CUTOVER_COMPAT_ENV_PATH', '')
     urgent_env = value(
         'AIRLOCK_CUTOVER_SLACK_URGENT_ENV',
-        'DEV_MONITOR_SLACK_WEBHOOK',
-    )
-    routine_env = value(
-        'AIRLOCK_CUTOVER_SLACK_ROUTINE_ENV',
         'DEV_MONITOR_SLACK_WEBHOOK',
     )
     backend_port = value('AIRLOCK_CUTOVER_BACKEND_PORT', '19923')
@@ -81,9 +75,6 @@ backend_port = {backend_port}
 messages = true
 token_freshness = true
 slack_webhook_urgent_env = {q(urgent_env)}
-slack_webhook_routine_env = {q(routine_env)}
-roster_path = {q(roster)}
-compat_env_path = {q(compat_env_path)}
 spool_writer_user = {q(spool_writer_user)}
 spool_writer_group = {q(spool_writer_group)}
 ''')

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 "use strict";
 // Level 2 (§14.4) executor tests: ensureTab idempotency / concurrent dedupe /
 // immutable workspace binding, and back/forward/reload commands.

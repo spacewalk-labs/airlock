@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 "use strict";
 // Locks the PROPORTIONATE url policy (owner-only tool): loopback / RFC1918 /
 // tailnet are ALLOWED (browsing one's own dev servers is the point); only cloud-

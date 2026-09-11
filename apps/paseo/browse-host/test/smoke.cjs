@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 "use strict";
 // Network-free smoke of the executor against the installed Playwright/Chromium.
 // Proves chromium launches, ai-mode snapshot yields @e refs, ref actions work,

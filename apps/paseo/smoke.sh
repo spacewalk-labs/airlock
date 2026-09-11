@@ -28,13 +28,17 @@ c_no=$(code                                    "http://127.0.0.1:${GATE}/")
 
 # --- cross-device ui-state route ---
 # Two answers matter and they are different failures: the owner must be able to READ
-# the shared sidebar order (404 counts — nothing stored yet is the normal first state,
-# and the patched bundle falls back to the device's own copy), and a non-owner must be
+# the shared sidebar order (404 counts — nothing stored yet or a revisioned tombstone),
+# the response must advertise revision support, and a non-owner must be
 # refused. A route that answered everyone would put the owner's workspace layout, and
 # a writable store, in front of every identity the tailnet lets reach this gate.
 UISTATE_KEY=sidebar-project-workspace-order
-c_ui_own=$(code  -H "${HDR}: ${OWNER}"           "http://127.0.0.1:${GATE}/airlock-ui-state/${UISTATE_KEY}")
-c_ui_deny=$(code -H "${HDR}: nobody@example.com" "http://127.0.0.1:${GATE}/airlock-ui-state/${UISTATE_KEY}")
+ui_headers="$(mktemp)" || exit 1
+trap 'rm -f "$ui_headers"' EXIT
+c_ui_own=$(curl -s -o /dev/null -D "$ui_headers" -w '%{http_code}' --max-time 6 \
+  -H "${HDR}: ${OWNER}" "http://127.0.0.1:${GATE}/airlock-ui-state/v2/${UISTATE_KEY}")
+c_ui_rev=$(sed -n 's/^X-Airlock-Revision:[[:space:]]*\([0-9][0-9]*\)\r*$/\1/ip' "$ui_headers" | tail -1)
+c_ui_deny=$(code -H "${HDR}: nobody@example.com" "http://127.0.0.1:${GATE}/airlock-ui-state/v2/${UISTATE_KEY}")
 
 # --- installed paseo version vs this tree's pin ---
 # install.sh dies on a version mismatch, but only on the path where it just
@@ -56,7 +60,7 @@ if [ -n "$paseo_bin" ]; then
 fi
 pin=$(sed -n 's/^PASEO_VER="\${AIRLOCK_PASEO_VERSION:-\([^}]*\)}".*/\1/p' "$HERE/install.sh" 2>/dev/null | head -1)
 
-echo "[paseo smoke] backend=${c_be}/200|302 owner=${c_own}/200|302 deny=${c_deny}/403 no-header=${c_no}/403 ui-state=${c_ui_own}/200|404,${c_ui_deny}/403 paseo=${ver:-?}/${pin:-?}"
+echo "[paseo smoke] backend=${c_be}/200|302 owner=${c_own}/200|302 deny=${c_deny}/403 no-header=${c_no}/403 ui-state=${c_ui_own}/200|404,rev=${c_ui_rev:-?},${c_ui_deny}/403 paseo=${ver:-?}/${pin:-?}"
 fail=0
 # Not-measured and measured-wrong are different answers. Only the second is a FAIL —
 # but "the unit is running and I cannot read its version" is the first masquerading
@@ -81,5 +85,6 @@ fi
 [ "$c_no"   = 403 ] || { echo "FAIL no-header (gate hole)"; fail=1; }
 { [ "$c_ui_own" = 200 ] || [ "$c_ui_own" = 404 ]; } \
   || { echo "FAIL ui-state (cross-device sidebar order not reachable through the gate: ${c_ui_own})"; fail=1; }
+[ -n "$c_ui_rev" ] || { echo "FAIL ui-state revision (v2 response has no X-Airlock-Revision)"; fail=1; }
 [ "$c_ui_deny" = 403 ] || { echo "FAIL ui-state deny (gate hole: ${c_ui_deny})"; fail=1; }
 [ "$fail" = 0 ]

@@ -131,7 +131,7 @@ git remote -v                       # → origin 이 내 계정의 레포를 가
 ## 다음 작업부터는 워크트리
 
 여기까지가 **본체**입니다. 본체는 `main` 에 둔 채로 두고, 실제 작업은 워크트리에서 합니다
-(`CLAUDE.md` §6-2). Paseo 를 쓰면 새 작업 만들 때 **New worktree** 를 고르는 것으로 끝입니다.
+([`worktree`](../worktree/SKILL.md)). Paseo 를 쓰면 새 작업 만들 때 **New worktree** 를 고르는 것으로 끝입니다.
 
 ## 하지 않는 것
 

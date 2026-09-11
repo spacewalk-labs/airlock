@@ -9,6 +9,7 @@ Usage:
   airlock-ledger plan
   airlock-ledger intent <id>
   airlock-ledger commit <id> [--active-ports "18900 18901"]
+  airlock-ledger preflight-remove <id> [--for-upgrade] [--active-ports "..."]
   airlock-ledger remove <id> [--for-upgrade] [--active-ports "..."]
   airlock-ledger teardown <id> [--active-ports "..."]
   airlock-ledger list
@@ -27,6 +28,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +37,14 @@ from typing import Any, NoReturn
 
 LEDGER_VERSION = 6
 LEDGER_FILENAME = "app-ledger.json"
+TRANSACTION_VERSION = 1
+TRANSACTION_FILENAME = "install-transaction.json"
+TRANSACTION_PHASES = frozenset((
+    "prepared", "installing", "rolling_back", "committed", "rolled_back", "degraded",
+))
+TRANSACTION_TERMINAL_PHASES = frozenset(("committed", "rolled_back", "degraded"))
+TRANSACTION_ACTIONS = frozenset(("fresh", "reinstall", "upgrade-diff",
+                                 "upgrade-deactivate", "remove", "teardown-intent"))
 # What an install was AUTHORIZED to do, recorded on the record itself so a
 # later load checks the decision admission already made instead of re-deriving
 # policy against a config that may have changed since. Closed: an unknown name
@@ -2026,10 +2036,10 @@ def _recorded_active_ports(store: dict[str, Any], exclude_id: str) -> set[tuple[
 
 def _dedupe_mappings(already_covered: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     """`candidate`'s entries whose (mode, listen) is NOT already present in
-    `already_covered` (Minor E): committed and intent are torn down as two
-    independent teardown_artifacts calls, and when both map the same
-    address the second call must not reissue the off the first already
-    covered — a second off that itself errors would otherwise keep the
+    `already_covered` (Minor E): committed and intent retain independent
+    artifact batches, and when both map the same address the second batch
+    must not reissue the off the first already covered — a second off that
+    itself errors would otherwise keep the
     whole entry and repeat the (harmless but noisy, and retry-blocking)
     duplicate on every re-run. Committed wins (matches _removal_order's own
     committed-over-intent precedence) — the caller passes committed's
@@ -2215,9 +2225,76 @@ def _preflight_teardown_artifacts(artifacts: dict[str, list[Any]],
     return units
 
 
+def _unit_status(path: str, scope: str) -> dict[str, str] | None:
+    """Unknown/failed queries are never evidence that a unit has stopped."""
+    command = (["systemctl", "--user"] if scope == "user"
+               else ["sudo", "systemctl"])
+    command += ["show", os.path.basename(path),
+                "--property=LoadState,ActiveState,MainPID,ControlPID"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        log(f"unit status query for {path} failed: {exc}")
+        return None
+    if result.returncode != 0:
+        log(f"unit status query for {path} failed with exit {result.returncode}")
+        return None
+    state = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if (state.get("LoadState") not in {"loaded", "masked", "not-found"}
+            or not state.get("ActiveState")
+            or (path.endswith(".service")
+                and not all(state.get(key) for key in ("MainPID", "ControlPID")))):
+        log(f"unit status query for {path} returned incomplete or invalid state")
+        return None
+    return state
+
+
+def _unit_is_stopped(path: str, state: dict[str, str]) -> bool:
+    stopped = (state["ActiveState"] == "inactive"
+               and (not path.endswith(".service")
+                    or (state["MainPID"] == "0" and state["ControlPID"] == "0")))
+    if not stopped:
+        log(f"unit {path} is not proven stopped: ActiveState={state['ActiveState']} "
+            f"MainPID={state.get('MainPID', '-')} ControlPID={state.get('ControlPID', '-')}")
+    return stopped
+
+
+def _stop_units(units: list[tuple[str, str]], dry: bool) -> bool:
+    # Stored order is not a dependency order: old records often put a service
+    # before its timer. Stop every activation source (including targets) first.
+    # No disable here: it can unlink linked fragments and implicitly reload.
+    for path, scope in sorted(units, key=lambda unit: unit[0].endswith(".service")):
+        if dry:
+            log(f"[dry] would stop and verify inactive unit {path}")
+            continue
+        if not os.path.lexists(path):
+            state = _unit_status(path, scope)
+            if state is None:
+                return False
+            if state["LoadState"] == "not-found" and _unit_is_stopped(path, state):
+                continue
+        command = (["systemctl", "--user"] if scope == "user"
+                   else ["sudo", "systemctl"]) + ["stop", os.path.basename(path)]
+        if _run_command(command, " ".join(command)) != 0:
+            return False
+        state = _unit_status(path, scope)
+        if state is None or not _unit_is_stopped(path, state):
+            return False
+    # Recheck the whole set immediately before the first destructive operation.
+    # A later stop can have changed a unit we already checked.
+    if not dry:
+        for path, scope in units:
+            state = _unit_status(path, scope)
+            if state is None or not _unit_is_stopped(path, state):
+                return False
+    return True
+
+
 def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
                    *, preflight_scope: str | None = None) -> tuple[bool, str]:
-    """Returns (ok, scope): scope is 'user'/'system' whenever the recorded
+    """Deletion stage, called only after the batch stop barrier.
+
+    Returns (ok, scope): scope is 'user'/'system' whenever the recorded
     path lies under that root (even if already absent — the batch reload in
     teardown_artifacts must still be retryable)."""
     path, scope = _unit_scope(path)
@@ -2233,13 +2310,14 @@ def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
     if dry:
         log(f"[dry] would disable and remove unit {path}")
         return True, scope
-    # A unit file removed while its service still runs can never be stopped
-    # through the record again, so a failed disable keeps the file (and the
-    # record) in place for the retry.
+    # The batch has already proved every unit stopped. Disable only now:
+    # it may itself remove linked fragments. Suppress its implicit reload;
+    # the caller reloads each scope once after all fragment removals.
     if scope == "user":
-        if _run_command(["systemctl", "--user", "disable", "--now", unit_name],
-                        f"systemctl --user disable --now {unit_name}") != 0:
-            log(f"kept {path} so a re-run can retry the disable")
+        if _run_command(["systemctl", "--user", "disable", "--no-reload", unit_name],
+                        f"systemctl --user disable --no-reload {unit_name}") != 0:
+            log(f"disable failed for {path}; no explicit fragment removal attempted "
+                "(disable may already have removed links); record retained for retry")
             return False, scope
         try:
             _remove_plain_path(path, recursive=False)
@@ -2258,12 +2336,16 @@ def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
             log(f"remove {path} failed: {exc}")
             return False, scope
     else:
-        if _run_command(["sudo", "systemctl", "disable", "--now", unit_name],
-                        f"sudo systemctl disable --now {unit_name}") != 0:
-            log(f"kept {path} so a re-run can retry the disable")
+        if _run_command(["sudo", "systemctl", "disable", "--no-reload", unit_name],
+                        f"sudo systemctl disable --no-reload {unit_name}") != 0:
+            log(f"disable failed for {path}; no explicit fragment removal attempted "
+                "(disable may already have removed links); record retained for retry")
             return False, scope
         if _run_command(["sudo", "rm", "-f", path], f"sudo rm {path}") != 0:
             return False, scope
+    if os.path.lexists(path):
+        log(f"unit fragment {path} still exists after removal; record retained for retry")
+        return False, scope
     log(f"removed {path}")
     return True, scope
 
@@ -2324,24 +2406,44 @@ def _teardown_ports(ports: list[int], active_ports: set[tuple[str, int]], dry: b
 def teardown_artifacts(artifacts: dict[str, list[Any]], active_ports: set[tuple[str, int]], dry: bool,
                        mappings: dict[str, Any] | None = None, *,
                        capabilities: list[str] | None) -> bool:
-    # Attempt every artifact (they are independent) and report the aggregate:
-    # any failure means the caller must keep the record, or what is left on
-    # the box would have no record naming it (D6's orphan rule).
-    units = _preflight_teardown_artifacts(artifacts, capabilities)
+    return _teardown_artifact_batches([(artifacts, mappings, capabilities)], active_ports, dry)
+
+
+def _teardown_artifact_batches(batches: list[tuple[dict[str, list[Any]],
+                                                 dict[str, Any] | None,
+                                                 list[str] | None]],
+                               active_ports: set[tuple[str, int]], dry: bool) -> bool:
+    # Authorize each record independently, then stop the UNION before deleting
+    # anything: an interrupted upgrade can split a service and its timer across
+    # committed/intent records with different capability claims.
+    prepared = [(artifacts, mappings, capabilities,
+                 _preflight_teardown_artifacts(artifacts, capabilities))
+                for artifacts, mappings, capabilities in batches]
+    units = list(dict.fromkeys(unit for *_, batch_units in prepared for unit in batch_units))
+    if not _stop_units(units, dry):
+        log("unit stop/verification failed; no disable, artifact removal or reload "
+            "attempted; all fragments and the record are kept for retry")
+        return False
     ok = True
-    scopes: set[str] = set()
-    for path, scope in units:
-        unit_ok, scope = _teardown_unit(path, dry, capabilities,
-                                        preflight_scope=scope)
-        ok = unit_ok and ok
-        scopes.add(scope)
-    ok = _reload_units(scopes, dry) and ok
-    for name in ("fragments", "webroot", "files"):
-        for path in artifacts[name]:
-            ok = _remove_artifact_path(str(path), dry) and ok
-    for path in artifacts["rooted"]:
-        ok = _remove_rooted_artifact_path(str(path), dry, capabilities) and ok
-    ok = _teardown_ports([int(port) for port in artifacts["serve_ports"]], active_ports, dry, mappings) and ok
+    removed: set[str] = set()
+    for _, _, capabilities, batch_units in prepared:
+        for path, scope in batch_units:
+            if path in removed:
+                continue
+            unit_ok, _ = _teardown_unit(path, dry, capabilities, preflight_scope=scope)
+            ok = unit_ok and ok
+            removed.add(path)
+    ok = _reload_units({scope for _, scope in units}, dry) and ok
+    # Once units are stopped, other artifact removals remain independent and
+    # errors are aggregated. Any failure keeps the caller's ledger record.
+    for artifacts, mappings, capabilities, _ in prepared:
+        for name in ("fragments", "webroot", "files"):
+            for path in artifacts[name]:
+                ok = _remove_artifact_path(str(path), dry) and ok
+        for path in artifacts["rooted"]:
+            ok = _remove_rooted_artifact_path(str(path), dry, capabilities) and ok
+        ok = _teardown_ports([int(port) for port in artifacts["serve_ports"]],
+                             active_ports, dry, mappings) and ok
     return ok
 
 
@@ -2471,6 +2573,44 @@ def command_plan(store: dict[str, Any], info: dict[str, Any]) -> int:
     for app_id in refusals:
         log(f"cannot remove {app_id}: no deactivator was recorded; the only exit is bin/airlock-teardown {app_id}")
     return 3 if refusals else 0
+
+
+def command_handoffs(store: dict[str, Any], info: dict[str, Any], app_id: str) -> int:
+    """List removed owners that must yield a resource immediately before app_id.
+
+    This is a read-only projection of the same canonical artifact/port/container
+    claim spaces used by commit. It cannot authorize teardown; remove performs
+    the normal execution-time capability and containment checks afterwards.
+    """
+    packages = _desired_package_map(info)
+    package = packages.get(app_id)
+    if package is None:
+        fail(f"package-info has no configured package {app_id}")
+    candidate = _intent_record(app_id, package, store)
+    candidate_artifacts = _intent_artifacts(candidate)
+    new_paths, new_ports = _record_artifact_sets(candidate_artifacts)
+    new_containers = ((candidate.get("container_runtime") or {}).get("declarations") or [])
+    selected: list[str] = []
+    for other_id, entry in store["entries"].items():
+        if other_id == app_id or other_id in packages:
+            continue
+        record = entry.get("committed") or entry.get("intent")
+        if record is None:
+            continue
+        artifacts = (_committed_artifacts(record) if entry.get("committed") is not None
+                     else _intent_artifacts(record))
+        old_paths, old_ports = _record_artifact_sets(artifacts)
+        old_containers = ((record.get("container_runtime") or {}).get("declarations") or [])
+        paths_overlap = any(_paths_related(left, right)
+                            for left in new_paths for right in old_paths)
+        if (paths_overlap or bool(new_ports & old_ports)
+                or _container_claims_overlap(new_containers, old_containers)):
+            selected.append(other_id)
+    if selected:
+        selected = _removal_order(store, selected)
+    for other_id in selected:
+        print(other_id)
+    return 0
 
 
 def command_intent(store: dict[str, Any], info: dict[str, Any], app_id: str,
@@ -2819,28 +2959,17 @@ def command_remove(store: dict[str, Any], info: dict[str, Any], app_id: str,
 
     if committed["lifecycle"]["deactivate"] and _deactivator_matches(committed, app_id):
         _run_deactivator(committed, app_id, dry)
-        ok = _execute_container_teardown(app_id, committed_container_plan, dry)
-        ok = teardown_artifacts(committed_artifacts, active_ports, dry,
-                                committed["serve_mappings"],
-                                capabilities=committed["capabilities"]) and ok
     else:
         prefix = "[dry] " if dry else ""
         log(f"{prefix}deactivator did not run for {app_id}; tearing down recorded artifacts")
-        ok = _execute_container_teardown(app_id, committed_container_plan, dry)
-        ok = teardown_artifacts(committed_artifacts, active_ports, dry,
-                                committed["serve_mappings"],
-                                capabilities=committed["capabilities"]) and ok
-
+    ok = _execute_container_teardown(app_id, committed_container_plan, dry)
+    batches = [(committed_artifacts, committed["serve_mappings"], committed["capabilities"])]
     if intent is not None and not for_upgrade:
-        # Dedupe against committed (Minor E): the same (mode, listen) an
-        # intent alongside a committed record both name must get exactly
-        # one off, not two independent attempts from two separate calls.
         intent_mappings = _dedupe_mappings(committed["serve_mappings"], intent["serve_mappings"])
         assert intent_artifacts is not None
         ok = _execute_container_teardown(app_id, intent_container_plan, dry) and ok
-        ok = teardown_artifacts(intent_artifacts, active_ports, dry,
-                                intent_mappings,
-                                capabilities=intent["capabilities"]) and ok
+        batches.append((intent_artifacts, intent_mappings, intent["capabilities"]))
+    ok = _teardown_artifact_batches(batches, active_ports, dry) and ok
     if not ok:
         fail(f"removal of {app_id} is incomplete (see above); "
              "ledger record kept so a re-run can retry")
@@ -2871,12 +3000,8 @@ def command_teardown(store: dict[str, Any], info: dict[str, Any], app_id: str,
     dry = is_dry_run()
     active_ports = (parse_active_ports(active_ports_raw, info)
                     | _recorded_active_ports(store, app_id))
-    # Committed and intent are torn down as two SEPARATE calls, each with its
-    # own record's artifacts and capability list (a committed and an intent
-    # record for the same id could in principle disagree on what was
-    # authorized, if the config changed between them) — but the (mode, listen) mapping set is
-    # deduped ACROSS the two calls first (Minor E), or a port both records
-    # name would get offed twice from two independent calls.
+    # Keep each record's capabilities and mapping ownership; the shared unit
+    # stop barrier spans both records before either can delete a fragment.
     committed_artifacts = _committed_artifacts(committed) if committed is not None else None
     intent_artifacts = (_intent_artifacts(intent, for_teardown=True)
                         if intent is not None else None)
@@ -2896,18 +3021,16 @@ def command_teardown(store: dict[str, Any], info: dict[str, Any], app_id: str,
     intent_mappings = (_dedupe_mappings(committed["serve_mappings"], intent["serve_mappings"])
                        if committed is not None and intent is not None
                        else (intent["serve_mappings"] if intent is not None else {}))
+    batches = []
     if committed is not None:
         assert committed_artifacts is not None
         ok = _execute_container_teardown(app_id, committed_container_plan, dry) and ok
-        ok = teardown_artifacts(committed_artifacts, active_ports, dry,
-                                committed["serve_mappings"],
-                                capabilities=committed["capabilities"]) and ok
+        batches.append((committed_artifacts, committed["serve_mappings"], committed["capabilities"]))
     if intent is not None:
         assert intent_artifacts is not None
         ok = _execute_container_teardown(app_id, intent_container_plan, dry) and ok
-        ok = teardown_artifacts(intent_artifacts, active_ports, dry,
-                                intent_mappings,
-                                capabilities=intent["capabilities"]) and ok
+        batches.append((intent_artifacts, intent_mappings, intent["capabilities"]))
+    ok = _teardown_artifact_batches(batches, active_ports, dry) and ok
     if not ok:
         fail(f"teardown of {app_id} is incomplete (see above); "
              "ledger entry kept so a re-run can retry")
@@ -2923,6 +3046,673 @@ def command_teardown(store: dict[str, Any], info: dict[str, Any], app_id: str,
         write_store(_drop_entry(store, app_id))
         log(f"dropped ledger entry {app_id}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Durable install transaction.  The ordinary ledger remains the ownership
+# source of truth; this sidecar only preserves the last committed bytes and
+# runtime state long enough to compensate one installer run.
+
+def transaction_path() -> Path:
+    return state_dir() / TRANSACTION_FILENAME
+
+
+def _transaction_root(transaction_id: str) -> Path:
+    return state_dir() / "install-checkpoints" / transaction_id
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            while True:
+                block = fh.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+    except OSError as exc:
+        fail(f"cannot hash checkpoint {path}: {exc}")
+    return digest.hexdigest()
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    directory = path.parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.is_symlink() or directory.is_symlink():
+            fail(f"refusing redirected transaction path: {path}")
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(value, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, path)
+            temporary = ""
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+    except LedgerError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        fail(f"cannot atomically write transaction {path}: {exc}")
+
+
+def _validate_transaction(value: Any, path: Path) -> dict[str, Any]:
+    fields = {"version", "id", "started_at", "config_sha256", "package_sha256",
+              "phase", "planned", "actions", "touched", "deactivated", "checkpoints",
+              "ledger_snapshot", "error", "restore_results"}
+    if not isinstance(value, dict) or set(value) != fields:
+        fail(f"{path}: invalid transaction shape")
+    if value["version"] != TRANSACTION_VERSION:
+        fail(f"{path}: unsupported transaction version {value['version']!r}")
+    if not re.fullmatch(r"[0-9a-f]{32}", str(value["id"])):
+        fail(f"{path}: invalid transaction id")
+    for key in ("config_sha256", "package_sha256"):
+        if not _is_hex_digest(value[key]):
+            fail(f"{path}: {key} must be a lowercase sha256")
+    if value["phase"] not in TRANSACTION_PHASES:
+        fail(f"{path}: invalid transaction phase {value['phase']!r}")
+    for key in ("planned", "touched", "deactivated"):
+        items = value[key]
+        if (not isinstance(items, list) or len(items) != len(set(items))
+                or any(not isinstance(item, str) or not _ID_RE.fullmatch(item) for item in items)):
+            fail(f"{path}: {key} must be unique package ids")
+    if (not isinstance(value["actions"], dict)
+            or set(value["actions"]) != set(value["planned"])
+            or any(action not in TRANSACTION_ACTIONS for action in value["actions"].values())):
+        fail(f"{path}: actions must map every planned app to a ledger plan action")
+    if not set(value["touched"]).issubset(value["planned"]):
+        fail(f"{path}: touched apps must be planned")
+    if not set(value["deactivated"]).issubset(value["touched"]):
+        fail(f"{path}: deactivated apps must be touched")
+    if not isinstance(value["checkpoints"], dict) or not isinstance(value["restore_results"], dict):
+        fail(f"{path}: checkpoints and restore_results must be objects")
+    if value["phase"] != "committed" and set(value["checkpoints"]) != set(value["planned"]):
+        fail(f"{path}: checkpoints must cover every planned app")
+    if not set(value["restore_results"]).issubset(value["touched"]):
+        fail(f"{path}: restore results must name touched apps")
+    if value["error"] is not None and not isinstance(value["error"], dict):
+        fail(f"{path}: error must be null or an object")
+    snapshot = value["ledger_snapshot"]
+    if (not isinstance(snapshot, dict) or set(snapshot) != {"file", "sha256"}
+            or snapshot["file"] != "ledger.json" or not _is_hex_digest(snapshot["sha256"])):
+        fail(f"{path}: invalid ledger snapshot receipt")
+    return value
+
+
+def load_transaction(*, required: bool = True) -> dict[str, Any] | None:
+    path = transaction_path()
+    if not os.path.lexists(path):
+        if required:
+            fail("no install transaction exists")
+        return None
+    if path.is_symlink() or not path.is_file():
+        fail(f"{path}: transaction must be a regular non-symlink file")
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            value = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{path}: cannot parse transaction: {exc}")
+    return _validate_transaction(value, path)
+
+
+def write_transaction(value: dict[str, Any]) -> None:
+    _validate_transaction(value, transaction_path())
+    _atomic_json(transaction_path(), value)
+
+
+def _transaction_checkpoint_path(tx: dict[str, Any], relative: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", relative) or relative.startswith("/") \
+            or ".." in Path(relative).parts:
+        fail(f"transaction {tx['id']}: unsafe checkpoint path {relative!r}")
+    root = _transaction_root(tx["id"])
+    path = root / relative
+    if root.is_symlink() or _redirected_ancestor(str(path)) is not None:
+        fail(f"transaction {tx['id']}: checkpoint path is redirected")
+    return path
+
+
+def _supported_checkpoint_tree(path: str, *, privileged: bool) -> None:
+    """Reject sockets/devices and unreadable data before the mutation boundary."""
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        try:
+            item_stat = os.lstat(current)
+        except OSError as exc:
+            fail(f"cannot inspect checkpoint artifact {current}: {exc}")
+        mode = item_stat.st_mode
+        if (not privileged and
+                (item_stat.st_uid != os.geteuid()
+                 or item_stat.st_gid not in {os.getegid(), *os.getgroups()})):
+            fail(f"checkpoint metadata for {current} cannot be restored by this user")
+        if stat.S_ISLNK(mode):
+            continue
+        if stat.S_ISREG(mode):
+            if item_stat.st_nlink != 1:
+                fail(f"unsupported hard-linked checkpoint artifact at {current}")
+            try:
+                with open(current, "rb") as fh:
+                    fh.read(1)
+            except OSError as exc:
+                fail(f"checkpoint artifact is unreadable: {current}: {exc}")
+            continue
+        if stat.S_ISDIR(mode):
+            try:
+                with os.scandir(current) as entries:
+                    pending.extend(entry.path for entry in entries)
+            except OSError as exc:
+                fail(f"checkpoint directory is unreadable: {current}: {exc}")
+            continue
+        fail(f"unsupported checkpoint artifact type at {current}; only files, directories, and symlinks are transactional")
+
+
+def _write_checkpoint_archive(source: str, archive: Path, *, privileged: bool) -> str:
+    _supported_checkpoint_tree(source, privileged=privileged)
+    try:
+        archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tarfile.open(archive, "x", format=tarfile.PAX_FORMAT, dereference=False) as bundle:
+            bundle.add(source, arcname="payload", recursive=True)
+        os.chmod(archive, 0o600)
+        with archive.open("rb") as fh:
+            os.fsync(fh.fileno())
+    except (OSError, tarfile.TarError) as exc:
+        try:
+            archive.unlink()
+        except OSError:
+            pass
+        fail(f"cannot create checkpoint archive for {source}: {exc}")
+    return _sha256_file(archive)
+
+
+def _capture_unit_state(path: str, scope: str) -> dict[str, bool]:
+    name = os.path.basename(path)
+    prefix = ["systemctl", "--user"] if scope == "user" else ["sudo", "systemctl"]
+    try:
+        active = subprocess.run(prefix + ["is-active", "--quiet", name], check=False).returncode
+        enabled = subprocess.run(prefix + ["is-enabled", "--quiet", name], check=False).returncode
+    except OSError as exc:
+        fail(f"cannot capture unit state for {name}: {exc}")
+    if active not in (0, 3) or enabled not in (0, 1):
+        fail(f"cannot classify unit state for {name} (active rc={active}, enabled rc={enabled})")
+    return {"active": active == 0, "enabled": enabled == 0}
+
+
+def _checkpoint_record(store: dict[str, Any], app_id: str, action: str, root: Path) -> dict[str, Any]:
+    entry = store["entries"].get(app_id) or {}
+    committed = entry.get("committed")
+    if committed is None:
+        return {"artifacts": [], "units": {}, "mappings": {}}
+    if action == "upgrade-deactivate" and committed.get("container_runtime") is not None:
+        fail(f"container-backed upgrade for {app_id} cannot be losslessly restored; refusing before mutation")
+    artifacts = _committed_artifacts(committed)
+    units = _preflight_teardown_artifacts(artifacts, committed["capabilities"])
+    unit_scope = {path: scope for path, scope in units}
+    captured: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    index = 0
+    for artifact_class in PATH_CLASSES:
+        for path in artifacts[artifact_class]:
+            path = str(path)
+            if path in seen:
+                continue
+            seen.add(path)
+            scope = unit_scope.get(path)
+            item: dict[str, Any] = {"path": path, "class": artifact_class,
+                                    "scope": scope, "existed": os.path.lexists(path),
+                                    "archive": None, "sha256": None}
+            if item["existed"]:
+                relative = f"{app_id}/{index:06d}.tar"
+                archive = root / relative
+                item["archive"] = relative
+                privileged = artifact_class == "rooted" or (artifact_class == "units" and scope == "system")
+                item["sha256"] = _write_checkpoint_archive(path, archive, privileged=privileged)
+            captured.append(item)
+            index += 1
+    states = {os.path.basename(path): {"scope": scope, **_capture_unit_state(path, scope)}
+              for path, scope in units}
+    return {"artifacts": captured, "units": states,
+            "mappings": copy.deepcopy(committed["serve_mappings"])}
+
+
+def _read_ledger_snapshot(tx: dict[str, Any]) -> dict[str, Any]:
+    path = _transaction_checkpoint_path(tx, tx["ledger_snapshot"]["file"])
+    if _sha256_file(path) != tx["ledger_snapshot"]["sha256"]:
+        fail(f"transaction {tx['id']}: ledger checkpoint digest mismatch")
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"transaction {tx['id']}: cannot parse ledger checkpoint: {exc}")
+    return _validate_store(raw, path)
+
+
+def _validate_checkpoint_archives(tx: dict[str, Any]) -> None:
+    saved_store = _read_ledger_snapshot(tx)
+    for app_id, checkpoint in tx["checkpoints"].items():
+        if app_id not in tx["planned"] or not isinstance(checkpoint, dict):
+            fail(f"transaction {tx['id']}: invalid checkpoint owner {app_id!r}")
+        if set(checkpoint) != {"artifacts", "units", "mappings"}:
+            fail(f"transaction {tx['id']}: invalid checkpoint shape for {app_id}")
+        committed = (saved_store["entries"].get(app_id) or {}).get("committed")
+        expected_items: list[tuple[str, str, str | None]] = []
+        expected_units: dict[str, str] = {}
+        expected_mappings: dict[str, Any] = {}
+        if committed is not None:
+            expected_artifacts = _committed_artifacts(committed)
+            expected_unit_pairs = _preflight_teardown_artifacts(
+                expected_artifacts, committed["capabilities"])
+            unit_scope = {path: scope for path, scope in expected_unit_pairs}
+            seen: set[str] = set()
+            for artifact_class in PATH_CLASSES:
+                for path in expected_artifacts[artifact_class]:
+                    if str(path) not in seen:
+                        expected_items.append((str(path), artifact_class, unit_scope.get(str(path))))
+                        seen.add(str(path))
+            expected_units = {os.path.basename(path): scope for path, scope in expected_unit_pairs}
+            expected_mappings = committed["serve_mappings"]
+        actual_items: list[tuple[str, str, str | None]] = []
+        for item in checkpoint["artifacts"]:
+            required = {"path", "class", "scope", "existed", "archive", "sha256"}
+            if not isinstance(item, dict) or set(item) != required:
+                fail(f"transaction {tx['id']}: invalid artifact receipt for {app_id}")
+            if (not isinstance(item["path"], str) or not os.path.isabs(item["path"])
+                    or item["class"] not in PATH_CLASSES
+                    or not isinstance(item["existed"], bool)
+                    or item["scope"] not in (None, "user", "system")):
+                fail(f"transaction {tx['id']}: invalid artifact values for {app_id}")
+            actual_items.append((item["path"], item["class"], item["scope"]))
+            if not item["existed"]:
+                if item["archive"] is not None or item["sha256"] is not None:
+                    fail(f"transaction {tx['id']}: absent artifact has an archive")
+                continue
+            if not isinstance(item["archive"], str) or not _is_hex_digest(item["sha256"]):
+                fail(f"transaction {tx['id']}: invalid archive receipt for {item['path']}")
+            archive = _transaction_checkpoint_path(tx, item["archive"])
+            if _sha256_file(archive) != item["sha256"]:
+                fail(f"transaction {tx['id']}: checkpoint digest mismatch for {item['path']}")
+        if actual_items != expected_items:
+            fail(f"transaction {tx['id']}: artifact inventory differs from saved ledger for {app_id}")
+        if (not isinstance(checkpoint["units"], dict)
+                or set(checkpoint["units"]) != set(expected_units)):
+            fail(f"transaction {tx['id']}: unit inventory differs from saved ledger for {app_id}")
+        for name, state in checkpoint["units"].items():
+            if (not isinstance(state, dict)
+                    or set(state) != {"scope", "active", "enabled"}
+                    or state["scope"] != expected_units[name]
+                    or not isinstance(state["active"], bool)
+                    or not isinstance(state["enabled"], bool)):
+                fail(f"transaction {tx['id']}: invalid unit state for {app_id}/{name}")
+        if checkpoint["mappings"] != expected_mappings:
+            fail(f"transaction {tx['id']}: mappings differ from saved ledger for {app_id}")
+
+
+def command_transaction_begin(specs: list[str]) -> int:
+    actions: dict[str, str] = {}
+    for spec in specs:
+        action, separator, app_id = spec.partition(":")
+        if (not separator or action not in TRANSACTION_ACTIONS
+                or not _ID_RE.fullmatch(app_id) or app_id in actions):
+            fail("transaction-begin requires unique <plan-action>:<package-id> values")
+        actions[app_id] = action
+    app_ids = list(actions)
+    if not app_ids:
+        fail("transaction-begin requires one or more plan actions")
+    for key in ("AIRLOCK_CONFIG_SNAPSHOT_SHA256", "AIRLOCK_INSTALL_PKG_INFO_SHA256"):
+        if not _is_hex_digest(os.environ.get(key)):
+            fail(f"transaction-begin requires {key}=<lowercase sha256>")
+    previous = load_transaction(required=False)
+    if previous is not None and previous["phase"] not in {"committed", "rolled_back"}:
+        fail(f"unfinished transaction {previous['id']} is {previous['phase']}; recover it before starting another")
+    if previous is not None:
+        _remove_transaction_checkpoints(previous)
+    store = load_store()
+    transaction_id = secrets.token_hex(16)
+    checkpoint_parent = state_dir() / "install-checkpoints"
+    root = checkpoint_parent / transaction_id
+    try:
+        if os.path.lexists(checkpoint_parent):
+            if checkpoint_parent.is_symlink() or not checkpoint_parent.is_dir():
+                fail(f"refusing redirected checkpoint directory: {checkpoint_parent}")
+        else:
+            checkpoint_parent.mkdir(mode=0o700)
+        os.chmod(checkpoint_parent, 0o700)
+        root.mkdir(mode=0o700)
+        os.chmod(root, 0o700)
+    except OSError as exc:
+        fail(f"cannot create transaction checkpoint directory {root}: {exc}")
+    try:
+        snapshot_path = root / "ledger.json"
+        _atomic_json(snapshot_path, store)
+        tx = {
+            "version": TRANSACTION_VERSION,
+            "id": transaction_id,
+            "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "config_sha256": os.environ["AIRLOCK_CONFIG_SNAPSHOT_SHA256"],
+            "package_sha256": os.environ["AIRLOCK_INSTALL_PKG_INFO_SHA256"],
+            "phase": "prepared", "planned": app_ids, "actions": actions,
+            "touched": [], "deactivated": [],
+            "checkpoints": {},
+            "ledger_snapshot": {"file": "ledger.json", "sha256": _sha256_file(snapshot_path)},
+            "error": None, "restore_results": {},
+        }
+        for app_id in app_ids:
+            tx["checkpoints"][app_id] = _checkpoint_record(store, app_id, actions[app_id], root)
+        _validate_checkpoint_archives(tx)
+        write_transaction(tx)
+    except BaseException:
+        if not os.path.lexists(transaction_path()):
+            shutil.rmtree(root, ignore_errors=True)
+        raise
+    print(transaction_id)
+    return 0
+
+
+def _transaction_update_list(field: str, app_id: str) -> int:
+    if not _ID_RE.fullmatch(app_id):
+        fail(f"invalid package id: {app_id!r}")
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] in TRANSACTION_TERMINAL_PHASES:
+        fail(f"transaction {tx['id']} is already {tx['phase']}")
+    if app_id not in tx["planned"]:
+        fail(f"transaction {tx['id']} did not plan {app_id}")
+    if app_id not in tx[field]:
+        tx[field].append(app_id)
+    if field == "deactivated" and app_id not in tx["touched"]:
+        tx["touched"].append(app_id)
+    tx["phase"] = "installing"
+    write_transaction(tx)
+    return 0
+
+
+def command_transaction_fail(phase: str, app_id: str) -> int:
+    if not phase or (app_id != "-" and not _ID_RE.fullmatch(app_id)):
+        fail("transaction-fail requires <phase> <package-id|->")
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] in TRANSACTION_TERMINAL_PHASES:
+        fail(f"transaction {tx['id']} is already {tx['phase']}")
+    message = os.environ.get("AIRLOCK_TRANSACTION_ERROR", "installer failed")
+    tx["error"] = {"phase": phase, "app": None if app_id == "-" else app_id,
+                   "message": message[:1000]}
+    write_transaction(tx)
+    return 0
+
+
+def _safe_extract_archive(archive: Path, destination: Path) -> tuple[Path, list[tarfile.TarInfo]]:
+    try:
+        with tarfile.open(archive, "r") as bundle:
+            members = bundle.getmembers()
+            for member in members:
+                parts = Path(member.name).parts
+                if not parts or parts[0] != "payload" or ".." in parts or member.name.startswith("/"):
+                    fail(f"unsafe checkpoint member {member.name!r}")
+                if not (member.isdir() or member.isreg() or member.issym()):
+                    fail(f"unsupported checkpoint member {member.name!r}")
+            for member in sorted((m for m in members if m.isdir()), key=lambda m: len(Path(m.name).parts)):
+                target = destination.joinpath(*Path(member.name).parts)
+                target.mkdir(parents=True, exist_ok=True)
+            for member in (m for m in members if m.isreg()):
+                target = destination.joinpath(*Path(member.name).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = bundle.extractfile(member)
+                if source is None:
+                    fail(f"cannot read checkpoint member {member.name!r}")
+                with source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+                os.chmod(target, stat.S_IMODE(member.mode))
+            for member in (m for m in members if m.issym()):
+                target = destination.joinpath(*Path(member.name).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(member.linkname, target)
+            for member in sorted((m for m in members if m.isdir()),
+                                 key=lambda m: len(Path(m.name).parts), reverse=True):
+                os.chmod(destination.joinpath(*Path(member.name).parts), stat.S_IMODE(member.mode))
+    except LedgerError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        fail(f"cannot extract checkpoint {archive}: {exc}")
+    return destination / "payload", members
+
+
+def _restore_archive_item(tx: dict[str, Any], item: dict[str, Any]) -> None:
+    path = item["path"]
+    if not item["existed"]:
+        return
+    archive = _transaction_checkpoint_path(tx, item["archive"])
+    if _sha256_file(archive) != item["sha256"]:
+        fail(f"checkpoint digest mismatch for {path}")
+    temporary = Path(tempfile.mkdtemp(prefix="restore.", dir=archive.parent))
+    try:
+        payload, members = _safe_extract_archive(archive, temporary)
+        privileged = item["class"] == "rooted" or (item["class"] == "units" and item["scope"] == "system")
+        if privileged:
+            if _run_command(["sudo", "rm", "-rf", "--", path], f"sudo rm -rf -- {path}") != 0:
+                fail(f"cannot clear restore target {path}")
+            if _run_command(["sudo", "mkdir", "-p", os.path.dirname(path)],
+                            f"sudo mkdir -p {os.path.dirname(path)}") != 0:
+                fail(f"cannot create restore parent for {path}")
+            if _run_command(["sudo", "cp", "-a", "--", str(payload), path],
+                            f"sudo cp -a -- checkpoint {path}") != 0:
+                fail(f"cannot restore {path}")
+        else:
+            refusal = _plain_artifact_refusal(path)
+            if refusal is not None:
+                fail(refusal)
+            if os.path.lexists(path):
+                _remove_plain_path(path, recursive=True)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            if payload.is_symlink():
+                os.symlink(os.readlink(payload), path)
+            elif payload.is_dir():
+                shutil.copytree(payload, path, symlinks=True, copy_function=shutil.copy2)
+            else:
+                shutil.copy2(payload, path, follow_symlinks=False)
+        for member in members:
+            relative = Path(member.name).parts[1:]
+            target = os.path.join(path, *relative) if relative else path
+            owner = f"{member.uid}:{member.gid}"
+            if privileged:
+                if _run_command(["sudo", "chown", "-h", owner, target],
+                                f"sudo chown -h {owner} {target}") != 0:
+                    fail(f"cannot restore owner for {target}")
+                if not member.issym() and _run_command(
+                        ["sudo", "chmod", f"{stat.S_IMODE(member.mode):o}", target],
+                        f"sudo chmod {stat.S_IMODE(member.mode):o} {target}") != 0:
+                    fail(f"cannot restore mode for {target}")
+            else:
+                try:
+                    os.chown(target, member.uid, member.gid, follow_symlinks=False)
+                    if not member.issym():
+                        os.chmod(target, stat.S_IMODE(member.mode))
+                except OSError as exc:
+                    fail(f"cannot restore metadata for {target}: {exc}")
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _restore_unit_states(checkpoint: dict[str, Any]) -> bool:
+    ok = True
+    scopes = {state["scope"] for state in checkpoint["units"].values()}
+    for scope in sorted(scopes):
+        args = ["systemctl", "--user", "daemon-reload"] if scope == "user" \
+            else ["sudo", "systemctl", "daemon-reload"]
+        ok = _run_command(args, " ".join(args)) == 0 and ok
+    for name, state in checkpoint["units"].items():
+        prefix = ["systemctl", "--user"] if state["scope"] == "user" else ["sudo", "systemctl"]
+        enable = "enable" if state["enabled"] else "disable"
+        active = "start" if state["active"] else "stop"
+        ok = _run_command(prefix + [enable, name], f"restore {enable} {name}") == 0 and ok
+        ok = _run_command(prefix + [active, name], f"restore {active} {name}") == 0 and ok
+    return ok
+
+
+def _restore_mappings(checkpoint: dict[str, Any]) -> bool:
+    ok = True
+    for mapping in checkpoint["mappings"].values():
+        target = f"http://127.0.0.1:{mapping['target']}"
+        args = ["sudo", "tailscale", "serve", "--bg",
+                f"--{mapping['mode']}={mapping['listen']}", target]
+        ok = _run_command(args, "restore " + " ".join(args[1:])) == 0 and ok
+    return ok
+
+
+def _committed_container_runtime_is_intact(app_id: str, record: dict[str, Any]) -> bool:
+    runtime = record.get("container_runtime")
+    if runtime is None:
+        return True
+    if _docker_daemon_identity() != runtime["daemon_identity"]:
+        return False
+    expected = {obj["id"] for obj in runtime["objects"]}
+    actual = {obj["id"] for obj in _enumerate_containers()
+              if obj["labels"].get(_PACKAGE_LABEL) == app_id
+              and obj["labels"].get(_NONCE_LABEL) == runtime["install_nonce"]}
+    return actual == expected
+
+
+def command_transaction_restore() -> int:
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] == "rolled_back":
+        return 0
+    if tx["phase"] == "committed":
+        fail(f"transaction {tx['id']} is committed and cannot be restored")
+    try:
+        _validate_checkpoint_archives(tx)
+        saved_store = _read_ledger_snapshot(tx)
+    except LedgerError as exc:
+        tx["phase"] = "degraded"
+        if tx["error"] is None:
+            tx["error"] = {"phase": "restore-verify", "app": None,
+                           "message": str(exc)[:1000]}
+        else:
+            # Preserve the first installer failure and add the independent
+            # recovery failure beside it; one must never overwrite the other.
+            tx["error"]["restore_message"] = str(exc)[:1000]
+        write_transaction(tx)
+        log(f"transaction {tx['id']} degraded before restore: {exc}")
+        return 1
+    # Re-run the existing ledger's containment gates against today's roots
+    # before removing or restoring a single path.
+    for app_id in tx["touched"]:
+        saved = (saved_store["entries"].get(app_id) or {}).get("committed")
+        if saved is not None:
+            artifacts = _committed_artifacts(saved)
+            _preflight_teardown_artifacts(artifacts, saved["capabilities"])
+    tx["phase"] = "rolling_back"
+    write_transaction(tx)
+    all_ok = True
+    for app_id in reversed(tx["touched"]):
+        result = {"status": "restoring", "error": None}
+        tx["restore_results"][app_id] = result
+        write_transaction(tx)
+        try:
+            current = load_store()
+            saved_entry = saved_store["entries"].get(app_id)
+            unchanged_committed = (app_id not in tx["deactivated"]
+                                   and saved_entry is not None
+                                   and current["entries"].get(app_id) == saved_entry)
+            saved_committed = (saved_entry or {}).get("committed")
+            if (app_id in tx["deactivated"] and saved_committed is not None
+                    and saved_committed.get("container_runtime") is not None):
+                if (current["entries"].get(app_id) == saved_entry
+                        and _committed_container_runtime_is_intact(app_id, saved_committed)):
+                    unchanged_committed = True
+                else:
+                    fail("committed container runtime changed and has no lossless checkpoint; manual recovery required")
+            if current["entries"].get(app_id) and not unchanged_committed:
+                command_teardown(current, {}, app_id, None)
+            checkpoint = tx["checkpoints"].get(app_id) or {"artifacts": [], "units": {}, "mappings": {}}
+            if not unchanged_committed:
+                for item in checkpoint["artifacts"]:
+                    _restore_archive_item(tx, item)
+            current = load_store()
+            restored = copy.deepcopy(current)
+            if saved_entry is not None:
+                restored["entries"][app_id] = copy.deepcopy(saved_entry)
+            else:
+                restored["entries"].pop(app_id, None)
+            write_store(restored, require_directory_sync=True)
+            if (not unchanged_committed and
+                    (not _restore_unit_states(checkpoint) or not _restore_mappings(checkpoint))):
+                fail("unit or serve mapping restoration failed")
+            result["status"] = "restored"
+        except (LedgerError, OSError) as exc:
+            result["status"] = "failed"
+            result["error"] = str(exc)[:1000]
+            all_ok = False
+            log(f"restore failed for {app_id}: {exc}")
+        write_transaction(tx)
+    tx["phase"] = "rolled_back" if all_ok else "degraded"
+    write_transaction(tx)
+    log(f"transaction {tx['id']} {tx['phase']}")
+    return 0 if all_ok else 1
+
+
+def _remove_transaction_checkpoints(tx: dict[str, Any]) -> None:
+    root = _transaction_root(tx["id"])
+    parent = state_dir() / "install-checkpoints"
+    if root.parent != parent or root.name != tx["id"] or root.is_symlink():
+        fail(f"refusing unsafe checkpoint cleanup path {root}")
+    if root.exists():
+        shutil.rmtree(root)
+
+
+def command_transaction_finish(phase: str) -> int:
+    if phase != "committed":
+        fail("transaction-finish accepts only committed; rollback is decided by transaction-restore")
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] in TRANSACTION_TERMINAL_PHASES:
+        fail(f"transaction {tx['id']} is already {tx['phase']}")
+    tx["phase"] = "committed"
+    write_transaction(tx)
+    try:
+        _remove_transaction_checkpoints(tx)
+    except (LedgerError, OSError) as exc:
+        # The durable terminal decision is already made. Checkpoint cleanup is
+        # a space warning, never a reason to lie that a committed install must
+        # be rolled back.
+        log(f"warning: committed transaction checkpoint cleanup failed: {exc}")
+    log(f"transaction {tx['id']} committed")
+    return 0
+
+
+def command_transaction_show() -> int:
+    tx = load_transaction(required=False)
+    if tx is None:
+        return 0
+    print(json.dumps(tx, sort_keys=True))
+    return 0
+
+
+def transaction_cli(argv: list[str]) -> int:
+    command = argv[0]
+    if command == "transaction-begin":
+        return command_transaction_begin(argv[1:])
+    if command in {"transaction-touch", "transaction-deactivated"} and len(argv) == 2:
+        return _transaction_update_list("touched" if command.endswith("touch") else "deactivated", argv[1])
+    if command == "transaction-fail" and len(argv) == 3:
+        return command_transaction_fail(argv[1], argv[2])
+    if command == "transaction-restore" and len(argv) == 1:
+        return command_transaction_restore()
+    if command == "transaction-finish" and len(argv) == 2:
+        return command_transaction_finish(argv[1])
+    if command == "transaction-show" and len(argv) == 1:
+        return command_transaction_show()
+    fail("usage: airlock-ledger transaction-{begin|touch|deactivated|fail|restore|finish|show} ...")
 
 
 def command_list(store: dict[str, Any]) -> int:
@@ -3000,9 +3790,9 @@ def command_audit_lock_override(store: dict[str, Any], info: dict[str, Any],
 def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
     if not argv:
         fail("usage: airlock-ledger "
-             "{plan|intent|commit|remove|teardown|list|audit-lock-override} ...")
+             "{plan|handoffs|intent|commit|preflight-remove|remove|teardown|list|audit-lock-override} ...")
     command = argv[0]
-    if command not in {"plan", "intent", "commit", "remove", "teardown", "list",
+    if command not in {"plan", "handoffs", "intent", "commit", "preflight-remove", "remove", "teardown", "list",
                        "audit-lock-override"}:
         fail(f"unknown subcommand: {command}")
     positional: list[str] = []
@@ -3012,8 +3802,8 @@ def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
     while index < len(argv):
         argument = argv[index]
         if argument == "--for-upgrade":
-            if command != "remove" or for_upgrade:
-                fail("--for-upgrade is only accepted once by remove")
+            if command not in {"remove", "preflight-remove"} or for_upgrade:
+                fail("--for-upgrade is only accepted once by remove/preflight-remove")
             for_upgrade = True
         elif argument == "--active-ports":
             if active_ports is not None or index + 1 >= len(argv):
@@ -3030,7 +3820,8 @@ def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
             positional.append(argument)
         index += 1
 
-    expected = {"plan": 0, "list": 0, "intent": 1, "commit": 1, "remove": 1,
+    expected = {"plan": 0, "list": 0, "handoffs": 1, "intent": 1, "commit": 1,
+                "preflight-remove": 1, "remove": 1,
                 "teardown": 1, "audit-lock-override": 1}[command]
     if len(positional) != expected:
         fail(f"usage: airlock-ledger {command}"
@@ -3039,15 +3830,30 @@ def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    command, app_id, for_upgrade, active_ports = parse_cli(list(sys.argv[1:] if argv is None else argv))
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0].startswith("transaction-"):
+        return transaction_cli(raw_argv)
+    command, app_id, for_upgrade, active_ports = parse_cli(raw_argv)
     store = load_store()
     info = read_package_info()
     if command == "plan":
         return command_plan(store, info)
+    if command == "handoffs":
+        return command_handoffs(store, info, app_id or "")
     if command == "intent":
         return command_intent(store, info, app_id or "", active_ports)
     if command == "commit":
         return command_commit(store, info, app_id or "", active_ports)
+    if command == "preflight-remove":
+        previous_dry = os.environ.get("AIRLOCK_DRY_RUN")
+        os.environ["AIRLOCK_DRY_RUN"] = "1"
+        try:
+            return command_remove(store, info, app_id or "", for_upgrade, active_ports)
+        finally:
+            if previous_dry is None:
+                os.environ.pop("AIRLOCK_DRY_RUN", None)
+            else:
+                os.environ["AIRLOCK_DRY_RUN"] = previous_dry
     if command == "remove":
         return command_remove(store, info, app_id or "", for_upgrade, active_ports)
     if command == "teardown":

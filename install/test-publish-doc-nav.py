@@ -105,10 +105,20 @@ def main(argv):
     check("전용 문서 포트 블록을 소스에서 찾는다", dedicated is not None)
     if dedicated:
         body = dedicated.group(1)
-        check("전용 포트의 문서에도 주입한다",
-              body.count(DEDICATED_TAG) == 2, str(body.count(DEDICATED_TAG)))
+        check("전용 포트의 문서와 실시간 루트 목록에도 주입한다",
+              body.count(DEDICATED_TAG) == 3, str(body.count(DEDICATED_TAG)))
         check("전용 포트가 위젯 자체를 서빙한다 — 안 그러면 주입은 404 를 가리킨다",
               "location = /airlock-return.js" in body)
+        root_listing = block(body, "location = /")
+        ordinary_docs = block(body, "location /")
+        check("전용 포트 루트는 남은 legacy index.html 대신 실시간 목록을 연다",
+              root_listing is not None
+              and "autoindex on" in root_listing
+              and "index .airlock-live-directory-index" in root_listing
+              and DEDICATED_TAG in root_listing)
+        check("하위 문서 번들의 index.html 동작은 막지 않는다",
+              ordinary_docs is not None
+              and ".airlock-live-directory-index" not in ordinary_docs)
 
     # --- 4. the duplicate must not come back ------------------------------
     dup = os.path.join(root, "apps/publish/frontend/doc-nav.js")

@@ -60,7 +60,7 @@ accepts() {  # accepts <case> <script-body> <what> [ext]
   local r; r="$(scan "$1" "${4-.sh}" "$2")"
   # rc AND the gate's ok line naming a non-zero file count, so "accepted" can
   # never mean "scanned nothing".
-  if grep -q '^rc=0$' <<<"$r" && grep -qE '^ok check-app-abi: [1-9][0-9]* shell file' <<<"$r"; then
+  if grep -q '^rc=0$' <<<"$r" && grep -qE '^ok check-app-abi: [1-9][0-9]* runtime source file' <<<"$r"; then
     ok "accepts $3"
   else
     bad "refused $3 — or the fixture never ran: $(tr '\n' ' ' <<<"$r")"
@@ -212,6 +212,36 @@ refuses ev_othervar '#!/bin/bash
 PLAT="${AIRLOCK_ROOT:?}"
 python3 "$PLAT/bin/airlock-config" get x' 'a platform internal read through a differently-named variable'
 
+# Runtime backends are handed app-specific values by their rendered unit. A
+# backend consuming AIRLOCK_ROOT would create the same package/platform coupling
+# as a shell installer deriving it, so the non-shell half of the gate refuses it.
+refuses python_platform 'import os
+root = os.environ["AIRLOCK_ROOT"]' \
+  'a Python runtime backend consuming the shell-only platform root' '.py'
+
+refuses python_platform_multiline 'import os
+root = os.environ.get(
+    "AIRLOCK_ROOT"
+)' 'a multiline Python environment read of the shell-only platform root' '.py'
+
+refuses python_platform_alias 'import os
+env = os.environ
+root = env["AIRLOCK_ROOT"]' \
+  'an aliased Python environment read of the shell-only platform root' '.py'
+
+refuses python_write_and_read_same_line 'import os
+env = {"AIRLOCK_ROOT": os.environ["AIRLOCK_ROOT"]}' \
+  'a forbidden environment read beside an allowed child-environment key' '.py'
+
+refuses python_noext '#!/usr/bin/env python3
+import os
+root = os.getenv("AIRLOCK_ROOT")' \
+  'an extensionless Python runtime consuming the shell-only platform root' ''
+
+refuses node_noext '#!/usr/bin/env node
+const root = process.env.AIRLOCK_ROOT;' \
+  'an extensionless Node runtime consuming the shell-only platform root' ''
+
 # ---------------------------------------------------------- negative controls
 # The ABI itself must not be flagged, or the gate is unusable and gets disabled.
 accepts abi '#!/usr/bin/env bash
@@ -222,6 +252,15 @@ AIRLOCK_APP_ID="${AIRLOCK_APP_ID:?}"
 . "$ROOT/gate/nginx-lib.sh"
 . "$HERE/render.sh"
 python3 "$HERE/backend/thing.py"' 'the D5 ABI itself (lib.sh, gate/, AIRLOCK_APP_DIR)'
+
+accepts python_app_env 'import os
+domain = os.environ["AIRLOCK_SLACK_UNFURL_DOMAIN"]' \
+  'a Python runtime backend consuming only app-specific environment' '.py'
+
+accepts python_fixture_write 'import os
+env = os.environ.copy()
+env.update({"AIRLOCK_ROOT": "/tmp/fake"})' \
+  'a Python test passing the ABI root to lifecycle shell without consuming it' '.py'
 
 # Climbing WITHIN the package is self-location too, and must be accepted. This is
 # apps/orca/bin/verify-web-bundle.sh's real shape — it steps from bin/ up to the
@@ -275,9 +314,9 @@ live="$(bash "$GATE" 2>&1)"; live_rc=$?
 [ "$live_rc" = 0 ] \
   && ok "the shipped apps/ tree passes" \
   || bad "the shipped apps/ tree fails: $live"
-n="$(printf '%s' "$live" | sed -n 's/^ok check-app-abi: \([0-9]*\) shell file.*/\1/p')"
+n="$(printf '%s' "$live" | sed -n 's/^ok check-app-abi: \([0-9]*\) runtime source file.*/\1/p')"
 { [ -n "$n" ] && [ "$n" -ge 30 ]; } \
-  && ok "the scan really read the tree ($n shell files, not an empty set)" \
+  && ok "the scan really read the tree ($n runtime source files, not an empty set)" \
   || bad "the scan reported an implausible file count: ${n:-<none>}"
 
 # An empty directory is an error, not a pass — the shape a --dir typo takes.
@@ -288,23 +327,15 @@ mkdir -p "$FIX/empty"; bash "$GATE" --dir "$FIX/empty" >/dev/null 2>&1; rc2=$?
   || bad "empty scan did not error (missing rc=$rc, empty rc=$rc2)"
 
 # ---------------------------------------------------------- the gate's scope
-# The gate reads *.sh. That is only sufficient while non-shell app files do not
-# reach the platform tree, which was measured true when it was written — assert
-# it, so the day a backend starts reading AIRLOCK_ROOT the gate gets widened on
-# purpose instead of silently covering less than it claims.
-nonshell="$(grep -rlE 'AIRLOCK_ROOT|/install/lib\.sh' "$ROOT/apps" \
-  --include='*.py' --include='*.mjs' --include='*.js' --include='*.cjs' 2>/dev/null \
-  | grep -v '/patches/' | grep -v '/node_modules/' || true)"
-[ -z "$nonshell" ] \
-  && ok "no non-shell app file reaches the platform tree (the *.sh scope still covers everything)" \
-  || bad "non-shell app files now reach the platform tree — widen check-app-abi.sh to cover them: $nonshell"
-
-# And the control for that control: the pattern must be able to find something.
-probe="$FIX/scope-probe"; mkdir -p "$probe/pkg"
-printf 'import os\nr = os.environ["AIRLOCK_ROOT"]\n' > "$probe/pkg/backend.py"
-[ -n "$(grep -rlE 'AIRLOCK_ROOT|/install/lib\.sh' "$probe" --include='*.py' 2>/dev/null)" ] \
-  && ok "the non-shell scope probe is capable of finding a hit (positive control)" \
-  || bad "the non-shell scope probe found nothing in a file that plainly matches"
+# Test modules may construct a fake platform to execute a lifecycle script. Pin
+# that read/write distinction without excluding their filenames from the scan.
+probe="$FIX/test-scope/pkg"; mkdir -p "$probe"
+printf 'domain = "example.test"\n' > "$probe/backend.py"
+printf 'import os\nenv = {"AIRLOCK_ROOT": "/tmp/fake"}\n' > "$probe/test-installer.py"
+probe_out="$(bash "$GATE" --dir "$FIX/test-scope" 2>&1)"; probe_rc=$?
+{ [ "$probe_rc" = 0 ] && grep -q '2 runtime source file(s)' <<<"$probe_out"; } \
+  && ok "test fixture environment writes are allowed and the test module is still scanned" \
+  || bad "test fixture read/write scope distinction failed: $probe_out"
 
 # CI has to run this, or none of the above is load-bearing.
 # Matched as an executable `run:` line, not as a substring: the comments above

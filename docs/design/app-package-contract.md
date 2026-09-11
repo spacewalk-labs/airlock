@@ -121,6 +121,17 @@ only key `[packages.X]` accepts; anything else is a validation error, which is
 what keeps the git-source rejection enforced rather than aspirational. Package
 id, manifest id, `[apps.X]`, and `[packages.X]` must agree exactly.
 
+**2026-09-10 managed-store clarification.** This local package rule remains unchanged. An
+organisation app store does not add a remote source key and the box never fetches package source.
+The release side resolves reviewed sources and publishes a digest-bound composite; the box consumes
+that immutable release through the updater. Its resolver adds a third
+`source_class = managed`: it is authenticated by the box owner's organisation enrollment rather
+than an operator-written path, but inherits the `explicit` class's capability restrictions and
+dry-run prohibition. It never receives `shipped` first-party privilege. Requested grants are bounded
+by the locally stored enrollment ceiling; `rooted-artifact` still requires an explicit per-app local
+owner grant. See
+[`managed-app-store.md`](managed-app-store.md).
+
 Shadowing substitutes an id, not a capability: dependencies are id-level (D3),
 so an operator who shadows `publish` with a package lacking the upload API their
 `notepad` calls (`apps/notepad/frontend/notepad.html:247,298`) owns that
@@ -135,7 +146,8 @@ manifest, resolved implicitly for any configured `[apps.<id>]`; an explicit
 consumer — trust is a property of the source and must be visible, not
 inferred (dry-run execution and the `rooted` artifact class key on it, and
 OQ2's possible non-built-in hub labelling would too — OQ2 itself stays
-open). Operators add no lines for shipped
+open). The managed updater extends that closed set with the `managed` class specified above; ordinary
+local config cannot mint it. Operators add no lines for shipped
 apps; every existing `airlock.toml` keeps working across the flip.
 
 ### D2 — One manifest per app, static and local
@@ -269,8 +281,10 @@ splitting `APP_DEFAULTS`'s two roles while keeping typo detection fail-closed.
 Amended in child 3: the manifest and all three lifecycle scripts must be
 regular non-symlink files (`lstat`-checked) — the D6 digest records only a
 symlink's *target string*, so a symlinked manifest or script could change
-behind an unchanged digest. No remote catalog, ever: the CasaOS store outages
-traced to its live catalog API are the counterexample.
+behind an unchanged digest. No live catalog in the install path: the CasaOS store outages traced to
+its live catalog API are the counterexample. A managed app-store UI may read the last verified
+catalog snapshot, but installation authority is the immutable release lock and already-installed
+apps do not depend on catalog reachability.
 
 `[artifacts]` patterns are validated for **disjointness against every other
 claim on the box**: the other configured packages *and* every ledger or journal
@@ -434,6 +448,11 @@ is what keeps the dry integration suite meaningful across the flip; an
 explicit package's scripts are never executed on a dry run, migrated or not.
 SECURITY.md carries this boundary in its package-trust section (F13 gates on
 the section existing).
+
+**2026-09-10 managed-store extension.** A managed package is the owner's bounded trust grant to an
+enrolled organisation publisher. It follows explicit-package restrictions, including no lifecycle
+execution during dry run and no remotely conferred `rooted` authority. The signed snapshot supplies
+identity and provenance; it does not promote third-party code to shipped code.
 
 ### D5 — Lifecycle is three scripts with an objective requirement matrix
 
@@ -1255,10 +1274,10 @@ the shipped apps.
   a later child or keep app-written fragments indefinitely?
 - **OQ2** Should the hub visually label non-built-in packages (Umbrel's
   community badge), or is the operator's explicit config line enough?
-- **OQ3** Version/update surface: packages are paths, so "update" is "stage a
-  new path and re-run". The ledger records a content digest per install — is
-  that enough history, or do we want an explicit lockfile at this layer too? (A
-  release layer composing Airlock + packages keeps its own lock regardless.)
+- **OQ3 — decided 2026-09-10.** A local package remains "stage a new path and re-run". Public and
+  organisation catalogs update through an immutable composite release with an explicit lock. The
+  organisation catalog, policy, multi-box distribution and evidence are the paid fleet surface; see
+  [`managed-app-store.md`](managed-app-store.md).
 - **OQ4** — *decided 2026-08-01: deferred.* Only the owner installs packages in
   phase 1. Personal apps (D7's third audience class — an app a named
   collaborator installs for themselves) stay out of the contract until designed

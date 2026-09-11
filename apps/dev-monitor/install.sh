@@ -25,6 +25,8 @@ AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-dev-monitor}"
 . "$ROOT/install/lib.sh"
 # shellcheck source=/dev/null
 . "$HERE/render.sh"
+# shellcheck source=/dev/null
+. "$HERE/secret-check.sh"
 
 require_cmd python3 systemctl journalctl realpath
 
@@ -32,19 +34,10 @@ airlock_load dev-monitor
 BACKEND_PORT="${AIRLOCK_DEV_MONITOR_BACKEND_PORT:?}"
 MESSAGES="${AIRLOCK_DEV_MONITOR_MESSAGES:-false}"
 SLACK_WEBHOOK_URGENT_ENV="${AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT_ENV:-}"
-SLACK_WEBHOOK_ROUTINE_ENV="${AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE_ENV:-}"
-SLACK_WEBHOOK_ENV="${AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ENV:-}"
 EXEC_CWD_ROOT="${AIRLOCK_DEV_MONITOR_EXEC_CWD_ROOT:-}"
 EXEC_SESSION="${AIRLOCK_DEV_MONITOR_EXEC_SESSION:-devmon-exec}"
 SPOOL_WRITER_USER="${AIRLOCK_DEV_MONITOR_SPOOL_WRITER_USER:-airlock-dev-monitor-writer}"
 SPOOL_WRITER_GROUP="${AIRLOCK_DEV_MONITOR_SPOOL_WRITER_GROUP:-airlock-dev-monitor-writers}"
-SMTP_HOST="${AIRLOCK_DEV_MONITOR_SMTP_HOST:-}"
-SMTP_PORT="${AIRLOCK_DEV_MONITOR_SMTP_PORT:-}"
-SMTP_FROM="${AIRLOCK_DEV_MONITOR_SMTP_FROM:-}"
-SMTP_TO="${AIRLOCK_DEV_MONITOR_SMTP_TO:-}"
-SMTP_USER="${AIRLOCK_DEV_MONITOR_SMTP_USER:-}"
-SMTP_PASSWORD_ENV="${AIRLOCK_DEV_MONITOR_SMTP_PASSWORD_ENV:-}"
-ROSTER_PATH="${AIRLOCK_DEV_MONITOR_ROSTER_PATH:-}"
 TOKEN_FRESHNESS="${AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS:-false}"
 TOKEN_WARN_HOURS="${AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_WARN_HOURS:-24}"
 TOKEN_STALE_HOURS="${AIRLOCK_DEV_MONITOR_TOKEN_FRESHNESS_STALE_HOURS:-24}"
@@ -106,11 +99,15 @@ esac
   || die "AIRLOCK_AGENT_BIN does not name a readable platform file"
 AGENT_BIN="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
   "$AIRLOCK_AGENT_BIN")"
-# Optional cutover bridge for existing producers/watchdogs. There is deliberately no
-# default: a public installer must not guess a box-specific legacy path. The operator names
-# the path in deployment config, and the generated file contains only four compatibility
-# values. Keeping it in config also makes disable/reinstall update the same owned file.
-COMPAT_ENV="${AIRLOCK_DEV_MONITOR_COMPAT_ENV_PATH:-}"
+# The orchestrator resolves AIRLOCK_CONFIG to the absolute operator pathname before
+# invoking any package installer. Persist that origin for the long-lived backend: its
+# cwd is the app directory, where airlock-config's fallback search can otherwise select
+# the repository's own airlock.toml. Never persist AIRLOCK_CONFIG_SNAPSHOT or its digest;
+# those pin one installer run and would make the service read stale bytes forever.
+case "${AIRLOCK_CONFIG:-}" in
+  /*) AIRLOCK_CONFIG_PATH="$AIRLOCK_CONFIG" ;;
+  *) die "AIRLOCK_CONFIG must be the absolute original config path" ;;
+esac
 CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
 WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
 IDENTITY_HEADER="${AIRLOCK_IDENTITY_HEADER:?}"
@@ -123,37 +120,55 @@ case "$IDENTITY_HEADER" in
 esac
 # Same reasoning one level down: these values feed a systemd EnvironmentFile,
 # where a newline would inject additional environment entries.
-for _v in "$EXEC_CWD_ROOT" "$EXEC_SESSION" "$SLACK_WEBHOOK_URGENT_ENV" \
-          "$SLACK_WEBHOOK_ROUTINE_ENV" "$SLACK_WEBHOOK_ENV" \
-          "$SMTP_HOST" "$SMTP_PORT" "$SMTP_FROM" "$SMTP_TO" "$SMTP_USER" \
-          "$SMTP_PASSWORD_ENV" "$ROSTER_PATH" "$COMPAT_ENV"; do
+for _v in "$EXEC_CWD_ROOT" "$EXEC_SESSION" "$SLACK_WEBHOOK_URGENT_ENV"; do
   case "$_v" in *[$'\n\r']*) die "config values must not contain newlines" ;; esac
 done
-case "$COMPAT_ENV" in
-  "") ;;
-  /*) ;;
-  *) die "AIRLOCK_DEV_MONITOR_COMPAT_ENV_PATH must be an absolute path" ;;
-esac
 # Precedence treats surrounding whitespace as unset, matching the documented table.
 trim_config_value() {
   python3 -c 'import sys; print(sys.argv[1].strip(), end="")' "$1"
 }
 SLACK_WEBHOOK_URGENT_ENV="$(trim_config_value "$SLACK_WEBHOOK_URGENT_ENV")"
-SLACK_WEBHOOK_ROUTINE_ENV="$(trim_config_value "$SLACK_WEBHOOK_ROUTINE_ENV")"
-SLACK_WEBHOOK_ENV="$(trim_config_value "$SLACK_WEBHOOK_ENV")"
-SMTP_HOST="$(trim_config_value "$SMTP_HOST")"
-SMTP_PORT="$(trim_config_value "$SMTP_PORT")"
-SMTP_FROM="$(trim_config_value "$SMTP_FROM")"
-SMTP_TO="$(trim_config_value "$SMTP_TO")"
-SMTP_USER="$(trim_config_value "$SMTP_USER")"
-SMTP_PASSWORD_ENV="$(trim_config_value "$SMTP_PASSWORD_ENV")"
-ROSTER_PATH="$(trim_config_value "$ROSTER_PATH")"
 OWNER="${AIRLOCK_OWNER:?}"
 UNIT_DIR="$HOME/.config/systemd/user"
 DEVMON_STATE="$HOME/.local/state/airlock/dev-monitor"
 DEVMON_ENV="$HOME/.config/airlock/dev-monitor.env"
+DEVMON_SECRETS="$HOME/.config/airlock/dev-monitor-secrets.env"
+SLACK_WEBHOOK_NAME="$SLACK_WEBHOOK_URGENT_ENV"
+render_dev_monitor_check_secret_names "$SLACK_WEBHOOK_NAME" || exit 1
+# This optional file is loaded by the service even without selected credentials
+# or messages. Existing files always cross the same ownership/mode boundary.
+if [ -e "$DEVMON_SECRETS" ] || [ -L "$DEVMON_SECRETS" ]; then
+  [ -f "$DEVMON_SECRETS" ] && [ ! -L "$DEVMON_SECRETS" ] \
+    || die "dev-monitor-secrets.env must exist as a regular file (not a symlink)"
+  [ "$(stat -c %u "$DEVMON_SECRETS")" = "$(id -u)" ] \
+    || die "dev-monitor-secrets.env must be owned by the installing user"
+  [ "$(stat -c %a "$DEVMON_SECRETS")" = 600 ] \
+    || die "dev-monitor-secrets.env must have mode 0600"
+fi
+secret_check_args=(--file "$DEVMON_SECRETS")
+for secret_name in "$SLACK_WEBHOOK_NAME"; do
+  [ -n "$secret_name" ] || continue
+  secret_check_args+=(--allow "$secret_name")
+done
+if [ "$MESSAGES" = true ]; then
+  for secret_name in "$SLACK_WEBHOOK_NAME"; do
+    [ -n "$secret_name" ] || continue
+    [ -f "$DEVMON_SECRETS" ] \
+      || die "dev-monitor-secrets.env must exist when a credential name is configured"
+    secret_check_args+=("$secret_name")
+  done
+fi
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  secret_check_args+=(--static)
+fi
+if [ -f "$DEVMON_SECRETS" ]; then
+  python3 "$HERE/check-secrets.py" "${secret_check_args[@]}" \
+    || die "dev-monitor-secrets.env validation failed (file security/names, empty value, or user systemd unavailable)"
+fi
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] secret name/owner/mode checked; systemd value semantics NOT checked"
+fi
 DEVMON_ENV_OUTPUT="$DEVMON_ENV"
-COMPAT_ENV_OUTPUT=""
 # AIRLOCK_RENDER_DIR: harness-only destination-root override (highest
 # priority). Redirects only where render output lands — install/lib.sh
 # fail-closes if this is set without AIRLOCK_DRY_RUN=1, since real system
@@ -167,21 +182,6 @@ if [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
   # while the rendered unit reads a file that exists only in the test harness.
   DEVMON_ENV_OUTPUT="$AIRLOCK_RENDER_DIR/files/dev-monitor.env"
 fi
-if [ -n "$COMPAT_ENV" ]; then
-  [ ! -L "$COMPAT_ENV" ] \
-    || die "compatibility env path must not be a symbolic link"
-  COMPAT_ENV="$(realpath -m -- "$COMPAT_ENV")" \
-    || die "compatibility env path could not be normalized"
-  DEVMON_ENV_NORMALIZED="$(realpath -m -- "$DEVMON_ENV")" \
-    || die "canonical backend env path could not be normalized"
-  COMPAT_ENV_OUTPUT="${AIRLOCK_RENDER_DIR:+$AIRLOCK_RENDER_DIR/files/dev-monitor-compat.env}"
-  COMPAT_ENV_OUTPUT="${COMPAT_ENV_OUTPUT:-$COMPAT_ENV}"
-  [ "$COMPAT_ENV" != "$DEVMON_ENV_NORMALIZED" ] \
-    || die "compatibility env path must differ from the canonical backend env"
-  [ ! -e "$COMPAT_ENV" ] || [ -f "$COMPAT_ENV" ] \
-    || die "compatibility env path must be absent or a regular file"
-fi
-
 # The spool is written by a SECOND UID, which therefore has to traverse every directory
 # above it. The one in the way is Airlock's own state directory: install/airlock-install.sh
 # creates it 0700, which is right for a directory holding the ledger and wrong for a
@@ -320,50 +320,7 @@ fi
 # Nothing to reuse (no env file yet, or it is unreadable): mint one. Safe on a dry run
 # only because the fragment write below will not overwrite an existing file.
 [ -n "$DEVMON_SECRET" ] || DEVMON_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-SLACK_WEBHOOK_URGENT=""
-SLACK_WEBHOOK_ROUTINE=""
 if [ "$MESSAGES" = true ]; then
-  if [ -n "$SLACK_WEBHOOK_URGENT_ENV" ]; then
-    SLACK_WEBHOOK_URGENT="$(printenv "$SLACK_WEBHOOK_URGENT_ENV" 2>/dev/null || true)"
-    [ -n "$SLACK_WEBHOOK_URGENT" ] || log "WARN: slack_webhook_urgent_env names an unset variable — urgent Slack delivery stays off"
-  elif [ -n "$SLACK_WEBHOOK_ENV" ]; then
-    SLACK_WEBHOOK_URGENT="$(printenv "$SLACK_WEBHOOK_ENV" 2>/dev/null || true)"
-    [ -n "$SLACK_WEBHOOK_URGENT" ] || log "WARN: legacy slack_webhook_env names an unset variable — urgent Slack delivery stays off"
-  fi
-  if [ -n "$SLACK_WEBHOOK_ROUTINE_ENV" ]; then
-    SLACK_WEBHOOK_ROUTINE="$(printenv "$SLACK_WEBHOOK_ROUTINE_ENV" 2>/dev/null || true)"
-    [ -n "$SLACK_WEBHOOK_ROUTINE" ] || log "WARN: slack_webhook_routine_env names an unset variable — routine Slack delivery stays off"
-  fi
-  for _v in "$SLACK_WEBHOOK_URGENT" "$SLACK_WEBHOOK_ROUTINE"; do
-    case "$_v" in *[$'\n\r']*) die "resolved Slack webhook values must not contain newlines" ;; esac
-  done
-
-  # The email lane. Same indirection as the webhooks: config names the variable, never
-  # holds the password. The warnings are per-field because "email is off" is not a
-  # diagnosis — the operator has to know which of the five is missing.
-  SMTP_PASSWORD=""
-  if [ -n "$SMTP_PASSWORD_ENV" ]; then
-    SMTP_PASSWORD="$(printenv "$SMTP_PASSWORD_ENV" 2>/dev/null || true)"
-    [ -n "$SMTP_PASSWORD" ] || log "WARN: smtp_password_env names an unset variable — the email lane will try to send without a credential"
-  fi
-  # Newlines and backslashes, on both credential fields. The env file is a systemd
-  # EnvironmentFile, which strips a backslash and treats a trailing one as a line
-  # continuation — measured: `hunter2\` swallows the next variable, and `CORP\jdoe` arrives
-  # as `CORPjdoe`. Either way SMTP auth fails with nothing pointing at the cause. The user
-  # field matters as much as the password here: `DOMAIN\user` is the ordinary spelling for
-  # SMTP AUTH against a Windows relay, so it is the value most likely to contain one.
-  for _pair in "SMTP password:$SMTP_PASSWORD" "SMTP user:$SMTP_USER"; do
-    case "${_pair#*:}" in
-      *[$'\n\r']*) die "resolved ${_pair%%:*} must not contain newlines" ;;
-      *\\*) die "resolved ${_pair%%:*} must not contain a backslash — systemd EnvironmentFile reads it as a line continuation" ;;
-    esac
-  done
-  if [ -n "$SMTP_HOST$SMTP_FROM$SMTP_TO" ]; then
-    for _pair in "smtp_host:$SMTP_HOST" "smtp_from:$SMTP_FROM" "smtp_to:$SMTP_TO"; do
-      [ -n "${_pair#*:}" ] || log "WARN: ${_pair%%:*} is empty — the email lane stays off (page still reaches Slack and the console)"
-    done
-  fi
-
   if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
     install -d -m 700 "$(dirname "$DEVMON_ENV")"
   fi
@@ -384,29 +341,14 @@ if [ "$MESSAGES" = true ]; then
     install -d -m 700 "$(dirname "$DEVMON_ENV_OUTPUT")"
     ( umask 077; render_dev_monitor_env \
         "$OWNER" "$DEVMON_SECRET" "$DEVMON_STATE" "${EXEC_CWD_ROOT:-$HOME}" \
-        "$EXEC_SESSION" "$SLACK_WEBHOOK_URGENT" "$SLACK_WEBHOOK_ROUTINE" \
-        "$CONSOLE_URL" "$SMTP_HOST" "$SMTP_PORT" "$SMTP_FROM" "$SMTP_TO" \
-        "$SMTP_USER" "$SMTP_PASSWORD" "$ROSTER_PATH" >"$DEVMON_ENV_OUTPUT" )
+        "$EXEC_SESSION" "$SLACK_WEBHOOK_NAME" "$CONSOLE_URL" >"$DEVMON_ENV_OUTPUT" )
     chmod 600 "$DEVMON_ENV_OUTPUT"
-    if [ -n "$COMPAT_ENV_OUTPUT" ]; then
-      install -d "$(dirname "$COMPAT_ENV_OUTPUT")"
-      ( set -e
-        compat_tmp="$(mktemp "$(dirname "$COMPAT_ENV_OUTPUT")/.dev-monitor-compat.XXXXXX")"
-        trap 'rm -f "$compat_tmp"' EXIT
-        umask 077
-        render_dev_monitor_compat_env "$DEVMON_STATE" \
-          "$SLACK_WEBHOOK_URGENT" "$SLACK_WEBHOOK_ROUTINE" >"$compat_tmp"
-        chmod 600 "$compat_tmp"
-        mv -T "$compat_tmp" "$COMPAT_ENV_OUTPUT"
-        trap - EXIT
-      )
-    fi
+
   fi
 elif [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
   install -d -m 700 "$(dirname "$DEVMON_ENV_OUTPUT")"
   ( umask 077; render_dev_monitor_owner_env "$OWNER" "$DEVMON_SECRET" >"$DEVMON_ENV_OUTPUT" )
   chmod 600 "$DEVMON_ENV_OUTPUT"
-  [ -z "$COMPAT_ENV_OUTPUT" ] || rm -f "$COMPAT_ENV_OUTPUT"
   # Turning the console off does not reach into a run that is already going. Killing
   # someone's in-flight work to honour a config change would be worse than leaving it —
   # but leaving it silently would be worse still, because the UI that could stop it is
@@ -427,7 +369,8 @@ else
   install -d "$UNIT_DIR"
   render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_origins" "$DEVMON_ENV" \
     "$TOKEN_FRESHNESS" "$TOKEN_WARN_HOURS" "$TOKEN_STALE_HOURS" "$MESSAGES" \
-    "$ACCOUNTS_STATUS_BIN" "$AGENT_PROVIDER" "$AGENT_BIN" \
+    "$ACCOUNTS_STATUS_BIN" "$AGENT_PROVIDER" "$AGENT_BIN" "$SLACK_WEBHOOK_NAME" \
+    "$AIRLOCK_CONFIG_PATH" \
     >"$UNIT_DIR/airlock-dev-monitor.service"
 fi
 # The card is on; the CHECKING is not. Said once at install time, because "the feature is
@@ -436,9 +379,68 @@ fi
 if [ "$TOKEN_FRESHNESS" = true ] && [ ! -f "$HOME/.config/systemd/user/airlock-token-freshness.timer" ]; then
   log "NOTE: token_freshness is on, so the dashboard card and /api/tokens are live — but nothing checks on a schedule yet. Wire the timer with: AIRLOCK_ROOT=$ROOT AIRLOCK_APP_DIR=$HERE AIRLOCK_APP_ID=$AIRLOCK_APP_ID bash $HERE/install-token-timer.sh"
 fi
+# The heartbeat is part of the message pipeline, so messages=false stops it too.
+if [ "$MESSAGES" = true ]; then
+  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
+    for kind in service timer; do
+      render_dev_monitor_heartbeat "$kind" "$DEVMON_STATE/spool" \
+        >"$UNIT_DIR/airlock-devmon-heartbeat.$kind"
+    done
+  fi
+else
+  # Query the manager, not just fragment existence: a removed file may still
+  # have an active timer or in-flight oneshot loaded. Never delete its recovery
+  # files when disable/stop failed or the manager still reports it running.
+  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+    airlock_run systemctl --user disable --now airlock-devmon-heartbeat.timer
+    airlock_run systemctl --user disable --now airlock-devmon-heartbeat.service
+  else
+    require_cmd timeout
+    heartbeat_state() {
+      local unit="$1" state key value
+      state="$(timeout 30 systemctl --user show "$unit" --property=LoadState \
+        --property=ActiveState --property=UnitFileState --property=MainPID)" \
+        || die "cannot query heartbeat unit state: $unit"
+      hb_load='' hb_active='' hb_enabled='' hb_pid=''
+      # Timer units have no MainPID property; services must report it.
+      case "$unit" in *.timer) hb_pid=0 ;; esac
+      while IFS='=' read -r key value; do
+        case "$key" in
+          LoadState) hb_load="$value" ;;
+          ActiveState) hb_active="$value" ;;
+          UnitFileState) hb_enabled="$value" ;;
+          MainPID) hb_pid="$value" ;;
+        esac
+      done <<< "$state"
+      [ -n "$hb_load" ] && [ -n "$hb_active" ] && [ -n "$hb_pid" ] \
+        || die "incomplete heartbeat unit state: $unit"
+    }
+    for heartbeat_unit in airlock-devmon-heartbeat.timer airlock-devmon-heartbeat.service; do
+      heartbeat_state "$heartbeat_unit"
+      if [ "$hb_load" = not-found ] && [ "$hb_active" = inactive ] \
+          && [ "$hb_pid" = 0 ] && [ -z "$hb_enabled" ]; then
+        continue
+      fi
+      timeout 30 systemctl --user disable --now "$heartbeat_unit" \
+        || die "cannot disable and stop heartbeat unit: $heartbeat_unit; files preserved"
+      heartbeat_state "$heartbeat_unit"
+      case "$hb_active:$hb_pid:$hb_enabled" in
+        inactive:0:disabled|inactive:0:static|inactive:0:linked|inactive:0:linked-runtime|inactive:0:|\
+        failed:0:disabled|failed:0:static|failed:0:linked|failed:0:linked-runtime|failed:0:) ;;
+        *) die "heartbeat unit is still active or enabled: $heartbeat_unit ($hb_active/$hb_pid/$hb_enabled); files preserved" ;;
+      esac
+    done
+  fi
+  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
+    rm -f "$UNIT_DIR/airlock-devmon-heartbeat.service" "$UNIT_DIR/airlock-devmon-heartbeat.timer"
+  fi
+fi
 airlock_run systemctl --user daemon-reload
 airlock_run systemctl --user enable airlock-dev-monitor.service
 airlock_run systemctl --user restart airlock-dev-monitor.service
+if [ "$MESSAGES" = true ]; then
+  airlock_run systemctl --user enable --now airlock-devmon-heartbeat.timer
+fi
 
 # --- 2. dashboard UI into the hub webroot (served by the hub's static location /) ---
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
@@ -456,14 +458,13 @@ fi
 frag="$CONFD/hub-locations.d/dev-monitor.conf"
 install -d "$CONFD/hub-locations.d"
 
-# The updates endpoints are owner-only regardless of whether messages are enabled. Three
-# locations, each scoped to one branch so a future message route cannot accidentally
-# inherit their gate: an exact match for the snapshot itself, a prefix for the execution
-# routes under it (/run, /execute), and the same prefix for the settings panel's harness
-# section, which shares this gate and nothing else (devmon_harness). Each prefix is
-# longer than the /monitor/api/ observability location and than the message console's
-# /monitor/api/owner/ location, so nginx's longest-prefix rule keeps the owner gate on
-# all three whether or not the console is installed.
+# Owner-only non-message endpoints are always rendered as separately-scoped branches:
+# updates has an exact snapshot plus its execution prefix, harness has its own prefix,
+# the app store has an exact inventory plus its action prefix, and home order is exact.
+# Keeping each branch narrow means a future message route cannot accidentally inherit
+# this gate. Each prefix is longer than /monitor/api/ and than the conditional message
+# console /monitor/api/owner/ location, so nginx's longest-prefix rule keeps these
+# owner gates active whether or not the console is installed.
 # Message/action routes keep their existing conditional prefix location below.
 #
 # Both X-Devmon-* headers are set here, which is also what makes a client-supplied copy
@@ -475,9 +476,14 @@ updates_location="$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var"
   '= /monitor/api/owner/updates')$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" \
   "$DEVMON_SECRET" '/monitor/api/owner/updates/')$(render_dev_monitor_owner_location \
   "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" '/monitor/api/owner/harness/')"
-owner_location=""
+apps_location="$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" \
+  '= /monitor/api/owner/apps')$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" \
+  "$DEVMON_SECRET" '/monitor/api/owner/apps/')"
+home_order_location="$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" \
+  '= /monitor/api/owner/home/order')"
+owner_location="${apps_location}${home_order_location}"
 if [ "$MESSAGES" = true ]; then
-  owner_location="$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET")"
+  owner_location+="$(render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET")"
 fi
 
 # A dry run must not touch an EXISTING fragment. Elsewhere in Airlock the nginx fragment

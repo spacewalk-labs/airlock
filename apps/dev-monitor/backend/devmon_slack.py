@@ -1,26 +1,11 @@
 #!/usr/bin/env python3
-"""devmon_slack — the outbox worker that pushes urgent cards to Slack. stdlib only.
-
-At-least-once, deliberately: a duplicate ping is a nuisance, a missed one is the failure
-this feature exists to prevent. ingest() enqueues at the moment a card becomes urgent; this
-worker claims pending deliveries, sends, and either marks them sent or reschedules with
-backoff (giving up as failed after the cap).
-
-The webhook URL is a SECRET, injected via DEV_MONITOR_SLACK_WEBHOOK. This module never puts
-that value into a log line or an exception message — which is why send() returns a short
-error string of its own making rather than letting a urllib exception carry the URL out.
-"""
+"""Slack formatting and bounded HTTP transport; scheduling belongs to the loop."""
 import json
-import sys
 import urllib.error
 import urllib.request
 
-import devmon_messages as MSG
 
-URGENCY_MARK = {'urgent': '🔴', 'normal': '•'}
-# enum -> what a human reads in Slack. Not an identity map: the point is that 'action'
-# reads as something being asked of you, which the bare enum name does not convey.
-KIND_LABEL = {'action': 'action requested', 'link': 'link', 'info': 'notice'}
+LEVEL_MARK = {'urgent': '🔴', 'normal': '•'}
 MAX_BODY_ITEMS = 4
 MAX_DETAIL_CHARS = 240
 
@@ -57,12 +42,11 @@ def format_text(card, console_url=''):
     """Build the message text. A card's title/source go to the owner's own channel so they
     are not secrets, but they are escaped anyway to prevent mrkdwn injection. console_url is
     server-generated, so it is used as-is."""
-    mark = URGENCY_MARK.get(card.get('urgency'), '•')
-    kind = KIND_LABEL.get(card.get('kind'), card.get('kind', ''))
+    mark = LEVEL_MARK.get(card.get('level'), '•')
     lines = ['%s *%s*' % (mark, esc_mrkdwn(card.get('title', '(no title)'))),
-             '_%s · %s_' % (esc_mrkdwn(card.get('source', '?')), esc_mrkdwn(kind))]
-    if card.get('occurrence_count', 1) > 1:
-        lines[-1] += '  ×%d' % card['occurrence_count']
+             esc_mrkdwn(card.get('source', '?'))]
+    if card.get('count', 1) > 1:
+        lines[-1] += ' ×%d' % card['count']
 
     body_items = _body_items(card.get('body'))
     shown = body_items[:MAX_BODY_ITEMS]
@@ -73,23 +57,12 @@ def format_text(card, console_url=''):
     if omitted:
         lines.append('• … (%d more items omitted)' % omitted)
 
-    action_line = card.get('action_line')
-    if action_line is not None and str(action_line).strip():
-        lines.append('• Action: ' + esc_mrkdwn(_truncate_detail(action_line)))
-    # P4: mention the resolved owner only when the roster actually names a Slack member —
-    # a card with no declared owner, or one that fell back to the box owner, adds nothing
-    # here. The fallback itself is not silent; it is visible on the card (the console/API
-    # projection), which is where "not only in the log" is verified. Repeating it in every
-    # Slack line for cards nobody assigned would be noise, not visibility.
-    owner_info = MSG.resolve_owner(card.get('owner'))
-    if not owner_info['fallback'] and owner_info['slack_member_id']:
-        lines.append('• Owner: <@%s>' % owner_info['slack_member_id'])
     if console_url:
         lines.append('<%s|Open in the console>' % console_url)
     return '\n'.join(lines)
 
 
-def send(webhook, text, timeout=8):
+def send(webhook, text, timeout=2):
     """POST to the webhook. -> (ok, status-or-error-type, raw Retry-After)."""
     data = json.dumps({'text': text}).encode('utf-8')
     req = urllib.request.Request(webhook, data=data,
@@ -108,10 +81,6 @@ def send(webhook, text, timeout=8):
         return False, type(e).__name__, None
 
 
-def _terminal_http(code):
-    return isinstance(code, int) and 400 <= code < 500 and code not in (408, 429)
-
-
 def _retry_after_seconds(code, value):
     """Accept only 429 delta-seconds; dates and malformed remote values use jitter."""
     if code != 429 or value is None:
@@ -128,30 +97,3 @@ def _retry_after_seconds(code, value):
     if seconds < 0:
         return None
     return max(1, min(seconds, 3600))
-
-
-def _error_reason(code):
-    return 'http %d' % code if isinstance(code, int) else str(code)
-
-
-def run_worker(lane, webhook, stop_event, console_url=''):
-    """One lane's outbox worker: one thread, one pass every 5 seconds."""
-    while not stop_event.is_set():
-        try:
-            batch = MSG.claim_due_deliveries(lane, 10)
-            for index, d in enumerate(batch):
-                if index and stop_event.wait(1):
-                    break
-                ok, code, retry_after = send(webhook, format_text(d, console_url))
-                if ok:
-                    MSG.delivery_sent(d['id'], d['card_id'], d['claimed_by'])
-                elif _terminal_http(code):
-                    MSG.delivery_failed(
-                        d['id'], d['claimed_by'], _error_reason(code))
-                else:
-                    MSG.delivery_retry(
-                        d['id'], d['claimed_by'], _error_reason(code),
-                        _retry_after_seconds(code, retry_after))
-        except Exception as e:                      # noqa: BLE001 — the worker must not die
-            sys.stderr.write('[slack] worker err: %s\n' % type(e).__name__)
-        stop_event.wait(5)

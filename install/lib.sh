@@ -59,9 +59,29 @@ if [ -n "${AIRLOCK_RENDER_DIR:-}" ] && [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
 fi
 
 require_cmd() {
-  local c
+  local c resolved receipt_row receipt_path predicate expected owners version
   for c in "$@"; do
-    command -v "$c" >/dev/null 2>&1 || die "required command not found: $c"
+    resolved="$(airlock_find_cmd "$c")" || die "required command not found: $c"
+    # Only an orchestrated lifecycle child has both markers. A directly invoked
+    # app uses the same resolver locally; an ambient receipt cannot become an
+    # admission switch.
+    if [ -n "${AIRLOCK_INSTALL_PKG_INFO_SHA256:-}" ] \
+      && [ -n "${AIRLOCK_PREREQ_RECEIPT:-}" ]; then
+      receipt_row="$(airlock_prerequisite_receipt_lookup "$c")" \
+        || die "required command was not approved by preflight receipt: $c"
+      IFS=$'\t' read -r receipt_path predicate expected owners <<< "$receipt_row"
+      [ "$resolved" = "$receipt_path" ] && [ -x "$receipt_path" ] \
+        || die "required command changed after preflight: $c (was $receipt_path, now $resolved)"
+      if [ "$predicate" = major-gte ]; then
+        version="$("$receipt_path" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || version=""
+        if [ "$c" != python3 ]; then
+          version="$("$receipt_path" -p 'process.versions.node.split(".")[0]' 2>/dev/null)" || version=""
+        fi
+        [[ "$version" =~ ^[0-9]+([.][0-9]+)?$ ]] || version=""
+        airlock_preflight_version_ge "${version:-0}" "$expected" \
+          || die "required command version changed after preflight: $c"
+      fi
+    fi
   done
 }
 
@@ -427,6 +447,28 @@ airlock_panel_url() {
   printf 'https://%s:%s/' "$fqdn" "$port"
 }
 
+# airlock_publish_doc_url — the link a reader can actually open, or empty.
+#
+# The hub path (/publish/files/) and the dedicated document port serve the SAME
+# directory, but they sit behind different gates: the hub is owner+collaborators,
+# the document port is every tailnet member when tailnet_view is on. So the hub
+# link works for the person who published and 403s for everyone they send it to —
+# and both look identical in the manager UI. Handing the UI the openable URL is
+# what stops that link from being copied out of here at all.
+#
+# Empty when tailnet_view is off: then no link is open to others and the UI has
+# nothing better to offer than the hub path it already uses.
+airlock_publish_doc_url() {
+  local port fqdn
+  [ "$(airlock_config get apps.publish.tailnet_view 2>/dev/null)" = true ] || return 0
+  port="$(airlock_config get apps.publish.https_port 2>/dev/null)" || return 0
+  [ -n "$port" ] || return 0
+  fqdn="${AIRLOCK_TS_FQDN:-}"
+  [ -n "$fqdn" ] || fqdn="$(ts_fqdn)" || return 0
+  [ -n "$fqdn" ] || return 0
+  if [ "$port" = 443 ]; then printf 'https://%s' "$fqdn"; else printf 'https://%s:%s' "$fqdn" "$port"; fi
+}
+
 # airlock_escape_selfkill_cgroup SCRIPT [ARGS...] — survive stopping our own host.
 #
 # An install stops and restarts the app units it manages. When the run was started
@@ -526,10 +568,58 @@ airlock_escape_selfkill_cgroup() {
   # --wait blocks here for the exit status, so an operator watching a terminal still
   # gets one. It is only this waiter that is fragile: if the caller dies, the service
   # keeps running and finishes the install, which is the whole point.
+  # The transient unit inherits the user manager's environment. Forward the
+  # caller's AIRLOCK_* inputs and PATH so it uses the same config and paths.
+  # Shadow manager-only AIRLOCK_* names with empty values to avoid stale inputs.
+  #
+  # NAME-ONLY --setenv, never NAME=VALUE. systemd-run reads the value out of
+  # its own environment for the bare form, so the value never enters argv.
+  # With NAME=VALUE it does, and /proc/<pid>/cmdline is world-readable unless
+  # the box mounts /proc with hidepid -- measured here: no hidepid, and a
+  # secret passed as NAME=VALUE was readable from another account's view for
+  # the whole install (--wait keeps systemd-run alive the entire time). The
+  # values still reach `systemctl show` for this same UID while the unit
+  # lives, and --collect drops the unit at exit.
+  #
+  # AIRLOCK_SELFKILL_ESCAPED is excluded from EVERY loop below, not just the
+  # shadowing one. It is passed explicitly as =1 before these arguments, and
+  # systemd resolves duplicate --setenv by LAST ONE WINS (measured). A caller
+  # that exported it EMPTY passes the guard at the top of this function (-n on
+  # an empty string is false), so without the exclusion its empty value would
+  # be forwarded after the =1 and blank the guard -- and the escaped run would
+  # escape again, forever.
+  local -a esc_env=()
+  local _n
+  for _n in $(compgen -e 2>/dev/null | grep '^AIRLOCK_' || true); do
+    [ "$_n" = AIRLOCK_SELFKILL_ESCAPED ] && continue
+    esc_env+=("--setenv=${_n}")
+  done
+  esc_env+=("--setenv=PATH")
+
+  # Read the manager's list -- there is no other way to
+  # learn which AIRLOCK_* it holds. A failed query is reported rather than read
+  # as "the manager holds nothing", which would silently skip the shadowing.
+  local _manager_env _manager_rc=0
+  _manager_env="$(systemctl --user show-environment 2>/dev/null)" || _manager_rc=$?
+  if [ "$_manager_rc" -ne 0 ]; then
+    log "  WARNING: could not read the user manager's environment (rc=${_manager_rc});"
+    log "    a stale AIRLOCK_* it holds could reach the escaped run"
+    _manager_env=""
+  else
+    _manager_env="$(printf '%s\n' "$_manager_env" \
+      | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')"
+  fi
+  # Same shadowing rule for the platform inputs.
+  for _n in $(printf '%s\n' "$_manager_env" | grep '^AIRLOCK_' || true); do
+    [ "$_n" = AIRLOCK_SELFKILL_ESCAPED ] && continue
+    [ -n "${!_n+x}" ] || esc_env+=("--setenv=${_n}=")
+  done
+
   local rc=0
   "$runner" --user --unit="$esc_unit" --service-type=exec --collect --quiet --wait \
     --same-dir \
     --setenv=AIRLOCK_SELFKILL_ESCAPED=1 \
+    "${esc_env[@]}" \
     -- bash "$@" || rc=$?
   if [ "$rc" -eq 0 ]; then
     log "  escaped run finished (unit ${esc_unit})"

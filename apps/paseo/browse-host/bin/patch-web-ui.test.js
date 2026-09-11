@@ -8,6 +8,7 @@ const {
   BROWSE_PATCHES,
   KNOWN_BUNDLE_SHAPES,
   PINNED_SHA,
+  SIDEBAR_REHYDRATE_REVISIONED,
   SUBAGENT_STREAM_PATCHES,
   patchBundleContent,
   productionShasForEdits,
@@ -68,8 +69,8 @@ assert.ok(byName("tooltip-hover-none-is-compact").repl.includes('matchMedia?.("(
 // route (or the order stays per-browser) and the local fallback (or a box without the
 // backend loses the order entirely instead of degrading to upstream behaviour).
 assert.ok(byName("sidebar-order-shared-storage").repl.includes("/airlock-ui-state/"));
-assert.ok(byName("sidebar-order-shared-storage").repl.includes("l.getItem(e)"));
-assert.ok(byName("sidebar-order-shared-storage").repl.includes("await l.setItem(e,t)"));
+assert.ok(byName("sidebar-order-shared-storage").repl.includes("local.getItem(key)"));
+assert.ok(byName("sidebar-order-shared-storage").repl.includes("await writeLocal(key,value)"));
 // An already-open second device must converge when the owner switches back to it;
 // initial hydration alone only updates a device that performs a full page load.
 assert.ok(byName("sidebar-order-rehydrate-on-visibility").find.includes("migrate:j"));
@@ -81,23 +82,26 @@ assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes("f.persi
   const start = patch.repl.indexOf('"undefined"!=typeof document');
   const end = patch.repl.indexOf("},3544,[", start);
   const expression = patch.repl.slice(start, end);
-  let listener = null;
+  const listeners = new Map();
   let rehydrates = 0;
   const documentStub = {
     visibilityState: "hidden",
     addEventListener: (name, callback) => {
-      assert.equal(name, "visibilitychange");
-      listener = callback;
+      listeners.set(name, callback);
     },
   };
   const f = { persist: { rehydrate: () => { rehydrates += 1; } } };
   new Function("document", "f", `return (${expression});`)(documentStub, f);
+  const listener = listeners.get("visibilitychange");
   assert.ok(listener, "visibility listener was not registered");
+  assert.ok(listeners.has("airlock-ui-state-stale"), "stale-write listener was not registered");
   listener();
   assert.equal(rehydrates, 0, "a hidden tab must not rehydrate");
   documentStub.visibilityState = "visible";
   listener();
   assert.equal(rehydrates, 1, "a returning tab must rehydrate shared order");
+  listeners.get("airlock-ui-state-stale")();
+  assert.equal(rehydrates, 2, "a rejected stale write must rehydrate shared order");
 }
 // The default the user sees on a device that has never saved settings. Asserted on
 // the bytes, not the name: a silent revert to upstream's 16/12 is the failure mode.
@@ -127,6 +131,7 @@ const key = (edits) => [...edits].sort().join("|");
 // accept nothing; a duplicated edit set would make the lookup order-dependent.
 for (const shape of KNOWN_BUNDLE_SHAPES) {
   assert.match(shape.sha, /^[0-9a-f]{64}$/);
+  for (const legacySha of shape.legacyShas ?? []) assert.match(legacySha, /^[0-9a-f]{64}$/);
   for (const edit of shape.edits) {
     assert.ok(ALL_EDITS.includes(edit), `shape names an unknown edit: ${edit}`);
   }
@@ -136,26 +141,25 @@ assert.equal(
   KNOWN_BUNDLE_SHAPES.length,
 );
 assert.equal(
-  new Set(KNOWN_BUNDLE_SHAPES.map((shape) => shape.sha)).size,
-  KNOWN_BUNDLE_SHAPES.length,
+  new Set(KNOWN_BUNDLE_SHAPES.flatMap((shape) => [shape.sha, ...(shape.legacyShas ?? [])])).size,
+  KNOWN_BUNDLE_SHAPES.reduce((count, shape) => count + 1 + (shape.legacyShas?.length ?? 0), 0),
 );
 
 // The four shapes the installer must be able to name, or a box in that state refuses.
 assert.deepEqual(productionShasForEdits([]), [PINNED_SHA]);
 // Fully patched, and the browse-less box this revision creates. Both must exist.
-assert.equal(productionShasForEdits(ALL_EDITS).length, 1);
-assert.equal(productionShasForEdits(GENERAL_EDITS).length, 1);
+assert.ok(productionShasForEdits(ALL_EDITS).length >= 1);
+assert.ok(productionShasForEdits(GENERAL_EDITS).length >= 1);
 assert.equal(productionShasForEdits(BROWSE_EDITS).length, 1);
 // The shape THIS box carried when the bug was found: the whole general group as it
 // stood before the move, no browse. Completing it is the entire point of the change.
-assert.equal(
-  productionShasForEdits(PRE_REHYDRATE_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer")).length,
-  1,
+assert.ok(
+  productionShasForEdits(PRE_REHYDRATE_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer")).length >= 1,
 );
 // Both complete general shapes behind this revision stay nameable: the one before the
 // visibility rehydrate edit, and the one this revision's sidebar-tap fix migrates from.
-assert.equal(productionShasForEdits(PRE_REHYDRATE_GENERAL_EDITS).length, 1);
-assert.equal(productionShasForEdits(PREVIOUS_GENERAL_EDITS).length, 1);
+assert.ok(productionShasForEdits(PRE_REHYDRATE_GENERAL_EDITS).length >= 1);
+assert.ok(productionShasForEdits(PREVIOUS_GENERAL_EDITS).length >= 1);
 // Every pre-move browse box holds the coarse-pointer edit already, beside a general
 // group that is one, two, three or four edits old. All four must remain nameable.
 for (const revision of [1, 2, 3, 4]) {
@@ -164,7 +168,7 @@ for (const revision of [1, 2, 3, 4]) {
     ...BROWSE_EDITS,
     "project-actions-coarse-pointer",
   ];
-  assert.equal(productionShasForEdits(edits).length, 1, `pre-move browse revision ${revision}`);
+  assert.ok(productionShasForEdits(edits).length >= 1, `pre-move browse revision ${revision}`);
 }
 // The lookup is set equality, so a repeated name must not turn a known shape into an
 // unknown one. Production cannot repeat a name today; the argument is a plain list and
@@ -245,18 +249,18 @@ assert.ok(migratedTap.source.includes(byName("sidebar-tap-not-swallowed-on-web")
 // current group must replace it with the durable outbox/queue adapter and add the
 // visibility rehydrate edit.
 const storagePatch = byName("sidebar-order-shared-storage");
-assert.equal(storagePatch.legacyRepls.length, 1);
-const legacyGeneral = general.source
-  .replace(storagePatch.repl, storagePatch.legacyRepls[0])
-  .replace(
-    byName("sidebar-order-rehydrate-on-visibility").repl,
-    byName("sidebar-order-rehydrate-on-visibility").find,
-  );
-const migratedStorage = apply(legacyGeneral, "subagent-stream", [sha(legacyGeneral)]);
-assert.equal(migratedStorage.alreadyPatched, false);
-assert.equal(migratedStorage.states["subagent-stream"], "partial");
-assert.equal(migratedStorage.source, general.source);
-assert.ok(!migratedStorage.source.includes(storagePatch.legacyRepls[0]));
+assert.equal(storagePatch.legacyRepls.length, 2);
+for (const legacyStorage of storagePatch.legacyRepls) {
+  const rehydratePatch = byName("sidebar-order-rehydrate-on-visibility");
+  const legacyGeneral = general.source
+    .replace(storagePatch.repl, legacyStorage)
+    .replace(rehydratePatch.repl, rehydratePatch.legacyRepls[0]);
+  const migratedStorage = apply(legacyGeneral, "subagent-stream", [sha(legacyGeneral)]);
+  assert.equal(migratedStorage.alreadyPatched, false);
+  assert.equal(migratedStorage.states["subagent-stream"], "partial");
+  assert.equal(migratedStorage.source, general.source);
+  assert.ok(!migratedStorage.source.includes(legacyStorage));
+}
 
 // ...and the mirror case: a PRE-move browse box already holds the coarse-pointer edit,
 // so running the general group there must complete the rest around it and reach the

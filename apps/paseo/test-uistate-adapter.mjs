@@ -1,272 +1,374 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// What the injected storage adapter DOES, not just where it is anchored.
-//
-// patch-web-ui.test.js proves the anchor is unique and survives a migration; it
-// cannot prove the replacement behaves, because the replacement is a string. This
-// evaluates that exact string — the one the patcher writes into the bundle — against
-// a stub AsyncStorage and a stub fetch, and pins the four behaviours the feature is:
-// server-first reads, local fallback when there is no server answer, write-through on
-// change, and never losing the local copy when the box has no ui-state backend.
-//
-//   node apps/paseo/test-uistate-adapter.mjs
+// Evaluate the exact adapter and rehydrate listener injected into Paseo's bundle.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { SUBAGENT_STREAM_PATCHES } = require("./browse-host/bin/patch-web-ui.js");
-
-const patch = SUBAGENT_STREAM_PATCHES.find((p) => p.name === "sidebar-order-shared-storage");
+const patcher = require("./browse-host/bin/patch-web-ui.js");
+const patch = patcher.SUBAGENT_STREAM_PATCHES.find((p) => p.name === "sidebar-order-shared-storage");
 assert.ok(patch, "the sidebar-order anchor is gone — nothing to evaluate");
-
-// Cut the adapter expression out of the replacement exactly as the bundle would
-// evaluate it: everything the store passes to createJSONStorage.
 const head = "storage:(0,n.createJSONStorage)(()=>";
 const tail = "),partialize:";
 const start = patch.repl.indexOf(head) + head.length;
 const end = patch.repl.lastIndexOf(tail);
 assert.ok(start > head.length - 1 && end > start, "could not locate the adapter expression");
 const expression = patch.repl.slice(start, end);
-
 const KEY = "sidebar-project-workspace-order";
 
-function build({ respond }) {
-  const local = new Map();
+function response(status, body = "", revision = null) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => body,
+    headers: { get: (name) => name.toLowerCase() === "x-airlock-revision" ? revision : null },
+  };
+}
+
+function revisionServer(initial = null, initialRevision = initial === null ? 0 : 1) {
+  let value = initial;
+  let revision = initialRevision;
+  const respond = async (_url, init = {}) => {
+    const method = init.method ?? "GET";
+    if (method === "GET") return response(value === null ? 404 : 200, value ?? "", String(revision));
+    const base = init.headers?.["X-Airlock-Base-Revision"];
+    if (base !== String(revision)) return response(409, value ?? "", String(revision));
+    value = method === "DELETE" ? null : init.body;
+    revision += 1;
+    return response(204, "", String(revision));
+  };
+  return { respond, value: () => value, revision: () => revision };
+}
+
+function eventDocument() {
+  const listeners = new Map();
+  return {
+    visibilityState: "visible",
+    addEventListener(name, callback) {
+      const values = listeners.get(name) ?? [];
+      values.push(callback);
+      listeners.set(name, values);
+    },
+    dispatchEvent(event) {
+      for (const callback of listeners.get(event.type) ?? []) callback(event);
+    },
+  };
+}
+
+function build({ respond, document = eventDocument(), local = new Map(), beforeGet = async () => {} }) {
   const calls = [];
   const asyncStorage = {
-    getItem: async (k) => (local.has(k) ? local.get(k) : null),
-    setItem: async (k, v) => { local.set(k, v); },
-    removeItem: async (k) => { local.delete(k); },
+    getItem: async (key) => { await beforeGet(key); return local.has(key) ? local.get(key) : null; },
+    setItem: async (key, value) => { local.set(key, value); },
+    removeItem: async (key) => { local.delete(key); },
   };
   const fetchStub = async (url, init = {}) => {
-    calls.push({ url, method: init.method ?? "GET", body: init.body });
+    calls.push({ url, method: init.method ?? "GET", headers: init.headers ?? {}, body: init.body });
     return respond(url, init);
   };
-  // `g` is the bundle module's global parameter and `o.default` its AsyncStorage
-  // import — the two free names the replacement leans on.
-  const factory = new Function("g", "o", "fetch", `return (${expression});`);
-  return { adapter: factory({}, { default: asyncStorage }, fetchStub), local, calls };
+  const factory = new Function("g", "o", "fetch", "document", "Event", `return (${expression});`);
+  return { adapter: factory({}, { default: asyncStorage }, fetchStub, document, Event), local, calls, document };
 }
 
-const ok = (body) => ({ ok: true, status: 200, text: async () => body });
-const notFound = { ok: false, status: 404, text: async () => "" };
-const unavailable = { ok: false, status: 503, text: async () => "" };
+const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-// 1. The server's copy wins — that IS the cross-device behaviour.
+// Shared server wins on load and its revision is remembered locally.
 {
-  const { adapter, local } = build({ respond: () => ok('{"from":"server"}') });
+  const server = revisionServer('{"from":"server"}');
+  const { adapter, local } = build(server);
   local.set(KEY, '{"from":"device"}');
   assert.equal(await adapter.getItem(KEY), '{"from":"server"}');
-  assert.equal(local.get(KEY), '{"from":"server"}', "a server read must refresh the offline fallback");
+  assert.equal(local.get(KEY), '{"from":"server"}');
 }
 
-// 2. Nothing stored yet (404) falls back to this device instead of wiping it.
+// First deployment seeds a truly new server (revision 0) from existing local order.
 {
-  const { adapter, local } = build({ respond: () => notFound });
-  local.set(KEY, '{"from":"device"}');
-  assert.equal(await adapter.getItem(KEY), '{"from":"device"}');
+  const server = revisionServer();
+  const { adapter, local } = build(server);
+  local.set(KEY, '{"from":"pre-revision-device"}');
+  assert.equal(await adapter.getItem(KEY), '{"from":"pre-revision-device"}');
+  assert.equal(server.value(), '{"from":"pre-revision-device"}');
+  assert.equal(server.revision(), 1);
 }
 
-// 3. No backend at all (upstream paseo, or the service down) degrades to upstream
-//    behaviour. This is the one that must never throw: a rejected hydrate would
-//    leave the sidebar with no order at all.
+// A local reorder during the first revision-0 seed is newer than the seed snapshot.
+// Hydration returns that live value, then its rebased outbox becomes revision 2.
 {
-  const { adapter, local } = build({ respond: () => { throw new Error("ECONNREFUSED"); } });
-  local.set(KEY, '{"from":"device"}');
-  assert.equal(await adapter.getItem(KEY), '{"from":"device"}');
-  await adapter.setItem(KEY, '{"from":"reorder"}');
-  assert.equal(local.get(KEY), '{"from":"reorder"}', "an offline write must still land locally");
-  await adapter.removeItem(KEY);
-  assert.equal(local.has(KEY), false);
-}
-
-// 4. A reorder writes through: local first (so it survives a failed request), then
-//    the server, at the gated path, as a PUT carrying the same bytes.
-{
-  const { adapter, local, calls } = build({ respond: () => ok("") });
-  await adapter.setItem(KEY, '{"from":"reorder"}');
-  assert.equal(local.get(KEY), '{"from":"reorder"}');
-  const put = calls.find((c) => c.method === "PUT");
-  assert.ok(put, "no PUT reached the backend");
-  assert.equal(put.url, `/airlock-ui-state/${KEY}`);
-  assert.equal(put.body, '{"from":"reorder"}');
-
-  await adapter.removeItem(KEY);
-  const del = calls.find((c) => c.method === "DELETE");
-  assert.ok(del, "no DELETE reached the backend");
-  assert.equal(del.url, `/airlock-ui-state/${KEY}`);
-  assert.equal(local.has(KEY), false);
-}
-
-// 5. The route is same-origin and per-key: a key with characters that would change
-//    the path is encoded, not interpolated raw.
-{
-  const { adapter, calls } = build({ respond: () => notFound });
-  await adapter.getItem("a/b?c");
-  assert.equal(calls[0].url, "/airlock-ui-state/a%2Fb%3Fc");
-}
-
-// 6. A write made while the backend is down stays pending on the device. The next
-// read retries it before accepting an older server value, then another device sees
-// the recovered value. This is the exact 2026-09-01 unit-outage failure path.
-{
-  let online = false;
-  let server = '{"from":"old-server"}';
-  const respond = (_url, init = {}) => {
-    const method = init.method ?? "GET";
-    if (!online) return unavailable;
-    if (method === "PUT") {
-      server = init.body;
-      return ok("");
-    }
-    return ok(server);
-  };
-  const first = build({ respond });
-  await first.adapter.setItem(KEY, '{"from":"offline-reorder"}');
-  assert.equal(first.local.get(KEY), '{"from":"offline-reorder"}');
-  assert.equal(server, '{"from":"old-server"}');
-
-  online = true;
-  assert.equal(await first.adapter.getItem(KEY), '{"from":"offline-reorder"}');
-  assert.equal(server, '{"from":"offline-reorder"}', "pending reorder was not retried");
-
-  const second = build({ respond });
-  assert.equal(await second.adapter.getItem(KEY), '{"from":"offline-reorder"}');
-}
-
-// 7. Persist may call setItem again before the prior fetch completes. Only one PUT
-// may be in flight for this key, or an older request that completes last can undo the
-// newest drag on the shared server.
-{
-  let server = null;
+  let value = null, revision = 0;
   const releases = [];
-  const { adapter, local, calls } = build({
-    respond: (_url, init = {}) => {
-      if ((init.method ?? "GET") !== "PUT") return notFound;
-      return new Promise((resolve) => {
-        releases.push(() => {
-          server = init.body;
-          resolve(ok(""));
-        });
-      });
-    },
-  });
-  const first = adapter.setItem(KEY, '{"order":1}');
-  await new Promise((resolve) => setImmediate(resolve));
-  const second = adapter.setItem(KEY, '{"order":2}');
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(calls.filter((call) => call.method === "PUT").length, 1, "PUTs were not serialized");
-  assert.equal(local.get(KEY), '{"order":2}', "stalled PUT delayed the newest local fallback");
-  assert.equal(local.get(`@airlock-pending:${KEY}`), '{"order":2}', "stalled PUT delayed the newest outbox");
-
+  const respond = async (_url, init = {}) => {
+    if ((init.method ?? "GET") === "GET") return response(404, "", "0");
+    const base = init.headers["X-Airlock-Base-Revision"];
+    return new Promise((resolve) => releases.push(() => {
+      assert.equal(base, String(revision));
+      value = init.body;
+      revision += 1;
+      resolve(response(204, "", String(revision)));
+    }));
+  };
+  const { adapter, local } = build({ respond });
+  local.set(KEY, '{"order":"seed"}');
+  const read = adapter.getItem(KEY);
+  await tick();
+  const write = adapter.setItem(KEY, '{"order":"new-user"}');
+  await tick();
   releases.shift()();
-  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await read, '{"order":"new-user"}');
+  await tick();
+  releases.shift()();
+  await write;
+  assert.equal(value, '{"order":"new-user"}');
+  assert.equal(revision, 2);
+}
+
+// Normal reorder uses the observed revision and remembers the committed revision.
+{
+  const server = revisionServer('{"order":0}');
+  const { adapter, local, calls } = build(server);
+  await adapter.getItem(KEY);
+  await adapter.setItem(KEY, '{"order":1}');
+  assert.equal(server.value(), '{"order":1}');
+  const put = calls.find((call) => call.method === "PUT");
+  assert.equal(put.url, `/airlock-ui-state/v2/${KEY}`);
+  assert.equal(put.headers["X-Airlock-Base-Revision"], "1");
+}
+
+// A -> B while A is in flight rebases B onto A's committed revision.
+{
+  let value = '{"order":0}', revision = 1;
+  const releases = [];
+  const respond = async (_url, init = {}) => {
+    if ((init.method ?? "GET") === "GET") return response(200, value, String(revision));
+    const base = init.headers["X-Airlock-Base-Revision"];
+    return new Promise((resolve) => releases.push(() => {
+      assert.equal(base, String(revision));
+      value = init.body;
+      revision += 1;
+      resolve(response(204, "", String(revision)));
+    }));
+  };
+  const { adapter, local, calls } = build({ respond });
+  await adapter.getItem(KEY);
+  const first = adapter.setItem(KEY, '{"order":1}');
+  await tick();
+  const second = adapter.setItem(KEY, '{"order":2}');
+  await tick();
+  assert.equal(local.get(KEY), '{"order":2}');
+  assert.equal(calls.filter((call) => call.method === "PUT").length, 1);
+  releases.shift()();
+  await tick();
   assert.equal(calls.filter((call) => call.method === "PUT").length, 2);
   releases.shift()();
   await Promise.all([first, second]);
-  assert.equal(server, '{"order":2}');
+  assert.equal(value, '{"order":2}');
+  assert.equal(revision, 3);
 }
 
-// 8. A GET begun before a reorder may finish after setItem was invoked. Its stale
-// response must not roll the local cache or the value returned to rehydrate back.
+// A GET begun before a local reorder may finish afterwards. Its old response must
+// not overwrite the immediately durable local value or cancel the queued mutation.
 {
-  let releaseGet;
-  let server = '{"order":"old"}';
-  const { adapter, local } = build({
-    respond: (_url, init = {}) => {
-      const method = init.method ?? "GET";
-      if (method === "GET") {
-        const snapshot = server;
-        return new Promise((resolve) => { releaseGet = () => resolve(ok(snapshot)); });
-      }
-      server = init.body;
-      return ok("");
-    },
-  });
+  let releaseGet, reads = 0;
+  const server = revisionServer('{"order":"old"}');
+  const respond = (url, init = {}) => {
+    if ((init.method ?? "GET") !== "GET") return server.respond(url, init);
+    reads += 1;
+    if (reads === 1) return response(200, '{"order":"old"}', "1");
+    return new Promise((resolve) => { releaseGet = () => resolve(response(200, '{"order":"old"}', "1")); });
+  };
+  const { adapter, local } = build({ respond });
+  await adapter.getItem(KEY);
   const read = adapter.getItem(KEY);
-  await new Promise((resolve) => setImmediate(resolve));
+  await tick();
   const write = adapter.setItem(KEY, '{"order":"new"}');
-  releaseGet();
-  assert.equal(await read, '{"order":"new"}', "stale GET reached visibility rehydrate");
-  await write;
+  await tick();
   assert.equal(local.get(KEY), '{"order":"new"}');
-  assert.equal(server, '{"order":"new"}');
-}
-
-// 9. Two GETs share the same operation queue, so an older delayed response cannot
-// land after a newer one and poison the next offline fallback.
-{
-  let releaseFirst;
-  let server = '{"order":1}';
-  let reads = 0;
-  const { adapter, local } = build({
-    respond: () => {
-      reads += 1;
-      const snapshot = server;
-      if (reads === 1) return new Promise((resolve) => { releaseFirst = () => resolve(ok(snapshot)); });
-      return ok(snapshot);
-    },
-  });
-  const first = adapter.getItem(KEY);
-  await new Promise((resolve) => setImmediate(resolve));
-  server = '{"order":2}';
-  const second = adapter.getItem(KEY);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(reads, 1, "GETs overlapped outside the operation queue");
-  releaseFirst();
-  assert.equal(await first, '{"order":1}');
-  assert.equal(await second, '{"order":2}');
-  assert.equal(local.get(KEY), '{"order":2}');
-}
-
-// 10. Equal values are different generations. A -> B -> A while the first request
-// is held must skip B but still send the final A; value equality alone cannot tell
-// the first and third operations apart.
-{
-  const releases = [];
-  const bodies = [];
-  const { adapter } = build({
-    respond: (_url, init = {}) => new Promise((resolve) => {
-      bodies.push(init.body);
-      releases.push(() => resolve(ok("")));
-    }),
-  });
-  const first = adapter.setItem(KEY, "A");
-  await new Promise((resolve) => setImmediate(resolve));
-  const middle = adapter.setItem(KEY, "B");
-  const last = adapter.setItem(KEY, "A");
-  releases.shift()();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(bodies, ["A", "A"]);
-  releases.shift()();
-  await Promise.all([first, middle, last]);
-}
-
-// 11. A stalled server read must not hold the durable local write behind its network
-// queue. The tab can close before that GET resolves; by then both the visible fallback
-// and the outbox must already contain the newest drag.
-{
-  let releaseGet;
-  const { adapter, local, calls } = build({
-    respond: (_url, init = {}) => {
-      if ((init.method ?? "GET") === "GET") {
-        return new Promise((resolve) => { releaseGet = () => resolve(ok('{"order":"old"}')); });
-      }
-      return ok("");
-    },
-  });
-  const read = adapter.getItem(KEY);
-  await new Promise((resolve) => setImmediate(resolve));
-  const write = adapter.setItem(KEY, '{"order":"new"}');
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(calls.filter((call) => call.method === "GET").length, 1);
-  assert.equal(calls.filter((call) => call.method === "PUT").length, 0);
-  assert.equal(local.get(KEY), '{"order":"new"}', "stalled GET delayed the local fallback");
-  assert.equal(local.get(`@airlock-pending:${KEY}`), '{"order":"new"}', "stalled GET delayed the durable outbox");
-
   releaseGet();
   assert.equal(await read, '{"order":"new"}');
   await write;
+  assert.equal(server.value(), '{"order":"new"}');
+}
+
+// On first hydration there is no per-tab proof of what the visible UI was based on.
+// Even equal bytes in shared localStorage may have come from another tab, so an
+// overlapping gesture yields to the existing shared server value.
+{
+  let releaseGet;
+  const server = revisionServer('{"order":"same-base"}');
+  const respond = (url, init = {}) => {
+    if ((init.method ?? "GET") !== "GET") return server.respond(url, init);
+    return new Promise((resolve) => { releaseGet = () => resolve(response(200, '{"order":"same-base"}', "1")); });
+  };
+  const local = new Map([[KEY, '{"order":"same-base"}']]);
+  const { adapter } = build({ respond, local });
+  const read = adapter.getItem(KEY);
+  await tick();
+  const write = adapter.setItem(KEY, '{"order":"new-on-first-load"}');
+  await tick();
+  releaseGet();
+  assert.equal(await read, '{"order":"same-base"}');
+  await write;
+  assert.equal(server.value(), '{"order":"same-base"}');
+}
+
+// If that first GET reveals a different shared snapshot, the local gesture was
+// derived from stale UI and must be discarded rather than blessed with the revision.
+{
+  let releaseGet;
+  const server = revisionServer('{"order":"fresh-server"}');
+  const respond = (url, init = {}) => {
+    if ((init.method ?? "GET") !== "GET") return server.respond(url, init);
+    return new Promise((resolve) => { releaseGet = () => resolve(response(200, '{"order":"fresh-server"}', "1")); });
+  };
+  const local = new Map([[KEY, '{"order":"stale-local"}']]);
+  const built = build({ respond, local });
+  const read = built.adapter.getItem(KEY);
+  await tick();
+  const write = built.adapter.setItem(KEY, '{"order":"stale-derived"}');
+  await tick();
+  releaseGet();
+  assert.equal(await read, '{"order":"fresh-server"}');
+  await write;
+  assert.equal(server.value(), '{"order":"fresh-server"}');
+  assert.equal(built.calls.filter((call) => call.method === "PUT").length, 0);
+}
+
+// Two tabs share localStorage but must not share the revision each UI actually saw.
+// Otherwise stale tab A can borrow tab B's rev2 and make its stale snapshot valid.
+{
+  const server = revisionServer('{"order":"initial"}');
+  const local = new Map();
+  const tabA = build({ respond: server.respond, local });
+  const tabB = build({ respond: server.respond, local });
+  await tabA.adapter.getItem(KEY);
+  await tabB.adapter.getItem(KEY);
+  await tabB.adapter.setItem(KEY, '{"order":"fresh-B"}');
+  await tabA.adapter.setItem(KEY, '{"order":"stale-A"}');
+  assert.equal(server.value(), '{"order":"fresh-B"}');
+  assert.equal(local.get(KEY), '{"order":"fresh-B"}');
+  assert.deepEqual(
+    [...tabB.calls, ...tabA.calls].filter((call) => call.method === "PUT").map((call) => call.headers["X-Airlock-Base-Revision"]),
+    ["1", "1"],
+  );
+}
+
+// A delayed success from tab B must not clear tab A's newer shared outbox. The
+// operation ID makes cleanup conditional on the exact pending record B sent.
+{
+  let value = '{"order":"initial"}', revision = 1, firstPut = true, releaseB;
+  const respond = async (_url, init = {}) => {
+    if ((init.method ?? "GET") === "GET") return response(200, value, String(revision));
+    const base = init.headers["X-Airlock-Base-Revision"];
+    if (base !== String(revision)) return response(409, value, String(revision));
+    value = init.body;
+    revision += 1;
+    if (firstPut) {
+      firstPut = false;
+      return new Promise((resolve) => { releaseB = () => resolve(response(204, "", String(revision))); });
+    }
+    return response(204, "", String(revision));
+  };
+  const local = new Map();
+  const tabB = build({ respond, local });
+  await tabB.adapter.getItem(KEY);
+  const writeB = tabB.adapter.setItem(KEY, '{"order":"B"}');
+  await tick();
+  assert.equal(value, '{"order":"B"}');
+  assert.equal(revision, 2);
+
+  let holdA = false, releaseARead;
+  const tabA = build({
+    respond,
+    local,
+    beforeGet: (key) => holdA && key === `@airlock-pending:${KEY}`
+      ? new Promise((resolve) => { releaseARead = resolve; })
+      : undefined,
+  });
+  assert.equal(await tabA.adapter.getItem(KEY), '{"order":"B"}');
+  holdA = true;
+  const writeA = tabA.adapter.setItem(KEY, '{"order":"A"}');
+  await tick();
+  assert.ok(releaseARead, "tab A did not pause after durably writing its outbox");
+  releaseB();
+  await tick();
+  assert.match(local.get(`@airlock-pending:${KEY}`), /"value":"\{\\"order\\":\\"A\\"\}"/);
+  holdA = false;
+  releaseARead();
+  await Promise.all([writeA, writeB]);
+  assert.equal(value, '{"order":"A"}');
+  assert.equal(revision, 3);
+}
+
+// A stale tab gets 409, keeps the other device's value, and rehydrates the store.
+{
+  const server = revisionServer('{"order":"old"}');
+  const document = eventDocument();
+  const { adapter, local } = build({ respond: server.respond, document });
+  await adapter.getItem(KEY);
+  await server.respond("", { method: "PUT", headers: { "X-Airlock-Base-Revision": "1" }, body: '{"order":"other-device"}' });
+  let rehydrates = 0;
+  const store = { persist: { rehydrate: () => { rehydrates += 1; return adapter.getItem(KEY); } } };
+  new Function("f", "document", "Event", patcher.SIDEBAR_REHYDRATE_REVISIONED)(store, document, Event);
+  await adapter.setItem(KEY, '{"order":"stale-tab"}');
+  await tick();
+  assert.equal(server.value(), '{"order":"other-device"}');
+  assert.equal(local.get(KEY), '{"order":"other-device"}');
+  assert.equal(rehydrates, 1);
+}
+
+// An offline outbox is rejected if another device advances its base revision.
+{
+  const server = revisionServer('{"order":0}');
+  let online = true;
+  const respond = (...args) => online ? server.respond(...args) : Promise.reject(new Error("offline"));
+  const first = build({ respond });
+  await first.adapter.getItem(KEY);
+  online = false;
+  await first.adapter.setItem(KEY, '{"order":"offline"}');
+  assert.ok(first.local.has(`@airlock-pending:${KEY}`));
+  online = true;
+  await server.respond("", { method: "PUT", headers: { "X-Airlock-Base-Revision": "1" }, body: '{"order":"other-device"}' });
+  assert.equal(await first.adapter.getItem(KEY), '{"order":"other-device"}');
+  assert.equal(first.local.has(`@airlock-pending:${KEY}`), false);
+}
+
+// Legacy raw outboxes have no trustworthy base and are never transmitted.
+{
+  const server = revisionServer('{"order":"server"}', 7);
+  const { adapter, local, calls } = build(server);
+  local.set(KEY, '{"order":"legacy-pending"}');
+  local.set(`@airlock-pending:${KEY}`, '{"order":"legacy-pending"}');
+  assert.equal(await adapter.getItem(KEY), '{"order":"server"}');
+  assert.equal(calls.some((call) => call.method !== "GET"), false);
   assert.equal(local.has(`@airlock-pending:${KEY}`), false);
 }
 
-console.log("paseo ui-state adapter: immediate outbox, durable retry, generation ordering, serialization, and visibility safety passed");
+// An old/headerless backend never receives PUT/DELETE, even around write-before-read.
+{
+  const respond = async (_url, init = {}) => response((init.method ?? "GET") === "GET" ? 200 : 204, '{"old":"backend"}');
+  const { adapter, local, calls } = build({ respond });
+  await adapter.setItem(KEY, '{"local":1}');
+  await adapter.getItem(KEY);
+  await adapter.setItem(KEY, '{"local":2}');
+  await adapter.removeItem(KEY);
+  assert.equal(calls.filter((call) => call.method !== "GET").length, 0);
+  assert.equal(local.has(KEY), false);
+}
+
+// The versioned route encodes keys, and visibility still rehydrates only on return.
+{
+  const { adapter, calls } = build({ respond: async () => response(404, "", "0") });
+  await adapter.getItem("a/b?c");
+  assert.equal(calls[0].url, "/airlock-ui-state/v2/a%2Fb%3Fc");
+
+  const document = eventDocument();
+  document.visibilityState = "hidden";
+  let rehydrates = 0;
+  const store = { persist: { rehydrate: () => { rehydrates += 1; } } };
+  new Function("f", "document", "Event", patcher.SIDEBAR_REHYDRATE_REVISIONED)(store, document, Event);
+  document.dispatchEvent(new Event("visibilitychange"));
+  assert.equal(rehydrates, 0);
+  document.visibilityState = "visible";
+  document.dispatchEvent(new Event("visibilitychange"));
+  assert.equal(rehydrates, 1);
+}
+
+console.log("paseo ui-state adapter: revision CAS, stale convergence, rolling safety, and rehydrate wiring passed");

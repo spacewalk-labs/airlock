@@ -21,6 +21,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.path.join(HERE, 'backend', 'airlock-publish.py')
@@ -82,6 +84,133 @@ def page(share, name, body='<h1>hi</h1>'):
 
 
 OWNER = 'me@example.com'
+
+
+def backend_get(module, path, owner=OWNER):
+    """Issue one request to the in-process backend and return (status, JSON)."""
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    headers = {} if owner is None else {module.IDENTITY_HEADER: owner}
+    req = urllib.request.Request(
+        f'http://127.0.0.1:{server.server_port}{path}', headers=headers)
+    try:
+        try:
+            response = urllib.request.urlopen(req, timeout=2)
+        except urllib.error.HTTPError as exc:
+            response = exc
+        with response:
+            return response.status, json.loads(response.read().decode('utf-8'))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def t_title_meta(tmp):
+    print('\n[meta] one-document title metadata endpoint')
+    share, _pub, _state, env = make_dirs(
+        tmp, AIRLOCK_PUBLISH_TITLE_META='true',
+        AIRLOCK_IDENTITY_HEADER='X-Verified-Login')
+    m = load(env)
+    doc = os.path.join(share, 'named.html')
+    with open(doc, 'w', encoding='utf-8') as fh:
+        fh.write('<!doctype html><TITLE> Quarterly &amp; Plan </TITLE><p>private body</p>')
+    os.utime(doc, (1_700_000_000, 1_700_000_000))
+
+    status, body = backend_get(m, '/meta?name=named.html')
+    check('meta returns only name/title/mtime',
+          status == 200 and body == {
+              'name': 'named.html', 'title': 'Quarterly & Plan', 'mtime': 1_700_000_000},
+          f'{status} {body}')
+
+    implicit_head_titles = {
+        'meta-before-title.html': '<meta charset="utf-8"><title>After Meta</title><p>body</p>',
+        'link-before-title.html': '<link rel="icon" href="x"><title>After Link</title>',
+        'base-before-title.html': '<base href="/"><title>After Base</title>',
+        'script-before-title.html': '<script>const x = 1;</script><title>After Script</title>',
+    }
+    for implicit_name, implicit_html in implicit_head_titles.items():
+        with open(os.path.join(share, implicit_name), 'w', encoding='utf-8') as fh:
+            fh.write(implicit_html)
+        status, body = backend_get(m, '/publish/api/meta?name=' + implicit_name)
+        expected = implicit_name.split('-before-title.html', 1)[0].title()
+        check(f'meta follows the browser implicit-head title rules for {implicit_name}',
+              status == 200 and body['title'] == f'After {expected}', f'{status} {body}')
+
+    status, body = backend_get(m, '/publish/api/meta?name=missing.html')
+    check('meta returns a file-specific 404 rather than an absent-route 404',
+          status == 404 and body == {'ok': False, 'error': 'not found'},
+          f'{status} {body}')
+
+    no_title = os.path.join(share, 'untitled.html')
+    with open(no_title, 'w', encoding='utf-8') as fh:
+        fh.write('<p>no title element</p>')
+    status, body = backend_get(m, '/publish/api/meta?name=untitled.html')
+    check('meta falls back to the selected filename when title is absent',
+          status == 200 and set(body) == {'name', 'title', 'mtime'}
+          and body['name'] == 'untitled.html' and body['title'] == 'untitled.html'
+          and isinstance(body['mtime'], int), f'{status} {body}')
+
+    deceptive_titles = {
+        'comment-title.html': '<!-- <title>comment secret</title> --><p>body</p>',
+        'script-title.html': '<script>const x = "<title>script secret</title>"</script>',
+        'body-title.html': '<body><title>body secret</title></body>',
+        'svg-title.html': '<svg><title>svg secret</title></svg>',
+        'template-title.html': '<template><title>template secret</title></template>',
+        'main-title.html': '<main><title>main secret</title></main>',
+        'nested-head-title.html': '<head><svg><title>nested secret</title></svg></head>',
+        'implicit-body-title.html': '<p>private body</p><title>late secret</title>',
+        'text-body-title.html': 'private body<title>late secret</title>',
+        'after-head-title.html': '<head></head><title>late secret</title>',
+    }
+    for deceptive_name, deceptive_html in deceptive_titles.items():
+        with open(os.path.join(share, deceptive_name), 'w', encoding='utf-8') as fh:
+            fh.write(deceptive_html)
+        status, body = backend_get(m, '/publish/api/meta?name=' + deceptive_name)
+        check(f'meta does not expose title-like text from {deceptive_name}',
+              status == 200 and set(body) == {'name', 'title', 'mtime'}
+              and body['name'] == deceptive_name and body['title'] == deceptive_name
+              and isinstance(body['mtime'], int), f'{status} {body}')
+
+    linked_source = os.path.join(tmp, 'linked-source.html')
+    with open(linked_source, 'w', encoding='utf-8') as fh:
+        fh.write('<title>Linked document</title>')
+    os.symlink(linked_source, os.path.join(share, 'linked.html'))
+    status, body = backend_get(m, '/publish/api/meta?name=linked.html')
+    check('meta preserves the documented symlinked-document workflow',
+          status == 200 and body['title'] == 'Linked document', f'{status} {body}')
+
+    late_title = os.path.join(share, 'late-title.html')
+    with open(late_title, 'w', encoding='utf-8') as fh:
+        fh.write('x' * (m._TITLE_SCAN_CHARS + 1) + '<title>too late</title>')
+    status, body = backend_get(m, '/publish/api/meta?name=late-title.html')
+    check('meta bounds title scanning instead of reading an entire large file',
+          status == 200 and body['title'] == 'late-title.html', f'{status} {body}')
+
+    status, body = backend_get(m, '/meta?name=..%2Foutside.html')
+    check('meta rejects path traversal without leaking document data',
+          status == 400 and body == {'ok': False, 'error': 'name must be an HTML basename'},
+          f'{status} {body}')
+
+    with open(os.path.join(share, 'notes.txt'), 'w', encoding='utf-8') as fh:
+        fh.write('<title>private note</title>')
+    status, body = backend_get(m, '/meta?name=notes.txt')
+    check('meta rejects non-HTML share entries',
+          status == 400 and body == {'ok': False, 'error': 'name must be an HTML basename'},
+          f'{status} {body}')
+
+    status, body = backend_get(m, '/meta?name=named.html', owner=None)
+    check('meta requires the ingress identity header with a minimal error',
+          status == 403 and body == {'ok': False, 'error': 'identity header missing'},
+          f'{status} {body}')
+
+    status, body = backend_get(m, '/meta?name=named.html&name=other.html')
+    check('meta refuses ambiguous repeated names', status == 400, f'{status} {body}')
+
+    m_off = load({**env, 'AIRLOCK_PUBLISH_TITLE_META': 'false'})
+    status, body = backend_get(m_off, '/meta?name=named.html')
+    check('meta is absent by default', status == 404, f'{status} {body}')
 
 
 # ---------------------------------------------------------------- 1, 9, 11
@@ -1088,7 +1217,7 @@ def t_remote_contract_v1(tmp):
 
 
 def main():
-    for fn in (t_happy_path, t_slug_abuse, t_symlinked_source, t_empty_owner, t_owner_collision,
+    for fn in (t_title_meta, t_happy_path, t_slug_abuse, t_symlinked_source, t_empty_owner, t_owner_collision,
                t_crash_between, t_concurrent, t_corrupt_state, t_overlap_refused,
                t_config_shapes, t_remote_regression, t_bundle_plan_contract, t_gated_contract,
                t_gated_reconciliation_and_storage, t_local_bundle_limit,

@@ -24,6 +24,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 TMP="$(mktemp -d)" || { echo "FAIL could not create test directory" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
+SELFKILL_CGROUP="$TMP/cgroup"
+printf '%s\n' '0::/user.slice/user-1000.slice/session-fixture.scope' > "$SELFKILL_CGROUP"
+export AIRLOCK_SELFKILL_CGROUP_FILE="$SELFKILL_CGROUP"
 
 pass=0 fail=0
 ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
@@ -71,6 +74,8 @@ printf '%s\n' "\$*" >> "$TMP/systemctl.log"
 case "\$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left airlock-update-detect.timer airlock-update-detect.service' ;; esac
 # See the note in test-operator-surface.sh: a service installer asserts is-active.
 case "\$*" in *is-active*) printf '%s\n' active ;; esac
+# Ledger teardown verifies the stopped state before deleting any unit.
+case "\$*" in *show*) printf 'LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=0\n' ;; esac
 case "\$*" in *daemon-reload*) [ -e "$TMP/reload-fails" ] && exit 1 ;; esac
 # Real systemd's \`disable\` REMOVES a symlinked unit file itself. Opt-in seam
 # (flag file) so a test can model that; every other test sees the old shim.
@@ -194,6 +199,12 @@ orch() {
 }
 
 ledger_json() { cat "$STATE/app-ledger.json" 2>/dev/null || printf '{"version":1,"entries":{}}'; }
+transaction_phase() {
+  python3 - "$STATE/install-transaction.json" <<'PY' 2>/dev/null
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["phase"])
+PY
+}
 ledger_field() { # ledger_field <id> <python-expr over rec dict e> — committed record field
   ledger_json | python3 -c '
 import json, sys
@@ -805,11 +816,11 @@ EOF
 mkcfg "$F9/cfg/airlock.toml" "[apps.t4]" "backend_port = 18904" "[packages.t4]" "path = \"$F9/pkg\""
 out="$(orch "$F9/cfg/airlock.toml" 2>&1)" && rc=0 || rc=$?
 [ "$rc" != 0 ] || bad "F9b: crashing installer should fail the run"
-if [ "$(ledger_field t4 x '"intent" in e')" = True ] \
-   && [ "$(ledger_field t4 x '"committed" in e')" != True ]; then
-  ok "F9b: a run that dies after install leaves an intent entry, no commit"
+if [ "$(ledger_field t4 x '"intent" in e or "committed" in e')" != True ] \
+   && [ ! -e "$WEB/t4/marker" ] && [ "$(transaction_phase)" = rolled_back ]; then
+  ok "F9b: an ordinary install error removes the intent/artifact and records rolled_back"
 else
-  bad "F9b: intent state after crash (ledger: $(ledger_json | head -c 200))"
+  bad "F9b: install error was not compensated (ledger: $(ledger_json | head -c 200))"
 fi
 
 # Still desired -> the next run repairs by reinstalling.
@@ -1376,9 +1387,11 @@ manifest "$CS/p2/airlock-app.toml" v2 <<EOF
 [artifacts]
 files = ["$CS/real/shared"]
 EOF
-mkcfg "$CS/cfg2.toml" "[apps.v2]" "backend_port = 18921" "[packages.v2]" "path = \"$CS/p2\""
+mkcfg "$CS/cfg2.toml" \
+  "[apps.v1]" "backend_port = 18920" "[packages.v1]" "path = \"$CS/p1\"" \
+  "[apps.v2]" "backend_port = 18921" "[packages.v2]" "path = \"$CS/p2\""
 msg="$(run "$CS/cfg2.toml" validate 2>&1)" && rc=0 || rc=$?
-if [ "$rc" != 0 ] && grep -q "recorded under id 'v1'" <<<"$msg"; then
+if [ "$rc" != 0 ] && grep -q "overlapping artifacts" <<<"$msg"; then
   ok "canon: an alias-recorded artifact collides with a claim on the real path"
 else
   bad "canon: alias record and real claim live in different spaces (rc=$rc)"
@@ -1636,10 +1649,12 @@ files = ["$TSL/x/link/"]
 EOF
 mkcfg "$TSL/airlock.toml" "[apps.ts]" "backend_port = 18930" "[packages.ts]" "path = \"$TSL/pkg\""
 msg="$(run "$TSL/airlock.toml" validate 2>&1)" && rc=0 || rc=$?
-if [ "$rc" != 0 ] && grep -q "recorded under id 'zb'" <<<"$msg"; then
-  ok "canon: a trailing-slash declaration collides with the slashless record"
+handoff="$(run "$TSL/airlock.toml" package-info \
+  | "$ROOT/bin/airlock-ledger" handoffs ts 2>/dev/null || true)"
+if [ "$rc" = 0 ] && [ "$handoff" = zb ]; then
+  ok "canon: trailing-slash and slashless forms produce one transaction handoff"
 else
-  bad "canon: trailing slash made a second object of one link (rc=$rc)"
+  bad "canon: trailing slash missed the recorded owner handoff (rc=$rc handoff=${handoff:-none})"
 fi
 
 # Serve keys that do not end in _port join the same port-uniqueness pool,
@@ -1813,16 +1828,15 @@ exit 1
 EOF
 mkcfg "$IR/cfg/airlock.toml" "[apps.ir]" "backend_port = 18925" "[packages.ir]" "path = \"$IR/pkg\""
 orch "$IR/cfg/airlock.toml" >/dev/null 2>&1 && bad "intent-roots: crashing install passed"
-mkcfg "$IR/cfg/airlock.toml"   # package dropped: repair must tear the intent down
+rolled_back=0
+[ ! -e "$UU/ir.service" ] && [ "$(ledger_field ir x '"intent" in e')" != True ] \
+  && [ "$(transaction_phase)" = rolled_back ] && rolled_back=1
+mkcfg "$IR/cfg/airlock.toml"
 out="$(orch "$IR/cfg/airlock.toml" AIRLOCK_UNIT_DIR_USER="$TMP/mvroot" 2>&1)" && rc=0 || rc=$?
-moved_ok=0
-[ "$rc" != 0 ] && [ -f "$UU/ir.service" ] && [ "$(ledger_field ir x '"intent" in e')" = True ] && moved_ok=1
-out="$(orch "$IR/cfg/airlock.toml" 2>&1)" && rc=0 || rc=$?
-if [ "$moved_ok" = 1 ] && [ "$rc" = 0 ] && [ ! -e "$UU/ir.service" ] \
-   && [ "$(ledger_field ir x '"intent" in e')" != True ]; then
-  ok "intent-roots: a moved root env fails loudly; the true env converges"
+if [ "$rolled_back" = 1 ] && [ "$rc" = 0 ] && [ ! -e "$UU/ir.service" ]; then
+  ok "intent-roots: normal error compensates under the original root before a later env can move"
 else
-  bad "intent-roots: crash repair lost the recorded root (moved_ok=$moved_ok rc=$rc)"
+  bad "intent-roots: rollback did not close the original root (rolled_back=$rolled_back rc=$rc)"
 fi
 
 # An intent's serve VALUE map must be exactly its declared key set — an
@@ -2524,25 +2538,22 @@ fi
 f16_new_fixture
 printf 'crash-after-one\n' > "$F16/mode"
 out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
-f16_crash_nonce="$(f16_intent_nonce)"
-f16_crash_id="$(f16_state_eval "next(iter(s['objects'])) if len(s['objects']) == 1 else ''")"
-if [ "$rc" != 0 ] && [ -n "$f16_crash_nonce" ] && [[ "$f16_crash_id" =~ ^[0-9a-f]{64}$ ]] \
-   && [ "$(ledger_field t16 x '"intent" in e and "committed" not in e')" = True ]; then
-  ok "F16: crash after first create leaves one object and an intent-only nonce"
+if [ "$rc" != 0 ] \
+   && [ "$(f16_state_eval "len(s['objects'])")" = 0 ] \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ] \
+   && [ "$(transaction_phase)" = rolled_back ]; then
+  ok "F16: normal failure after first create removes the owned object and intent"
 else
-  bad "F16: crash fixture did not preserve its intent-only recovery record"
+  bad "F16: first-create failure was not transactionally compensated"
 fi
 rm -f "$F16/mode"
 : > "$F16_DOCKER_LOG"
 out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
-f16_retry_nonce="$(f16_nonce)"
-if [ "$rc" = 0 ] && [ "$f16_retry_nonce" != "$f16_crash_nonce" ] \
-   && f16_object_absent "$f16_crash_id" \
-   && [ "$(f16_log_eval "any(r.get('event') == 'inspect-result' and r.get('query') == '$f16_crash_id' and r.get('state') == 'ABSENT' and r.get('ledger_kind') == 'intent' for r in rows)")" = True ] \
+if [ "$rc" = 0 ] \
    && [ "$(ledger_field t16 x 'len(e.get("committed",{}).get("container_runtime",{}).get("objects",[]))')" = 2 ]; then
-  ok "F16: intent-crash retry proves old absence, journals a fresh nonce, and commits two"
+  ok "F16: retry after compensated first-create failure commits a fresh owned set"
 else
-  bad "F16: intent-crash retry reused/orphaned the old nonce set (rc=$rc)"
+  bad "F16: retry after compensated failure did not commit two (rc=$rc)"
 fi
 
 # Foreign namespace matrix: every incomplete/wrong ownership pair blocks an
@@ -2613,6 +2624,8 @@ cp "$F16_DOCKER_STATE" "$F16/docker.snapshot"
 f16_restore_fault() {
   cp "$F16/ledger.snapshot" "$STATE/app-ledger.json"
   cp "$F16/docker.snapshot" "$F16_DOCKER_STATE"
+  rm -f "$STATE/install-transaction.json"
+  rm -rf "$STATE/install-checkpoints"
   f16_control '{}'
   : > "$F16_DOCKER_LOG"
 }
@@ -2648,10 +2661,11 @@ fi
 f16_control '{}'
 : > "$F16_DOCKER_LOG"
 out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
-if [ "$f16_nonzero_first" = 1 ] && [ "$rc" = 0 ] \
+if [ "$f16_nonzero_first" = 1 ] && [ "$rc" != 0 ] \
    && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'rm-result'])")" = 0 ] \
-   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ]; then
-  ok "F16: non-zero rm followed by ABSENT retains once, then retry drops without another rm"
+   && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && [ "$(transaction_phase)" = degraded ]; then
+  ok "F16: partial container removal becomes durable degraded and blocks a guessing retry"
 else
   bad "F16: nonzero-rm/ABSENT retry semantics drifted (first=$f16_nonzero_first rc=$rc)"
 fi
@@ -2686,10 +2700,11 @@ f16_new_fixture
 printf 'outside-name\n' > "$F16/mode"
 out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
 f16_outside_id="$(f16_state_eval "next((oid for oid,o in s['objects'].items() if o['name'] == 't16-outside-declaration'),'')")"
-if [ "$rc" != 0 ] && [[ "$f16_outside_id" =~ ^[0-9a-f]{64}$ ]] \
-   && [ "$(ledger_field t16 x '"intent" in e and "committed" not in e')" = True ] \
+if [ "$rc" != 0 ] && [ -z "$f16_outside_id" ] \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ] \
+   && [ "$(transaction_phase)" = rolled_back ] \
    && grep -q "outside the declaration" <<<"$out"; then
-  ok "F16: exact-label object outside the namespace blocks commit and keeps intent"
+  ok "F16: outside-declaration object blocks commit and compensation removes the intent set"
 else
   bad "F16: outside-namespace exact-label object reached commit (rc=$rc)"
 fi
@@ -2697,7 +2712,7 @@ mkcfg "$F16/airlock.toml"
 rm -f "$F16/mode"
 : > "$F16_DOCKER_LOG"
 out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
-if [ "$rc" = 0 ] && f16_object_absent "$f16_outside_id" \
+if [ "$rc" = 0 ] \
    && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ]; then
   ok "F16: nonce-driven teardown removes the exact-label object outside the declaration"
 else
@@ -2716,20 +2731,21 @@ out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
 f16_race_id="$(f16_state_eval "next((oid for oid,o in s['objects'].items() if o['name'] == 'airlock-t16-race'),'')")"
 if [ "$rc" != 0 ] && [[ "$f16_race_id" =~ ^[0-9a-f]{64}$ ]] \
    && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && [ "$(transaction_phase)" = degraded ] \
    && grep -q "final container label-set is not empty" <<<"$out"; then
-  ok "F16: final label-set oracle catches a new same-nonce id and retains the record"
+  ok "F16: partial committed-container removal is retained and surfaced degraded"
 else
   bad "F16: final-oracle race escaped or lost its record (rc=$rc)"
 fi
 f16_control '{}'
 : > "$F16_DOCKER_LOG"
 out="$(orch "$F16/airlock.toml" 2>&1)" && rc=0 || rc=$?
-if [ "$rc" = 0 ] && f16_object_absent "$f16_race_id" \
-   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ] \
-   && ! grep -q "foreign container collision" <<<"$out"; then
-  ok "F16: retry removes the race id as unexpected owned, not foreign"
+if [ "$rc" != 0 ] && ! f16_object_absent "$f16_race_id" \
+   && [ "$(ledger_field t16 x '"committed" in e')" = True ] \
+   && grep -q "recovery remains degraded" <<<"$out"; then
+  ok "F16: unresolved container rollback blocks a new candidate instead of guessing"
 else
-  bad "F16: final-oracle retry did not converge as owned (rc=$rc)"
+  bad "F16: degraded container rollback did not block retry (rc=$rc)"
 fi
 
 # The load gate runs again inside smoke.sh, and smoke runs after install.sh
@@ -2764,9 +2780,10 @@ if [ "$rc" != 0 ] \
    `# object with the same collision wording, and the case would pass even if` \
    `# the smoke-phase gate had admitted a foreign nonce.` \
    && grep -q "container runtime admission failed for app 't16'" <<<"$out" \
-   && [ "$(ledger_field t16 x '"committed" in e')" != True ] \
+   && [ "$(ledger_field t16 x '"intent" in e or "committed" in e')" != True ] \
+   && [ "$(transaction_phase)" = rolled_back ] \
    && [ "$(f16_state_eval "any(o['name'] == 'airlock-t16-othernonce' for o in s['objects'].values())")" = True ] \
-   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'rm-result'])")" = 0 ]; then
+   && [ "$(f16_log_eval "len([r for r in rows if r.get('event') == 'rm-result']) > 0")" = True ]; then
   ok "F16: smoke-phase load still refuses a foreign namespace collision"
 else
   bad "F16: smoke-phase load lost the foreign namespace guard (rc=$rc)"
@@ -2879,22 +2896,25 @@ out_blast="$(orch "$BR/cfg/airlock.toml" 2>&1)" && rc_blast=0 || rc_blast=$?
 [ "$rc_blast" != 0 ] \
   && ok "F17: 비활성화 실패가 실행을 실패로 끝낸다 (조용히 넘어가지 않는다)" \
   || bad "F17: run exited 0 despite a failed deactivation"
-grep -q "reconcile FAILED: could not deactivate 'ba'" <<<"$out_blast" \
+grep -q "could not deactivate 'ba'" <<<"$out_blast" \
   && ok "F17: 실패한 패키지를 이름으로 말한다" \
   || bad "F17: failure was not named (out: $(tail -3 <<<"$out_blast"))"
-grep -q "skipping install of 'ba'" <<<"$out_blast" \
+! grep -q "installing packaged app: ba ($BR/a2)" <<<"$out_blast" \
   && ok "F17: 내리지 못한 패키지는 그 위에 설치하지 않는다" \
   || bad "F17: the failed package was installed over its stale artifacts"
 n_bb_after="$(grep -c '^ROOT=' "$TMP/invoke-bb.log" 2>/dev/null || echo 0)"
-[ "$n_bb_after" -gt "$n_bb_before" ] \
-  && ok "F17: 무관한 패키지는 그대로 재설치된다 (끌려 내려가지 않는다)" \
-  || bad "F17: bb was not reinstalled (before=$n_bb_before after=$n_bb_after)"
+[ "$n_bb_after" = "$n_bb_before" ] \
+  && ok "F17: 아직 차례가 아닌 패키지는 내리거나 다시 설치하지 않는다" \
+  || bad "F17: bb was unexpectedly reinstalled (before=$n_bb_before after=$n_bb_after)"
 [ -f "$WEB/bb/marker" ] \
-  && ok "F17: 무관한 패키지가 실제로 다시 서 있다" \
+  && ok "F17: 무관한 패키지는 계속 서 있다" \
   || bad "F17: bb marker missing after the run"
 [ "$(ledger_field ba x '"committed" in e')" = True ] \
   && ok "F17: 실패한 패키지의 기록은 남아 다음 실행이 재시도한다" \
   || bad "F17: ba ledger record was dropped despite the failed teardown"
+grep -q 'result=rolled_back' <<<"$out_blast" \
+  && ok "F17: platform 보상이 deactivator 재호출 없이 committed 상태를 복원한다" \
+  || bad "F17: platform compensation was not surfaced as rolled_back"
 
 # =============================================================================
 # F18 — disable 이 유닛 파일을 먼저 지워도 회수는 성공이어야 한다

@@ -47,7 +47,9 @@ else
   bad "units did not render the expected collector contract"
 fi
 if command -v systemd-analyze >/dev/null 2>&1; then
-  unit_check="$(systemd-analyze --user verify --recursive-errors=no "$SERVICE" "$TIMER" 2>&1)"
+  # User-unit verification needs a runtime directory even without a live manager.
+  mkdir -m 700 "$TMP/runtime"
+  unit_check="$(XDG_RUNTIME_DIR="$TMP/runtime" systemd-analyze --user verify --recursive-errors=no "$SERVICE" "$TIMER" 2>&1)"
   unit_rc=$?
   if [ "$unit_rc" = 0 ]; then
     ok "systemd-analyze accepts the rendered units"

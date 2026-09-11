@@ -9,9 +9,9 @@ event_id was already published — that is ordinary dedup, not an error.
 
 Usage (the spool path the installer creates):
   python3 emit_message.py --spool ~/.local/state/airlock/dev-monitor/spool \
-      --source disk --group-key disk:cleanup --kind action --urgency urgent \
+      --source disk --group-key disk:cleanup --level urgent \
       --title "Disk is at 92% — clean up?" \
-      --cwd /path/to/your/project --prompt "Clean up old logs" --explain "Frees disk space"
+      --cwd /path/to/your/project --prompt "Clean up old logs"
 
 Or set DEV_MONITOR_SPOOL instead of passing --spool.
 
@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 def emit(spool, payload):
     """Atomically publish. Returns: 'queued' (spool publish succeeded — **not collector acceptance**) | 'duplicate'."""
-    event_id = payload['event_id']
+    event_id = payload.get('id', payload.get('event_id'))
     new_dir = os.path.join(spool, 'new')
     tmp_dir = os.path.join(spool, 'tmp')
     # Do not create the spool — if it is absent, this box has no message channel (observation-only) or the path is wrong.
@@ -69,25 +69,13 @@ def main():
     ap.add_argument('--spool', default=os.environ.get('DEV_MONITOR_SPOOL'))
     ap.add_argument('--source', required=True)
     ap.add_argument('--group-key', required=True)
-    ap.add_argument('--kind', choices=('action', 'info', 'link'), default='info')
-    ap.add_argument('--urgency', choices=('urgent', 'normal'), default='normal')
+    ap.add_argument('--level', '--urgency', dest='level', choices=('urgent', 'normal'), default='normal')
     ap.add_argument('--title', required=True)
     ap.add_argument('--body', default='')
     ap.add_argument('--event-id', default=None)
-    # action
     ap.add_argument('--cwd')
-    ap.add_argument('--skill')
     ap.add_argument('--prompt')
-    ap.add_argument('--exec', nargs='+', dest='exec_argv',
-                    help='action: invoke the executable directly (first argument=absolute executable path, rest=arguments). Does not go through Claude')
-    ap.add_argument('--explain')
-    # link
-    ap.add_argument('--url', help='link kind: http(s) URL (opens a new tab when clicked)')
-    ap.add_argument('--label', help='link kind: display label (defaults to title)')
-    # info
-    ap.add_argument('--outcome', default='')
-    ap.add_argument('--why', default='')
-    ap.add_argument('--followup', default='none')
+    ap.add_argument('--url', help='http(s) link')
     a = ap.parse_args()
     if not a.spool:
         sys.exit('DEV_MONITOR_SPOOL is not set (or use --spool)')
@@ -96,37 +84,16 @@ def main():
     event_id = a.event_id or ('%s-%s-%s' % (
         a.source, now.strftime('%Y-%m-%dT%H:%M:%SZ'), uuid.uuid4().hex[:4]))
     payload = {
-        'schema_version': 1, 'event_id': event_id, 'group_key': a.group_key,
-        'source': a.source, 'kind': a.kind, 'urgency': a.urgency,
+        'id': event_id, 'group': a.group_key,
+        'source': a.source, 'level': a.level,
         'title': a.title, 'body': a.body,
-        'created_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
     }
-    if a.kind == 'action':
-        # Checked here rather than left to the watcher: without it the script prints
-        # 'queued' and the payload is quarantined in bad/ where nobody looks.
-        if not a.cwd or not a.explain:
-            sys.exit('action kind requires --cwd and --explain')
-        if not (a.exec_argv or a.skill or a.prompt):
-            sys.exit('action kind requires exactly one of --exec, --skill or --prompt')
-        ra = {'cwd': a.cwd, 'explain': a.explain}
-        if a.exec_argv:
-            ra['exec'] = a.exec_argv
-        elif a.skill:
-            ra['skill'] = a.skill
-        elif a.prompt:
-            ra['prompt'] = a.prompt
-        payload['recommended_action'] = ra
-    elif a.kind == 'link':
-        if not a.url:
-            sys.exit('link kind requires --url')
-        ln = {'url': a.url}
-        if a.label:
-            ln['label'] = a.label
-        payload['link'] = ln
-    else:
-        payload.update(outcome=a.outcome or a.title,
-                       why_it_matters=a.why or a.body or a.title,
-                       followup=a.followup)
+    if a.cwd or a.prompt:
+        if not a.cwd or not a.prompt:
+            sys.exit('run requires --cwd and --prompt')
+        payload['run'] = {'cwd': a.cwd, 'prompt': a.prompt}
+    if a.url:
+        payload['link'] = a.url
     result = emit(a.spool, payload)
     print('%s: %s' % (result, event_id))
     if result == 'queued':

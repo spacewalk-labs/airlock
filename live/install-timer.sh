@@ -40,6 +40,41 @@ die() { printf '[timer] FATAL: %s\n' "$*" >&2; exit 1; }
 
 UNITS=(airlock-live-verify.service airlock-live-verify.timer airlock-live-failed.service)
 
+# Retire live units that this version no longer declares. This stays local instead of
+# sourcing install/lib.sh: the live installer is deliberately standalone, with its own
+# diagnostics and no dependency on the main installer's preflight or globals.
+#
+# The marker is the ownership boundary. Another installer's marked units and unmarked app
+# units may share the airlock- prefix, but are structurally out of reach here.
+#
+# This is not retroactive: only units rendered after X-Airlock-Owner was introduced are
+# visible to the sweep. A unit retired in the same revision that introduced the marker
+# would remain unmarked and could not be found by later runs.
+sweep_live_platform_units() {
+  [ "$#" -gt 0 ] \
+    || die "refusing to sweep with an empty declared set (owner=airlock-live)"
+
+  [ -d "$UNITDIR" ] || return 0
+
+  local declared=" $* " removed=0 path base
+  # Timers first, so a trigger is stopped before the service it starts is removed.
+  for path in "$UNITDIR"/*.timer "$UNITDIR"/*.service; do
+    [ -f "$path" ] || continue
+    base="$(basename "$path")"
+    grep -qx 'X-Airlock-Owner=airlock-live' "$path" || continue
+    case "$declared" in *" $base "*) continue ;; esac
+
+    say "removing orphaned platform unit: $base (no longer declared)"
+    systemctl --user disable --now "$base" >/dev/null 2>&1 \
+      || say "WARN: could not disable $base — removing the file anyway"
+    rm -f -- "$path" || die "could not remove orphaned unit $base"
+    removed=$((removed + 1))
+  done
+
+  [ "$removed" -eq 0 ] || say "swept $removed orphaned platform unit(s)"
+  return 0
+}
+
 if [ "$UNINSTALL" = 1 ]; then
   systemctl --user disable --now airlock-live-verify.timer >/dev/null 2>&1 || true
   for u in "${UNITS[@]}"; do rm -f "$UNITDIR/$u"; done
@@ -77,6 +112,7 @@ for u in "${UNITS[@]}"; do
 done
 say "rendered ${#UNITS[@]} units into $UNITDIR"
 
+sweep_live_platform_units "${UNITS[@]}"
 systemctl --user daemon-reload || die "daemon-reload failed"
 systemctl --user enable --now airlock-live-verify.timer >/dev/null 2>&1 \
   || die "could not enable the timer"

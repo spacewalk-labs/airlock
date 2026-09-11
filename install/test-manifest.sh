@@ -2282,7 +2282,16 @@ EOF
 printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP/outside-smoke.sh"
 chmod +x "$pkg/install.sh" "$TMP/outside-smoke.sh"
 cfg="$CFGROOT/a24.toml"; make_pkg_cfg "$cfg" swapapp "$pkg"
-out24="$(env AIRLOCK_CONFIG="$cfg" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" \
+# This case judges the post-validation script re-check, not the independent
+# self-kill escape.  A suite hosted by airlock-*.service would otherwise move
+# the inner run to a transient service whose diagnostics correctly go to the
+# journal, outside this command substitution.  Use the escape's cgroup test
+# seam for this invocation only; H64 above remains a real cross-layer canary
+# for the caller-environment forwarding contract.
+printf '0::/user.slice/user-1000.slice/user@1000.service/session.slice/airlock-test.scope\n' \
+  >"$TMP/a24-neutral-cgroup"
+out24="$(env AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/a24-neutral-cgroup" \
+  AIRLOCK_CONFIG="$cfg" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" \
   bash "$ROOT/install/airlock-install.sh" 2>&1)"; rc24=$?
 if [ "$rc24" -ne 0 ] && grep -Fq "regular non-symlink file" <<<"$out24" \
    && ! grep -Fq "smoke: swapapp" <<<"$out24"; then
@@ -2421,6 +2430,7 @@ fi
 # is removed (the same exclusivity serve values already had).
 reset_box
 pkg="$PKGROOT/d44-span-ledger"; mkpkg "$pkg" d44 backend_port
+other_pkg="$PKGROOT/d44-other"; mkpkg "$other_pkg" otherapp
 pkg_manifest "$pkg" 'contract = 1' 'id = "d44"' \
   '[config.defaults]' 'backend_port = 19000' 'slots = 2' \
   '[[config.port_spans]]' 'base = "backend_port"' 'count = "slots"'
@@ -2441,6 +2451,10 @@ cat >"$STATE/app-ledger.json" <<EOF
 }
 EOF
 cfg="$CFGROOT/d44.toml"; make_pkg_cfg "$cfg" d44 "$pkg"
+{
+  printf '[apps.otherapp]\n'
+  printf '[packages.otherapp]\npath = "%s"\n' "$other_pkg"
+} >>"$cfg"
 expect_fail "D44 a port span covering another id's recorded serve port is fatal" \
   "port span covering 19001" run "$cfg" validate
 

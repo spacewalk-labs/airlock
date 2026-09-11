@@ -355,6 +355,110 @@ else
   bad "a stale release changed or was allowed on the box (rc=$direction_run_rc): $direction_run_out"
 fi
 
+# A long-lived box accumulates one local marker commit per update.  The newest marker
+# is enough to establish direction; scanning the rest through a truncating pipeline
+# can make a normal forward measurement fail with SIGPIPE once the history outgrows
+# the pipe buffer.
+LONG_MARKER_BOX="$scratch/long-marker-box"
+mkdir -p "$LONG_MARKER_BOX"
+git -C "$DIRECTION_REL" archive "$direction_old" | tar -x -C "$LONG_MARKER_BOX"
+git -C "$LONG_MARKER_BOX" init -q -b main
+git -C "$LONG_MARKER_BOX" remote add airlock-release "$DIRECTION_REL"
+git -C "$LONG_MARKER_BOX" fetch -q airlock-release "$direction_current"
+git -C "$LONG_MARKER_BOX" add -A
+long_marker_tree="$(git -C "$LONG_MARKER_BOX" write-tree)"
+long_marker_parent=""
+for _ in $(seq 1 1100); do
+  if [ -n "$long_marker_parent" ]; then
+    long_marker_parent="$(printf 'airlock-update: 배포본 %s 으로 갱신\n' \
+      "${direction_old:0:12}" | git -C "$LONG_MARKER_BOX" commit-tree \
+      "$long_marker_tree" -p "$long_marker_parent")"
+  else
+    long_marker_parent="$(printf 'airlock-update: 배포본 %s 으로 갱신\n' \
+      "${direction_old:0:12}" | git -C "$LONG_MARKER_BOX" commit-tree "$long_marker_tree")"
+  fi
+done
+git -C "$LONG_MARKER_BOX" update-ref refs/heads/main "$long_marker_parent"
+[ "$(git -C "$LONG_MARKER_BOX" rev-list --count HEAD)" = 1100 ] \
+  && ok "positive control: the long-lived box has 1100 update markers" \
+  || bad "positive control: the long-lived box did not retain its marker history"
+long_marker_json="$(AIRLOCK_DIR="$LONG_MARKER_BOX" AIRLOCK_RELEASE_URL="$DIRECTION_REL" \
+  AIRLOCK_RELEASE_REF="$direction_current" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/long-marker.err")"; long_marker_rc=$?
+if [ "$long_marker_rc" = 0 ] && printf '%s' "$long_marker_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is True, value
+assert value["changedCount"] > 0, value
+'; then
+  ok "a long marker history still reports a forward release"
+else
+  bad "a long marker history turned a forward release into failure (rc=$long_marker_rc): $long_marker_json"
+fi
+
+# `git log --grep` searches the whole commit message, not only its subject.  An
+# operator note whose body merely quotes a marker must not hide the older real marker.
+git -C "$LONG_MARKER_BOX" commit -q --allow-empty -m "operator note" \
+  -m "airlock-update: 배포본 ${direction_current:0:12} 으로 갱신"
+if [ "$(git -C "$LONG_MARKER_BOX" log -1 --format=%s)" = "operator note" ] \
+  && git -C "$LONG_MARKER_BOX" log -1 --format=%b \
+    | grep -Fxq "airlock-update: 배포본 ${direction_current:0:12} 으로 갱신"; then
+  ok "positive control: a newer operator commit quotes a marker only in its body"
+else
+  bad "positive control: the operator commit does not exercise body-only marker text"
+fi
+marker_body_json="$(AIRLOCK_DIR="$LONG_MARKER_BOX" AIRLOCK_RELEASE_URL="$DIRECTION_REL" \
+  AIRLOCK_RELEASE_REF="$direction_current" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/marker-body.err")"; marker_body_rc=$?
+if [ "$marker_body_rc" = 0 ] && printf '%s' "$marker_body_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is True, value
+assert value["changedCount"] > 0, value
+'; then
+  ok "body-only marker text cannot shadow the newest real marker"
+else
+  bad "body-only marker text hid the real marker (rc=$marker_body_rc): $marker_body_json"
+fi
+
+# FETCH_HEAD preserves an annotated tag object instead of peeling it.  The updater
+# must normalize a release ref to its commit before writing the local marker, or the
+# next detector run rejects the updater's own marker as a non-commit Source-Digest.
+git -C "$DIRECTION_REL" tag -a release-current-tag \
+  -m "annotated current release" "$direction_current"
+direction_tag="$(git -C "$DIRECTION_REL" rev-parse refs/tags/release-current-tag)"
+[ "$direction_tag" != "$direction_current" ] \
+  && [ "$(git -C "$DIRECTION_REL" cat-file -t "$direction_tag")" = tag ] \
+  && ok "positive control: the release ref is an annotated tag object" \
+  || bad "positive control: the release ref did not preserve its tag object"
+TAG_RELEASE_BOX="$scratch/tag-release-box"
+mkdir -p "$TAG_RELEASE_BOX"
+git -C "$DIRECTION_REL" archive "$direction_old" | tar -x -C "$TAG_RELEASE_BOX"
+git -C "$TAG_RELEASE_BOX" init -q -b main
+git -C "$TAG_RELEASE_BOX" remote add airlock-release "$DIRECTION_REL"
+git -C "$TAG_RELEASE_BOX" fetch -q airlock-release "$direction_old"
+git -C "$TAG_RELEASE_BOX" add -A
+git -C "$TAG_RELEASE_BOX" commit -q \
+  -m "airlock-update: 배포본 ${direction_old:0:12} 으로 갱신"
+tag_update_out="$(AIRLOCK_DIR="$TAG_RELEASE_BOX" AIRLOCK_RELEASE_URL="$DIRECTION_REL" \
+  AIRLOCK_RELEASE_REF=release-current-tag bash "$UPDATE" --no-install 2>&1)"; tag_update_rc=$?
+[ "$tag_update_rc" = 0 ] && grep -q 'release-current' "$TAG_RELEASE_BOX/README.md" \
+  && ok "an annotated release ref updates to its commit tree" \
+  || bad "an annotated release ref did not update (rc=$tag_update_rc): $tag_update_out"
+tag_second_json="$(AIRLOCK_DIR="$TAG_RELEASE_BOX" AIRLOCK_RELEASE_URL="$DIRECTION_REL" \
+  AIRLOCK_RELEASE_REF=release-current-tag bash "$UPDATE" --dry-run --json \
+  2>"$scratch/tag-second.err")"; tag_second_rc=$?
+if [ "$tag_second_rc" = 0 ] && printf '%s' "$tag_second_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is False, value
+assert value["changedCount"] == 0, value
+'; then
+  ok "an annotated release marker remains measurable on the next detection"
+else
+  bad "an annotated release poisoned its next detector result (rc=$tag_second_rc): $tag_second_json"
+fi
+
 # A deployment checkout has the private source graph, but its HEAD can be an
 # unrelated-history merge wrapper.  Compare the release subject's source SHA with the
 # checkout's merge-base against fresh private main; comparing it with HEAD directly
@@ -412,6 +516,10 @@ git -C "$PRIVATE_PUBLIC" add -A
 git -C "$PRIVATE_PUBLIC" commit -q \
   -m "release from other-source @ ${private_current:0:7}"
 private_public_mismatch="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
+seed_tree "$PRIVATE_PUBLIC" private-no-provenance
+git -C "$PRIVATE_PUBLIC" add -A
+git -C "$PRIVATE_PUBLIC" commit -q -m "release without provenance"
+private_public_no_provenance="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
 
 PRIVATE_BOX="$scratch/private-deployment"
 git clone -q "$PRIVATE_REL" "$PRIVATE_BOX"
@@ -419,10 +527,400 @@ canonical_private="https://github.com/spacewalk-labs/${PRIVATE_SOURCE_NAME}.git"
 git -C "$PRIVATE_BOX" remote set-url origin "$canonical_private"
 git -C "$PRIVATE_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
 git -C "$PRIVATE_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
-git -C "$PRIVATE_BOX" fetch -q airlock-release main
+git -C "$PRIVATE_BOX" fetch -q airlock-release "$private_public_current"
 git -C "$PRIVATE_BOX" merge -q --allow-unrelated-histories -s ours \
   -m "deploy current release" FETCH_HEAD
 private_deploy_head="$(git -C "$PRIVATE_BOX" rev-parse HEAD)"
+
+# One detection may contact one repository.  Count the real `git fetch` argv rather
+# than scraping progress text; the first fetch is also the positive control that the
+# counter is live.  A private deployment used to fetch the public release here and
+# then fetch private origin/main again inside release_direction().
+FETCH_COUNT_BIN="$scratch/fetch-count-bin"
+FETCH_COUNT_LOG="$scratch/private-fetches.log"
+mkdir -p "$FETCH_COUNT_BIN"
+real_git="$(command -v git)"
+cat >"$FETCH_COUNT_BIN/git" <<SH
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if [ "\$arg" = fetch ]; then
+    printf '%s\n' "\$*" >>"\$AIRLOCK_FETCH_COUNT_LOG"
+    break
+  fi
+done
+exec "$real_git" "\$@"
+SH
+chmod 755 "$FETCH_COUNT_BIN/git"
+: >"$FETCH_COUNT_LOG"
+private_fetch_json="$(PATH="$FETCH_COUNT_BIN:$PATH" AIRLOCK_FETCH_COUNT_LOG="$FETCH_COUNT_LOG" \
+  AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_current" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/private-fetch-count.err")"; private_fetch_json_rc=$?
+private_fetch_count="$(wc -l <"$FETCH_COUNT_LOG" | tr -d ' ')"
+[ "$private_fetch_count" -ge 1 ] \
+  && ok "positive control: the fetch counter sees the release fetch" \
+  || bad "positive control: the fetch counter saw no fetch"
+[ "$private_fetch_json_rc" = 0 ] && [ "$private_fetch_count" = 1 ] \
+  && ok "one private-deployment detection performs exactly one fetch" \
+  || bad "one private-deployment detection performed $private_fetch_count fetches (rc=$private_fetch_json_rc): $private_fetch_json"
+
+# If the local private-main evidence is unavailable, direction is unknown.  The
+# detector must fail so devmon_updates leaves its last complete snapshot and original
+# checkedAt untouched; successful {available:false} would overwrite that truth with a
+# fresh-looking zero.  The git shim also prevents this fixture from reaching a private
+# remote if the updater regresses to fetching it again.
+PRIVATE_NO_TIP_BOX="$scratch/private-no-tip"
+git clone -q "$PRIVATE_BOX" "$PRIVATE_NO_TIP_BOX"
+git -C "$PRIVATE_NO_TIP_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_NO_TIP_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_NO_TIP_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
+git -C "$PRIVATE_NO_TIP_BOX" update-ref -d refs/remotes/origin/main
+NO_PRIVATE_FETCH_BIN="$scratch/no-private-fetch-bin"
+mkdir -p "$NO_PRIVATE_FETCH_BIN"
+cat >"$NO_PRIVATE_FETCH_BIN/git" <<SH
+#!/usr/bin/env bash
+if [ "\$*" = "fetch -q origin main" ]; then
+  exit 72
+fi
+exec "$real_git" "\$@"
+SH
+chmod 755 "$NO_PRIVATE_FETCH_BIN/git"
+private_no_tip_json="$(PATH="$NO_PRIVATE_FETCH_BIN:$PATH" AIRLOCK_DIR="$PRIVATE_NO_TIP_BOX" \
+  AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_current" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/private-no-tip.err")"; private_no_tip_rc=$?
+[ "$private_no_tip_rc" -ne 0 ] && [ -z "$private_no_tip_json" ] \
+  && ok "missing private-main evidence fails detection instead of publishing a fresh zero" \
+  || bad "missing private-main evidence became a fresh detector result (rc=$private_no_tip_rc): $private_no_tip_json"
+
+# Reading the fetched candidate's provenance is itself part of the measurement.  A
+# failed subject read must not look like a semantic source mismatch and publish a
+# fresh zero/checkedAt through the collector.
+CANDIDATE_LOG_FAIL_BIN="$scratch/candidate-log-fail-bin"
+mkdir -p "$CANDIDATE_LOG_FAIL_BIN"
+cat >"$CANDIDATE_LOG_FAIL_BIN/git" <<SH
+#!/usr/bin/env bash
+if [ "\${1-}" = log ] && [ "\${2-}" = -1 ] && [ "\${3-}" = --format=%s ] \
+   && [ "\${4-}" = "$private_public_current" ]; then
+  exit 72
+fi
+exec "$real_git" "\$@"
+SH
+chmod 755 "$CANDIDATE_LOG_FAIL_BIN/git"
+candidate_log_fail_json="$(PATH="$CANDIDATE_LOG_FAIL_BIN:$PATH" AIRLOCK_DIR="$PRIVATE_BOX" \
+  AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_current" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/candidate-log-fail.err")"; candidate_log_fail_rc=$?
+[ "$candidate_log_fail_rc" -ne 0 ] && [ -z "$candidate_log_fail_json" ] \
+  && ok "a failed candidate provenance read preserves the previous detector snapshot" \
+  || bad "a failed candidate provenance read published a fresh result (rc=$candidate_log_fail_rc): $candidate_log_fail_json"
+
+# Missing origin configuration is a legitimate generic checkout; failure to read an
+# existing private identity is not.  It must not bypass the private provenance path.
+ORIGIN_CONFIG_FAIL_BIN="$scratch/origin-config-fail-bin"
+mkdir -p "$ORIGIN_CONFIG_FAIL_BIN"
+cat >"$ORIGIN_CONFIG_FAIL_BIN/git" <<SH
+#!/usr/bin/env bash
+if [ "\${1-}" = config ] && [ "\${2-}" = --get ] \
+   && [ "\${3-}" = remote.origin.url ]; then
+  exit 72
+fi
+exec "$real_git" "\$@"
+SH
+chmod 755 "$ORIGIN_CONFIG_FAIL_BIN/git"
+origin_config_fail_json="$(PATH="$ORIGIN_CONFIG_FAIL_BIN:$PATH" AIRLOCK_DIR="$PRIVATE_BOX" \
+  AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_current" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/origin-config-fail.err")"; origin_config_fail_rc=$?
+[ "$origin_config_fail_rc" -ne 0 ] && [ -z "$origin_config_fail_json" ] \
+  && ok "a failed origin identity read preserves the previous detector snapshot" \
+  || bad "a failed origin identity read published a fresh result (rc=$origin_config_fail_rc): $origin_config_fail_json"
+
+# A present origin/main is not necessarily a current one.  Rewind only that tracking
+# ref while keeping the S1+R1 deployment at HEAD; an R0 request must not mistake S0
+# for the deployed source and overwrite S1 with the older release.
+PRIVATE_REWIND_BOX="$scratch/private-rewind"
+git clone -q "$PRIVATE_BOX" "$PRIVATE_REWIND_BOX"
+git -C "$PRIVATE_REWIND_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_REWIND_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_REWIND_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
+git -C "$PRIVATE_REWIND_BOX" update-ref refs/remotes/origin/main "$private_old"
+private_rewind_head="$(git -C "$PRIVATE_REWIND_BOX" rev-parse HEAD)"
+private_rewind_out="$(AIRLOCK_DIR="$PRIVATE_REWIND_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --no-install 2>&1)"; private_rewind_rc=$?
+[ "$private_rewind_rc" -ne 0 ] \
+  && [ "$(git -C "$PRIVATE_REWIND_BOX" rev-parse HEAD)" = "$private_rewind_head" ] \
+  && grep -q 'private-current' "$PRIVATE_REWIND_BOX/README.md" \
+  && ok "a stale private-main tracking ref cannot rewind a deployed checkout" \
+  || bad "a stale private-main tracking ref rewound the deployment (rc=$private_rewind_rc): $private_rewind_out"
+
+# A release records an object-id prefix, not a revision name.  A local branch with the
+# same seven hexadecimal characters must not redirect provenance resolution to S0.
+PRIVATE_PREFIX_REF_BOX="$scratch/private-prefix-ref"
+git clone -q "$PRIVATE_BOX" "$PRIVATE_PREFIX_REF_BOX"
+git -C "$PRIVATE_PREFIX_REF_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_PREFIX_REF_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_PREFIX_REF_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
+git -C "$PRIVATE_PREFIX_REF_BOX" update-ref refs/remotes/origin/main "$private_old"
+git -C "$PRIVATE_PREFIX_REF_BOX" branch "${private_current:0:7}" "$private_old"
+private_prefix_ref_head="$(git -C "$PRIVATE_PREFIX_REF_BOX" rev-parse HEAD)"
+private_prefix_ref_out="$(AIRLOCK_DIR="$PRIVATE_PREFIX_REF_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --no-install 2>&1)"; private_prefix_ref_rc=$?
+[ "$private_prefix_ref_rc" -ne 0 ] \
+  && [ "$(git -C "$PRIVATE_PREFIX_REF_BOX" rev-parse HEAD)" = "$private_prefix_ref_head" ] \
+  && grep -q 'private-current' "$PRIVATE_PREFIX_REF_BOX/README.md" \
+  && ok "a ref named like a source digest cannot redirect provenance or rewind" \
+  || bad "a source-digest ref collision rewound the deployment (rc=$private_prefix_ref_rc): $private_prefix_ref_out"
+
+# A failed installed-history read is failed provenance, not permission to fall back to
+# a stale tracking ref.  The shim targets only that exact graph-read shape; release fetch
+# and the candidate subject read remain live controls elsewhere in this fixture.
+PRIVATE_LOG_FAIL_BOX="$scratch/private-log-fail"
+git clone -q "$PRIVATE_BOX" "$PRIVATE_LOG_FAIL_BOX"
+git -C "$PRIVATE_LOG_FAIL_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_LOG_FAIL_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_LOG_FAIL_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
+git -C "$PRIVATE_LOG_FAIL_BOX" update-ref refs/remotes/origin/main "$private_old"
+private_log_fail_head="$(git -C "$PRIVATE_LOG_FAIL_BOX" rev-parse HEAD)"
+LOG_FAIL_BIN="$scratch/history-log-fail-bin"
+mkdir -p "$LOG_FAIL_BIN"
+cat >"$LOG_FAIL_BIN/git" <<SH
+#!/usr/bin/env bash
+if [ "\${1-}" = rev-list ] && [ "\${2-}" = --first-parent ] \
+   && [ "\${3-}" = --parents ] && [ "\${4-}" = "$private_log_fail_head" ]; then
+  exit 72
+fi
+exec "$real_git" "\$@"
+SH
+chmod 755 "$LOG_FAIL_BIN/git"
+private_log_fail_json="$(PATH="$LOG_FAIL_BIN:$PATH" AIRLOCK_DIR="$PRIVATE_LOG_FAIL_BOX" \
+  AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_old" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/private-log-fail.err")"; private_log_fail_json_rc=$?
+[ "$private_log_fail_json_rc" -ne 0 ] && [ -z "$private_log_fail_json" ] \
+  && ok "a failed installed-history read preserves the previous detector snapshot" \
+  || bad "a failed installed-history read published a fresh result (rc=$private_log_fail_json_rc): $private_log_fail_json"
+private_log_fail_out="$(PATH="$LOG_FAIL_BIN:$PATH" AIRLOCK_DIR="$PRIVATE_LOG_FAIL_BOX" \
+  AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_old" \
+  bash "$UPDATE" --no-install 2>&1)"; private_log_fail_rc=$?
+[ "$private_log_fail_rc" -ne 0 ] \
+  && [ "$(git -C "$PRIVATE_LOG_FAIL_BOX" rev-parse HEAD)" = "$private_log_fail_head" ] \
+  && grep -q 'private-current' "$PRIVATE_LOG_FAIL_BOX/README.md" \
+  && ok "a failed installed-history read cannot fall back to stale provenance" \
+  || bad "a failed installed-history read rewound the deployment (rc=$private_log_fail_rc): $private_log_fail_out"
+
+# Commit timestamps and a whole-graph `git log` do not identify which public release
+# was deployed last.  Preserve two divergent public release parents under HEAD, make
+# the older deployment's timestamp newer, and require the last deployment merge to
+# win.  Otherwise requesting R0 can silently replace the later S1+R1 deployment.
+DIVERGENT_PUBLIC="$scratch/private-divergent/$PRIVATE_PUBLIC_NAME"
+seed_tree "$DIVERGENT_PUBLIC" private-old
+git -C "$DIVERGENT_PUBLIC" init -q -b old
+git -C "$DIVERGENT_PUBLIC" add -A
+GIT_AUTHOR_DATE='2030-01-01T00:00:00Z' GIT_COMMITTER_DATE='2030-01-01T00:00:00Z' \
+  git -C "$DIVERGENT_PUBLIC" commit -q \
+  -m "release from ${PRIVATE_SOURCE_NAME} @ ${private_old:0:7}"
+divergent_public_old="$(git -C "$DIVERGENT_PUBLIC" rev-parse HEAD)"
+git -C "$DIVERGENT_PUBLIC" checkout -q --orphan current
+git -C "$DIVERGENT_PUBLIC" rm -q -rf .
+seed_tree "$DIVERGENT_PUBLIC" private-current
+git -C "$DIVERGENT_PUBLIC" add -A
+GIT_AUTHOR_DATE='2020-01-01T00:00:00Z' GIT_COMMITTER_DATE='2020-01-01T00:00:00Z' \
+  git -C "$DIVERGENT_PUBLIC" commit -q \
+  -m "release from ${PRIVATE_SOURCE_NAME} @ ${private_current:0:7}"
+divergent_public_current="$(git -C "$DIVERGENT_PUBLIC" rev-parse HEAD)"
+
+PRIVATE_DIVERGENT_BOX="$scratch/private-divergent-deployment"
+git clone -q "$PRIVATE_REL" "$PRIVATE_DIVERGENT_BOX"
+git -C "$PRIVATE_DIVERGENT_BOX" checkout -q -b deployed-divergent "$private_old"
+git -C "$PRIVATE_DIVERGENT_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_DIVERGENT_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_DIVERGENT_BOX" remote add airlock-release "$DIVERGENT_PUBLIC"
+git -C "$PRIVATE_DIVERGENT_BOX" fetch -q airlock-release "$divergent_public_old"
+git -C "$PRIVATE_DIVERGENT_BOX" merge -q --allow-unrelated-histories -s ours \
+  -m "deploy old divergent release" FETCH_HEAD
+git -C "$PRIVATE_DIVERGENT_BOX" merge -q \
+  -m "advance private source" "$private_current"
+git -C "$PRIVATE_DIVERGENT_BOX" fetch -q airlock-release "$divergent_public_current"
+git -C "$PRIVATE_DIVERGENT_BOX" merge -q --allow-unrelated-histories -s ours \
+  -m "deploy current divergent release" FETCH_HEAD
+git -C "$PRIVATE_DIVERGENT_BOX" update-ref refs/remotes/origin/main "$private_old"
+private_divergent_head="$(git -C "$PRIVATE_DIVERGENT_BOX" rev-parse HEAD)"
+private_divergent_out="$(AIRLOCK_DIR="$PRIVATE_DIVERGENT_BOX" \
+  AIRLOCK_RELEASE_URL="$DIVERGENT_PUBLIC" AIRLOCK_RELEASE_REF="$divergent_public_old" \
+  bash "$UPDATE" --no-install 2>&1)"; private_divergent_rc=$?
+[ "$private_divergent_rc" -ne 0 ] \
+  && [ "$(git -C "$PRIVATE_DIVERGENT_BOX" rev-parse HEAD)" = "$private_divergent_head" ] \
+  && grep -q 'private-current' "$PRIVATE_DIVERGENT_BOX/README.md" \
+  && ok "the last deployment merge wins when public release histories diverge" \
+  || bad "commit-date ordering selected an older divergent release (rc=$private_divergent_rc): $private_divergent_out"
+
+# A ref can exist and still be too old.  Keep origin/main at the deployed source while
+# making the newer source object available under no ref, so this distinguishes a real
+# freshness check from a mere "does the ref exist?" check.
+seed_tree "$PRIVATE_REL" private-future
+git -C "$PRIVATE_REL" add -A
+git -C "$PRIVATE_REL" commit -q -m "private future"
+private_future="$(git -C "$PRIVATE_REL" rev-parse HEAD)"
+seed_tree "$PRIVATE_PUBLIC" private-future
+git -C "$PRIVATE_PUBLIC" add -A
+git -C "$PRIVATE_PUBLIC" commit -q \
+  -m "release from ${PRIVATE_SOURCE_NAME} @ ${private_future:0:7}"
+private_public_future="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
+git -C "$PRIVATE_BOX" fetch -q "$PRIVATE_REL" "$private_future"
+[ "$(git -C "$PRIVATE_BOX" rev-parse refs/remotes/origin/main)" = "$private_current" ] \
+  && git -C "$PRIVATE_BOX" cat-file -e "${private_future}^{commit}" \
+  && ok "positive control: private main is stale while the future source object exists" \
+  || bad "positive control: stale private-main fixture is not discriminating"
+private_old_tip_json="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_future" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/private-old-tip.err")"; private_old_tip_rc=$?
+if [ "$private_old_tip_rc" = 0 ] && printf '%s' "$private_old_tip_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is True, value
+assert value["changedCount"] > 0, value
+'; then
+  ok "public release ancestry keeps forward detection live with a stale private-main ref"
+else
+  bad "a stale private-main ref hid a forward release (rc=$private_old_tip_rc): $private_old_tip_json"
+fi
+
+# The normal future-release case does not have the future private source object at
+# all.  Clone only reachable deployment refs after the object-only fetch above, then
+# pin its remote-tracking main to the deployed source and prove the object is absent.
+PRIVATE_NO_SOURCE_BOX="$scratch/private-no-source"
+git clone -q --no-local "file://$PRIVATE_BOX" "$PRIVATE_NO_SOURCE_BOX"
+git -C "$PRIVATE_NO_SOURCE_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_NO_SOURCE_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_NO_SOURCE_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
+git -C "$PRIVATE_NO_SOURCE_BOX" update-ref refs/remotes/origin/main "$private_current"
+if git -C "$PRIVATE_NO_SOURCE_BOX" cat-file -e "${private_future}^{commit}" 2>/dev/null; then
+  bad "positive control: the future private source leaked into the no-source fixture"
+else
+  ok "positive control: the future private source object is absent"
+fi
+private_no_source_json="$(AIRLOCK_DIR="$PRIVATE_NO_SOURCE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_future" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/private-no-source.err")"; private_no_source_rc=$?
+if [ "$private_no_source_rc" = 0 ] && printf '%s' "$private_no_source_json" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["available"] is True, value
+assert value["changedCount"] > 0, value
+'; then
+  ok "public release ancestry detects forward without the future private source object"
+else
+  bad "a missing future private source object hid a forward release (rc=$private_no_source_rc): $private_no_source_json"
+fi
+
+# Candidate-history provenance must pass through the same unique-commit resolver as
+# every other Source-Digest consumer.  A textual prefix match is not evidence when
+# Git reports that the prefix names more than one object.
+PRIVATE_AMBIGUOUS_HISTORY_BOX="$scratch/private-ambiguous-history"
+git clone -q --no-local "file://$PRIVATE_NO_SOURCE_BOX" "$PRIVATE_AMBIGUOUS_HISTORY_BOX"
+git -C "$PRIVATE_AMBIGUOUS_HISTORY_BOX" checkout -q -B installed-source "$private_current"
+git -C "$PRIVATE_AMBIGUOUS_HISTORY_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_AMBIGUOUS_HISTORY_BOX" config \
+  "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_AMBIGUOUS_HISTORY_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
+git -C "$PRIVATE_AMBIGUOUS_HISTORY_BOX" update-ref \
+  refs/remotes/origin/main "$private_current"
+[ "$(git -C "$PRIVATE_AMBIGUOUS_HISTORY_BOX" rev-parse HEAD)" = "$private_current" ] \
+  && ! git -C "$PRIVATE_AMBIGUOUS_HISTORY_BOX" cat-file -e \
+    "${private_future}^{commit}" 2>/dev/null \
+  && ok "positive control: candidate history must recover the installed source" \
+  || bad "positive control: another provenance path can decide the ambiguous-history fixture"
+AMBIGUOUS_HISTORY_BIN="$scratch/ambiguous-history-bin"
+mkdir -p "$AMBIGUOUS_HISTORY_BIN"
+ambiguous_history_peer="${private_current:0:7}${private_old:7}"
+cat >"$AMBIGUOUS_HISTORY_BIN/git" <<SH
+#!/usr/bin/env bash
+if [ "\${1-}" = rev-parse ] \
+   && [ "\${2-}" = "--disambiguate=${private_current:0:7}" ]; then
+  printf '%s\n' "$private_current" "$ambiguous_history_peer"
+  exit 0
+fi
+exec "$real_git" "\$@"
+SH
+chmod 755 "$AMBIGUOUS_HISTORY_BIN/git"
+ambiguous_history_objects="$(cd "$PRIVATE_AMBIGUOUS_HISTORY_BOX" \
+  && PATH="$AMBIGUOUS_HISTORY_BIN:$PATH" \
+  git rev-parse --disambiguate="${private_current:0:7}")"
+printf '%s\n' "$ambiguous_history_objects" | awk \
+  -v prefix="${private_current:0:7}" 'NF { count++; if (index($0, prefix) != 1) bad=1 } END { exit !(count == 2 && !bad) }' \
+  && ok "positive control: the installed-source token resolves to two objects" \
+  || bad "positive control: the installed-source token is not ambiguous"
+ambiguous_history_json="$(PATH="$AMBIGUOUS_HISTORY_BIN:$PATH" \
+  AIRLOCK_DIR="$PRIVATE_AMBIGUOUS_HISTORY_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_future" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/ambiguous-history.err")"; ambiguous_history_rc=$?
+[ "$ambiguous_history_rc" -ne 0 ] && [ -z "$ambiguous_history_json" ] \
+  && ok "an ambiguous candidate-history source digest preserves the detector snapshot" \
+  || bad "an ambiguous candidate-history source digest became a fresh result (rc=$ambiguous_history_rc): $ambiguous_history_json"
+
+# Zero matching objects is a normal consequence of the one-fetch design, but failure
+# of the object lookup command is not.  Only the former may use public ancestry.
+DISAMBIGUATE_FAIL_BIN="$scratch/disambiguate-fail-bin"
+mkdir -p "$DISAMBIGUATE_FAIL_BIN"
+cat >"$DISAMBIGUATE_FAIL_BIN/git" <<SH
+#!/usr/bin/env bash
+if [ "\${1-}" = rev-parse ] \
+   && [ "\${2-}" = "--disambiguate=${private_future:0:7}" ]; then
+  exit 72
+fi
+exec "$real_git" "\$@"
+SH
+chmod 755 "$DISAMBIGUATE_FAIL_BIN/git"
+disambiguate_fail_json="$(PATH="$DISAMBIGUATE_FAIL_BIN:$PATH" \
+  AIRLOCK_DIR="$PRIVATE_NO_SOURCE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_future" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/disambiguate-fail.err")"; disambiguate_fail_rc=$?
+[ "$disambiguate_fail_rc" -ne 0 ] && [ -z "$disambiguate_fail_json" ] \
+  && ok "a failed object-prefix lookup preserves the previous detector snapshot" \
+  || bad "an object-prefix lookup failure became a fresh result (rc=$disambiguate_fail_rc): $disambiguate_fail_json"
+
+# A Source-Digest names a private commit.  If its unique object prefix peels only to
+# a blob, public release ancestry must not reinterpret that malformed provenance as a
+# merely absent future source and install it.
+seed_tree "$PRIVATE_PUBLIC" private-invalid-source
+printf 'not a commit\n' >"$PRIVATE_PUBLIC/invalid-source-object"
+git -C "$PRIVATE_PUBLIC" add -A
+invalid_source_blob="$(git -C "$PRIVATE_PUBLIC" hash-object invalid-source-object)"
+git -C "$PRIVATE_PUBLIC" commit -q \
+  -m "release from ${PRIVATE_SOURCE_NAME} @ ${invalid_source_blob:0:7}"
+private_public_invalid_source="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
+PRIVATE_INVALID_SOURCE_BOX="$scratch/private-invalid-source"
+git clone -q "$PRIVATE_BOX" "$PRIVATE_INVALID_SOURCE_BOX"
+git -C "$PRIVATE_INVALID_SOURCE_BOX" remote set-url origin "$canonical_private"
+git -C "$PRIVATE_INVALID_SOURCE_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$PRIVATE_INVALID_SOURCE_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
+private_invalid_source_head="$(git -C "$PRIVATE_INVALID_SOURCE_BOX" rev-parse HEAD)"
+private_invalid_source_out="$(AIRLOCK_DIR="$PRIVATE_INVALID_SOURCE_BOX" \
+  AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_invalid_source" \
+  bash "$UPDATE" --no-install 2>&1)"; private_invalid_source_rc=$?
+[ "$private_invalid_source_rc" -ne 0 ] \
+  && [ "$(git -C "$PRIVATE_INVALID_SOURCE_BOX" rev-parse HEAD)" = "$private_invalid_source_head" ] \
+  && grep -q 'private-current' "$PRIVATE_INVALID_SOURCE_BOX/README.md" \
+  && ok "a non-commit source digest cannot bypass provenance through public ancestry" \
+  || bad "a release naming a blob as its source was installed (rc=$private_invalid_source_rc): $private_invalid_source_out"
+
+# An annotated tag's object ID is not the commit it targets.  Source-Digest must
+# name the commit object itself; accepting the tag object via ^{commit} would turn
+# malformed provenance into a successful, fresh detector result.
+git -C "$PRIVATE_INVALID_SOURCE_BOX" tag -a invalid-source-tag \
+  -m "invalid source tag" "$private_current"
+invalid_source_tag="$(git -C "$PRIVATE_INVALID_SOURCE_BOX" rev-parse refs/tags/invalid-source-tag)"
+[ "$(git -C "$PRIVATE_INVALID_SOURCE_BOX" cat-file -t "$invalid_source_tag")" = tag ] \
+  && ok "positive control: the invalid source digest names an annotated tag object" \
+  || bad "positive control: the invalid source digest is not an annotated tag object"
+seed_tree "$PRIVATE_PUBLIC" private-invalid-tag-source
+git -C "$PRIVATE_PUBLIC" add -A
+git -C "$PRIVATE_PUBLIC" commit -q \
+  -m "release from ${PRIVATE_SOURCE_NAME} @ ${invalid_source_tag:0:12}"
+private_public_invalid_tag_source="$(git -C "$PRIVATE_PUBLIC" rev-parse HEAD)"
+private_invalid_tag_json="$(AIRLOCK_DIR="$PRIVATE_INVALID_SOURCE_BOX" \
+  AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_invalid_tag_source" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/private-invalid-tag.err")"; private_invalid_tag_rc=$?
+[ "$private_invalid_tag_rc" -ne 0 ] && [ -z "$private_invalid_tag_json" ] \
+  && ok "an annotated-tag source digest preserves the previous detector snapshot" \
+  || bad "an annotated-tag source digest became a fresh result (rc=$private_invalid_tag_rc): $private_invalid_tag_json"
 
 private_stale_json="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
   AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --dry-run --json \
@@ -476,6 +974,16 @@ private_mismatch_rc=$?
   && ok "a release naming another source is refused before checkout mutation" \
   || bad "a mismatched release source reached the checkout (rc=$private_mismatch_rc): $private_mismatch_out"
 
+# A well-formed release naming another source is a measured semantic non-update,
+# covered above.  A candidate with no source provenance is different: the detector
+# cannot measure its direction and must leave the collector's last snapshot intact.
+private_no_provenance_json="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
+  AIRLOCK_RELEASE_REF="$private_public_no_provenance" bash "$UPDATE" --dry-run --json \
+  2>"$scratch/private-no-provenance.err")"; private_no_provenance_rc=$?
+[ "$private_no_provenance_rc" -ne 0 ] && [ -z "$private_no_provenance_json" ] \
+  && ok "a release without provenance preserves the previous detector snapshot" \
+  || bad "a release without provenance published a fresh zero (rc=$private_no_provenance_rc): $private_no_provenance_json"
+
 PRIVATE_OLD_BOX="$scratch/private-old-deployment"
 git clone -q "$PRIVATE_REL" "$PRIVATE_OLD_BOX"
 git -C "$PRIVATE_OLD_BOX" checkout -q -b deploy-old "$private_old"
@@ -522,16 +1030,9 @@ diff_fail_head="$(git -C "$BOX" rev-parse HEAD)"
 diff_fail_json="$(PATH="$DIFF_FAIL_BIN:$PATH" AIRLOCK_DIR="$BOX" \
   AIRLOCK_RELEASE_URL="$REL" bash "$UPDATE" --dry-run --json \
   2>"$scratch/diff-fail.err")"; diff_fail_json_rc=$?
-if [ "$diff_fail_json_rc" = 0 ] && printf '%s' "$diff_fail_json" | python3 -c '
-import json, sys
-value = json.load(sys.stdin)
-assert value["available"] is False, value
-assert value["changedCount"] == 0, value
-'; then
-  ok "a failed direction diff produces no update badge"
-else
-  bad "a failed direction diff became an available update: $diff_fail_json"
-fi
+[ "$diff_fail_json_rc" -ne 0 ] && [ -z "$diff_fail_json" ] \
+  && ok "a failed direction diff preserves the previous detector snapshot" \
+  || bad "a failed direction diff published a fresh result (rc=$diff_fail_json_rc): $diff_fail_json"
 diff_fail_out="$(PATH="$DIFF_FAIL_BIN:$PATH" AIRLOCK_DIR="$BOX" \
   AIRLOCK_RELEASE_URL="$REL" bash "$UPDATE" --no-install 2>&1)"
 diff_fail_rc=$?
@@ -540,6 +1041,56 @@ diff_fail_rc=$?
   && grep -q 'version old' "$BOX/README.md" \
   && ok "a failed direction diff is refused before checkout mutation" \
   || bad "a failed direction diff was treated as a match (rc=$diff_fail_rc): $diff_fail_out"
+
+# A marker resolves direction without consulting the worktree diff above.  Exercise
+# the later, final changed-file measurement independently: its failure must still be
+# a detector failure, never a fresh-looking zero result.
+MARKER_DIFF_BOX="$scratch/marker-diff-box"
+mkdir -p "$MARKER_DIFF_BOX"
+git -C "$DIRECTION_REL" archive "$direction_old" | tar -x -C "$MARKER_DIFF_BOX"
+git -C "$MARKER_DIFF_BOX" init -q -b main
+git -C "$MARKER_DIFF_BOX" remote add airlock-release "$DIRECTION_REL"
+git -C "$MARKER_DIFF_BOX" fetch -q airlock-release "$direction_current"
+git -C "$MARKER_DIFF_BOX" add -A
+git -C "$MARKER_DIFF_BOX" commit -q \
+  -m "airlock-update: 배포본 ${direction_old:0:12} 으로 갱신"
+marker_diff_json="$(PATH="$DIFF_FAIL_BIN:$PATH" AIRLOCK_DIR="$MARKER_DIFF_BOX" \
+  AIRLOCK_RELEASE_URL="$DIRECTION_REL" AIRLOCK_RELEASE_REF="$direction_current" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/marker-diff.err")"; marker_diff_rc=$?
+[ "$marker_diff_rc" -ne 0 ] && [ -z "$marker_diff_json" ] \
+  && ok "a failed final diff after marker direction preserves the detector snapshot" \
+  || bad "a failed final diff after marker direction published a fresh result (rc=$marker_diff_rc): $marker_diff_json"
+
+AWK_FAIL_BIN="$scratch/awk-fail-bin"
+mkdir -p "$AWK_FAIL_BIN"
+cat >"$AWK_FAIL_BIN/awk" <<'SH'
+#!/usr/bin/env bash
+exit 72
+SH
+chmod 755 "$AWK_FAIL_BIN/awk"
+marker_count_json="$(PATH="$AWK_FAIL_BIN:$PATH" AIRLOCK_DIR="$MARKER_DIFF_BOX" \
+  AIRLOCK_RELEASE_URL="$DIRECTION_REL" AIRLOCK_RELEASE_REF="$direction_current" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/marker-count.err")"; marker_count_rc=$?
+[ "$marker_count_rc" -ne 0 ] && [ -z "$marker_count_json" ] \
+  && ok "a failed final change count preserves the detector snapshot" \
+  || bad "a failed final change count exited successfully (rc=$marker_count_rc): $marker_count_json"
+
+JSON_FAIL_BIN="$scratch/json-fail-bin"
+mkdir -p "$JSON_FAIL_BIN"
+cat >"$JSON_FAIL_BIN/python3" <<SH
+#!/usr/bin/env bash
+if [ "\${1-}" = - ] && { [ "\${2-}" = 0 ] || [ "\${2-}" = 1 ]; }; then
+  exit 72
+fi
+exec "$(command -v python3)" "\$@"
+SH
+chmod 755 "$JSON_FAIL_BIN/python3"
+marker_json_fail_out="$(PATH="$JSON_FAIL_BIN:$PATH" AIRLOCK_DIR="$MARKER_DIFF_BOX" \
+  AIRLOCK_RELEASE_URL="$DIRECTION_REL" AIRLOCK_RELEASE_REF="$direction_current" \
+  bash "$UPDATE" --dry-run --json 2>"$scratch/marker-json-fail.err")"; marker_json_fail_rc=$?
+[ "$marker_json_fail_rc" -ne 0 ] && [ -z "$marker_json_fail_out" ] \
+  && ok "a failed JSON serialization is not reported as detector success" \
+  || bad "a failed JSON serialization exited successfully (rc=$marker_json_fail_rc): $marker_json_fail_out"
 
 # ---------------------------------------------------------------- 5) refuses strangers
 notabox="$scratch/not-a-checkout"; mkdir -p "$notabox"; printf 'hi\n' > "$notabox/file"

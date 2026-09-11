@@ -42,10 +42,25 @@ TMP="$(mktemp -d)"
 NGTMP=""
 NGSOCKDIR=""
 NGINX_PARITY_PID=""
+NGINX_META_OFF_PID=""
+META_BACKEND_PID=""
+META_OFF_BACKEND_PID=""
 nginx_parity_cleanup() {
   if [ -n "$NGINX_PARITY_PID" ] && kill -0 "$NGINX_PARITY_PID" 2>/dev/null; then
     kill -TERM "$NGINX_PARITY_PID" 2>/dev/null || true
     wait "$NGINX_PARITY_PID" 2>/dev/null || true
+  fi
+  if [ -n "$META_BACKEND_PID" ] && kill -0 "$META_BACKEND_PID" 2>/dev/null; then
+    kill -TERM "$META_BACKEND_PID" 2>/dev/null || true
+    wait "$META_BACKEND_PID" 2>/dev/null || true
+  fi
+  if [ -n "$NGINX_META_OFF_PID" ] && kill -0 "$NGINX_META_OFF_PID" 2>/dev/null; then
+    kill -TERM "$NGINX_META_OFF_PID" 2>/dev/null || true
+    wait "$NGINX_META_OFF_PID" 2>/dev/null || true
+  fi
+  if [ -n "$META_OFF_BACKEND_PID" ] && kill -0 "$META_OFF_BACKEND_PID" 2>/dev/null; then
+    kill -TERM "$META_OFF_BACKEND_PID" 2>/dev/null || true
+    wait "$META_OFF_BACKEND_PID" 2>/dev/null || true
   fi
   [ -z "$NGTMP" ] || chmod 700 "$NGTMP/private" 2>/dev/null || true
   rm -rf "$TMP"
@@ -240,9 +255,10 @@ done
 
 # ===========================================================================
 # dev-monitor — apps/dev-monitor/render.sh
-# Branch: MESSAGES (true vs false) adds the owner_location NGXOWNER block to
-# the nginx fragment and changes the unit's Environment=...MESSAGES=
-# literal. Sets: messages-off, messages-on. Plus a cors_origins="" variant
+# Branch: MESSAGES (true vs false) adds the broad message-console owner location
+# while the narrow updates, harness, app-store, and home-order owner locations are
+# always rendered; it also changes the unit's Environment=...MESSAGES= literal.
+# Sets: messages-off, messages-on. Plus a cors_origins="" variant
 # (FQDN unresolved — install.sh:59-69) since it is a real, cheap-to-cover
 # value case for the same unit heredoc.
 #
@@ -255,6 +271,11 @@ done
 # ===========================================================================
 APP="$ROOT/apps/dev-monitor"
 . "$APP/render.sh"
+for kind in service timer; do
+  f="$(out_file)"
+  render_to "$f" render_dev_monitor_heartbeat "$kind" "/home/example/.local/state/airlock/dev-monitor/spool"
+  golden_check_file "dev-monitor/heartbeat/airlock-devmon-heartbeat.$kind" "$f"
+done
 # Direct renderer cases do not source install/lib.sh, so hand in the same D5 value
 # explicitly. An empty golden would prove only that the line exists, not that the
 # platform path survives the package-local rename.
@@ -263,34 +284,13 @@ AIRLOCK_ACCOUNTS_STATUS_BIN="/opt/example/airlock/bin/airlock-accounts-status"
 # proxy secret in a committed golden would turn a fixture into a credential copy.
 f="$(out_file)"; render_to "$f" render_dev_monitor_env \
   "owner@fixture.dev" "" "/home/example/.local/state/airlock/dev-monitor" \
-  "/home/example" "devmon-exec" "" "" "https://box.example.ts.net/monitor/#messages"
+  "/home/example" "devmon-exec" "" "https://box.example.ts.net/monitor/#messages"
 golden_check_file "dev-monitor/env/messages-on.env.txt" "$f"
-# The email lane configured, pinned separately. The lane being off is the shape most boxes
-# have, so it is the shape a golden most easily freezes by accident: without this case a
-# renderer that dropped all five SMTP lines would still match the golden above, and the
-# email path would go missing with nothing to see. The password stays empty here for the
-# same reason the webhooks do.
-f_mail="$(out_file)"; render_to "$f_mail" render_dev_monitor_env \
-  "owner@fixture.dev" "" "/home/example/.local/state/airlock/dev-monitor" \
-  "/home/example" "devmon-exec" "" "" "https://box.example.ts.net/monitor/#messages" \
-  "relay.example.com" "587" "dev-monitor@example.com" "owner@fixture.dev" "devmon" ""
-golden_check_file "dev-monitor/env/messages-on-email.env.txt" "$f_mail"
-# The roster path (P4) configured, pinned separately for the same reason the email lane
-# is: unconfigured is the shape most boxes have (the golden above), so it is the shape a
-# regression most easily hides behind. A path is not a secret, so unlike the SMTP/webhook
-# fixtures this one carries a real-looking value rather than an empty placeholder.
-f_roster="$(out_file)"; render_to "$f_roster" render_dev_monitor_env \
-  "owner@fixture.dev" "" "/home/example/.local/state/airlock/dev-monitor" \
-  "/home/example" "devmon-exec" "" "" "https://box.example.ts.net/monitor/#messages" \
-  "" "" "" "" "" "" "/home/example/.local/state/roster/roster.json"
-golden_check_file "dev-monitor/env/messages-on-roster.env.txt" "$f_roster"
-for f_secret in "$f" "$f_mail" "$f_roster"; do
-  if grep -Eq '^(DEV_MONITOR_PROXY_SECRET|DEV_MONITOR_SMTP_PASSWORD|AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_(URGENT|ROUTINE))=.+$' "$f_secret"; then
-    bad "dev-monitor env golden source contains a non-empty secret"
-  else
-    ok "dev-monitor env golden source contains no non-empty secret"
-  fi
-done
+if grep -Eq '^(DEV_MONITOR_PROXY_SECRET|AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT)=.+$' "$f"; then
+  bad "dev-monitor env golden source contains a non-empty secret"
+else
+  ok "dev-monitor env golden source contains no non-empty secret"
+fi
 for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
   BACKEND_PORT=19200; IDENTITY_HEADER="Tailscale-User-Login"
   DEVMON_ENV="/home/example/.config/airlock/dev-monitor.env"
@@ -299,11 +299,11 @@ for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
   DEVMON_SECRET="deadbeefcafef00d"
   TOKEN_ARGS=()
   case "$SET" in
-    messages-off) MESSAGES=false; owner_location="" ;;
+    messages-off) MESSAGES=false ;;
     messages-on)
       MESSAGES=true
       ;;
-    messages-off-no-cors) MESSAGES=false; owner_location=""; cors_origins="" ;;
+    messages-off-no-cors) MESSAGES=false; cors_origins="" ;;
     token-freshness-on)
       MESSAGES=true
       TOKEN_ARGS=(true 6 12)
@@ -313,9 +313,20 @@ for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
   f="$(out_file)"; render_to "$f" render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_origins" "$DEVMON_ENV" ${TOKEN_ARGS[@]+"${TOKEN_ARGS[@]}"}
   golden_check_file "dev-monitor/$SET/unit.service" "$f"
 
+  apps_location=""
+  f="$(out_file)"; render_to "$f" render_dev_monitor_owner_location \
+    "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" '= /monitor/api/owner/apps'
+  apps_location="$(cat "$f")"
+  f="$(out_file)"; render_to "$f" render_dev_monitor_owner_location \
+    "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" '/monitor/api/owner/apps/'
+  apps_location="$apps_location$(cat "$f")"
+  f="$(out_file)"; render_to "$f" render_dev_monitor_owner_location \
+    "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET" '= /monitor/api/owner/home/order'
+  owner_location="$apps_location$(cat "$f")"
+
   if [ "$MESSAGES" = true ]; then
     f="$(out_file)"; render_to "$f" render_dev_monitor_owner_location "$BACKEND_PORT" "$hdr_var" "$DEVMON_SECRET"
-    owner_location="$(cat "$f")"
+    owner_location="$owner_location$(cat "$f")"
   fi
 
   f="$(out_file)"; render_to "$f" render_dev_monitor_owner_location \
@@ -330,7 +341,42 @@ for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
   f="$(out_file)"; render_to "$f" render_dev_monitor_nginx \
     "$BACKEND_PORT" "$updates_location" "$owner_location"
   golden_check_file "dev-monitor/$SET/nginx.conf" "$f"
+  if grep -qxF 'location = /monitor/api/owner/apps {' "$f" \
+      && grep -qxF 'location /monitor/api/owner/apps/ {' "$f" \
+      && grep -qxF 'location = /monitor/api/owner/home/order {' "$f"; then
+    ok "dev-monitor $SET: app-store and home-order stay on narrow owner routes"
+  else
+    bad "dev-monitor $SET: app-store or home-order owner route missing"
+  fi
+  if [ "$MESSAGES" = true ]; then
+    if grep -qxF 'location /monitor/api/owner/ {' "$f"; then
+      ok "dev-monitor $SET: message console keeps its broad owner route"
+    else
+      bad "dev-monitor $SET: message console owner route missing"
+    fi
+  elif grep -qxF 'location /monitor/api/owner/ {' "$f"; then
+    bad "dev-monitor $SET: messages-off broadened the owner route"
+  else
+    ok "dev-monitor $SET: messages-off has no broad owner route"
+  fi
 done
+
+# The config path is a trailing compatibility argument. Direct callers and old
+# fixtures that omit it must remain byte-identical to callers that pass an explicit
+# empty value; only the real installer is allowed to add AIRLOCK_CONFIG to the unit.
+devmon_omitted="$(out_file)"; devmon_empty="$(out_file)"
+render_to "$devmon_omitted" render_dev_monitor_unit \
+  19200 false Tailscale-User-Login box.example.ts.net,box \
+  /home/example/.config/airlock/dev-monitor.env false 24 24 false "" "" "" ""
+render_to "$devmon_empty" render_dev_monitor_unit \
+  19200 false Tailscale-User-Login box.example.ts.net,box \
+  /home/example/.config/airlock/dev-monitor.env false 24 24 false "" "" "" "" ""
+if cmp -s "$devmon_omitted" "$devmon_empty" \
+    && ! grep -q '^Environment=.*AIRLOCK_CONFIG=' "$devmon_empty"; then
+  ok "dev-monitor empty config path preserves the historical unit bytes"
+else
+  bad "dev-monitor empty config path changed the historical unit bytes"
+fi
 
 # ===========================================================================
 # devterm — apps/devterm/render.sh
@@ -639,7 +685,7 @@ for SET in mode-remote mode-local; do
   esac
 
   f="$(out_file)"; render_to "$f" render_publish_unit_service "$BACKEND_PORT" "$SHARE_DIR" "$UPLOADS_DIR" "$IDENTITY_HEADER" \
-    "$INGEST_URL" "$BASE_URL" "$TOKEN_ENV" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" "$TOKEN_HEADER"
+    "$INGEST_URL" "$BASE_URL" "$TOKEN_ENV" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" "$TOKEN_HEADER" "" owner
   golden_check_file "publish/$SET/unit-service.service" "$f"
 
   f="$(out_file)"; render_to "$f" render_publish_unit_cleanup "$UPLOADS_DIR" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN"
@@ -660,6 +706,24 @@ for SET in mode-remote mode-local; do
     golden_check_file "publish/$SET/nginx-gated-retracted.conf" "$f"
   fi
 done
+
+# The opt-in adds one core exact route and one backend environment flag. The
+# publish app fragment itself remains byte-identical, so a missing/stale fragment
+# cannot turn the core gate exception into an SPA fallback.
+f="$(out_file)"; render_to "$f" render_publish_unit_service "$BACKEND_PORT" "$SHARE_DIR" "$UPLOADS_DIR" "$IDENTITY_HEADER" \
+  "$INGEST_URL" "$BASE_URL" "$TOKEN_ENV" remote "" "$STATE_DIR" "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" "$TOKEN_HEADER" "" owner true
+if grep -qxF 'Environment=AIRLOCK_PUBLISH_TITLE_META=true' "$f"; then
+  ok "publish/title-meta: true reaches the backend unit environment"
+else
+  bad "publish/title-meta: true did not reach the backend unit environment"
+fi
+f="$(out_file)"; render_to "$f" render_publish_unit_service "$BACKEND_PORT" "$SHARE_DIR" "$UPLOADS_DIR" "$IDENTITY_HEADER" \
+  "$INGEST_URL" "$BASE_URL" "$TOKEN_ENV" remote "" "$STATE_DIR" "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" "$TOKEN_HEADER" "" owner false
+if ! grep -qF 'AIRLOCK_PUBLISH_TITLE_META' "$f"; then
+  ok "publish/title-meta: false leaves the backend opt-in absent"
+else
+  bad "publish/title-meta: false unexpectedly enabled the backend opt-in"
+fi
 
 SET=sed-metachars
 SHARE_DIR_META='/opt/airlock/sha&re|dir\with'
@@ -722,6 +786,80 @@ else
   sed 's/^/    /' "$NGTMP/site.err"
 fi
 
+NGMETAOFFCFG="$NGTMP/airlock-title-meta-off.toml"
+NGMETAONCFG="$NGTMP/airlock-title-meta-on.toml"
+sed '/^\[apps.publish\]$/a title_meta = false' "$NGCFG" > "$NGMETAOFFCFG"
+sed '/^\[apps.publish\]$/a title_meta = true' "$NGCFG" > "$NGMETAONCFG"
+for meta_mode in off on; do
+  meta_cfg="$NGMETAOFFCFG"
+  [ "$meta_mode" = off ] || meta_cfg="$NGMETAONCFG"
+  (
+    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$meta_cfg" AIRLOCK_WEBROOT="$NGTMP/web" \
+           AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
+    bash "$ROOT/install/render-nginx.sh"
+  ) > "$NGTMP/site-title-meta-$meta_mode.conf" 2> "$NGTMP/site-title-meta-$meta_mode.err"
+done
+if cmp -s "$NGTMP/site.conf" "$NGTMP/site-title-meta-off.conf"; then
+  ok "publish/title-meta: explicit false keeps the core nginx render byte-identical to default"
+else
+  bad "publish/title-meta: explicit false changed the core nginx render"
+fi
+if grep -qF 'map "$hub_ok:$tailnet_ok:$request_method:$uri" $publish_hub_ok {' "$NGTMP/site-title-meta-on.conf" \
+  && grep -qF '"0:1:GET:/publish/api/meta" 1;' "$NGTMP/site-title-meta-on.conf" \
+  && grep -qF 'if ($publish_hub_ok = 0) { return 403; }' "$NGTMP/site-title-meta-on.conf" \
+  && grep -qF 'location = /publish/api/meta {' "$NGTMP/site-title-meta-on.conf" \
+  && grep -qF 'limit_except GET { deny all; }' "$NGTMP/site-title-meta-on.conf" \
+  && grep -qF "proxy_set_header $IDENTITY_HEADER \$http_tailscale_user_login;" "$NGTMP/site-title-meta-on.conf"; then
+  ok "publish/title-meta: true widens the core selector only for authenticated GET on the exact URI"
+else
+  bad "publish/title-meta: true did not render the method-bound exact core route"
+fi
+
+# Exercise the real publish installer with the SAME opt-in config used for the
+# core render above. Direct render-function calls would stay green if install.sh
+# forgot to pass title_meta into the backend unit.
+META_INSTALL_RENDER="$NGTMP/meta-install-render"
+meta_install_rc=0
+(
+  export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGMETAONCFG" AIRLOCK_TS_FQDN="box.example.ts.net" \
+         AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$META_INSTALL_RENDER" \
+         AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
+         AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+  bash "$ROOT/apps/publish/install.sh"
+) > "$NGTMP/meta-install.log" 2>&1 || meta_install_rc=$?
+if [ "$meta_install_rc" -eq 0 ] \
+  && grep -qxF 'Environment=AIRLOCK_PUBLISH_TITLE_META=true' \
+       "$META_INSTALL_RENDER/units/airlock-publish.service" \
+  && grep -qxF 'Environment=AIRLOCK_PUBLISH_DOC_AUDIENCE=owner' \
+       "$META_INSTALL_RENDER/units/airlock-publish.service" \
+  && grep -qF 'location = /publish/api/meta {' "$NGTMP/site-title-meta-on.conf"; then
+  ok "publish/title-meta: one opt-in config reaches both the real installer unit and core nginx route"
+else
+  bad "publish/title-meta: opt-in config did not reach installer and core render together"
+  sed 's/^/    /' "$NGTMP/meta-install.log" | tail -20
+fi
+
+META_INSTALL_OFF_RENDER="$NGTMP/meta-install-off-render"
+meta_install_off_rc=0
+(
+  export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGMETAOFFCFG" AIRLOCK_TS_FQDN="box.example.ts.net" \
+         AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$META_INSTALL_OFF_RENDER" \
+         AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
+         AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+  bash "$ROOT/apps/publish/install.sh"
+) > "$NGTMP/meta-install-off.log" 2>&1 || meta_install_off_rc=$?
+if [ "$meta_install_off_rc" -eq 0 ] \
+  && ! grep -qF 'Environment=AIRLOCK_PUBLISH_TITLE_META=' \
+       "$META_INSTALL_OFF_RENDER/units/airlock-publish.service" \
+  && grep -qxF 'Environment=AIRLOCK_PUBLISH_DOC_AUDIENCE=owner' \
+       "$META_INSTALL_OFF_RENDER/units/airlock-publish.service" \
+  && ! grep -qF 'location = /publish/api/meta {' "$NGTMP/site-title-meta-off.conf"; then
+  ok "publish/title-meta: one disabled config keeps both the real unit and core route off"
+else
+  bad "publish/title-meta: disabled config drifted between installer and core render"
+  sed 's/^/    /' "$NGTMP/meta-install-off.log" | tail -20
+fi
+
 # tailnet_view changes only the selector inside publish's dedicated server. It
 # must not rewrite the allowlist-backed map or the hub server it protects.
 # Extract the two brace-delimited blocks from off/on renders and compare bytes;
@@ -774,16 +912,69 @@ else
   diff -u "$NGTMP/hub-off.contract" "$NGTMP/hub-on.contract" | head -n 40 | sed 's/^/    /'
 fi
 if sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
-     "$NGTMP/site.conf" | grep -qF 'if ($hub_ok = 0)'; then
+     "$NGTMP/site.conf" | grep -F 'if ($hub_ok = 0)' >/dev/null; then
   ok "publish tailnet view: shipped default keeps the dedicated port on hub_ok"
 else
   bad "publish tailnet view: shipped default is not hub_ok (tailnet-wide trust must default off)"
 fi
 if sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
-     "$NGTMP/site-tailnet-on.conf" | grep -qF 'if ($tailnet_ok = 0)'; then
+     "$NGTMP/site-tailnet-on.conf" | grep -F 'if ($tailnet_ok = 0)' >/dev/null; then
   ok "publish tailnet view: box opt-in selects the non-empty tailnet identity tier"
 else
   bad "publish tailnet view: box opt-in did not select tailnet_ok"
+fi
+
+# The gate above decides who MAY open a document; this decides which link the manager
+# UI hands out. They drifted apart in production: the UI copied the hub path, which is
+# owner+collaborators only, so a published link worked for its author and 403'd for
+# every reader they sent it to — and both paths serve the same directory, so nothing
+# in the UI looked wrong. Pin both directions of airlock_publish_doc_url here, next to
+# the gate it has to agree with.
+#
+# 🔴 The probe runs in a subshell (it sources lib.sh) but the verdict does NOT — ok/bad
+# increment counters, and a bad inside a subshell would print red and still exit 0.
+for state in off on; do
+  doc_cfg="$NGCFG"; doc_want=""
+  # The public port is a Tailscale Serve mapping, so nginx's render does not carry it and
+  # a literal would pin a moving default (19920 -> 8000 landed while this was written).
+  # Read it back through airlock_config: that leaves the port itself unpinned, but what
+  # this case is for is the rest — the tailnet_view gate, and that the link is built from
+  # this box's FQDN and that port with no trailing slash.
+  doc_port="$(AIRLOCK_CONFIG="$NGONCFG" bash -c '. "'"$ROOT"'/install/lib.sh"; airlock_config get apps.publish.https_port')"
+  [ -n "$doc_port" ] || bad "publish doc link: no publish https_port in the fixture config"
+  if [ "$state" = on ]; then doc_cfg="$NGONCFG"; doc_want="https://box.example.ts.net:${doc_port}"; fi
+  doc_got="$(
+    export AIRLOCK_TS_FQDN="box.example.ts.net" AIRLOCK_CONFIG="$doc_cfg"
+    # shellcheck source=/dev/null
+    . "$ROOT/install/lib.sh"
+    airlock_publish_doc_url 2>/dev/null || true
+  )"
+  if [ "$doc_got" = "$doc_want" ]; then
+    ok "publish doc link: tailnet_view $state hands out ${doc_want:-no link}"
+  else
+    bad "publish doc link: tailnet_view $state gave '$doc_got', wanted '${doc_want:-<empty>}'"
+  fi
+done
+
+# The URL alone cannot distinguish "owner-only" from "tailnet link calculation
+# failed": both used to materialize as an empty string. Keep the audience as its
+# own runtime fact so downstream readers never have to reverse-infer it.
+DOC_AUDIENCE_RENDER="$NGTMP/doc-audience-render"
+doc_audience_rc=0
+(
+  export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGONCFG" AIRLOCK_TS_FQDN="box.example.ts.net" \
+         AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$DOC_AUDIENCE_RENDER" \
+         AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/publish" AIRLOCK_APP_ID=publish \
+         AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+  bash "$ROOT/apps/publish/install.sh"
+) > "$NGTMP/doc-audience-install.log" 2>&1 || doc_audience_rc=$?
+if [ "$doc_audience_rc" -eq 0 ] \
+  && grep -qxF 'Environment=AIRLOCK_PUBLISH_DOC_AUDIENCE=tailnet' \
+       "$DOC_AUDIENCE_RENDER/units/airlock-publish.service"; then
+  ok "publish doc audience: tailnet_view opt-in materializes an explicit tailnet marker"
+else
+  bad "publish doc audience: tailnet_view opt-in did not reach the runtime unit"
+  sed 's/^/    /' "$NGTMP/doc-audience-install.log" | tail -20
 fi
 # The widget's unread badge polls the hub's owner-only message preview
 # (hub/assets/airlock-return.js UNREAD_URL). Once tailnet_view admits any tailnet
@@ -799,7 +990,7 @@ else
   ok "publish tailnet view: shipped default keeps the unread badge poll on"
 fi
 if sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
-     "$NGTMP/site-tailnet-on.conf" | grep -qF 'data-mode="corner" data-badge="0" defer'; then
+     "$NGTMP/site-tailnet-on.conf" | grep -F 'data-mode="corner" data-badge="0" defer' >/dev/null; then
   ok "publish tailnet view: box opt-in disables the unread badge poll (hub gate would 403 it pre-CORS)"
 else
   bad "publish tailnet view: box opt-in did not disable the unread badge poll"
@@ -823,42 +1014,65 @@ if [ -z "$NGINX_BIN" ]; then
 elif [[ "$CURL_HELP" != *"--unix-socket"* ]]; then
   bad "nginx 403 provenance e2e: curl with --unix-socket is required"
 else
+  read -r META_BACKEND_PORT META_OFF_BACKEND_PORT < <(python3 - <<'PY'
+import socket
+with socket.socket() as first, socket.socket() as second:
+    first.bind(('127.0.0.1', 0))
+    second.bind(('127.0.0.1', 0))
+    print(first.getsockname()[1], second.getsockname()[1])
+PY
+)
   NGE2E_CFG="$NGTMP/airlock-e2e.toml"
   sed -e '/owner = "owner@fixture.dev"/a collaborators = ["friend@fixture.dev"]' \
       -e "/^\[apps.publish\]$/a share_dir = \"$NGTMP/share\"" \
       "$NGCFG" > "$NGE2E_CFG"
   NGE2E_ON_CFG="$NGTMP/airlock-e2e-tailnet-on.toml"
-  sed '/^\[apps.publish\]$/a tailnet_view = true' "$NGE2E_CFG" > "$NGE2E_ON_CFG"
+  sed "/^\[apps.publish\]$/a title_meta = true\nbackend_port = $META_BACKEND_PORT\ntailnet_view = true" \
+    "$NGE2E_CFG" > "$NGE2E_ON_CFG"
+  NGE2E_OFF_CFG="$NGTMP/airlock-e2e-title-meta-off.toml"
+  sed "/^\[apps.publish\]$/a title_meta = false\nbackend_port = $META_OFF_BACKEND_PORT\ntailnet_view = false" \
+    "$NGE2E_CFG" > "$NGE2E_OFF_CFG"
   (
     export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_ON_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
            AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
     bash "$ROOT/install/render-nginx.sh"
   ) > "$NGTMP/e2e-site.conf" 2> "$NGTMP/e2e-site.err"
   (
-    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
-           AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
+    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_OFF_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
+           AIRLOCK_CONFD="$NGTMP/confd-off" AIRLOCK_TS_FQDN="box.example.ts.net"
     bash "$ROOT/install/render-nginx.sh"
   ) > "$NGTMP/e2e-site-tailnet-off.conf" 2> "$NGTMP/e2e-site-tailnet-off.err"
 
-  mkdir -p "$NGTMP/share" "$NGTMP/private" "$NGTMP/cbt" "$NGTMP/pt" \
-    "$NGTMP/ft" "$NGTMP/ut" "$NGTMP/st"
+  mkdir -p "$NGTMP/share/nested" "$NGTMP/private" "$NGTMP/cbt" "$NGTMP/pt" \
+    "$NGTMP/ft" "$NGTMP/ut" "$NGTMP/st" "$NGTMP/confd-off/hub-locations.d" \
+    "$NGTMP/confd-off/servers.d"
   chmod 755 "$NGTMP" "$NGTMP/web" "$NGTMP/share" "$NGTMP/confd" \
     "$NGTMP/confd/hub-locations.d" "$NGTMP/confd/servers.d"
   chmod 777 "$NGTMP/cbt" "$NGTMP/pt" "$NGTMP/ft" "$NGTMP/ut" "$NGTMP/st"
   cp "$ROOT/hub/wrong-owner.html" "$NGTMP/web/wrong-owner.html"
   printf '%s\n' 'HUB OK' > "$NGTMP/web/index.html"
   printf '%s\n' 'READABLE' > "$NGTMP/share/readable.html"
+  printf '%s\n' 'STALE LEGACY INDEX' > "$NGTMP/share/index.html"
+  printf '%s\n' 'NESTED INDEX' > "$NGTMP/share/nested/index.html"
+  printf '%s\n' '<title>Proxied document</title><p>private body</p>' > "$NGTMP/share/meta.html"
   printf '%s\n' 'UNREADABLE' > "$NGTMP/private/unreadable.html"
   chmod 000 "$NGTMP/private"
   ln -s "$NGTMP/private/unreadable.html" "$NGTMP/share/unreadable.html"
   ln -s "$NGTMP/does-not-exist.html" "$NGTMP/share/dangling.html"
-  render_publish_nginx_main 19800 "$NGTMP/share" > "$NGTMP/confd/hub-locations.d/publish.conf"
+  render_publish_nginx_main "$META_BACKEND_PORT" "$NGTMP/share" \
+    > "$NGTMP/confd/hub-locations.d/publish.conf"
+  render_publish_nginx_main "$META_OFF_BACKEND_PORT" "$NGTMP/share" \
+    > "$NGTMP/confd-off/hub-locations.d/publish.conf"
   render_fileview_nginx 19501 owner > "$NGTMP/confd/hub-locations.d/fileview.conf"
 
   sed -e "s|listen 127.0.0.1:19902;|listen unix:$NGSOCKDIR/hub.sock;|" \
       -e "s|listen 127.0.0.1:19903;|listen unix:$NGSOCKDIR/redirect.sock;|" \
       -e "s|listen 127.0.0.1:19925;|listen unix:$NGSOCKDIR/publish-on.sock;|" \
       "$NGTMP/e2e-site.conf" > "$NGTMP/e2e-site-unix.conf"
+  sed -e "s|listen 127.0.0.1:19902;|listen unix:$NGSOCKDIR/hub-meta-off.sock;|" \
+      -e "s|listen 127.0.0.1:19903;|listen unix:$NGSOCKDIR/redirect-meta-off.sock;|" \
+      -e "s|listen 127.0.0.1:19925;|listen unix:$NGSOCKDIR/publish-meta-off.sock;|" \
+      "$NGTMP/e2e-site-tailnet-off.conf" > "$NGTMP/e2e-site-meta-off-unix.conf"
   sed -n '/^# ==== Publish dedicated document-view gate ====$/,/^# ==== End publish dedicated document-view gate ====$/p' \
       "$NGTMP/e2e-site-tailnet-off.conf" \
     | sed -e "s|listen 127.0.0.1:19925;|listen unix:$NGSOCKDIR/publish-off.sock;|" \
@@ -881,18 +1095,68 @@ else
     echo '}'
   } > "$NGTMP/e2e-nginx.conf"
 
-  if ! "$NGINX_BIN" -t -c "$NGTMP/e2e-nginx.conf" -p "$NGTMP" > "$NGTMP/e2e-nginx-test.log" 2>&1; then
+  mkdir -p "$NGTMP/cbt-off" "$NGTMP/pt-off" "$NGTMP/ft-off" "$NGTMP/ut-off" "$NGTMP/st-off"
+  chmod 777 "$NGTMP/cbt-off" "$NGTMP/pt-off" "$NGTMP/ft-off" "$NGTMP/ut-off" "$NGTMP/st-off"
+  # Keep the title_meta=false maps in a separate nginx process: nginx forbids
+  # redeclaring the same map variable in one http block.
+  {
+    [ "$(id -u)" -ne 0 ] || echo 'user nobody;'
+    echo "pid $NGTMP/e2e-meta-off-nginx.pid;"
+    echo "error_log $NGTMP/e2e-meta-off-nginx-error.log;"
+    echo 'daemon off;'
+    echo 'events {}'
+    echo 'http {'
+    echo '  access_log off;'
+    echo "  client_body_temp_path $NGTMP/cbt-off;"
+    echo "  proxy_temp_path $NGTMP/pt-off;"
+    echo "  fastcgi_temp_path $NGTMP/ft-off;"
+    echo "  uwsgi_temp_path $NGTMP/ut-off;"
+    echo "  scgi_temp_path $NGTMP/st-off;"
+    cat "$NGTMP/e2e-site-meta-off-unix.conf"
+    echo '}'
+  } > "$NGTMP/e2e-meta-off-nginx.conf"
+
+  if ! "$NGINX_BIN" -t -c "$NGTMP/e2e-nginx.conf" -p "$NGTMP" > "$NGTMP/e2e-nginx-test.log" 2>&1 \
+    || ! "$NGINX_BIN" -t -c "$NGTMP/e2e-meta-off-nginx.conf" -p "$NGTMP" \
+      > "$NGTMP/e2e-meta-off-nginx-test.log" 2>&1; then
     bad "nginx 403 provenance e2e: rendered config is invalid"
     sed 's/^/    /' "$NGTMP/e2e-nginx-test.log"
   else
+    # Hold both backends behind a test-only barrier. This makes the startup race
+    # deterministic: nginx becomes ready first, so the positive control below
+    # proves that an unbound upstream is the component producing HTTP 502. The
+    # real assertions run only after both backends answer their own health route.
+    (
+      while [ ! -e "$NGTMP/meta-backends.release" ]; do sleep 0.02; done
+      exec env AIRLOCK_PUBLISH_BACKEND_PORT="$META_BACKEND_PORT" \
+        AIRLOCK_PUBLISH_SHARE_DIR="$NGTMP/share" \
+        AIRLOCK_IDENTITY_HEADER='Tailscale-User-Login' \
+        AIRLOCK_PUBLISH_TITLE_META=true \
+        python3 "$ROOT/apps/publish/backend/airlock-publish.py"
+    ) > "$NGTMP/meta-backend.log" 2>&1 &
+    META_BACKEND_PID=$!
+    (
+      while [ ! -e "$NGTMP/meta-backends.release" ]; do sleep 0.02; done
+      exec env AIRLOCK_PUBLISH_BACKEND_PORT="$META_OFF_BACKEND_PORT" \
+        AIRLOCK_PUBLISH_SHARE_DIR="$NGTMP/share" \
+        AIRLOCK_IDENTITY_HEADER='Tailscale-User-Login' \
+        AIRLOCK_PUBLISH_TITLE_META=false \
+        python3 "$ROOT/apps/publish/backend/airlock-publish.py"
+    ) > "$NGTMP/meta-off-backend.log" 2>&1 &
+    META_OFF_BACKEND_PID=$!
     "$NGINX_BIN" -c "$NGTMP/e2e-nginx.conf" -p "$NGTMP" > "$NGTMP/e2e-nginx-start.log" 2>&1 &
     NGINX_PARITY_PID=$!
+    "$NGINX_BIN" -c "$NGTMP/e2e-meta-off-nginx.conf" -p "$NGTMP" \
+      > "$NGTMP/e2e-meta-off-nginx-start.log" 2>&1 &
+    NGINX_META_OFF_PID=$!
     NGINX_READY=0
     for ((attempt = 0; attempt < 50; attempt++)); do
       if [ -S "$NGSOCKDIR/hub.sock" ] \
+        && [ -S "$NGSOCKDIR/hub-meta-off.sock" ] \
         && [ -S "$NGSOCKDIR/publish-on.sock" ] \
         && [ -S "$NGSOCKDIR/publish-off.sock" ] \
-        && kill -0 "$NGINX_PARITY_PID" 2>/dev/null; then
+        && kill -0 "$NGINX_PARITY_PID" 2>/dev/null \
+        && kill -0 "$NGINX_META_OFF_PID" 2>/dev/null; then
         NGINX_READY=1
         break
       fi
@@ -902,11 +1166,111 @@ else
       bad "nginx 403 provenance e2e: nginx did not start"
       sed 's/^/    /' "$NGTMP/e2e-nginx-start.log"
     else
+      if python3 - "$META_BACKEND_PORT" "$META_OFF_BACKEND_PORT" <<'PY'
+import socket, sys
+ports = [int(value) for value in sys.argv[1:]]
+if len(set(ports)) != len(ports):
+    raise SystemExit(1)
+for port in ports:
+    with socket.socket() as sock:
+        sock.settimeout(0.1)
+        if sock.connect_ex(('127.0.0.1', port)) == 0:
+            raise SystemExit(1)
+PY
+      then
+        ok "publish title meta startup control: reserved backend ports are distinct and unbound"
+      else
+        bad "publish title meta startup control: a reserved backend port was reused or already bound"
+      fi
+
+      : > "$NGTMP/e2e-nginx-error.log"
+      status="$(curl --silent --show-error --path-as-is --max-time 5 \
+        --unix-socket "$NGSOCKDIR/hub.sock" \
+        -H 'Tailscale-User-Login: any-member@fixture.dev' \
+        --output "$NGTMP/meta-upstream-absent.body" --write-out '%{http_code}' \
+        'http://localhost/publish/api/meta?name=meta.html' \
+        2> "$NGTMP/meta-upstream-absent.err" || true)"
+      if [ "$status" = 502 ] \
+        && grep -qF 'connect() failed (111: Connection refused) while connecting to upstream' \
+          "$NGTMP/e2e-nginx-error.log" \
+        && grep -qF "upstream: \"http://127.0.0.1:$META_BACKEND_PORT/publish/api/meta?name=meta.html\"" \
+          "$NGTMP/e2e-nginx-error.log"; then
+        ok "publish title meta startup control: nginx 502 names the absent backend upstream"
+      else
+        bad "publish title meta startup control: absent backend did not produce the expected nginx upstream 502"
+        sed 's/^/    /' "$NGTMP/e2e-nginx-error.log"
+      fi
+
+      : > "$NGTMP/meta-backends.release"
+      backend_process_running() {
+        local pid="$1" state
+        kill -0 "$pid" 2>/dev/null || return 1
+        if [ -r "/proc/$pid/stat" ]; then
+          state="$(awk '{print $3}' "/proc/$pid/stat")"
+          [ "$state" != Z ] || return 1
+        fi
+      }
+
+      publish_backend_healthy() {
+        local port="$1" pid="$2" body="$3" status
+        backend_process_running "$pid" || return 1
+        status="$(curl --silent --connect-timeout 0.1 --max-time 0.2 \
+          --output "$body" --write-out '%{http_code}' \
+          "http://127.0.0.1:$port/health" 2>/dev/null || true)"
+        [ "$status" = 200 ] || return 1
+        python3 - "$body" "$port" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as stream:
+    body = json.load(stream)
+raise SystemExit(0 if body.get('service') == 'airlock-publish'
+                 and body.get('port') == int(sys.argv[2]) else 1)
+PY
+      }
+
+      BACKENDS_READY=0
+      BACKENDS_DEADLINE=$((SECONDS + 10))
+      while (( SECONDS < BACKENDS_DEADLINE )); do
+        if ! backend_process_running "$META_BACKEND_PID" \
+          || ! backend_process_running "$META_OFF_BACKEND_PID"; then
+          break
+        fi
+        if publish_backend_healthy "$META_BACKEND_PORT" "$META_BACKEND_PID" \
+          "$NGTMP/meta-backend-health.body" \
+          && publish_backend_healthy "$META_OFF_BACKEND_PORT" "$META_OFF_BACKEND_PID" \
+            "$NGTMP/meta-off-backend-health.body"; then
+          BACKENDS_READY=1
+          break
+        fi
+        sleep 0.05
+      done
+      if [ "$BACKENDS_READY" -eq 0 ]; then
+        bad "publish title meta startup: backends did not become healthy"
+        sed 's/^/    /' "$NGTMP/meta-backend.log" "$NGTMP/meta-off-backend.log"
+      else
       hub_get() {
         local login="$1" path="$2" body="$3"
         curl --silent --show-error --path-as-is --max-time 5 \
           --unix-socket "$NGSOCKDIR/hub.sock" -H "Tailscale-User-Login: $login" \
           --output "$body" --write-out '%{http_code}' "http://localhost$path" 2> "$body.err" || true
+      }
+
+      hub_meta_off_get() {
+        local login="$1" path="$2" body="$3"
+        curl --silent --show-error --path-as-is --max-time 5 \
+          --unix-socket "$NGSOCKDIR/hub-meta-off.sock" -H "Tailscale-User-Login: $login" \
+          --output "$body" --write-out '%{http_code}' "http://localhost$path" 2> "$body.err" || true
+      }
+
+      hub_method() {
+        local login="$1" method="$2" path="$3" body="$4"
+        curl --silent --show-error --path-as-is --max-time 5 \
+          --unix-socket "$NGSOCKDIR/hub.sock" -H "Tailscale-User-Login: $login" \
+          -X "$method" -H 'Content-Type: application/json' \
+          --output "$body" --write-out '%{http_code}' "http://localhost$path" 2> "$body.err" || true
+      }
+
+      hub_post() {
+        hub_method "$1" POST "$2" "$3"
       }
 
       publish_get() {
@@ -925,6 +1289,137 @@ else
           -H 'Content-Type: application/json' --data '{}' \
           --output "$body" --write-out '%{http_code}' "http://localhost$path" 2> "$body.err" || true
       }
+
+      status="$(hub_get any-member@fixture.dev \
+        '/publish/api/meta?name=meta.html' "$NGTMP/meta-member.body")"
+      if [ "$status" = 200 ] && python3 - "$NGTMP/meta-member.body" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1], encoding='utf-8'))
+raise SystemExit(0 if set(body) == {'name', 'title', 'mtime'}
+                 and body['name'] == 'meta.html'
+                 and body['title'] == 'Proxied document'
+                 and isinstance(body['mtime'], int) else 1)
+PY
+      then
+        ok "publish title meta: authenticated tailnet member reaches the real backend with the exact response"
+      else
+        bad "publish title meta: real backend returned $status or the wrong response through nginx"
+      fi
+
+      status="$(hub_get any-member@fixture.dev \
+        '/publish/api/meta?name=missing.html' "$NGTMP/meta-member-missing.body")"
+      if [ "$status" = 404 ] && python3 - "$NGTMP/meta-member-missing.body" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1], encoding='utf-8'))
+raise SystemExit(0 if body == {'ok': False, 'error': 'not found'} else 1)
+PY
+      then
+        ok "publish title meta: missing file keeps the exact 404 response through nginx"
+      else
+        bad "publish title meta: missing file returned $status or the wrong response through nginx"
+      fi
+
+      status="$(hub_meta_off_get stranger@fixture.dev \
+        '/publish/api/meta?name=meta.html' "$NGTMP/meta-off-stranger.body")"
+      if [ "$status" = 403 ] && grep -qF "This isn't your Airlock" "$NGTMP/meta-off-stranger.body"; then
+        ok "publish title meta: disabled config keeps a non-allowlisted identity outside the hub"
+      else
+        bad "publish title meta: disabled config admitted a non-allowlisted identity with $status"
+      fi
+
+      status="$(hub_meta_off_get friend@fixture.dev \
+        '/publish/api/meta?name=meta.html' "$NGTMP/meta-off-friend.body")"
+      if [ "$status" = 404 ] && python3 - "$NGTMP/meta-off-friend.body" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1], encoding='utf-8'))
+raise SystemExit(0 if body == {'ok': False, 'error': 'unknown path: /api/meta'} else 1)
+PY
+      then
+        ok "publish title meta: disabled config keeps the real backend route absent for a collaborator"
+      else
+        bad "publish title meta: disabled config returned $status or exposed metadata"
+      fi
+
+      status="$(hub_get '' '/publish/api/meta?name=readable.html' "$NGTMP/meta-no-header.body")"
+      if [ "$status" = 403 ] && grep -qF "This isn't your Airlock" "$NGTMP/meta-no-header.body"; then
+        ok "publish title meta: nginx denies the exact route without an identity"
+      else
+        bad "publish title meta: missing identity reached the exact route with $status"
+      fi
+
+      for api_path in list health public-list uploads-cleanup; do
+        status="$(hub_get any-member@fixture.dev "/publish/api/$api_path" \
+          "$NGTMP/meta-member-protected.body")"
+        if [ "$status" = 403 ] && grep -qF "This isn't your Airlock" \
+          "$NGTMP/meta-member-protected.body"; then
+          ok "publish title meta: protected GET $api_path remains behind the hub gate"
+        else
+          bad "publish title meta: protected GET $api_path widened with status $status"
+        fi
+      done
+      for api_path in unpublish unpublish-direct unpublish-batch repair-broken \
+        publish-public publish-plan public-revoke public-set-expiry upload-image upload-file; do
+        status="$(hub_post any-member@fixture.dev "/publish/api/$api_path" \
+          "$NGTMP/meta-member-protected.body")"
+        if [ "$status" = 403 ]; then
+          ok "publish title meta: protected POST $api_path remains behind the hub gate"
+        else
+          bad "publish title meta: protected POST $api_path widened with status $status"
+        fi
+      done
+
+      for variant in '/publish/api/meta/' '/publish/api/meta/anything'; do
+        status="$(hub_get any-member@fixture.dev "$variant?name=meta.html" \
+          "$NGTMP/meta-member-variant.body")"
+        if [ "$status" = 403 ] && grep -qF "This isn't your Airlock" \
+          "$NGTMP/meta-member-variant.body"; then
+          ok "publish title meta: non-exact route $variant stays behind the hub gate"
+        else
+          bad "publish title meta: non-exact route $variant crossed the exception with $status"
+        fi
+      done
+
+      for method in POST PUT DELETE PATCH OPTIONS HEAD; do
+        status="$(hub_method any-member@fixture.dev "$method" /publish/api/meta \
+          "$NGTMP/meta-member-method.body")"
+        if [ "$status" = 403 ]; then
+          ok "publish title meta: $method remains behind the hub gate"
+        else
+          bad "publish title meta: $method crossed the GET-only exception with status $status"
+        fi
+      done
+
+      status="$(hub_get any-member@fixture.dev \
+        '/publish/api/meta?name=..%2Foutside.html' "$NGTMP/meta-member-traversal.body")"
+      if [ "$status" = 400 ] && python3 - "$NGTMP/meta-member-traversal.body" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1], encoding='utf-8'))
+raise SystemExit(0 if body == {'ok': False, 'error': 'name must be an HTML basename'} else 1)
+PY
+      then
+        ok "publish title meta: traversal is rejected by the real backend through nginx"
+      else
+        bad "publish title meta: traversal returned $status or the wrong error through nginx"
+      fi
+
+      status="$(hub_get friend@fixture.dev /publish/api/list "$NGTMP/meta-collaborator-list.body")"
+      if [ "$status" = 200 ] && python3 - "$NGTMP/meta-collaborator-list.body" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1], encoding='utf-8'))
+raise SystemExit(0 if body.get('ok') is True else 1)
+PY
+      then
+        ok "publish title meta: existing collaborator API access remains live under the composite gate"
+      else
+        bad "publish title meta: collaborator API regression returned $status"
+      fi
+
+      status="$(hub_get friend@fixture.dev / "$NGTMP/meta-collaborator-hub.body")"
+      if [ "$status" = 200 ] && grep -qF 'HUB OK' "$NGTMP/meta-collaborator-hub.body"; then
+        ok "publish title meta: existing collaborator hub access remains live under the composite gate"
+      else
+        bad "publish title meta: collaborator hub regression returned $status"
+      fi
 
       status="$(publish_get "$NGSOCKDIR/publish-off.sock" stranger@fixture.dev \
         /publish/files/readable.html "$NGTMP/publish-off-stranger.body")"
@@ -956,6 +1451,25 @@ else
         ok "publish tailnet view: the document is also served at the ROOT — /<name>.html is the whole link"
       else
         bad "publish tailnet view: root-path document returned $status"
+      fi
+
+      status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        / "$NGTMP/publish-on-live-index.body")"
+      if [ "$status" = 200 ] \
+        && grep -qF 'readable.html' "$NGTMP/publish-on-live-index.body" \
+        && grep -qF 'src="/airlock-return.js"' "$NGTMP/publish-on-live-index.body" \
+        && ! grep -qF 'STALE LEGACY INDEX' "$NGTMP/publish-on-live-index.body"; then
+        ok "publish tailnet view: root lists live files with navigation instead of a stale legacy index.html"
+      else
+        bad "publish tailnet view: root did not replace the stale legacy index with a navigable live listing"
+      fi
+
+      status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
+        /nested/ "$NGTMP/publish-on-nested-index.body")"
+      if [ "$status" = 200 ] && grep -qx 'NESTED INDEX' "$NGTMP/publish-on-nested-index.body"; then
+        ok "publish tailnet view: nested bundles still resolve their own index.html"
+      else
+        bad "publish tailnet view: root-only live listing broke a nested bundle index (status $status)"
       fi
 
       manager_status="$(publish_get "$NGSOCKDIR/publish-on.sock" any-member@fixture.dev \
@@ -1024,6 +1538,7 @@ else
           bad "nginx 403 provenance: stranger $target target returned $status or bypassed the identity explanation"
         fi
       done
+      fi
     fi
   fi
   if [ -n "$NGINX_PARITY_PID" ] && kill -0 "$NGINX_PARITY_PID" 2>/dev/null; then
@@ -1031,6 +1546,21 @@ else
     wait "$NGINX_PARITY_PID" 2>/dev/null || true
   fi
   NGINX_PARITY_PID=""
+  if [ -n "$NGINX_META_OFF_PID" ] && kill -0 "$NGINX_META_OFF_PID" 2>/dev/null; then
+    kill -TERM "$NGINX_META_OFF_PID" 2>/dev/null || true
+    wait "$NGINX_META_OFF_PID" 2>/dev/null || true
+  fi
+  NGINX_META_OFF_PID=""
+  if [ -n "$META_BACKEND_PID" ] && kill -0 "$META_BACKEND_PID" 2>/dev/null; then
+    kill -TERM "$META_BACKEND_PID" 2>/dev/null || true
+    wait "$META_BACKEND_PID" 2>/dev/null || true
+  fi
+  META_BACKEND_PID=""
+  if [ -n "$META_OFF_BACKEND_PID" ] && kill -0 "$META_OFF_BACKEND_PID" 2>/dev/null; then
+    kill -TERM "$META_OFF_BACKEND_PID" 2>/dev/null || true
+    wait "$META_OFF_BACKEND_PID" 2>/dev/null || true
+  fi
+  META_OFF_BACKEND_PID=""
 fi
 chmod 700 "$NGTMP/private" 2>/dev/null || true
 rm -rf "$NGTMP"
@@ -1230,11 +1760,11 @@ run_installer_path dev-monitor "" "" installer-path \
   "confd/hub-locations.d/dev-monitor.conf" "nginx.conf" \
   "units/airlock-dev-monitor.service" "unit.service"
 
-# dev-monitor webhook precedence — the real installer path, all eight combinations.
-# Values are deliberately distinguishable fakes and are never copied to a golden.
+# dev-monitor single webhook — configured and unset through the real installer.
+# Only credential names are rendered; the dedicated input file stays private.
 run_devmon_webhook_case() {
-  local label="$1" urgent="$2" routine="$3" alias="$4" expected_urgent="$5" expected_routine="$6"
-  local WDIR CFG out rc=0 envf unit warning_count expected_warning=0
+  local label="$1" urgent="$2" expected_urgent="$3"
+  local WDIR CFG out rc=0 envf unit
   WDIR="$(mktemp -d)"; CFG="$WDIR/airlock.toml"
   mkdir -p "$WDIR/home/.config/airlock" "$WDIR/render" "$WDIR/shim"
   printf 'DEV_MONITOR_PROXY_SECRET=fixture-proxy-only\n' > "$WDIR/home/.config/airlock/dev-monitor.env"
@@ -1242,64 +1772,56 @@ run_devmon_webhook_case() {
     printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.dev-monitor]\nmessages = true\n'
     [ "$urgent" = set ] && printf 'slack_webhook_urgent_env = "DEVMON_FIXTURE_URGENT"\n'
     [ "$urgent" = missing ] && printf 'slack_webhook_urgent_env = "DEVMON_FIXTURE_MISSING"\n'
-    [ "$routine" = set ] && printf 'slack_webhook_routine_env = "DEVMON_FIXTURE_ROUTINE"\n'
-    [ "$alias" = set ] && printf 'slack_webhook_env = "DEVMON_FIXTURE_ALIAS"\n'
   } > "$CFG"
+  # The dedicated file contains only the selected credential.
+  {
+    [ -z "$expected_urgent" ] || printf '%s=synthetic-fixture\n' "$expected_urgent"
+  } > "$WDIR/home/.config/airlock/dev-monitor-secrets.env"
+  chmod 600 "$WDIR/home/.config/airlock/dev-monitor-secrets.env"
   out="$(
     export HOME="$WDIR/home" AIRLOCK_CONFIG="$CFG" AIRLOCK_TS_FQDN="box.example.ts.net" \
       AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$WDIR/render" \
-      DEVMON_FIXTURE_URGENT="urgent-fixture" \
-      DEVMON_FIXTURE_ROUTINE="routine-fixture" \
-      DEVMON_FIXTURE_ALIAS="alias-fixture"
+      DEVMON_FIXTURE_URGENT="urgent-fixture"
     AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
     bash "$ROOT/apps/dev-monitor/install.sh" 2>&1
   )" || rc=$?
+  if [ -f "$WDIR/render/units/airlock-devmon-heartbeat.service" ] \
+      && [ -f "$WDIR/render/units/airlock-devmon-heartbeat.timer" ] \
+      && printf '%s\n' "$out" | grep -q 'enable --now airlock-devmon-heartbeat.timer'; then
+    ok "dev-monitor heartbeat $label: rendered and enable --now wired"
+  else
+    bad "dev-monitor heartbeat $label: missing render or activation"
+  fi
   envf="$WDIR/render/files/dev-monitor.env"
   unit="$WDIR/render/units/airlock-dev-monitor.service"
   if [ "$rc" -ne 0 ]; then
-    bad "dev-monitor precedence $label: installer exited $rc"
+    bad "dev-monitor webhook $label: installer exited $rc"
   elif [ ! -f "$envf" ]; then
-    bad "dev-monitor precedence $label: captured env missing"
-  elif ! grep -qxF "AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT=${expected_urgent}" "$envf" \
-       || ! grep -qxF "AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_ROUTINE=${expected_routine}" "$envf"; then
-    bad "dev-monitor precedence $label: resolved lanes differ"
+    bad "dev-monitor webhook $label: captured env missing"
+  elif ! grep -qxF "DEVMON_SLACK_WEBHOOK_NAME=${expected_urgent}" "$envf"; then
+    bad "dev-monitor webhook $label: credential names differ"
   elif grep -q '^AIRLOCK_DEVMON_SLACK_WEBHOOK=' "$envf"; then
-    bad "dev-monitor precedence $label: legacy generated variable survived"
+    bad "dev-monitor webhook $label: legacy generated variable survived"
   else
-    ok "dev-monitor precedence $label: canonical lane values"
-  fi
-  [ "$alias" = set ] && expected_warning=1
-  warning_count="$(printf '%s\n' "$out" | grep -c 'apps.dev-monitor.slack_webhook_env is deprecated' || true)"
-  if [ "$warning_count" = "$expected_warning" ] \
-      && { [ "$expected_warning" = 0 ] || printf '%s\n' "$out" | grep -q 'slack_webhook_urgent_env.*2026-09-07'; }; then
-    ok "dev-monitor precedence $label: alias warning count/content"
-  else
-    bad "dev-monitor precedence $label: alias warning count/content"
+    ok "dev-monitor webhook $label: canonical credential names"
   fi
   if [ -f "$envf" ] && [ "$(stat -c '%a' "$envf")" = 600 ]; then
-    ok "dev-monitor precedence $label: env mode 0600"
+    ok "dev-monitor webhook $label: env mode 0600"
   else
-    bad "dev-monitor precedence $label: env mode is not 0600"
+    bad "dev-monitor webhook $label: env mode is not 0600"
   fi
   if [ -f "$unit" ] \
       && grep -qxF "EnvironmentFile=-$WDIR/home/.config/airlock/dev-monitor.env" "$unit" \
       && ! grep -qF "$WDIR/render/files/dev-monitor.env" "$unit"; then
-    ok "dev-monitor precedence $label: capture path is not service path"
+    ok "dev-monitor webhook $label: capture path is not service path"
   else
-    bad "dev-monitor precedence $label: EnvironmentFile points at capture path"
+    bad "dev-monitor webhook $label: EnvironmentFile points at capture path"
   fi
   rm -rf "$WDIR"
 }
 
-run_devmon_webhook_case U-R-x set set unset urgent-fixture routine-fixture
-run_devmon_webhook_case U-x-x set unset unset urgent-fixture ""
-run_devmon_webhook_case x-R-x unset set unset "" routine-fixture
-run_devmon_webhook_case x-x-x unset unset unset "" ""
-run_devmon_webhook_case U-R-A set set set urgent-fixture routine-fixture
-run_devmon_webhook_case U-x-A set unset set urgent-fixture ""
-run_devmon_webhook_case x-R-A unset set set alias-fixture routine-fixture
-run_devmon_webhook_case x-x-A unset unset set alias-fixture ""
-run_devmon_webhook_case Umissing-x-A missing unset set "" ""
+run_devmon_webhook_case configured set DEVMON_FIXTURE_URGENT
+run_devmon_webhook_case unset unset ""
 
 # Turning messages off removes its spool/action values but retains the two-value updates
 # owner gate. Otherwise the daily snapshot would exist with no authenticated read path.
@@ -1334,7 +1856,7 @@ rm -rf "$DMOFF"
 
 # Env-file injection guards: reject both configured variable names and the values
 # resolved through them, while never echoing the rejected value.
-for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_env; do
+for dm_key in slack_webhook_urgent_env; do
   DMBAD="$(mktemp -d)"; mkdir -p "$DMBAD/home/.config/airlock" "$DMBAD/render"
   {
     printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.dev-monitor]\nmessages = true\n'
@@ -1353,7 +1875,7 @@ for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_e
   rm -rf "$DMBAD"
 done
 
-for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_env; do
+for dm_key in slack_webhook_urgent_env; do
   DMBAD="$(mktemp -d)"; mkdir -p "$DMBAD/home/.config/airlock" "$DMBAD/render"
   printf 'DEV_MONITOR_PROXY_SECRET=fixture-proxy-only\n' > "$DMBAD/home/.config/airlock/dev-monitor.env"
   {
@@ -1365,11 +1887,11 @@ for dm_key in slack_webhook_urgent_env slack_webhook_routine_env slack_webhook_e
     DEVMON_BAD_VALUE=$'secret-canary\nINJECTED=1' \
     AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
     bash "$ROOT/apps/dev-monitor/install.sh" 2>&1)"; dm_rc=$?
-  if [ "$dm_rc" -ne 0 ] && printf '%s\n' "$dm_out" | grep -q 'resolved Slack webhook values must not contain newlines' \
+  if [ "$dm_rc" -ne 0 ] && printf '%s\n' "$dm_out" | grep -q 'dev-monitor-secrets.env must exist' \
       && ! printf '%s\n' "$dm_out" | grep -Eq 'secret-canary|INJECTED'; then
-    ok "dev-monitor rejects newline in resolved $dm_key value without disclosure"
+    ok "dev-monitor ignores ambient $dm_key value and requires app secrets file"
   else
-    bad "dev-monitor resolved newline guard failed for $dm_key"
+    bad "dev-monitor ambient credential isolation failed for $dm_key"
   fi
   rm -rf "$DMBAD"
 done

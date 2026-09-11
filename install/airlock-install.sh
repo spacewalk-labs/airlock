@@ -18,16 +18,58 @@ AIRLOCK_CONFIG_BIN="$ROOT/bin/airlock-config"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
 
+# Never trust caller markers as proof of lock, snapshot, or transaction
+# ownership. This must precede self-kill escape so the re-exec cannot forward
+# stale authority into the recovered process.
+unset AIRLOCK_LEDGER_LOCK_HELD AIRLOCK_CONFIG_SNAPSHOT \
+  AIRLOCK_CONFIG_SNAPSHOT_SHA256 AIRLOCK_INSTALL_PKG_INFO_SHA256 \
+  AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT
+
 # Before anything is stopped: if this run is hosted by one of the units it is about
 # to restart, move it out of that cgroup so it survives its own teardown. Informs
 # and continues rather than refusing — see install/lib.sh.
 airlock_escape_selfkill_cgroup "$0" "$@"
 
-# This marker is asserted only after this process acquires or verifies the
-# ledger lock below. Never trust a value inherited from a parent shell as
-# proof of lock ownership.
-unset AIRLOCK_LEDGER_LOCK_HELD AIRLOCK_CONFIG_SNAPSHOT \
-  AIRLOCK_CONFIG_SNAPSHOT_SHA256 AIRLOCK_INSTALL_PKG_INFO_SHA256
+# Crash recovery is config-independent and precedes config
+# parsing: a bad new candidate must not prevent the last committed apps from
+# being restored. The same ledger lock remains held if this run continues.
+_airlock_recovery_lock=0
+_airlock_early_state_dir="${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}"
+if [ -e "$_airlock_early_state_dir/install-transaction.json" ] \
+    || [ -L "$_airlock_early_state_dir/install-transaction.json" ]; then
+  airlock_preflight_bootstrap
+  require_cmd flock
+  airlock_pin_state_dir
+  _airlock_early_state_dir="${AIRLOCK_STATE_DIR:-$_airlock_early_state_dir}"
+  if [ -n "${AIRLOCK_LEDGER_LOCK_FD:-}" ]; then
+    case "$AIRLOCK_LEDGER_LOCK_FD" in *[!0-9]*) die "inherited ledger lock fd must be numeric" ;; esac
+    [ "$AIRLOCK_LEDGER_LOCK_FD" -ge 3 ] 2>/dev/null \
+      && [ -f "/proc/self/fd/$AIRLOCK_LEDGER_LOCK_FD" ] \
+      && [ "/proc/self/fd/$AIRLOCK_LEDGER_LOCK_FD" -ef "$_airlock_early_state_dir/app-ledger.lock" ] \
+      || die "inherited ledger lock fd does not name $_airlock_early_state_dir/app-ledger.lock"
+    flock -n "$AIRLOCK_LEDGER_LOCK_FD" || die "inherited ledger lock fd is unavailable"
+    if [ "$AIRLOCK_LEDGER_LOCK_FD" != 9 ]; then
+      eval "exec 9<&$AIRLOCK_LEDGER_LOCK_FD"
+      eval "exec $AIRLOCK_LEDGER_LOCK_FD>&-"
+    fi
+  else
+    exec 9>>"$_airlock_early_state_dir/app-ledger.lock"
+    flock -n 9 || die "another airlock run holds the ledger lock ($_airlock_early_state_dir/app-ledger.lock) — recovery will not race it"
+  fi
+  AIRLOCK_LEDGER_LOCK_HELD=1
+  export AIRLOCK_LEDGER_LOCK_HELD
+  _airlock_recovery_phase="$("$ROOT/bin/airlock-ledger" transaction-show \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')" \
+    || die "cannot read unfinished install transaction"
+  case "$_airlock_recovery_phase" in
+    prepared|installing|rolling_back|degraded)
+      log "recovering unfinished install transaction before reading the new candidate"
+      "$ROOT/bin/airlock-ledger" transaction-restore \
+        || die "transaction recovery remains degraded; inspect bin/airlock-status before retrying"
+      ;;
+  esac
+  _airlock_recovery_lock=1
+fi
 
 # The exceptional path is one exact, package-scoped argv value.  Do not add an
 # environment alias: an exported value would silently remain active for later
@@ -37,6 +79,11 @@ _airlock_lifecycle_args=()
 _airlock_lifecycle_config_bin="$AIRLOCK_CONFIG_BIN"
 _airlock_config_wrapper=""
 _airlock_config_snapshot=""
+_airlock_prereq_receipt=""
+_airlock_transaction_active=0
+_airlock_transaction_id=""
+_airlock_failure_phase="pre-mutation"
+_airlock_failure_app="-"
 for _airlock_install_arg in "$@"; do
   case "$_airlock_install_arg" in
     --dangerously-admit-unverified=*)
@@ -54,10 +101,28 @@ for _airlock_install_arg in "$@"; do
 done
 
 _airlock_cleanup_config_wrapper() {
+  local _exit_rc=$? _restore_rc=0 _restore_output="" _result=""
+  trap - EXIT INT TERM HUP
+  if [ "${_airlock_transaction_active:-0}" = 1 ]; then
+    [ "$_exit_rc" != 0 ] || _exit_rc=1
+    AIRLOCK_TRANSACTION_ERROR="installer exited rc=$_exit_rc" \
+      "$ROOT/bin/airlock-ledger" transaction-fail \
+        "${_airlock_failure_phase:-unknown}" "${_airlock_failure_app:--}" >/dev/null 2>&1 || true
+    _restore_output="$("$ROOT/bin/airlock-ledger" transaction-restore 2>&1)" || _restore_rc=$?
+    [ -z "$_restore_output" ] || printf '%s\n' "$_restore_output" >&2
+    _result="rolled_back"
+    [ "$_restore_rc" = 0 ] || _result="degraded"
+    log "FATAL: transaction=${_airlock_transaction_id:-unknown} phase=${_airlock_failure_phase:-unknown} app=${_airlock_failure_app:--} result=$_result; inspect: bin/airlock-status"
+  fi
   [ -z "$_airlock_config_wrapper" ] || rm -f -- "$_airlock_config_wrapper"
   [ -z "$_airlock_config_snapshot" ] || rm -f -- "$_airlock_config_snapshot"
+  [ -z "$_airlock_prereq_receipt" ] || rm -f -- "$_airlock_prereq_receipt"
+  exit "$_exit_rc"
 }
 trap _airlock_cleanup_config_wrapper EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 if [ "${#_airlock_lifecycle_args[@]}" -eq 1 ]; then
   _airlock_config_wrapper="$(mktemp)" || die "cannot create break-glass config wrapper"
@@ -110,6 +175,13 @@ export AIRLOCK_CONFIG AIRLOCK_CONFIG_SNAPSHOT AIRLOCK_CONFIG_SNAPSHOT_SHA256
 # and whether this run touches the installed-state ledger at all.
 AIRLOCK_PKG_INFO="$(airlock_config package-info)" || exit 2
 export AIRLOCK_PKG_INFO
+_pkg_info_digest="$(printf '%s' "$AIRLOCK_PKG_INFO" \
+  | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
+  || die "cannot hash package-info for prerequisite receipt"
+AIRLOCK_PREREQ_CONTEXT="config=${AIRLOCK_CONFIG_SNAPSHOT_SHA256} package=${_pkg_info_digest}"
+_airlock_prereq_receipt="$(mktemp)" || die "cannot create prerequisite receipt"
+AIRLOCK_PREREQ_RECEIPT="$_airlock_prereq_receipt"
+export AIRLOCK_PREREQ_CONTEXT AIRLOCK_PREREQ_RECEIPT
 AIRLOCK_CONFIG="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print(json.load(sys.stdin)["config_path"])')"
 export AIRLOCK_CONFIG AIRLOCK_ROOT
 _pkg_ids="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print("\n".join(sorted(json.load(sys.stdin)["packages"])))')"
@@ -120,6 +192,7 @@ fi
 _state_dir="${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}"
 LEDGER_FILE="$_state_dir/app-ledger.json"
 RETIREMENT_FILE="$_state_dir/plaintext-retirement.json"
+TRANSACTION_FILE="$_state_dir/install-transaction.json"
 # F15 amendment (child 4/P4): the gate must also open for a box that has NO
 # configured packages and NO ledger file yet, but DOES have a known builtin
 # on disk (apps/<id>/airlock-app.toml, hub/core and shadowed ids excluded) —
@@ -137,6 +210,7 @@ _known_builtins="$(airlock_config known-builtins)" || exit 2
 if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] \
   && { [ -n "$_pkg_ids" ] || [ -e "$LEDGER_FILE" ] || [ -L "$LEDGER_FILE" ] \
     || [ -e "$RETIREMENT_FILE" ] || [ -L "$RETIREMENT_FILE" ] \
+    || [ -e "$TRANSACTION_FILE" ] || [ -L "$TRANSACTION_FILE" ] \
     || [ -n "$_known_builtins" ]; }; then
   require_cmd flock
   # `install -d -m` sets the mode on an EXISTING directory too, and that turned a
@@ -158,6 +232,10 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] \
   _state_dir="${AIRLOCK_STATE_DIR:-$_state_dir}"
   LEDGER_FILE="$_state_dir/app-ledger.json"
   RETIREMENT_FILE="$_state_dir/plaintext-retirement.json"
+  TRANSACTION_FILE="$_state_dir/install-transaction.json"
+  if [ "$_airlock_recovery_lock" = 1 ]; then
+    AIRLOCK_LEDGER_LOCK_FD=9
+  fi
   if [ -n "${AIRLOCK_LEDGER_LOCK_FD:-}" ]; then
     case "$AIRLOCK_LEDGER_LOCK_FD" in
       *[!0-9]*) die "inherited ledger lock fd must be an open descriptor >= 3" ;;
@@ -270,6 +348,8 @@ _candidate_preflight="$(printf '%s' "$AIRLOCK_PKG_INFO" \
   | airlock_config install-preflight --package-info-stdin)" || exit 2
 [[ "$_candidate_preflight" =~ ^[0-9a-f]{64}$ ]] \
   || die "complete install candidate preflight returned an invalid digest"
+airlock_verify_prerequisite_receipt \
+  || die "prerequisites changed after preflight — no app was deactivated"
 
 # 1) hub static + frontend config
 # WEBROOT and CONFD live under system paths nginx can read. Create them with sudo
@@ -320,7 +400,9 @@ fi
 # app without a deactivator) aborts here, before any install touches the box.
 # Sits after the roots above because teardown resolves against $CONFD/$WEBROOT.
 _active_ports=""
-_deactivate_failed=""
+_upgrade_ids=""
+_remove_plan=""
+_removed_ids=""
 if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
   && { [ -n "$_pkg_ids" ] || [ -f "$LEDGER_FILE" ] || [ -n "$_known_builtins" ]; }; }; then
   # Close the read-to-reconcile window.  The first pass proved every static
@@ -352,34 +434,32 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
   # after an old package had already been deactivated.
   _adopt_scan="$(airlock_config adopt-scan)" \
     || die "known-builtin adoption sweep failed (rc=$?)"
-  # 🔴 One package's failed teardown must not strand the others. This loop
-  # deactivates EVERY changed package before ANY of them reinstalls (so a port
-  # an old install still holds is free before the new one binds), which means
-  # aborting in the middle leaves the packages already processed deactivated
-  # with nothing to bring them back. Measured twice on a real box (2026-08-26):
-  # one deactivator exited 1 and four unrelated apps stayed down.
-  # So: record the failure, keep going, skip only that package's install, and
-  # fail loudly at the end. The ledger keeps a failed package's record, so the
-  # next run re-plans exactly the same teardown.
+  # Classify only. No app is deactivated here: upgrades move to their own
+  # install turn, and config removals wait until all desired apps smoke+commit.
+  # Every planned app is checkpointed first, so an install, smoke, final-render,
+  # or removal error can compensate the complete touched prefix.
+  _tx_specs=()
   while IFS=$'\t' read -r _action _id; do
     [ -n "${_action:-}" ] || continue
+    _tx_specs+=("${_action}:${_id}")
     case "$_action" in
       remove|teardown-intent)
-        # airlock-ledger honours AIRLOCK_DRY_RUN itself ([dry] per artifact),
-        # which previews more than airlock_run's one-line command echo would.
-        log "reconcile: removing '$_id' (recorded but no longer in config)"
-        printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" remove "$_id" --active-ports "$_active_ports" \
-          || { log "reconcile FAILED: could not remove '$_id' (see above)"; _deactivate_failed="$_deactivate_failed $_id"; } ;;
+        _remove_plan="${_remove_plan}${_action}"$'\t'"${_id}"$'\n' ;;
       upgrade-deactivate)
-        log "reconcile: '$_id' changed — deactivating the recorded install before the fresh one"
-        printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" remove "$_id" --for-upgrade --active-ports "$_active_ports" \
-          || { log "reconcile FAILED: could not deactivate '$_id' (see above); its install is skipped, the rest continue"; _deactivate_failed="$_deactivate_failed $_id"; } ;;
+        _upgrade_ids="$_upgrade_ids $_id" ;;
       fresh|reinstall|upgrade-diff)
-        : ;;  # handled by the install/commit path below
+        : ;;
       *)
         die "unknown ledger plan action: $_action ($_id)" ;;
     esac
   done <<<"$_plan"
+  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] && [ "${#_tx_specs[@]}" -gt 0 ]; then
+    _airlock_failure_phase="checkpoint"
+    _airlock_transaction_id="$("$ROOT/bin/airlock-ledger" transaction-begin "${_tx_specs[@]}")" \
+      || die "could not create a verified install checkpoint — no app was deactivated"
+    _airlock_transaction_active=1
+    log "install transaction prepared: $_airlock_transaction_id"
+  fi
 
   # F15 sweep (child 4/P4, amended: runs on EVERY ledger-enabled run, not
   # only the first): known builtins with no config entry and no ledger
@@ -483,12 +563,43 @@ print("1" if "dry-run-exec" in (pkg.get("certifications") or []) else "0")
     else
       log "[dry] would install packaged app: $app from $pkg_dir (script not run)"
     fi
-  elif case " $_deactivate_failed " in *" $app "*) true ;; *) false ;; esac; then
-    # Its recorded teardown failed above, so the box still holds the OLD
-    # install's artifacts. Installing over them would let the ledger commit a
-    # new record while the old one still names artifacts nobody will reclaim.
-    log "skipping install of '$app': its recorded deactivation failed above"
   else
+    _airlock_failure_app="$app"
+    _airlock_failure_phase="intent"
+    if [ "$_airlock_transaction_active" = 1 ]; then
+      "$ROOT/bin/airlock-ledger" transaction-touch "$app"
+    fi
+    _handoff_ids="$(printf '%s' "$AIRLOCK_PKG_INFO" \
+      | "$ROOT/bin/airlock-ledger" handoffs "$app")" \
+      || die "could not calculate resource handoff for '$app'"
+    while IFS= read -r _handoff_id; do
+      [ -n "$_handoff_id" ] || continue
+      _airlock_failure_phase="resource-handoff"
+      _airlock_failure_app="$_handoff_id"
+      "$ROOT/bin/airlock-ledger" transaction-touch "$_handoff_id"
+      printf '%s' "$AIRLOCK_PKG_INFO" \
+        | "$ROOT/bin/airlock-ledger" preflight-remove "$_handoff_id" --active-ports "$_active_ports" >/dev/null
+      "$ROOT/bin/airlock-ledger" transaction-deactivated "$_handoff_id"
+      log "resource handoff: removing '$_handoff_id' immediately before '$app'"
+      printf '%s' "$AIRLOCK_PKG_INFO" \
+        | "$ROOT/bin/airlock-ledger" remove "$_handoff_id" --active-ports "$_active_ports" \
+        || die "resource handoff from '$_handoff_id' to '$app' failed; compensating"
+      _removed_ids="$_removed_ids $_handoff_id"
+    done <<<"$_handoff_ids"
+    _airlock_failure_app="$app"
+    case " $_upgrade_ids " in
+      *" $app "*)
+        _airlock_failure_phase="deactivate"
+        printf '%s' "$AIRLOCK_PKG_INFO" \
+          | "$ROOT/bin/airlock-ledger" preflight-remove "$app" --for-upgrade --active-ports "$_active_ports" >/dev/null
+        "$ROOT/bin/airlock-ledger" transaction-deactivated "$app"
+        log "reconcile: '$app' changed — deactivating it immediately before its fresh install"
+        printf '%s' "$AIRLOCK_PKG_INFO" \
+          | "$ROOT/bin/airlock-ledger" remove "$app" --for-upgrade --active-ports "$_active_ports" \
+          || die "could not deactivate '$app'; compensating the touched transaction"
+        ;;
+    esac
+    _airlock_failure_phase="install"
     log "installing packaged app: $app ($pkg_dir)"
     printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" intent "$app" --active-ports "$_active_ports" >/dev/null
     # F4: stage the tile icon ONLY NOW that the intent above names its
@@ -512,6 +623,8 @@ print("1" if "dry-run-exec" in (pkg.get("certifications") or []) else "0")
     _installed_pkgs="$_installed_pkgs $app"
   fi
 done <<<"$_app_ids"
+_airlock_failure_app="-"
+_airlock_failure_phase="final-render"
 
 # 3) render the main site (includes the fragments from step 2)
 log "rendering nginx site -> $NGINX_SITE"
@@ -579,6 +692,8 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   _smoke_failed=""
   while read -r app; do
     [ "$app" = hub ] && continue
+    _airlock_failure_phase="smoke"
+    _airlock_failure_app="$app"
     pkg_dir="$(airlock_pkg_dir "$app")"
     s="$pkg_dir/smoke.sh"
     # Validate proved smoke.sh was a regular non-symlink file (F6); a
@@ -602,17 +717,34 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   _commit_fail=0
   for app in $_installed_pkgs; do
     case " $_smoke_failed " in *" $app "*) continue ;; esac
+    _airlock_failure_phase="commit"
+    _airlock_failure_app="$app"
     printf '%s' "$AIRLOCK_PKG_INFO" | "$ROOT/bin/airlock-ledger" commit "$app" --active-ports "$_active_ports" \
       || { log "installed-state ledger commit failed for '$app' (intent kept; the next run repairs it)"; _commit_fail=1; }
   done
   [ "$smoke_fail" = 0 ] || die "one or more app smokes failed"
   [ "$_commit_fail" = 0 ] || die "one or more ledger commits failed (see above)"
+
+  # Config removals are last. They cannot strand an app that has not reached
+  # its own install/smoke/commit turn, and they remain compensatable because
+  # their committed artifacts were checkpointed with the rest of the plan.
+  while IFS=$'\t' read -r _action _id; do
+    [ -n "${_action:-}" ] || continue
+    case " $_removed_ids " in *" $_id "*) continue ;; esac
+    _airlock_failure_phase="remove"
+    _airlock_failure_app="$_id"
+    "$ROOT/bin/airlock-ledger" transaction-touch "$_id"
+    printf '%s' "$AIRLOCK_PKG_INFO" \
+      | "$ROOT/bin/airlock-ledger" preflight-remove "$_id" --active-ports "$_active_ports" >/dev/null
+    "$ROOT/bin/airlock-ledger" transaction-deactivated "$_id"
+    log "reconcile: removing '$_id' after desired apps committed"
+    printf '%s' "$AIRLOCK_PKG_INFO" \
+      | "$ROOT/bin/airlock-ledger" remove "$_id" --active-ports "$_active_ports" \
+      || die "could not remove '$_id'; compensating the touched transaction"
+  done <<<"$_remove_plan"
 fi
-# Last, so the run still reinstalls, renders, smokes and commits everything it
-# could before it reports the packages it could not take down.
-if [ -n "$_deactivate_failed" ]; then
-  die "reconcile could not deactivate:$_deactivate_failed — every other app was reinstalled; re-run after fixing the deactivator(s) named above"
-fi
+_airlock_failure_app="-"
+_airlock_failure_phase="frontend-check"
 
 # 6b) the layer in front of the loopback smokes: is the serve mapping assembled, is TLS
 # terminating, is something alive behind it. Skips itself, loudly, under a dry run.
@@ -626,10 +758,17 @@ serve_rc=0; airlock_serve_check || serve_rc=$?
 # Validation, install, smoke, ledger, and the runnable serve check have all
 # crossed their fatal edges above. A dry run never writes machine trust state.
 if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+  _airlock_failure_phase="lock-finalize"
+  _airlock_failure_app="-"
   if [ "${#_airlock_lifecycle_args[@]}" -eq 1 ]; then
     airlock_config lock-finalize "$_breakglass_receipt" || exit 2
   else
     airlock_config lock-finalize || exit 2
+  fi
+  if [ "$_airlock_transaction_active" = 1 ]; then
+    _airlock_failure_phase="transaction-commit"
+    "$ROOT/bin/airlock-ledger" transaction-finish committed
+    _airlock_transaction_active=0
   fi
 fi
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 // Integration test against the REAL upstream Paseo broker.
 //
 // Loads @getpaseo/server's BrowserToolsBroker, registers a client that pipes

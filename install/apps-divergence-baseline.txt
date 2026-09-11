@@ -37,14 +37,12 @@ only-work	apps/devterm/test-accounts-js.mjs
 #    reads a page and a backend module by path and can never be mirrored, so it lives in
 #    install/ instead. Registering it would have widened this guard in the direction it
 #    exists to close — the same call P2 made for test-inbox-state.mjs.
-only-work	apps/dev-monitor/backend/devmon_email.py
 # 4) 2026-08-18 P4 owner/roster: one more work-ahead backend module, same shape as
 #    devmon_email.py above. devmon_roster.py resolves a card's owner against the roster
 #    snapshot for the Slack/email/console axes devmon_messages.py, devmon_slack.py and
 #    devmon_email.py already read — it belongs in the public mirror and will land there on
 #    the next publish sync. It is only-work today because that sync has not run since this
 #    file was added, not because it is work-only by design.
-only-work	apps/dev-monitor/backend/devmon_roster.py
 # 5) 2026-08-21 provider-subagent selective delivery: a new paseo patch GROUP, split the
 #    same way batch 1 describes — work is the live consumer and the public copy is behind.
 #    The server filter trio (.mjs/.patch/.test.mjs) mirrors the shape airlock-apps already
@@ -208,6 +206,15 @@ only-work	apps/dev-monitor/backend/devmon_accounts.py
 # the live consumer until that sync; recording this exact temporary only-work path
 # preserves the gate's refusal of any unrelated private backend module.
 only-work	apps/dev-monitor/backend/devmon_updates.py
+# 14) 2026-09-10 app-store A: owner home order is a public dev-monitor backend
+# helper, but this card ships only the private work source. The public projection is
+# a separate, explicitly approved release; keep this work-ahead path narrow until it.
+only-work	apps/dev-monitor/backend/devmon_home_order.py
+# 15) 2026-09-11 app-store B: the owner app inventory/config writer is likewise a
+# public dev-monitor backend helper whose public mirror ships separately. Record only
+# this new module; existing backend/install/render edits remain content drift and do
+# not widen the set of work-only paths.
+only-work	apps/dev-monitor/backend/devmon_apps.py
 # 8) 2026-08-22 secret drop double header: the embedded panel drew a second title bar
 #    inside the widget's own, because the guard keyed on `close` (which panel.html hands
 #    over precisely when embedded) instead of on who owns the window. The fix edits
@@ -374,3 +381,78 @@ content	apps/fileview/static/app.js
 #    sync, not a designed split. devterm-gate.py itself is already content drift in
 #    batch 2 and keeps its kind.
 only-work	apps/devterm/test-codex-usage-sweep.py
+# 21) 2026-09-08 Slack published-document unfurls: this is a new public app
+#    package, so all eight files belong in airlock-apps at the next mirror sync.
+#    Work remains the live consumer until then; this is expected work-ahead drift,
+#    not a designed split. Remove the entries as soon as that sync lands.
+only-work	apps/slack-unfurl/airlock-app.toml
+only-work	apps/slack-unfurl/backend/slack_unfurl.py
+only-work	apps/slack-unfurl/backend/socket_mode.py
+only-work	apps/slack-unfurl/deactivate.sh
+only-work	apps/slack-unfurl/install.sh
+only-work	apps/slack-unfurl/render.sh
+only-work	apps/slack-unfurl/smoke.sh
+only-work	apps/slack-unfurl/test-slack-unfurl.py
+# 22) 2026-09-08 코어 라이선스 표기 변경(AGPL-3.0): 저작권자가 Apache-2.0 → AGPL-3.0 으로
+#    확정해(#392) 트리의 `SPDX-License-Identifier` 를 전부 `AGPL-3.0-only` 로 맞췄다.
+#    browse-host 는 mirrored app 이라 그 헤더 한 줄이 여기 열일곱 경로를 content 로 가른다.
+#    batch 1 과 같은 모양이다 — work 가 apps/ 의 live consumer 이고 공개본이 뒤에 있다.
+#    설계된 갈라짐이 **아니다**: 다음 publish sync 에서 airlock-apps 가 같은 헤더를 받으면
+#    열일곱 줄 전부 healed 가 되어야 하고, 그때 이 배치를 지운다.
+#    🔴 그때까지 airlock-apps 의 이 파일들은 헤더에 Apache-2.0 을 달고 있다. 정본은 저장소
+#    루트의 LICENSE 이고 그쪽은 아직 옛 값이므로, 공개 미러의 라이선스 표기는 sync 전까지
+#    실제와 어긋난다. 이 갈라짐을 오래 두지 말 것 — 라이선스는 늦게 맞춰도 되는 종류의
+#    드리프트가 아니다.
+#    browse-host 의 host.js·stream-server.js·smoke.sh·install.sh·README.md·
+#    bin/patch-web-ui.js 는 이미 위에서 content 로 잡혀 있어 kind 가 그대로다.
+content	apps/paseo/browse-host/bin/paseo-browse-host.js
+content	apps/paseo/browse-host/package.json
+content	apps/paseo/browse-host/src/commands.js
+content	apps/paseo/browse-host/src/executor.js
+content	apps/paseo/browse-host/src/security.js
+content	apps/paseo/browse-host/test/broker.integration.mjs
+content	apps/paseo/browse-host/test/companion.e2e.cjs
+content	apps/paseo/browse-host/test/companion.unit.cjs
+content	apps/paseo/browse-host/test/executor.ensuretab.cjs
+content	apps/paseo/browse-host/test/executor.roundtrip.cjs
+content	apps/paseo/browse-host/test/logs.unit.cjs
+content	apps/paseo/browse-host/test/roster.integration.cjs
+content	apps/paseo/browse-host/test/roster.unit.cjs
+content	apps/paseo/browse-host/test/security.policy.cjs
+content	apps/paseo/browse-host/test/smoke.cjs
+content	apps/paseo/browse-host/test/stream.roundtrip.cjs
+content	apps/paseo/browse-host/web/browse-view-client.js
+
+# 2026-09-10 dev-monitor Phase 1: app-only secret contract regression suite.
+only-work	apps/dev-monitor/test-secrets.py
+
+# Phase 1 review: shared boolean secret check and public smoke regressions.
+only-work	apps/dev-monitor/secret-check.sh
+only-work	apps/dev-monitor/test-secret-regressions.py
+only-work	apps/dev-monitor/backend/devmon_secret_names.py
+only-work	apps/dev-monitor/backend/devmon_secrets.py
+only-work	apps/dev-monitor/check-secrets.py
+only-work	apps/dev-monitor/test-secret-resolution.py
+only-work	apps/dev-monitor/backend/devmon_secret_file.py
+# 2026-09-10 dev-monitor Phase 2: daily producer, units, and local E2E oracle.
+only-work	apps/dev-monitor/heartbeat.py
+only-work	apps/dev-monitor/backend/devmon_heartbeat.py
+only-work	apps/dev-monitor/test-heartbeat.py
+only-work	apps/dev-monitor/systemd/airlock-devmon-heartbeat.service.in
+only-work	apps/dev-monitor/systemd/airlock-devmon-heartbeat.timer.in
+only-work	apps/dev-monitor/test-frontend-contract.mjs
+only-work	apps/dev-monitor/test-message-contract.py
+content	apps/dev-monitor/examples/emit_message.py
+content	apps/dev-monitor/token-freshness-alarm.sh
+only-work	apps/dev-monitor/test-run-contract.py
+
+# Phase 6: app-only loop, offline row mapping, and decisive endstate oracles.
+only-work	apps/dev-monitor/backend/devmon_loop.py
+only-work	apps/dev-monitor/backend/devmon_migrate.py
+only-work	apps/dev-monitor/test-loop-contract.py
+only-work	apps/dev-monitor/test-endstate-rehearsal.py
+
+# 2026-09-11 company catalog: public dev-monitor module and its offline contract tests
+# are work-ahead until the next airlock-apps projection sync.
+only-work	apps/dev-monitor/backend/devmon_company_catalog.py
+only-work	apps/dev-monitor/backend/test_devmon_company_catalog.py

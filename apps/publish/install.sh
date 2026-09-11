@@ -31,6 +31,7 @@ require_cmd python3 systemctl sudo
 
 airlock_load publish
 BACKEND_PORT="${AIRLOCK_PUBLISH_BACKEND_PORT:?}"
+TITLE_META="${AIRLOCK_PUBLISH_TITLE_META:-false}"
 CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
 WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
 IDENTITY_HEADER="${AIRLOCK_IDENTITY_HEADER:?}"
@@ -80,6 +81,15 @@ HTPASSWD_BIN="$(airlock_config get apps.publish.public_target.htpasswd_bin 2>/de
 # so a box can talk to a receiver that already has publishers deployed against a
 # different name — changing the shared default would break every one of them.
 TOKEN_HEADER="$(airlock_config get apps.publish.public_target.token_header 2>/dev/null || true)"
+# The URL a reader other than the owner can actually open (empty when tailnet_view
+# is off). The manager UI hands this out instead of the hub path, which 403s for
+# everyone except the person who published — see airlock_publish_doc_url.
+DOC_URL="$(airlock_publish_doc_url 2>/dev/null || true)"
+case "${AIRLOCK_PUBLISH_TAILNET_VIEW:-false}" in
+  true) DOC_AUDIENCE=tailnet ;;
+  false) DOC_AUDIENCE=owner ;;
+  *) die "publish tailnet_view must resolve to true or false" ;;
+esac
 [ -n "$TOKEN_HEADER" ] || TOKEN_HEADER=X-Airlock-Publish-Token
 [ -n "$HTPASSWD_BIN" ] || HTPASSWD_BIN=htpasswd
 if [ "$PUBLIC_MODE" = local ]; then
@@ -302,7 +312,7 @@ else
   install -d "$UNIT_DIR"
   render_publish_unit_service "$BACKEND_PORT" "$SHARE_DIR" "$UPLOADS_DIR" "$IDENTITY_HEADER" \
     "$INGEST_URL" "$BASE_URL" "$TOKEN_ENV" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" \
-    "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" "$TOKEN_HEADER" \
+    "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" "$TOKEN_HEADER" "$DOC_URL" "$DOC_AUDIENCE" "$TITLE_META" \
     >"$UNIT_DIR/airlock-publish.service"
   render_publish_unit_cleanup "$UPLOADS_DIR" "$PUBLIC_MODE" "$PUBLIC_DIR" "$STATE_DIR" \
     "$GATED_DIR" "$HTPASSWD_DIR" "$HTPASSWD_BIN" >"$UNIT_DIR/airlock-publish-cleanup.service"
