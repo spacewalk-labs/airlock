@@ -3390,7 +3390,14 @@ async def main():
             loop.add_signal_handler(sig, stop.set)
     except (NotImplementedError, RuntimeError):
         signal_wait = False
-    server = await asyncio.start_server(handle, LISTEN_HOST, LISTEN_PORT)
+    client_tasks = set()
+
+    def accept_client(cr, cw):
+        task = asyncio.create_task(handle(cr, cw))
+        client_tasks.add(task)
+        task.add_done_callback(client_tasks.discard)
+
+    server = await asyncio.start_server(accept_client, LISTEN_HOST, LISTEN_PORT)
     # Started only once the listener is bound. Its first act is a login-generation
     # read, which is a blocking subprocess; ahead of the bind that would hold the port
     # closed for the length of its timeout on every restart.
@@ -3405,12 +3412,22 @@ async def main():
           f"secret_cli={bool(PLATFORM_SECRET)}; "
           f"codex_usage_sweep={CODEX_USAGE_SWEEP if sweeper else 'off'}", flush=True)
     try:
-        async with server:
-            if signal_wait:
-                await stop.wait()
-            else:
-                await server.serve_forever()
+        if signal_wait:
+            await stop.wait()
+        else:
+            await server.serve_forever()
     finally:
+        # Python 3.12's Server.__aexit__ waits for every accepted connection before
+        # returning. A WebSocket can live indefinitely, so using `async with server`
+        # here made SIGTERM wait until systemd's 90-second SIGKILL. We own the client
+        # tasks explicitly: stop acceptance, close those clients, then wait for the
+        # server's active-connection count to reach zero.
+        server.close()
+        tasks = tuple(client_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await server.wait_closed()
         if sweeper is not None:
             sweeper.cancel()
             try:

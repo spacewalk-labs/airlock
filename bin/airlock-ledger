@@ -2232,7 +2232,7 @@ def _unit_status(path: str, scope: str) -> dict[str, str] | None:
     command = (["systemctl", "--user"] if scope == "user"
                else ["sudo", "systemctl"])
     command += ["show", os.path.basename(path),
-                "--property=LoadState,ActiveState,MainPID,ControlPID"]
+                "--property=LoadState,ActiveState,MainPID,ControlPID,ControlGroup"]
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except OSError as exc:
@@ -2300,12 +2300,22 @@ def _unit_invocations(path: str, scope: str) -> list[str]:
 
 
 def _unit_is_stopped(path: str, state: dict[str, str]) -> bool:
-    stopped = (state["ActiveState"] == "inactive"
-               and (not path.endswith(".service")
-                    or (state["MainPID"] == "0" and state["ControlPID"] == "0")))
+    service = path.endswith(".service")
+    no_manager_process = (service and state["MainPID"] == "0"
+                          and state["ControlPID"] == "0")
+    stopped = ((state["ActiveState"] == "inactive"
+                and (not service or no_manager_process))
+               # A timed-out stop leaves a failed unit even after SIGKILL completed.
+               # Accept that terminal state only with stronger evidence than the
+               # inactive path: systemd must report no main/control PID and an
+               # explicitly empty cgroup. Missing/unknown or residual cgroups remain
+               # refusals, so a failed unit alone is never proof that teardown is safe.
+               or (state["ActiveState"] == "failed" and no_manager_process
+                   and state.get("ControlGroup") == ""))
     if not stopped:
         log(f"unit {path} is not proven stopped: ActiveState={state['ActiveState']} "
-            f"MainPID={state.get('MainPID', '-')} ControlPID={state.get('ControlPID', '-')}")
+            f"MainPID={state.get('MainPID', '-')} ControlPID={state.get('ControlPID', '-')} "
+            f"ControlGroup={state.get('ControlGroup', '<unknown>')!r}")
     return stopped
 
 

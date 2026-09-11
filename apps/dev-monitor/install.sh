@@ -250,7 +250,7 @@ devmon_write_outer_receipt() {
   [ -n "$receipt$transaction_id" ] || return 0
   [[ "$transaction_id" =~ ^[0-9a-f]{32}$ ]] \
     || die "invalid outer install transaction id"
-  expected="${AIRLOCK_STATE_DIR:?outer transaction state is missing}/install-checkpoints/$transaction_id/dev-monitor-migration.json"
+  expected="$(devmon_migration_receipt_path "$transaction_id")"
   [ "$receipt" = "$expected" ] \
     || die "outer dev-monitor migration receipt path does not match its transaction"
   python3 - "$receipt" "$transaction_id" "$DEVMON_DB" "$SPOOL_WRITER_USER" \

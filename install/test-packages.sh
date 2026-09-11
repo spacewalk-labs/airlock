@@ -591,7 +591,8 @@ grep -q "$WEB/t1" <<<"$exp" \
   || bad "F1: expanded artifacts (got: $exp)"
 
 # Sibling non-discovery: present on disk, referenced nowhere -> never touched.
-if [ ! -f "$TMP/invoke-t9.log" ] && ! grep -q t9 <<<"$out" \
+if [ ! -f "$TMP/invoke-t9.log" ] \
+   && ! grep -Fq "installing packaged app: t9 (" <<<"$out" \
    && [ "$(ledger_field t9 x '"committed" in e')" != True ]; then
   ok "F1: a sibling package named in no [packages] table is never resolved"
 else

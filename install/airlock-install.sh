@@ -117,7 +117,7 @@ airlock_escape_selfkill_cgroup "$0" "$@"
 # parsing: a bad new candidate must not prevent the last committed apps from
 # being restored. The same ledger lock remains held if this run continues.
 _airlock_recovery_lock=0
-_airlock_early_state_dir="${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}"
+_airlock_early_state_dir="$(devmon_migration_state_dir)"
 if [ -e "$_airlock_early_state_dir/install-transaction.json" ] \
     || [ -L "$_airlock_early_state_dir/install-transaction.json" ]; then
   airlock_preflight_bootstrap
@@ -199,7 +199,7 @@ _airlock_cleanup_config_wrapper() {
   if [ "${_airlock_transaction_active:-0}" = 1 ]; then
     [ "$_exit_rc" != 0 ] || _exit_rc=1
     _airlock_devmon_compensate \
-      "${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}" \
+      "$(devmon_migration_state_dir)" \
       "${_airlock_transaction_id:-}" || _db_restore_rc=$?
     AIRLOCK_TRANSACTION_ERROR="installer exited rc=$_exit_rc" \
       "$ROOT/bin/airlock-ledger" transaction-fail \
@@ -560,7 +560,7 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
       || die "could not create a verified install checkpoint — no app was deactivated"
     _airlock_transaction_active=1
     AIRLOCK_INSTALL_TRANSACTION_ID="$_airlock_transaction_id"
-    AIRLOCK_DEVMON_MIGRATION_RECEIPT="${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}/install-checkpoints/$_airlock_transaction_id/dev-monitor-migration.json"
+    AIRLOCK_DEVMON_MIGRATION_RECEIPT="$(devmon_migration_receipt_path "$_airlock_transaction_id")"
     export AIRLOCK_INSTALL_TRANSACTION_ID AIRLOCK_DEVMON_MIGRATION_RECEIPT
     log "install transaction prepared: $_airlock_transaction_id"
   fi

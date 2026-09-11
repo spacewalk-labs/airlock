@@ -221,9 +221,12 @@ EOF
 }
 
 orch() {
-  HOME="$FAKEHOME" AIRLOCK_CONFIG="$1" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" \
-    AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup" \
-    bash "$ROOT/install/airlock-install.sh"
+  (
+    [ "${AIRLOCK_FIXTURE_UNSET_STATE_DIR:-0}" != 1 ] || unset AIRLOCK_STATE_DIR
+    HOME="$FAKEHOME" AIRLOCK_CONFIG="$1" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" \
+      AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup" \
+      bash "$ROOT/install/airlock-install.sh"
+  )
 }
 
 ledger_has_committed() {
@@ -667,6 +670,31 @@ devmon_standalone_fallback() {
   fi
 }
 
+devmon_default_state_dir() {
+  reset_fixture
+  local cfg="$TMP/devmon-default-state.toml" rc=0 phase
+  local state="$FAKEHOME/.local/state/airlock"
+  local db="$state/dev-monitor/messages.db"
+  AIRLOCK_FIXTURE_UNSET_STATE_DIR=1 prepare_devmon_migration "$cfg" \
+    || { bad "devmon-default-state-dir: setup failed"; tail -30 "$TMP/devmon-first.log"; return; }
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$TMP/devmon-v2/smoke.sh"
+  chmod +x "$TMP/devmon-v2/smoke.sh"
+  AIRLOCK_FIXTURE_UNSET_STATE_DIR=1 \
+    devmon_orch "$cfg" >"$TMP/devmon-default-state.log" 2>&1 || rc=$?
+  phase="$(env -u AIRLOCK_STATE_DIR HOME="$FAKEHOME" \
+    "$ROOT/bin/airlock-ledger" transaction-show \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])' 2>/dev/null)"
+  if [ "$rc" = 0 ] && [ "$phase" = committed ] \
+      && [ "$(python3 "$ROOT/apps/dev-monitor/migrate-legacy-state.py" --schema-state "$db")" = canonical ] \
+      && [ "$(python3 "$ROOT/apps/dev-monitor/migrate-legacy-state.py" --schema-state "${db}.pre-endstate")" = legacy ] \
+      && ! find "$state/install-checkpoints" -name dev-monitor-migration.json -print -quit | grep -q .; then
+    ok "devmon-default-state-dir: unset state uses the shared default through outer commit"
+  else
+    bad "devmon-default-state-dir: rc=$rc phase=${phase:-none}"
+    tail -35 "$TMP/devmon-default-state.log" | sed 's/^/    /'
+  fi
+}
+
 devmon_crash_reentry() {
   reset_fixture
   local cfg="$TMP/devmon-crash.toml" rc=0 retry_rc=0
@@ -723,6 +751,7 @@ case "$case_name" in
   devmon-nginx-failure) devmon_nginx_failure ;;
   devmon-restore-refused) devmon_restore_refused ;;
   devmon-standalone-fallback) devmon_standalone_fallback ;;
+  devmon-default-state-dir) devmon_default_state_dir ;;
   devmon-crash-reentry) devmon_crash_reentry ;;
   current-blast) current_blast ;;
   all)
@@ -739,6 +768,7 @@ case "$case_name" in
     devmon_nginx_failure
     devmon_restore_refused
     devmon_standalone_fallback
+    devmon_default_state_dir
     devmon_crash_reentry
     ;;
   *) bad "unknown case: $case_name" ;;

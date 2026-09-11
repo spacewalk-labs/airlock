@@ -14,7 +14,7 @@ What it pins down, because these are the parts that fail quietly:
     graded crit instead of passing for a healthy login;
   - that no identity ever appears in the alert payload.
 """
-import asyncio, contextlib, re, copy, importlib.machinery, importlib.util, inspect, io, json, os, shutil, stat, subprocess, sys, tempfile, time, types, urllib.error
+import asyncio, contextlib, re, copy, importlib.machinery, importlib.util, inspect, io, json, os, shutil, socket, stat, subprocess, sys, tempfile, time, types, urllib.error
 os.environ.setdefault("AIRLOCK_OWNER", "owner@example.com")
 spec = importlib.util.spec_from_file_location("gate", "apps/devterm/backend/devterm-gate.py")
 g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
@@ -813,14 +813,50 @@ try:
 finally:
     g._xai_login_process = _saved_login_process
 
-_main_source = inspect.getsource(g.main)
-check("gate shutdown serializes and cancels the tracked xAI process",
-      "finally:" in _main_source
-      and "async with _xai_operation_lock" in _main_source
-      and "await _cancel_xai_login()" in _main_source)
+def _sigterm_with_open_client_case():
+    """An accepted client must not make Server.wait_closed() own shutdown forever."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    listener.close()
+    env = dict(os.environ, AIRLOCK_OWNER="owner@example.com",
+               DEVTERM_LISTEN_HOST="127.0.0.1", DEVTERM_LISTEN_PORT=str(port),
+               DEVTERM_ACCOUNTS="false", DEVTERM_XAI="false")
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(g.__file__)],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    client = None
+    deadline = time.monotonic() + 3
+    try:
+        while client is None and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                client = socket.create_connection(("127.0.0.1", port), timeout=0.1)
+            except OSError:
+                time.sleep(0.02)
+        if client is None:
+            return False
+        # Leave the accepted request incomplete. This models the long-lived /ws
+        # connection measured during both 90-second systemd stop timeouts.
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+            return proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+    finally:
+        if client is not None:
+            client.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+check("SIGTERM closes accepted clients before waiting for the server",
+      _sigterm_with_open_client_case())
 
 # CORS: same first hostname label echoes, anything else does not
-import socket
 host = socket.gethostname().split(".")[0]
 check("same-box origin echoes",
       g._cors_origin({b"origin": f"https://{host}.example.ts.net:8447".encode()})

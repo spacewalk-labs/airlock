@@ -17,6 +17,15 @@ DEVMON_MIGRATION_NEW_MODE=-
 DEVMON_MIGRATION_TMP_IDENTITY=
 DEVMON_MIGRATION_NEW_IDENTITY=
 
+devmon_migration_state_dir() {
+  printf '%s\n' "${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}"
+}
+
+devmon_migration_receipt_path() {
+  printf '%s/install-checkpoints/%s/dev-monitor-migration.json\n' \
+    "$(devmon_migration_state_dir)" "$1"
+}
+
 devmon_migration_unit_state() {
   local unit="$1" row key value
   row="$(timeout 30 systemctl --user show "$unit" \

@@ -76,6 +76,8 @@ elif action == 'show':
         if name.endswith('.service') and fault != 'missing-pid':
             print('MainPID=' + u['pid'])
             print('ControlPID=' + u['control'])
+            if 'cgroup' in u:
+                print('ControlGroup=' + u['cgroup'])
 elif action == 'disable':
     # Legacy disable --now stops, but a still-active trigger can restart service.
     if unit and '--now' in args:
@@ -251,6 +253,25 @@ class TeardownTests(unittest.TestCase):
         (self.root / 'trace.jsonl').unlink(missing_ok=True)
         self.fault('show', effect='missing-pid')
         self.assert_preserved(paths)
+
+    def test_failed_service_requires_explicitly_empty_control_group(self):
+        for cgroup, allowed in (('', True),
+                                ('/user.slice/residual.service', False),
+                                (None, False)):
+            with self.subTest(cgroup=cgroup, allowed=allowed):
+                paths = self.fixture(suffixes=('service',))
+                (self.root / 'trace.jsonl').unlink(missing_ok=True)
+                unit = self.manager['units']['user:probe.service']
+                unit.update(active='failed', pid='0', control='0')
+                if cgroup is not None:
+                    unit['cgroup'] = cgroup
+                self.fault('stop', effect='lie')
+                self.save_manager()
+                if allowed:
+                    self.assertEqual(self.teardown(), 0, self.output)
+                    self.assertFalse(os.path.lexists(paths[0]))
+                else:
+                    self.assert_preserved(paths)
 
     def test_final_barrier_detects_reactivated_trigger(self):
         paths = self.fixture()
