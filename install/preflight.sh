@@ -98,9 +98,14 @@ airlock_verify_prerequisite_receipt() {
 }
 
 airlock_load_nvm() {
-  # Paseo supports a default nvm installation. Preflight and the installer must
-  # resolve the same node/npm pair or an ambient Ubuntu node can produce a false
-  # wrong-version result before the installer switches to nvm.
+  # An orchestrated lifecycle must keep the exact runtime preflight recorded.
+  # Re-sourcing nvm here can replace an approved system node with a different
+  # nvm node; require_cmd then correctly rejects our own path change as drift.
+  # Direct app invocation has no receipt authority and retains nvm discovery.
+  if [ -n "${AIRLOCK_INSTALL_PKG_INFO_SHA256:-}" ] \
+    && [ -n "${AIRLOCK_PREREQ_RECEIPT:-}" ]; then
+    return 0
+  fi
   if [ -s "$HOME/.nvm/nvm.sh" ]; then
     # shellcheck source=/dev/null
     . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 || true
@@ -351,13 +356,10 @@ airlock_preflight() {
     log "preflight: required core declaration missing: $cmd"
     return 2
   done
-  # Child 4/P3: the row-required rule ("an enabled built-in must own a TSV
-  # row") and the paseo nvm-preflight hook were both legacy-built-in-only
-  # escapes — a manifest IS the declaration (a zero-prereq package, including
-  # one shadowing a built-in tree, is complete without rows), and a packaged
-  # paseo resolves its own runtime via its own install.sh (which calls
-  # airlock_load_nvm itself; install/test-preflight.sh pins that call site).
-  # Every enabled non-hub app is a package now, so both retire.
+  # Runtime selection precedes both the version probe and receipt publication.
+  # Key this to the effective manifest row, not merely the package id: a package
+  # shadowing paseo without a Node prerequisite made no NVM contract.
+  case ",${owners[node]:-}," in *,paseo,*) airlock_load_nvm ;; esac
 
   local -a failures=()
   local path version req status detected selected_owners=""

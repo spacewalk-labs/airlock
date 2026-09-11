@@ -228,19 +228,10 @@ else
   bad "disabled Paseo tightened File Viewer's node requirement"
 fi
 
-# Paseo's nvm hook (child-4 P2b STEP 3): install/preflight.sh:203-209
-# (pre-existing, from child 3 — unchanged by this migration) DELIBERATELY
-# skips the shared airlock_load_nvm preflight hook once paseo is PACKAGED:
-# "a packaged paseo declares its own runtime through its manifest, and this
-# hook would act on a contract that package never made." So a preflight
-# report for a packaged paseo, run against an ambient-only Node 18 with a
-# real Node 20 available only via nvm, must legitimately show the wrong-
-# version/missing gaps below (proving the documented boundary is real, not
-# just commented) — the RESPONSIBILITY for nvm resolution shifted onto
-# paseo's own install.sh, which still calls airlock_load_nvm itself
-# unconditionally (apps/paseo/install.sh:78, untouched by this migration)
-# at actual install time. Both halves are asserted: preflight's negative
-# (still gap-reporting) and install.sh's positive (still nvm-resolving).
+# Paseo supports an nvm runtime, so runtime selection must happen before the
+# version probe and receipt publication. The actual installer repeats the same
+# helper for direct invocation, while an orchestrated child retains the receipt's
+# selection instead of sourcing nvm again.
 NVM_ALL="$TMP/nvm-ambient"; mkdir -p "$NVM_ALL"
 while IFS= read -r cmd; do make_stub "$NVM_ALL" "$cmd"; done \
   < <(awk -F '\t' 'NF >= 2 {print $2}' "$ASSEMBLED_PREREQS" | sort -u)
@@ -255,11 +246,12 @@ chmod +x "$NVM_ALL/node"
 NVM_HOME="$TMP/nvm-home"; mkdir -p "$NVM_HOME/.nvm" "$NVM_HOME/nvm-bin"
 cat >"$NVM_HOME/nvm-bin/node" <<'STUB'
 #!/usr/bin/env bash
-case "${1:-}" in -p) echo 20 ;; *) echo v20.0.0 ;; esac
+case "$*" in *process.execPath*) echo "$0" ;; *process.versions.node*) echo 22 ;; *) echo v22.0.0 ;; esac
 STUB
 make_stub "$NVM_HOME/nvm-bin" npm
 chmod +x "$NVM_HOME/nvm-bin/node"
 cat >"$NVM_HOME/.nvm/nvm.sh" <<'STUB'
+if [ -n "${NVM_LOAD_COUNT_FILE:-}" ]; then printf 'load\n' >>"$NVM_LOAD_COUNT_FILE"; fi
 PATH="$HOME/nvm-bin:$PATH"
 export PATH
 STUB
@@ -267,10 +259,10 @@ make_config "$TMP/paseo.toml" hub paseo
 nvm_pf_rc=0
 nvm_pf_out="$(HOME="$NVM_HOME" PATH="$NVM_ALL" AIRLOCK_CONFIG="$TMP/paseo.toml" \
   /bin/bash "$ROOT/bin/airlock-preflight" --quiet 2>&1)" || nvm_pf_rc=$?
-if [ "$nvm_pf_rc" = 1 ] && [[ "$nvm_pf_out" == *"node"*wrong-version* ]]; then
-  ok "packaged paseo's preflight no longer auto-loads nvm (its manifest owns its own runtime declaration — install/preflight.sh:203-209)"
+if [ "$nvm_pf_rc" = 0 ] && [ -z "$nvm_pf_out" ]; then
+  ok "Paseo preflight selects its manifest-declared nvm runtime before validation"
 else
-  bad "packaged paseo preflight/nvm boundary changed: rc=$nvm_pf_rc out=$nvm_pf_out"
+  bad "Paseo preflight did not validate the selected nvm runtime: rc=$nvm_pf_rc out=$nvm_pf_out"
 fi
 # The other half of the boundary: install.sh's OWN airlock_load_nvm call
 # (apps/paseo/install.sh:78) still resolves nvm's node/npm at actual install
@@ -301,11 +293,16 @@ run_paseo_install() {
   # dir" — the scratch copy the self-check below runs still resolves
   # render.sh, web/, etc. from the REAL apps/paseo, only its own top-level
   # statements differ.
-  local script="$1" state; state="$(mktemp -d -p "$TMP")"
-  HOME="$NVM_HOME" PATH="$NVM_ALL:$PATH" \
+  local script="$1" runtime_bin="${2:-$NVM_ALL}" state
+  state="$(mktemp -d -p "$TMP")"
+  HOME="$NVM_HOME" PATH="$runtime_bin:$PATH" \
     AIRLOCK_CONFIG="$NVM_INSTALL_CFG" AIRLOCK_ROOT="$ROOT" \
     AIRLOCK_APP_DIR="$ROOT/apps/paseo" AIRLOCK_APP_ID="paseo" \
     AIRLOCK_CONFD="$(mktemp -d -p "$TMP")" AIRLOCK_STATE_DIR="$state" \
+    AIRLOCK_PREREQ_RECEIPT="${AIRLOCK_PREREQ_RECEIPT:-}" \
+    AIRLOCK_PREREQ_CONTEXT="${AIRLOCK_PREREQ_CONTEXT:-}" \
+    AIRLOCK_INSTALL_PKG_INFO_SHA256="${AIRLOCK_INSTALL_PKG_INFO_SHA256:-}" \
+    NVM_LOAD_COUNT_FILE="${NVM_LOAD_COUNT_FILE:-}" \
     AIRLOCK_DRY_RUN=1 /bin/bash "$script" 2>&1
 }
 nvm_install_rc=0
@@ -341,6 +338,50 @@ else
     bad "self-check FAILED: stripping install.sh's airlock_load_nvm call did NOT turn it red (rc=$attack_rc out=$attack_out) — the positive assertion above is not load-bearing"
   fi
 fi
+
+# The orchestrator's receipt is the runtime selection boundary. Preflight starts
+# with the valid ambient Node 20 below, selects NVM Node 22, and records that path.
+# Paseo must not select again in its real installer; a genuinely changed PATH
+# after receipt publication must still fail at the existing drift gate.
+NVM_APPROVED="$TMP/nvm-approved"; cp -a "$NVM_ALL" "$NVM_APPROVED"
+cat >"$NVM_APPROVED/node" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in *process.execPath*) echo "$0" ;; *process.versions.node*) echo 20 ;; *) echo v20.0.0 ;; esac
+STUB
+chmod +x "$NVM_APPROVED/node"
+NVM_RECEIPT="$TMP/nvm-runtime.receipt"
+NVM_CONTEXT="fixture=paseo-runtime"
+NVM_LOAD_COUNT_FILE="$TMP/nvm-load-count"
+nvm_receipt_rc=0
+HOME="$NVM_HOME" PATH="$NVM_APPROVED:/usr/bin:/bin" AIRLOCK_CONFIG="$NVM_INSTALL_CFG" \
+  AIRLOCK_PREREQ_RECEIPT="$NVM_RECEIPT" AIRLOCK_PREREQ_CONTEXT="$NVM_CONTEXT" \
+  NVM_LOAD_COUNT_FILE="$NVM_LOAD_COUNT_FILE" \
+  /bin/bash "$ROOT/bin/airlock-preflight" --quiet >/dev/null 2>&1 || nvm_receipt_rc=$?
+AIRLOCK_PREREQ_RECEIPT="$NVM_RECEIPT"
+AIRLOCK_PREREQ_CONTEXT="$NVM_CONTEXT"
+AIRLOCK_INSTALL_PKG_INFO_SHA256="$(printf 'd%.0s' {1..64})"
+nvm_orchestrated_rc=0
+nvm_orchestrated_out="$(run_paseo_install "$ROOT/apps/paseo/install.sh" "$NVM_HOME/nvm-bin:$NVM_APPROVED")" \
+  || nvm_orchestrated_rc=$?
+if [ "$nvm_receipt_rc" = 0 ] && [ "$nvm_orchestrated_rc" = 0 ] \
+  && [ "$(wc -l <"$NVM_LOAD_COUNT_FILE")" = 1 ]; then
+  ok "orchestrated Paseo selects nvm once, before its real preflight receipt"
+else
+  bad "orchestrated Paseo changed its approved node runtime: preflight_rc=$nvm_receipt_rc install_rc=$nvm_orchestrated_rc out=$nvm_orchestrated_out"
+fi
+NVM_DRIFT="$TMP/nvm-drift"; mkdir -p "$NVM_DRIFT"
+cp "$NVM_APPROVED/node" "$NVM_DRIFT/node"
+nvm_drift_rc=0
+nvm_drift_out="$(run_paseo_install "$ROOT/apps/paseo/install.sh" "$NVM_DRIFT:$NVM_HOME/nvm-bin:$NVM_APPROVED")" \
+  || nvm_drift_rc=$?
+if [ "$nvm_drift_rc" != 0 ] \
+  && [[ "$nvm_drift_out" == *"required command changed after preflight: node"* ]]; then
+  ok "an external node PATH change after receipt publication is still rejected"
+else
+  bad "external node PATH drift escaped the receipt gate: rc=$nvm_drift_rc out=$nvm_drift_out"
+fi
+unset AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT AIRLOCK_INSTALL_PKG_INFO_SHA256 \
+  NVM_LOAD_COUNT_FILE
 
 # Child 4/P3: an unknown app is fatal at validate now (the local/custom-app
 # escape hatch retired with the built-in registry) — bin/airlock-preflight
