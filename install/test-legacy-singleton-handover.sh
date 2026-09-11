@@ -847,10 +847,16 @@ run_paseo_case() {
   else
     bad "paseo: candidate failures deleted or changed live legacy singleton state"
   fi
-  if grep -qx 'Restart=on-success' "$unit" && ! grep -qx 'Restart=always' "$unit"; then
-    ok "paseo: nonzero candidate failure is not retried while clean UI restart remains supported"
+  # The invariant is a BOUNDED retry, not one specific Restart= value. on-success
+  # bounded the loop by never retrying a failure at all, and that cost a 5.5h
+  # outage on 2026-09-11 when a transient ENOSPC exit stayed down. Restart=always
+  # plus the StartLimitBurst below retries at most three times in thirty seconds
+  # and then stays failed, which is what this test was protecting.
+  if grep -qx 'Restart=always' "$unit" \
+     && grep -qx 'StartLimitIntervalSec=30' "$unit" && grep -qx 'StartLimitBurst=3' "$unit"; then
+    ok "paseo: candidate failure retries are bounded, and clean UI restart remains supported"
   else
-    bad "paseo: rendered restart policy still loops on candidate failure"
+    bad "paseo: rendered restart policy is not a bounded retry"
   fi
   if grep -qx 'StartLimitIntervalSec=30' "$unit" && grep -qx 'StartLimitBurst=3' "$unit"; then
     ok "paseo: even clean-exit restart behavior is rate limited"
