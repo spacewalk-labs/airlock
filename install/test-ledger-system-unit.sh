@@ -260,6 +260,7 @@ expect_refusal \
 # Same CI entry point also exercises the actual two-stage teardown with
 # stateful systemctl faults, scratch fragments and persisted legacy records.
 python3 "$HERE/test-ledger-teardown.py" || exit 1
+python3 "$HERE/test-ledger-template-units.py" || exit 1
 
 echo "---"
 echo "passed=$pass failed=$fail"

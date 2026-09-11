@@ -2249,6 +2249,54 @@ def _unit_status(path: str, scope: str) -> dict[str, str] | None:
     return state
 
 
+def _is_service_template(name: str) -> bool:
+    return name.endswith("@.service")
+
+
+def _template_instance_matches(template: str, name: str) -> bool:
+    if not _is_service_template(template):
+        return False
+    prefix = template[:-len(".service")]
+    return (name.startswith(prefix) and name.endswith(".service")
+            and len(name) > len(prefix) + len(".service"))
+
+
+def _unit_invocations(path: str, scope: str) -> list[str]:
+    """Return concrete unit names that systemctl may safely invoke.
+
+    A template fragment is an artifact, but ``foo@.service`` is not an
+    invocable unit. Ask the manager for the concrete instances it currently
+    knows and keep the wildcard inside one argv element (never shell-expand
+    it). With --no-legend/--plain every non-empty output line begins with the
+    full unit name.
+    """
+    name = os.path.basename(path)
+    if not _is_service_template(name):
+        return [name]
+    pattern = name[:-len("@.service")] + "@*.service"
+    command = (["systemctl", "--user"] if scope == "user"
+               else ["sudo", "systemctl"])
+    command += ["list-units", "--all", "--full", "--plain",
+                "--no-legend", "--no-pager", pattern]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        fail(f"cannot enumerate instances of template unit {name}: {exc}")
+    if result.returncode != 0:
+        fail(f"cannot enumerate instances of template unit {name} "
+             f"(rc={result.returncode})")
+    instances: list[str] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        candidate = line.split(None, 1)[0]
+        if not _template_instance_matches(name, candidate):
+            fail(f"cannot classify template unit {name}: unexpected list-units row {line!r}")
+        if candidate not in instances:
+            instances.append(candidate)
+    return instances
+
+
 def _unit_is_stopped(path: str, state: dict[str, str]) -> bool:
     stopped = (state["ActiveState"] == "inactive"
                and (not path.endswith(".service")
@@ -2291,7 +2339,8 @@ def _stop_units(units: list[tuple[str, str]], dry: bool) -> bool:
 
 
 def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
-                   *, preflight_scope: str | None = None) -> tuple[bool, str]:
+                   *, preflight_scope: str | None = None,
+                   unit_names: list[str] | None = None) -> tuple[bool, str]:
     """Deletion stage, called only after the batch stop barrier.
 
     Returns (ok, scope): scope is 'user'/'system' whenever the recorded
@@ -2304,9 +2353,11 @@ def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
     if scope == "system" and "system-unit" not in (capabilities or ()):
         fail("artifacts.units contains a system unit but capabilities does not "
              f"claim 'system-unit' (capabilities={capabilities!r})")
-    if not os.path.lexists(path):
+    template = _is_service_template(os.path.basename(path))
+    if unit_names is None:
+        unit_names = [] if template else [os.path.basename(path)]
+    if not os.path.lexists(path) and not (template and unit_names):
         return True, scope
-    unit_name = os.path.basename(path)
     if dry:
         log(f"[dry] would disable and remove unit {path}")
         return True, scope
@@ -2314,11 +2365,14 @@ def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
     # it may itself remove linked fragments. Suppress its implicit reload;
     # the caller reloads each scope once after all fragment removals.
     if scope == "user":
-        if _run_command(["systemctl", "--user", "disable", "--no-reload", unit_name],
-                        f"systemctl --user disable --no-reload {unit_name}") != 0:
-            log(f"disable failed for {path}; no explicit fragment removal attempted "
-                "(disable may already have removed links); record retained for retry")
-            return False, scope
+        for unit_name in unit_names:
+            if _run_command(["systemctl", "--user", "disable", "--no-reload", unit_name],
+                            f"systemctl --user disable --no-reload {unit_name}") != 0:
+                log(f"disable failed for {path}; no explicit fragment removal attempted "
+                    "(disable may already have removed links); record retained for retry")
+                return False, scope
+        if not os.path.lexists(path):
+            return True, scope
         try:
             _remove_plain_path(path, recursive=False)
         except FileNotFoundError:
@@ -2336,11 +2390,14 @@ def _teardown_unit(path: str, dry: bool, capabilities: list[str] | None,
             log(f"remove {path} failed: {exc}")
             return False, scope
     else:
-        if _run_command(["sudo", "systemctl", "disable", "--no-reload", unit_name],
-                        f"sudo systemctl disable --no-reload {unit_name}") != 0:
-            log(f"disable failed for {path}; no explicit fragment removal attempted "
-                "(disable may already have removed links); record retained for retry")
-            return False, scope
+        for unit_name in unit_names:
+            if _run_command(["sudo", "systemctl", "disable", "--no-reload", unit_name],
+                            f"sudo systemctl disable --no-reload {unit_name}") != 0:
+                log(f"disable failed for {path}; no explicit fragment removal attempted "
+                    "(disable may already have removed links); record retained for retry")
+                return False, scope
+        if not os.path.lexists(path):
+            return True, scope
         if _run_command(["sudo", "rm", "-f", path], f"sudo rm {path}") != 0:
             return False, scope
     if os.path.lexists(path):
@@ -2420,7 +2477,20 @@ def _teardown_artifact_batches(batches: list[tuple[dict[str, list[Any]],
                  _preflight_teardown_artifacts(artifacts, capabilities))
                 for artifacts, mappings, capabilities in batches]
     units = list(dict.fromkeys(unit for *_, batch_units in prepared for unit in batch_units))
-    if not _stop_units(units, dry):
+    invocation_names: dict[tuple[str, str], list[str]] = {}
+    invocations: list[tuple[str, str]] = []
+    for path, scope in units:
+        if dry and _is_service_template(os.path.basename(path)):
+            log(f"[dry] would enumerate, stop, and disable instances of template unit {path}")
+            names: list[str] = []
+        else:
+            names = _unit_invocations(path, scope)
+        invocation_names[(path, scope)] = names
+        for name in names:
+            invocation = (os.path.join(os.path.dirname(path), name), scope)
+            if invocation not in invocations:
+                invocations.append(invocation)
+    if not _stop_units(invocations, dry):
         log("unit stop/verification failed; no disable, artifact removal or reload "
             "attempted; all fragments and the record are kept for retry")
         return False
@@ -2430,7 +2500,9 @@ def _teardown_artifact_batches(batches: list[tuple[dict[str, list[Any]],
         for path, scope in batch_units:
             if path in removed:
                 continue
-            unit_ok, _ = _teardown_unit(path, dry, capabilities, preflight_scope=scope)
+            unit_ok, _ = _teardown_unit(
+                path, dry, capabilities, preflight_scope=scope,
+                unit_names=invocation_names[(path, scope)])
             ok = unit_ok and ok
             removed.add(path)
     ok = _reload_units({scope for _, scope in units}, dry) and ok
@@ -3236,8 +3308,7 @@ def _write_checkpoint_archive(source: str, archive: Path, *, privileged: bool) -
     return _sha256_file(archive)
 
 
-def _capture_unit_state(path: str, scope: str) -> dict[str, bool]:
-    name = os.path.basename(path)
+def _capture_unit_state(name: str, scope: str) -> dict[str, bool]:
     prefix = ["systemctl", "--user"] if scope == "user" else ["sudo", "systemctl"]
     try:
         active = subprocess.run(prefix + ["is-active", "--quiet", name], check=False).returncode
@@ -3280,8 +3351,15 @@ def _checkpoint_record(store: dict[str, Any], app_id: str, action: str, root: Pa
                 item["sha256"] = _write_checkpoint_archive(path, archive, privileged=privileged)
             captured.append(item)
             index += 1
-    states = {os.path.basename(path): {"scope": scope, **_capture_unit_state(path, scope)}
-              for path, scope in units}
+    states: dict[str, dict[str, Any]] = {}
+    for path, scope in units:
+        name = os.path.basename(path)
+        if _is_service_template(name):
+            instances = {instance: _capture_unit_state(instance, scope)
+                         for instance in _unit_invocations(path, scope)}
+            states[name] = {"scope": scope, "instances": instances}
+        else:
+            states[name] = {"scope": scope, **_capture_unit_state(name, scope)}
     return {"artifacts": captured, "units": states,
             "mappings": copy.deepcopy(committed["serve_mappings"])}
 
@@ -3348,11 +3426,22 @@ def _validate_checkpoint_archives(tx: dict[str, Any]) -> None:
                 or set(checkpoint["units"]) != set(expected_units)):
             fail(f"transaction {tx['id']}: unit inventory differs from saved ledger for {app_id}")
         for name, state in checkpoint["units"].items():
-            if (not isinstance(state, dict)
-                    or set(state) != {"scope", "active", "enabled"}
-                    or state["scope"] != expected_units[name]
-                    or not isinstance(state["active"], bool)
-                    or not isinstance(state["enabled"], bool)):
+            if not isinstance(state, dict) or state.get("scope") != expected_units[name]:
+                fail(f"transaction {tx['id']}: invalid unit state for {app_id}/{name}")
+            if _is_service_template(name):
+                instances = state.get("instances")
+                if (set(state) != {"scope", "instances"}
+                        or not isinstance(instances, dict)
+                        or any(not _template_instance_matches(name, instance)
+                               or not isinstance(instance_state, dict)
+                               or set(instance_state) != {"active", "enabled"}
+                               or not isinstance(instance_state["active"], bool)
+                               or not isinstance(instance_state["enabled"], bool)
+                               for instance, instance_state in instances.items())):
+                    fail(f"transaction {tx['id']}: invalid unit state for {app_id}/{name}")
+            elif (set(state) != {"scope", "active", "enabled"}
+                  or not isinstance(state["active"], bool)
+                  or not isinstance(state["enabled"], bool)):
                 fail(f"transaction {tx['id']}: invalid unit state for {app_id}/{name}")
         if checkpoint["mappings"] != expected_mappings:
             fail(f"transaction {tx['id']}: mappings differ from saved ledger for {app_id}")
@@ -3550,12 +3639,15 @@ def _restore_unit_states(checkpoint: dict[str, Any]) -> bool:
         args = ["systemctl", "--user", "daemon-reload"] if scope == "user" \
             else ["sudo", "systemctl", "daemon-reload"]
         ok = _run_command(args, " ".join(args)) == 0 and ok
-    for name, state in checkpoint["units"].items():
+    for recorded_name, state in checkpoint["units"].items():
         prefix = ["systemctl", "--user"] if state["scope"] == "user" else ["sudo", "systemctl"]
-        enable = "enable" if state["enabled"] else "disable"
-        active = "start" if state["active"] else "stop"
-        ok = _run_command(prefix + [enable, name], f"restore {enable} {name}") == 0 and ok
-        ok = _run_command(prefix + [active, name], f"restore {active} {name}") == 0 and ok
+        unit_states = (state["instances"].items() if _is_service_template(recorded_name)
+                       else ((recorded_name, state),))
+        for name, unit_state in unit_states:
+            enable = "enable" if unit_state["enabled"] else "disable"
+            active = "start" if unit_state["active"] else "stop"
+            ok = _run_command(prefix + [enable, name], f"restore {enable} {name}") == 0 and ok
+            ok = _run_command(prefix + [active, name], f"restore {active} {name}") == 0 and ok
     return ok
 
 
