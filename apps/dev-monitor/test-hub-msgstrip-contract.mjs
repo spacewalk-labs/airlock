@@ -157,7 +157,7 @@ const DevmonCardUI = {
       },
       openMessage(card) { uiCalls.message.push(card.card_id); return options.read(card); },
       openTitle(card) {
-        if (card.link) { uiCalls.doc.push(card.card_id); return null; }
+        if (card.link) { uiCalls.doc.push(card.card_id); return options.read(card); }
         uiCalls.message.push(card.card_id); return options.read(card);
       }
     };

@@ -56,6 +56,26 @@ bash install/airlock-install.sh # installs enabled apps, renders nginx, runs smo
 
 Then open `https://<your-box>/` (Tailscale HTTPS) and add to home screen.
 
+## Update
+
+An installed box has no remote pointing here — the install cuts that link on
+purpose — so `git pull` is not the update path. Preview, then update:
+
+```bash
+bash bin/airlock-update --dry-run   # what would change; changes nothing
+bash bin/airlock-update             # write the release, commit it, re-run the installer
+```
+
+A checkout older than that script (2026-08-22) runs it once from here, with the same
+flags after `bash -s --`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/spacewalk-labs/airlock/main/bin/airlock-update | bash -s -- --dry-run
+```
+
+Installed before 2026-08-21, or the preview says it cannot tell which release the box
+came from: [`docs/update-old-install.md`](docs/update-old-install.md).
+
 ## Write an external app package
 
 [Copy the runnable external package example and read the short author guide.](examples/app-package/README.md)

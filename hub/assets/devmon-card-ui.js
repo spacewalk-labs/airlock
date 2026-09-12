@@ -130,6 +130,9 @@
       return modal;
     }
     function openDoc(card) {
+      // Opening the document is reading the card, same as opening the plain card —
+      // without this a card that carries a link could never leave the unread count.
+      markRead(card).catch(report);
       var modal = frame('DOC', card, true);
       var iframe = el('iframe', 'dmc-iframe');
       iframe.src = card.link;

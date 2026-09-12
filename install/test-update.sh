@@ -1317,10 +1317,16 @@ except OSError as exc:
     raise SystemExit(2)
 print(json.dumps({"config_path": str(source), "sha256": hashlib.sha256(data).hexdigest()}))
 PY
+  # `validate` answers because every real release's config tool does — the update's
+  # preflight asks it before writing anything. Every other command still fails, so a
+  # flow that leans on the NEW tool after the overwrite stays caught.
   if [ "$version" = new ]; then
     cat >"$d/bin/airlock-config" <<'PY'
 #!/usr/bin/env python3
 import sys
+if sys.argv[1:] == ["validate"]:
+    print("ok: config valid")
+    raise SystemExit(0)
 sys.stderr.write("fixture: the failed new release config command is unavailable\n")
 raise SystemExit(91)
 PY
@@ -1574,6 +1580,131 @@ incomplete_retry_out="$(run_rollback)"; incomplete_retry_rc=$?
   && printf '%s' "$incomplete_retry_out" | grep -q 'airlock-status rc=0' \
   && ok "a rollback left incomplete can retry to exact status and clean recovery state" \
   || bad "an incomplete rollback could not be retried safely: $incomplete_retry_out"
+
+# ---------------------------------------------------------------- pre-history box
+# The public history starts at 2026-08-21. A box installed from an earlier tree holds
+# files no published release has — measured on a real one installed 2026-07-29: the
+# nearest release differed in 327 files. Its direction was "ambiguous" and the
+# documented update path refused with nothing to type next.
+make_prehistory_box() {
+  rm -rf "$BOX"; seed_tree "$BOX" ancient
+  printf '[site]\nname = "My Box"\n' > "$BOX/airlock.toml"
+  printf 'my notes\n'                > "$BOX/MY-NOTES.md"
+  git -C "$BOX" init -q -b main; git -C "$BOX" add -A; git -C "$BOX" commit -q -m "init: copy"
+}
+make_prehistory_box
+ph_head="$(git -C "$BOX" rev-parse HEAD)"
+ph_json="$(AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$REL" \
+  bash "$UPDATE" --dry-run --json 2>/dev/null)"; ph_json_rc=$?
+[ "$ph_json_rc" = 0 ] && printf '%s' "$ph_json" | python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+assert v["available"] is False and v["changedCount"] == 0, v' \
+  && ok "the daily detector's answer for a pre-history box is unchanged (no update, rc 0)" \
+  || bad "the detector contract changed for a pre-history box (rc=$ph_json_rc): $ph_json"
+ph_preview="$(run_update --dry-run)"; ph_preview_rc=$?
+[ "$ph_preview_rc" = 0 ] && printf '%s' "$ph_preview" | grep -q 'README.md' \
+  && printf '%s' "$ph_preview" | grep -q -- '--from-unknown' \
+  && grep -q 'version ancient' "$BOX/README.md" \
+  && ok "a person's preview of a pre-history box lists the changes and names --from-unknown" \
+  || bad "the preview of a pre-history box hid the changes or the way forward: $ph_preview"
+ph_refuse="$(run_update --no-install)"; ph_refuse_rc=$?
+[ "$ph_refuse_rc" -ne 0 ] && grep -q 'version ancient' "$BOX/README.md" \
+  && [ "$(git -C "$BOX" rev-parse HEAD)" = "$ph_head" ] \
+  && printf '%s' "$ph_refuse" | grep -q -- '--from-unknown' \
+  && ok "without --from-unknown a pre-history box is refused and left exactly as it was" \
+  || bad "a pre-history box was changed without --from-unknown (rc=$ph_refuse_rc): $ph_refuse"
+ph_run="$(run_update --no-install --from-unknown)"; ph_run_rc=$?
+[ "$ph_run_rc" = 0 ] && grep -q 'version new' "$BOX/README.md" \
+  && [ "$(cat "$BOX/airlock.toml")" = "$CONFIG" ] && [ -f "$BOX/MY-NOTES.md" ] \
+  && ok "--from-unknown updates a pre-history box and keeps its config and own files" \
+  || bad "--from-unknown did not update a pre-history box cleanly (rc=$ph_run_rc): $ph_run"
+REL_NEXT="$scratch/release-next"
+git clone -q "$REL" "$REL_NEXT"
+printf 'version next\n' > "$REL_NEXT/README.md"
+git -C "$REL_NEXT" add -A; git -C "$REL_NEXT" commit -q -m "release next"
+ph_next="$(AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$REL_NEXT" \
+  bash "$UPDATE" --dry-run --json 2>/dev/null)"; ph_next_rc=$?
+[ "$ph_next_rc" = 0 ] && printf '%s' "$ph_next" | python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+assert v["available"] is True and v["changedCount"] > 0, v' \
+  && ok "after one --from-unknown run the next release is detected with no flag" \
+  || bad "the box still could not place itself after --from-unknown (rc=$ph_next_rc): $ph_next"
+
+make_prehistory_box
+git -C "$REL" branch -f pinned-old HEAD~1
+ph_pin="$(AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$REL" AIRLOCK_RELEASE_REF=pinned-old \
+  bash "$UPDATE" --no-install --from-unknown 2>&1)"; ph_pin_rc=$?
+git -C "$REL" branch -D -q pinned-old
+[ "$ph_pin_rc" -ne 0 ] && grep -q 'version ancient' "$BOX/README.md" \
+  && ok "--from-unknown does not unlock a pinned ref, which may be older than the box" \
+  || bad "--from-unknown installed a pinned ref over an unplaceable box: $ph_pin"
+# The oldest boxes may never have run `git init` at all.
+make_prehistory_box; rm -rf "$BOX/.git"
+ph_nogit_preview="$(run_update --dry-run)"; ph_nogit_preview_rc=$?
+[ "$ph_nogit_preview_rc" = 0 ] && printf '%s' "$ph_nogit_preview" | grep -q -- '--from-unknown' \
+  && [ ! -d "$BOX/.git" ] \
+  && ok "a pre-history box without .git previews through the throwaway repository" \
+  || bad "a pre-history box without .git did not preview cleanly (rc=$ph_nogit_preview_rc): $ph_nogit_preview"
+ph_nogit_run="$(run_update --no-install --from-unknown)"; ph_nogit_run_rc=$?
+[ "$ph_nogit_run_rc" = 0 ] && grep -q 'version new' "$BOX/README.md" \
+  && [ "$(cat "$BOX/airlock.toml")" = "$CONFIG" ] \
+  && git -C "$BOX" log --format=%s | grep -q '^airlock-update: 배포본 [0-9a-f]\{12\} 으로 갱신$' \
+  && ok "and --from-unknown updates it, leaving a repository that records its release" \
+  || bad "a pre-history box without .git did not update cleanly (rc=$ph_nogit_run_rc): $ph_nogit_run"
+
+ph_rb="$(run_update --rollback --from-unknown)"; ph_rb_rc=$?
+[ "$ph_rb_rc" -ne 0 ] && printf '%s' "$ph_rb" | grep -q '함께 쓸 수 없습니다' \
+  && ok "--from-unknown cannot ride along with --rollback" \
+  || bad "--rollback accepted --from-unknown: $ph_rb"
+
+# ---------------------------------------------------------------- config preflight
+# The installer validates airlock.toml with the new release's rules only after the files
+# are overwritten. Measured on the same 2026-07-29 box: its [apps.markwand] (renamed
+# fileview) would have stopped the installer with the new tree on disk and old services
+# running, on a box too old to have airlock-status, so no rollback was armed.
+RELC="$scratch/release-config"
+git clone -q "$REL" "$RELC"
+cat > "$RELC/bin/airlock-config" <<'PY'
+#!/usr/bin/env python3
+import pathlib, sys
+if sys.argv[1:2] == ["validate"]:
+    if "[apps.markwand]" in pathlib.Path("airlock.toml").read_text():
+        sys.stderr.write("airlock-config: unknown app [apps.markwand]\n")
+        sys.exit(1)
+    print("ok: config valid")
+PY
+git -C "$RELC" add -A; git -C "$RELC" commit -q -m "release with a stricter config"
+run_update_c() { AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$RELC" bash "$UPDATE" "$@" 2>&1; }
+
+make_box "$BOX"
+printf '\n[apps.markwand]\nmarkserv_port = 1\n' >> "$BOX/airlock.toml"
+pc_head="$(git -C "$BOX" rev-parse HEAD)"
+pc_preview="$(run_update_c --dry-run)"; pc_preview_rc=$?
+[ "$pc_preview_rc" = 0 ] && printf '%s' "$pc_preview" | grep -q 'apps.markwand' \
+  && grep -q 'version old' "$BOX/README.md" \
+  && ok "the preview names a config the new release will reject" \
+  || bad "the preview did not surface the config problem (rc=$pc_preview_rc): $pc_preview"
+pc_json="$(AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$RELC" \
+  bash "$UPDATE" --dry-run --json 2>/dev/null)"; pc_json_rc=$?
+[ "$pc_json_rc" = 0 ] && printf '%s' "$pc_json" | python3 -c '
+import json, sys
+assert json.load(sys.stdin)["available"] is True' \
+  && ok "the detector's JSON is not affected by the config preflight" \
+  || bad "the config preflight leaked into the detector (rc=$pc_json_rc): $pc_json"
+pc_run="$(run_update_c)"; pc_run_rc=$?
+[ "$pc_run_rc" -ne 0 ] && grep -q 'version old' "$BOX/README.md" \
+  && [ "$(git -C "$BOX" rev-parse HEAD)" = "$pc_head" ] \
+  && ! printf '%s' "$pc_run" | grep -q '설치기를 다시 돌립니다' \
+  && ok "a config the new installer rejects stops the update before any file changes" \
+  || bad "the update overwrote files despite a config the installer rejects (rc=$pc_run_rc): $pc_run"
+printf '%s\n' "$CONFIG" > "$BOX/airlock.toml"
+pc_fixed="$(run_update_c)"; pc_fixed_rc=$?
+[ "$pc_fixed_rc" = 0 ] && grep -q 'version new' "$BOX/README.md" \
+  && printf '%s' "$pc_fixed" | grep -q '^installed$' \
+  && ok "once the config is fixed the same update runs through the installer" \
+  || bad "a valid config still did not update (rc=$pc_fixed_rc): $pc_fixed"
 
 timer_out="$(bash "$ROOT/install/test-update-timer.sh" 2>&1)"; timer_rc=$?
 [ "$timer_rc" = 0 ] \

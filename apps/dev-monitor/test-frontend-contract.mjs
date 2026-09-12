@@ -107,6 +107,8 @@ assert.deepEqual(buttons(ui.createActions(both)), ['Run', 'Archive']);
 assert.deepEqual(buttons(ui.createActions(neither)), ['Archive']);
 ui.openTitle(link);
 assert.equal(latestOverlay(document).querySelector('iframe').src, link.link);
+await tick();
+assert.deepEqual(calls.read, ['run', 'link'], 'opening the document marks the card read');
 ui.openTitle(neither);
 assert.ok(latestOverlay(document).textContent.includes('marked read · stays in place'));
 
