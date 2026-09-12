@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko" data-learning-view="list">
+<html lang="ko" data-learning-view="list" data-theme="system">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -11,20 +11,32 @@
      글리프이고, bin/gen-app-icons.py 가 거기서 favicon 과 홈화면 아이콘을 만든다. -->
 <link rel="icon" type="image/svg+xml" href="/assets/app-icons/learning.svg">
 <link rel="apple-touch-icon" href="/assets/app-icons/learning.png">
+<link rel="stylesheet" href="/assets/airlock-tokens.css">
 <meta name="apple-mobile-web-app-title" content="Learning">
+<script>
+(function () {
+  var key = "learning-reader-theme";
+  var value = "Auto";
+  try { value = localStorage.getItem(key) || value; } catch (_) {}
+  if (["Auto", "Light", "Dark"].indexOf(value) < 0) value = "Auto";
+  document.documentElement.setAttribute("data-theme", value === "Auto" ? "system" : value.toLowerCase());
+}());
+</script>
 <style>
 :root {
-  --ink: #1c1c1e;
-  --ink2: #8e8e93;
-  --ink3: #c7c7cc;
-  --bg: #f2f2f7;
-  --sf: #ffffff;
-  --sep: #e5e5ea;
-  --fill: #e9e9ec;
-  --tint: #0f766e;
-  --red: #d1332e;
-  --sys: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Pretendard", system-ui, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --ink: var(--airlock-ink);
+  --ink2: var(--airlock-body);
+  --ink3: var(--airlock-mute);
+  --bg: var(--airlock-canvas);
+  --sf: var(--airlock-surface-1);
+  --sep: var(--airlock-hairline);
+  --fill: var(--airlock-surface-2);
+  --tint: var(--airlock-primary);
+  --on-tint: var(--airlock-on-primary);
+  --yellow: var(--airlock-warning);
+  --red: var(--airlock-danger);
+  --sys: var(--airlock-font);
+  --mono: var(--airlock-font-mono);
 }
 
 * { box-sizing: border-box; }
@@ -58,7 +70,8 @@ button:disabled {
 }
 
 :focus-visible {
-  outline: 3px solid rgba(15, 118, 110, .35);
+  outline: 0;
+  box-shadow: var(--airlock-focus);
   outline-offset: 2px;
 }
 
@@ -110,7 +123,7 @@ button:disabled {
 
 .nav-button:hover,
 .header-action:hover,
-.refresh-button:hover { background: rgba(15, 118, 110, .08); }
+.refresh-button:hover { background: color-mix(in srgb, var(--tint) 8%, transparent); }
 
 .nav-button.back { padding: 8px 6px; }
 
@@ -124,6 +137,30 @@ button:disabled {
   text-align: center;
 }
 
+.theme-group {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 10px;
+  background: var(--fill);
+}
+
+.theme-button {
+  min-height: 36px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.theme-button[aria-pressed="true"] {
+  background: var(--sf);
+  color: var(--ink);
+  box-shadow: var(--airlock-shadow);
+}
+
 .warning-badge {
   display: inline-flex;
   align-items: center;
@@ -132,7 +169,7 @@ button:disabled {
   margin-top: 7px;
   padding: 3px 8px;
   border-radius: 8px;
-  background: rgba(209, 51, 46, .08);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
   color: var(--red);
   font-size: 13px;
   font-weight: 650;
@@ -171,6 +208,22 @@ button:disabled {
   background: var(--fill);
   color: var(--ink2);
 }
+
+.search-close {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  min-height: 36px;
+  padding: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink2);
+  font-size: 18px;
+}
+
+.search-close:hover { background: color-mix(in srgb, var(--tint) 8%, transparent); }
 
 .search-wrap input {
   width: 100%;
@@ -227,18 +280,18 @@ button:disabled {
   white-space: nowrap;
 }
 
-.category-chip:hover { background: rgba(15, 118, 110, .14); }
+.category-chip:hover { background: color-mix(in srgb, var(--tint) 14%, transparent); }
 
 .category-chip.is-selected {
   background: var(--tint);
-  color: #fff;
+  color: var(--on-tint);
 }
 
 .category-chip.is-zero {
   color: var(--ink3);
 }
 
-.category-chip.is-selected.is-zero { color: rgba(255, 255, 255, .62); }
+.category-chip.is-selected.is-zero { color: color-mix(in srgb, var(--on-tint) 62%, transparent); }
 
 .category-chip .count {
   color: var(--ink2);
@@ -246,7 +299,7 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-.category-chip.is-selected .count { color: rgba(255, 255, 255, .72); }
+.category-chip.is-selected .count { color: color-mix(in srgb, var(--on-tint) 72%, transparent); }
 
 .star-filter {
   flex: 0 0 auto;
@@ -255,8 +308,8 @@ button:disabled {
 }
 
 .star-filter.is-selected {
-  background: #8a6400;
-  color: #fff;
+  background: var(--yellow);
+  color: var(--on-tint);
 }
 
 .ingest-composer {
@@ -299,7 +352,7 @@ button:disabled {
   white-space: nowrap;
 }
 
-.ingest-submit:hover { background: rgba(15, 118, 110, .08); }
+.ingest-submit:hover { background: color-mix(in srgb, var(--tint) 8%, transparent); }
 
 .ingest-submit:disabled { color: var(--ink3); }
 
@@ -345,6 +398,22 @@ button:disabled {
   min-width: 0;
   gap: 8px;
 }
+
+.ingest-card-close {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  min-height: 36px;
+  margin: -8px -8px -8px 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink2);
+  font-size: 18px;
+}
+
+.ingest-card-close:hover { background: var(--fill); }
 
 .ingest-row-title {
   min-width: 0;
@@ -422,6 +491,54 @@ button:disabled {
   font-size: 13px;
 }
 
+.ingest-timeline {
+  display: grid;
+  gap: 3px;
+  margin: 9px 0 0;
+  padding: 0;
+  color: var(--ink2);
+  font-size: 13px;
+  line-height: 1.45;
+  list-style: none;
+}
+
+.ingest-timeline li::before {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 12px 1px 0;
+  border-radius: 999px;
+  background: var(--ink3);
+  content: "";
+}
+
+.ingest-timeline li.is-failed {
+  color: var(--red);
+}
+
+.ingest-timeline li.is-failed::before { background: var(--red); }
+
+.ingest-details {
+  margin-top: 7px;
+  color: var(--ink2);
+  font-size: 13px;
+}
+
+.ingest-details summary {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  padding: 5px 8px;
+  border-radius: 8px;
+  color: var(--tint);
+  cursor: pointer;
+  font-weight: 620;
+  list-style: none;
+}
+
+.ingest-details summary::-webkit-details-marker { display: none; }
+.ingest-details summary:hover { background: color-mix(in srgb, var(--tint) 8%, transparent); }
+
 .ingest-actions {
   display: flex;
   gap: 5px;
@@ -438,26 +555,12 @@ button:disabled {
   font-weight: 620;
 }
 
-.ingest-action:hover { background: rgba(15, 118, 110, .08); }
+.ingest-action:hover { background: color-mix(in srgb, var(--tint) 8%, transparent); }
 .ingest-action.danger { color: var(--red); }
 
 .ingest-log {
   max-height: 320px;
   overflow: auto;
-}
-
-.plan-details {
-  margin-top: 10px;
-  padding: 9px 10px;
-  border-radius: 8px;
-  background: var(--fill);
-  color: var(--ink2);
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.6;
-  text-align: left;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 
 .header-notice,
@@ -468,7 +571,7 @@ button:disabled {
   margin: 8px 0 0;
   padding: 9px 11px;
   border-radius: 10px;
-  background: rgba(15, 118, 110, .08);
+  background: color-mix(in srgb, var(--tint) 8%, transparent);
   color: var(--ink2);
   font-size: 14px;
   line-height: 1.45;
@@ -493,7 +596,7 @@ button:disabled {
   z-index: 4;
   margin: 0;
   padding: 8px 4px 6px;
-  background: linear-gradient(to bottom, rgba(242, 242, 247, .98) 72%, rgba(242, 242, 247, .78));
+  background: linear-gradient(to bottom, color-mix(in srgb, var(--bg) 98%, transparent) 72%, color-mix(in srgb, var(--bg) 78%, transparent));
   color: var(--ink2);
   font-size: 13px;
   font-weight: 650;
@@ -518,9 +621,7 @@ button:disabled {
 
 .item-row:not(.is-editing) {
   display: grid;
-  /* 링크 · 별표 · 공유. 칸을 안 늘리면 세 번째 자식이 암시적 다음 줄로 떨어져
-     행 높이가 두 배가 된다(실측 52 -> 96px). */
-  grid-template-columns: minmax(0, 1fr) 44px 44px;
+  grid-template-columns: minmax(0, 1fr) 44px;
 }
 
 .item-row + .item-row::before,
@@ -536,12 +637,12 @@ button:disabled {
 
 .item-row.is-editing + .item-row.is-editing::before { left: 56px; }
 
-.item-row.is-selected { background: rgba(15, 118, 110, .055); }
+.item-row.is-selected { background: color-mix(in srgb, var(--tint) 6%, transparent); }
 
 /* 적재 중인 자료. 행은 이미 열리고 읽히므로 흐리게 하지 않는다 — 아직 안 온 것은
    문서가 아니라 다듬기다. 표시는 날짜 칸 하나로 끝낸다. */
 .cell-added.is-ingesting {
-  color: var(--accent, #0f766e);
+  color: var(--tint);
   font-variant-numeric: tabular-nums;
 }
 
@@ -557,11 +658,17 @@ button:disabled {
   text-decoration: none;
 }
 
-.item-link:hover { background: rgba(15, 118, 110, .045); }
+.item-link:hover { background: color-mix(in srgb, var(--tint) 5%, transparent); }
 
 .item-link.no-link { cursor: default; }
 
-.item-copy { min-width: 0; }
+.item-copy {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0 6px;
+  min-width: 0;
+}
 
 .cell-title {
   display: -webkit-box;
@@ -576,6 +683,7 @@ button:disabled {
 }
 
 .mobile-meta {
+  grid-column: 1 / -1;
   margin-top: 3px;
   overflow: hidden;
   color: var(--ink2);
@@ -583,6 +691,18 @@ button:disabled {
   letter-spacing: -.005em;
   line-height: 1.3;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shared-badge {
+  justify-self: end;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tint) 9%, transparent);
+  color: var(--tint);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
   white-space: nowrap;
 }
 
@@ -616,8 +736,8 @@ button:disabled {
   line-height: 1;
 }
 
-.star-button:hover { background: rgba(138, 100, 0, .08); }
-.star-button.is-starred { color: #8a6400; }
+.star-button:hover { background: color-mix(in srgb, var(--yellow) 8%, transparent); }
+.star-button.is-starred { color: var(--yellow); }
 .star-button[aria-busy="true"] { opacity: .72; }
 
 .edit-check {
@@ -730,7 +850,7 @@ button:disabled {
   padding: 8px 9px;
   border-radius: 7px;
   background: var(--fill);
-  color: #3a3a3c;
+  color: var(--ink2);
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.55;
@@ -743,7 +863,7 @@ button:disabled {
   padding: 1px 4px;
   border-radius: 4px;
   background: var(--fill);
-  color: #3a3a3c;
+  color: var(--ink2);
   font-family: var(--mono);
   font-size: .92em;
 }
@@ -752,7 +872,7 @@ button:disabled {
   margin-top: 10px;
   padding: 0 12px;
   border-radius: 10px;
-  background: rgba(209, 51, 46, .06);
+  background: color-mix(in srgb, var(--red) 6%, transparent);
   color: var(--ink2);
 }
 
@@ -851,10 +971,6 @@ button:disabled {
   gap: 4px;
 }
 
-.share-button { color: var(--ink3); }
-.share-button:hover { background: rgba(15, 118, 110, .08); }
-.share-button.is-shared { color: var(--tint); }
-.share-button svg { display: block; }
 .row-action {
   min-width: 44px;
   min-height: 44px;
@@ -865,7 +981,7 @@ button:disabled {
   white-space: nowrap;
 }
 
-.row-action:hover { background: rgba(15, 118, 110, .08); }
+.row-action:hover { background: color-mix(in srgb, var(--tint) 8%, transparent); }
 
 .row-action.danger { color: var(--red); }
 
@@ -882,8 +998,8 @@ button:disabled {
   z-index: 20;
   padding: 8px max(16px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
   border-top: 1px solid var(--sep);
-  background: rgba(249, 249, 251, .94);
-  box-shadow: 0 -5px 18px rgba(28, 28, 30, .06);
+  background: color-mix(in srgb, var(--sf) 94%, transparent);
+  box-shadow: var(--airlock-shadow);
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
 }
@@ -928,13 +1044,34 @@ button:disabled {
   padding: 12px 14px;
   border-radius: 11px;
   background: var(--ink);
-  color: #fff;
-  box-shadow: 0 8px 26px rgba(28, 28, 30, .2);
+  color: var(--bg);
+  box-shadow: var(--airlock-shadow-hover);
   font-size: 14px;
   text-align: center;
 }
 
 .toast.error { background: var(--red); }
+
+.ingest-undo {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+}
+
+.ingest-undo button {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--bg);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.ingest-undo button:hover { background: color-mix(in srgb, var(--bg) 14%, transparent); }
 
 .sheet-backdrop {
   position: fixed;
@@ -944,7 +1081,7 @@ button:disabled {
   align-items: flex-end;
   justify-content: center;
   padding: 8px max(8px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
-  background: rgba(0, 0, 0, .32);
+  background: color-mix(in srgb, var(--ink) 32%, transparent);
 }
 
 .action-sheet {
@@ -955,8 +1092,8 @@ button:disabled {
   margin-bottom: 8px;
   overflow: hidden;
   border-radius: 14px;
-  background: rgba(255, 255, 255, .97);
-  box-shadow: 0 5px 22px rgba(0, 0, 0, .08);
+  background: color-mix(in srgb, var(--sf) 97%, transparent);
+  box-shadow: var(--airlock-shadow);
   -webkit-backdrop-filter: blur(20px);
   backdrop-filter: blur(20px);
 }
@@ -996,13 +1133,13 @@ button:disabled {
   width: 100%;
   min-height: 52px;
   padding: 12px 16px;
-  background: #fff;
+  background: var(--sf);
   color: var(--tint);
   font-size: 18px;
   text-align: center;
 }
 
-.sheet-button:hover { background: #f7f7f9; }
+.sheet-button:hover { background: var(--fill); }
 
 .sheet-button.danger { color: var(--red); }
 
@@ -1056,7 +1193,7 @@ button:disabled {
     padding: 0 12px;
     border-top: 1px solid var(--sep);
     border-bottom: 1px solid var(--sep);
-    background: rgba(255, 255, 255, .62);
+    background: color-mix(in srgb, var(--sf) 62%, transparent);
     color: var(--ink2);
     font-size: 13px;
     font-weight: 650;
@@ -1164,64 +1301,37 @@ button:disabled {
   z-index: 40;
   display: flex;
   flex-direction: column;
-  background: var(--bg, #fff);
+  background: var(--bg);
 }
 
-.viewer-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left));
-  padding-top: max(8px, env(safe-area-inset-top));
-  border-bottom: 1px solid var(--sep);
-  background: var(--surface, #fff);
-}
-
-.viewer-back {
+.viewer-fallback-back {
+  position: absolute;
+  top: max(8px, env(safe-area-inset-top));
+  left: max(8px, env(safe-area-inset-left));
+  z-index: 1;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
+  width: 44px;
   min-height: 44px;
-  padding: 0 12px 0 8px;
+  padding: 0;
   border: 1px solid var(--sep);
   border-radius: 10px;
-  background: transparent;
+  background: var(--sf);
   color: inherit;
   font: inherit;
   cursor: pointer;
 }
 
-.viewer-back:hover { background: rgba(15, 118, 110, .06); }
-
-.viewer-title {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 600;
-}
-
-.viewer-copy {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 44px;
-  min-height: 44px;
-  border: 1px solid var(--sep);
-  border-radius: 10px;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-}
-
-.viewer-copy:hover { background: rgba(15, 118, 110, .06); }
+.viewer-fallback-back:hover { background: var(--fill); }
 
 .viewer-frame {
+  display: block;
   flex: 1;
+  min-height: 0;
   width: 100%;
   border: 0;
-  background: var(--bg, #fff);
+  background: var(--bg);
 }
 
 /* 이 문서의 subview에서만 공용 위젯을 숨긴다. 위젯은 app root 밖에 지연 주입되므로
@@ -1245,6 +1355,8 @@ window.__LEARNING_DATA__ = null;
 
   var root = document.getElementById("learning-app");
   var SVG_NS = "http://www.w3.org/2000/svg";
+  var THEME_STORAGE_KEY = "learning-reader-theme";
+  var THEMES = ["Auto", "Light", "Dark"];
   /* 에러 카드가 "무엇을 돌렸는지" 를 보여줄 때의 폴백. 서버가 실제 argv 를 함께 주므로
      이건 그게 없을 때만 쓰이고, 내장 생산자에는 실행한 명령 자체가 없다. 특정 사람의
      홈 경로를 박아 두면 남의 박스에서 없는 파일을 가리키게 된다. */
@@ -1253,6 +1365,7 @@ window.__LEARNING_DATA__ = null;
   // 흔들린다. 테스트가 덮을 수 있게 열어둔다: 폴링이 도는지 보려고 프로덕션 케이던스를
   // 그대로 기다리면 스위트가 주기에 결박되고, 주기를 바꾸는 순간 무관한 테스트가 깨진다.
   var INGEST_POLL_MS = Number(window.__LEARNING_INGEST_POLL_MS__) || 10000;
+  var INGEST_UNDO_MS = 8000;
   var state = {
     items: [],
     archive: { archived: [], needs_attention: [] },
@@ -1268,11 +1381,8 @@ window.__LEARNING_DATA__ = null;
     archiveView: false,
     selected: new Set(),
     query: "",
+    searchOpen: false,
     searchComposing: false,
-    // 검색 debounce 타이머. 값이 없어도 `clearTimeout(undefined)` 이 조용히 넘어가서
-    // 선언 없이도 돌아가던 자리다 — 선언하지 않으면 "없는 키를 읽는다" 를 잡는 검사가
-    // 이 하나 때문에 서 있을 수 없다.
-    searchTimer: null,
     category: "all",
     starredOnly: false,
     /* 기본 정렬은 `added` 다. 예전 기본값이던 `changed` 는 git 커밋 시각이라, git 이
@@ -1281,15 +1391,17 @@ window.__LEARNING_DATA__ = null;
     sortKey: "added",
     sortDirection: "desc",
     sheet: null,
-    ingestPlan: null,
     ingestUrl: "",
     ingestBusy: false,
+    ingestUndo: null,
     ingestRequests: [],
+    dismissedIngest: new Set(),
     ingestDetail: null,
     ingestError: null,
     ingestLoadNumber: 0,
     ingestDetailLoadNumber: 0,
     ingestPollTimer: null,
+    theme: readStoredTheme(),
     toast: null,
     viewer: null,
     starError: null,
@@ -1298,6 +1410,7 @@ window.__LEARNING_DATA__ = null;
   var starMutations = new Map();
   var confirmedStarOverlays = new Map();
   var historyTraversalPending = false;
+  var ingestUndoTimer = null;
 
   /* 카테고리는 **라이브러리의 폴더**다. 예전에는 여기 네 개(engineering/business/
      science/other)가 한국어 라벨과 함께 박혀 있었고, 그 목록에 없는 폴더의 자료는
@@ -1321,6 +1434,9 @@ window.__LEARNING_DATA__ = null;
     search: [
       ["circle", { cx: "11", cy: "11", r: "7" }],
       ["path", { d: "M20 20l-3.6-3.6" }]
+    ],
+    close: [
+      ["path", { d: "M7 7l10 10M17 7L7 17" }]
     ],
     chevron: [
       ["path", { d: "M9 6l6 6-6 6" }]
@@ -1351,6 +1467,41 @@ window.__LEARNING_DATA__ = null;
     if (className) node.className = className;
     if (text !== undefined && text !== null) node.textContent = String(text);
     return node;
+  }
+
+  function readStoredTheme() {
+    var value = "Auto";
+    try { value = localStorage.getItem(THEME_STORAGE_KEY) || value; } catch (_) {}
+    return THEMES.indexOf(value) >= 0 ? value : "Auto";
+  }
+
+  function applyTheme(value, persist) {
+    var theme = THEMES.indexOf(value) >= 0 ? value : "Auto";
+    state.theme = theme;
+    document.documentElement.setAttribute(
+      "data-theme", theme === "Auto" ? "system" : theme.toLowerCase()
+    );
+    if (persist) {
+      try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (_) {}
+    }
+  }
+
+  function makeThemeGroup() {
+    var group = el("div", "theme-group");
+    group.setAttribute("role", "group");
+    group.setAttribute("aria-label", "테마");
+    THEMES.forEach(function (theme) {
+      var button = el("button", "theme-button", theme);
+      button.type = "button";
+      button.setAttribute("data-theme-btn", theme.toLowerCase());
+      button.setAttribute("aria-pressed", String(state.theme === theme));
+      button.addEventListener("click", function () {
+        applyTheme(theme, true);
+        render();
+      });
+      group.appendChild(button);
+    });
+    return group;
   }
 
   function append(parent) {
@@ -1644,6 +1795,47 @@ window.__LEARNING_DATA__ = null;
   }
   // TESTABLE:INGEST_BADGE_END
 
+  // TESTABLE:INGEST_FAILURE_START
+  var INGEST_FAILURE_MESSAGES = Object.freeze({
+    "tool-missing": "자막을 받을 도구를 찾지 못했습니다. Learning 설치 상태를 확인해 주세요.",
+    "rate-limited": "유튜브가 잠시 요청을 막았습니다. 자막이 없어서가 아닙니다.",
+    "video-unavailable": "영상 정보를 읽을 수 없습니다. 삭제되었거나 접근할 수 없는 영상일 수 있습니다.",
+    "metadata-invalid": "영상 정보의 형식이 올바르지 않아 적재를 시작할 수 없습니다.",
+    "no-subs": "이 영상은 자막이 없어 적재할 수 없습니다.",
+    "subtitle-unreadable": "자막을 받았지만 읽을 수 있는 문장을 찾지 못했습니다.",
+    "transcript-write-failed": "자막은 받았지만 전사본 파일을 저장하지 못했습니다."
+  });
+
+  function ingestFailureMessage(entry) {
+    var value = entry || {};
+    var reason = String(value.reason || "");
+    if (Object.prototype.hasOwnProperty.call(INGEST_FAILURE_MESSAGES, reason)) {
+      return INGEST_FAILURE_MESSAGES[reason];
+    }
+    return String(value.failure_summary || value.error || "적재가 실패했습니다")
+      .replace(/\bexit(?: code)?\s*-?\d+\b/gi, "실행 결과")
+      .replace(/#[0-9]+\b/g, "이전 시도");
+  }
+
+  function ingestFailureTimeline(entry) {
+    var reason = String((entry && entry.reason) || "");
+    var lines = ["링크 접수 — 완료"];
+    if (reason === "tool-missing") return lines.concat(["자막 도구 확인 — 실패"]);
+    if (reason === "rate-limited") return lines.concat(["유튜브 응답 대기 — 실패"]);
+    if (reason === "video-unavailable" || reason === "metadata-invalid") {
+      return lines.concat(["영상 정보 확인 — 실패"]);
+    }
+    if (reason === "no-subs") return lines.concat(["영상 정보 확인 — 완료", "자막 확인 — 실패"]);
+    if (reason === "subtitle-unreadable") {
+      return lines.concat(["영상 정보 확인 — 완료", "자막 읽기 — 실패"]);
+    }
+    if (reason === "transcript-write-failed") {
+      return lines.concat(["자막 읽기 — 완료", "문서 저장 — 실패"]);
+    }
+    return lines.concat(["적재 실행 — 실패"]);
+  }
+  // TESTABLE:INGEST_FAILURE_END
+
   function ingestIsActive(entry) {
     return !!entry && ingestStatusIsActive(entry.status);
   }
@@ -1770,6 +1962,7 @@ window.__LEARNING_DATA__ = null;
         return oldActive[entry.id] && (entry.status === "done" || entry.status === "failed" || entry.status === "cancelled");
       });
       state.ingestRequests = records;
+      hideStartedIngestUndo(records);
       clearPollError();
       if (completed) loadData(false);
       scheduleIngestPoll();
@@ -1782,39 +1975,9 @@ window.__LEARNING_DATA__ = null;
     });
   }
 
-  function requestIngestPlan() {
+  function runIngest() {
     var url = state.ingestUrl.trim();
     if (!url || state.ingestBusy) return;
-    state.ingestBusy = true;
-    state.ingestError = null;
-    render();
-    window.fetch(apiUrl("ingest/plan"), {
-      method: "POST",
-      cache: "no-store",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ url: url })
-    }).then(function (response) {
-      return readResponse(response).then(function (payload) {
-        if (!response.ok) throw ingestErrorFrom(payload, response.status, "적재 계획을 만들지 못했습니다");
-        return payload;
-      });
-    }).then(function (payload) {
-      state.ingestPlan = payload;
-      state.ingestUrl = stringValue(payload.url, url);
-      state.ingestError = null;
-    }).catch(function (error) {
-      setActionError(error, "적재 계획을 만들지 못했습니다");
-    }).finally(function () {
-      state.ingestBusy = false;
-      render();
-    });
-  }
-
-  function runIngestPlan() {
-    var plan = state.ingestPlan;
-    if (!plan || state.ingestBusy) return;
-    var planUrl = stringValue(plan.url, "");
-    if (!planUrl) return;
     state.ingestBusy = true;
     state.ingestError = null;
     render();
@@ -1822,14 +1985,13 @@ window.__LEARNING_DATA__ = null;
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ url: planUrl })
+      body: JSON.stringify({ url: url })
     }).then(function (response) {
       return readResponse(response).then(function (payload) {
         if (!response.ok) throw ingestErrorFrom(payload, response.status, "적재 큐 등록에 실패했습니다");
         return payload;
       });
     }).then(function (payload) {
-      state.ingestPlan = null;
       state.ingestUrl = "";
       state.ingestError = null;
       if (payload && payload.duplicate === true) {
@@ -1838,19 +2000,48 @@ window.__LEARNING_DATA__ = null;
         showToast("기존 문서를 맨 위로 올렸습니다");
         loadData(false);
       } else {
-        showToast("적재 큐에 넣었습니다");
+        showIngestUndo(payload);
         loadIngest();
       }
     }).catch(function (error) {
-      setActionError(error, "적재 큐 등록에 실패했습니다");
+      state.ingestError = null;
+      showToast(error && error.message ? error.message : "적재 큐 등록에 실패했습니다", true);
     }).finally(function () {
       state.ingestBusy = false;
       render();
     });
   }
 
+  function clearIngestUndo() {
+    if (ingestUndoTimer !== null) {
+      window.clearTimeout(ingestUndoTimer);
+      ingestUndoTimer = null;
+    }
+    state.ingestUndo = null;
+  }
+
+  function showIngestUndo(payload) {
+    var id = payload && payload.id;
+    if (!id) return;
+    clearIngestUndo();
+    state.ingestUndo = { id: id };
+    ingestUndoTimer = window.setTimeout(function () {
+      ingestUndoTimer = null;
+      state.ingestUndo = null;
+      render();
+    }, INGEST_UNDO_MS);
+  }
+
+  function hideStartedIngestUndo(records) {
+    if (!state.ingestUndo) return;
+    var id = state.ingestUndo.id;
+    var current = records.find(function (entry) { return entry.id === id; });
+    if (current && current.status !== "queued") clearIngestUndo();
+  }
+
   function cancelIngest(id) {
     if (state.ingestBusy) return;
+    if (state.ingestUndo && state.ingestUndo.id === id) clearIngestUndo();
     state.ingestBusy = true;
     state.ingestError = null;
     render();
@@ -1895,7 +2086,15 @@ window.__LEARNING_DATA__ = null;
         if (!response.ok) throw ingestErrorFrom(payload, response.status, "다시 시도하지 못했습니다");
         return payload;
       });
-    }).then(function () {
+    }).then(function (payload) {
+      var previous = ingestRecord(id) || {};
+      state.dismissedIngest.add(id);
+      state.ingestRequests = state.ingestRequests.filter(function (entry) {
+        return entry.id !== id;
+      });
+      if (payload && typeof payload.id === "number") {
+        state.ingestRequests.unshift(Object.assign({}, previous, payload));
+      }
       state.ingestDetail = null;
       showToast("다시 큐에 넣었습니다");
       loadIngest();
@@ -2091,16 +2290,15 @@ window.__LEARNING_DATA__ = null;
   }
 
   function docHref(item) {
-    /* 🔴 발행 여부로 갈린다. 목록이 폴더 전체가 되기 전에는 목록에 있는 것이 곧
-       발행본이라 `doc/` 하나면 됐다. 지금은 미발행 자료도 목록에 있고, 그것도
-       읽을 수 있어야 한다 — 읽기가 공유를 기다릴 이유가 없다. */
-    if (item && item.published === true) {
-      var name = publishedName(item);
-      if (name) return "doc/" + encodeURIComponent(name);
-    }
+    /* 앱 안 읽기는 발행 상태와 분리한다. `/read/` 응답에만 읽기 셸이 붙으므로 원본
+       경로가 있으면 항상 그것을 쓰고, `/doc/` 는 옛 항목의 호환 폴백으로만 남긴다. */
     var html = stringValue(fieldOf(item, "html_path", ""), "");
     if (html) {
       return "read/" + html.split("/").map(encodeURIComponent).join("/");
+    }
+    if (item && item.published === true) {
+      var name = publishedName(item);
+      if (name) return "doc/" + encodeURIComponent(name);
     }
     return null;
   }
@@ -2331,6 +2529,7 @@ window.__LEARNING_DATA__ = null;
   function listHistorySnapshot(scrollY) {
     return {
       query: state.query,
+      searchOpen: state.searchOpen,
       category: state.category,
       starredOnly: state.starredOnly,
       sortKey: state.sortKey,
@@ -2364,6 +2563,7 @@ window.__LEARNING_DATA__ = null;
     var sortKey = stringValue(saved.sortKey, "added");
     if (["title", "channel", "duration", "added", "changed"].indexOf(sortKey) === -1) sortKey = "added";
     state.query = stringValue(saved.query, "");
+    state.searchOpen = saved.searchOpen === true || state.query !== "";
     state.category = category;
     state.starredOnly = saved.starredOnly === true;
     state.sortKey = sortKey;
@@ -2483,10 +2683,18 @@ window.__LEARNING_DATA__ = null;
       var submit = el("button", "ingest-submit", "적재");
       submit.type = "button";
       submit.disabled = state.ingestBusy;
-      submit.addEventListener("click", requestIngestPlan);
+      submit.addEventListener("click", runIngest);
       composer.appendChild(submit);
     }
     return composer;
+  }
+
+  function closeSearch() {
+    state.searchOpen = false;
+    state.searchComposing = false;
+    state.query = "";
+    syncCurrentListHistory();
+    render();
   }
 
   function pageSubtitle() {
@@ -2498,7 +2706,9 @@ window.__LEARNING_DATA__ = null;
     var active = activeIngestRequests();
     var running = active.filter(function (entry) { return entry.status === "running" || entry.status === "cancelling"; }).length;
     var waiting = active.filter(function (entry) { return entry.status === "queued"; }).length;
-    var failed = state.ingestRequests.filter(function (entry) { return entry.status === "failed"; }).length;
+    var failed = state.ingestRequests.filter(function (entry) {
+      return entry.status === "failed" && !state.dismissedIngest.has(entry.id);
+    }).length;
     var ingestSummary = [];
     if (running) ingestSummary.push("적재 " + running + "건 진행");
     if (waiting) ingestSummary.push(waiting + "건 대기");
@@ -2519,8 +2729,29 @@ window.__LEARNING_DATA__ = null;
       nav.appendChild(back);
     }
     nav.appendChild(el("span", "nav-spacer"));
+    nav.appendChild(makeThemeGroup());
 
     if (!state.archiveView) {
+      var searchButton = el("button", "header-action");
+      searchButton.type = "button";
+      searchButton.setAttribute("data-search-toggle", "true");
+      searchButton.setAttribute("aria-pressed", String(state.searchOpen));
+      searchButton.setAttribute("aria-label", state.searchOpen ? "검색 닫기" : "검색 열기");
+      searchButton.appendChild(icon("search", 18));
+      searchButton.addEventListener("click", function () {
+        if (state.searchOpen) {
+          closeSearch();
+          return;
+        }
+        state.searchOpen = true;
+        syncCurrentListHistory();
+        render();
+        window.setTimeout(function () {
+          var searchInput = root.querySelector('[data-focus-key="search"]');
+          if (searchInput) searchInput.focus();
+        }, 0);
+      });
+      nav.appendChild(searchButton);
       var archiveButton = el("button", "header-action", "보관함");
       archiveButton.type = "button";
       archiveButton.appendChild(el("span", "count", archiveCount()));
@@ -2541,7 +2772,7 @@ window.__LEARNING_DATA__ = null;
     }
     header.appendChild(nav);
 
-    var title = el("h1", "page-title", state.archiveView ? "보관함" : "Learning Library");
+    var title = el("h1", "page-title", state.archiveView ? "보관함" : "Learning");
     header.appendChild(title);
     header.appendChild(el("p", "page-subtitle", pageSubtitle()));
     if (state.warnings.length) {
@@ -2550,14 +2781,10 @@ window.__LEARNING_DATA__ = null;
       header.appendChild(warningBadge);
     }
 
-    /* 🔴 적재 중에 검색창·주제 칩을 숨기면 안 된다. `state.query`·`state.category` 는 그대로
-       남아 목록을 계속 걸러내는데, 그것을 되돌릴 UI 가 사라져 사용자가 **갇힌다** — 실측
-       2026-07-31 사용자 보고: 검색한 뒤 적재하니 "검색 결과가 없습니다" 만 남고 검색창이 없어
-       지울 수도 없었다. #258 에서 세로 공간을 아끼려고 `&& !activeIngestRequests().length` 를
-       붙였는데, 그 조건에 주석도 테스트도 없었다.
-       규칙: **켜 둔 상태를 되돌리는 UI 는 그 상태가 살아 있는 동안 화면에 있어야 한다.** */
+    /* 검색과 적재는 서로 다른 입력이다. 돋보기로 검색을 연 동안에는 적재 입력을 접어,
+       화면에 입력칸이 늘 하나만 보이게 한다. 검색 상태에는 토글·닫기·Escape 세 출구가 있다. */
     if (!state.archiveView) {
-      var search = el("label", "search-wrap");
+      var search = el("div", "search-wrap");
       var searchIcon = icon("search", 17);
       searchIcon.setAttribute("aria-hidden", "true");
       search.appendChild(searchIcon);
@@ -2567,36 +2794,36 @@ window.__LEARNING_DATA__ = null;
       input.setAttribute("aria-label", "제목과 채널 검색");
       input.setAttribute("data-focus-key", "search");
       input.value = state.query;
-      function scheduleSearchRender() {
-        window.clearTimeout(state.searchTimer);
-        state.searchTimer = window.setTimeout(function () {
-          syncCurrentListHistory();
-          render();
-        }, 130);
-      }
       /* iOS 한글 IME는 조합 중에도 input을 보낸다. 그때 render()가 input DOM을 교체하면
          포커스·캐럿은 복원해도 IME 조합 세션은 복원할 수 없어 글자가 분리되거나 덮인다.
-         조합 직전의 예약 렌더까지 취소하고, compositionend 뒤 기존 검색 경로를 재개한다. */
+         조합이 끝난 뒤 즉시 기존 검색 경로를 재개한다. */
       input.addEventListener("compositionstart", function () {
         state.searchComposing = true;
-        window.clearTimeout(state.searchTimer);
       });
       input.addEventListener("input", function (event) {
         state.query = input.value;
-        window.clearTimeout(state.searchTimer);
         if (state.searchComposing || event.isComposing) return;
-        scheduleSearchRender();
+        syncCurrentListHistory();
+        render();
       });
       input.addEventListener("compositionend", function () {
         state.searchComposing = false;
         state.query = input.value;
-        scheduleSearchRender();
+        syncCurrentListHistory();
+        render();
       });
       search.appendChild(input);
-      header.appendChild(search);
+      var searchClose = el("button", "search-close");
+      searchClose.type = "button";
+      searchClose.setAttribute("data-search-close", "true");
+      searchClose.setAttribute("aria-label", "검색 닫기");
+      searchClose.addEventListener("click", closeSearch);
+      searchClose.appendChild(icon("close", 17));
+      search.appendChild(searchClose);
+      if (state.searchOpen) header.appendChild(search);
       header.appendChild(makeCategoryChips());
     }
-    if (!state.archiveView) header.appendChild(makeIngestComposer());
+    if (!state.archiveView && !state.searchOpen) header.appendChild(makeIngestComposer());
     return header;
   }
 
@@ -2761,8 +2988,10 @@ window.__LEARNING_DATA__ = null;
       });
     }
 
+    var published = item.published === true;
     var copy = el("span", "item-copy");
     copy.appendChild(el("span", "cell-title", titleOf(item)));
+    if (published) copy.appendChild(el("span", "shared-badge", "공유 중"));
     var badge = ingesting ? ingestBadgeText() : "";
     var badgeMeta = ingesting ? ingestBadgeMeta(ingesting) : "";
     var plainMeta = [channelOf(item), durationOf(item), topicOf(item)]
@@ -2811,26 +3040,6 @@ window.__LEARNING_DATA__ = null;
       });
       row.appendChild(star);
 
-      /* 발행은 이제 자료별 액션이다. 예전에는 목록에 들어올 자격이었고, 발행하지
-         않은 자료는 보관함에서 찾아야 했다 — 앱을 막 깐 사람에게 자기 첫 자료가
-         목록에 없는 이유를 설명할 방법이 없었다. */
-      var published = item.published === true;
-      var share = el("button", "star-button share-button" + (published ? " is-shared" : ""), "");
-      share.type = "button";
-      share.appendChild(icon("link", 15));
-      share.setAttribute("data-share-path", path);
-      share.setAttribute("aria-pressed", published ? "true" : "false");
-      share.setAttribute("aria-label",
-        published ? titleOf(item) + " 공유 링크 회수" : titleOf(item) + " 공유 링크 만들기");
-      share.title = published ? "공유 링크 회수" : "공유 링크 만들기";
-      share.disabled = !canChange || !safeRepoPath(path);
-      if (share.disabled && !mutationsLocked()) share.title = "이 항목은 변경할 수 없습니다";
-      share.addEventListener("click", function (event) {
-        event.preventDefault();
-        event.stopPropagation();
-        openSheet(published ? "unpublish" : "publish", [path]);
-      });
-      row.appendChild(share);
     }
     if (state.selected.has(path)) row.classList.add("is-selected");
     return row;
@@ -2876,6 +3085,17 @@ window.__LEARNING_DATA__ = null;
     if (status === "cancelling") title += " 중지 중";
     if (status === "failed") title += " 적재 실패";
     head.appendChild(el("span", "ingest-row-title", title));
+    if (status === "failed") {
+      var closeCard = el("button", "ingest-card-close", "✕");
+      closeCard.type = "button";
+      closeCard.setAttribute("aria-label", "실패 카드 닫기");
+      closeCard.addEventListener("click", function () {
+        state.dismissedIngest.add(entry.id);
+        if (state.ingestDetail && state.ingestDetail.id === entry.id) state.ingestDetail = null;
+        render();
+      });
+      head.appendChild(closeCard);
+    }
     if (status === "queued") {
       head.appendChild(el("span", "ingest-row-time", "대기"));
     } else if (status !== "cancelled") {
@@ -2887,31 +3107,12 @@ window.__LEARNING_DATA__ = null;
     if (subtitle) row.appendChild(el("p", "ingest-row-sub", subtitle));
 
     if (status === "failed") {
-      // 🔴 **요약이 있으면 그것만 읽으면 되게 한다.**
-      //    예전에는 일반 문구(`error`)를 **항상 위에** 그리고 그 아래 요약을 붙였다. 그런데
-      //    `error` 는 실패 종류당 한 문장으로 고정이라("claude가 exit 0으로 끝났지만 적재 완료
-      //    표시가 없습니다 …") 매번 같은 말이 먼저 눈에 들어오고, 정작 이 건에서 무슨 일이
-      //    있었는지 말해 주는 요약은 그 아래로 밀렸다. 읽는 사람에게는 반복되는 머리말이다.
-      //    이제 요약이 있으면 **요약이 본문**이고, 기계 정보(exit·재시도)만 작게 남긴다.
-      var summary = stringValue(entry.failure_summary, "");
-      var machine = [];
-      if (entry.exit_code !== undefined) {
-        machine.push("exit " + (entry.exit_code === null ? "없음" : String(entry.exit_code)));
-      }
-      if (entry.retry_of) machine.push("#" + String(entry.retry_of) + " 다시 시도");
-
-      if (summary) {
-        row.appendChild(el("p", "ingest-row-summary", summary));
-        // 기계 정보는 진단에 쓰이므로 버리지 않는다 — 다만 본문 자리를 뺏지 않게 아래로.
-        if (machine.length) row.appendChild(el("p", "ingest-row-detail", machine.join(" · ")));
-      } else {
-        // 요약이 없을 때만 일반 문구가 최선의 설명이다.
-        var detail = stringValue(entry.error, "적재가 실패했습니다");
-        if (machine.length) detail += " · " + machine.join(" · ");
-        row.appendChild(el("p", "ingest-row-detail", detail));
-        var why = stringValue(entry.failure_summary_error, "");
-        if (why) row.appendChild(el("p", "ingest-row-summary is-missing", "이유 요약 없음 — " + why));
-      }
+      row.appendChild(el("p", "ingest-row-summary", ingestFailureMessage(entry)));
+      var timeline = el("ol", "ingest-timeline");
+      ingestFailureTimeline(entry).forEach(function (line, index, lines) {
+        timeline.appendChild(el("li", index === lines.length - 1 ? "is-failed" : "", line));
+      });
+      row.appendChild(timeline);
     }
 
     var actions = el("div", "ingest-actions");
@@ -2934,32 +3135,37 @@ window.__LEARNING_DATA__ = null;
       stop.addEventListener("click", function () { cancelIngest(entry.id); });
       actions.appendChild(stop);
     } else if (status === "failed") {
-      var again = el("button", "ingest-action", "다시 시도");
+      var again = el("button", "ingest-action", "다시 하기");
       again.type = "button";
       again.disabled = state.ingestBusy;
       again.addEventListener("click", function () { retryIngest(entry.id); });
       actions.appendChild(again);
-      var log = el("button", "ingest-action", "로그 보기");
-      log.type = "button";
-      log.disabled = state.ingestBusy;
-      log.addEventListener("click", function () { loadIngestDetail(entry.id); });
-      actions.appendChild(log);
-      var remove = el("button", "ingest-action danger", "지우기");
-      remove.type = "button";
-      remove.disabled = state.ingestBusy;
-      remove.addEventListener("click", function () { deleteIngest(entry.id); });
-      actions.appendChild(remove);
     }
     if (actions.childNodes.length) row.appendChild(actions);
 
-    if (state.ingestDetail && state.ingestDetail.id === entry.id) {
-      row.appendChild(errorField("로그", state.ingestDetail.log || "로그가 비어 있습니다", "ingest-log"));
+    if (status === "failed") {
+      var details = el("details", "ingest-details");
+      details.appendChild(el("summary", "", "자세히"));
+      var selectedDetail = state.ingestDetail && state.ingestDetail.id === entry.id
+        ? state.ingestDetail : null;
+      if (selectedDetail) {
+        details.open = true;
+        details.appendChild(errorField(
+          "원본 로그", selectedDetail.log || "로그가 비어 있습니다", "ingest-log"
+        ));
+      }
+      details.addEventListener("toggle", function () {
+        if (details.open && !selectedDetail) loadIngestDetail(entry.id);
+      });
+      row.appendChild(details);
     }
     return row;
   }
 
   function makeIngestQueue() {
-    var records = state.ingestRequests.filter(ingestCardVisible);
+    var records = state.ingestRequests.filter(function (entry) {
+      return ingestCardVisible(entry) && !state.dismissedIngest.has(entry.id);
+    });
     if (!records.length && !state.ingestError) return null;
     var section = el("section", "ingest-queue");
     if (records.length) section.appendChild(el("h2", "ingest-queue-heading", "적재 큐 · " + records.length + "건"));
@@ -3258,63 +3464,6 @@ window.__LEARNING_DATA__ = null;
     return backdrop;
   }
 
-  function makeIngestSheet() {
-    var plan = state.ingestPlan;
-    if (!plan) return null;
-    var backdrop = el("div", "sheet-backdrop");
-    backdrop.setAttribute("role", "presentation");
-    backdrop.addEventListener("click", function (event) {
-      if (event.target === backdrop && !state.ingestBusy) {
-        state.ingestPlan = null;
-        render();
-      }
-    });
-    var dialog = el("div", "action-sheet");
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-    dialog.setAttribute("aria-labelledby", "ingest-sheet-title");
-    var group = el("div", "sheet-group");
-    var heading = el("div", "sheet-heading");
-    var duplicate = plan.duplicate === true;
-    var title = el("h2", "", duplicate ? "이미 적재된 영상입니다" : "이 계획대로 실행합니다");
-    title.id = "ingest-sheet-title";
-    heading.appendChild(title);
-    heading.appendChild(el("p", "", duplicate
-      ? "적재를 다시 돌리지 않습니다. 승인하면 기존 문서를 목록 맨 위로 올립니다."
-      : "승인하면 이 데브박스에서 Claude Code 헤드리스 적재가 큐에 들어갑니다. 자동 실행은 없습니다."));
-    var details = (duplicate ? [
-      "기존 문서 : " + stringValue(plan.existing_title, "확인 불가"),
-      "경로     : " + stringValue(plan.existing_path, "확인 불가"),
-      "입력     : " + stringValue(plan.url, "확인 불가")
-    ] : [
-      "cwd      : " + stringValue(plan.cwd, "확인 불가"),
-      "실행     : " + stringValue(plan.execution, "/learning-ingest"),
-      "입력     : " + stringValue(plan.url, "확인 불가"),
-      "계정     : " + stringValue(plan.account, "구독 (API 키 미주입)")
-    ]).join("\n");
-    heading.appendChild(el("div", "plan-details", details));
-    group.appendChild(heading);
-    var confirm = el("button", "sheet-button", duplicate ? "맨 위로 올리기" : "실행");
-    confirm.type = "button";
-    confirm.disabled = state.ingestBusy;
-    confirm.addEventListener("click", runIngestPlan);
-    group.appendChild(confirm);
-    dialog.appendChild(group);
-    var cancelGroup = el("div", "sheet-group");
-    var cancel = el("button", "sheet-button cancel", "취소");
-    cancel.type = "button";
-    cancel.disabled = state.ingestBusy;
-    cancel.addEventListener("click", function () {
-      state.ingestPlan = null;
-      state.ingestError = null;
-      render();
-    });
-    cancelGroup.appendChild(cancel);
-    dialog.appendChild(cancelGroup);
-    backdrop.appendChild(dialog);
-    return backdrop;
-  }
-
   function actionErrorFrom(payload, status) {
     var object = objectValue(payload) || {};
     var error = makeError(object, "작업이 실패했습니다", status);
@@ -3457,6 +3606,25 @@ window.__LEARNING_DATA__ = null;
     }, isError ? TOAST_MS.error : TOAST_MS.success);
   }
 
+  function makeIngestUndo() {
+    if (!state.ingestUndo) return null;
+    var snackbar = el("div", "toast ingest-undo");
+    snackbar.setAttribute("role", "status");
+    snackbar.setAttribute("data-ingest-undo", "true");
+    snackbar.appendChild(el("span", "", "적재 큐에 넣었습니다"));
+    var undo = el("button", "", "되돌리기");
+    undo.type = "button";
+    undo.disabled = state.ingestBusy;
+    undo.addEventListener("click", function () {
+      var id = state.ingestUndo && state.ingestUndo.id;
+      if (!id) return;
+      clearIngestUndo();
+      cancelIngest(id);
+    });
+    snackbar.appendChild(undo);
+    return snackbar;
+  }
+
   function actionSuccess(kind) {
     if (kind === "archive") return "보관함으로 옮겼습니다";
     if (kind === "publish") return "발행했습니다";
@@ -3471,7 +3639,11 @@ window.__LEARNING_DATA__ = null;
     if (learningView() !== "list") return;
     var src = docHref(item);
     if (!src) return;
-    var viewer = { src: src, title: titleOf(item), external: publicHref(item) };
+    var viewer = {
+      src: src,
+      title: titleOf(item),
+      legacyFallback: !stringValue(fieldOf(item, "html_path", ""), "")
+    };
     pushSubview("viewer", { learningViewer: viewer });
     state.archiveView = false;
     state.viewer = viewer;
@@ -3486,35 +3658,6 @@ window.__LEARNING_DATA__ = null;
   window.addEventListener("popstate", function (event) {
     renderHistoryDestination(event.state);
   });
-
-  /* 문서 주소를 클립보드로. `navigator.clipboard` 는 보안 컨텍스트(https·localhost)에서만 있고
-     테일넷 http 로 열면 없다 — 그때는 execCommand 로 내려가고, 그것도 안 되면 주소를 토스트로
-     띄워 손으로 복사할 수 있게 한다(조용히 실패 금지). */
-  function copyLink(url) {
-    function done(ok) {
-      if (ok) showToast("주소를 복사했습니다");
-      else showToast("복사가 막혔습니다 — " + url, true);
-      render();
-    }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(url).then(function () { done(true); }, function () { done(fallbackCopy(url)); });
-      return;
-    }
-    done(fallbackCopy(url));
-  }
-
-  function fallbackCopy(text) {
-    var area = document.createElement("textarea");
-    area.value = text;
-    area.setAttribute("readonly", "readonly");
-    area.style.cssText = "position:fixed;top:-1000px;left:0;opacity:0";
-    document.body.appendChild(area);
-    area.select();
-    var ok = false;
-    try { ok = document.execCommand("copy"); } catch (error) { ok = false; }
-    document.body.removeChild(area);
-    return ok;
-  }
 
   /* 🔴 뷰어는 `root` **밖**에 산다. `render()` 가 `root` 를 통째로 비우기 때문에, 뷰어가 그 안에
      있으면 폴링이 돌 때마다 `<iframe>` 이 DOM 에서 떨어졌다 붙는다 — 브라우저는 그때마다
@@ -3540,24 +3683,17 @@ window.__LEARNING_DATA__ = null;
     var wrap = el("div", "viewer");
     wrap.setAttribute("role", "dialog");
     wrap.setAttribute("aria-label", state.viewer.title || "문서");
-    var bar = el("div", "viewer-bar");
-    var back = el("button", "viewer-back");
-    back.type = "button";
-    back.appendChild(icon("back", 18));
-    back.appendChild(el("span", "", "목록"));
-    back.addEventListener("click", closeDoc);
-    bar.appendChild(back);
-    bar.appendChild(el("span", "viewer-title", state.viewer.title || "문서"));
-    if (state.viewer.external) {
-      var copy = el("button", "viewer-copy");
-      copy.type = "button";
-      copy.title = "이 문서 주소 복사";
-      copy.setAttribute("aria-label", "이 문서 주소 복사");
-      copy.appendChild(icon("copy", 17));
-      copy.addEventListener("click", function () { copyLink(state.viewer.external); });
-      bar.appendChild(copy);
+    /* `/read/` 는 응답 안의 셸이 전체 도구 막대를 제공한다. 셸이 없는 `/doc/`
+       호환 폴백만 화면을 빠져나올 수 있는 아이콘 하나를 앱 쪽에 남긴다. */
+    if (state.viewer.legacyFallback === true) {
+      var back = el("button", "viewer-fallback-back");
+      back.type = "button";
+      back.title = "목록";
+      back.setAttribute("aria-label", "목록");
+      back.appendChild(icon("back", 18));
+      back.addEventListener("click", closeDoc);
+      wrap.appendChild(back);
     }
-    wrap.appendChild(bar);
     var frame = el("iframe", "viewer-frame");
     frame.src = state.viewer.src;
     frame.title = state.viewer.title || "문서";
@@ -3659,6 +3795,8 @@ window.__LEARNING_DATA__ = null;
     var queue = makeIngestQueue();
     slot.replaceChildren();
     if (queue) slot.appendChild(queue);
+    var undo = root.querySelector("[data-ingest-undo]");
+    if (undo && !state.ingestUndo) undo.remove();
   }
 
   function render() {
@@ -3697,23 +3835,21 @@ window.__LEARNING_DATA__ = null;
     var bar = makeSelectionBar();
     if (bar) shell.appendChild(bar);
     var sheet = makeSheet();
-    var ingestSheet = makeIngestSheet();
-    // 🔴 모달이 떠 있으면 토스트를 띄우지 않는다. 토스트는 `z-index:60` 에 하단 정렬이고 시트는
-    //    `50` 에 하단 정렬이라, 둘이 겹치면 토스트가 정확히 시트의 **주 버튼 자리**에 앉는다
-    //    (실측 2026-07-31: "이 계획대로 실행합니다" 다이얼로그의 `실행` 자리에 "적재 기록을
-    //    지웠습니다" 가 보여, 버튼 라벨이 완료 메시지인 것처럼 읽히고 누를 수도 없었다).
-    //    모달이 화면을 소유하는 동안 지난 작업의 알림은 물러나야 한다.
-    if (state.toast && !sheet && !ingestSheet) {
+    var ingestUndo = makeIngestUndo();
+    // 모달이 화면을 소유하는 동안 알림은 물러난다. 되돌리기는 일반 토스트보다 우선해서
+    // 8초의 취소 기회를 다른 짧은 알림이 가리지 않게 한다.
+    if (ingestUndo && !sheet) {
+      shell.appendChild(ingestUndo);
+    } else if (state.toast && !sheet) {
       var toast = el("div", "toast" + (state.toast.error ? " error" : ""), state.toast.message);
       toast.setAttribute("role", "status");
       shell.appendChild(toast);
     }
     if (sheet) shell.appendChild(sheet);
-    if (ingestSheet) shell.appendChild(ingestSheet);
     root.appendChild(shell);
     // 🔴 모달이 떠 있으면 되살리지 않는다 — 시트가 화면을 소유하는 동안 커서를 뒤 화면의
     //    입력창으로 되돌리면 iOS 에서 키보드가 시트를 덮는다.
-    if (!sheet && !ingestSheet) restoreFocus(savedFocus);
+    if (!sheet) restoreFocus(savedFocus);
     syncViewer();
   }
 
@@ -3735,10 +3871,15 @@ window.__LEARNING_DATA__ = null;
     } else if (event.key === "Escape" && state.sheet) {
       state.sheet = null;
       render();
-    } else if (event.key === "Escape" && state.ingestPlan && !state.ingestBusy) {
-      state.ingestPlan = null;
-      render();
+    } else if (event.key === "Escape" && state.searchOpen) {
+      closeSearch();
     }
+  });
+
+  window.addEventListener("storage", function (event) {
+    if (event.key !== THEME_STORAGE_KEY) return;
+    applyTheme(readStoredTheme(), false);
+    render();
   });
 
   if (window.history && "scrollRestoration" in window.history) {

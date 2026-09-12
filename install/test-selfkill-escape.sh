@@ -373,6 +373,22 @@ EOF
   fi
 fi
 
+# ---- the caller's PATH is not the install's PATH ----------------------------
+# The escape forwards the caller's PATH so the escaped run resolves the same
+# binaries; a caller whose shell omits /usr/sbin (hosted sessions) therefore
+# lost nft half way through an install (measured 2026-09-10). lib.sh appends
+# the sbin directories at load, direct and escaped alike, and keeps the
+# caller's ordering in front.
+out="$(env PATH=/usr/bin:/bin bash -c '. "'"$ROOT"'/install/lib.sh"; printf %s "$PATH"' 2>&1)"
+case ":$out:" in
+  :/usr/bin:/bin:*:/usr/sbin:*) ok "a caller PATH without /usr/sbin gains it at lib.sh load, behind the caller's own entries" ;;
+  *) bad "PATH after lib.sh load lacks /usr/sbin or reordered the caller: $out" ;;
+esac
+out="$(env PATH=/usr/sbin:/usr/bin:/bin bash -c '. "'"$ROOT"'/install/lib.sh"; printf %s "$PATH"' 2>&1)"
+[ "$(tr ':' '\n' <<<"$out" | grep -c '^/usr/sbin$')" = 1 ] \
+  && ok "an entry already present is not duplicated" \
+  || bad "PATH entry duplicated: $out"
+
 echo
 echo "selfkill-escape: $pass ok, $fail failed"
 [ "$fail" -eq 0 ]

@@ -335,12 +335,15 @@ def _write_candidate(config: Path, candidate_text: str) -> Path:
         raise AppsError("config_unwritable", str(exc)) from exc
 
 
-def _replace_validated(config: Path, candidate_text: str, expected: bytes) -> None:
+def _replace_validated(config: Path, candidate_text: str, expected: bytes,
+                       approved_package: tuple[str, str] | None = None) -> None:
     root = default_root()
     candidate = _write_candidate(config, candidate_text)
     backup_tmp: Path | None = None
     try:
-        _command(root, ["validate"], config=candidate)
+        validation = (["validate"] if approved_package is None else
+                      ["package-register-validate", *approved_package])
+        _command(root, validation, config=candidate)
         try:
             current = config.read_bytes()
         except OSError as exc:
@@ -405,10 +408,14 @@ def mutate_enabled(config: Path, app_id: str, enabled: bool) -> dict[str, Any]:
 
 
 def register(config: Path, app_id: str,
-             package: dict[str, Any] | None = None) -> dict[str, Any]:
+             package: dict[str, Any] | None = None, *,
+             approved_digest: str | None = None) -> dict[str, Any]:
     """Register an app, optionally with an explicit package path, via the same writer."""
     app_id = _checked_id(app_id)
     package = _checked_package(package)
+    if approved_digest is not None:
+        if package is None or re.fullmatch(r"[0-9a-f]{64}", approved_digest) is None:
+            raise AppsError("bad_package_approval")
     config = Path(config).resolve()
     with _WRITE_LOCK:
         original, document = _read_config(config)
@@ -421,5 +428,7 @@ def register(config: Path, app_id: str,
         if package is not None and app_id in packages:
             raise AppsError("package_already_registered")
         text = _append_tables(original.decode("utf-8"), app_id, package)
-        _replace_validated(config, text, original)
+        approval = ((app_id, approved_digest)
+                    if approved_digest is not None else None)
+        _replace_validated(config, text, original, approval)
     return {"id": app_id, "enabled": True, "changed": True}

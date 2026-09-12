@@ -25,6 +25,20 @@ AIRLOCK_ROOT="$(cd "$_lib_here/.." && pwd)"
 # wrapper. It is not an admission switch: only the exact installer argv can
 # create it, and it disappears with that run.
 AIRLOCK_CONFIG_BIN="${AIRLOCK_CONFIG_BIN:-$AIRLOCK_ROOT/bin/airlock-config}"
+# The sbin directories, whatever the caller's shell put in PATH. The
+# install reaches for nft, useradd, sshd and friends, which live in sbin; a
+# hosted session (an agent harness, a login shell with a user-only PATH) can
+# lack /usr/sbin and the run dies half way with "required command not
+# found: nft" -- measured 2026-09-10, after seven apps had already been
+# reinstalled and before the rest were. The selfkill escape forwards the
+# caller's PATH by design (the escaped run must resolve the same binaries),
+# so the fix belongs here, where every installer starts, not in the escape.
+# Appended, never prepended: the caller's own ordering keeps precedence.
+for _d in /usr/local/sbin /usr/sbin /sbin; do
+  case ":${PATH:-}:" in *":${_d}:"*) ;; *) PATH="${PATH:+$PATH:}${_d}" ;; esac
+done
+export PATH
+unset _d
 # The account tools stay two binaries rather than one with a `status` subcommand,
 # because devterm reaches them through two separate unit variables today and the
 # whole point of the re-homing is that its call sites do not change.

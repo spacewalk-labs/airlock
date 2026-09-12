@@ -73,7 +73,7 @@ RATCHET = {
     # adding one more emoji. They now share a single named constant (resolveWhy's
     # WHY), which is what banked the drop — nothing was restyled here either.
     "devterm":     {"hex": 283, "emoji": 54},
-    "learning":    {"hex": 22, "emoji": 75},
+    "learning":    {"hex": 0, "emoji": 67},
     "notepad":     {"hex": 26, "emoji": 10},
     # #247 로 합류. 도구가 --ratchet 으로 낸 값 그대로이며 0/0 이라 이 앱은
     # 앞으로 hex·emoji 를 단 하나도 늘릴 수 없다(천장은 내려가기만 한다).

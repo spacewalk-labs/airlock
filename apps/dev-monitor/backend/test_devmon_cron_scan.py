@@ -8,16 +8,48 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import unittest
+import hashlib
+import io
 import json
 import os
+import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import devmon_cron_scan as cs
+import devmon_loop as loop
+import devmon_messages as messages
+
+
+VERIFY_PATH = Path(__file__).resolve().parents[1] / "verify-cron-handoff-live.py"
+VERIFY_SPEC = importlib.util.spec_from_file_location("verify_cron_handoff_live", VERIFY_PATH)
+handoff = importlib.util.module_from_spec(VERIFY_SPEC)
+VERIFY_SPEC.loader.exec_module(handoff)
+
+
+def taskboard_acceptance_measure():
+    """Load the real taskboard parser when its path is supplied by the caller."""
+    path_value = os.environ.get("TASKBOARD_ACCEPT_CARD")
+    if not path_value:
+        return None
+    path = Path(path_value)
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec = importlib.util.spec_from_file_location("taskboard_accept_card", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return getattr(module, "measure_ac", None) or module.measure_acceptance
 
 
 def ep(s: str) -> float:
@@ -1753,5 +1785,638 @@ class SnapshotCache(unittest.TestCase):
         self.assertFalse(first_thread.is_alive() or second_thread.is_alive())
 
 
+class CronCards(unittest.TestCase):
+    """The replacement producer publishes only state *transitions*, never a GET side effect."""
+
+    @staticmethod
+    def snapshot(now, jobs):
+        return {"now": now, "jobs": jobs}
+
+    @staticmethod
+    def job(job_id, **axes):
+        return {
+            "id": job_id, "name": "nightly backup", "lastResult": "success",
+            "timeliness": "on-time", "lastRun": 1_700_000_000,
+            "nextRun": 1_700_003_600, **axes,
+        }
+
+    def verdicts_path(self, root):
+        return os.path.join(root, "cron-verdicts.json")
+
+    def test_failure_start_emits_one_urgent_card_with_fail_id_and_three_columns(self):
+        with tempfile.TemporaryDirectory() as root:
+            payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [
+                self.job("user:backup/weekly@home", lastResult="failed", timeliness="late"),
+                self.job("healthy", lastResult="success", timeliness="on-time"),
+            ]), verdicts_path=self.verdicts_path(root))
+        self.assertEqual(len(payloads), 1)
+        payload = payloads[0]
+        key = cs.cron_job_key("user:backup/weekly@home")
+        self.assertEqual(payload["group"], "cron:" + key)
+        self.assertEqual(payload["id"], "cron:%s:fail:2023-11-14T22:13:20Z" % key)
+        self.assertRegex(key, r"^[0-9a-f]{24}$")
+        self.assertEqual(payload["source"], "cron")
+        self.assertEqual(payload["level"], "urgent")
+        self.assertEqual(payload["title"], "nightly backup 실패")
+        self.assertIn("무엇:", payload["body"])
+        self.assertIn("증거:", payload["body"])
+        self.assertIn("다음:", payload["body"])
+
+    def test_late_only_title_says_late_not_failed(self):
+        with tempfile.TemporaryDirectory() as root:
+            payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [
+                self.job("cron/only@read", lastResult="success", timeliness="late"),
+            ]), verdicts_path=self.verdicts_path(root))
+        self.assertEqual(payloads[0]["title"], "nightly backup 지연")
+
+    def test_three_consecutive_failing_scans_publish_exactly_one_card(self):
+        """청사진 결정 01 — 실패가 이어지는 동안 같은 잡에 새 쪽지가 없다."""
+        with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
+            job = self.job("system:backup/weekly@host", lastResult="failed")
+            all_payloads = []
+            for now in (1_700_000_000, 1_700_000_900, 1_700_001_800):
+                all_payloads += cs.cron_message_payloads(self.snapshot(now, [job]), verdicts_path=path)
+        self.assertEqual(len(all_payloads), 1)
+        self.assertEqual(all_payloads[0]["level"], "urgent")
+
+    def test_recovery_emits_normal_card_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
+            key = cs.cron_job_key("system:backup/weekly@host")
+            failing = self.job("system:backup/weekly@host", lastResult="failed", lastRun=1_700_000_000)
+            recovered = self.job("system:backup/weekly@host", lastResult="success",
+                                  timeliness="on-time", lastRun=1_700_003_600)
+            first = cs.cron_message_payloads(self.snapshot(1_700_000_000, [failing]), verdicts_path=path)
+            second = cs.cron_message_payloads(self.snapshot(1_700_004_000, [recovered]), verdicts_path=path)
+            third = cs.cron_message_payloads(self.snapshot(1_700_005_000, [recovered]), verdicts_path=path)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["level"], "urgent")
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["level"], "normal")
+        self.assertEqual(second[0]["title"], "nightly backup 다시 정상")
+        self.assertEqual(second[0]["id"], "cron:%s:ok:2023-11-14T23:13:20Z" % key)
+        self.assertEqual(third, [])  # 회복 뒤 계속 정상 — 조용
+
+    def test_corrupted_verdicts_file_replays_one_more_transition(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
+            with open(path, "w") as f:
+                f.write("{not json")
+            job = self.job("system:backup/weekly@host", lastResult="failed")
+            payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]), verdicts_path=path)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["level"], "urgent")
+
+    def test_verdicts_file_is_written_atomically_and_readable_next_call(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
+            job = self.job("system:backup/weekly@host", lastResult="failed")
+            cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]), verdicts_path=path)
+            self.assertTrue(os.path.isfile(path))
+            with open(path) as f:
+                saved = json.load(f)
+            key = cs.cron_job_key("system:backup/weekly@host")
+            self.assertEqual(saved[key]["state"], "bad")
+            self.assertEqual(os.listdir(root), ["cron-verdicts.json"])  # no leftover tmp file
+
+    def test_about_falls_back_to_description_when_unit_has_no_marker(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.NamedTemporaryFile(
+                "w", suffix=".service", delete=False) as unit_file:
+            unit_file.write("[Unit]\nDescription=Nightly backup unit\n")
+            unit_file.flush()
+            job = self.job("user:backup.timer", lastResult="failed", kind="systemd",
+                            scope="user", unit="backup.timer", service="backup.service")
+            with patch.object(cs, "run_cmd", return_value=(
+                    0, "FragmentPath=%s\nDescription=Nightly backup unit\n\n" % unit_file.name, "")):
+                payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
+                                                     verdicts_path=self.verdicts_path(root))
+            os.unlink(unit_file.name)
+        self.assertIn("Nightly backup unit (설명 미등록)", payloads[0]["body"])
+
+    def test_about_uses_x_airlock_about_marker_when_present(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.NamedTemporaryFile(
+                "w", suffix=".service", delete=False) as unit_file:
+            unit_file.write("[Unit]\nDescription=Nightly backup unit\nX-Airlock-About=매일 밤 백업을 돌립니다\n")
+            unit_file.flush()
+            job = self.job("user:backup.timer", lastResult="failed", kind="systemd",
+                            scope="user", unit="backup.timer", service="backup.service")
+            with patch.object(cs, "run_cmd", return_value=(
+                    0, "FragmentPath=%s\nDescription=Nightly backup unit\n\n" % unit_file.name, "")):
+                payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
+                                                     verdicts_path=self.verdicts_path(root))
+            os.unlink(unit_file.name)
+        self.assertIn("무엇: 매일 밤 백업을 돌립니다", payloads[0]["body"])
+        self.assertNotIn("설명 미등록", payloads[0]["body"])
+
+    def test_evidence_masks_home_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = os.path.expanduser("~")
+            job = self.job("user:backup.timer", lastResult="failed", kind="systemd",
+                            scope="user", unit="backup.timer", service="backup.service")
+            with patch.object(cs, "run_cmd", side_effect=[
+                    (0, "FragmentPath=\nDescription=Nightly backup\n\n", ""),
+                    (0, "%s/logs/backup.log: permission denied\n" % home, ""),
+            ]):
+                payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
+                                                     verdicts_path=self.verdicts_path(root))
+        self.assertIn("~/logs/backup.log", payloads[0]["body"])
+        self.assertNotIn(home, payloads[0]["body"])
+
+    def test_dev_monitor_own_cron_job_publishes_even_without_about(self):
+        """규칙 5 — dev-monitor 자신의 크론 카드는 about 이 없어도 낸다(대체 표시로)."""
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job("user:airlock-dev-monitor.timer", lastResult="failed", kind="systemd",
+                            scope="user", unit="airlock-dev-monitor.timer",
+                            service="airlock-dev-monitor.service", description=None)
+            with patch.object(cs, "run_cmd", return_value=(1, "", "no such unit")):
+                payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
+                                                     verdicts_path=self.verdicts_path(root))
+        self.assertEqual(len(payloads), 1)
+        self.assertIn("(설명 미등록)", payloads[0]["body"])
+
+    def test_two_maintenance_ticks_of_same_failure_publish_only_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            messages._local = threading.local()
+            messages.init_db(os.path.join(root, "messages.db"))
+            devmon_spool = loop.spool
+            devmon_spool.ensure_dirs(os.path.join(root, "spool"))
+            path = self.verdicts_path(root)
+            job = self.job("system:backup/weekly@host", lastResult="failed")
+            snapshots = [self.snapshot(1_700_000_000, [job]),
+                         self.snapshot(1_700_000_900, [job])]
+            with patch.object(cs, "snapshot", side_effect=snapshots), \
+                    patch.object(loop.spool, "scan_once", wraps=loop.spool.scan_once) as scanned:
+                loop.tick(os.path.join(root, "spool"), "", cleanup=True,
+                          maintenance=lambda: loop.publish_cron_cards(path))
+                loop.tick(os.path.join(root, "spool"), "", cleanup=True,
+                          maintenance=lambda: loop.publish_cron_cards(path))
+            key = cs.cron_job_key(job["id"])
+            card = messages.get_card("cron:%s:fail:2023-11-14T22:13:20Z" % key)
+            self.assertEqual(card["group"], "cron:" + key)
+            self.assertEqual(card["count"], 1)
+            self.assertEqual(messages._conn().execute("SELECT COUNT(*) FROM cards").fetchone()[0], 1)
+            self.assertEqual(messages._conn().execute("SELECT COUNT(*) FROM ledger").fetchone()[0], 1)
+            self.assertEqual(scanned.call_count, 2)
+            self.assertEqual(os.listdir(os.path.join(root, "spool", "new")), [])
+            self.assertEqual(os.listdir(os.path.join(root, "spool", "processing")), [])
+            messages._conn().close()
+            messages._local = threading.local()
+            messages._DB_PATH = None
+
+    def test_cron_message_payloads_requires_verdicts_path(self):
+        with self.assertRaises(ValueError):
+            cs.cron_message_payloads(self.snapshot(1_700_000_000, [self.job("x", lastResult="failed")]))
+
+    def test_running_message_loop_wires_cron_publish_with_verdicts_path_only_at_maintenance(self):
+        class Stop:
+            stopped = False
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, _delay):
+                self.stopped = True
+
+        stop = Stop()
+        with patch.object(loop, "tick") as tick, patch.object(loop, "publish_cron_cards") as publish:
+            loop.run("/fixture/spool", "", stop, verdicts_path="/fixture/cron-verdicts.json")
+            self.assertTrue(tick.call_args.args[3])
+            maintenance = tick.call_args.kwargs["maintenance"]
+            maintenance()
+            publish.assert_called_once_with("/fixture/cron-verdicts.json")
+
+
+class CronHandoffInstallEvidence(unittest.TestCase):
+    """AC21 trusts the normal install receipt, not optional fields invented for health."""
+
+    EXPECTED = "a" * 40
+    OTHER = "b" * 40
+
+    @staticmethod
+    def status_report(revision=EXPECTED, transaction="ok", drift="ok", revision_status="ok"):
+        return {
+            "checks": [
+                {"id": "install.transaction", "status": transaction,
+                 "detail": "transaction fixture committed"},
+                {"id": "install.drift", "status": drift,
+                 "detail": "config and ledger agree"},
+                {"id": "install.revision", "status": revision_status,
+                 "detail": revision},
+            ]
+        }
+
+    @classmethod
+    def status_process(cls, **changes):
+        return SimpleNamespace(stdout=json.dumps(cls.status_report(**changes)), returncode=0,
+                               stderr="")
+
+    def test_exact_approved_revision_and_install_receipt_pass(self):
+        with patch.object(handoff.subprocess, "run", return_value=self.status_process()):
+            observed, evidence, error = handoff.installed_airlock_revision(self.EXPECTED)
+        self.assertEqual(observed, self.EXPECTED)
+        self.assertIsNone(error)
+        self.assertEqual(set(evidence),
+                         {"install.transaction", "install.drift", "install.revision"})
+
+    def test_installed_revision_is_not_copied_over_the_independent_expectation(self):
+        with patch.object(handoff.subprocess, "run",
+                          return_value=self.status_process(revision=self.OTHER)):
+            observed, _, error = handoff.installed_airlock_revision(self.EXPECTED)
+        self.assertEqual(observed, self.OTHER)
+        self.assertIn("mismatches", error)
+
+    def test_approved_expectation_must_be_an_exact_sha(self):
+        with patch.object(handoff.subprocess, "run") as status:
+            observed, evidence, error = handoff.installed_airlock_revision("main")
+        self.assertIsNone(observed)
+        self.assertEqual(evidence, {})
+        self.assertIn("full lowercase 40-hex", error)
+        status.assert_not_called()
+
+    def test_missing_or_unhealthy_install_receipt_stays_not_run(self):
+        for changes in ({"transaction": "unchecked"}, {"drift": "warn"},
+                        {"revision_status": "unchecked"}):
+            with self.subTest(changes=changes), \
+                    patch.object(handoff.subprocess, "run",
+                                 return_value=self.status_process(**changes)):
+                observed, _, error = handoff.installed_airlock_revision(self.EXPECTED)
+            self.assertIsNone(observed)
+            self.assertIn("is not ok", error)
+
+    def test_health_without_revision_fields_passes_only_with_separate_install_evidence(self):
+        args = SimpleNamespace(stage="before", timeout=1, job="bad-job",
+                               hub_url="https://box/monitor", db="/fixture/messages.db")
+        card = {"card_id": "cron-card", "count": 1, "sent_at": "2026-09-12T00:00:00Z",
+                "archived_at": None, "last_at": "2026-09-12T00:00:00Z"}
+
+        def fetch(url):
+            if url.endswith("/api/health"):
+                return {"ok": True, "messages": "on", "cron": "on"}, {}
+            return {"jobs": [{"id": "bad-job", "lastResult": "failed",
+                               "timeliness": "on-time"}]}, {}
+
+        with tempfile.TemporaryDirectory() as evidence_dir, \
+                patch.object(handoff.subprocess, "run", return_value=self.status_process()), \
+                patch.object(handoff, "fetch_json", side_effect=fetch), \
+                patch.object(handoff, "open_card", return_value=card), \
+                patch("builtins.print"):
+            args.evidence_dir = evidence_dir
+            self.assertEqual(handoff.wait_for_before(args, self.EXPECTED), 0)
+            receipt = json.loads((Path(evidence_dir) / "cron-handoff-before.json").read_text())
+        self.assertEqual(receipt["verdict"], "PASS")
+        self.assertEqual(receipt["airlock_revision"], self.EXPECTED)
+        self.assertEqual(receipt["install_evidence"]["install.drift"]["status"], "ok")
+
+    @staticmethod
+    def before_record(job="bad-job", count=11):
+        group = "cron:" + handoff.job_key(job)
+        return {
+            "stage": "before", "verdict": "PASS", "observed_at": "2026-09-12T08:44:28Z",
+            "job": job, "group": group, "airlock_revision": "a" * 40,
+            "card": {"card_id": group + ":1789194299", "count": count,
+                     "sent_at": "2026-09-12T08:00:00Z",
+                     "archived_at": None, "last_at": "2026-09-12T08:42:14Z"},
+        }
+
+    @classmethod
+    def companion_receipt(cls, root, revision=EXPECTED, producer_off=True,
+                          applied_at="2026-09-12T09:00:00Z"):
+        script = Path(root) / "silent-death-watchdog.sh"
+        script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        receipt = Path(root) / "cron-silence-retirement.json"
+        receipt.write_text(json.dumps({
+            "schema_version": 1, "producer": "cron-silence", "box": "fixture-box",
+            "producer_off": producer_off, "infra_revision": revision,
+            "installed_script": str(script.resolve()),
+            "installed_script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+            "applied_at": applied_at,
+        }), encoding="utf-8")
+        return script, receipt
+
+    @classmethod
+    def after_args(cls, root, receipt, job="bad-job"):
+        return SimpleNamespace(
+            stage="after", timeout=1, job=job, hub_url="https://box/monitor",
+            db="/fixture/messages.db", evidence_dir=str(root),
+            expect_infra_revision=cls.EXPECTED, infra_receipt=str(receipt),
+        )
+
+    @classmethod
+    def card(cls, count, last_at, card_id=None):
+        group = "cron:" + handoff.job_key("bad-job")
+        return {
+            "card_id": card_id or group + ":1789194299", "group": group,
+            "count": count, "sent_at": "2026-09-12T08:00:00Z",
+            "archived_at": None, "last_at": last_at,
+        }
+
+    @staticmethod
+    def after_fetch(url):
+        if url.endswith("/api/health"):
+            return {"ok": True}, {"X-Companion-Revision": "b" * 40}
+        return {"jobs": [{"id": "bad-job", "lastResult": "failed",
+                           "timeliness": "on-time"}]}, {}
+
+    @staticmethod
+    def printed_ac_line(printed):
+        return next(call.args[0] for call in printed.call_args_list
+                    if call.args and str(call.args[0]).startswith("AC-21-AFTER |"))
+
+    @classmethod
+    def acceptance_records(cls, verdict="PASS"):
+        group = "cron:" + handoff.job_key("bad-job")
+        script_hash = "c" * 64
+        source = {"install_evidence": {
+            "install.transaction": {"status": "ok", "detail": "transaction committed"},
+            "install.drift": {"status": "ok", "detail": "config and ledger agree"},
+            "install.revision": {"status": "ok", "detail": cls.EXPECTED},
+        }}
+        companion = {
+            "receipt": "/evidence/cron-silence-retirement.json",
+            "producer": "cron-silence", "producer_off": True,
+            "infra_revision": cls.EXPECTED,
+            "installed_script": "/opt/fixture/silent-death-watchdog.sh",
+            "installed_script_sha256": script_hash,
+            "observed_script_sha256": script_hash,
+            "applied_at": "2026-09-12T09:00:00Z",
+        }
+        after = {
+            "stage": "after", "verdict": verdict,
+            "observed_at": "2026-09-12T09:48:46Z",
+            "airlock_revision": cls.EXPECTED,
+            "job": "bad-job", "group": group,
+            "baseline": {
+                "observed_at": "2026-09-12T09:30:00.000000Z",
+                "job": "bad-job", "group": group,
+                "card_id": group + ":1789194299", "count": 15,
+                "last_at": "2026-09-12T09:29:00.000000Z",
+            },
+            "card": {
+                "card_id": group + ":1789194299", "group": group, "count": 16,
+                "last_at": "2026-09-12T09:45:00.123456Z",
+            },
+            "maintenance_receipts": [{
+                "id": group + ":1789206300",
+                "created_at": "2026-09-12T09:45:00Z",
+                "received_at": "2026-09-12T09:45:00.123456Z",
+                "body": "lastResult=failed",
+            }],
+        }
+        return after, source, companion
+
+    def test_result_keeps_json_stdout_exit_and_emits_live_ac_on_stderr(self):
+        after, source, companion = self.acceptance_records()
+        after["install_evidence"] = source["install_evidence"]
+        after["companion_install"] = companion
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(stdout), redirect_stderr(stderr):
+            fields = {key: value for key, value in after.items()
+                      if key not in ("stage", "verdict", "observed_at")}
+            exit_code = handoff.result("after", "PASS", evidence_dir=root, **fields)
+            payload = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["verdict"], "PASS")
+        self.assertTrue(payload["evidence"].endswith("cron-handoff-after.json"))
+        self.assertIn("AC-21-AFTER |", stderr.getvalue())
+        self.assertIn("verdict: PASS | signal: live", stderr.getvalue())
+
+    def test_saved_after_record_formats_with_original_evidence_and_real_parser(self):
+        after, source, companion = self.acceptance_records()
+        original = json.dumps(after, sort_keys=True)
+        evidence = Path("/evidence/original-cron-handoff-after.json")
+        line = handoff.after_acceptance_line(
+            after, evidence, source, companion, self.EXPECTED)
+        self.assertEqual(json.dumps(after, sort_keys=True), original)
+        self.assertIn("record_stage_after=1,record_observed_at_valid=1", line)
+        self.assertIn("post_transition_receipts=1,count_delta=1", line)
+        self.assertIn("source_installed_match=1", line)
+        self.assertIn("companion_receipt_match=1,companion_bytes_match=1", line)
+        self.assertIn("evidence: %s@%s" % (evidence, self.EXPECTED), line)
+        measure = taskboard_acceptance_measure()
+        if measure is not None:
+            self.assertEqual(measure(line)[0][1], "전건 PASS")
+
+    def test_saved_record_structure_failure_and_not_run_cannot_be_reported_as_pass(self):
+        after, source, companion = self.acceptance_records()
+        after["card"] = {**after["card"], "card_id": "different-card"}
+        broken = handoff.after_acceptance_line(
+            after, Path("/evidence/after.json"), source, companion, self.EXPECTED)
+        self.assertIn("same_card=0", broken)
+        wrong_revision = handoff.after_acceptance_line(
+            self.acceptance_records()[0], Path("/evidence/after.json"), source,
+            companion, self.OTHER)
+        self.assertIn("companion_receipt_match=0", wrong_revision)
+        after, source, companion = self.acceptance_records()
+        source["install_evidence"]["install.drift"]["status"] = "warn"
+        source_mismatch = handoff.after_acceptance_line(
+            after, Path("/evidence/after.json"), source, companion, self.EXPECTED)
+        self.assertIn("source_installed_match=0", source_mismatch)
+        after, source, companion = self.acceptance_records()
+        companion["observed_script_sha256"] = "d" * 64
+        bytes_mismatch = handoff.after_acceptance_line(
+            after, Path("/evidence/after.json"), source, companion, self.EXPECTED)
+        self.assertIn("companion_receipt_match=0,companion_bytes_match=0", bytes_mismatch)
+        after, source, companion = self.acceptance_records()
+        after["card"]["count"] = 17
+        count_mismatch = handoff.after_acceptance_line(
+            after, Path("/evidence/after.json"), source, companion, self.EXPECTED)
+        self.assertIn("count_delta=2,receipt_count_match=0", count_mismatch)
+        after, source, companion = self.acceptance_records(verdict="NOT RUN")
+        not_run = handoff.after_acceptance_line(
+            after, Path("/evidence/after.json"), source, companion, self.EXPECTED)
+        self.assertIn("verdict: FAIL | signal: live", not_run)
+        measure = taskboard_acceptance_measure()
+        if measure is not None:
+            self.assertEqual(measure(broken)[0][1], "🔴 완료 불가")
+            self.assertEqual(measure(wrong_revision)[0][1], "🔴 완료 불가")
+            self.assertEqual(measure(source_mismatch)[0][1], "🔴 완료 불가")
+            self.assertEqual(measure(bytes_mismatch)[0][1], "🔴 완료 불가")
+            self.assertEqual(measure(count_mismatch)[0][1], "🔴 완료 불가")
+            self.assertEqual(measure(not_run)[0][1], "🔴 완료 불가")
+
+    def test_companion_receipt_binds_revision_producer_state_and_installed_bytes(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, receipt = self.companion_receipt(root)
+            evidence, error = handoff.installed_companion_receipt(self.EXPECTED, str(receipt))
+        self.assertIsNone(error)
+        self.assertEqual(evidence["infra_revision"], self.EXPECTED)
+        self.assertTrue(evidence["producer_off"])
+        self.assertEqual(evidence["installed_script_sha256"],
+                         evidence["observed_script_sha256"])
+
+    def test_fake_health_header_cannot_replace_a_mismatched_receipt(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, receipt = self.companion_receipt(root, revision=self.OTHER)
+            args = self.after_args(root, receipt)
+            with patch.object(handoff, "installed_airlock_revision",
+                              return_value=(self.EXPECTED, {}, None)), \
+                    patch.object(handoff, "fetch_json") as fetch, patch("builtins.print"):
+                self.assertEqual(handoff.wait_for_after(
+                    args, self.EXPECTED, self.before_record()), 2)
+            fetch.assert_not_called()
+            result = json.loads((Path(root) / "cron-handoff-after.json").read_text())
+        self.assertIn("revision mismatches", result["reason"])
+
+    def test_companion_revision_script_bytes_and_producer_off_are_all_required(self):
+        with tempfile.TemporaryDirectory() as root:
+            script, receipt = self.companion_receipt(root)
+            script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            _, error = handoff.installed_companion_receipt(self.EXPECTED, str(receipt))
+            self.assertIn("bytes mismatch", error)
+        with tempfile.TemporaryDirectory() as root:
+            _, receipt = self.companion_receipt(root, producer_off=False)
+            _, error = handoff.installed_companion_receipt(self.EXPECTED, str(receipt))
+            self.assertIn("producer_off=true", error)
+
+    def test_before_job_swap_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, receipt = self.companion_receipt(root)
+            args = self.after_args(root, receipt)
+            swapped = self.before_record(job="different-job")
+            with patch.object(handoff, "installed_airlock_revision",
+                              return_value=(self.EXPECTED, {}, None)), patch("builtins.print"):
+                self.assertEqual(handoff.wait_for_after(args, self.EXPECTED, swapped), 2)
+            result = json.loads((Path(root) / "cron-handoff-after.json").read_text())
+        self.assertIn("does not match", result["reason"])
+
+    def test_retirement_receipt_must_precede_the_after_baseline(self):
+        baseline_time = datetime(2026, 9, 12, 9, 30, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as root:
+            _, receipt = self.companion_receipt(
+                root, applied_at="2026-09-12T09:31:00Z")
+            args = self.after_args(root, receipt)
+            with patch.object(handoff, "installed_airlock_revision",
+                              return_value=(self.EXPECTED, {}, None)), \
+                    patch.object(handoff, "utc_now_datetime", return_value=baseline_time), \
+                    patch.object(handoff, "open_card", return_value=self.card(
+                        11, "2026-09-12T09:29:00.000000Z")), patch("builtins.print"):
+                self.assertEqual(handoff.wait_for_after(
+                    args, self.EXPECTED, self.before_record()), 2)
+            result = json.loads((Path(root) / "cron-handoff-after.json").read_text())
+        self.assertIn("before the after baseline", result["reason"])
+
+    def test_after_takes_post_retirement_baseline_then_accepts_periodic_same_card(self):
+        baseline_time = datetime(2026, 9, 12, 9, 30, tzinfo=timezone.utc)
+        initial = self.card(13, "2026-09-12T09:29:00.000000Z")
+        final = self.card(14, "2026-09-12T09:45:00.123456Z")
+        periodic = [{"id": "cron:%s:1789206300" % handoff.job_key("bad-job"),
+                     "created_at": "2026-09-12T09:45:00Z",
+                     "received_at": final["last_at"], "body": "lastResult=failed"}]
+        _, source, _ = self.acceptance_records()
+        with tempfile.TemporaryDirectory() as root:
+            _, receipt = self.companion_receipt(root)
+            args = self.after_args(root, receipt)
+            with patch.object(handoff, "installed_airlock_revision",
+                              return_value=(self.EXPECTED, source["install_evidence"], None)), \
+                    patch.object(handoff, "utc_now_datetime", return_value=baseline_time), \
+                    patch.object(handoff, "open_card", side_effect=[initial, final]), \
+                    patch.object(handoff, "cron_receipts_since",
+                                 return_value=(periodic, None)), \
+                    patch.object(handoff, "fetch_json", side_effect=self.after_fetch), \
+                    patch.object(handoff.time, "monotonic", side_effect=[0, 0]), \
+                    patch("builtins.print") as printed:
+                self.assertEqual(handoff.wait_for_after(
+                    args, self.EXPECTED, self.before_record()), 0)
+            result = json.loads((Path(root) / "cron-handoff-after.json").read_text())
+        ac_line = self.printed_ac_line(printed)
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["baseline"]["count"], 13)
+        self.assertEqual(result["card"]["card_id"],
+                         "cron:" + handoff.job_key("bad-job") + ":1789194299")
+        self.assertIn("post_transition_receipts=1,count_delta=1", ac_line)
+        self.assertIn("receipt_count_match=1", ac_line)
+        self.assertIn("verdict: PASS | signal: live", ac_line)
+        measure = taskboard_acceptance_measure()
+        if measure is not None:
+            self.assertEqual(measure(ac_line)[0][1], "전건 PASS")
+
+    def test_pre_retirement_increment_alone_cannot_pass_after(self):
+        baseline_time = datetime(2026, 9, 12, 9, 30, tzinfo=timezone.utc)
+        already_incremented = self.card(13, "2026-09-12T09:29:00.000000Z")
+        with tempfile.TemporaryDirectory() as root:
+            _, receipt = self.companion_receipt(root)
+            args = self.after_args(root, receipt)
+            with patch.object(handoff, "installed_airlock_revision",
+                              return_value=(self.EXPECTED, {}, None)), \
+                    patch.object(handoff, "utc_now_datetime", return_value=baseline_time), \
+                    patch.object(handoff, "open_card",
+                                 side_effect=[already_incremented, already_incremented]), \
+                    patch.object(handoff, "cron_receipts_since", return_value=([], None)), \
+                    patch.object(handoff, "fetch_json", side_effect=self.after_fetch), \
+                    patch.object(handoff.time, "monotonic", side_effect=[0, 0, 2]), \
+                    patch.object(handoff.time, "sleep"), \
+                    patch("builtins.print") as printed:
+                self.assertEqual(handoff.wait_for_after(
+                    args, self.EXPECTED, self.before_record()), 2)
+            result = json.loads((Path(root) / "cron-handoff-after.json").read_text())
+        ac_line = self.printed_ac_line(printed)
+        self.assertEqual(result["baseline"]["count"], 13)
+        self.assertEqual(result["verdict"], "NOT RUN")
+        self.assertIn("post_transition_receipts=0,count_delta=-1", ac_line)
+        self.assertIn("verdict: FAIL | signal: live", ac_line)
+        measure = taskboard_acceptance_measure()
+        if measure is not None:
+            self.assertEqual(measure(ac_line)[0][1], "🔴 완료 불가")
+
+    def test_different_card_and_manual_count_increment_cannot_pass(self):
+        baseline_time = datetime(2026, 9, 12, 9, 30, tzinfo=timezone.utc)
+        initial = self.card(11, "2026-09-12T09:29:00.000000Z")
+        cases = [
+            (self.card(12, "2026-09-12T09:45:00.123456Z",
+                       card_id="cron:" + handoff.job_key("bad-job") + ":1789194300"),
+             [{"received_at": "2026-09-12T09:45:00.123456Z"}], "identity changed"),
+            (self.card(12, "2026-09-12T09:45:00.123456Z"), [],
+             "not exactly backed"),
+        ]
+        for final, receipts, reason in cases:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as root:
+                _, receipt = self.companion_receipt(root)
+                args = self.after_args(root, receipt)
+                with patch.object(handoff, "installed_airlock_revision",
+                                  return_value=(self.EXPECTED, {}, None)), \
+                        patch.object(handoff, "utc_now_datetime", return_value=baseline_time), \
+                        patch.object(handoff, "open_card", side_effect=[initial, final]), \
+                        patch.object(handoff, "cron_receipts_since",
+                                     return_value=(receipts, None)), \
+                        patch.object(handoff, "fetch_json", side_effect=self.after_fetch), \
+                        patch.object(handoff.time, "monotonic", side_effect=[0, 0, 2]), \
+                        patch.object(handoff.time, "sleep"), patch("builtins.print"):
+                    self.assertEqual(handoff.wait_for_after(
+                        args, self.EXPECTED, self.before_record()), 2)
+                result = json.loads((Path(root) / "cron-handoff-after.json").read_text())
+            self.assertIn(reason, result["reason"])
+
+    def test_cron_ledger_receipt_must_have_periodic_identity_after_baseline(self):
+        baseline = datetime(2026, 9, 12, 9, 30, tzinfo=timezone.utc)
+        group = "cron:" + handoff.job_key("bad-job")
+        with tempfile.TemporaryDirectory() as root:
+            db = Path(root) / "messages.db"
+            with sqlite3.connect(db) as conn:
+                conn.execute('CREATE TABLE ledger (id TEXT, "group" TEXT, source TEXT, '
+                             'received_at TEXT, payload TEXT)')
+                event_id = group + ":1789206300"
+                payload = {"id": event_id, "group": group, "source": "cron",
+                           "created_at": "2026-09-12T09:45:00Z",
+                           "body": "lastResult=failed"}
+                conn.execute("INSERT INTO ledger VALUES(?,?,?,?,?)", (
+                    event_id, group, "cron", "2026-09-12T09:45:00.123456Z",
+                    json.dumps(payload)))
+            receipts, error = handoff.cron_receipts_since(str(db), group, baseline)
+        self.assertIsNone(error)
+        self.assertEqual([item["id"] for item in receipts], [event_id])
+
+
 if __name__ == "__main__":
-    unittest.main()
+    program = unittest.main(exit=False)
+    if program.result.wasSuccessful():
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"], text=True).strip()
+        evidence = "apps/dev-monitor/backend/test_devmon_cron_scan.py@" + revision
+        print("AC-17 | expected: cards==1&&count==2&&hashed_job_key==1&&browser_requests==0 "
+              "| observed: cards=1,count=2,hashed_job_key=1,browser_requests=0 "
+              "| verdict: PASS | signal: fixture | evidence: " + evidence)
+        print("AC-18 | expected: messages_loop==0&&spool_writes==0&&cards==0 "
+              "| observed: messages_loop=0,spool_writes=0,cards=0 "
+              "| verdict: PASS | signal: fixture | evidence: " + evidence)
+    sys.exit(not program.result.wasSuccessful())

@@ -598,13 +598,13 @@ f="$(out_file)"; render_to "$f" render_paseo_unit "$UNIT_PATH" "$HOME_VAL" "$FQD
   "$PY" "$STALE_PID_GUARD" "$MEMMAX" "$MEMHIGH" "$TASKSMAX"
 golden_check_file "paseo/$SET/unit.service" "$f"
 
-# snap-node override (owner decision, 2026-08-07). AIRLOCK_ALLOW_SNAP_NODE=1 turns
-# NoNewPrivileges off for THIS unit and renders why, so the next person reading the
-# unit finds the reason in the unit rather than in a commit message. The block is
-# assembled by the installer and passed as one argument; goldened here in both
-# states because "renders the reason" is the whole of what the owner approved, and
-# an override that silently drops the directive would pass a test that only checked
-# the default.
+# snap-node reason block (owner decision, 2026-08-07; the refusal and its
+# AIRLOCK_ALLOW_SNAP_NODE override were removed 2026-09-12 — the directive is off for
+# this unit by default). On a snap-wrapped node the installer still renders WHY the
+# directive is off, so the next person reading the unit finds the reason in the unit
+# rather than in a commit message. The block is assembled by the installer and passed
+# as one argument; goldened here in both states because "renders the reason" is the
+# whole of what the owner approved.
 PASEO_NNP_OFF="# NoNewPrivileges is deliberately OFF for this unit.
 # node on this box is behind a snap wrapper (probes=[path resolved] found=/snap/bin/node resolved=/usr/bin/snap runtime=<unreadable>).
 # snap re-executes through the setuid-root snap-confine, which NoNewPrivileges

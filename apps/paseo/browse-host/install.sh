@@ -133,7 +133,10 @@ else
     # Fallback: derive the web-ui from the paseo the RUNNING daemon uses. A box can
     # carry two paseo installs (e.g. nvm + ~/.npm-global); the daemon unit runs one
     # of them, so `command -v paseo` may pick the WRONG copy and we'd patch a web-ui
-    # the daemon never serves. Prefer the daemon's own argv.
+    # the daemon never serves. Prefer the daemon's own argv. Then ask node, from
+    # that binary, where @getpaseo/server resolves: the guarded bundle installs
+    # it beside the cli (prefix level), a registry install nests it under the
+    # cli, and node's own lookup is the only answer that is right for both.
     PBIN=""
     DPID="$(systemctl --user show -p MainPID --value airlock-paseo.service 2>/dev/null || true)"
     if [ -n "$DPID" ] && [ "$DPID" != "0" ] && [ -r "/proc/$DPID/cmdline" ]; then
@@ -141,7 +144,7 @@ else
     fi
     [ -n "$PBIN" ] || PBIN="$(command -v paseo || true)"
     if [ -n "$PBIN" ]; then
-      WEBUI_DIR="$(PBIN="$PBIN" node -e 'const p=require("path"),fs=require("fs");const b=fs.realpathSync(process.env.PBIN);const m="/@getpaseo/cli/";const i=b.indexOf(m);if(i<0)process.exit(1);console.log(p.join(b.slice(0,i+m.length-1),"node_modules/@getpaseo/server/dist/server/web-ui"))' 2>/dev/null || echo "")"
+      WEBUI_DIR="$(PBIN="$PBIN" node -e 'const p=require("path"),fs=require("fs"),{createRequire}=require("module");const b=fs.realpathSync(process.env.PBIN);const r=createRequire(b).resolve("@getpaseo/server");const m="/@getpaseo/server/";const i=r.indexOf(m);if(i<0)process.exit(1);console.log(p.join(r.slice(0,i+m.length-1),"dist/server/web-ui"))' 2>/dev/null || echo "")"
     fi
   fi
   if [ -n "$WEBUI_DIR" ] && [ -d "$WEBUI_DIR" ]; then

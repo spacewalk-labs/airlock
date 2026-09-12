@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""Project signed managed policy into one validated, ephemeral Airlock config.
+
+The operator config is read-only. The output target must already be a private
+regular file; it is replaced only after release, selection, policy, and the
+ordinary airlock-config validation all succeed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    sys.stderr.write("airlock-managed-projector: Python >= 3.11 required\n")
+    raise SystemExit(2)
+
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_CLI = ROOT / "bin/airlock-config"
+RELEASE_CLI = ROOT / "bin/airlock-managed-release"
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
+APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+MAX_INPUT = 16 * 1024 * 1024
+
+
+class ProjectionError(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise ProjectionError(message)
+
+
+def canonical(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def digest(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def read_regular(path: Path, label: str) -> bytes:
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                fail(f"{label} must be a regular non-symlink file: {path}")
+            if info.st_size > MAX_INPUT:
+                fail(f"{label} exceeds {MAX_INPUT} bytes: {path}")
+            chunks = []
+            remaining = info.st_size + 1
+            while remaining:
+                chunk = os.read(fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) != info.st_size:
+                fail(f"{label} changed while it was read: {path}")
+            return raw
+        finally:
+            os.close(fd)
+    except ProjectionError:
+        raise
+    except OSError as exc:
+        fail(f"cannot read {label} {path}: {exc}")
+
+
+def no_duplicate_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            fail(f"JSON object has duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def load_canonical_json(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
+    raw = read_regular(path, label)
+    try:
+        value = json.loads(raw, object_pairs_hook=no_duplicate_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{label} is invalid JSON: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{label} must be a JSON object")
+    if raw != canonical(value):
+        fail(f"{label} must use canonical JSON bytes")
+    return value, raw
+
+
+def exact(value: Any, keys: set[str], where: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail(f"{where} must be an object")
+    unknown = sorted(set(value) - keys)
+    missing = sorted(keys - set(value))
+    if unknown or missing:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unknown:
+            details.append("unknown " + ", ".join(unknown))
+        fail(f"{where} has invalid fields ({'; '.join(details)})")
+    return value
+
+
+def validate_selection(value: Any) -> dict[str, Any]:
+    obj = exact(value, {"organization_id", "schema", "selections", "sequence", "snapshot_digest"}, "selection")
+    if obj["schema"] != "airlock.managed.selection/v1":
+        fail("selection.schema is unsupported")
+    if not isinstance(obj["organization_id"], str) or ID_RE.fullmatch(obj["organization_id"]) is None:
+        fail("selection.organization_id is invalid")
+    if not isinstance(obj["snapshot_digest"], str) or DIGEST_RE.fullmatch(obj["snapshot_digest"]) is None:
+        fail("selection.snapshot_digest is invalid")
+    if isinstance(obj["sequence"], bool) or not isinstance(obj["sequence"], int) or obj["sequence"] < 1:
+        fail("selection.sequence must be an integer >= 1")
+    if not isinstance(obj["selections"], list):
+        fail("selection.selections must be an array")
+    ids = []
+    for index, raw in enumerate(obj["selections"]):
+        row = exact(raw, {"id", "source"}, f"selection.selections[{index}]")
+        if not isinstance(row["id"], str) or APP_ID_RE.fullmatch(row["id"]) is None:
+            fail(f"selection.selections[{index}].id is invalid")
+        if row["source"] not in {"local", "managed", "public"}:
+            fail(f"selection.selections[{index}].source is invalid")
+        ids.append(row["id"])
+    if ids != sorted(set(ids)):
+        fail("selection.selections must be sorted and unique by id")
+    return obj
+
+
+def toml_string(value: str) -> str:
+    escaped = []
+    simple = {"\\": "\\\\", '"': '\\"', "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+    for char in value:
+        if char in simple:
+            escaped.append(simple[char])
+        elif char < " " or char == "\x7f":
+            escaped.append(f"\\u{ord(char):04X}")
+        else:
+            escaped.append(char)
+    return '"' + "".join(escaped) + '"'
+
+
+def toml_value(value: Any, where: str) -> str:
+    if isinstance(value, str):
+        return toml_string(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        if any(isinstance(item, (dict, list)) or item is None for item in value):
+            fail(f"{where} contains a TOML value the projector cannot preserve")
+        return "[" + ", ".join(toml_value(item, where) for item in value) + "]"
+    fail(f"{where} has unsupported TOML value {value!r}")
+
+
+def render_toml(config: dict[str, Any]) -> bytes:
+    lines: list[str] = []
+
+    def render_table(parts: tuple[str, ...], table: dict[str, Any]) -> None:
+        if parts:
+            lines.append("[" + ".".join(toml_string(part) for part in parts) + "]")
+        for key, value in table.items():
+            if not isinstance(value, dict):
+                lines.append(f"{toml_string(key)} = {toml_value(value, '.'.join((*parts, key)))}")
+        lines.append("")
+        for key, value in table.items():
+            if isinstance(value, dict):
+                render_table((*parts, key), value)
+
+    for key, value in config.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            fail("operator config must contain only named top-level tables")
+        render_table((key,), value)
+    raw = ("\n".join(lines).rstrip() + "\n").encode()
+    try:
+        reparsed = tomllib.loads(raw.decode())
+    except (UnicodeError, ValueError) as exc:
+        fail(f"internal TOML rendering failed: {exc}")
+    if reparsed != config:
+        fail("internal TOML rendering changed the operator config values")
+    return raw
+
+
+def run_checked(argv: list[str], label: str, env: dict[str, str] | None = None) -> bytes:
+    result = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        reason = result.stderr.decode(errors="replace").strip()
+        fail(f"{label} failed: {reason or f'exit {result.returncode}'}")
+    return result.stdout
+
+
+def config_environment(path: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env["AIRLOCK_CONFIG"] = str(path)
+    env.pop("AIRLOCK_CONFIG_SNAPSHOT", None)
+    env.pop("AIRLOCK_CONFIG_SNAPSHOT_SHA256", None)
+    return env
+
+
+def validate_config(path: Path, label: str) -> None:
+    run_checked([sys.executable, str(CONFIG_CLI), "validate"], label, config_environment(path))
+
+
+def normalize_local_package_paths(config: dict[str, Any], config_dir: Path) -> None:
+    packages = config.get("packages") or {}
+    if not isinstance(packages, dict):
+        fail("operator config [packages] must be a table")
+    for package_id, raw in packages.items():
+        if not isinstance(raw, dict) or not isinstance(raw.get("path"), str):
+            fail(f"operator config packages.{package_id}.path is invalid")
+        path = Path(raw["path"]).expanduser()
+        if not path.is_absolute():
+            path = config_dir / path
+        raw["path"] = str(path.resolve())
+
+
+def verified_release(stage: Path, authority: Path, at: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if not stage.is_dir() or stage.is_symlink():
+        fail("release must be a real signed-stage directory")
+    if not authority.is_dir() or authority.is_symlink():
+        fail("authority must be a real directory")
+    raw_result = run_checked([
+        sys.executable, str(RELEASE_CLI), "verify", "--stage", str(stage),
+        "--signed", "--authority", str(authority), "--at", at,
+    ], "signed release verification")
+    try:
+        result = json.loads(raw_result)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"signed release verifier returned invalid JSON: {exc}")
+    if not isinstance(result, dict):
+        fail("signed release verifier returned a non-object result")
+    catalog, catalog_raw = load_canonical_json(stage / "catalog.json", "catalog.json")
+    lock, lock_raw = load_canonical_json(stage / "release.lock", "release.lock")
+    snapshot, snapshot_raw = load_canonical_json(stage / "snapshot.json", "snapshot.json")
+    if result.get("snapshot_digest") != digest(snapshot_raw):
+        fail("signed release changed after verification")
+    if snapshot.get("artifacts", {}).get("catalog.json") != digest(catalog_raw):
+        fail("catalog.json changed after verification")
+    if snapshot.get("artifacts", {}).get("release.lock") != digest(lock_raw):
+        fail("release.lock changed after verification")
+    return result, catalog, lock, snapshot
+
+
+def target_info(path: Path) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"output must be a pre-created private regular file: {path} ({exc})")
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        fail(f"output must be a pre-created regular non-symlink file: {path}")
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        fail("output must be owned by this uid with no group/other permissions")
+    parent = path.parent
+    if not parent.is_dir() or parent.is_symlink():
+        fail("output parent must be a real directory")
+    return info
+
+
+def atomic_write(path: Path, raw: bytes) -> None:
+    temporary: str | None = None
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=".managed-projection-", delete=False) as handle:
+            temporary = handle.name
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        os.fsync(directory_fd)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        os.close(directory_fd)
+
+
+def project(config_path: Path, stage: Path, authority: Path, selection_path: Path, at: str) -> dict[str, Any]:
+    config_path = config_path.expanduser().resolve()
+    validate_config(config_path, "operator config validation")
+    config_raw = read_regular(config_path, "operator config")
+    try:
+        operator_config = tomllib.loads(config_raw.decode())
+    except (UnicodeError, ValueError) as exc:
+        fail(f"operator config is invalid TOML: {exc}")
+    candidate = copy.deepcopy(operator_config)
+    normalize_local_package_paths(candidate, config_path.parent)
+
+    verify_result, catalog, lock, snapshot = verified_release(stage, authority, at)
+    selection, selection_raw = load_canonical_json(selection_path, "owner selection")
+    selection = validate_selection(selection)
+    if selection["organization_id"] != snapshot["organization_id"]:
+        fail("owner selection belongs to another organisation")
+    if selection["snapshot_digest"] != verify_result["snapshot_digest"]:
+        fail("owner selection does not name this signed snapshot")
+
+    apps = candidate.setdefault("apps", {})
+    packages = candidate.setdefault("packages", {})
+    if not isinstance(apps, dict) or not isinstance(packages, dict):
+        fail("operator config apps/packages must be tables")
+    catalog_apps = catalog.get("apps")
+    lock_packages = lock.get("packages")
+    if not isinstance(catalog_apps, list) or not isinstance(lock_packages, list):
+        fail("verified release has invalid catalog/lock arrays")
+    catalog_by_id = {row["id"]: row for row in catalog_apps}
+    locked_by_id = {row["id"]: row for row in lock_packages}
+    if len(catalog_by_id) != len(catalog_apps) or len(locked_by_id) != len(lock_packages):
+        fail("verified release repeats an app id")
+    choices = {row["id"]: row["source"] for row in selection["selections"]}
+    unknown = sorted(set(choices) - set(catalog_by_id))
+    if unknown:
+        fail("owner selection names app ids absent from the catalog: " + ", ".join(unknown))
+
+    projected_apps = []
+    for app_id, catalog_row in catalog_by_id.items():
+        policy = catalog_row["policy"]
+        configured = app_id in apps
+        existing_source = "local" if app_id in packages else ("public" if configured else None)
+        chosen = choices.get(app_id)
+        if policy == "blocked":
+            if configured or chosen is not None:
+                fail(f"blocked app {app_id!r} is configured or selected")
+            source = "none"
+        elif policy == "required":
+            if chosen is not None and chosen != "managed":
+                fail(f"required app {app_id!r} must select the managed source")
+            if configured and chosen is None:
+                fail(f"app id collision for required app {app_id!r}; select managed explicitly")
+            source = "managed"
+        else:
+            if configured and chosen is None:
+                fail(f"app id collision for available app {app_id!r}; select local, public, or managed explicitly")
+            source = chosen or "none"
+
+        package_digest = None
+        package_path = None
+        if source == "managed":
+            locked = locked_by_id.get(app_id)
+            if locked is None:
+                fail(f"selected managed app {app_id!r} is absent from release.lock")
+            package_path = locked["path"]
+            package_dir = stage / package_path
+            if not package_dir.is_dir() or package_dir.is_symlink():
+                fail(f"managed package path is not a real directory: {package_path}")
+            apps.setdefault(app_id, {})
+            packages[app_id] = {"path": str(package_dir.resolve())}
+            package_digest = locked["digest"]
+        elif source == "local":
+            if existing_source != "local":
+                fail(f"selected local source for {app_id!r} is not configured locally")
+        elif source == "public":
+            if not configured:
+                apps[app_id] = {}
+            packages.pop(app_id, None)
+        elif source != "none":
+            fail(f"internal unsupported source for {app_id!r}")
+        projected_apps.append({
+            "id": app_id,
+            "package_digest": package_digest,
+            "package_path": package_path,
+            "policy": policy,
+            "source_class": source,
+        })
+
+    config_toml = render_toml(candidate)
+    with tempfile.NamedTemporaryFile(mode="wb", prefix="airlock-managed-config-", suffix=".toml", delete=False) as handle:
+        candidate_path = Path(handle.name)
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(config_toml)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        validate_config(candidate_path, "projected config validation")
+    finally:
+        try:
+            candidate_path.unlink()
+        except OSError:
+            pass
+
+    verify_after, catalog_after, lock_after, snapshot_after = verified_release(stage, authority, at)
+    if (verify_after != verify_result or catalog_after != catalog
+            or lock_after != lock or snapshot_after != snapshot):
+        fail("signed release or current authority changed during projection")
+
+    return {
+        "apps": projected_apps,
+        "channel_id": snapshot["channel_id"],
+        "config_digest": digest(config_toml),
+        "config_toml": config_toml.decode(),
+        "epoch": snapshot["epoch"],
+        "inputs": {
+            "catalog_digest": snapshot["artifacts"]["catalog.json"],
+            "local_config_digest": digest(config_raw),
+            "lock_digest": snapshot["artifacts"]["release.lock"],
+            "selection_digest": digest(selection_raw),
+        },
+        "organization_id": snapshot["organization_id"],
+        "schema": "airlock.managed.desired-projection/v1",
+        "selection_sequence": selection["sequence"],
+        "sequence": snapshot["sequence"],
+        "snapshot_digest": verify_result["snapshot_digest"],
+        "target_profile": snapshot["target_profile"],
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    root.add_argument("--config", required=True)
+    root.add_argument("--release", required=True)
+    root.add_argument("--authority", required=True)
+    root.add_argument("--selection", required=True)
+    root.add_argument("--at", required=True)
+    root.add_argument("--out", required=True)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    output = Path(args.out).expanduser().absolute()
+    try:
+        target_info(output)
+        projection = project(
+            Path(args.config), Path(args.release).resolve(), Path(args.authority).resolve(),
+            Path(args.selection).expanduser().resolve(), args.at,
+        )
+        raw = canonical(projection)
+        atomic_write(output, raw)
+        print(json.dumps({"output": str(output), "projection_digest": digest(raw)}, sort_keys=True, separators=(",", ":")))
+        return 0
+    except ProjectionError as exc:
+        sys.stderr.write(f"airlock-managed-projector: {exc}\n")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

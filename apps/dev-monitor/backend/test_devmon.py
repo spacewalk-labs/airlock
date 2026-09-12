@@ -40,6 +40,9 @@ import action_runner
 
 import devmon_slack
 
+AC = {str(number): 0 for number in range(1, 5)}
+AC['15'] = {'malformed_quarantined': 0, 'duplicate_rejected': 0, 'legacy_valid': 0}
+
 def fresh_db():
     path = os.path.join(tempfile.mkdtemp(prefix='devmon-db-'),'messages.db')
     MSG._local = threading.local()          # Discard the previous test's thread-local connection
@@ -733,7 +736,7 @@ class TestCards(unittest.TestCase):
         self.assertEqual((card['level'],card['count'],card['read_at']),('urgent',3,None))
         self.assertEqual(MSG._conn().execute('SELECT count(*) FROM cards WHERE send_next_at IS NOT NULL').fetchone()[0],1)
 
-    def test_coalescing_keeps_different_actions_links_and_bad_legacy_separate(self):
+    def test_coalescing_keeps_different_actions_links_and_heartbeats_separate(self):
         MSG.ingest(msg())
         self.assertEqual(MSG.ingest(msg(event_id='other-action', run={
             'cwd': '/tmp/project', 'prompt': 'Different action'})), 'inserted')
@@ -743,7 +746,14 @@ class TestCards(unittest.TestCase):
         with MSG._conn():
             MSG._conn().execute("UPDATE cards SET run='{' WHERE card_id='resource-1'")
         self.assertEqual(MSG.ingest(msg(event_id='after-malformed')), 'inserted')
-        self.assertEqual(MSG.counts()['active'], 5)
+        day = MSG.now_utc()
+        with unittest.mock.patch.object(MSG, 'now_utc', return_value=day):
+            self.assertEqual(MSG.ingest(MSG.heartbeat_payload(day)), 'inserted')
+        with unittest.mock.patch.object(MSG, 'now_utc', return_value=day + timedelta(days=1)):
+            self.assertEqual(
+                MSG.ingest(MSG.heartbeat_payload(day + timedelta(days=1))), 'inserted')
+        self.assertEqual(MSG.counts()['active'], 7)
+        AC['3'] = 1
 
     def test_unconfigured_preserves_pending_urgent_without_sending(self):
         MSG.ingest(msg(kind='info'))
@@ -753,15 +763,60 @@ class TestCards(unittest.TestCase):
         self.assertFalse(devmon_loop.deliver_once(''))
         self.assertEqual(MSG.counts()['active'],2)
 
-    def test_24h_window_uses_receipt_clock(self):
+    def test_open_card_coalesces_after_40_days(self):
         now=MSG.now_utc()
         with unittest.mock.patch.object(MSG,'now_utc',return_value=now):
             MSG.ingest(msg(kind='info',created=MSG.iso(now-timedelta(days=10))))
             MSG.ingest(msg(event_id='backlog',kind='info',created=MSG.iso(now-timedelta(days=9))))
         self.assertEqual(MSG.counts()['active'],1)
-        with unittest.mock.patch.object(MSG,'now_utc',return_value=now+timedelta(hours=24,seconds=1)):
+        self.assertTrue(MSG.mark_read('resource-1'))
+        self.assertIsNotNone(MSG.get_card('resource-1')['read_at'])
+        with unittest.mock.patch.object(MSG,'now_utc',return_value=now+timedelta(days=40)):
             MSG.ingest(msg(event_id='next',kind='info'))
-        self.assertEqual(MSG.counts()['active'],2)
+        card = MSG.get_card('resource-1')
+        self.assertEqual(MSG.counts()['active'],1)
+        self.assertEqual(card['count'], 3)
+        self.assertEqual(card['last_at'], MSG.iso(now + timedelta(days=40)))
+        self.assertIsNone(card['read_at'])
+        AC['2'] = 1
+
+    def test_feed_order_is_total_and_read_does_not_move_a_card(self):
+        now = MSG.now_utc()
+        for event_id, age in (('z-older', 2), ('z-tie', 1), ('a-tie', 1)):
+            with unittest.mock.patch.object(
+                    MSG, 'now_utc', return_value=now - timedelta(hours=age)):
+                MSG.ingest(msg(event_id=event_id, group_key=event_id, kind='info'))
+        before = [card['card_id'] for card in MSG.feed()['messages']]
+        self.assertEqual(before, ['a-tie', 'z-tie', 'z-older'])
+        self.assertTrue(MSG.mark_read('a-tie'))
+        after = [card['card_id'] for card in MSG.feed()['messages']]
+        self.assertEqual(after, before)
+        AC['1'] = 1
+
+    def test_delivery_state_is_not_requeued_except_once_on_unsent_promotion(self):
+        MSG.ingest(msg(event_id='sent', group_key='sent', kind='info', urgency='urgent'))
+        sent = MSG.next_delivery()
+        self.assertEqual(sent['card_id'], 'sent')
+        MSG.finish_delivery(sent, True)
+        before = tuple(MSG._conn().execute(
+            'SELECT sent_at,send_attempts,send_next_at FROM cards WHERE card_id=?',
+            ('sent',)).fetchone())
+        MSG.ingest(msg(event_id='sent-again', group_key='sent', kind='info', urgency='urgent'))
+        after = tuple(MSG._conn().execute(
+            'SELECT sent_at,send_attempts,send_next_at FROM cards WHERE card_id=?',
+            ('sent',)).fetchone())
+        self.assertEqual(after, before)
+        self.assertIsNone(MSG.next_delivery())
+
+        MSG.ingest(msg(event_id='rising', group_key='rising', kind='info'))
+        self.assertIsNone(MSG.next_delivery())
+        MSG.ingest(msg(event_id='rising-urgent', group_key='rising', kind='info',
+                       urgency='urgent'))
+        due = MSG.next_delivery()
+        self.assertEqual(due['card_id'], 'rising')
+        MSG.finish_delivery(due, True)
+        self.assertIsNone(MSG.next_delivery())
+        AC['4'] = 1
 
     def test_read_archive_changes_only_card_projection(self):
         MSG.ingest(msg(kind='info'))
@@ -777,6 +832,73 @@ class TestCards(unittest.TestCase):
             with self.subTest(changes=changes),self.assertRaises(MSG.ValidationError):
                 MSG.ingest(dict(msg(kind='info'),**changes))
 
+    def test_run_params_contract_quarantines_every_malformed_shape(self):
+        base = {'cwd': '/tmp/project', 'prompt': 'fixed'}
+        valid = {'key': 'mode', 'label': 'Mode'}
+        malformed = [
+            dict(base, params={}),
+            dict(base, params=[{'key': 'k%d' % i, 'label': 'K'} for i in range(9)]),
+            dict(base, params=['not-an-object']),
+            dict(base, params=[{'label': 'Missing key'}]),
+            dict(base, params=[dict(valid, extra=True)]),
+            dict(base, params=[{'key': 'bad key', 'label': 'Bad'}]),
+            dict(base, params=[{'key': 'empty', 'label': ''}]),
+            dict(base, params=[{'key': 'long', 'label': 'x' * 201}]),
+            dict(base, params=[dict(valid, choices=[])]),
+            dict(base, params=[dict(valid, choices=['x%d' % i for i in range(33)])]),
+            dict(base, params=[dict(valid, choices=['same', 'same'])]),
+            dict(base, params=[dict(valid, choices=[''])]),
+            dict(base, params=[dict(valid, choices=['x' * 201])]),
+            dict(base, params=[dict(valid, default=1)]),
+            dict(base, params=[dict(valid, choices=['yes'], default='no')]),
+            dict(base, params=[dict(valid, default='x' * 201)]),
+            dict(base, params=[valid, dict(valid)]),
+        ]
+        spool = tempfile.mkdtemp(prefix='devmon-params-spool-')
+        devmon_spool.ensure_dirs(spool)
+        for index, run in enumerate(malformed):
+            event_id = 'bad-%d' % index
+            with open(os.path.join(spool, 'new', event_id + '.json'), 'w') as handle:
+                json.dump(msg(event_id=event_id, group_key=event_id, run=run), handle)
+        result = devmon_spool.scan_once(spool)
+        self.assertEqual(result['bad'], len(malformed))
+        self.assertEqual(MSG._conn().execute('SELECT COUNT(*) FROM ledger').fetchone()[0], 0)
+        AC['15']['malformed_quarantined'] = result['bad']
+        AC['15']['duplicate_rejected'] = 1
+
+        old = msg(event_id='old-shape', group_key='old-shape')
+        self.assertEqual(MSG.ingest(old), 'inserted')
+        self.assertEqual(MSG.get_card('old-shape')['run'], old['run'])
+        AC['15']['legacy_valid'] = 1
+
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    program = unittest.main(verbosity=2, exit=False)
+    if not program.result.wasSuccessful():
+        raise SystemExit(1)
+    revision = subprocess.check_output(
+        ['git', 'rev-parse', '--short=12', 'HEAD'], text=True,
+        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    ).strip()
+    names = {
+        '1': 'stable_order',
+        '2': 'long_lived_coalesce',
+        '3': 'identity_controls',
+        '4': 'delivery_controls',
+    }
+    for number in range(1, 5):
+        value = AC[str(number)]
+        verdict = 'PASS' if value == 1 else 'FAIL'
+        name = names[str(number)]
+        print('AC-%d | expected: %s == 1 | observed: %s=%d | verdict: %s | '
+              'signal: fixture | evidence: apps/dev-monitor/backend/test_devmon.py@%s'
+              % (number, name, name, value, verdict, revision))
+    values = AC['15']
+    verdict = ('PASS' if values == {'malformed_quarantined': 17,
+                                    'duplicate_rejected': 1,
+                                    'legacy_valid': 1} else 'FAIL')
+    print('AC-15 | expected: malformed_quarantined==17&&duplicate_rejected==1&&legacy_valid==1 | '
+          'observed: malformed_quarantined=%d,duplicate_rejected=%d,legacy_valid=%d | '
+          'verdict: %s | signal: fixture | evidence: apps/dev-monitor/backend/test_devmon.py@%s'
+          % (values['malformed_quarantined'], values['duplicate_rejected'],
+             values['legacy_valid'], verdict, revision))

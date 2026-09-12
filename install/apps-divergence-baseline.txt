@@ -59,6 +59,9 @@ only-work	apps/paseo/browse-host/bin/patch-web-ui.test.js
 #    content splits until the next public mirror synchronization.
 only-work	apps/dev-monitor/install-spool-hardening.sh
 only-work	apps/dev-monitor/migration-lifecycle.sh
+#    2026-09-12 PR #450: the deferred-activation record tool lands beside the
+#    migration lifecycle it serves (batch 1 kind — work-ahead dev-monitor installer file).
+only-work	apps/dev-monitor/activation-record.py
 only-work	apps/dev-monitor/test-migrate-legacy-state.py
 only-apps	apps/code-server/bin/migrate-legacy-state
 only-apps	apps/code-server/tests/lifecycle.sh
@@ -216,6 +219,11 @@ only-work	apps/dev-monitor/backend/devmon_home_order.py
 # this new module; existing backend/install/render edits remain content drift and do
 # not widen the set of work-only paths.
 only-work	apps/dev-monitor/backend/devmon_apps.py
+# 16) 2026-09-12 inbox Hub Phase 3: the caller contract and its live verifier are public
+# dev-monitor package files. This source PR does not publish the separate app mirror;
+# keep the temporary work-ahead split to these two new paths until that release sync.
+only-work	apps/dev-monitor/test-hub-msgstrip-contract.mjs
+only-work	apps/dev-monitor/verify-inbox-hub-live.py
 # 8) 2026-08-22 secret drop double header: the embedded panel drew a second title bar
 #    inside the widget's own, because the guard keyed on `close` (which panel.html hands
 #    over precisely when embedded) instead of on who owns the window. The fix edits
@@ -453,7 +461,58 @@ only-work	apps/dev-monitor/backend/devmon_migrate.py
 only-work	apps/dev-monitor/test-loop-contract.py
 only-work	apps/dev-monitor/test-endstate-rehearsal.py
 
+# 2026-09-12 dev-monitor Phase 4a: Cron-tab cards are a work-ahead production
+# path. The scan and its fixture exercise the public app's existing Cron data
+# differently, while the before/after verifier is an operator-only live gate;
+# all three await the next airlock-apps projection sync.
+content	apps/dev-monitor/backend/devmon_cron_scan.py
+content	apps/dev-monitor/backend/test_devmon_cron_scan.py
+only-work	apps/dev-monitor/verify-cron-handoff-live.py
+
 # 2026-09-11 company catalog: public dev-monitor module and its offline contract tests
 # are work-ahead until the next airlock-apps projection sync.
+
 only-work	apps/dev-monitor/backend/devmon_company_catalog.py
 only-work	apps/dev-monitor/backend/test_devmon_company_catalog.py
+
+# 2026-09-11 guarded Paseo 0.2.5: Airlock now carries the reviewed six-package
+# set as its reproducible default install input. The public platform bundle and the
+# three live dev boxes consume this work tree directly; airlock-apps remains a
+# separately pinned projection and receives the same immutable directory at its next
+# app release rather than a partial sync onto its older Paseo installer.
+only-work	apps/paseo/vendor/guarded-0.2.5/INSTALLED_SHA256SUMS
+only-work	apps/paseo/vendor/guarded-0.2.5/LICENSE
+only-work	apps/paseo/vendor/guarded-0.2.5/README.md
+only-work	apps/paseo/vendor/guarded-0.2.5/SHA256SUMS
+only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-cli-0.2.5.tgz
+only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-client-0.2.5.tgz
+only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-highlight-0.2.5.tgz
+only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-protocol-0.2.5.tgz
+only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-relay-0.2.5.tgz
+only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-server-0.2.5.tgz
+
+# 2026-09-12 적재 스킬 문체 규칙: 요약 프롬프트를 원칙 중심으로 다시 쓰면서 문체 규칙을
+# 신설했고(개요만 불릿, 그 밖의 절은 문단), 자막 경고를 본문에서 빼 프론트매터로 옮겼다.
+# work 가 앞서 있고 공개 미러는 다음 앱 릴리스에서 같은 파일을 통째로 받는다 — 이 레포가
+# 저작 원본이다.
+content	apps/learning/skill/SKILL.md
+
+# 2026-09-12 Learning 자막 요청 축소: transcript.py 는 메타 목록에서 트랙 하나만 골라
+# 요청하고 닫힌 실패 sentinel을 낸다. 공개 앱에 속하는 기존 파일이며, 공개 미러가 다음
+# 동기화에서 같은 변경을 받을 때까지 work 쪽이 앞선 content drift로 기록한다.
+content	apps/learning/skill/transcript.py
+
+# 2026-09-12 Learning 읽기 셸 계약: 비공개 저작 원본의 프런트 계약 시험이 `/read/`
+# 셸·Markdown 복사·설정 저장·공유 단계를 새로 고정했다. 이 시험도 앱과 함께 공개
+# 미러가 다음 릴리스에서 받는 임시 content drift다.
+content	apps/learning/test-frontend-contract.mjs
+
+# 2026-09-12 Learning 타임스탬프 링크: 결정적 HTML 변환기는 서버 옆에 설치되는 새 공개 앱
+# 백엔드 모듈이다. 공개 미러가 다음 명시적 앱 릴리스에서 받을 때까지 work 쪽에만 있는 경로로
+# 좁게 기록한다. 기존 Learning 파일은 위의 content drift 범위 안에 남는다.
+only-work	apps/learning/backend/timestamp_links.py
+
+# 2026-09-12 Learning 적재 흐름 v3: 저장 헬퍼가 새 문서의 파일명 형식
+# (`<날짜>--<슬러그>--<video_id>.md`)을 검사한다. 공개 앱에 속하는 기존 파일이며, 공개
+# 미러가 다음 앱 릴리스에서 같은 변경을 받을 때까지 work 쪽이 앞선 content drift로 기록한다.
+content	apps/learning/backend/save_document.py

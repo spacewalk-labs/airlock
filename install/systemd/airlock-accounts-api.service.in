@@ -17,6 +17,11 @@ Environment=AIRLOCK_ACCOUNTS_BIN=@ACCOUNTS_BIN@
 # Read-only pointers at the shared usage store. Empty is a normal box: the account list
 # then reports "no store" rather than "collecting", because promising a collector that
 # does not exist is what left seven rows collecting indefinitely on a real box.
+# Where the installed account panel assets live (hub webroot). Handed in for the
+# same reason the port is: the installer owns the webroot path, and a default
+# here would be a second source of truth. Empty means the mount answers 503.
+Environment=AIRLOCK_ACCOUNTS_PANEL_DIR=@PANEL_DIR@
+Environment=AIRLOCK_ACCOUNTS_PANEL_STYLE_DIR=@PANEL_STYLE_DIR@
 Environment=AIRLOCK_HUB_FLEET_STORE=@FLEET_STORE@
 Environment=AIRLOCK_HUB_FLEET_STORE_URL=@FLEET_STORE_URL@
 ExecStart=@PYTHON@ "@AIRLOCK_ROOT@/bin/airlock-accounts-api"

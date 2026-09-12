@@ -70,7 +70,11 @@ The current message has eight fields, with no schema version:
   "link": "https://example.test/jobs/backup",
   "run": {
     "cwd": "/path/to/project",
-    "prompt": "Check the current backup state and recover it if needed."
+    "prompt": "Check the current backup state and recover it if needed.",
+    "params": [
+      {"key": "mode", "label": "Mode", "choices": ["diagnose", "recover"], "default": "diagnose"},
+      {"key": "scope", "label": "Scope", "default": ""}
+    ]
   }
 }
 ```
@@ -79,7 +83,11 @@ The current message has eight fields, with no schema version:
 and defaults to empty; `link` and `run` are optional. IDs/groups/sources use 1–128
 ASCII letters, digits, dots, underscores, colons or hyphens. The `dev-monitor:` ID/group
 prefix remains reserved. Links must be absolute
-HTTP(S) URLs. A run contains exactly nonempty `cwd` and `prompt` strings. Files
+HTTP(S) URLs. A run contains nonempty `cwd` and `prompt` strings and may declare up
+to eight `params`. Each parameter has a unique 1–128 character ID-like `key`, a
+nonempty `label`, optional 1–32 unique nonempty string `choices`, and an optional
+string `default` (which must be one of its choices when choices exist). Labels,
+choices, and defaults are limited to 200 characters. Files
 larger than 16 KiB, filename/ID mismatches and invalid payloads are quarantined.
 
 The transitional aliases `event_id`, `group_key` and `urgency` remain accepted;
@@ -89,9 +97,10 @@ collector's receipt time, so a delayed spool backlog still coalesces. New produc
 should use the eight-field format. The emitter's old kind/outcome/why/followup and
 skill/exec CLI options have been removed.
 
-Within 24 hours of the first receipt, an unarchived card with the same group, run
-and link is updated: its count grows, title/body and last receipt time advance,
-and it becomes unread. Different runs or links get separate cards. Urgency can
+For as long as it remains open, a card with the same group, run and link is updated:
+its count grows, title/body and last receipt time advance, and it becomes unread.
+Different runs or links get separate cards. Daily heartbeat IDs never coalesce across
+UTC days. Urgency can
 rise from normal to urgent, which queues the card; another receipt for an already
 urgent card does not queue another notification. Repeating an ID never adds a
 receipt or delivery. Heartbeat IDs stay separate from ordinary same-group cards.
@@ -273,6 +282,35 @@ The old collector recovers retained `processing/` receipts and deduplicates agai
 the restored DB. Keep the backup. The tool's existing relocation, backup, restore
 and resume safeguards remain available in `--help`.
 
+### Coalescing existing open cards
+
+Before changing an installed database, rehearse against a consistent private copy. The
+backup command uses SQLite's online backup API, so it includes committed WAL state; do
+not use plain `cp` on a live database.
+
+```sh
+DEV_MON_COPY_DIR=$(mktemp -d)
+python3 apps/dev-monitor/migrate-legacy-state.py \
+  --backup-source ~/.local/state/airlock/dev-monitor/messages.db \
+  --db-backup "$DEV_MON_COPY_DIR/messages.db"
+python3 apps/dev-monitor/test-migrate-legacy-state.py \
+  --live-copy "$DEV_MON_COPY_DIR/messages.db"
+```
+
+The rehearsal derives the expected open identities from `(group, decoded run, link)`,
+keeps heartbeat cards separate, verifies row and occurrence totals plus SQLite integrity,
+runs the forward command twice, and restores the private copy byte-for-byte.
+
+The live command is an offline maintenance operation: stop every database writer,
+checkpoint and close SQLite, and verify the writers are stopped before running
+`--coalesce-open-cards <state>/messages.db --offline`. It retains
+`messages.db.pre-coalesce-open-cards` and adjacent manifest/target receipts. Duplicate
+rows are archived with `count=0`, never deleted; the selected survivor keeps its delivery
+columns. To roll back before any later write, run
+`--compensate-coalesce-open-cards <state>/messages.db --offline`. Compensation refuses a
+database whose bytes no longer match the recorded forward result. Keep the backup and
+receipts after either path.
+
 ## Credential freshness
 
 `token_freshness = true` enables the Credentials panel and `/api/tokens`; its timer
@@ -288,7 +326,7 @@ are read for timestamp/presence metadata; token values are never logged or publi
 
 The checker writes `token-freshness.json` and emits messages for unhealthy
 providers: expired is urgent; other non-OK verdicts are normal. Those messages
-coalesce by provider over 24 hours. Its OnFailure unit
+coalesce by provider while the card remains open. Its OnFailure unit
 leaves local evidence and emits an urgent message if the checker itself fails.
 A failed optional message configuration never takes observation down; health
 reports what actually started.

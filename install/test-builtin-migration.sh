@@ -3483,6 +3483,9 @@ POSITIVE = [
     ("paseo", f"{UU}/airlock-paseo-browse-host.service", "browse-host unit (browse=true)"),
     ("paseo", f"{HOME}/.npm-global/bin/paseo", "npm bin symlink"),
     ("paseo", f"{HOME}/.npm-global/lib/node_modules/@getpaseo/cli", "npm-global cli tree"),
+    ("paseo", f"{HOME}/.npm-global/lib/node_modules/@getpaseo/server", "npm-global bundle sibling (prefix-level server)"),
+    ("paseo", f"{HOME}/.npm-global/lib/node_modules/@getpaseo/relay", "npm-global bundle sibling"),
+    ("paseo", f"{HOME}/.npm-global/lib/node_modules/@getpaseo/.airlock-install-id", "install-id marker"),
     ("paseo", f"{HOME}/.local/share/paseo-browse-host", "browse-host install dir"),
 
     ("publish", f"{CONFD}/hub-locations.d/publish.conf", "nginx fragment"),
@@ -3495,6 +3498,8 @@ POSITIVE = [
 ]
 
 NEGATIVE = [
+    ("paseo", f"{HOME}/.npm-global/lib/node_modules/@getpaseo/extra",
+     "a package someone else installed into the @getpaseo scope — the scope is a namespace, not ours"),
     ("code-server", f"{HOME}/.config/airlock-code-server/tabs.json", "user tabs — retained"),
     ("code-server", f"{HOME}/.local/share/airlock-code-server", "extensions/slots — user state, retained"),
     ("dev-monitor", f"{HOME}/.local/state/airlock/dev-monitor", "spool/messages.db — retained"),

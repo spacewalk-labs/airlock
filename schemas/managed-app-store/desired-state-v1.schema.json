@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://airlock.local/schemas/managed-app-store/desired-state-v1.schema.json",
+  "title": "Airlock managed desired-state projection contract v1",
+  "description": "Closed owner-selection input and ephemeral config projection output. Release artifacts use release-contract-v1.schema.json.",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "appId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "ownerSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["organization_id", "schema", "selections", "sequence", "snapshot_digest"],
+      "properties": {
+        "schema": {"const": "airlock.managed.selection/v1"},
+        "organization_id": {"$ref": "#/$defs/id"},
+        "snapshot_digest": {"$ref": "#/$defs/digest"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "selections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "source"],
+            "properties": {
+              "id": {"$ref": "#/$defs/appId"},
+              "source": {"enum": ["local", "managed", "public"]}
+            }
+          }
+        }
+      }
+    },
+    "desiredProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apps", "channel_id", "config_digest", "config_toml", "epoch", "inputs", "organization_id", "schema", "selection_sequence", "sequence", "snapshot_digest", "target_profile"],
+      "properties": {
+        "schema": {"const": "airlock.managed.desired-projection/v1"},
+        "organization_id": {"$ref": "#/$defs/id"},
+        "channel_id": {"$ref": "#/$defs/id"},
+        "epoch": {"type": "integer", "minimum": 1},
+        "sequence": {"type": "integer", "minimum": 1},
+        "selection_sequence": {"type": "integer", "minimum": 1},
+        "snapshot_digest": {"$ref": "#/$defs/digest"},
+        "target_profile": {"$ref": "#/$defs/id"},
+        "config_toml": {"type": "string"},
+        "config_digest": {"$ref": "#/$defs/digest"},
+        "inputs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["catalog_digest", "local_config_digest", "lock_digest", "selection_digest"],
+          "properties": {
+            "catalog_digest": {"$ref": "#/$defs/digest"},
+            "local_config_digest": {"$ref": "#/$defs/digest"},
+            "lock_digest": {"$ref": "#/$defs/digest"},
+            "selection_digest": {"$ref": "#/$defs/digest"}
+          }
+        },
+        "apps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "package_digest", "package_path", "policy", "source_class"],
+            "properties": {
+              "id": {"$ref": "#/$defs/appId"},
+              "policy": {"enum": ["available", "blocked", "required"]},
+              "source_class": {"enum": ["local", "managed", "none", "public"]},
+              "package_digest": {
+                "oneOf": [
+                  {"$ref": "#/$defs/digest"},
+                  {"type": "null"}
+                ]
+              },
+              "package_path": {
+                "oneOf": [
+                  {"type": "string", "pattern": "^packages/[a-z0-9][a-z0-9-]{0,31}$"},
+                  {"type": "null"}
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/ownerSelection"},
+    {"$ref": "#/$defs/desiredProjection"}
+  ]
+}

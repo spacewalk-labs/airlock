@@ -66,7 +66,7 @@ if [ -z "$WEBUI_DIR" ]; then
     PBIN="$(tr '\0' '\n' < "/proc/$DPID/cmdline" | grep -m1 '/paseo$' || true)"
   fi
   [ -n "$PBIN" ] || PBIN="$(command -v paseo || true)"
-  [ -n "$PBIN" ] && WEBUI_DIR="$(PBIN="$PBIN" node -e 'const p=require("path"),fs=require("fs");const b=fs.realpathSync(process.env.PBIN);const m="/@getpaseo/cli/";const i=b.indexOf(m);if(i<0)process.exit(1);console.log(p.join(b.slice(0,i+m.length-1),"node_modules/@getpaseo/server/dist/server/web-ui"))' 2>/dev/null || echo "")"
+  [ -n "$PBIN" ] && WEBUI_DIR="$(PBIN="$PBIN" node -e 'const p=require("path"),fs=require("fs"),{createRequire}=require("module");const b=fs.realpathSync(process.env.PBIN);const r=createRequire(b).resolve("@getpaseo/server");const m="/@getpaseo/server/";const i=r.indexOf(m);if(i<0)process.exit(1);console.log(p.join(r.slice(0,i+m.length-1),"dist/server/web-ui"))' 2>/dev/null || echo "")"
 fi
 BUNDLE_JS="$(ls "$WEBUI_DIR/_expo/static/js/web/"index-*.js 2>/dev/null | head -1)"
 if [ -n "$BUNDLE_JS" ] && grep -qF 'dataSet:{paseoBrowserId:' "$BUNDLE_JS" 2>/dev/null; then

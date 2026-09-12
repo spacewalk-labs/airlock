@@ -3196,8 +3196,10 @@ def _validate_transaction(value: Any, path: Path) -> dict[str, Any]:
     fields = {"version", "id", "started_at", "config_sha256", "package_sha256",
               "phase", "planned", "actions", "touched", "deactivated", "checkpoints",
               "ledger_snapshot", "error", "restore_results"}
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict) or not (fields <= set(value) <= fields | {"forward_keep"}):
         fail(f"{path}: invalid transaction shape")
+    if "forward_keep" in value:
+        _validate_forward_keep(value["forward_keep"], value, path)
     if value["version"] != TRANSACTION_VERSION:
         fail(f"{path}: unsupported transaction version {value['version']!r}")
     if not re.fullmatch(r"[0-9a-f]{32}", str(value["id"])):
@@ -3876,6 +3878,104 @@ def _checkpoint_item_matches_live(tx: dict[str, Any], app_id: str,
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
 
+FORWARD_KEEP_APP = "dev-monitor"
+FORWARD_KEEP_FIELDS = {"app", "database", "backup_sha256", "target_sha256",
+                       "decided_at", "candidate"}
+
+
+def _validate_forward_keep(value: Any, tx: dict[str, Any], path: Path) -> None:
+    if (not isinstance(value, dict) or set(value) != FORWARD_KEEP_FIELDS
+            or value["app"] != FORWARD_KEEP_APP
+            or not isinstance(value["database"], str) or not value["database"].startswith("/")
+            or not _is_hex_digest(value["backup_sha256"]) or not _is_hex_digest(value["target_sha256"])
+            or not isinstance(value["decided_at"], str)
+            or value["candidate"] not in ("pending", "active", "inactive")):
+        fail(f"{path}: invalid forward-keep decision")
+    if value["app"] not in tx["touched"]:
+        fail(f"{path}: forward-keep names {value['app']}, which the transaction did not touch")
+
+
+def _forward_keep_evidence_holds(decision: dict[str, Any]) -> str | None:
+    """Re-read the database evidence the decision was made on; None when it still holds.
+
+    The decision lives in the transaction body, so it cannot go missing on its own --
+    but the database can change underneath it. Restore therefore proves the bytes are
+    the ones classified as sound before it keeps anything.
+    """
+    database = Path(decision["database"])
+    marker = Path(str(database) + ".pre-endstate.target.json")
+    for path, what in ((database, "database"), (marker, "canonical target marker")):
+        if path.is_symlink() or not path.is_file():
+            return f"{what} is not a regular file"
+    try:
+        actual = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "canonical target marker is unreadable"
+    if not isinstance(actual, dict) or actual.get("backup_sha256") != decision["backup_sha256"]:
+        return "canonical target marker no longer names the decided backup"
+    if _sha256_file(database) != decision["target_sha256"]:
+        return "database bytes differ from the ones the decision was made on"
+    return None
+
+
+def command_transaction_keep_forward(app_id: str, database: str,
+                                     backup_sha256: str, target_sha256: str) -> int:
+    """Record, in the transaction itself, that dev-monitor's candidate stays on its
+    converted database through the restore.
+
+    Bound three ways so that a caller holding only the transaction id cannot exempt an
+    app from rollback: the app is fixed, the candidate tree must still match the intent
+    the ledger journaled, and the database evidence must hold right now -- the marker
+    names this backup and the database bytes are the ones classified as sound.
+    """
+    if app_id != FORWARD_KEEP_APP:
+        fail(f"only {FORWARD_KEEP_APP} can be kept forward, not {app_id!r}")
+    if not (_is_hex_digest(backup_sha256) and _is_hex_digest(target_sha256)):
+        fail("transaction-keep-forward requires two lowercase sha256 digests")
+    if not database.startswith("/"):
+        fail("transaction-keep-forward requires an absolute database path")
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] in {"committed", "rolled_back"}:
+        fail(f"transaction {tx['id']} is already {tx['phase']}")
+    if app_id not in tx["touched"]:
+        fail(f"transaction {tx['id']} did not touch {app_id}")
+    existing = tx.get("forward_keep")
+    if existing is not None:
+        if (existing["database"], existing["backup_sha256"], existing["target_sha256"]) \
+                != (database, backup_sha256, target_sha256):
+            fail(f"transaction {tx['id']} already holds a different forward-keep decision")
+        return 0
+    store = load_store()
+    intent = (store["entries"].get(app_id) or {}).get("intent")
+    if intent is None:
+        fail(f"{app_id} has no journaled intent to keep")
+    if digest_tree(intent["path"]) != intent["digest"]:
+        fail(f"{app_id} candidate tree no longer matches its journaled intent; refusing to keep it")
+    decision = {"app": app_id, "database": database, "backup_sha256": backup_sha256,
+                "target_sha256": target_sha256, "candidate": "pending",
+                "decided_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+    reason = _forward_keep_evidence_holds(decision)
+    if reason is not None:
+        fail(f"refusing to keep {app_id} forward: {reason}")
+    tx["forward_keep"] = decision
+    write_transaction(tx)
+    log(f"transaction {tx['id']}: keeping {app_id} forward on its converted database")
+    return 0
+
+
+def command_transaction_keep_forward_candidate(state: str) -> int:
+    if state not in ("active", "inactive"):
+        fail("transaction-keep-forward-candidate requires active|inactive")
+    tx = load_transaction()
+    assert tx is not None
+    if tx.get("forward_keep") is None:
+        fail(f"transaction {tx['id']} holds no forward-keep decision")
+    tx["forward_keep"]["candidate"] = state
+    write_transaction(tx)
+    return 0
+
+
 def command_transaction_restore() -> int:
     tx = load_transaction()
     assert tx is not None
@@ -3905,10 +4005,30 @@ def command_transaction_restore() -> int:
         if saved is not None:
             artifacts = _committed_artifacts(saved)
             _preflight_teardown_artifacts(artifacts, saved["capabilities"])
+    kept = tx.get("forward_keep")
+    if kept is not None:
+        reason = _forward_keep_evidence_holds(kept)
+        if reason is not None:
+            # Decided on evidence that no longer holds: restoring the old package over
+            # this database would be a guess, and so would keeping the candidate.
+            tx["phase"] = "degraded"
+            tx["restore_results"][kept["app"]] = {"status": "failed", "error": reason[:1000]}
+            write_transaction(tx)
+            log(f"transaction {tx['id']} degraded before restore: forward-keep evidence changed: {reason}")
+            return 1
     tx["phase"] = "rolling_back"
     write_transaction(tx)
     all_ok = True
     for app_id in reversed(tx["touched"]):
+        if kept is not None and app_id == kept["app"]:
+            # Neither the checkpointed package nor its unit states come back: they
+            # were never shown to be compatible with the converted database. The
+            # candidate stays as the journaled intent for the next run to finish.
+            status = "kept-forward-" + ("inactive" if kept["candidate"] == "inactive" else "active")
+            tx["restore_results"][app_id] = {"status": status, "error": None}
+            write_transaction(tx)
+            log(f"kept {app_id} forward: candidate retained on its converted database ({kept['candidate']})")
+            continue
         result = {"status": "restoring", "error": None}
         tx["restore_results"][app_id] = result
         write_transaction(tx)
@@ -4006,11 +4126,15 @@ def transaction_cli(argv: list[str]) -> int:
         return command_transaction_fail(argv[1], argv[2])
     if command == "transaction-restore" and len(argv) == 1:
         return command_transaction_restore()
+    if command == "transaction-keep-forward" and len(argv) == 5:
+        return command_transaction_keep_forward(argv[1], argv[2], argv[3], argv[4])
+    if command == "transaction-keep-forward-candidate" and len(argv) == 2:
+        return command_transaction_keep_forward_candidate(argv[1])
     if command == "transaction-finish" and len(argv) == 2:
         return command_transaction_finish(argv[1])
     if command == "transaction-show" and len(argv) == 1:
         return command_transaction_show()
-    fail("usage: airlock-ledger transaction-{begin|touch|deactivated|fail|restore|finish|show} ...")
+    fail("usage: airlock-ledger transaction-{begin|touch|deactivated|fail|restore|keep-forward|finish|show} ...")
 
 
 def command_list(store: dict[str, Any]) -> int:

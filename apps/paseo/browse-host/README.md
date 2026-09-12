@@ -42,8 +42,11 @@ whole design — the alternative is a half-patched bundle — so re-deriving is 
 deliberate step, not an obstacle to route around.
 
 ```sh
-npm_config_prefix=/tmp/paseo-probe npm i -g @getpaseo/cli@<new-version>
-W=/tmp/paseo-probe/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server/dist/server/web-ui
+# The guarded bundle (apps/paseo/vendor/guarded-<ver>/) installs its six tarballs
+# as siblings, so @getpaseo/server sits beside the cli at the prefix level. A plain
+# registry install nests it under @getpaseo/cli/node_modules/ instead.
+npm_config_prefix=/tmp/paseo-probe npm i -g apps/paseo/vendor/guarded-<ver>/getpaseo-*.tgz
+W=/tmp/paseo-probe/lib/node_modules/@getpaseo/server/dist/server/web-ui
 grep -o 'index-[0-9a-f]*\.js' "$W/index.html"          # the bundle index.html serves
 sha256sum "$W/_expo/static/js/web/index-*.js"          # the new PINNED_SHA
 ```

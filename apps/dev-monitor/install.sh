@@ -206,20 +206,26 @@ if [ -d "$_devmon_state_parent" ]; then
     || die "cannot make $_devmon_state_parent traversable for the spool writer"
 fi
 
-# A legacy messages DB cannot be opened by the current backend.  Convert it here, inside
-# the existing install lifecycle, after the platform has deactivated an upgraded package
-# and before this script renders or starts the replacement.  Reinstall plans do not run a
-# deactivator, so this boundary also stops and verifies every in-repository DB writer and
-# producer itself.  The dedicated cross-UID publisher is fenced at the spool directories
-# while the DB snapshot is made; queued files are retained and need no conversion.
+# A legacy messages DB cannot be opened by the current backend.  Run on its own, this
+# script converts it here, before it renders or starts the replacement.  Under the
+# install orchestrator it only records the conversion and leaves the candidate stopped;
+# the orchestrator converts and starts after the transaction commits.  Either way this
+# boundary stops and verifies every in-repository DB writer and producer itself, since
+# reinstall plans do not run a deactivator.  The dedicated cross-UID publisher is fenced
+# at the spool directories while the DB snapshot is made; queued files are retained and
+# need no conversion.
+#
+# States: idle -> quiesced -> converted -> activated (standalone), or idle -> deferred.
 _devmon_migration_state=idle
-_devmon_outer_receipt_durable=0
+_devmon_convert_before_start=0
 
 devmon_migration_finish() {
   local outcome="$1" rc="${2:-0}" recovery_ready=1
   [ "$outcome" = success ] || trap - EXIT
-  if [ "$outcome" = failure ] && [ "$_devmon_outer_receipt_durable" = 1 ]; then
-    log "dev-monitor database compensation deferred to the install transaction"
+  if [ "$outcome" = failure ] && [ "$_devmon_migration_state" = deferred ]; then
+    # Nothing here touched the DB. The transaction takes the activation record back
+    # and restores the previous package with its own units.
+    log "dev-monitor activation was deferred; the install transaction restores the previous package"
     exit "$rc"
   fi
   if [ "$outcome" = failure ]; then
@@ -227,6 +233,10 @@ devmon_migration_finish() {
     if [ "$recovery_ready" = 1 ] && [ "$_devmon_migration_state" = converted ]; then
       devmon_migration_restore_db unconditional "$DEVMON_DB" \
         "$HERE/migrate-legacy-state.py" || recovery_ready=0
+    elif [ "$_devmon_migration_state" = activated ]; then
+      # The canonical writer has run, so the converted DB may hold rows the legacy
+      # copy never saw. Past that point this is forward-only, like a committed install.
+      log "dev-monitor's canonical writer already ran; the converted database is kept"
     fi
     [ "$recovery_ready" != 1 ] \
       || devmon_migration_restore_spool "$DEVMON_STATE" || recovery_ready=0
@@ -244,64 +254,6 @@ devmon_migration_finish() {
   trap - EXIT
 }
 
-devmon_write_outer_receipt() {
-  local receipt="${AIRLOCK_DEVMON_MIGRATION_RECEIPT:-}"
-  local transaction_id="${AIRLOCK_INSTALL_TRANSACTION_ID:-}" expected
-  [ -n "$receipt$transaction_id" ] || return 0
-  [[ "$transaction_id" =~ ^[0-9a-f]{32}$ ]] \
-    || die "invalid outer install transaction id"
-  expected="$(devmon_migration_receipt_path "$transaction_id")"
-  [ "$receipt" = "$expected" ] \
-    || die "outer dev-monitor migration receipt path does not match its transaction"
-  python3 - "$receipt" "$transaction_id" "$DEVMON_DB" "$SPOOL_WRITER_USER" \
-    "$DEVMON_MIGRATION_TMP_MODE" "$DEVMON_MIGRATION_NEW_MODE" \
-    "${DEVMON_MIGRATION_ACTIVE[@]}" <<'PY' \
-    || die "cannot persist outer dev-monitor migration receipt"
-import json
-import os
-from pathlib import Path
-import sys
-import tempfile
-
-path = Path(sys.argv[1])
-transaction_id, database, writer, tmp_mode, new_mode = sys.argv[2:7]
-if path.is_symlink() or path.exists():
-    raise SystemExit('migration receipt already exists')
-if path.parent.is_symlink() or not path.parent.is_dir():
-    raise SystemExit('migration checkpoint directory is unsafe')
-payload = {
-    'version': 1,
-    'transaction_id': transaction_id,
-    'database': database,
-    'writer_user': writer,
-    'spool_modes': {
-        'tmp': None if tmp_mode == '-' else tmp_mode,
-        'new': None if new_mode == '-' else new_mode,
-    },
-    'active_units': sys.argv[7:],
-}
-fd, raw = tempfile.mkstemp(prefix='.dev-monitor-migration.', dir=path.parent)
-temp = Path(raw)
-try:
-    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-        json.dump(payload, handle, sort_keys=True)
-        handle.write('\n')
-        handle.flush()
-        os.fchmod(handle.fileno(), 0o600)
-        os.fsync(handle.fileno())
-    os.replace(temp, path)
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-finally:
-    if temp.exists():
-        temp.unlink()
-PY
-  _devmon_outer_receipt_durable=1
-}
-
 DEVMON_DB="$DEVMON_STATE/messages.db"
 if [ "$MESSAGES" = true ] && { [ -e "$DEVMON_DB" ] || [ -L "$DEVMON_DB" ]; }; then
   _devmon_schema="$(python3 "$HERE/migrate-legacy-state.py" --schema-state "$DEVMON_DB")" \
@@ -310,29 +262,36 @@ if [ "$MESSAGES" = true ] && { [ -e "$DEVMON_DB" ] || [ -L "$DEVMON_DB" ]; }; th
     canonical) log "messages database already uses the current schema" ;;
     legacy)
       if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-        log "[dry] would quiesce dev-monitor writers/producers and convert the legacy messages database"
+        log "[dry] would quiesce dev-monitor writers/producers and convert the legacy messages database (after the install commit when orchestrated)"
+      elif [ -n "${AIRLOCK_INSTALL_TRANSACTION_ID:-}" ]; then
+        # Inside an install transaction nothing may open the canonical DB before
+        # commit: a backend start alone rewrites it, after which no later failure in
+        # the transaction could restore the legacy copy without losing writes. So the
+        # candidate is installed stopped and the orchestrator converts after commit
+        # (activation-record.py). The record is written before the first mutation.
+        devmon_migration_snapshot "$DEVMON_STATE" \
+          || die "cannot inspect DB writers, producers, or spool lanes"
+        trap 'devmon_migration_finish failure $?' EXIT
+        python3 "$HERE/activation-record.py" write "$(devmon_migration_state_dir)" \
+          "$AIRLOCK_INSTALL_TRANSACTION_ID" "$DEVMON_DB" "$SPOOL_WRITER_USER" \
+          "$BACKEND_PORT" "$AIRLOCK_APP_ID" \
+          || die "cannot record the deferred dev-monitor activation"
+        _devmon_migration_state=deferred
+        devmon_migration_quiesce \
+          || die "cannot stop and verify DB writers or spool producers"
+        log "legacy messages database left untouched; conversion and start follow the install commit"
       else
-        # Record the pre-migration state before the first mutation. A standalone app
-        # keeps it in memory; the outer transaction persists the same facts beside its
-        # package checkpoint so a crash or a later nginx/smoke failure can compensate.
+        # Run on its own there is no transaction to roll back to, so the conversion is
+        # held until the candidate's own units are in place (just before the restart
+        # below) and the two switch together. Everything up to that point can still
+        # fail with the legacy database and the old writers untouched.
         devmon_migration_snapshot "$DEVMON_STATE" \
           || die "cannot inspect DB writers, producers, or spool lanes"
         _devmon_migration_state=quiesced
         trap 'devmon_migration_finish failure $?' EXIT
-        devmon_write_outer_receipt
-
         devmon_migration_quiesce \
           || die "cannot stop and verify DB writers or spool producers"
-        # The identity check closes the receipt-write interval without another walk.
-        devmon_migration_fence "$DEVMON_STATE" "$SPOOL_WRITER_USER" true \
-          || die "cannot fence and verify cross-UID spool publishing"
-
-        _devmon_conversion_receipt="$(python3 "$HERE/migrate-legacy-state.py" \
-          --endstate "$DEVMON_DB" --offline)" \
-          || die "legacy messages database conversion failed; original/backup retained"
-        [ "$_devmon_conversion_receipt" = 'converted=1 backup_retained=1' ] \
-          || die "legacy messages database conversion returned no completion receipt"
-        _devmon_migration_state=converted
+        _devmon_convert_before_start=1
       fi
       ;;
     *) die "unknown messages database schema classification" ;;
@@ -572,9 +531,28 @@ else
 fi
 airlock_run systemctl --user daemon-reload
 airlock_run systemctl --user enable airlock-dev-monitor.service
-airlock_run systemctl --user restart airlock-dev-monitor.service
-if [ "$MESSAGES" = true ]; then
-  airlock_run systemctl --user enable --now airlock-devmon-heartbeat.timer
+if [ "$_devmon_migration_state" = deferred ]; then
+  log "airlock-dev-monitor.service enabled but not started: activation follows the install commit"
+  [ "$MESSAGES" != true ] || airlock_run systemctl --user enable airlock-devmon-heartbeat.timer
+else
+  if [ "$_devmon_convert_before_start" = 1 ]; then
+    devmon_migration_fence "$DEVMON_STATE" "$SPOOL_WRITER_USER" true \
+      || die "cannot fence and verify cross-UID spool publishing"
+    _devmon_conversion_receipt="$(python3 "$HERE/migrate-legacy-state.py" \
+      --endstate "$DEVMON_DB" --offline)" \
+      || die "legacy messages database conversion failed; original/backup retained"
+    [ "$_devmon_conversion_receipt" = 'converted=1 backup_retained=1' ] \
+      || die "legacy messages database conversion returned no completion receipt"
+    _devmon_migration_state=converted
+    devmon_migration_restore_spool "$DEVMON_STATE" \
+      || die "cannot reopen the spool lanes after conversion"
+  fi
+  # From the first canonical writer on, a standalone failure keeps the converted DB.
+  [ "$_devmon_migration_state" != converted ] || _devmon_migration_state=activated
+  airlock_run systemctl --user restart airlock-dev-monitor.service
+  if [ "$MESSAGES" = true ]; then
+    airlock_run systemctl --user enable --now airlock-devmon-heartbeat.timer
+  fi
 fi
 
 # --- 2. dashboard UI into the hub webroot (served by the hub's static location /) ---

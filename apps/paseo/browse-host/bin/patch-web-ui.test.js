@@ -8,6 +8,7 @@ const {
   BROWSE_PATCHES,
   KNOWN_BUNDLE_SHAPES,
   PINNED_SHA,
+  SIDEBAR_POLL_MS,
   SIDEBAR_REHYDRATE_REVISIONED,
   SUBAGENT_STREAM_PATCHES,
   patchBundleContent,
@@ -83,15 +84,28 @@ assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes("f.persi
   const end = patch.repl.indexOf("},3544,[", start);
   const expression = patch.repl.slice(start, end);
   const listeners = new Map();
+  const windowListeners = new Map();
+  const intervals = [];
   let rehydrates = 0;
+  const syncs = [];
   const documentStub = {
     visibilityState: "hidden",
     addEventListener: (name, callback) => {
       listeners.set(name, callback);
     },
   };
+  const windowStub = {
+    addEventListener: (name, callback) => {
+      windowListeners.set(name, callback);
+    },
+    setInterval: (callback, ms) => {
+      intervals.push({ callback, ms });
+      return intervals.length;
+    },
+  };
   const f = { persist: { rehydrate: () => { rehydrates += 1; } } };
-  new Function("document", "f", `return (${expression});`)(documentStub, f);
+  const g = { __airlockUiState: { sync: (key) => { syncs.push(key); } } };
+  new Function("document", "window", "f", "g", `return (${expression});`)(documentStub, windowStub, f, g);
   const listener = listeners.get("visibilitychange");
   assert.ok(listener, "visibility listener was not registered");
   assert.ok(listeners.has("airlock-ui-state-stale"), "stale-write listener was not registered");
@@ -102,7 +116,47 @@ assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes("f.persi
   assert.equal(rehydrates, 1, "a returning tab must rehydrate shared order");
   listeners.get("airlock-ui-state-stale")();
   assert.equal(rehydrates, 2, "a rejected stale write must rehydrate shared order");
+  // Device/window return and network return go through the revision check, never a
+  // blind rehydrate: an unchanged tab must not re-render (and must not disturb a drag).
+  for (const name of ["focus", "online"]) {
+    const windowListener = windowListeners.get(name);
+    assert.ok(windowListener, `${name} listener was not registered`);
+    windowListener();
+  }
+  assert.equal(rehydrates, 2, "focus/online must not rehydrate blindly");
+  assert.deepEqual(syncs, ["sidebar-project-workspace-order", "sidebar-project-workspace-order"]);
+  // One poll, at the named interval, that only checks while the tab is visible.
+  assert.equal(intervals.length, 1, "exactly one poll interval");
+  assert.equal(intervals[0].ms, SIDEBAR_POLL_MS);
+  assert.ok(SIDEBAR_POLL_MS >= 30000, "the poll is low-frequency by design");
+  documentStub.visibilityState = "hidden";
+  intervals[0].callback();
+  assert.equal(syncs.length, 2, "a hidden tick must do nothing");
+  documentStub.visibilityState = "visible";
+  intervals[0].callback();
+  intervals[0].callback();
+  assert.equal(syncs.length, 4, "a visible tick syncs once per interval");
+  assert.equal(rehydrates, 2, "the poll itself never rehydrates; only the stale event does");
 }
+// Every replacement for the rehydrate anchor — current or legacy — must carry the
+// anchor's own head and tail bytes, because the patcher swaps a legacy replacement for
+// the current one verbatim. A legacy string that is only the injected expression would
+// duplicate the surrounding `partialize:…}));` on a real installed bundle while this
+// fixture (which is built from the same strings) still came out equal. Caught on a live
+// box, 2026-09-12.
+{
+  const patch = byName("sidebar-order-rehydrate-on-visibility");
+  const head = patch.find.slice(0, "partialize:e=>".length);
+  const tail = "},3544,[3368,3273,3276]);";
+  assert.ok(patch.find.endsWith(tail));
+  for (const candidate of [patch.repl, ...patch.legacyRepls]) {
+    assert.ok(candidate.startsWith(head), "rehydrate replacement lost the anchor head");
+    assert.ok(candidate.endsWith(tail), "rehydrate replacement lost the anchor tail");
+    assert.equal(candidate.split(head).length - 1, 1, "rehydrate replacement duplicates the anchor head");
+  }
+}
+// The adapter half: the poll needs the revision check the storage exposes.
+assert.ok(byName("sidebar-order-shared-storage").repl.includes("sync:key=>"));
 // The default the user sees on a device that has never saved settings. Asserted on
 // the bytes, not the name: a silent revert to upstream's 16/12 is the failure mode.
 assert.ok(byName("appearance-default-font-sizes").find.includes("_=16,O=11,T=24,F=12"));
@@ -249,17 +303,21 @@ assert.ok(migratedTap.source.includes(byName("sidebar-tap-not-swallowed-on-web")
 // current group must replace it with the durable outbox/queue adapter and add the
 // visibility rehydrate edit.
 const storagePatch = byName("sidebar-order-shared-storage");
-assert.equal(storagePatch.legacyRepls.length, 2);
+assert.equal(storagePatch.legacyRepls.length, 3);
+const rehydratePatch = byName("sidebar-order-rehydrate-on-visibility");
+assert.equal(rehydratePatch.legacyRepls.length, 2);
 for (const legacyStorage of storagePatch.legacyRepls) {
-  const rehydratePatch = byName("sidebar-order-rehydrate-on-visibility");
+  for (const legacyRehydrate of rehydratePatch.legacyRepls) {
   const legacyGeneral = general.source
     .replace(storagePatch.repl, legacyStorage)
-    .replace(rehydratePatch.repl, rehydratePatch.legacyRepls[0]);
+    .replace(rehydratePatch.repl, legacyRehydrate);
   const migratedStorage = apply(legacyGeneral, "subagent-stream", [sha(legacyGeneral)]);
   assert.equal(migratedStorage.alreadyPatched, false);
   assert.equal(migratedStorage.states["subagent-stream"], "partial");
   assert.equal(migratedStorage.source, general.source);
   assert.ok(!migratedStorage.source.includes(legacyStorage));
+  assert.ok(!migratedStorage.source.includes(legacyRehydrate));
+  }
 }
 
 // ...and the mirror case: a PRE-move browse box already holds the coarse-pointer edit,

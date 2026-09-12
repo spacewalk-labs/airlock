@@ -1,0 +1,55 @@
+.dmc-overlay {
+  position: fixed; inset: 0; z-index: 1000; display: flex; align-items: flex-start;
+  justify-content: center; padding: 5vh 16px; background: rgba(15, 23, 42, .5);
+}
+.dmc-modal {
+  width: min(780px, 94vw); max-height: 90vh; overflow: auto; display: flex;
+  flex-direction: column; color: var(--text, #1d1d1f); background: var(--surface, #fff);
+  border: 1px solid var(--line, #d2d2d7); border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, .3);
+}
+.dmc-modal-wide { width: min(900px, 94vw); height: 90vh; overflow: hidden; }
+.dmc-head, .dmc-footer { display: flex; align-items: center; gap: 10px; padding: 13px 18px; }
+.dmc-head { border-bottom: 1px solid var(--line, #d2d2d7); }
+.dmc-head h2 { margin: 0; flex: 1; font-size: 17px; }
+.dmc-kind, .dmc-label { color: var(--accent, #0066cc); font-size: 11px; font-weight: 700; letter-spacing: .05em; }
+.dmc-footer { margin-top: auto; border-top: 1px solid var(--line, #d2d2d7); justify-content: flex-end; }
+.dmc-status { margin-right: auto; color: var(--muted, #6e6e73); font-size: 12px; }
+.dmc-meta { display: flex; flex-wrap: wrap; gap: 12px; padding: 9px 18px; color: var(--muted, #6e6e73); background: var(--code-bg, #f0f0f3); font: 12px var(--font-mono, monospace); }
+.dmc-body { padding: 14px 18px; line-height: 1.6; }
+.dmc-body p { margin: 0; }
+.dmc-about { margin: 12px 18px 0; padding: 10px 13px; border: 1px solid #dbeafe; background: #f0f7ff;
+             border-radius: 10px; line-height: 1.7; color: #1e293b; }
+.dmc-about b { display: block; margin-bottom: 2px; }
+.dmc-examples { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.dmc-chip { font-size: 12px; padding: 4px 11px; border-color: #bfdbfe; background: #fff; color: #1d4ed8; border-radius: 999px; }
+.dmc-chip:hover { background: #dbeafe; }
+.dmc-runbox { margin: 12px 18px 0; padding: 12px 14px; border: 1px dashed #93c5fd; border-radius: 10px; background: #eff6ff; color: #1e293b; }
+.dmc-cwd, .dmc-prompt { display: block; margin: 5px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--font-mono, monospace); }
+.dmc-note { border-color: #a7f3d0; background: #ecfdf5; }
+.dmc-note textarea { width: 100%; min-height: 120px; margin-top: 7px; padding: 8px; resize: vertical; }
+.dmc-param { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.dmc-param span { min-width: 140px; }
+.dmc-param input, .dmc-param select, .dmc-note textarea { color: #111827; background: #fff; border: 1px solid #cbd5e1; border-radius: 7px; font: 13px var(--font-sans, sans-serif); }
+.dmc-param input, .dmc-param select { flex: 1; min-width: 0; padding: 6px 8px; }
+.dmc-button { padding: 7px 11px; color: var(--text, #1d1d1f); background: transparent; border: 1px solid var(--line, #d2d2d7); border-radius: 8px; cursor: pointer; text-decoration: none; font: inherit; }
+.dmc-primary { color: var(--accent-contrast, #fff); background: var(--accent, #0066cc); border-color: var(--accent, #0066cc); }
+.dmc-close { padding: 2px 8px; border: 0; font-size: 22px; }
+.dmc-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
+.dmc-iframe { width: 100%; flex: 1; min-height: 0; border: 0; background: #fff; }
+.dmc-terminal { background: #0b1220; }
+.dmc-ended { display: grid; flex: 1; place-items: center; min-height: 260px; color: var(--muted, #6e6e73); font-size: 16px; }
+@media (prefers-color-scheme: dark) {
+  .dmc-runbox { background: #10233f; color: #e5e7eb; border-color: #2563eb; }
+  .dmc-note { background: #0b2d24; border-color: #047857; }
+  .dmc-about { background: #10233f; color: #e5e7eb; border-color: #2563eb; }
+}
+@media (max-width: 640px) {
+  .dmc-overlay { align-items: stretch; padding: 0; }
+  .dmc-modal, .dmc-modal-wide { width: 100vw; max-width: none; height: 100vh; max-height: none; border: 0; border-radius: 0; }
+  .dmc-head { position: sticky; top: 0; z-index: 1; background: var(--surface, #fff); }
+  .dmc-footer { position: sticky; bottom: 0; flex-wrap: wrap; background: var(--surface, #fff); }
+  .dmc-footer .dmc-status { flex-basis: 100%; }
+  .dmc-param { align-items: stretch; flex-direction: column; gap: 4px; }
+  .dmc-param span { min-width: 0; }
+}

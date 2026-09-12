@@ -371,4 +371,173 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
   assert.equal(rehydrates, 1);
 }
 
-console.log("paseo ui-state adapter: revision CAS, stale convergence, rolling safety, and rehydrate wiring passed");
+// ------------------------------------------------------------------ sync (poll)
+// sync() is the revision check behind the visible-tab poll and the focus/online
+// triggers. It never adopts a revision or touches the store itself: it only decides
+// whether to raise the stale event that the existing rehydrate path answers.
+function staleCounter(document) {
+  let count = 0;
+  document.addEventListener("airlock-ui-state-stale", () => { count += 1; });
+  return () => count;
+}
+
+// Unchanged revision: one GET, no event, nothing re-rendered.
+{
+  const server = revisionServer('{"order":1}');
+  const { adapter, calls, document } = build(server);
+  const stale = staleCounter(document);
+  await adapter.getItem(KEY);
+  const before = calls.length;
+  await adapter.sync(KEY);
+  assert.equal(calls.length - before, 1);
+  assert.equal(calls.at(-1).method, "GET");
+  assert.equal(stale(), 0);
+}
+
+// Another device advanced the server: exactly one event, and the rehydrate that
+// answers it reads the new value through the ordinary getItem path.
+{
+  const server = revisionServer('{"order":1}');
+  const { adapter, local, document } = build(server);
+  const stale = staleCounter(document);
+  await adapter.getItem(KEY);
+  await server.respond("/airlock-ui-state/v2/" + KEY, { method: "PUT", headers: { "X-Airlock-Base-Revision": "1" }, body: '{"order":2}' });
+  await adapter.sync(KEY);
+  assert.equal(stale(), 1);
+  assert.equal(await adapter.getItem(KEY), '{"order":2}');
+  assert.equal(local.get(KEY), '{"order":2}');
+  await adapter.sync(KEY);
+  assert.equal(stale(), 1, "a converged tab raises nothing more");
+}
+
+// Rolling-update recovery: first hydration met the old headerless backend, so no
+// revision was ever observed. Once the backend answers with a revision the poll must
+// request a full rehydrate rather than stay local forever.
+{
+  let capable = false;
+  const respond = async (_url, init = {}) =>
+    (init.method ?? "GET") === "GET" ? response(200, '{"order":1}', capable ? "7" : null) : response(204, "");
+  const { adapter, calls, document } = build({ respond });
+  const stale = staleCounter(document);
+  await adapter.getItem(KEY);
+  await adapter.sync(KEY);
+  assert.equal(stale(), 0, "a headerless backend keeps the tab local");
+  capable = true;
+  await adapter.sync(KEY);
+  assert.equal(stale(), 1, "the first revision-capable response requests rehydration");
+  assert.equal(calls.filter((call) => call.method !== "GET").length, 0, "sync never writes");
+}
+
+// A mutation in flight owns the key: sync waits behind it on the network queue, so
+// its GET observes the write's own revision and raises nothing.
+{
+  const releases = [];
+  let revision = "1";
+  const respond = async (_url, init = {}) => {
+    if ((init.method ?? "GET") === "GET") return response(200, '{"order":1}', revision);
+    return new Promise((resolve) => releases.push(() => { revision = "2"; resolve(response(204, "", "2")); }));
+  };
+  const { adapter, calls, document } = build({ respond });
+  const stale = staleCounter(document);
+  await adapter.getItem(KEY);
+  const before = calls.length;
+  const write = adapter.setItem(KEY, '{"order":"mine"}');
+  await tick();
+  const sync = adapter.sync(KEY);
+  releases.forEach((release) => release());
+  await write;
+  await sync;
+  const after = calls.slice(before).map((call) => call.method);
+  assert.deepEqual(after, ["PUT", "GET"], "the poll's GET runs only after the write settled");
+  assert.equal(stale(), 0);
+}
+
+// A mutation that begins while the poll's GET is outstanding wins: the GET result is
+// dropped and no event is raised even though the revision moved underneath.
+{
+  let gate = null;
+  const respond = async (_url, init = {}) => {
+    if ((init.method ?? "GET") === "GET") {
+      if (!gate) return response(200, '{"order":1}', "1");
+      return new Promise((resolve) => { gate.release = () => resolve(response(200, '{"order":"other"}', "5")); });
+    }
+    return response(204, "", "6");
+  };
+  const { adapter, document } = build({ respond });
+  const stale = staleCounter(document);
+  await adapter.getItem(KEY);
+  gate = {};
+  const sync = adapter.sync(KEY);
+  await tick();
+  const write = adapter.setItem(KEY, '{"order":"mine"}');
+  gate.release();
+  await sync;
+  await write;
+  assert.equal(stale(), 0);
+}
+
+// A based outbox entry is replayed through the rehydrate path, not polled around.
+{
+  let online = false;
+  const server = revisionServer('{"order":1}');
+  const respond = async (url, init = {}) => {
+    if (!online && (init.method ?? "GET") !== "GET") throw new Error("offline");
+    return server.respond(url, init);
+  };
+  const { adapter, calls, local, document } = build({ respond });
+  const stale = staleCounter(document);
+  await adapter.getItem(KEY);
+  await adapter.setItem(KEY, '{"order":"queued"}');
+  assert.ok(local.has("@airlock-pending:" + KEY), "the failed write stays in the outbox");
+  online = true;
+  const before = calls.length;
+  await adapter.sync(KEY);
+  assert.equal(calls.length, before, "an outbox skips the GET");
+  assert.equal(stale(), 1, "the outbox is replayed by rehydrate");
+  assert.equal(await adapter.getItem(KEY), '{"order":"queued"}');
+  assert.equal(server.value(), '{"order":"queued"}');
+  assert.equal(local.has("@airlock-pending:" + KEY), false);
+}
+
+// A failed GET is swallowed; two overlapping syncs coalesce into one GET.
+{
+  let fail = true;
+  let gate = null;
+  const respond = async () => {
+    if (fail) throw new Error("network");
+    return new Promise((resolve) => { gate = () => resolve(response(200, '{"order":1}', "1")); });
+  };
+  const { adapter, calls, document } = build({ respond });
+  const stale = staleCounter(document);
+  await adapter.sync(KEY);
+  assert.equal(stale(), 0);
+  fail = false;
+  const first = adapter.sync(KEY);
+  const second = adapter.sync(KEY);
+  await tick();
+  const gets = calls.filter((call) => call.method === "GET").length;
+  gate();
+  await first;
+  await second;
+  assert.equal(gets, 2, "one failed GET plus one coalesced GET");
+  assert.equal(stale(), 1, "no observed revision + capable response requests rehydration");
+}
+
+// End to end: the injected listener answers sync()'s stale event with a real rehydrate.
+{
+  const server = revisionServer('{"order":1}');
+  const { adapter, document } = build(server);
+  await adapter.getItem(KEY);
+  let rehydrates = 0;
+  const store = { persist: { rehydrate: () => { rehydrates += 1; return adapter.getItem(KEY); } } };
+  new Function("f", "document", "Event", "g", patcher.SIDEBAR_REHYDRATE_REVISIONED)(store, document, Event, { __airlockUiState: adapter });
+  await adapter.sync(KEY);
+  assert.equal(rehydrates, 0);
+  await server.respond("/airlock-ui-state/v2/" + KEY, { method: "PUT", headers: { "X-Airlock-Base-Revision": "1" }, body: '{"order":2}' });
+  await adapter.sync(KEY);
+  assert.equal(rehydrates, 1);
+  await tick();
+  assert.equal(await adapter.getItem(KEY), '{"order":2}');
+}
+
+console.log("paseo ui-state adapter: revision CAS, stale convergence, rolling safety, poll sync, and rehydrate wiring passed");

@@ -36,7 +36,7 @@ uistate_port = 19954
 # freeze every box on this release.
 version = ""
 
-# Transcribed from install/prerequisites.tsv's eight paseo rows (F11).
+# Paseo's runtime requirements, including the bundle integrity checker (F11).
 [[prerequisites]]
 command = "node"
 predicate = "major-gte"
@@ -80,6 +80,13 @@ fix = "sudo apt-get update && sudo apt-get install -y curl"
 note = "Smoke check"
 
 [[prerequisites]]
+command = "sha256sum"
+predicate = "present"
+expected = "-"
+fix = "sudo apt-get update && sudo apt-get install -y coreutils"
+note = "Bundled Paseo package integrity"
+
+[[prerequisites]]
 command = "ss"
 predicate = "present"
 expected = "-"
@@ -98,9 +105,13 @@ note = "Privileged ingress setup"
 # reasoning as publish's mode-gated fragment), one servers.d fragment plus
 # the icon location's own fragments-class dir claim (paseo/ —
 # favicon-ring.svg + icons/, [branding] icon_ring), the pinned npm-global
-# tree (prefix hardcoded $HOME/.npm-global, apps/paseo/install.sh:87 — the
-# depth4/model-prune/image-persist patches all land inside this tree) + its
-# bin symlink, and the browse-host sidecar's own install dir (browse=true).
+# tree (prefix hardcoded $HOME/.npm-global, apps/paseo/install.sh — the
+# guarded bundle installs all six @getpaseo packages as siblings under
+# @getpaseo/, the install-id marker sits there too, and every patch lands
+# inside this tree) + its bin symlink, and the browse-host sidecar's own
+# install dir (browse=true). The six packages and the marker are ENUMERATED,
+# not claimed as the @getpaseo/ directory: the npm scope is a namespace, and
+# a package someone else puts there is not Airlock's to remove.
 # Deliberately NOT declared (retained data, per the Appendix): ~/.paseo/
 # (config.json, patched in place, never removed) and
 # ~/.cache/ms-playwright/ (a SHARED Playwright cache other tools may use —
@@ -113,6 +124,12 @@ units = ["airlock-paseo.service", "airlock-paseo-browse-host.service",
          "airlock-paseo-uistate.service"]
 fragments = ["servers.d/paseo.conf", "paseo/"]
 files = ["~/.npm-global/lib/node_modules/@getpaseo/cli/",
+         "~/.npm-global/lib/node_modules/@getpaseo/client/",
+         "~/.npm-global/lib/node_modules/@getpaseo/highlight/",
+         "~/.npm-global/lib/node_modules/@getpaseo/protocol/",
+         "~/.npm-global/lib/node_modules/@getpaseo/relay/",
+         "~/.npm-global/lib/node_modules/@getpaseo/server/",
+         "~/.npm-global/lib/node_modules/@getpaseo/.airlock-install-id",
          "~/.npm-global/bin/paseo",
          "~/.local/share/paseo-browse-host/"]
 serve_ports = ["https_port"]

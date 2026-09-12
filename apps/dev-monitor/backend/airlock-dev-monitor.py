@@ -163,6 +163,8 @@ UPDATE_DETECT_UNIT = 'airlock-update-detect.service'
 _MESSAGES_STATE = 'off'
 _SLACK_WORKER_ON = False
 _TMUX_LOCK = threading.Lock()
+MAX_OWNER_PARAM = 200
+MAX_OWNER_NOTE = 8000
 # How long a run may sit in 'starting' with no window of its own name before the
 # reaper calls it a failed launch. Only has to outlast one _launch_run under the lock.
 STARTING_GRACE_S = 120
@@ -1338,6 +1340,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._owner_ready():
             return
         body = self._read_body()
+        if path == '/api/owner/run/window':
+            self._owner_run_window(body)
+            return
         if path == '/api/owner/run':
             self._owner_run(body)
             return
@@ -1545,10 +1550,16 @@ class Handler(BaseHTTPRequestHandler):
                 if preview.get('registered'):
                     self._json(409, {'ok': False, 'error': 'package_already_registered'})
                     return
-                APPS.register(config, app_id, {
+                reapprove = preview.get('requires_reapproval') is True
+                registration = {
                     'path': canonical_path,
                     'grant': preview.get('grants') or [],
-                })
+                }
+                if reapprove:
+                    APPS.register(config, app_id, registration,
+                                  approved_digest=entry['tree_digest'])
+                else:
+                    APPS.register(config, app_id, registration)
             except APPS.AppsError as exc:
                 sys.stderr.write(f'[apps] company register failed for {app_id!r} '
                                  f'({exc.code}): {exc.detail}\n')
@@ -1566,7 +1577,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._owner_update_launch(
                 'install', app_id, response_action='install-company', lock_held=True,
-                approved_digest=entry['tree_digest'], package_path=canonical_path)
+                approved_digest=entry['tree_digest'], package_path=canonical_path,
+                reapprove=reapprove)
 
     def _owner_app_action_locked(self, app_id, action, body=None):
         cfg = UPDATE_EXEC_CONFIG
@@ -1597,10 +1609,16 @@ class Handler(BaseHTTPRequestHandler):
                     if preview.get('registered'):
                         self._json(409, {'ok': False, 'error': 'package_already_registered'})
                         return
-                    APPS.register(config, app_id, {
+                    reapprove = preview.get('requires_reapproval') is True
+                    registration = {
                         'path': canonical_path,
                         'grant': preview.get('grants') or [],
-                    })
+                    }
+                    if reapprove:
+                        APPS.register(config, app_id, registration,
+                                      approved_digest=approved_digest)
+                    else:
+                        APPS.register(config, app_id, registration)
                 else:
                     if APPS.registered_package_path(config, app_id) != Path(canonical_path):
                         self._json(409, {'ok': False, 'error': 'package_path_changed'})
@@ -1608,10 +1626,11 @@ class Handler(BaseHTTPRequestHandler):
                     if preview.get('requires_reapproval') is not True:
                         self._json(409, {'ok': False, 'error': 'reapproval_not_required'})
                         return
+                    reapprove = True
                 self._owner_update_launch(
                     'install', app_id, response_action=action, lock_held=True,
                     approved_digest=approved_digest, package_path=canonical_path,
-                    reapprove=(action == 'reapprove'))
+                    reapprove=reapprove)
                 return
 
             projection = APPS.list_apps(cfg['root'], updates)
@@ -1644,7 +1663,8 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write(f'[apps] {action} failed for {app_id!r} '
                              f'({exc.code}): {exc.detail}\n')
             if exc.code in ('bad_app_id', 'bad_package_path', 'bad_package_registration',
-                            'bad_package_grants', 'config_invalid', 'config_unsupported'):
+                            'bad_package_grants', 'bad_package_approval',
+                            'config_invalid', 'config_unsupported'):
                 status = 400
             elif exc.code in ('config_conflict', 'app_already_registered',
                               'package_already_registered', 'package_not_registered'):
@@ -1788,13 +1808,39 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {'ok': False, 'error': 'run not found'})
             return
         try:
-            target = _launch_message(card, EXEC_CONFIG)
+            prompt, ran_input = _compose_message_input(
+                card, body.get('params', {}), body.get('note', ''))
+        except ValueError as error:
+            self._json(400, {'ok': False, 'error': str(error)})
+            return
+        try:
+            target = _launch_message(card, EXEC_CONFIG, prompt)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             sys.stderr.write('[message-run] launch failed: %s\n' % type(error).__name__)
             self._json(502, {'ok': False, 'error': 'launch_failed'})
             return
+        window = _win_id(target)
+        ran_at = MSG.mark_ran(card_id, ran_input, window)
         self._json(200, {'ok': True, 'card_id': card_id, 'target': target,
-                         'session': EXEC_CONFIG['session'], 'ran_at': MSG.mark_ran(card_id)})
+                         'window': window, 'session': EXEC_CONFIG['session'],
+                         'ran_at': ran_at})
+
+    def _owner_run_window(self, body):
+        card_id = body.get('card_id') if isinstance(body, dict) else None
+        if not isinstance(card_id, str):
+            self._json(400, {'ok': False, 'error': 'card_id required'})
+            return
+        card = MSG.get_card(card_id)
+        window = card.get('ran_window') if card else None
+        if not isinstance(window, str) or not re.fullmatch(r'@[0-9]+\Z', window):
+            self._json(404, {'ok': False, 'error': 'run window not found'})
+            return
+        with _TMUX_LOCK:
+            active = _tmux('select-window', '-t', window) is not None
+        self._json(200, {'ok': True, 'card_id': card_id,
+                         'state': 'active' if active else 'ended',
+                         'window': window,
+                         'session': EXEC_CONFIG['session'] if EXEC_CONFIG else None})
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f'[airlock-dev-monitor] {self.address_string()} - {fmt % args}\n')
@@ -1896,15 +1942,56 @@ def _build_exec_config():
     }
 
 
-def _launch_message(card, cfg):
+def _compose_message_input(card, supplied, note):
+    """Apply the stored declaration and compose the one immutable prompt argv."""
+    if not isinstance(supplied, dict):
+        raise ValueError('params must be an object')
+    if not isinstance(note, str) or len(note) > MAX_OWNER_NOTE:
+        raise ValueError('note must be a string of at most 8000 characters')
+    declared = card['run'].get('params', [])
+    by_key = {item['key']: item for item in declared}
+    if set(supplied) - set(by_key):
+        raise ValueError('undeclared param')
+    values = {}
+    for key, item in by_key.items():
+        if key in supplied:
+            value = supplied[key]
+            if not isinstance(value, str):
+                raise ValueError('param values must be strings')
+        elif 'default' in item:
+            value = item['default']
+        elif 'choices' in item:
+            raise ValueError('choice param requires a value')
+        else:
+            value = ''
+        if len(value) > MAX_OWNER_PARAM:
+            raise ValueError('param value is too long')
+        if 'choices' in item and value not in item['choices']:
+            raise ValueError('param value is not an allowed choice')
+        values[key] = value
+    canonical_params = json.dumps(
+        values, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    prompt = card['run']['prompt']
+    if card['count'] > 1:
+        prompt += '\n\nMessage context: last_at=%s count=%s' % (
+            card['last_at'], card['count'])
+    if declared:
+        prompt += '\n\nParameters: ' + canonical_params
+    if note:
+        prompt += '\n\nOwner note:\n' + note
+    ran_input = json.dumps({'note': note, 'params': values}, ensure_ascii=False,
+                           sort_keys=True, separators=(',', ':'))
+    return prompt, ran_input
+
+
+def _launch_message(card, cfg, prompt=None):
     run = card['run']
     cwd = os.path.realpath(os.path.expanduser(run['cwd']))
     root = os.path.realpath(os.path.expanduser(cfg['cwd_root']))
     if not os.path.isdir(cwd) or not cwd.startswith(root + os.sep):
         raise ValueError('cwd outside allowed root or missing')
-    prompt = run['prompt']
-    if card['count'] > 1:
-        prompt += '\n\nMessage context: last_at=%s count=%s' % (card['last_at'], card['count'])
+    if prompt is None:
+        prompt, _unused = _compose_message_input(card, {}, '')
     agent = action_runner.resolve_agent(cfg.get('agent'))
     agent['binary'] = action_runner.resolve_exe(
         action_runner.build_argv({'prompt': prompt}, agent), action_runner.runtime_env())
@@ -2003,8 +2090,11 @@ def _start_messages():
         EXEC_CONFIG = _build_exec_config()
         stop = threading.Event()
         _SLACK_WORKER_ON = bool(webhook)
+        # The cron card's prior-verdict file lives next to the message DB — same state
+        # directory, same lifetime, no new axis to provision or clean up.
+        verdicts_path = os.path.join(os.path.dirname(OWNER_CONFIG['db']), 'cron-verdicts.json')
         threading.Thread(target=devmon_loop.run,
-                         args=(OWNER_CONFIG['spool'],webhook,stop,console_url),
+                         args=(OWNER_CONFIG['spool'],webhook,stop,console_url,verdicts_path),
                          daemon=True,name='loop').start()
     except Exception as exc:  # noqa: BLE001 — an optional feature must not kill the monitor
         if stop is not None:

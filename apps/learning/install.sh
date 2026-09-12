@@ -44,6 +44,11 @@ case "$GIT_SYNC" in
   off|auto) ;;
   *) die "git_sync must be off or auto; got '$GIT_SYNC'" ;;
 esac
+INGEST_SLOTS="${AIRLOCK_LEARNING_INGEST_SLOTS:-3}"
+case "$INGEST_SLOTS" in
+  1|2|3) ;;
+  *) die "ingest_slots must be an integer from 1 to 3; got '$INGEST_SLOTS'" ;;
+esac
 
 # ~ is not expanded by the TOML reader, and a unit file cannot expand it either.
 # shellcheck disable=SC2088  # the tilde is DATA here, not a path to expand: these
@@ -139,6 +144,7 @@ else
   install -m644 "$HERE/backend/ingest_runner.py"    "$APP_DIR_LOCAL/backend/ingest_runner.py"
   install -m644 "$HERE/backend/save_document.py"   "$APP_DIR_LOCAL/backend/save_document.py"
   install -m644 "$HERE/backend/providers.py"       "$APP_DIR_LOCAL/backend/providers.py"
+  install -m644 "$HERE/backend/timestamp_links.py" "$APP_DIR_LOCAL/backend/timestamp_links.py"
   # 🔴 이 목록에서 빠진 백엔드 파일은 "그 기능만 안 되는" 것이 아니다. 다른 모듈이
   #    import 하는 순간 **앱 전체가 안 뜬다** — 실측 2026-09-02: git_sync.py 를 여기
   #    적지 않고 배포해 서버·워커가 둘 다 크래시 루프에 들어갔고, 렌더도 CI 도
@@ -168,6 +174,7 @@ render_learning_unit_server "$LIBRARY" "$PUBLISH_SHARE" "$STATE_DIR" "$PORT" "$L
   > "$UNIT_DIR/airlock-learning.service"
 render_learning_unit_ingest "$LIBRARY" "$STATE_DIR" "$PROVIDER" "$INGEST_PATH" \
   "$APP_DIR_LOCAL/backend" "$UNSAFE_ENV" "$ACCOUNTS_STATUS_BIN" "$GIT_SYNC" \
+  "$INGEST_SLOTS" \
   > "$UNIT_DIR/airlock-learning-ingest.service"
 fi
 log "wrote units: airlock-learning.service, airlock-learning-ingest.service"

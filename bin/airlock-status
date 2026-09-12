@@ -298,11 +298,35 @@ def state_dir():
     return Path.home() / ".local" / "state" / "airlock"
 
 
+def _devmon_activation_owed():
+    """The transaction id whose committed dev-monitor still awaits conversion+start.
+
+    apps/dev-monitor/activation-record.py owns the record; the installer deletes it
+    once activation finished, so its presence past a terminal phase means "owed".
+    """
+    path = state_dir() / "dev-monitor-activation.json"
+    if not os.path.lexists(path):
+        return None
+    try:
+        record = json.loads(path.read_text())
+        tx = record["transaction_id"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return "unreadable"
+    return tx[:12] if isinstance(tx, str) else "unreadable"
+
+
 def check_install(rep, cfg, enabled):
     ledger_path = state_dir() / "app-ledger.json"
     transaction_path = state_dir() / "install-transaction.json"
+    owed = _devmon_activation_owed()
+    owed_detail = (f"dev-monitor activation for committed transaction {owed} is still owed: "
+                   "converting its messages database and starting its backend have not finished")
+    owed_fix = "Re-run install/airlock-install.sh; it resumes the activation before anything else."
     if not os.path.lexists(transaction_path):
-        rep.record("install.transaction", OK, "no install transaction is pending")
+        if owed:
+            rep.record("install.transaction", FAIL, owed_detail, owed_fix)
+        else:
+            rep.record("install.transaction", OK, "no install transaction is pending")
     else:
         try:
             if transaction_path.is_symlink():
@@ -319,13 +343,34 @@ def check_install(rep, cfg, enabled):
                        "Preserve the state directory and repair the transaction record before installing.")
         else:
             short_id = transaction_id[:12]
-            if phase == "committed":
+            if phase in ("committed", "rolled_back") and owed:
+                rep.record("install.transaction", FAIL,
+                           f"transaction {short_id} {phase}; {owed_detail}", owed_fix)
+            elif phase == "committed":
                 rep.record("install.transaction", OK,
                            f"transaction {short_id} committed")
             elif phase == "rolled_back":
-                rep.record("install.transaction", WARN,
-                           f"transaction {short_id} rolled back; the previous committed apps were restored",
-                           "Review the installer error before retrying the candidate.")
+                results = transaction.get("restore_results") or {}
+                kept = sorted(name for name, result in results.items()
+                              if isinstance(result, dict)
+                              and str(result.get("status", "")).startswith("kept-forward"))
+                down = sorted(name for name in kept
+                              if results[name].get("status") == "kept-forward-inactive")
+                if down:
+                    rep.record("install.transaction", FAIL,
+                               f"transaction {short_id} rolled back; {', '.join(down)} was kept on the converted "
+                               "database but its candidate did not start",
+                               "Re-run install/airlock-install.sh; the kept candidate is an uncommitted intent it will finish.")
+                elif kept:
+                    rep.record("install.transaction", WARN,
+                               f"transaction {short_id} rolled back; {', '.join(kept)} kept its candidate on the "
+                               "converted database instead of restoring the previous package",
+                               "Re-run install/airlock-install.sh to finish the kept candidate; the old package "
+                               "was not brought back because its compatibility with the converted database is unproven.")
+                else:
+                    rep.record("install.transaction", WARN,
+                               f"transaction {short_id} rolled back; the previous committed apps were restored",
+                               "Review the installer error before retrying the candidate.")
             elif phase == "degraded":
                 failed = {name for name, result in
                           (transaction.get("restore_results") or {}).items()

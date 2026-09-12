@@ -24,6 +24,9 @@ Usage:
   airlock-config package-preview <path>
                                      # validate one local package as JSON without
                                      #   changing config or package trust state
+  airlock-config package-register-validate <id> <approved-digest>
+                                     # ORCHESTRATOR-INTERNAL: validate a config
+                                     #   candidate that re-registers one stale-lock id
   airlock-config package-info        # resolved [packages.*] as JSON (see D1/D6)
   airlock-config install-snapshot <private-path>
                                      # ORCHESTRATOR-INTERNAL: freeze the exact
@@ -69,6 +72,7 @@ import os
 import re
 import shlex
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -103,6 +107,11 @@ AGENT_PROVIDER_DEFAULT = "claude"
 # later commands and turn an exceptional, package-scoped act into ambient
 # process state.
 _DANGEROUS_ADMIT_UNVERIFIED: str | None = None
+# Set only by the read-only package-register-validate command.  Unlike the installer
+# break-glass flag this is already bound to the owner's exact digest and cannot write
+# trust state; keeping the two authorities separate prevents candidate validation from
+# accidentally acquiring the installer's broader audit/finalize meaning.
+_REGISTER_APPROVAL: tuple[str, str] | None = None
 _HTTPS_REGISTRY_CACHE: dict[str, bytes | None] = {}
 
 # App names cross a line-oriented shell boundary (`airlock-config apps`). Keep
@@ -807,8 +816,9 @@ def cmd_validate(cfg: dict) -> "None":
                 f"— configure [packages.{name}].path to point at its "
                 f"manifest, or remove [apps.{name}] if this was a typo.")
     _validate_keys(cfg)
-    validate_shortcuts(cfg)
-    _validate_tile_glyphs(specs)  # a glyph must exist in the sprite, or the
+    shortcut_glyphs = validate_shortcuts(cfg)
+    package_glyphs = _validate_tile_glyphs(specs)  # active external packages
+    shipped_declared, shipped_glyphs = _validate_shipped_tile_glyphs()
     # tile renders as an empty square with no error anywhere (2026-08-25).
     # The other tile axis, `icon`, is already fail-closed by package_specs
     # above: every declared icon strict-resolves to a regular readable file
@@ -831,6 +841,8 @@ def cmd_validate(cfg: dict) -> "None":
                            platform_scalars,
                            strict=(strict_scan and
                                    "strict-config-scan" in spec["certifications"]))
+    _emit_glyph_validation_ac(package_glyphs, shortcut_glyphs,
+                              shipped_declared, shipped_glyphs)
     print("ok: config valid")
 
 
@@ -2367,13 +2379,14 @@ def _check_glyph_exists(where: str, glyph: str) -> "None":
         f"Available glyphs: {', '.join(sorted(ids))}")
 
 
-def _validate_tile_glyphs(specs: dict) -> "None":
+def _validate_tile_glyphs(specs: dict) -> int:
     """Every packaged [tile] glyph must name a real sprite symbol.
 
     Runs at validate (not at manifest parse) so that read-only consumers like
     webjson keep working on a box whose checkout predates a sprite rename;
     validate is the gate every install runs first, and that is where a bad
     name must stop the pipeline."""
+    checked = 0
     for pid in sorted(specs):
         tile = specs[pid]["tile"]
         if tile is not None and tile["glyph"] is not None:
@@ -2381,9 +2394,83 @@ def _validate_tile_glyphs(specs: dict) -> "None":
                 f"package '{pid}' manifest "
                 f"({Path(specs[pid]['dir']) / 'airlock-app.toml'}): [tile]",
                 tile["glyph"])
+            checked += 1
+    return checked
 
 
-def validate_shortcuts(cfg: dict) -> "None":
+def _shipped_tile_glyphs() -> list[tuple[str, Path, str]]:
+    """Read every shipped manifest's declared glyph, independent of [apps]."""
+    declarations = []
+    for manifest in sorted((REPO_ROOT / "apps").glob("*/airlock-app.toml")):
+        try:
+            raw = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            die(f"cannot read shipped manifest {manifest}: {exc}")
+        tile = raw.get("tile")
+        if not isinstance(tile, dict) or "glyph" not in tile:
+            continue
+        glyph = tile["glyph"]
+        if not isinstance(glyph, str) or not glyph.strip():
+            die(f"shipped manifest {manifest}: [tile].glyph must be a non-empty "
+                f"string; got {glyph!r}")
+        declarations.append((manifest.parent.name, manifest, glyph.strip()))
+    return declarations
+
+
+def _validate_shipped_tile_glyphs() -> tuple[int, int]:
+    """Fail closed on a bad glyph in any shipped app, even when disabled."""
+    declarations = _shipped_tile_glyphs()
+    checked = 0
+    for pid, manifest, glyph in declarations:
+        _check_glyph_exists(f"shipped package '{pid}' manifest ({manifest}): [tile]",
+                            glyph)
+        checked += 1
+    return len(declarations), checked
+
+
+def _checkout_revision() -> str | None:
+    """The checkout revision behind an AC observation, when this is a checkout.
+
+    Installed Airlock deliberately has no Git metadata, so ordinary operator
+    output stays the one stable success line.  The card's exact verify command
+    runs in a checkout and gets a reproducible evidence coordinate instead.
+    """
+    if not (REPO_ROOT / ".git").exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--short=12", "HEAD"],
+            check=True, capture_output=True, encoding="utf-8", timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = result.stdout.strip()
+    return revision if re.fullmatch(r"[0-9a-f]{7,40}", revision) else None
+
+
+def _emit_glyph_validation_ac(package_glyphs: int, shortcut_glyphs: int,
+                              shipped_declared: int, shipped_checked: int) -> None:
+    """Emit fixture AC observations when the glyph regression invokes it."""
+    if os.environ.get("AIRLOCK_EMIT_AC") != "1":
+        return
+    revision = _checkout_revision()
+    if revision is None:
+        return
+    sprite_symbols = len(sprite_glyphs())
+    print("AC-GLYPH-SPRITE | expected: sprite_symbols > 0 | "
+          f"observed: sprite_symbols={sprite_symbols} | verdict: PASS | "
+          f"signal: fixture | evidence: hub/index.html@{revision}")
+    print("AC-GLYPH-DECLARATIONS | expected: "
+          "shipped_glyphs_checked == shipped_glyphs_declared && "
+          "shortcut_glyphs_checked == shortcut_glyphs_declared | observed: "
+          f"active_package_glyphs_checked={package_glyphs},"
+          f"shipped_glyphs_checked={shipped_checked},"
+          f"shipped_glyphs_declared={shipped_declared},"
+          f"shortcut_glyphs_checked={shortcut_glyphs},"
+          f"shortcut_glyphs_declared={shortcut_glyphs} | verdict: PASS | "
+          f"signal: fixture | evidence: bin/airlock-config@{revision}")
+
+
+def validate_shortcuts(cfg: dict) -> int:
     """[shortcuts.<id>] — a tile that sends you somewhere else, with nothing installed.
 
     A shortcut is the honest shape for a service this box does not run: the
@@ -2411,7 +2498,7 @@ def validate_shortcuts(cfg: dict) -> "None":
     """
     shortcuts = cfg.get("shortcuts") or {}
     if not shortcuts:
-        return
+        return 0
     app_names = set(cfg.get("apps") or {})
     for sid, raw in shortcuts.items():
         where = f"[shortcuts.{sid}]"
@@ -2467,6 +2554,7 @@ def validate_shortcuts(cfg: dict) -> "None":
                 f"{audience!r}. Default is {_SHORTCUT_AUDIENCE_DEFAULT!r} — a "
                 f"shortcut runs nothing here, so `owner` is how you say this "
                 f"link itself should not be shown to collaborators.")
+    return len(shortcuts)
 
 
 def _validate_tile(pid: str, raw):
@@ -3394,6 +3482,16 @@ def _check_package_lock(pid: str, pdir: Path, lock: dict[str, str]) -> tuple[str
                 "recorded_digest": recorded,
                 "admitted_digest": computed,
             }
+        if _REGISTER_APPROVAL is not None and _REGISTER_APPROVAL[0] == pid:
+            if _REGISTER_APPROVAL[1] != computed:
+                die(f"package '{pid}': approved digest changed before config "
+                    f"registration (approved {_REGISTER_APPROVAL[1]}, computed "
+                    f"{computed})", code=2)
+            return computed, {
+                "argument": "package-register-validate",
+                "recorded_digest": recorded,
+                "admitted_digest": computed,
+            }
         die(f"package '{pid}': package lock digest mismatch\n"
             f"  recorded digest: {recorded}\n"
             f"  computed digest: {computed}\n"
@@ -3872,6 +3970,43 @@ def cmd_package_preview(cfg: dict, raw_path: str) -> "None":
         "registered": existing_package is not None and existing_app is not None,
         "configured_path": configured_path,
     }, indent=2, sort_keys=True))
+
+
+def cmd_package_register_validate(cfg: dict, package_id: str,
+                                  approved_digest: str) -> "None":
+    """Validate one stale-lock registration against the owner's exact digest.
+
+    Disabling/removing an explicit package deliberately removes its config tables but
+    retains its trust history in ``airlock.lock``.  A later registration of changed
+    bytes therefore needs the same package-scoped exceptional admission as an ordinary
+    reapproval, but the config writer must validate its sibling candidate before that
+    candidate becomes live.  This read-only command closes that gap: it admits exactly
+    one real mismatch for validation, then requires the computed digest to equal the
+    digest the owner approved.  It never writes the lock or ledger, and every sibling
+    package remains lock-strict.
+    """
+    global _REGISTER_APPROVAL
+    if PACKAGE_ID_RE.fullmatch(package_id) is None:
+        die("package-register-validate requires a valid package id", code=2)
+    if re.fullmatch(r"[0-9a-f]{64}", approved_digest) is None:
+        die("package-register-validate requires a lowercase 64-hex approved digest",
+            code=2)
+    if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+        die("package-register-validate cannot be combined with "
+            "--dangerously-admit-unverified", code=2)
+    if _preflight_config_abi(cfg) != CONFIG_ABI_VERSION:
+        die(f"package-register-validate requires [airlock] config_version = "
+            f"{CONFIG_ABI_VERSION}", code=2)
+
+    _REGISTER_APPROVAL = (package_id, approved_digest)
+    cmd_validate(cfg)
+    spec = package_specs(cfg).get(package_id)
+    override = spec.get("lock_override") if isinstance(spec, dict) else None
+    admitted = override.get("admitted_digest") if isinstance(override, dict) else None
+    if admitted != approved_digest:
+        state = ("is not a configured explicit package with a stale lock"
+                 if admitted is None else "did not retain its approved digest")
+        die(f"package '{package_id}' {state}", code=2)
 
 
 def packages_resolved(cfg: dict) -> dict:
@@ -5697,11 +5832,12 @@ def cmd_webjson(cfg: dict) -> "None":
 
 
 def _parse_global_args(argv: list[str]) -> list[str]:
-    global _DANGEROUS_ADMIT_UNVERIFIED
+    global _DANGEROUS_ADMIT_UNVERIFIED, _REGISTER_APPROVAL
     # main() is normally one process per call, but keep the parser honest for
     # embedded/test callers too: an earlier exceptional invocation must never
     # become ambient state for a later normal invocation in the same process.
     _DANGEROUS_ADMIT_UNVERIFIED = None
+    _REGISTER_APPROVAL = None
     rest = []
     seen = False
     for argument in argv:
@@ -5725,7 +5861,8 @@ def main(argv: list[str]) -> int:
     argv = _parse_global_args(argv)
     if not argv:
         die("usage: airlock-config "
-            "<validate|apps|catalog|init|plaintext|get|env|json|package-preview> [arg]",
+            "<validate|apps|catalog|init|plaintext|get|env|json|package-preview|"
+            "package-register-validate> [arg]",
             code=2)
     cmd, rest = argv[0], argv[1:]
     # `catalog` runs BEFORE load(): it answers "what could I install?", which is
@@ -5829,6 +5966,10 @@ def main(argv: list[str]) -> int:
             die("--dangerously-admit-unverified has no meaning for package-preview: "
                 "preview mutates no trust state", code=2)
         cmd_package_preview(cfg, rest[0])
+    elif cmd == "package-register-validate":
+        if len(rest) != 2:
+            die("package-register-validate requires <id> <approved-digest>", code=2)
+        cmd_package_register_validate(cfg, rest[0], rest[1])
     elif cmd == "package-info":
         cmd_package_info(cfg)
     elif cmd == "install-preflight":

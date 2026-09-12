@@ -8,9 +8,9 @@ Licensed under the GNU Affero General Public License, Version 3. You may obtain
 a copy of the License at https://www.gnu.org/licenses/agpl-3.0.html — see LICENSE
 for the full text, the scope note, and the trademark and network-use notes.
 
-Airlock is an installer/composer. It does NOT bundle the upstream tools below;
-each is fetched at install time from its own source. Airlock ships only its own
-glue (identity gate, config layer, custom UIs) plus, where noted, patches.
+Airlock is an installer/composer. Most upstream tools below are fetched at install
+time from their own source. Airlock ships its own glue (identity gate, config
+layer, custom UIs) plus the explicitly identified vendored components and patches.
 
 Component         Upstream                          License       How obtained
 ----------------  --------------------------------  ------------  ----------------------------
@@ -24,7 +24,7 @@ marked            github.com/markedjs/marked        MIT           vendored in ap
 DOMPurify         github.com/cure53/DOMPurify       Apache-2.0 OR MPL-2.0  vendored in apps/fileview/static/vendor/purify.min.js (v3.4.8)
 orca (ADE)        github.com/stablyai/orca          MIT           AppImage downloaded at install (sha-pinned)
 orca web client   github.com/stablyai/orca          MIT           vendored BUILT dist in apps/orca/web-bundle/dist/ (patched; redistributed)
-paseo (CLI)       github.com/getpaseo/paseo         AGPL-3.0      npm i @getpaseo/cli at install (not redistributed)
+paseo (CLI)       github.com/getpaseo/paseo         AGPL-3.0      guarded 0.2.5 package set vendored under apps/paseo/vendor/
 paseo patches     apps/paseo/patches/               AGPL-3.0      our patches — derivative of paseo, see that dir
 paseo web-ui patcher apps/paseo/browse-host/bin/patch-web-ui.js  AGPL-3.0  encodes derivative edits of paseo's web-ui
 paseo browse-host apps/paseo/browse-host/ (ours)    AGPL-3.0      loopback-WS sidecar; needs Playwright (follow-up, not wired in v1)
@@ -50,6 +50,9 @@ Notes
   are NOT redistributed by Airlock; the installer fetches them from upstream and
   verifies sha256 where applicable. Operators accept the upstream terms of those
   binaries.
+- The modified Paseo npm packages are redistributed with checksum, review, source,
+  and license provenance in `apps/paseo/vendor/guarded-0.2.5/`. The corresponding
+  source is the public commit named there.
 - Core license: the Airlock core is AGPL-3.0 (changed from Apache-2.0 on
   2026-09-08 by the copyright holder). Paseo (@getpaseo/cli) is also AGPL-3.0 and
   runs as a SEPARATE PROCESS — the core talks to it over loopback IPC/WS, so the

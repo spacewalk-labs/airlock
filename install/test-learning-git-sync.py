@@ -91,6 +91,13 @@ def committed_names(repo):
     return set(git(repo, "show", "--name-only", "--format=", "HEAD").stdout.split())
 
 
+def clone_writer(remote, path):
+    subprocess.run(["git", "clone", "-q", "--branch", "main", remote, path],
+                   check=True, timeout=60)
+    git(path, "config", "user.email", "writer@example.com")
+    git(path, "config", "user.name", "writer")
+
+
 def main(argv):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     GIT = load(os.path.join(root, "apps/learning/backend/git_sync.py"),
@@ -161,7 +168,9 @@ def main(argv):
         # --- 5. a failed push is loud, and the commit survives ---------------
         repo = os.path.join(tmp, "broken")
         remote = make_repo(repo)
-        shutil.rmtree(remote)
+        reject = os.path.join(remote, "hooks", "pre-receive")
+        write(remote, "hooks/pre-receive", "#!/bin/sh\nexit 1\n")
+        os.chmod(reject, 0o755)
         state = os.path.join(tmp, "broken-state")
         os.makedirs(state)
         write(repo, "engineering/lost.md", "---\ntitle: lost\n---\n\nlost\n")
@@ -171,8 +180,143 @@ def main(argv):
               head_message(repo).startswith("learning:"), head_message(repo))
         check("실패가 상태 파일에 남아 다음 화면에 뜬다",
               (GIT.read_status(state) or {}).get("ok") is False)
+        status = GIT.sync(repo, state, categories)
+        check("다음 no-op tick 도 직전 실패를 성공으로 덮지 않는다",
+              status and status["ok"] is False and status["committed"] == 0
+              and (GIT.read_status(state) or {}).get("ok") is False,
+              str(status))
 
-        # --- 6. a library that is not the repository root is refused ---------
+        # --- 6. remote-only commits are fast-forwarded before app commits ----
+        repo = os.path.join(tmp, "behind")
+        remote = make_repo(repo)
+        writer = os.path.join(tmp, "behind-writer")
+        clone_writer(remote, writer)
+        write(writer, "engineering/remote.md", "---\ntitle: remote\n---\n\nremote\n")
+        git(writer, "add", "engineering/remote.md")
+        git(writer, "commit", "-q", "-m", "remote document")
+        remote_commit = git(writer, "rev-parse", "HEAD").stdout.strip()
+        git(writer, "push", "-q")
+        state = os.path.join(tmp, "behind-state")
+        os.makedirs(state)
+        write(repo, "engineering/local.md", "---\ntitle: local\n---\n\nlocal\n")
+        commands = []
+        real_git = GIT._git
+
+        def recording_git(repo_path, *args):
+            commands.append(args)
+            return real_git(repo_path, *args)
+
+        GIT._git = recording_git
+        try:
+            status = GIT.sync(repo, state, categories)
+        finally:
+            GIT._git = real_git
+        check("원격보다 뒤처졌으면 ff-only 뒤 앱 변경을 push 한다",
+              status and status["ok"] and status["committed"] == 1
+              and status["pushed"], str(status))
+        fetch_at = commands.index(("fetch",)) if ("fetch",) in commands else -1
+        pull_at = commands.index(("pull", "--ff-only")) \
+            if ("pull", "--ff-only") in commands else -1
+        push_at = commands.index(("push",)) if ("push",) in commands else -1
+        check("fetch → pull --ff-only → push 순서를 지킨다",
+              -1 < fetch_at < pull_at < push_at, str(commands))
+        check("원격 커밋이 로컬 이력에 보존된다",
+              git(repo, "merge-base", "--is-ancestor", remote_commit, "HEAD",
+                  check_rc=False).returncode == 0)
+        check("ff-only 뒤의 앱 커밋이 원격에 올라간다",
+              git(repo, "rev-parse", "HEAD").stdout
+              == git(remote, "rev-parse", "main").stdout)
+
+        # A fast-forward may still be impossible when it would overwrite an
+        # untracked app file. Stop with git's diagnostic; never discard the file.
+        repo = os.path.join(tmp, "behind-conflict")
+        remote = make_repo(repo)
+        writer = os.path.join(tmp, "behind-conflict-writer")
+        clone_writer(remote, writer)
+        write(writer, "engineering/same.md", "---\ntitle: remote\n---\n\nremote\n")
+        git(writer, "add", "engineering/same.md")
+        git(writer, "commit", "-q", "-m", "remote same path")
+        git(writer, "push", "-q")
+        local_same = "---\ntitle: local\n---\n\nlocal\n"
+        write(repo, "engineering/same.md", local_same)
+        state = os.path.join(tmp, "behind-conflict-state")
+        os.makedirs(state)
+        before = git(repo, "rev-parse", "HEAD").stdout.strip()
+        status = GIT.sync(repo, state, categories)
+        check("ff-only 가 로컬 파일과 충돌하면 실패로 멈춘다",
+              status and status["ok"] is False and "fast-forward" in status["error"],
+              str(status))
+        check("ff-only 충돌은 로컬 파일과 HEAD 를 보존한다",
+              open(os.path.join(repo, "engineering/same.md"), encoding="utf-8").read()
+              == local_same and git(repo, "rev-parse", "HEAD").stdout.strip() == before)
+
+        # --- 7. divergence stops push and remains loud across no-op ticks ----
+        repo = os.path.join(tmp, "diverged")
+        remote = make_repo(repo)
+        writer = os.path.join(tmp, "diverged-writer")
+        clone_writer(remote, writer)
+        write(writer, "engineering/remote.md", "---\ntitle: remote\n---\n\nremote\n")
+        git(writer, "add", "engineering/remote.md")
+        git(writer, "commit", "-q", "-m", "remote document")
+        git(writer, "push", "-q")
+        write(repo, "engineering/local.md", "---\ntitle: local\n---\n\nlocal\n")
+        git(repo, "add", "engineering/local.md")
+        git(repo, "commit", "-q", "-m", "local document")
+        remote_head = git(remote, "rev-parse", "main").stdout.strip()
+        state = os.path.join(tmp, "diverged-state")
+        os.makedirs(state)
+        commands = []
+        real_git = GIT._git
+
+        def recording_git(repo_path, *args):
+            commands.append(args)
+            return real_git(repo_path, *args)
+
+        GIT._git = recording_git
+        try:
+            status = GIT.sync(repo, state, categories)
+        finally:
+            GIT._git = real_git
+        check("갈라졌으면 push 하지 않고 diverged 로 남긴다",
+              status and status["ok"] is False and status["diverged"] is True,
+              str(status))
+        check("갈라진 로컬 커밋을 원격에 밀지 않는다",
+              not any(args and args[0] == "push" for args in commands)
+              and git(remote, "rev-parse", "main").stdout.strip() == remote_head,
+              str(commands))
+        status = GIT.sync(repo, state, categories)
+        check("다음 no-op tick 도 diverged 를 지우지 않는다",
+              status and status["committed"] == 0 and status["diverged"] is True
+              and (GIT.read_status(state) or {}).get("diverged") is True,
+              str(status))
+
+        write(repo, "engineering/pending.md", "---\ntitle: pending\n---\n\npending\n")
+        head_before = git(repo, "rev-parse", "HEAD").stdout.strip()
+        status = GIT.sync(repo, state, categories)
+        check("갈라졌으면 대기 중인 앱 파일도 stage·commit 하지 않는다",
+              status and status["diverged"] is True
+              and git(repo, "rev-parse", "HEAD").stdout.strip() == head_before
+              and "pending.md" in git(repo, "status", "--porcelain").stdout,
+              str(status))
+
+        offline = remote + ".offline"
+        os.rename(remote, offline)
+        write(repo, "engineering/pending2.md", "---\ntitle: pending2\n---\n\npending2\n")
+        try:
+            status = GIT.sync(repo, state, categories)
+        finally:
+            os.rename(offline, remote)
+        check("갈라진 뒤 fetch 가 실패해도 diverged 와 HEAD 를 보존한다",
+              status and status["ok"] is False and status["diverged"] is True
+              and git(repo, "rev-parse", "HEAD").stdout.strip() == head_before,
+              str(status))
+        git(repo, "reset", "--hard", "origin/main")
+        status = GIT.sync(repo, state, categories)
+        check("사람이 갈라짐을 해결하면 다음 tick 이 경고를 해제한다",
+              status and status["ok"] is True and status["diverged"] is False,
+              str(status))
+
+        # --- 8. a library that is not the repository root is refused ---------
         outer = os.path.join(tmp, "outer")
         make_repo(outer, with_remote=False)
         nested = os.path.join(outer, "library")
@@ -187,7 +331,7 @@ def main(argv):
         check("거부했으면 바깥 저장소에 커밋하지 않았다",
               head_message(outer) == "seed", head_message(outer))
 
-        # --- 7. a plain folder is not an error, it just has nothing to sync --
+        # --- 9. a plain folder is not an error, it just has nothing to sync --
         plain = os.path.join(tmp, "plain", "engineering")
         os.makedirs(plain)
         state = os.path.join(tmp, "plain-state")
@@ -196,7 +340,7 @@ def main(argv):
         check("git 저장소가 아니면 실패로 기록하되 예외는 내지 않는다",
               status is not None and status["ok"] is False, str(status))
 
-        # --- 8. the ticker has its own beat ---------------------------------
+        # --- 10. the ticker has its own beat --------------------------------
         repo = os.path.join(tmp, "beat")
         make_repo(repo)
         state = os.path.join(tmp, "beat-state")
@@ -212,7 +356,7 @@ def main(argv):
         check("force 는 주기를 무시한다",
               forced is not None and forced["committed"] == 1, str(forced))
 
-        # --- 9. the worker calls it, and the server only reads it ------------
+        # --- 11. the worker calls it, and the server only reads it -----------
         runner = open(os.path.join(root, "apps/learning/backend/ingest_runner.py"),
                       encoding="utf-8").read()
         check("워커가 적재 직후 force 로 동기화한다", "git_tick(force=True)" in runner)
@@ -223,7 +367,7 @@ def main(argv):
               "GITSYNC.read_status" in server and "GITSYNC.sync" not in server)
         check("서버가 실패를 경고로 올린다", "git_sync_warnings" in server)
 
-        # --- 10. only the worker unit carries the knob ----------------------
+        # --- 12. only the worker unit carries the knob ----------------------
         render = subprocess.run(
             ["bash", "-c",
              f'. "{root}/apps/learning/render.sh"; '
@@ -244,7 +388,7 @@ def main(argv):
         check("인자를 안 주면 off 로 렌더된다",
               'Environment="AIRLOCK_LEARNING_REPO_SYNC=off"' in omitted)
 
-        # --- 11. every backend module the app ships is actually installed ---
+        # --- 13. every backend module the app ships is actually installed ---
         # 🔴 The copy list is written by hand, and a file missing from it does not
         #    degrade the feature — the module that imports it fails at load, so the
         #    server AND the worker crash-loop. Measured 2026-09-02: git_sync.py was
@@ -261,7 +405,7 @@ def main(argv):
         check("대조기 양성 대조군이 잡힌다",
               "definitely-not-shipped.py" not in installer and bool(shipped))
 
-        # --- 11. the installer refuses a value it does not understand -------
+        # --- 14. the installer refuses a value it does not understand -------
         manifest = open(os.path.join(root, "apps/learning/airlock-app.toml"),
                         encoding="utf-8").read()
         check("기본값이 off 로 선언돼 있다", 'git_sync = "off"' in manifest)

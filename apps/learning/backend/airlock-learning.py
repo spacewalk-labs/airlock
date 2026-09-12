@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""learning-manager — learning 레포 발행 상태를 소유하는 개인앱 백엔드.
+"""Learning — learning 레포 발행 상태를 소유하는 개인앱 백엔드.
 
 수집은 learning 레포의 ``learn.py manifest --json`` 하나에 맡기고, 이 앱은
 manifest의 repo-relative path를 실제 파일·심링크 상태에 다시 결합한다.
@@ -28,7 +28,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.request import urlopen
 
 
 DEFAULT_LIBRARY = "~/learning"
@@ -48,6 +49,9 @@ MANIFEST_STDOUT_MAX_BYTES = 4 << 20
 MANIFEST_STDERR_MAX_BYTES = 16 << 10
 MANIFEST_TIMEOUT_SECONDS = 5
 GIT_TIMEOUT_SECONDS = 3
+OEMBED_TIMEOUT_SECONDS = 2
+OEMBED_MAX_BYTES = 64 << 10
+FREERELAY_TIMEOUT_SECONDS = 15
 # 취소 요청이 유닛 중지를 기다려 주는 예산 = **HTTP 핸들러가 매달릴 시간**이지, 중지가
 # 실패했다고 판정하는 기한이 아니다. 넘으면 실패가 아니라 "접수됐고 아직 멈추는 중"이고
 # 확정은 스윕이 한다.
@@ -64,6 +68,7 @@ GIT_TIMEOUT_SECONDS = 3
 # 러너를 죽었다고 오판한다. 🔴 실측(2026-08-04, 레퍼런스 박스): 1800초를 돈 실제 적재 유닛
 # `20db6e2e`의 ActiveEnterTimestamp가 비어 있다 — oneshot은 active를 한 번도 거치지 않는다.
 VIDEO_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+PUBLIC_SLUG_RE = re.compile(r"\A[a-z0-9][a-z0-9-]{2,63}\Z")
 # 취소 계열. 서버와 러너가 각자 "이미 취소로 기울었나"를 묻는 곳이 넷이라 이름을 준다.
 YOUTUBE_HOSTS = {
     "youtube.com",
@@ -180,11 +185,6 @@ class IngestQueue:
       failure_summary_error TEXT
     );
 
-    -- 🔴 "동시 1건" 의 1차 보장은 워커가 하나라는 사실이고, 이 인덱스는 그 사실이 깨졌을 때
-    --    조용히 두 건이 도는 대신 **쓰기가 실패하게** 만드는 2차 방어선이다.
-    CREATE UNIQUE INDEX IF NOT EXISTS one_running
-      ON attempts(state) WHERE state = 'running';
-
     -- 🔴 같은 영상은 큐에 하나만 살아 있다. 웹앱의 사전 확인(`active_video_ids`)은 SELECT 와
     --    INSERT 사이에 창이 있어, 같은 URL 로 동시에 들어온 세 요청이 **전부 통과했다**(실측).
     --    그 창을 닫는 것은 인덱스뿐이다 — `one_running` 과 같은 자리의 방어선이다.
@@ -265,6 +265,14 @@ class IngestQueue:
         IngestQueue._enable_wal(conn)
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(IngestQueue.SCHEMA)
+        # v2 싱글 슬롯 인덱스는 기존 DB 에 남아 있다. SCHEMA 문자열에
+        # DROP 을 두면 모든 HTTP 연결이 매번 DDL 을 시도하므로, 있을 때만 한 번
+        # 제거한다. 상한은 claim_next 의 BEGIN IMMEDIATE 트랜잭션이 지킨다.
+        legacy = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'one_running'"
+        ).fetchone()
+        if legacy is not None:
+            conn.execute("DROP INDEX IF EXISTS one_running")
         return conn
 
 
@@ -279,12 +287,12 @@ class IngestQueue:
 
 
     @staticmethod
-    def enqueue(conn, url, video_id, now, retry_of=None):
+    def enqueue(conn, url, video_id, now, retry_of=None, title=None, channel=None):
         try:
             cursor = conn.execute(
-                "INSERT INTO attempts (url, video_id, state, created_at, retry_of)"
-                " VALUES (?, ?, 'queued', ?, ?)",
-                (url, video_id, now, retry_of),
+                "INSERT INTO attempts (url, video_id, state, created_at, retry_of, title, channel)"
+                " VALUES (?, ?, 'queued', ?, ?, ?, ?)",
+                (url, video_id, now, retry_of, title, channel),
             )
         except IngestQueue.sqlite3.IntegrityError as exc:
             # `one_live_per_video` 가 막았다 = 그 사이에 같은 영상이 들어왔다.
@@ -302,7 +310,10 @@ class IngestQueue:
     @staticmethod
     def recent(conn, limit=200):
         rows = conn.execute(
-            "SELECT * FROM attempts ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM attempts AS current "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM attempts AS retry WHERE retry.retry_of = current.id"
+            ") ORDER BY current.id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [IngestQueue.row_to_dict(row) for row in rows]
 
@@ -358,19 +369,21 @@ class IngestQueue:
 
 
     @staticmethod
-    def claim_next(conn, now):
+    def claim_next(conn, now, slots=1):
         """가장 오래된 `queued` 한 건을 `running` 으로 옮기고 그 행을 돌려준다.
 
         취소가 요청된 행은 뜨우지 않고 곧바로 `cancelled` 로 종결한다(그래서 돌려주지 않는다).
         """
+        try:
+            limit = max(1, int(slots))
+        except (TypeError, ValueError):
+            limit = 1
         conn.execute("BEGIN IMMEDIATE")
         try:
-            # 이미 도는 건이 있으면 아무것도 집지 않는다. 워커가 하나면 이 조건은 늘 거짓이지만,
-            # 참이 되는 상황(손으로 워커를 하나 더 띄운 경우)에서 `one_running` 인덱스가
-            # IntegrityError 로 터지는 대신 조용히 양보하게 만든다.
-            if conn.execute(
-                "SELECT 1 FROM attempts WHERE state = 'running' LIMIT 1"
-            ).fetchone() is not None:
+            running = conn.execute(
+                "SELECT COUNT(*) FROM attempts WHERE state = 'running'"
+            ).fetchone()[0]
+            if running >= limit:
                 conn.execute("COMMIT")
                 return None
             row = conn.execute(
@@ -468,6 +481,13 @@ GIT_SYNC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "git_sy
 _GIT_SYNC_SPEC = importlib.util.spec_from_file_location("learning_git_sync", GIT_SYNC_PATH)
 GITSYNC = importlib.util.module_from_spec(_GIT_SYNC_SPEC)
 _GIT_SYNC_SPEC.loader.exec_module(GITSYNC)
+
+TIMESTAMP_LINKS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "timestamp_links.py")
+_TIMESTAMP_LINKS_SPEC = importlib.util.spec_from_file_location(
+    "learning_timestamp_links", TIMESTAMP_LINKS_PATH)
+TIMESTAMP_LINKS = importlib.util.module_from_spec(_TIMESTAMP_LINKS_SPEC)
+_TIMESTAMP_LINKS_SPEC.loader.exec_module(TIMESTAMP_LINKS)
 
 
 def normalized_document(repo, relative):
@@ -602,7 +622,7 @@ def library_categories(root):
     return [name for name in entries if is_category_dir(root, name)]
 
 
-FRONTMATTER_KEYS = ("title", "added", "video_id", "source", "channel", "duration",
+FRONTMATTER_KEYS = ("title", "added", "video_id", "source", "channel", "duration", "subs",
                     "upload_date", "url",
                     # 별표와 보관은 **문서 안에** 산다(오너 결정 2, 2026-08-21). 라이브러리
                     # 폴더를 통째로 위키로 옮겨도 상태가 따라가야 하기 때문이다 — 상태가
@@ -1484,6 +1504,66 @@ def write_resurfaced(state_dir, resurfaced):
         raise LearningManagerError(f"재부상 상태를 원자 저장하지 못했습니다: {exc}", 500) from exc
 
 
+def public_share_value(value, error_type=LearningManagerError):
+    """회수에 필요한 공개 주소와 slug만 좁은 로컬 상태로 받는다."""
+    if not isinstance(value, dict):
+        raise error_type("인터넷 공유 상태가 object가 아닙니다", 400)
+    slug = value.get("slug")
+    url = value.get("url")
+    expiry = value.get("expiry")
+    mode = value.get("mode", "open")
+    try:
+        parsed = urlsplit(url) if isinstance(url, str) else None
+    except ValueError:
+        parsed = None
+    if not isinstance(slug, str) or not PUBLIC_SLUG_RE.fullmatch(slug):
+        raise error_type("인터넷 공유 slug가 올바르지 않습니다", 400)
+    if (parsed is None or parsed.scheme not in ("http", "https") or not parsed.netloc
+            or len(url) > 4096):
+        raise error_type("인터넷 공유 주소가 올바르지 않습니다", 400)
+    if type(expiry) is not int or expiry <= 0:
+        raise error_type("인터넷 공유 기한이 올바르지 않습니다", 400)
+    if mode not in ("open", "gated"):
+        raise error_type("인터넷 공유 모드가 올바르지 않습니다", 400)
+    return {"slug": slug, "url": url, "expiry": expiry, "mode": mode}
+
+
+def read_public_shares(state_dir):
+    path = os.path.join(state_dir, "public-shares.json")
+    if not os.path.lexists(path):
+        return {}
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise LearningManagerError(f"인터넷 공유 상태 파일이 일반 파일이 아닙니다: {path}", 500)
+        with open(path, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except LearningManagerError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise LearningManagerError(f"인터넷 공유 상태 JSON을 읽지 못했습니다: {exc}", 500) from exc
+    if not isinstance(data, dict):
+        raise LearningManagerError("인터넷 공유 상태 JSON의 최상위 값이 object가 아닙니다", 500)
+    shares = {}
+    for key, value in data.items():
+        safe_relative(key, "인터넷 공유 상태 path", LearningManagerError)
+        try:
+            shares[key] = public_share_value(value, LearningManagerError)
+        except LearningManagerError as exc:
+            raise LearningManagerError(exc.message, 500) from exc
+    return shares
+
+
+def write_public_shares(state_dir, shares):
+    try:
+        write_json_atomic(
+            os.path.join(state_dir, "public-shares.json"),
+            {key: shares[key] for key in sorted(shares)},
+        )
+    except OSError as exc:
+        raise LearningManagerError(f"인터넷 공유 상태를 원자 저장하지 못했습니다: {exc}", 500) from exc
+
+
 @contextmanager
 def state_lock(state_dir):
     """보관 상태(starred·resurfaced·manifest 캐시)용 lock.
@@ -1607,17 +1687,6 @@ def _ingested_manifest_item(video_id):
     return manifest, None
 
 
-def anthropic_account_diagnostic():
-    """Anthropic 설정의 존재 여부만 보고 실행 계정 위험을 진단한다."""
-    configured = any(
-        name in os.environ
-        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
-    )
-    if configured:
-        return "종량 과금 위험 — 실행이 거부됩니다"
-    return "구독 (API 키 미주입)"
-
-
 def _open_queue():
     """요청마다 연결을 연다. SQLite 연결은 싸고, 오래 들고 있으면 그것이 곧 락 문제가 된다."""
     return QUEUE.connect(configured_paths()["state"])
@@ -1680,34 +1749,84 @@ def _assert_video_available(conn, video_id):
     return _ingested_manifest_item(video_id)
 
 
-def create_ingest_plan(url):
-    """계획은 **서버 상태가 아니다** — 검증하고 확인 다이얼로그가 보여줄 값만 돌려준다."""
-    url = validate_youtube_url(url)
-    video_id = video_id_from_url(url)
-    paths = configured_paths()
-    conn = _open_queue()
+def _display_metadata(payload):
+    """큐 카드에 넣을 제목과 채널만 엄격하게 고른다.
+
+    oEmbed 와 free-relay 둘 다 외부 응답이다. 잘못된 형식을 그대로 DB 와
+    HTML 에 보내지 않고, 제목이 없으면 전체 응답을 실패로 본다.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("메타데이터가 객체가 아닙니다")
+    title = payload.get("title")
+    channel = payload.get("author_name", payload.get("channel"))
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("제목이 없습니다")
+    result = {"title": title.strip()[:500]}
+    if isinstance(channel, str) and channel.strip():
+        result["channel"] = channel.strip()[:300]
+    return result
+
+
+def fetch_oembed_metadata(url):
+    """YouTube oEmbed 에서 카드용 임시 메타데이터를 받는다."""
+    endpoint = (
+        "https://www.youtube.com/oembed?url=" + quote(url, safe="") + "&format=json"
+    )
+    with urlopen(endpoint, timeout=OEMBED_TIMEOUT_SECONDS) as response:
+        raw = response.read(OEMBED_MAX_BYTES + 1)
+    if len(raw) > OEMBED_MAX_BYTES:
+        raise ValueError("oEmbed 응답이 너무 큽니다")
+    return _display_metadata(json.loads(raw.decode("utf-8")))
+
+
+def _freerelay_script():
+    """설치된 free-relay 래퍼 하나를 고른다. 없으면 호출 실패로 처리된다."""
+    for relative in (
+        ".claude/skills/free-relay/freerelay_call.py",
+        ".agents/skills/free-relay/freerelay_call.py",
+    ):
+        path = os.path.join(os.path.expanduser("~"), relative)
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError("free-relay 래퍼를 찾지 못했습니다")
+
+
+def fetch_relay_metadata(url):
+    """oEmbed 실패 때만 freerelay-short 를 한 번 부른다."""
+    prompt = (
+        "다음 YouTube URL의 영상 제목과 채널명을 확인해 JSON 객체 하나로만 "
+        "답하세요. 형식은 "
+        '{"title":"영상 제목","channel":"채널명"}'
+        f"입니다. URL: {url}"
+    )
+    done = subprocess.run(
+        [sys.executable, _freerelay_script(), "--model", "freerelay-short",
+         "--prompt", prompt],
+        capture_output=True, text=True, timeout=FREERELAY_TIMEOUT_SECONDS, check=False,
+    )
+    if done.returncode != 0:
+        raise RuntimeError("free-relay 호출이 실패했습니다")
+    text = (done.stdout or "").strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.IGNORECASE | re.DOTALL)
+    if fenced is not None:
+        text = fenced.group(1).strip()
+    return _display_metadata(json.loads(text))
+
+
+def prefill_ingest_metadata(url):
+    """접수 즉시 표시할 메타데이터. 워커의 META 마커가 나오면 덮어써진다."""
     try:
-        _, item = _assert_video_available(conn, video_id)
-    finally:
-        conn.close()
-    plan = {
-        "url": url,
-        "video_id": video_id,
-        "cwd": paths["repo"],
-        "execution": "/learning-ingest",
-        "account": anthropic_account_diagnostic(),
-    }
-    if item is not None:
-        plan.update({
-            "duplicate": True,
-            "existing_path": item["path"],
-            "existing_title": item.get("title", ""),
-        })
-    return plan
+        return fetch_oembed_metadata(url)
+    except Exception:
+        pass
+    try:
+        return fetch_relay_metadata(url)
+    except Exception:
+        return {"title": url}
 
 
 def create_ingest_run(url):
-    """URL 하나로 큐에 넣는다 — 승인은 클라이언트가 사람에게 받고, 서버는 요청만 받는다.
+    """URL 하나를 검증하고 표시용 제목을 채워 바로 큐에 넣는다.
 
     행 하나를 INSERT 하는 것이 전부다. 워커가 자기 주기에 집어 간다. 예전처럼 여기서
     유닛을 띄우지 않으므로 "띄웠는데 떴는지 모르겠다"(`launching`)는 상태가 없다.
@@ -1741,12 +1860,15 @@ def create_ingest_run(url):
             )
             write_resurfaced(paths["state"], resurfaced)
             return {"duplicate": True, "path": item["path"], "video_id": video_id}
+        metadata = prefill_ingest_metadata(url)
         try:
-            attempt_id = QUEUE.enqueue(conn, url, video_id, _now_iso())
+            attempt_id = QUEUE.enqueue(
+                conn, url, video_id, _now_iso(), title=metadata.get("title"),
+                channel=metadata.get("channel"))
         except QUEUE.DuplicateVideo:
             # 사전 확인과 INSERT 사이에 같은 영상이 들어왔다 — 결과는 사전 확인과 같은 409 다.
             raise RequestError(f"video_id가 이미 큐에 있습니다: {video_id}", 409)
-        return {"id": attempt_id, "status": "queued", "video_id": video_id}
+        return {"id": attempt_id, "status": "queued", "video_id": video_id, **metadata}
     finally:
         conn.close()
 
@@ -1770,8 +1892,10 @@ def retry_ingest(request_id):
         if record["video_id"] in QUEUE.active_video_ids(conn):
             raise RequestError("같은 영상이 이미 큐에 있습니다", 409)
         try:
-            new_id = QUEUE.enqueue(conn, record["url"], record["video_id"], _now_iso(),
-                                   retry_of=attempt_id)
+            new_id = QUEUE.enqueue(
+                conn, record["url"], record["video_id"], _now_iso(),
+                retry_of=attempt_id, title=record.get("title"),
+                channel=record.get("channel"))
         except QUEUE.DuplicateVideo:
             raise RequestError("같은 영상이 이미 큐에 있습니다", 409)
         return {"id": new_id, "status": "queued", "retry_of": attempt_id}
@@ -2186,6 +2310,25 @@ def publish_path(path):
                 "sibling": sibling}
 
 
+def set_public_share(path, share):
+    """브라우저가 받은 publish 결과를 문서별 회수 포인터로 보존한다."""
+    paths = configured_paths()
+    path = safe_relative(path, "path", RequestError)
+    with state_lock(paths["state"]):
+        manifest = collect_manifest()
+        item = validate_item(manifest, path)
+        require_mutable(item)
+        shares = read_public_shares(paths["state"])
+        if share is None:
+            shares.pop(path, None)
+            stored = None
+        else:
+            stored = public_share_value(share, RequestError)
+            shares[path] = stored
+        write_public_shares(paths["state"], shares)
+    return {"ok": True, "path": path, "share": stored}
+
+
 def unpublish_path(path):
     paths = configured_paths()
     with state_lock(paths["state"]):
@@ -2301,6 +2444,125 @@ def rewrite_asset_refs(body):
     return DOC_ASSET_REF.sub(b"../_assets/", body)
 
 
+READER_SHELL_STYLE = r"""<!-- LEARNING_READER_SHELL_STYLE -->
+<style id="learning-reader-shell-style">
+:root{--learning-reader-scale:1}html{font-size:calc(100% * var(--learning-reader-scale))}
+html[data-learning-reader-theme=light]{color-scheme:light}html[data-learning-reader-theme=dark]{color-scheme:dark}
+html[data-learning-reader-theme=dark] body{background:#111214!important;color:#f2f2f7!important}html[data-learning-reader-theme=dark] a{color:#6eb4ff!important}html[data-learning-reader-theme=dark] h1,html[data-learning-reader-theme=dark] h2,html[data-learning-reader-theme=dark] h3,html[data-learning-reader-theme=dark] h4,html[data-learning-reader-theme=dark] h5,html[data-learning-reader-theme=dark] h6,html[data-learning-reader-theme=dark] th,html[data-learning-reader-theme=dark] td,html[data-learning-reader-theme=dark] strong,html[data-learning-reader-theme=dark] b{color:#f2f2f7!important}html[data-learning-reader-theme=dark] .meta,html[data-learning-reader-theme=dark] blockquote,html[data-learning-reader-theme=dark] figcaption,html[data-learning-reader-theme=dark] small{color:#a8b0bf!important}html[data-learning-reader-theme=dark] h2,html[data-learning-reader-theme=dark] hr,html[data-learning-reader-theme=dark] table,html[data-learning-reader-theme=dark] th,html[data-learning-reader-theme=dark] td,html[data-learning-reader-theme=dark] blockquote{border-color:#2b3752!important}html[data-learning-reader-theme=dark] th{background:#1d2740!important}html[data-learning-reader-theme=dark] code,html[data-learning-reader-theme=dark] pre{background:#1d2740!important;color:#f2f2f7!important}
+@media(prefers-color-scheme:dark){html[data-learning-reader-theme=auto]{color-scheme:dark}html[data-learning-reader-theme=auto] body{background:#111214!important;color:#f2f2f7!important}html[data-learning-reader-theme=auto] a{color:#6eb4ff!important}}
+#learning-reader-toolbar{position:fixed;z-index:2147483646;top:0;left:0;right:0;height:48px;padding:env(safe-area-inset-top) 8px 0;box-sizing:content-box;display:flex;align-items:center;justify-content:flex-start;gap:3px;overflow-x:auto;background:color-mix(in srgb,Canvas 92%,transparent);color:CanvasText;border-bottom:1px solid color-mix(in srgb,CanvasText 16%,transparent);backdrop-filter:blur(18px);font:16px/1 -apple-system,BlinkMacSystemFont,sans-serif}
+#learning-reader-toolbar button{appearance:none;border:0;border-radius:9px;min-width:38px;height:38px;padding:0 7px;background:transparent;color:inherit;font:inherit;cursor:pointer}#learning-reader-toolbar button:hover{background:color-mix(in srgb,CanvasText 9%,transparent)}#learning-reader-toolbar button:disabled{opacity:.35;cursor:default}#learning-reader-font-value{min-width:46px;text-align:center;font-size:12px;font-variant-numeric:tabular-nums}#learning-reader-spacer{height:calc(49px + env(safe-area-inset-top))}
+#learning-reader-toast{position:fixed;z-index:2147483647;left:50%;bottom:28px;transform:translateX(-50%);display:none;max-width:min(86vw,420px);padding:9px 13px;border-radius:999px;color:#fff;background:rgba(28,28,30,.94);font:13px/1.35 -apple-system,BlinkMacSystemFont,sans-serif}
+#learning-reader-share{position:fixed;z-index:2147483647;inset:0;display:none;align-items:flex-end;justify-content:center;padding:18px;background:rgba(0,0,0,.28);font:15px/1.4 -apple-system,BlinkMacSystemFont,sans-serif}#learning-reader-share.is-open{display:flex}.learning-reader-sheet{width:min(520px,100%);padding:18px;border-radius:18px;background:Canvas;color:CanvasText;box-shadow:0 18px 70px rgba(0,0,0,.28)}.learning-reader-sheet-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.learning-reader-sheet-head strong{font-size:18px}.learning-reader-sheet button{border:0;border-radius:9px;padding:9px 12px;background:color-mix(in srgb,CanvasText 9%,Canvas);color:inherit}.learning-reader-segments{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;border-radius:11px;background:color-mix(in srgb,CanvasText 8%,Canvas)}.learning-reader-segments button[aria-pressed=true]{background:Canvas;box-shadow:0 1px 4px rgba(0,0,0,.18)}#learning-reader-share-description{margin:13px 2px;min-height:42px;color:GrayText;font-size:13px}.learning-reader-address{display:flex;gap:7px}#learning-reader-share-url{min-width:0;flex:1;padding:9px 10px;border:1px solid color-mix(in srgb,CanvasText 15%,Canvas);border-radius:9px;background:Canvas;color:CanvasText;font:12px/1.3 ui-monospace,monospace}#learning-reader-public-options{display:none;margin-top:12px;padding-top:12px;border-top:1px solid color-mix(in srgb,CanvasText 12%,transparent);font-size:13px}#learning-reader-public-options.is-visible{display:grid;gap:9px}#learning-reader-password{display:none;box-sizing:border-box;width:100%;padding:8px;border:1px solid GrayText;border-radius:8px}#learning-reader-password.is-visible{display:block}#learning-reader-revoke-note{display:none;margin:12px 2px 0;color:GrayText;font-size:12px}.learning-reader-transcript-note{margin:32px auto 12px;color:#8e8e93;font:12px/1.5 -apple-system,BlinkMacSystemFont,sans-serif}
+</style>"""
+
+READER_SHARED_CSS = '<link rel="stylesheet" href="../_assets/swk-doc.css">'
+READER_SHARED_JS = '<script type="module" src="../_assets/swk-doc.js"></script>'
+
+READER_SHELL_BODY = r"""<!-- LEARNING_READER_SHELL -->
+<div id="learning-reader-spacer" aria-hidden="true"></div>
+<nav id="learning-reader-toolbar" aria-label="문서 도구">
+<button type="button" data-reader-action="back" title="목록" aria-label="목록">←</button><button type="button" data-reader-action="copy-link" title="링크 복사" aria-label="링크 복사">🔗</button><button type="button" data-reader-action="copy-markdown" title="내용 복사" aria-label="내용 복사">📋</button><button type="button" data-reader-action="font-down" title="글자 작게" aria-label="글자 작게">−</button><output id="learning-reader-font-value" title="글자 크기" aria-label="글자 크기">100%</output><button type="button" data-reader-action="font-up" title="글자 크게" aria-label="글자 크게">＋</button><button type="button" data-reader-action="theme" title="테마" aria-label="테마">☾</button><button type="button" data-reader-action="star" title="별표" aria-label="별표">☆</button><button type="button" data-reader-action="more" title="더보기" aria-label="더보기">⋯</button>
+</nav><div id="learning-reader-toast" role="status" aria-live="polite"></div>
+<div id="learning-reader-share" role="dialog" aria-modal="true" aria-labelledby="learning-reader-share-title"><section class="learning-reader-sheet"><div class="learning-reader-sheet-head"><strong id="learning-reader-share-title">공유</strong><button type="button" data-share-close title="닫기" aria-label="닫기">×</button></div><div class="learning-reader-segments" role="group" aria-label="공유 범위"><button type="button" data-share-level="private" aria-pressed="true">나만</button><button type="button" data-share-level="company" aria-pressed="false">회사</button><button type="button" data-share-level="internet" aria-pressed="false">인터넷</button></div><p id="learning-reader-share-description"></p><div class="learning-reader-address"><input id="learning-reader-share-url" readonly aria-label="공유 주소"><button type="button" data-share-copy>복사</button></div><div id="learning-reader-public-options"><span>30일 뒤 자동 회수</span><label><input id="learning-reader-password-enabled" type="checkbox"> 비밀번호</label><input id="learning-reader-password" type="password" autocomplete="new-password" placeholder="비밀번호" aria-label="공개 링크 비밀번호"><button type="button" data-share-publish>인터넷 공유 시작</button><button type="button" data-share-renew>30일 연장</button></div><p id="learning-reader-revoke-note">링크를 회수해도 이미 받은 사람의 사본은 남습니다</p></section></div>
+<script id="learning-reader-shell-script">(function(){"use strict";
+var c=window.__LEARNING_READER__||{},F=[100,112,125,140,160],T=["Auto","Light","Dark"],FK="learning-reader-font-size",TK="learning-reader-theme",pk="learning-reader-public:"+(c.path||location.pathname),timer;
+function get(k,d){try{return localStorage.getItem(k)||d}catch(_){return d}}function put(k,v){try{localStorage.setItem(k,v)}catch(_){}}function toast(m){var n=document.getElementById("learning-reader-toast");n.textContent=m;n.style.display="block";clearTimeout(timer);timer=setTimeout(function(){n.style.display="none"},1800)}
+// TESTABLE:READER_CLIPBOARD_FALLBACK — plain HTTP has no navigator.clipboard.
+async function copyText(t){if(navigator.clipboard&&typeof navigator.clipboard.writeText==="function"){try{await navigator.clipboard.writeText(t);return}catch(_){}}var f=document.createElement("textarea");f.value=t;f.setAttribute("readonly","");f.style.cssText="position:fixed;opacity:0;pointer-events:none";document.body.appendChild(f);f.focus();f.select();f.setSelectionRange(0,f.value.length);var ok=false;try{ok=document.execCommand("copy")}finally{f.remove()}if(!ok)throw new Error("copy failed")}
+function root(){var m=location.pathname.indexOf("/read/");return m<0?"../":location.pathname.slice(0,m+1)}function companyUrl(){return c.publicName?new URL("/publish/files/"+encodeURIComponent(c.publicName),location.origin).href:""}function ps(){try{return JSON.parse(get(pk,"null"))}catch(_){return null}}function setps(v){if(v)put(pk,JSON.stringify(v));else try{localStorage.removeItem(pk)}catch(_){}}if(c.publicShare)setps(c.publicShare);else setps(null);async function post(u,b){var r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}),j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||"요청에 실패했습니다");return j}
+var font=Number(get(FK,"100"));if(F.indexOf(font)<0)font=100;function af(){document.documentElement.style.setProperty("--learning-reader-scale",String(font/100));document.getElementById("learning-reader-font-value").textContent=font+"%";put(FK,String(font))}function mf(d){var i=F.indexOf(font);font=F[Math.max(0,Math.min(F.length-1,i+d))];af()}
+var theme=get(TK,"Auto");if(T.indexOf(theme)<0)theme="Auto";function dark(){return theme==="Dark"||(theme==="Auto"&&matchMedia("(prefers-color-scheme: dark)").matches)}function at(){document.documentElement.dataset.learningReaderTheme=theme.toLowerCase();var b=document.querySelector('[data-reader-action="theme"]');b.textContent=dark()?"☀":"☾";b.title="테마: "+theme;b.setAttribute("aria-label","테마: "+theme);put(TK,theme)}function ct(){theme=T[(T.indexOf(theme)+1)%T.length];at();toast("테마 "+theme)}
+var star=!!c.starred;function paint(){var b=document.querySelector('[data-reader-action="star"]');b.textContent=star?"★":"☆";b.disabled=!c.mutable}async function toggle(){if(!c.mutable)return;try{await post(root()+"api/star",{path:c.path,starred:!star});star=!star;paint();toast(star?"별표했습니다":"별표를 해제했습니다")}catch(e){toast(e.message)}}
+function level(v){document.querySelectorAll("[data-share-level]").forEach(function(b){b.setAttribute("aria-pressed",String(b.dataset.shareLevel===v))});var d={private:"나만 앱 안에서 볼 수 있습니다.",company:"회사 구성원 모두가 볼 수 있습니다.",internet:"인터넷 링크를 아는 사람이 30일 동안 볼 수 있습니다."};document.getElementById("learning-reader-share-description").textContent=d[v];var s=ps(),u=v==="internet"&&s?s.url:(v==="company"?companyUrl():location.href),a=document.getElementById("learning-reader-share-url"),p=document.getElementById("learning-reader-password-enabled");a.value=u||"설정을 적용하면 주소가 생깁니다";document.querySelector("[data-share-copy]").disabled=!u;document.getElementById("learning-reader-public-options").classList.toggle("is-visible",v==="internet");document.querySelector("[data-share-publish]").style.display=v==="internet"&&!s?"":"none";document.querySelector("[data-share-renew]").style.display=v==="internet"&&s?"":"none";p.disabled=!!s;if(s){p.checked=s.mode==="gated";document.getElementById("learning-reader-password").classList.remove("is-visible")}document.getElementById("learning-reader-revoke-note").style.display=s&&v!=="internet"?"block":"none"}
+async function company(){var r=await post(root()+"api/publish",{path:c.path});c.published=true;c.publicName=r.name}async function remember(s){if(s)setps(s);await post(root()+"api/public-share",{path:c.path,share:s});setps(s)}async function revoke(){var s=ps();if(!s||!s.slug)return;var r=await fetch("/publish/api/public-revoke",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({slug:s.slug})}),j=await r.json();if((!r.ok||!j.ok)&&j.error!=="not found")throw new Error(j.error||"공개 링크를 회수하지 못했습니다");await remember(null)}async function publishInternet(){if(!c.mutable)return toast("이 문서는 공유 상태를 바꿀 수 없습니다");if(ps())return toast("이미 인터넷에 공유 중입니다");var gated=document.getElementById("learning-reader-password-enabled").checked,pw=gated?document.getElementById("learning-reader-password").value:"";if(gated&&!pw)return toast("비밀번호를 입력하세요");try{await company();var r=await post("/publish/api/publish-public",{name:c.publicName,ttl_hours:720,mode:gated?"gated":"open",password:pw});try{await remember(r.result)}catch(e){try{await post("/publish/api/public-revoke",{slug:r.result.slug});setps(null)}catch(_){}throw e}level("internet");toast("인터넷 공유 링크를 만들었습니다")}catch(e){toast(e.message)}}async function choose(v){if(!c.mutable)return toast("이 문서는 공유 상태를 바꿀 수 없습니다");if(v==="internet")return level(v);var had=!!ps(),current=had?"internet":c.published?"company":"private";if(v===current)return level(v);try{if(v==="private"){await revoke();if(c.published)await post(root()+"api/unpublish",{path:c.path});c.published=false}if(v==="company"){await revoke();await company()}level(v);if(had)document.getElementById("learning-reader-revoke-note").style.display="block";toast(v==="company"?"회사에 공유했습니다":"공유를 껐습니다")}catch(e){toast(e.message)}}async function renew(){var s=ps();if(!s||!s.slug)return toast("먼저 인터넷 공유를 켜세요");try{var r=await post("/publish/api/public-set-expiry",{slug:s.slug,ttl_hours:720});s.expiry=r.expiry;await remember(s);toast("30일 연장했습니다")}catch(e){toast(e.message)}}
+function open(){document.getElementById("learning-reader-share").classList.add("is-open");level(ps()?"internet":c.published?"company":"private")}function close(){document.getElementById("learning-reader-share").classList.remove("is-open")}
+document.querySelector('[data-reader-action="back"]').onclick=function(){try{if(parent!==window&&parent.location.origin===location.origin){parent.history.back();return}}catch(_){}location.assign(root())};document.querySelector('[data-reader-action="copy-link"]').onclick=async function(){try{await copyText(location.href);toast("링크를 복사했습니다")}catch(_){toast("복사하지 못했습니다")}};document.querySelector('[data-reader-action="copy-markdown"]').onclick=async function(){try{var r=await fetch(root()+"api/markdown/"+c.markdownPath);if(!r.ok)throw new Error();await copyText(await r.text());toast("내용을 복사했습니다")}catch(_){toast("내용을 복사하지 못했습니다")}};document.querySelector('[data-reader-action="font-down"]').onclick=function(){mf(-1)};document.querySelector('[data-reader-action="font-up"]').onclick=function(){mf(1)};document.querySelector('[data-reader-action="theme"]').onclick=ct;document.querySelector('[data-reader-action="star"]').onclick=toggle;document.querySelector('[data-reader-action="more"]').onclick=open;document.querySelector("[data-share-close]").onclick=close;document.querySelectorAll("[data-share-level]").forEach(function(b){b.onclick=function(){choose(b.dataset.shareLevel)}});document.querySelector("[data-share-copy]").onclick=async function(){try{await copyText(document.getElementById("learning-reader-share-url").value);toast("주소를 복사했습니다")}catch(_){toast("복사하지 못했습니다")}};document.querySelector("[data-share-publish]").onclick=publishInternet;document.querySelector("[data-share-renew]").onclick=renew;document.getElementById("learning-reader-password-enabled").onchange=function(e){document.getElementById("learning-reader-password").classList.toggle("is-visible",e.target.checked)};document.getElementById("learning-reader-share").onclick=function(e){if(e.target===e.currentTarget)close()};document.addEventListener("keydown",function(e){if(e.key==="Escape")close()});af();at();paint();function annotate(){if(!c.subsAuto)return;var q=document.querySelector("blockquote");if(q&&/자동\s*자막/.test(q.textContent||""))q.hidden=true;if(document.querySelector("p.sub-note, p.learning-reader-transcript-note"))return;var n=document.createElement("p");n.className="learning-reader-transcript-note";n.textContent="* 자동 자막 생성이 기반입니다. 단어나 용어가 흔들릴 수 있습니다.";document.body.appendChild(n)}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",annotate,{once:true});else annotate()}());</script>"""
+
+
+def markdown_body(blob):
+    """저장 헬퍼가 인정한 프론트매터만 걷은 UTF-8 본문."""
+    bounds = SAVE.frontmatter_bounds(blob)
+    if bounds is None:
+        return blob.decode("utf-8-sig", "replace")
+    lines, _start, end = bounds
+    return b"\n".join(lines[end + 1:]).decode("utf-8", "replace")
+
+
+def reader_context(relative):
+    """읽기 경로를 실제 manifest 항목에 결합한다. 실패하면 읽기는 유지하고 변경만 막는다."""
+    paths = configured_paths()
+    markdown_relative = relative[:-5] + ".md"
+    item = None
+    starred = False
+    published = False
+    public_name = None
+    public_share = None
+    try:
+        with state_lock(paths["state"]):
+            manifest = collect_manifest()
+            item = next(
+                (candidate for candidate in manifest["items"]
+                 if candidate.get("html_path") == relative), None)
+            if item is not None:
+                markdown_relative = item["path"]
+                view = item_view(item, scan_links(paths["repo"], paths["public"], manifest))
+                starred = document_flag(paths["repo"], manifest, markdown_relative, "starred") \
+                    or markdown_relative in read_starred(paths["state"])
+                published = bool(view.get("published"))
+                public_name = view.get("public_name")
+                shares = read_public_shares(paths["state"])
+                public_share = shares.get(markdown_relative)
+                if public_share and public_share["expiry"] <= int(time.time()):
+                    shares.pop(markdown_relative, None)
+                    write_public_shares(paths["state"], shares)
+                    public_share = None
+    except (LearningManagerError, OSError):
+        pass
+    try:
+        markdown_path = repo_path(paths["repo"], markdown_relative, error_type=RequestError)
+        fields, _heading, has_block = read_front_matter(markdown_path)
+    except LearningManagerError:
+        fields, has_block = {}, False
+    return {
+        "path": markdown_relative,
+        "markdownPath": "/".join(quote(part, safe="") for part in markdown_relative.split("/")),
+        "mutable": bool(item and item.get("mutable")),
+        "starred": starred,
+        "published": published,
+        "publicName": public_name,
+        "publicShare": public_share,
+        "subsAuto": has_block and str(fields.get("subs", "")).strip().lower() == "auto",
+        "videoUrl": fields.get("url") if has_block else None,
+    }
+
+
+def inject_reader_shell(body, context):
+    """라이브러리 `/read/` 응답에만 런타임 셸을 씌운다."""
+    page = body.decode("utf-8", "replace")
+    page, _linked = TIMESTAMP_LINKS.link_timestamps(page, context.get("videoUrl"))
+    config = "<script>window.__LEARNING_READER__ = " + script_payload(context) + ";</script>"
+    shared_assets = ""
+    if not re.search(r"(?:href|src)\s*=\s*([\"'])[^\"']*swk-doc\.css(?:[?#][^\"']*)?\1",
+                     page, re.IGNORECASE):
+        shared_assets += READER_SHARED_CSS
+    if not re.search(r"(?:href|src)\s*=\s*([\"'])[^\"']*swk-doc\.js(?:[?#][^\"']*)?\1",
+                     page, re.IGNORECASE):
+        shared_assets += READER_SHARED_JS
+    if re.search(r"</head\s*>", page, re.IGNORECASE):
+        page = re.sub(r"</head\s*>", shared_assets + READER_SHELL_STYLE + "</head>", page,
+                      count=1, flags=re.IGNORECASE)
+    else:
+        page = shared_assets + READER_SHELL_STYLE + page
+    shell = config + READER_SHELL_BODY
+    body_tag = re.search(r"<body(?:\s[^>]*)?>", page, re.IGNORECASE)
+    if body_tag:
+        page = page[:body_tag.end()] + shell + page[body_tag.end():]
+    else:
+        page = shell + page
+    return page.encode("utf-8")
+
+
 def snapshot_or_failure():
     try:
         snapshot = build_snapshot()
@@ -2391,7 +2653,7 @@ def inventory(fix=False):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "learning-manager"
+    server_version = "Learning"
 
     def log_message(self, format_string, *args):
         return
@@ -2478,7 +2740,26 @@ class Handler(BaseHTTPRequestHandler):
                 body = stream.read()
         except OSError as exc:
             return self._send_json(404, {"error": f"렌더본을 읽지 못했습니다: {exc}"})
-        return self._send_bytes(200, rewrite_asset_refs(body), "text/html; charset=utf-8")
+        body = rewrite_asset_refs(body)
+        return self._send_bytes(
+            200, inject_reader_shell(body, reader_context(relative)), "text/html; charset=utf-8")
+
+    def _markdown_doc(self, relative):
+        """원본 Markdown의 프론트매터를 제외한 본문만 내준다."""
+        paths = configured_paths()
+        try:
+            relative = safe_relative(relative, "마크다운 경로")
+            if not relative.endswith(".md"):
+                raise RequestError("원문은 .md 입니다", 400)
+            target = repo_path(paths["repo"], relative, error_type=RequestError)
+        except LearningManagerError as exc:
+            return self._send_json(exc.code, exc.payload())
+        try:
+            with open(target, "rb") as stream:
+                body = markdown_body(stream.read()).encode("utf-8")
+        except OSError as exc:
+            return self._send_json(404, {"error": f"원문을 읽지 못했습니다: {exc}"})
+        return self._send_bytes(200, body, "text/markdown; charset=utf-8")
 
     ASSET_TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
 
@@ -2534,8 +2815,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True})
         if path.startswith("/doc/"):
             return self._published_doc(unquote(path[len("/doc/"):]))
+        read_asset = re.fullmatch(r"/read/(?:.*/)?_assets/([^/]+)", path)
+        if read_asset:
+            # `../_assets/` 는 문서 깊이에 따라 `/read/.../_assets/` 로 풀린다. 어느
+            # 깊이에서도 같은 검증·콘텐츠 타입을 쓰도록 기존 자산 서빙으로 모은다.
+            return self._published_asset(unquote(read_asset.group(1)))
         if path.startswith("/read/"):
             return self._library_doc(unquote(path[len("/read/"):]))
+        if path.startswith("/api/markdown/"):
+            return self._markdown_doc(unquote(path[len("/api/markdown/"):]))
         if path.startswith("/_assets/"):
             # `/doc/…` 이 내주는 문서의 자산 참조가 여기로 온다(`rewrite_asset_refs` 참고). 앱 오리진에서
             # 이걸 안 내주면 뷰어 안 문서가 스타일을 잃는다(실측: 무장식 텍스트로 렌더).
@@ -2566,9 +2854,6 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         try:
             body = self._read_json()
-            if path == "/api/ingest/plan":
-                result = create_ingest_plan(body.get("url"))
-                return self._send_json(200, result)
             if path == "/api/ingest/run":
                 result = create_ingest_run(body.get("url"))
                 return self._send_json(202, result)
@@ -2588,6 +2873,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send_json(200, result)
             if path == "/api/publish":
                 result = publish_path(self._post_path(body))
+                return self._send_json(200, result)
+            if path == "/api/public-share":
+                result = set_public_share(self._post_path(body), body.get("share"))
                 return self._send_json(200, result)
             if path == "/api/unpublish":
                 result = unpublish_path(self._post_path(body))
@@ -2623,7 +2911,7 @@ class Server(ThreadingHTTPServer):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="learning-manager")
+    parser = argparse.ArgumentParser(description="Learning")
     parser.add_argument("--inventory", action="store_true")
     parser.add_argument("--fix-links", action="store_true")
     args = parser.parse_args(argv)

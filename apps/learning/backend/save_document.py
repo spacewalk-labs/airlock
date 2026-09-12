@@ -22,7 +22,8 @@
 
 CLI:
 
-    python3 save_document.py --path <라이브러리 상대경로>.md [--video-id ID]
+    python3 save_document.py --path [<폴더>/]<YYYY-MM-DD>--<슬러그>--<video_id>.md
+                             [--video-id ID]
                              [--library ROOT] [--from FILE] [--receipt PATH]
 
 내용은 `--from` 이 없으면 표준입력에서 읽는다. 성공하면 영수증 JSON 한 줄을 표준출력에
@@ -62,9 +63,19 @@ DOCUMENT_MIN_BYTES = 400
 #    라이브러리 루트 바로 아래이거나, 카테고리 폴더 한 단계 아래.
 DOCUMENT_PATH_RE = re.compile(r"\A(?:[^/\s]+/)?[^/\s]+\.md\Z")
 
+# 새 적재 문서의 basename. 기존 문서는 사용자가 이름을 바꾸지 않아도 계속 읽고 상태를
+# 고칠 수 있어야 하므로, 이 규칙은 `save()` 가 **빈 자리**에 새 문서를 쓸 때만 적용한다.
+# 날짜는 모양뿐 아니라 실제 달력 날짜인지도 확인한다(`2026-02-31` 같은 값은 거절).
+NEW_DOCUMENT_NAME_RE = re.compile(
+    r"\A(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})--"
+    r"(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)--"
+    r"(?P<video_id>[A-Za-z0-9_-]{1,128})\.md\Z")
+
 # 프론트매터 블록을 줄 단위로 훑는다.
 VIDEO_ID_RE = re.compile(  # noqa: regex-anchor  # 프론트매터 블록을 줄 단위로 읽는다 — 여기의 ^$ 는 값 검증이 아니라 줄 경계다
     rb'^video_id:[ \t]*"?([A-Za-z0-9_-]{1,128})"?[ \t\r]*$', re.MULTILINE)
+ADDED_RE = re.compile(  # noqa: regex-anchor  # 프론트매터 블록을 줄 단위로 읽는다 — 여기의 ^$ 는 줄 경계다
+    rb'^added:[ \t]*"?([0-9]{4}-[0-9]{2}-[0-9]{2})"?[ \t\r]*$', re.MULTILINE)
 
 RECEIPT_SCHEMA = 1
 # 적재의 단계. 지금 이 헬퍼가 증명할 수 있는 것은 첫 단계뿐이다 — 렌더와 발행은 뒤에
@@ -175,6 +186,14 @@ def frontmatter_video_id(blob):
     return found.group(1).decode("ascii", "replace") if found else None
 
 
+def frontmatter_added(blob):
+    front = frontmatter_block(blob)
+    if front is None:
+        return None
+    found = ADDED_RE.search(front)
+    return found.group(1).decode("ascii", "replace") if found else None
+
+
 def document_defect(blob, relative, video_id=None):
     """학습자료로 볼 수 없으면 (reason, 사람 문장). 통과하면 (None, None).
 
@@ -231,6 +250,40 @@ def resolve_in_library(library, relative):
     #    로 실패했다 — 같은 문자열을 두 번 찍으면서(적대검증 2026-08-22). 고칠 자리는
     #    어느 철자를 싣느냐가 아니라 **철자로 맞대 본 것** 쪽이었다.
     return target, candidate
+
+
+def new_document_name_defect(relative, document_video_id, document_added):
+    """신규 문서 이름이 고정 계약과 다르면 (reason, 사람 문장), 맞으면 (None, None)."""
+    basename = relative.rsplit("/", 1)[-1]
+    matched = NEW_DOCUMENT_NAME_RE.fullmatch(basename)
+    if matched is None:
+        return "filename-shape", (
+            f"새 문서 이름이 규칙에 맞지 않습니다: {relative!r} — "
+            "`<적재일 YYYY-MM-DD>--<영문 소문자·숫자·붙임표 슬러그>--<video_id>.md` "
+            "형식이어야 합니다")
+    try:
+        datetime.strptime(matched.group("date"), "%Y-%m-%d")
+    except ValueError:
+        return "filename-shape", (
+            f"새 문서 이름의 적재일이 실제 날짜가 아닙니다: {relative!r}")
+    if not document_added:
+        return "filename-date", (
+            f"새 문서 이름의 적재일을 확인할 수 없습니다: {relative!r} — "
+            "프론트매터에 added: YYYY-MM-DD 를 적으십시오")
+    if matched.group("date") != document_added:
+        return "filename-date", (
+            f"새 문서 이름의 적재일={matched.group('date')}, "
+            f"문서 added={document_added}: {relative!r}")
+    if not document_video_id:
+        return "filename-video-id", (
+            f"새 문서 이름의 video_id 를 확인할 수 없습니다: {relative!r} — "
+            "프론트매터에 video_id 를 적으십시오")
+    if matched.group("video_id") != document_video_id:
+        return "filename-video-id", (
+            f"새 문서 이름의 video_id={matched.group('video_id')}, "
+            f"문서={document_video_id}: "
+            f"{relative!r}")
+    return None, None
 
 
 # --- 문서 단위 락 ---
@@ -494,6 +547,13 @@ def save(library, relative, blob, video_id=None, state_dir=None, receipt_path=No
                 f"그 자리에 이미 다른 문서가 있습니다: {relative}"
                 + (f" (그 문서의 video_id={existing})" if existing else "")
                 + " — 덮어쓰지 않습니다. 다른 이름을 고르십시오"))
+        # 이미 있던 문서의 이름은 이 계약을 도입하기 전 모양이어도 그대로 둔다. 새 이름만
+        # 강제해야 목록이 앞으로 정돈되면서 기존 링크와 사용자 문서는 깨지지 않는다.
+        if existing is FREE:
+            name_reason, name_message = new_document_name_defect(
+                relative, frontmatter_video_id(blob), frontmatter_added(blob))
+            if name_reason is not None:
+                raise SaveError(name_reason, name_message)
         warnings += atomic_write(target, blob)
         # 🔴 렌더된 짝은 **같은 락 안에서** 함께 들어간다. 이 파일이 없으면 그 문서는
         #    영원히 공유할 수 없다 — publish 로 나가는 것은 `.md` 가 아니라 `.html` 이고,
@@ -555,7 +615,8 @@ def main(argv=None):
         prog="save_document.py",
         description="학습 문서를 라이브러리에 원자적으로 저장하고 영수증을 낸다")
     parser.add_argument("--path", required=True,
-                        help="라이브러리 상대경로 (이름.md 또는 카테고리/이름.md)")
+                        help=("라이브러리 상대경로 "
+                              "([카테고리/]YYYY-MM-DD--슬러그--video_id.md)"))
     parser.add_argument("--library", default=None,
                         help="라이브러리 루트 (기본: AIRLOCK_LEARNING_LIBRARY)")
     parser.add_argument("--video-id", default=None,

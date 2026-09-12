@@ -153,6 +153,18 @@ def _upstream(repo):
     return out.strip() if rc == 0 and out.strip() else None
 
 
+def _ahead_behind(repo):
+    """Return commits unique to HEAD and its upstream, in that order."""
+    rc, out, err = _git(repo, "rev-list", "--left-right", "--count", "HEAD...@{u}")
+    if rc != 0:
+        return None, None, f"git 이력 비교가 실패했습니다: {err.strip() or rc}"
+    try:
+        ahead, behind = (int(value) for value in out.split())
+    except (TypeError, ValueError):
+        return None, None, "git 이력 비교 결과를 이해할 수 없습니다"
+    return ahead, behind, None
+
+
 def sync(repo, state_dir, categories, log=None):
     """Commit (and push, when there is an upstream) the library's documents.
 
@@ -162,13 +174,17 @@ def sync(repo, state_dir, categories, log=None):
     if mode() == MODE_OFF:
         return None
 
+    previous = read_status(state_dir)
+    previous_diverged = isinstance(previous, dict) and previous.get("diverged") is True
+
     def say(line):
         if log is not None:
             log(line)
 
-    def record(ok, error, committed=0, pushed=False):
+    def record(ok, error, committed=0, pushed=False, diverged=False):
         payload = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "ok": ok,
-                   "error": error, "committed": committed, "pushed": pushed}
+                   "error": error, "committed": committed, "pushed": pushed,
+                   "diverged": diverged}
         _write_status(state_dir, payload)
         return payload
 
@@ -178,41 +194,107 @@ def sync(repo, state_dir, categories, log=None):
 
     specs = _pathspecs(repo, categories)
     if not specs:
-        # No category directories yet. Not an error — a new library is empty.
-        return record(True, None)
-
-    changed, err = _changed(repo, specs)
-    if err:
-        return record(False, err)
-    if not changed:
-        return record(True, None)
-
-    # 🔴 여기서 pathspec 을 다시 쓰지 않고 **방금 관측한 경로**를 그대로 스테이징한다.
-    #    glob 을 다시 던지면 짝 HTML 이 없는 문서에서 `pathspec did not match any files`
-    #    로 add 전체가 죽어 아무것도 커밋되지 않는다(실측 — 이 스위트가 잡았다).
-    #    관측한 목록을 쓰면 그 창이 없고, 커밋한 것과 셌던 것이 같아진다.
-    rc, _out, add_err = _git(repo, "add", "--", *changed)
-    if rc != 0:
-        return record(False, f"git add 가 실패했습니다: {add_err.strip() or rc}")
-
-    count = len(changed)
-    message = (f"learning: 문서 {count}건 변경\n\n"
-               "airlock learning 앱이 라이브러리에 쓴 것을 그대로 커밋했습니다.\n"
-               "커밋 대상은 카테고리 폴더의 .md/.html 뿐입니다.")
-    rc, _out, commit_err = _git(repo, "commit", "-m", message)
-    if rc != 0:
-        # `nothing to commit` is possible when another writer committed between
-        # our status and our add. That is not a failure — the tree is clean now.
-        blob = (commit_err + _out).lower()
-        if "nothing to commit" in blob or "nothing added" in blob:
-            return record(True, None)
-        return record(False, f"git commit 이 실패했습니다: {commit_err.strip() or rc}")
-    say(f"[git] 문서 {count}건을 커밋했습니다")
+        # No category directories yet means there is nothing to commit, but we
+        # still inspect the remote so an earlier sync failure cannot disappear.
+        changed = []
+    else:
+        changed, err = _changed(repo, specs)
+        if err:
+            return record(False, err)
 
     upstream = _upstream(repo)
+    pulled = False
+    fetch_error = None
+    if upstream is None and previous_diverged:
+        return record(False,
+                      "직전 갈라짐을 재확인할 upstream 이 없습니다 — push 를 멈춥니다",
+                      diverged=True)
+    if upstream is not None:
+        rc, _out, fetch_err = _git(repo, "fetch")
+        if rc != 0:
+            error = (f"push 전 fetch 가 실패했습니다 ({upstream}): "
+                     f"{fetch_err.strip() or rc}")
+            if previous_diverged:
+                # Not observed is not resolved. A transient network failure must
+                # neither clear the warning nor stack commits on a branch already
+                # known to need a person.
+                return record(False, error, diverged=True)
+            # Keep the app's files in a local commit even while the remote is
+            # unavailable. The failed fetch remains loud and a later tick can
+            # retry without requiring another document change.
+            fetch_error = error
+        else:
+            ahead, behind, compare_error = _ahead_behind(repo)
+            if compare_error:
+                return record(False, compare_error)
+            if ahead and behind:
+                return record(
+                    False,
+                    (f"로컬과 {upstream} 이 갈라졌습니다 (로컬 {ahead}개, 원격 {behind}개) — "
+                     "자동 rebase 하지 않으며 push 를 멈춥니다"),
+                    diverged=True)
+            if behind:
+                rc, _out, pull_err = _git(repo, "pull", "--ff-only")
+                if rc != 0:
+                    return record(False, f"{upstream} fast-forward 가 실패했습니다: "
+                                        f"{pull_err.strip() or rc}")
+                pulled = True
+                # The fast-forward may have changed category paths. Stage the
+                # current working tree, not the list observed before the pull.
+                specs = _pathspecs(repo, categories)
+                if specs:
+                    changed, err = _changed(repo, specs)
+                    if err:
+                        return record(False, err)
+                else:
+                    changed = []
+
+    count = 0
+    if changed:
+        # 🔴 여기서 pathspec 을 다시 쓰지 않고 **방금 관측한 경로**를 그대로 스테이징한다.
+        #    glob 을 다시 던지면 짝 HTML 이 없는 문서에서 `pathspec did not match any files`
+        #    로 add 전체가 죽어 아무것도 커밋되지 않는다(실측 — 이 스위트가 잡았다).
+        #    관측한 목록을 쓰면 그 창이 없고, 커밋한 것과 셌던 것이 같아진다.
+        rc, _out, add_err = _git(repo, "add", "--", *changed)
+        if rc != 0:
+            return record(False, f"git add 가 실패했습니다: {add_err.strip() or rc}")
+
+        count = len(changed)
+        message = (f"learning: 문서 {count}건 변경\n\n"
+                   "airlock learning 앱이 라이브러리에 쓴 것을 그대로 커밋했습니다.\n"
+                   "커밋 대상은 카테고리 폴더의 .md/.html 뿐입니다.")
+        rc, _out, commit_err = _git(repo, "commit", "-m", message)
+        if rc != 0:
+            # `nothing to commit` is possible when another writer committed between
+            # our status and our add. That is not a failure — the tree is clean now.
+            blob = (commit_err + _out).lower()
+            if "nothing to commit" in blob or "nothing added" in blob:
+                count = 0
+            else:
+                return record(False, f"git commit 이 실패했습니다: "
+                                    f"{commit_err.strip() or rc}")
+        else:
+            say(f"[git] 문서 {count}건을 커밋했습니다")
+
     if upstream is None:
+        if not count:
+            return record(True, None)
         return record(True, "커밋했지만 push 하지 않았습니다 — 현재 브랜치에 upstream 이 "
                             "없습니다", committed=count)
+    if fetch_error:
+        return record(False, fetch_error, committed=count)
+
+    ahead, behind, compare_error = _ahead_behind(repo)
+    if compare_error:
+        return record(False, compare_error, committed=count)
+    if ahead and behind:
+        return record(False,
+                      (f"로컬과 {upstream} 이 갈라졌습니다 (로컬 {ahead}개, 원격 {behind}개) — "
+                       "자동 rebase 하지 않으며 push 를 멈춥니다"),
+                      committed=count, diverged=True)
+    if not ahead and not pulled:
+        return record(True, None, committed=count)
+
     rc, _out, push_err = _git(repo, "push")
     if rc != 0:
         # 🔴 A failed push is loud, and it stays loud: the commit is local, the

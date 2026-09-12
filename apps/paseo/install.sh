@@ -193,11 +193,14 @@ PASEO_PKG="@getpaseo/cli"
 # Version PIN — do NOT track latest. paseo is pre-1.0; a floating install would
 # drift the web-ui bundle and the depth4 anchor out from under us.
 PASEO_VER="${AIRLOCK_PASEO_VERSION:-0.2.5}"
+PASEO_BUNDLE_DIR="$HERE/vendor/guarded-0.2.5"
+PASEO_BUNDLE_SUMS="$PASEO_BUNDLE_DIR/SHA256SUMS"
+PASEO_BUNDLE_INSTALLED_SUMS="$PASEO_BUNDLE_DIR/INSTALLED_SHA256SUMS"
 
 # nvm (if present) puts node/npm on PATH; the unit PATH is derived from what we
 # resolve here, so per-box node locations never need to be hardcoded.
 airlock_load_nvm
-require_cmd node npm systemctl tailscale python3 ss sudo
+require_cmd node npm sha256sum systemctl tailscale python3 ss sudo
 
 # Contain a failed/activating candidate left by an older Restart=always unit
 # before performing any install work. This is the candidate's own stable name,
@@ -221,27 +224,6 @@ NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 
 [ "${NODE_MAJOR:-0}" -ge 20 ] 2>/dev/null \
   || die "paseo needs node >= 20 (found $(node --version 2>/dev/null)). Upgrade node on this box, then re-run."
 
-# --- snap-wrapped node vs NoNewPrivileges (owner decision, 2026-08-07) ---
-#
-# /snap/bin/node is a symlink to /usr/bin/snap, which re-executes the real
-# interpreter through the setuid-root snap-confine. `NoNewPrivileges=yes` neuters
-# setuid; snap swallows the failure. The unit then dies with status=1 and writes
-# nothing at all — 4,242 restarts of airlock-paseo on 2026-08-07 with a journal
-# containing only the restart lines. #77 did not cause this, it revealed it:
-# before /snap/bin was on the unit PATH the same unit died at exit 127 instead.
-#
-# So: detect it, refuse, and say what was measured rather than what was assumed.
-# The escape hatch turns the directive off FOR THIS UNIT and renders why, in the
-# unit, where the next person to read it will be. It does not weaken code-server
-# or orca, which never see this variable.
-#
-# Placed here and not in install/preflight.sh on purpose: packaged paseo's
-# preflight deliberately does not load nvm and leaves runtime selection to this
-# script (install/preflight.sh:193-199), so a central check would fire on boxes
-# where nvm supplies a perfectly good native node. This runs after
-# airlock_load_nvm and the version gate, and before the first npm call, file
-# write or systemctl — the same position, and the same shape, as the memory
-# refusal above.
 # --- NoNewPrivileges is OFF for this unit by default (owner decision, 2026-09-02) ---
 #
 # This unit is not just a daemon: it is the PARENT of every agent session on the
@@ -266,6 +248,18 @@ printf -v PASEO_NNP_BLOCK '%s\n%s\n%s\n%s' \
   "# This unit is the parent of the operator's agent sessions, and the directive" \
   "# is inherited by every child — it would remove sudo from the human's own shell." \
   "NoNewPrivileges=no"
+
+# --- snap-wrapped node (measured 2026-08-07) ---
+# /snap/bin/node is a symlink to /usr/bin/snap, which re-executes the real
+# interpreter through the setuid-root snap-confine. `NoNewPrivileges=yes` neuters
+# setuid and snap swallows the failure: 4,242 restarts of airlock-paseo on
+# 2026-08-07 with a journal containing only the restart lines. This script used to
+# REFUSE a snap node for that reason, behind an AIRLOCK_ALLOW_SNAP_NODE=1 override
+# whose whole effect was to turn the directive off for this unit. The directive is
+# off by default now (above), so the failure the refusal guarded cannot happen and
+# the gate is gone with the override. What remains is the measurement: say what
+# node this is, in the log and in the unit, so the next reader of a snap-node box
+# sees why the directive must stay off here.
 _node_found="$(command -v node 2>/dev/null || true)"
 _node_real="$(readlink -f -- "$_node_found" 2>/dev/null || true)"
 _node_runtime="$(node -p 'process.execPath' 2>/dev/null || true)"
@@ -273,30 +267,19 @@ _snap_probes="$(airlock_snap_probe "$_node_found" "$_node_real" "$_node_runtime"
 if [ -n "$_snap_probes" ]; then
   _snap_detail="probes=[${_snap_probes}] found=${_node_found:-<none>} \
 resolved=${_node_real:-<none>} runtime=${_node_runtime:-<unreadable>}"
-  if [ "${AIRLOCK_ALLOW_SNAP_NODE:-0}" = 1 ]; then
-    log "WARNING: paseo is being installed against a snap-wrapped node by explicit override \
-AIRLOCK_ALLOW_SNAP_NODE=1 — ${_snap_detail}. NoNewPrivileges is being turned OFF for the \
-airlock-paseo unit only, because snap's setuid-root re-exec cannot survive it. Nothing else \
-on this box changes; code-server and orca keep the directive."
-    # printf -v, not a heredoc: this text ends up inside apps/paseo/render.sh's
-    # UNITEOF body, which is unquoted. Assembling it there would put a shell
-    # command in prose back where command substitution happens. A variable's
-    # value is not re-scanned, so built here it arrives literally.
-    printf -v PASEO_NNP_BLOCK '%s\n%s\n%s\n%s\n%s' \
-      "# NoNewPrivileges is deliberately OFF for this unit." \
-      "# node on this box is behind a snap wrapper (${_snap_detail})." \
-      "# snap re-executes through the setuid-root snap-confine, which NoNewPrivileges" \
-      "# neuters; the unit then fails with status=1 and no output at all." \
-      "NoNewPrivileges=no"
-  else
-    die "paseo install refused: node on this box is behind a snap wrapper, and this unit \
-sets NoNewPrivileges=yes. ${_snap_detail}. snap re-executes the real interpreter through the \
-setuid-root snap-confine, which NoNewPrivileges neuters, and snap reports nothing — the unit \
-crash-loops with status=1 and an empty journal (measured 2026-08-07, 4,242 restarts). \
-Install node from a non-snap source (nvm, or the NodeSource apt repository) and re-run. \
-To install anyway with NoNewPrivileges turned off for the airlock-paseo unit only, set \
-AIRLOCK_ALLOW_SNAP_NODE=1."
-  fi
+  log "WARNING: node on this box is behind a snap wrapper — ${_snap_detail}. snap's \
+setuid-root re-exec cannot survive NoNewPrivileges; the airlock-paseo unit keeps the \
+directive off (it is off by default for this unit anyway). Nothing else on this box changes."
+  # printf -v, not a heredoc: this text ends up inside apps/paseo/render.sh's
+  # UNITEOF body, which is unquoted. Assembling it there would put a shell
+  # command in prose back where command substitution happens. A variable's
+  # value is not re-scanned, so built here it arrives literally.
+  printf -v PASEO_NNP_BLOCK '%s\n%s\n%s\n%s\n%s' \
+    "# NoNewPrivileges is deliberately OFF for this unit." \
+    "# node on this box is behind a snap wrapper (${_snap_detail})." \
+    "# snap re-executes through the setuid-root snap-confine, which NoNewPrivileges" \
+    "# neuters; the unit then fails with status=1 and no output at all." \
+    "NoNewPrivileges=no"
 fi
 
 # Every directory node can be found through — see airlock_cmd_dirs in
@@ -311,6 +294,38 @@ PASEO_PREFIX="$HOME/.npm-global"
 NPM_GBIN="$PASEO_PREFIX/bin"
 NPM_ROOT="$PASEO_PREFIX/lib/node_modules"
 PASEO_BIN="$NPM_GBIN/paseo"
+PASEO_INSTALL_ID_FILE="$NPM_ROOT/@getpaseo/.airlock-install-id"
+# Where the cli loads @getpaseo/server from — the one directory every patch below
+# edits. Node resolves upward from the cli, so a copy nested under the cli shadows
+# the prefix-level one; the two candidates are exactly node's lookup order.
+#   bundle:   the six tarballs are installed as siblings, so server lands at the
+#             prefix level and NOTHING is nested under the cli (measured 2026-09-12,
+#             npm 10.9.8; INSTALLED_SHA256SUMS is written against this layout).
+#   registry: `npm i -g @getpaseo/cli` nests its dependencies under the cli.
+# The 2026-09-12 install died here: every patch path was written for the nested
+# layout, the bundle put server at the prefix level, and a hard `die` on the
+# first missing path rolled the whole platform back over a lookup.
+PASEO_SERVER_NESTED="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server"
+PASEO_SERVER_TOP="$NPM_ROOT/@getpaseo/server"
+paseo_server_dir() {
+  if [ -d "$PASEO_SERVER_NESTED" ]; then printf '%s\n' "$PASEO_SERVER_NESTED"
+  else printf '%s\n' "$PASEO_SERVER_TOP"; fi
+}
+
+if [ -n "${AIRLOCK_PASEO_VERSION:-}" ]; then
+  PASEO_SOURCE=registry
+  PASEO_INSTALL_ID="registry:$PASEO_VER"
+else
+  [ -f "$PASEO_BUNDLE_SUMS" ] || die "paseo bundle manifest missing: $PASEO_BUNDLE_SUMS"
+  [ -f "$PASEO_BUNDLE_INSTALLED_SUMS" ] \
+    || die "paseo installed-file manifest missing: $PASEO_BUNDLE_INSTALLED_SUMS"
+  (cd "$PASEO_BUNDLE_DIR" && sha256sum -c SHA256SUMS >/dev/null) \
+    || die "paseo bundle checksum mismatch: $PASEO_BUNDLE_SUMS"
+  mapfile -t paseo_packages < <(awk '{print dir "/" $2}' dir="$PASEO_BUNDLE_DIR" "$PASEO_BUNDLE_SUMS")
+  [ "${#paseo_packages[@]}" -eq 6 ] || die "paseo bundle must contain exactly 6 packages"
+  PASEO_SOURCE=bundle
+  PASEO_INSTALL_ID="bundle:$(sha256sum "$PASEO_BUNDLE_SUMS" | cut -d' ' -f1)"
+fi
 export PATH="$NPM_GBIN:$PATH"
 
 # Installer-side stale-pidfile guard (apps/paseo/paseo-clear-stale-pid.py). It is
@@ -379,22 +394,64 @@ UNIT="$UNIT_DIR/airlock-paseo.service"
 # owner's live agent sessions.
 need_restart=0
 
-# --- 1. provision paseo (version-pinned; idempotent) ---
-if [ "$("$PASEO_BIN" --version 2>/dev/null || true)" = "$PASEO_VER" ]; then
-  log "paseo ${PASEO_PKG}@${PASEO_VER} present (prefix=$PASEO_PREFIX)"
+# --- 1. provision paseo (source-pinned; idempotent) ---
+current_paseo_version="$("$PASEO_BIN" --version 2>/dev/null || true)"
+current_install_id=""
+if [ -f "$PASEO_INSTALL_ID_FILE" ]; then
+  current_install_id="$(cat "$PASEO_INSTALL_ID_FILE")"
+elif [ -n "$current_paseo_version" ]; then
+  current_install_id="registry:$current_paseo_version"
+fi
+
+install_matches=0
+if [ "$current_paseo_version" = "$PASEO_VER" ] && [ "$current_install_id" = "$PASEO_INSTALL_ID" ]; then
+  # Bundle mode: the checksums prove the prefix-level files, so a server copy still
+  # nested under the cli (a registry-era leftover, or a rolled-back upgrade — the
+  # 2026-09-12 box had both) would shadow exactly what was just verified. Not a
+  # match: the reinstall below reifies the tree and npm removes the nested copy
+  # (measured: "removed 230 packages").
+  if [ "$PASEO_SOURCE" = registry ] \
+    || { [ ! -d "$PASEO_SERVER_NESTED" ] \
+         && (cd "$NPM_ROOT" && sha256sum -c "$PASEO_BUNDLE_INSTALLED_SUMS" >/dev/null 2>&1); }; then
+    install_matches=1
+  fi
+fi
+
+if [ "$install_matches" -eq 1 ]; then
+  log "paseo $PASEO_INSTALL_ID present (prefix=$PASEO_PREFIX)"
 elif [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "[dry] npm i -g ${PASEO_PKG}@${PASEO_VER} (prefix=$PASEO_PREFIX)"
+  log "[dry] install paseo $PASEO_INSTALL_ID (prefix=$PASEO_PREFIX)"
 else
-  log "npm i -g ${PASEO_PKG}@${PASEO_VER} (prefix=$PASEO_PREFIX)"
+  log "install paseo $PASEO_INSTALL_ID (prefix=$PASEO_PREFIX)"
   # npm_config_prefix overrides the box default (e.g. /usr = non-root fails) so we
   # always land in the fixed user prefix.
   # Both streams used to go to /dev/null, so this die() named the package and
   # nothing else — the operator got a fatal error with no cause. See install/lib.sh.
-  airlock_quiet env npm_config_prefix="$PASEO_PREFIX" npm i -g "${PASEO_PKG}@${PASEO_VER}" \
-    || die "npm install failed: ${PASEO_PKG}@${PASEO_VER} (prefix=$PASEO_PREFIX) — npm output above"
+  if [ "$PASEO_SOURCE" = bundle ]; then
+    airlock_quiet env npm_config_prefix="$PASEO_PREFIX" npm i -g "${paseo_packages[@]}" \
+      --no-audit --no-fund \
+      || die "npm install failed for paseo bundle (prefix=$PASEO_PREFIX) — npm output above"
+    (cd "$NPM_ROOT" && sha256sum -c "$PASEO_BUNDLE_INSTALLED_SUMS") \
+      || die "installed paseo bundle does not match $PASEO_BUNDLE_INSTALLED_SUMS"
+    [ ! -d "$PASEO_SERVER_NESTED" ] \
+      || die "a second @getpaseo/server is nested under the cli ($PASEO_SERVER_NESTED) and would shadow the verified bundle at $PASEO_SERVER_TOP"
+  else
+    if [ -f "$PASEO_INSTALL_ID_FILE" ]; then
+      airlock_quiet env npm_config_prefix="$PASEO_PREFIX" npm uninstall -g \
+        @getpaseo/cli @getpaseo/client @getpaseo/highlight @getpaseo/protocol \
+        @getpaseo/relay @getpaseo/server --no-audit --no-fund \
+        || die "failed to clear bundled paseo packages before registry install"
+    fi
+    airlock_quiet env npm_config_prefix="$PASEO_PREFIX" npm i -g "${PASEO_PKG}@${PASEO_VER}" \
+      --no-audit --no-fund \
+      || die "npm install failed: ${PASEO_PKG}@${PASEO_VER} (prefix=$PASEO_PREFIX) — npm output above"
+  fi
   [ -x "$PASEO_BIN" ] || die "paseo binary missing after install: $PASEO_BIN"
   [ "$("$PASEO_BIN" --version 2>/dev/null || true)" = "$PASEO_VER" ] \
     || die "paseo version mismatch (want ${PASEO_VER}, got $("$PASEO_BIN" --version 2>/dev/null))"
+  install -d -m755 "$(dirname "$PASEO_INSTALL_ID_FILE")"
+  printf '%s\n' "$PASEO_INSTALL_ID" > "$PASEO_INSTALL_ID_FILE.tmp"
+  mv "$PASEO_INSTALL_ID_FILE.tmp" "$PASEO_INSTALL_ID_FILE"
   need_restart=1   # freshly (re)installed the daemon -> restart to run it
 fi
 
@@ -405,7 +462,10 @@ fi
 # in patches/ is the reference/re-derivation copy; we apply it via idempotent sed
 # so a paseo version bump that moved the anchor warns loudly instead of silently
 # skipping (fail-visible, not fail-silent).
-SESSION_JS="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/server/session.js"
+# Resolved once, after step 1 has settled the tree; every patch target below hangs
+# off it. (Dry run: whatever is on disk, or the bundle layout if nothing is.)
+PASEO_SERVER_DIR="$(paseo_server_dir)"
+SESSION_JS="$PASEO_SERVER_DIR/dist/server/server/session.js"
 PATCH_LINE='                maxDepth: searchesWorkspace ? undefined : 4,'
 PATCH_ANCHOR='confidentResultScanThreshold: searchesWorkspace ? undefined : 5000,'
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
@@ -438,21 +498,30 @@ fi
 # Keep the server edit as a checked candidate until the UI edit succeeds. Serving the
 # new UI against the old broadcast server is harmless; loading the new server against
 # the old UI is not. The daemon restart below therefore cannot expose a half-patched
-# pair. Unlike the optional browse group, both halves fail hard on pinned-version drift.
+# pair.
+#
+# What is fatal here, and what is not: the guarded bundle already carries the server
+# half (the patcher answers ALREADY), and only the web half is applied at install time.
+# A target that is not where this script expects it, an anchor that moved, or a patcher
+# that cannot run all leave the checksum-verified bundle serving exactly what upstream
+# shipped — a feature missing, not an install broken — so they warn and skip. Only a
+# served tree that is actually wrong is fatal: invalid JS in a file the daemon serves,
+# a rename that did not happen, or installed bytes that carry a patch's sentinel and
+# fail that patch's behaviour check (the sentinel is a comment; the check is the proof).
+# The 2026-09-12 install was rolled back, platform-wide, by the `die` that used to
+# stand where the first warning below stands now.
 SUBAGENT_FILTER_PATCHER="$HERE/patches/provider-subagent-stream-filter.mjs"
 SUBAGENT_FILTER_TEST="$HERE/patches/provider-subagent-stream-filter.test.mjs"
 WEBUI_PATCHER="$HERE/browse-host/bin/patch-web-ui.js"
-WEBUI_DIR="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/web-ui"
+WEBUI_DIR="$PASEO_SERVER_DIR/dist/server/web-ui"
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] apply provider-subagent source filter to $SESSION_JS"
   log "[dry] apply always-on provider-subagent parent subscription to $WEBUI_DIR"
+elif [ ! -f "$SESSION_JS" ] || [ ! -d "$WEBUI_DIR" ]; then
+  log "warning: session.js or web-ui not found under $PASEO_SERVER_DIR (paseo dist layout changed?) — provider-subagent selective delivery skipped"
+elif [ ! -f "$SUBAGENT_FILTER_PATCHER" ] || [ ! -f "$SUBAGENT_FILTER_TEST" ] || [ ! -f "$WEBUI_PATCHER" ]; then
+  log "warning: provider-subagent patcher, its behaviour test or the web-ui patcher is missing under $HERE — skipped"
 else
-  [ -f "$SESSION_JS" ] || die "session.js not found ($SESSION_JS) — provider-subagent filter cannot be installed"
-  [ -f "$SUBAGENT_FILTER_PATCHER" ] || die "provider-subagent filter patcher missing: $SUBAGENT_FILTER_PATCHER"
-  [ -f "$SUBAGENT_FILTER_TEST" ] || die "provider-subagent filter behavior test missing: $SUBAGENT_FILTER_TEST"
-  [ -f "$WEBUI_PATCHER" ] || die "web-ui patcher missing: $WEBUI_PATCHER"
-  [ -d "$WEBUI_DIR" ] || die "paseo web-ui directory missing: $WEBUI_DIR"
-
   sf_tmp="${SESSION_JS}.paseo-new.mjs"
   rm -f "$sf_tmp"
   sf_rc=0
@@ -460,46 +529,56 @@ else
   sf_candidate=0
   case "$sf_rc" in
     10) log "provider-subagent server filter already applied" ;;
-    20) die "provider-subagent server filter anchors drifted: $sf_out" ;;
+    20) log "warning: provider-subagent server filter anchors not found (paseo version drift) — server half skipped: $sf_out" ;;
     0)
-      [ -f "$sf_tmp" ] || die "provider-subagent server filter produced no candidate"
-      node --check "$sf_tmp" || { rm -f "$sf_tmp"; die "provider-subagent server filter produced invalid JS"; }
-      node "$SUBAGENT_FILTER_TEST" "$sf_tmp" >/dev/null 2>&1 \
-        || { rm -f "$sf_tmp"; die "provider-subagent server filter behavior check failed on candidate"; }
-      sf_candidate=1
+      if [ ! -f "$sf_tmp" ]; then
+        log "warning: provider-subagent server filter produced no candidate — server half skipped"
+      elif ! node --check "$sf_tmp"; then
+        rm -f "$sf_tmp"
+        log "warning: provider-subagent server filter candidate is invalid JS — not applied"
+      elif ! node "$SUBAGENT_FILTER_TEST" "$sf_tmp" >/dev/null 2>&1; then
+        rm -f "$sf_tmp"
+        log "warning: provider-subagent server filter candidate failed its behaviour check — not applied"
+      else
+        sf_candidate=1
+      fi
       ;;
-    *) die "provider-subagent server filter patcher error (rc=$sf_rc): $sf_out" ;;
+    *) log "warning: provider-subagent server filter patcher error (rc=$sf_rc): $sf_out — server half skipped" ;;
   esac
 
   # This mode changes only the general provider-subagent subscription anchor. It
   # shares cache-busting/index.html repointing with the optional --browse group.
-  if ! node "$WEBUI_PATCHER" --subagent-stream "$WEBUI_DIR"; then
+  # The patcher writes the new bundle before it repoints index.html, so a failure
+  # leaves the old UI served intact (apps/paseo/browse-host/bin/patch-web-ui.js).
+  if node "$WEBUI_PATCHER" --subagent-stream "$WEBUI_DIR"; then
+    webui_bundle="$(find "$WEBUI_DIR/_expo/static/js/web" -maxdepth 1 -type f -name 'index-*.js' -print -quit)"
+    { [ -n "$webui_bundle" ] && [ -f "$webui_bundle" ]; } \
+      || die "served paseo web-ui bundle not found after provider-subagent patch"
+    node --check "$webui_bundle" || die "provider-subagent web-ui patch produced invalid JS"
+    if [ "$sf_candidate" = 1 ]; then
+      mv "$sf_tmp" "$SESSION_JS" || die "provider-subagent server filter mv failed"
+      need_restart=1
+      log "provider-subagent server filter applied"
+    fi
+  else
     rm -f "$sf_tmp"
-    die "provider-subagent web-ui subscription patch failed"
+    log "warning: provider-subagent web-ui subscription patch failed — pair not installed, web UI serves as shipped"
   fi
-  webui_bundle="$(find "$WEBUI_DIR/_expo/static/js/web" -maxdepth 1 -type f -name 'index-*.js' -print -quit)"
-  if [ -z "$webui_bundle" ] || [ ! -f "$webui_bundle" ]; then
-    rm -f "$sf_tmp"
-    die "served paseo web-ui bundle not found after provider-subagent patch"
+  # The sentinel the patcher keys on is a comment; this check on the INSTALLED bytes is
+  # the only evidence that the code under it does what the sentinel claims. A file
+  # that carries the sentinel and fails the check is a wrong tree — fatal, not a warning.
+  if grep -qF 'paseo-provider-subagent-stream-filter' "$SESSION_JS"; then
+    node "$SUBAGENT_FILTER_TEST" "$SESSION_JS" >/dev/null 2>&1 \
+      || die "installed provider-subagent server filter failed its behaviour check — the served session.js claims the filter and does not behave like it"
+    log "provider-subagent selective delivery pair verified"
   fi
-  node --check "$webui_bundle" \
-    || { rm -f "$sf_tmp"; die "provider-subagent web-ui patch produced invalid JS"; }
-
-  if [ "$sf_candidate" = 1 ]; then
-    mv "$sf_tmp" "$SESSION_JS" || die "provider-subagent server filter mv failed"
-    need_restart=1
-    log "provider-subagent server filter applied"
-  fi
-  node "$SUBAGENT_FILTER_TEST" "$SESSION_JS" >/dev/null 2>&1 \
-    || die "installed provider-subagent server filter behavior check failed"
-  log "provider-subagent selective delivery pair verified"
 fi
 
 # The pinned manifest — the file the prune step below edits. Declared here rather
 # than beside its only user because it has already outlived one: an Opus 5 backport
 # step owned this declaration until the pin reached a version whose manifest ships
 # Opus 5, and under `set -u` removing that step would have taken the prune with it.
-CLAUDE_MANIFEST_JS="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/server/agent/providers/claude/model-manifest.js"
+CLAUDE_MANIFEST_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/claude/model-manifest.js"
 
 # --- 2b2. add Fable 5.1 to the picker (idempotent) ---
 # The pinned manifest predates Fable 5.1, so the picker cannot offer a model the
@@ -530,10 +609,10 @@ else
         log "Fable 5.1 rows added ($fb_out)"
       else
         rm -f "$FB_TMP"
-        die "Fable 5.1 add produced invalid JS — not applied"
+        log "warning: Fable 5.1 add produced invalid JS — not applied"
       fi
       ;;
-    *) die "Fable 5.1 patcher error (rc=$fb_rc): $fb_out" ;;
+    *) log "warning: Fable 5.1 patcher error (rc=$fb_rc): $fb_out — skipped" ;;
   esac
 fi
 
@@ -566,10 +645,10 @@ else
         log "model prune applied ($pr_out)"
       else
         rm -f "$PR_TMP"
-        die "model prune produced invalid JS — not applied"
+        log "warning: model prune produced invalid JS — not applied"
       fi
       ;;
-    *) die "model prune patcher error (rc=$pr_rc): $pr_out" ;;
+    *) log "warning: model prune patcher error (rc=$pr_rc): $pr_out — skipped" ;;
   esac
 fi
 
@@ -581,7 +660,7 @@ fi
 # sibling text block. No CLI version gate: this changes what the provider sends, not which
 # model runs.
 IMGPERSIST_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/image-attachments-persist.mjs"
-CLAUDE_AGENT_JS="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/server/agent/providers/claude/agent.js"
+CLAUDE_AGENT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/claude/agent.js"
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] apply pasted-image persistence to $CLAUDE_AGENT_JS"
 elif [ ! -f "$CLAUDE_AGENT_JS" ]; then
@@ -602,10 +681,10 @@ else
         log "pasted-image persistence applied (saves under <cwd>/.paseo-attachments/)"
       else
         rm -f "$IP_TMP"
-        die "pasted-image persistence produced invalid JS — not applied"
+        log "warning: pasted-image persistence produced invalid JS — not applied"
       fi
       ;;
-    *) die "pasted-image patcher error (rc=$ip_rc): $ip_out" ;;
+    *) log "warning: pasted-image patcher error (rc=$ip_rc): $ip_out — skipped" ;;
   esac
 fi
 
@@ -625,7 +704,7 @@ fi
 # the daemon's info-level logger never emits, so this class of leak was unobservable.
 ORPHANGUARD_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/orphan-process-guard.mjs"
 ORPHANGUARD_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/orphan-process-guard.test.mjs"
-CODEX_AGENT_JS="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/server/agent/providers/codex-app-server-agent.js"
+CODEX_AGENT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/codex-app-server-agent.js"
 apply_orphan_guard() {  # <mode> <target-js>
   local mode="$1" target="$2" og_rc=0 og_out og_tmp
   if [ ! -f "$target" ]; then
@@ -644,10 +723,10 @@ apply_orphan_guard() {  # <mode> <target-js>
         log "orphan guard applied ($mode)"
       else
         rm -f "$og_tmp"
-        die "orphan guard produced invalid JS ($mode) — not applied"
+        log "warning: orphan guard produced invalid JS ($mode) — not applied"
       fi
       ;;
-    *) die "orphan guard patcher error ($mode rc=$og_rc): $og_out" ;;
+    *) log "warning: orphan guard patcher error ($mode rc=$og_rc): $og_out — skipped" ;;
   esac
 }
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
@@ -662,7 +741,7 @@ else
   # that applied but reassembled wrongly fails the install instead of shipping quietly.
   if [ -f "$ORPHANGUARD_TEST" ] && grep -q 'paseo-orphan-guard' "$CLAUDE_AGENT_JS" 2>/dev/null; then
     node "$ORPHANGUARD_TEST" "$CLAUDE_AGENT_JS" >/dev/null 2>&1 \
-      || die "orphan guard behaviour check failed — the patched bundle does not behave as intended"
+      || die "orphan guard behaviour check failed — the installed provider carries the guard's sentinel and still leaks children"
     log "orphan guard behaviour check passed"
   fi
 fi
@@ -682,8 +761,8 @@ fi
 # skipped, this exits 20 and skips too — never half a fix.
 PGROUP_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/orphan-process-group.mjs"
 PGROUP_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/orphan-process-group.test.mjs"
-CLAUDE_QUERY_JS="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/server/agent/providers/claude/query.js"
-CODEX_TRANSPORT_JS="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/server/agent/providers/codex/app-server-transport.js"
+CLAUDE_QUERY_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/claude/query.js"
+CODEX_TRANSPORT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/codex/app-server-transport.js"
 apply_pgroup() {  # <mode> <target-js>
   local mode="$1" target="$2" pg_rc=0 pg_out pg_tmp
   if [ ! -f "$target" ]; then
@@ -702,10 +781,10 @@ apply_pgroup() {  # <mode> <target-js>
         log "process-group sweep applied ($mode)"
       else
         rm -f "$pg_tmp"
-        die "process-group sweep produced invalid JS ($mode) — not applied"
+        log "warning: process-group sweep produced invalid JS ($mode) — not applied"
       fi
       ;;
-    *) die "process-group patcher error ($mode rc=$pg_rc): $pg_out" ;;
+    *) log "warning: process-group patcher error ($mode rc=$pg_rc): $pg_out — skipped" ;;
   esac
 }
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
@@ -722,7 +801,7 @@ else
   # processes — it should never ship unverified.
   if [ -f "$PGROUP_TEST" ] && grep -q 'paseo-process-group' "$CLAUDE_AGENT_JS" 2>/dev/null; then
     node "$PGROUP_TEST" "$CLAUDE_AGENT_JS" >/dev/null 2>&1 \
-      || die "process-group behaviour check failed — the patched bundle does not reap descendants as intended"
+      || die "process-group behaviour check failed — the installed provider carries the sweep's sentinel and does not reap descendants"
     log "process-group behaviour check passed"
   fi
 fi
@@ -743,7 +822,7 @@ fi
 # of into zod's output. Data preservation only: refresh timing is untouched.
 CREDPRESERVE_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/credential-key-preservation.mjs"
 CREDPRESERVE_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/credential-key-preservation.test.mjs"
-QUOTA_PROVIDERS="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/services/quota-fetcher/providers"
+QUOTA_PROVIDERS="$PASEO_SERVER_DIR/dist/server/services/quota-fetcher/providers"
 apply_cred_preserve() {  # <mode> <target-js>
   local mode="$1" target="$2" cp_rc=0 cp_out cp_tmp
   if [ ! -f "$target" ]; then
@@ -762,10 +841,10 @@ apply_cred_preserve() {  # <mode> <target-js>
         log "credential key preservation applied ($mode)"
       else
         rm -f "$cp_tmp"
-        die "credential key preservation produced invalid JS ($mode) — not applied"
+        log "warning: credential key preservation produced invalid JS ($mode) — not applied"
       fi
       ;;
-    *) die "credential key preservation patcher error ($mode rc=$cp_rc): $cp_out" ;;
+    *) log "warning: credential key preservation patcher error ($mode rc=$cp_rc): $cp_out — skipped" ;;
   esac
 }
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
@@ -784,7 +863,7 @@ else
     for cp_mode in claude codex; do
       if grep -q 'paseo-cred-preserve' "$QUOTA_PROVIDERS/${cp_mode}.js" 2>/dev/null; then
         node "$CREDPRESERVE_TEST" "$cp_mode" "$QUOTA_PROVIDERS/${cp_mode}.js" >/dev/null 2>&1 \
-          || die "credential key preservation behaviour check failed ($cp_mode) — the patched bundle still drops fields"
+          || die "credential key preservation behaviour check failed ($cp_mode) — the installed fetcher carries the sentinel and still drops fields"
         log "credential key preservation behaviour check passed ($cp_mode)"
       fi
     done
@@ -894,7 +973,7 @@ if [ -n "${AIRLOCK_ICON_RING:-}" ] && [ -f "$HERE/paseo.png" ]; then
   # upstream variant under its own hashed name and serve those too — the state
   # signal (running/attention) survives, it just wears the ring. Regenerated every
   # install, so a paseo bump that rehashes the assets self-heals.
-  WEBUI_IMG="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/web-ui/assets/assets/images"
+  WEBUI_IMG="$WEBUI_DIR/assets/assets/images"
   ring_n=0
   if [ -d "$WEBUI_IMG" ]; then
     install -d "$CONFD/paseo/icons"
@@ -981,7 +1060,6 @@ webui_has_live_panel() {
 
 if [ "$BROWSE" = true ]; then
   BROWSE_INSTALL="$HERE/browse-host/install.sh"
-  WEBUI_DIR="$NPM_ROOT/${PASEO_PKG}/node_modules/@getpaseo/server/dist/server/web-ui"
   if [ ! -f "$BROWSE_INSTALL" ]; then
     log "warning: browse=true but $BROWSE_INSTALL missing — skipped"
   elif [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then

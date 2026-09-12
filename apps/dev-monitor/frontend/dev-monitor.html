@@ -9,6 +9,7 @@
        Same-origin subpath app: /assets/ is the hub's, copied there by the installer. -->
   <link rel="icon" type="image/svg+xml" href="/assets/app-icons/dev-monitor.svg">
   <link rel="apple-touch-icon" href="/assets/app-icons/dev-monitor.png">
+  <link rel="stylesheet" href="/assets/devmon-card-ui.css">
   <style>
     :root {
       --bg: #f5f5f7; --surface: #fff; --text: #1d1d1f; --muted: #6e6e73;
@@ -485,6 +486,7 @@
 
 <div id="msg-toast" role="status" aria-live="polite"></div>
 
+<script src="/assets/devmon-card-ui.js"></script>
 <script>
   // ---- theme ----
   var THEME_KEY = 'airlock-monitor-theme';
@@ -931,8 +933,45 @@
   // Message producers are not trusted dashboard data, so every card is assembled with textContent.
   // Keeping response status available also lets this optional feature explain access and setup issues.
   var OWNER_API = API + '/owner';
-  var msgState = { key: 'active', cards: [], counts: {}, enabled: null, expanded: {} };
+  var msgState = { key: 'active', cards: [], counts: {}, enabled: null, nodes: {} };
   var msgToastTimer = null, msgPoll = null;
+  var devtermConfig = null;
+  var cardUI = DevmonCardUI.create({
+    read: function (card) { return cardAction(card.card_id, 'read'); },
+    archive: function (card) { return cardAction(card.card_id, 'archive'); },
+    run: function (card, params, note) {
+      return ownerFetch('/run', { method: 'POST', body: JSON.stringify({
+        card_id: card.card_id, params: params, note: note
+      }) }).then(ownerResponse).then(function (res) {
+        if (res.status === 403) { disableMessages(403); throw new Error('Owner access required.'); }
+        if (!res.ok || !res.data.ok) throw new Error(res.data.error || 'Could not start the agent.');
+        return res.data;
+      });
+    },
+    selectWindow: function (card) {
+      return ownerFetch('/run/window', { method: 'POST', body: JSON.stringify({card_id: card.card_id}) })
+        .then(ownerResponse).then(function (res) {
+          if (res.status === 403) { disableMessages(403); throw new Error('Owner access required.'); }
+          if (!res.ok || !res.data.ok) throw new Error(res.data.error || 'Could not select the run window.');
+          return res.data;
+        });
+    },
+    devtermUrl: function (session) {
+      var load = devtermConfig ? Promise.resolve(devtermConfig) : j('/__airlock.json').then(function (cfg) {
+        devtermConfig = cfg;
+        return cfg;
+      });
+      return load.then(function (cfg) {
+        var app = cfg && cfg.apps && cfg.apps.devterm;
+        var host = cfg && cfg.fqdn && cfg.fqdn.indexOf('.') > 0 ? cfg.fqdn : location.hostname;
+        return app && app.port && host
+          ? 'https://' + host + ':' + app.port + '/?arg=' + encodeURIComponent(session) : '';
+      });
+    },
+    changed: reflectMessageChange,
+    removed: removeMessage,
+    toast: msgToast
+  });
 
   function ownerFetch(path, opts) {
     opts = opts || {};
@@ -1049,12 +1088,17 @@
     unread.hidden = !unreadCount;
     var feed = document.getElementById('msg-feed');
     feed.textContent = '';
+    msgState.nodes = {};
     var cards = filteredMessages();
     if (!cards.length) {
       feed.appendChild(msgEl('div', 'msg-empty', EMPTY_TEXT[msgState.key] || 'No messages.'));
       return;
     }
-    cards.forEach(function (card) { feed.appendChild(buildMessageCard(card)); });
+    cards.forEach(function (card) {
+      var node = buildMessageCard(card);
+      msgState.nodes[card.card_id] = node;
+      feed.appendChild(node);
+    });
   }
   function buildMessageCard(message) {
     var card = msgEl('div', 'mcard' + (message.read_at ? '' : ' unread')
@@ -1067,17 +1111,7 @@
     if (message.level === 'urgent') top.appendChild(msgEl('span', 'murg', 'Urgent'));
     if (message.delivery === 'failed') top.appendChild(msgEl('span', 'murg', 'Delivery failed'));
     main.appendChild(top);
-    var detailNodes = [];
-    if (message.body) detailNodes.push(msgEl('div', 'mbody', message.body));
-    if (message.link && isHttpUrl(message.link)) detailNodes.push(msgEl('div', 'mbody murl', message.link));
-    if (detailNodes.length) {
-      var detail = msgEl('div', 'mdetail');
-      detailNodes.forEach(function (node) { detail.appendChild(node); });
-      if (!msgState.expanded[message.card_id]) detail.hidden = true;
-      main.appendChild(detail);
-      top.appendChild(msgEl('span', 'mchev', msgState.expanded[message.card_id] ? 'v' : '>'));
-    }
-    top.addEventListener('click', function () { toggleMessageCard(message); });
+    top.addEventListener('click', function () { cardUI.openTitle(message); });
     var meta = msgEl('div', 'mmeta');
     meta.appendChild(msgEl('span', null, message.source));
     meta.appendChild(msgEl('span', null, timeAgo(message.first_at)));
@@ -1086,42 +1120,54 @@
     main.appendChild(meta);
     if (message.ran_at) main.appendChild(msgEl('div', 'mmeta', 'Last run ' + timeAgo(message.ran_at)));
     card.appendChild(main);
-    var actions = msgEl('div', 'mactions');
-    if (message.run) {
-      var run = msgEl('button', 'mbtn primary', 'Run'); run.type = 'button';
-      run.addEventListener('click', function () { return runMessage(message, run); });
-      actions.appendChild(run);
-    }
-    if (message.link && isHttpUrl(message.link)) {
-      var open = msgEl('a', 'mbtn primary', 'Open' + ' ↗');
-      open.href = message.link; open.target = '_blank'; open.rel = 'noopener noreferrer';
-      open.addEventListener('click', function () {
-        if (!message.read_at) cardAction(message.card_id, 'read').then(loadMessages)
-          .catch(function (error) { msgToast('Could not mark message as read: ' + error.message); });
-      });
-      actions.appendChild(open);
-    }
-    if (msgState.key !== 'archived') {
-      var archive = msgEl('button', 'micon', 'Archive'); archive.type = 'button'; archive.title = 'Archive';
-      archive.addEventListener('click', function () {
-        cardAction(message.card_id, 'archive').then(loadMessages)
-          .catch(function (error) { msgToast('Could not archive message: ' + error.message); });
-      });
-      actions.appendChild(archive);
-    }
+    var actions = cardUI.createActions(message, msgState.key !== 'archived');
+    actions.classList.add('mactions');
     card.appendChild(actions);
     return card;
   }
-  function toggleMessageCard(message) {
-    var hasDetail = !!(message.body || message.link);
-    if (hasDetail) msgState.expanded[message.card_id] = !msgState.expanded[message.card_id];
-    if (!message.read_at) {
-      message.read_at = new Date().toISOString();
+  function reflectMessageChange(message, kind) {
+    var card = msgState.nodes[message.card_id];
+    if (!card) return;
+    if (kind === 'read' && card.classList.contains('unread')) {
+      card.classList.remove('unread');
+      var status = card.querySelector('.mstatus');
+      if (status) status.textContent = 'Read';
       if (msgState.counts.unread > 0) msgState.counts.unread--;
-      cardAction(message.card_id, 'read').then(loadMessages)
-        .catch(function (error) { msgToast('Could not mark message as read: ' + error.message); });
+      var unreadCount = msgState.counts.unread || 0;
+      setStat('st-unread', unreadCount);
+      ['nav-unread', 'tb-unread'].forEach(function (id) {
+        var badge = document.getElementById(id);
+        badge.textContent = unreadCount > 99 ? '99+' : unreadCount;
+        badge.hidden = !unreadCount;
+      });
     }
-    renderMessages();
+    if (kind === 'read-failed' && !card.classList.contains('unread')) {
+      card.classList.add('unread');
+      var failedStatus = card.querySelector('.mstatus');
+      if (failedStatus) failedStatus.textContent = 'Unread';
+      msgState.counts.unread = (msgState.counts.unread || 0) + 1;
+    }
+    if (kind === 'ran') {
+      var prior = card.querySelector('.mrun');
+      if (prior) prior.remove();
+      var main = card.querySelector('.mmain');
+      var ran = msgEl('div', 'mmeta mrun', 'Last run ' + timeAgo(message.ran_at));
+      if (main) main.appendChild(ran);
+      var oldActions = card.querySelector('.mactions');
+      var newActions = cardUI.createActions(message, msgState.key !== 'archived');
+      newActions.classList.add('mactions');
+      if (oldActions) oldActions.replaceWith(newActions);
+    }
+  }
+  function removeMessage(message) {
+    var card = msgState.nodes[message.card_id];
+    if (card) card.remove();
+    delete msgState.nodes[message.card_id];
+    msgState.cards = msgState.cards.filter(function (item) { return item.card_id !== message.card_id; });
+    if (msgState.counts.active > 0) msgState.counts.active--;
+    if (!message.read_at && msgState.counts.unread > 0) msgState.counts.unread--;
+    if (message.level === 'urgent' && msgState.counts.urgent > 0) msgState.counts.urgent--;
+    if (!msgState.cards.length) renderMessages();
   }
   function cardAction(cardId, action) {
     return ownerFetch('/messages/' + encodeURIComponent(cardId) + '/' + action, { method: 'POST' }).then(ownerResponse)
@@ -1139,19 +1185,6 @@
     });
     loadMessages();
   });
-
-  function runMessage(message, button) {
-    button.disabled = true;
-    return ownerFetch('/run', { method: 'POST', body: JSON.stringify({card_id: message.card_id}) })
-      .then(ownerResponse).then(function (res) {
-        if (res.status === 403) { disableMessages(403); throw new Error('Owner access required.'); }
-        if (!res.ok || !res.data.ok) throw new Error('Could not start the agent.');
-        message.ran_at = res.data.ran_at;
-        msgToast('Agent started in the terminal.');
-        return loadMessages();
-      }).catch(function (error) { msgToast(error.message); })
-      .finally(function () { button.disabled = false; });
-  }
 
   // ---- tabs ----
   // Both bars drive the same function: the phone bar is not a second implementation, it is

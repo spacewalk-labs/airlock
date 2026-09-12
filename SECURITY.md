@@ -316,6 +316,25 @@ reach a loopback gate, it obtains owner access. Therefore:
   against forged-header requests.
 
 
+## Managed release publisher trust
+
+An organisation-managed release is a separate trust class from both a shipped package and an
+operator-selected local package. Its Ed25519 signature proves that one key signed one canonical
+snapshot; it does not make the package first-party and it does not authorize the key by itself.
+Authorization comes from the operator-owned `current-membership.json`, signed by the offline
+organisation root pinned outside the release. Promotion requires the signing key to be an active
+current publisher, within its validity window and capability ceiling, on the root-authorized channel
+epoch. The receipt binds the exact membership digest used for that decision.
+The promotion store also retains the highest root-signed membership sequence and digest observed for
+each organisation, refusing older sequences and same-sequence equivocation before publisher
+authorization. Invalid root signatures cannot advance this authority floor.
+
+Publishers must not be able to write the authority directory. The generic release tool only reads
+that directory and cannot add members, rotate or revoke keys, grant capabilities, enroll a box, or
+install a release. Company identity and filesystem ownership for the authority directory are a
+private operator responsibility. A green publisher fixture is therefore not evidence that a box
+accepted or installed the release.
+
 ## Package trust (D4)
 
 Airlock does not sandbox apps. An app package's lifecycle scripts run

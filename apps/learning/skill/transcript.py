@@ -53,8 +53,24 @@ YT_DLP_LAST_RESORT = ["--extractor-args", "youtube:player_client=android"]
 VIDEO_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 
 
-def die(message):
+ERROR_SENTINEL = "LEARNING-INGEST-ERROR"
+ERROR_CODES = {
+    "tool-missing",
+    "rate-limited",
+    "video-unavailable",
+    "metadata-invalid",
+    "no-subs",
+    "subtitle-unreadable",
+    "transcript-write-failed",
+}
+
+
+def die(message, error):
+    if error not in ERROR_CODES:
+        raise ValueError(f"unknown learning ingest error: {error}")
     print(message, file=sys.stderr)
+    print(f'{ERROR_SENTINEL} {json.dumps({"error": error}, separators=(",", ":"))}',
+          file=sys.stderr)
     raise SystemExit(2)
 
 
@@ -62,18 +78,20 @@ def yt_dlp():
     found = shutil.which("yt-dlp")
     if not found:
         die("yt-dlp 을 찾지 못했습니다 — 자막을 받으려면 필요합니다. "
-            "`pip install --user yt-dlp` 또는 배포판 패키지로 설치하십시오")
+            "`pip install --user yt-dlp` 또는 배포판 패키지로 설치하십시오",
+            "tool-missing")
     return found
 
 
-def run(argv, **kwargs):
+def run(argv, failure_code="video-unavailable", **kwargs):
     try:
         return subprocess.run(argv, shell=False, capture_output=True,
                               timeout=YT_DLP_TIMEOUT_SECONDS, **kwargs)
     except subprocess.TimeoutExpired:
-        die(f"yt-dlp 이 {YT_DLP_TIMEOUT_SECONDS}초 안에 끝나지 않았습니다")
+        die(f"yt-dlp 이 {YT_DLP_TIMEOUT_SECONDS}초 안에 끝나지 않았습니다",
+            failure_code)
     except OSError as exc:
-        die(f"yt-dlp 을 실행하지 못했습니다: {exc}")
+        die(f"yt-dlp 을 실행하지 못했습니다: {exc}", "tool-missing")
 
 
 def rate_limited(stderr):
@@ -81,21 +99,21 @@ def rate_limited(stderr):
     return "429" in text or "Too Many Requests" in text
 
 
-def run_patiently(argv, sleep=None):
+def run_patiently(argv, sleep=None, failure_code="video-unavailable"):
     """429 면 잠깐 기다렸다 다시 청한다. 다른 실패는 그대로 돌려준다 — 재시도가 고칠 수
     있는 것은 레이트리밋뿐이고, 지역차단·삭제된 영상을 세 번 더 물어봐야 답은 같다."""
     sleep = time.sleep if sleep is None else sleep
     for delay in YT_DLP_RETRY_DELAYS:
-        result = run(argv)
+        result = run(argv, failure_code=failure_code)
         if result.returncode == 0 or not rate_limited(result.stderr):
             return result
         sleep(delay)
-    result = run(argv)
+    result = run(argv, failure_code=failure_code)
     if result.returncode == 0 or not rate_limited(result.stderr):
         return result
     if YT_DLP_LAST_RESORT[0] in argv:
         return result
-    return run(argv + YT_DLP_LAST_RESORT)
+    return run(argv + YT_DLP_LAST_RESORT, failure_code=failure_code)
 
 
 def source_language(info):
@@ -123,18 +141,39 @@ def source_language(info):
     return info.get("language")
 
 
-def language_rounds(language):
-    """자막 언어를 청하는 순서. 영상이 자기 언어를 말하면 **그것만** 먼저 청하고, `en` 은
-    그 라운드가 빈손일 때의 대비책으로 미룬다.
+def _track_names(tracks):
+    if not isinstance(tracks, dict):
+        return []
+    return sorted(name for name in tracks if isinstance(name, str) and name)
 
-    🔴 한 번에 `ko,ko-orig,en` 을 청하면 안 된다. yt-dlp 는 청한 언어 중 **하나라도**
-       못 받으면 비영 종료라, ko 자막을 이미 손에 쥐고도 en 하나의 429 로 전체가 실패한다
-       (실측 2026-09-02~05: 잡 118건 중 18건이 이 경로로 죽었고 실패 사유는 전부
-       `for 'en'` 이었다). 요청 수도 영상마다 두 배가 되어 레이트리밋을 스스로 앞당긴다.
+
+def caption_choice(info):
+    """(플래그, 종류, 정확한 자막 코드) 하나. 없으면 None.
+
+    메타데이터에 실제로 있는 트랙 하나만 고른다. 우선순위는 사람 자막 원어 → 사람
+    자막 그 밖 → 자동 자막 원어(`-orig`) → 자동 자막 그 밖이다. `--sub-langs` 에
+    후보를 여러 개 넘기면 하나가 429 일 때 이미 받은 자막까지 실패하므로, 이 함수에서
+    요청 언어를 하나로 확정한다.
     """
-    if language and language != "en":
-        return ([language, f"{language}-orig"], ["en"])
-    return (["en"],)
+    language = source_language(info)
+    manual = _track_names(info.get("subtitles"))
+    automatic = _track_names(info.get("automatic_captions"))
+
+    # 사람 자막은 원어의 정확한 언어 코드가 있을 때 먼저 쓴다. 원어를 모르면
+    # 아래의 "그 밖" 순서로만 고른다.
+    if language and language in manual:
+        return "--write-subs", "manual", language
+    if manual:
+        return "--write-subs", "manual", manual[0]
+
+    # 자동자막의 원어는 source_language()가 찾아낸 <언어>-orig 키다. 접미사가 없는
+    # 자동자막은 그 뒤의 일반 후보로만 취급한다.
+    original = f"{language}-orig" if language else None
+    if original and original in automatic:
+        return "--write-auto-subs", "auto", original
+    if automatic:
+        return "--write-auto-subs", "auto", automatic[0]
+    return None
 
 
 def metadata(binary, url):
@@ -148,11 +187,14 @@ def metadata(binary, url):
         # 🔴 낡은 yt-dlp 는 여기서 403 을 낸다. 그 경우 원인은 URL 이 아니라 도구다.
         hint = ("\n(yt-dlp 이 낡으면 403 이 납니다 — 최신으로 올려 보십시오)"
                 if "403" in detail else "")
-        die(f"영상 정보를 읽지 못했습니다: {detail[:400]}{hint}")
+        error = "rate-limited" if rate_limited(result.stderr) else "video-unavailable"
+        die(f"영상 정보를 읽지 못했습니다: {detail[:400]}{hint}", error)
     try:
         data = json.loads(result.stdout.decode("utf-8", "replace"))
     except ValueError as exc:
-        die(f"영상 정보를 해석하지 못했습니다: {exc}")
+        die(f"영상 정보를 해석하지 못했습니다: {exc}", "metadata-invalid")
+    if not isinstance(data, dict):
+        die("영상 정보가 JSON 객체가 아닙니다", "metadata-invalid")
     return data
 
 
@@ -161,61 +203,51 @@ def hms(seconds):
     return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
-def attempts(language):
-    """(플래그, 종류, 언어목록, 끈질기게) 를 시도할 순서대로. 사람 자막 → 자동자막, 각
-    안에서 영상 언어 → en.
-
-    🔴 429 를 기다려 주는 것은 **1순위 라운드에만** 한다. 대비책인 en 라운드에서까지
-       세 번 기다리면 영상 하나에 2분이 그냥 사라지는데, 정작 그 영상의 진짜 자막은
-       다음 라운드에 있다. 대비책은 한 번 청해 보고 아니면 넘어가는 것이 맞다.
-    """
-    for flag, kind in (("--write-subs", "manual"), ("--write-auto-subs", "auto")):
-        for index, langs in enumerate(language_rounds(language)):
-            yield flag, kind, langs, index == 0
-
-
-def subtitle_events(binary, url, workdir, language=None, failures=None):
+def subtitle_events(binary, url, workdir, info, failures=None, failure_code=None):
     """(이벤트 목록, 종류). 자막이 없으면 (None, None). 실패 사유는 `failures` 에 쌓인다.
 
-    사람 자막 → 자동자막 순서. 사람 자막이 있으면 그것을 먼저 쓴다 — 자동자막은 받아쓰기라
-    고유명사와 숫자가 틀린다.
+    `info` 에서 이미 고른 트랙 하나만 요청한다. 트랙이 없으면 호출하지 않고 반환한다.
+    자동자막은 받아쓰기라 고유명사와 숫자가 틀린다.
     """
     failures = [] if failures is None else failures
-    for flag, kind, langs, patient in attempts(language):
-        for name in os.listdir(workdir):
-            os.unlink(os.path.join(workdir, name))   # 앞 시도의 산출물을 이번 것으로 읽지 않는다
-        # 🔴 언어를 안 주면 yt-dlp 는 **영어를 고른다.** 한국어 영상의 자동자막에 ko 와
-        #    en 이 다 있으면 en(기계번역)을 받아 오고, 요약이 번역본에서 만들어진다
-        #    (적대검증 2026-08-22 실측). 그래서 언제나 명시해서 청한다.
-        argv = [binary, "--skip-download", flag, "--sub-format", "json3",
-                "--sub-langs", ",".join(langs),
-                "--no-playlist", "--no-warnings",
-                "-o", os.path.join(workdir, "s.%(ext)s"), url]
-        result = run_patiently(argv) if patient else run(argv)
-        label = f"{kind}/{','.join(langs)}"
-        if result.returncode != 0:
-            # 🔴 실패 사유를 버리지 않는다. 버리면 429·지역차단·인증요구가 전부 "자막이
-            #    없습니다" 로 세탁된다 — 사용자는 되는 영상을 안 된다고 읽고, 그 오해를
-            #    풀 방법이 없다.
-            detail = result.stderr.decode("utf-8", "replace").strip()
-            if detail:
-                failures.append(f"{label}: {detail.splitlines()[-1][:200]}")
-            continue
-        landed = sorted(os.listdir(workdir))
-        hits = [name for name in landed if name.endswith(".json3")]
-        if not hits:
-            if landed:
-                # 자막은 왔는데 json3 가 아니다. "없다" 와 전혀 다른 사건이다.
-                failures.append(f"{label}: json3 자막이 없습니다 (받은 것: {', '.join(landed)})")
-            continue
-        try:
-            with open(os.path.join(workdir, hits[0]), "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        events = payload.get("events")
-        if isinstance(events, list) and events:
-            return events, kind
+    choice = caption_choice(info)
+    if choice is None:
+        return None, None
+    flag, kind, code = choice
+    for name in os.listdir(workdir):
+        os.unlink(os.path.join(workdir, name))   # 이전 산출물을 이번 것으로 읽지 않는다
+    # 🔴 언어를 안 주면 yt-dlp 는 **영어를 고른다.** 선택한 코드 하나를 항상 명시한다.
+    argv = [binary, "--skip-download", flag, "--sub-format", "json3",
+            "--sub-langs", code, "--no-playlist", "--no-warnings",
+            "-o", os.path.join(workdir, "s.%(ext)s"), url]
+    result = run_patiently(argv, failure_code="subtitle-unreadable")
+    label = f"{kind}/{code}"
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        if detail:
+            failures.append(f"{label}: {detail.splitlines()[-1][:200]}")
+        error = "rate-limited" if rate_limited(result.stderr) else "subtitle-unreadable"
+        if failure_code is not None:
+            failure_code.append(error)
+        return None, None
+    landed = sorted(os.listdir(workdir))
+    hits = [name for name in landed if name.endswith(".json3")]
+    if not hits:
+        if landed:
+            failures.append(f"{label}: json3 자막이 없습니다 (받은 것: {', '.join(landed)})")
+        if failure_code is not None:
+            failure_code.append("subtitle-unreadable")
+        return None, None
+    try:
+        with open(os.path.join(workdir, hits[0]), "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        events = payload.get("events") if isinstance(payload, dict) else None
+    except (OSError, ValueError, TypeError):
+        events = None
+    if isinstance(events, list) and events:
+        return events, kind
+    if failure_code is not None:
+        failure_code.append("subtitle-unreadable")
     return None, None
 
 
@@ -248,21 +280,27 @@ def main(argv=None):
     info = metadata(binary, args.url)
     video_id = str(info.get("id") or "")
     if not VIDEO_ID_RE.fullmatch(video_id):
-        die(f"영상 id 를 읽지 못했습니다: {video_id!r}")
+        die(f"영상 id 를 읽지 못했습니다: {video_id!r}", "metadata-invalid")
+
+    # 메타데이터가 알려 준 트랙이 없으면 자막 요청 자체를 하지 않는다. 음성 인식으로
+    # 우회하지 않는 것은 스킬 계약이다.
+    if caption_choice(info) is None:
+        die("이 영상은 자막이 없어 적재할 수 없습니다", "no-subs")
 
     failures = []
+    failure_code = []
     with tempfile.TemporaryDirectory(prefix="airlock-learning-subs-") as workdir:
         events, kind = subtitle_events(binary, args.url, workdir,
-                                       source_language(info), failures)
+                                       info, failures, failure_code)
     if not events:
+        detail = "자막을 받지 못했습니다"
         if failures:
-            die("자막을 받지 못했습니다 — " + " / ".join(failures))
-        die("이 영상에는 자막이 없습니다 — 자막 없는 영상의 적재는 아직 지원하지 않습니다. "
-            "(기계 전사를 붙이면 되지만 모델 파일 수 GB 가 설치에 따라붙습니다.)")
+            detail += " — " + " / ".join(failures)
+        die(detail, failure_code[-1] if failure_code else "subtitle-unreadable")
 
     lines = lines_from(events)
     if not lines:
-        die("자막 파일은 받았지만 읽을 문장이 하나도 없습니다")
+        die("자막 파일은 받았지만 읽을 문장이 하나도 없습니다", "subtitle-unreadable")
 
     body = "\n".join(f"**[{hms(start)}]** {text}" for start, text in lines)
     # 🔴 임시 파일에 쓰고 이름을 바꾼다. 대상에 바로 쓰면 실패했을 때 **반쯤 쓰인 전사본**이
@@ -283,8 +321,8 @@ def main(argv=None):
             except OSError:
                 pass
             raise
-    except OSError as exc:
-        die(f"전사본을 쓰지 못했습니다: {exc}")
+    except (OSError, UnicodeError) as exc:
+        die(f"전사본을 쓰지 못했습니다: {exc}", "transcript-write-failed")
 
     duration = info.get("duration")
     print(json.dumps({

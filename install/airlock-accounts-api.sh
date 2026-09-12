@@ -46,6 +46,25 @@ else
   eval "$(airlock_config env hub)"
   ACCOUNTS_PORT="${AIRLOCK_HUB_ACCOUNTS_PORT:?hub accounts_port missing}"
 fi
+# The account panel is served by the platform surface itself (bin/airlock-accounts-api),
+# so it needs the directory the installed assets land in. Same single-read rule as the
+# port above: the orchestrator exports AIRLOCK_WEBROOT, and a standalone run falls back
+# to the documented default rather than inventing a second webroot opinion.
+PANEL_DIR="${AIRLOCK_WEBROOT:-/opt/airlock/hub}/assets/accounts"
+# The account view also needs popup.css. The surface now ships its own copy
+# (install/accounts-panel/), so the mount serves a complete page without depending on
+# apps/devterm/web being present -- which it is not in a partial tree, and which is the
+# ownership question docs/design/platform-account-surface.md:81 left open.
+PANEL_STYLE_DIR="$ROOT/install/accounts-panel"
+# Verified here, at install time, rather than discovered as a 404 in the panel: a mount
+# that promises assets must fail while someone is still looking at the install. The
+# stylesheet ships with this repository, so its absence is a broken tree, not a fixture.
+[ -f "$PANEL_STYLE_DIR/popup.css" ] \
+  || die "account panel stylesheet missing: $PANEL_STYLE_DIR/popup.css"
+# panel.html and accounts.js are hub's to install (install/airlock-install.sh copies
+# hub/assets/), so this helper does not require them: run standalone or on a scratch box
+# before the hub step, they are legitimately absent, and the mount already answers their
+# absence with 404/500 rather than a page. The fixture measures that layout end to end.
 FLEET_STORE="${AIRLOCK_HUB_FLEET_STORE-}"
 FLEET_STORE_URL="${AIRLOCK_HUB_FLEET_STORE_URL-}"
 
@@ -66,6 +85,8 @@ if ! sed -e "s|@AIRLOCK_ROOT@|$(escape "$ROOT")|g" \
           -e "s|@ACCOUNTS_STATUS_BIN@|$(escape "$AIRLOCK_ACCOUNTS_STATUS_BIN")|g" \
           -e "s|@ACCOUNTS_BIN@|$(escape "$AIRLOCK_ACCOUNTS_BIN")|g" \
           -e "s|@FLEET_STORE@|$(escape "$FLEET_STORE")|g" \
+          -e "s|@PANEL_DIR@|$(escape "$PANEL_DIR")|g" \
+          -e "s|@PANEL_STYLE_DIR@|$(escape "$PANEL_STYLE_DIR")|g" \
           -e "s|@FLEET_STORE_URL@|$(escape "$FLEET_STORE_URL")|g" \
           "$HERE/systemd/$SERVICE.in" > "$tmp"; then
   rm -f "$tmp"

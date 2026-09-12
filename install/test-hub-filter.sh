@@ -187,8 +187,11 @@ sourceCheck("company install reuses the owner app mutation route",
   html.includes('"/monitor/api/owner/apps/" + encodeURIComponent(id) + "/" + action'));
 sourceCheck("personal approval binds the preview path and digest",
   html.includes('personal ? { path: selected.preview.path, digest: selected.preview.digest }') &&
-  html.includes('reapprove ? "재승인"') &&
+  html.includes('registered ? "재승인" : "재승인하고 설치"') &&
   html.includes('"승인하고 설치"'));
+sourceCheck("an unregistered stale lock stays on register while requesting reapproval",
+  html.includes('const reapprove = value.requires_reapproval === true;') &&
+  html.includes('const action = registered && reapprove ? "reapprove" : "register";'));
 sourceCheck("denied personal capabilities disable approval",
   html.includes('value.installable !== true || (registered && !reapprove)') &&
   html.includes('chip.dataset.denied = String(denied)') &&

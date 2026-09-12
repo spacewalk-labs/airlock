@@ -4,8 +4,9 @@
 (파일 이름은 옛 oneshot 러너 시절 그대로다. `infra/dev-hub/` 는 이관 중이라 파일 추가가
 금지돼 있어 새 이름으로 옮기지 못한다 — 하는 일은 러너가 아니라 워커다.)
 
-구조는 한 문장이다. **하나 집어서, 끝날 때까지 돌리고, 그 다음 것을 집는다.**
-"동시 1건"이 락으로 지키는 불변식이 아니라 직선 코드라, 위반할 방법이 없다.
+구조는 한 문장이다. **설정된 슬롯만큼 집어서 각자 돌리고, 빈 슬롯을 다시
+채운다.** 각 슬롯은 자기 SQLite 연결과 자기 프로세스 그룹을 갖는다. git sync 만
+메인 루프가 실행해 동시 저장을 한 커밋으로 모은다.
 
 이전 구조는 요청마다 systemd 템플릿 유닛을 띄우고 `kick_ingest_queue()` 를 HTTP 핸들러
 셋과 러너의 `finally` 가 각자 불렀다. "다음 것을 시작한다"는 결정이 프로세스 경계를
@@ -26,6 +27,7 @@ import fcntl
 import hashlib
 import importlib.util
 import os
+import re
 import signal
 import json
 import subprocess
@@ -68,6 +70,8 @@ QUEUE = BACKEND.IngestQueue
 #    `TimeoutStartSec` 이 없고, 그래서 "유닛과 러너 중 누가 먼저 죽나"를 맞추던 grace 상수와
 #    `--print-unit-timeout` 왕복이 통째로 사라졌다.
 DEFAULT_TIMEOUT_SECONDS = 60 * 60
+DEFAULT_INGEST_SLOTS = 3
+MAX_INGEST_SLOTS = 3
 
 # 큐를 들여다보는 주기. 13분짜리 작업에 2초 폴링은 공짜다 — 대신 알림 프로토콜·시그널
 # 전달·`kick` 삼중 호출이 전부 없어진다.
@@ -75,6 +79,26 @@ POLL_SECONDS = 2.0
 
 # 판정할 때 이해 못 한 줄을 세려고 읽는 로그 길이. 꼬리만 본다.
 INGEST_UNKNOWN_SCAN_BYTES = 256 << 10
+
+# 전사본 도구가 자유문장과 함께 남기는 기계 판독용 실패 표시. 닫힌 목록 밖의 값은
+# 무시한다 — 오타나 낯선 새 코드를 기존 실패 판정으로 조용히 받아들이지 않는다.
+INGEST_ERROR_MARKER = "LEARNING-INGEST-ERROR"
+INGEST_ERROR_RE = re.compile(
+    r"LEARNING-INGEST-ERROR\s+\{\s*\"error\"\s*:\s*\"([^\"]+)\"\s*\}"
+)
+INGEST_ERROR_MESSAGES = {
+    "tool-missing": "자막을 받을 도구를 찾지 못했습니다",
+    "rate-limited": "유튜브 요청이 너무 많아 잠시 뒤 다시 시도해야 합니다",
+    "video-unavailable": "영상 정보를 읽을 수 없습니다",
+    "metadata-invalid": "영상 정보의 형식이 올바르지 않습니다",
+    "no-subs": "이 영상은 자막이 없어 적재할 수 없습니다",
+    "subtitle-unreadable": "자막을 받았지만 읽을 수 없습니다",
+    "transcript-write-failed": "전사본을 저장하지 못했습니다",
+}
+
+# IP 단위 레이트리밋을 피하려고 한 적재가 끝난 뒤 다음 큐 항목을 집기 전까지 두는
+# 최소 간격. 429 자체의 5·15·45초 대기는 transcript.py 가 별도로 유지한다.
+MIN_INGEST_INTERVAL_SECONDS = 5.0
 
 # 취소·종료 시 자식에게 주는 유예. 넘으면 프로세스 그룹째 SIGKILL 한다.
 TERM_GRACE_SECONDS = 20.0
@@ -205,6 +229,15 @@ def timeout_seconds():
     except ValueError:
         return float(DEFAULT_TIMEOUT_SECONDS)
     return value if value > 0 else float(DEFAULT_TIMEOUT_SECONDS)
+
+
+def ingest_slots():
+    raw = BACKEND.env_first("AIRLOCK_LEARNING_WORKER_SLOTS", default=str(DEFAULT_INGEST_SLOTS))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_INGEST_SLOTS
+    return value if 1 <= value <= MAX_INGEST_SLOTS else DEFAULT_INGEST_SLOTS
 
 
 def resolve_provider():
@@ -485,6 +518,26 @@ def read_log(path, limit=None):
     return data.decode("utf-8", "replace")
 
 
+def ingest_error(log_path):
+    """전사본 도구의 닫힌 실패 코드를 로그에서 읽는다.
+
+    Codex 평문은 표시가 줄머리에 오고, Claude 도구 실패는 `[결과·오류]` 한 줄 안에
+    접혀 온다. 그 둘만 받는다. 일반 도구 결과나 `[원문]` 이벤트 속 예시는 실패 표시로
+    오인하지 않는다.
+    """
+    text = read_log(log_path, INGEST_UNKNOWN_SCAN_BYTES)
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not (stripped.startswith(INGEST_ERROR_MARKER)
+                or (stripped.startswith("[결과·오류]")
+                    and INGEST_ERROR_MARKER in stripped)):
+            continue
+        match = INGEST_ERROR_RE.search(stripped)
+        if match and match.group(1) in INGEST_ERROR_MESSAGES:
+            return match.group(1)
+    return None
+
+
 def build_prompt(row, state_dir):
     """🔴 이전 로그를 **argv 에 싣지 않고 경로로 넘긴다.** 스킬이 자기 Read 도구로 읽는다.
 
@@ -536,6 +589,27 @@ def verdict(repo, row, return_code, log_path, produced_output, receipt_path=None
     기계가 쓴 것 하나(영수증) + 지금 그 자리의 파일**이 된다. 영수증이 없어도 판정은
     되지만 그때 무엇이 빠졌는지는 fields 에 적힌다 — 조용히 같은 것으로 치지 않는다.
     """
+    document = _completion_document(log_path) if produced_output else None
+
+    # 성공 증거가 모두 있으면 그것부터 확정한다. 전사본 도구가 중간에 실패 표시를 남긴 뒤
+    # 에이전트가 복구해 저장까지 마칠 수 있으므로 sentinel이나 exit code를 먼저 보면 실제로
+    # 생긴 문서가 실패로 뒤집힌다. 이 우선권은 영수증까지 있는 강한 성공에만 준다.
+    receipt_exists = bool(receipt_path and os.path.exists(receipt_path))
+    receipt = SAVE.read_receipt(receipt_path) if receipt_exists else None
+    if document is not None and receipt is not None:
+        reason, error = _verify_document(repo, document, row.get("video_id"), receipt)
+        if reason is None:
+            return "done", {
+                "exit_code": return_code, "reason": "completed", "document": document,
+            }
+
+    error_code = ingest_error(log_path) if produced_output else None
+    if error_code is not None:
+        return "failed", {
+            "exit_code": return_code,
+            "reason": error_code,
+            "error": INGEST_ERROR_MESSAGES[error_code],
+        }
     if return_code != 0:
         return "failed", {
             "exit_code": return_code, "reason": "cli-failed",
@@ -546,7 +620,6 @@ def verdict(repo, row, return_code, log_path, produced_output, receipt_path=None
             "exit_code": return_code, "reason": "no-output",
             "error": "에이전트 CLI 가 아무 출력 없이 끝났습니다",
         }
-    document = _completion_document(log_path)
     if document is None:
         # 🔴 이해하지 못한 이벤트가 로그에 있으면 원인이 다르다 — 스킬이 멈춘 게 아니라
         #    **우리가 CLI 의 출력 형식을 못 읽은 것**이다. 그 둘을 같은 문장으로 보고하면
@@ -568,9 +641,7 @@ def verdict(repo, row, return_code, log_path, produced_output, receipt_path=None
     # 영수증이 **없는 것**과 **있는데 못 읽는 것**은 다르다. 앞은 헬퍼를 쓰지 않은 스킬이고,
     # 뒤는 헬퍼가 쓰다 만 것이거나 누군가 건드린 것이다 — 뒤를 앞으로 접어 넣으면 그것이
     # 바로 조용한 통과가 된다.
-    receipt = None
-    if receipt_path and os.path.exists(receipt_path):
-        receipt = SAVE.read_receipt(receipt_path)
+    if receipt_exists:
         if receipt is None:
             return "failed", {
                 "exit_code": return_code, "reason": "receipt-unreadable",
@@ -755,6 +826,86 @@ def _terminate(process, log_path):
         append_log(log_path, "[ingest] 프로세스 종료 경고: " + "; ".join(errors) + "\n")
 
 
+def wait_until_next_ingest(not_before, clock=None, sleep=None):
+    """연속 적재의 최소 간격을 지키되 종료 신호에는 폴링 주기 안에 반응한다."""
+    clock = time.monotonic if clock is None else clock
+    sleep = time.sleep if sleep is None else sleep
+    while not STOPPING:
+        remaining = not_before - clock()
+        if remaining <= 0:
+            return
+        sleep(min(POLL_SECONDS, remaining))
+
+
+def _run_slot(paths, row):
+    """슬롯 하나의 DB 연결과 실행 수명을 같이 묶는다.
+
+    sqlite 연결은 만든 스레드만 쓴다. 예상 밖 예외가 스레드만 죽여 `running`
+    행을 영원히 남기지 않도록 같은 연결에서 실패로 종결한다.
+    """
+    conn = QUEUE.connect(paths["state"])
+    try:
+        try:
+            run_attempt(conn, paths, row)
+        except Exception as exc:
+            current = QUEUE.get(conn, row["id"])
+            if current and current["state"] == "running":
+                QUEUE.finish(
+                    conn, row["id"], "failed", now_iso(), reason="worker-error",
+                    error=f"적재 워커 슬롯이 예상치 못하게 종료됐습니다: {exc}")
+    finally:
+        conn.close()
+
+
+def run_worker_loop(paths, conn, slot_count, git_tick):
+    """큐 코디네이터. 프로세스 신호·singleton 은 main 이, 배치 조율은 이곳이 담당한다."""
+    active = {}
+    available_at = [0.0] * slot_count
+    pending_git = False
+    while not STOPPING:
+        now = time.monotonic()
+        finished = []
+        for slot, (thread, _row) in active.items():
+            if not thread.is_alive():
+                thread.join()
+                finished.append(slot)
+        for slot in finished:
+            del active[slot]
+            available_at[slot] = now + MIN_INGEST_INTERVAL_SECONDS
+            pending_git = True
+
+        # 동시에 돌던 저장을 슬롯 스레드가 각자 commit 하지 않는다.
+        # 메인이 현재 배치가 다 빈 시점에 한 번만 모아 처리한다.
+        if pending_git and not active:
+            git_tick(force=True)
+            pending_git = False
+
+        launched = False
+        for slot in range(slot_count):
+            if slot in active or now < available_at[slot]:
+                continue
+            row = QUEUE.claim_next(conn, now_iso(), slot_count)
+            if row is None:
+                break
+            thread = threading.Thread(
+                target=_run_slot, args=(paths, row),
+                name=f"learning-ingest-{row['id']}", daemon=False)
+            active[slot] = (thread, row)
+            thread.start()
+            launched = True
+
+        if not active and not launched:
+            git_tick()
+        time.sleep(POLL_SECONDS)
+
+    # 신호 핸들러는 플래그만 세웠다. 각 슬롯이 자기 프로세스 그룹만
+    # 종료하고 DB 행을 종결할 때까지 연결과 singleton lock 을 유지한다.
+    for thread, _row in active.values():
+        thread.join()
+    if active or pending_git:
+        git_tick(force=True)
+
+
 def main(argv=None):
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -782,15 +933,7 @@ def main(argv=None):
                         BACKEND.library_categories(paths["repo"]),
                         log=lambda line: print(line, file=sys.stderr), force=force)
 
-        while not STOPPING:
-            row = QUEUE.claim_next(conn, now_iso())
-            if row is None:
-                git_tick()
-                time.sleep(POLL_SECONDS)
-                continue
-            run_attempt(conn, paths, row)
-            # 방금 문서가 생겼다. 다음 주기를 기다리지 않는다 — 사용자가 지금 보고 있다.
-            git_tick(force=True)
+        run_worker_loop(paths, conn, ingest_slots(), git_tick)
     finally:
         conn.close()
         lock.close()

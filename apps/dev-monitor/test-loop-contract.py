@@ -47,6 +47,7 @@ class Recorder(http.server.BaseHTTPRequestHandler):
 
 
 def retries(root, server, hook):
+    controls = 0
     for code in (500,429,400):
         case = root/str(code);case.mkdir()
         open_db(case)
@@ -74,6 +75,8 @@ def retries(root, server, hook):
             assert delays == [45,90,180,360,720] and jitter.call_count==5
         print('RETRY HTTP%d: total_attempts=6 (initial included), jitter delays=%s; collected=7 failed=1' % (code,delays))
         M._conn().close()
+        controls += 1
+    return controls
 
 
 def fault(root,server,hook):
@@ -96,6 +99,7 @@ def fault(root,server,hook):
     assert M._conn().execute('SELECT COUNT(*) FROM ledger').fetchone()[0]==1
     print('FAULT: SIGKILL after POST before commit; restart total_POSTs=2 ledger=1 sent=1 missing=0')
     M._conn().close()
+    return len(server.posts)-before
 
 
 def retention(root):
@@ -184,10 +188,17 @@ def main():
         worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
         hook='http://127.0.0.1:%d/hook'%server.server_port
         try:
-            retries(root,server,hook)
-            fault(root,server,hook)
+            retry_controls = retries(root,server,hook)
+            crash_posts = fault(root,server,hook)
             retention(root)
             threads(root)
+            revision = subprocess.check_output(
+                ['git', 'rev-parse', '--short=12', 'HEAD'], text=True, cwd=APP.parent.parent
+            ).strip()
+            print('AC-5 | expected: retry_controls == 3 && crash_posts == 2 | '
+                  'observed: retry_controls=%d,crash_posts=%d | verdict: PASS | '
+                  'signal: fixture | evidence: apps/dev-monitor/test-loop-contract.py@%s'
+                  % (retry_controls, crash_posts, revision))
         finally:
             server.shutdown();server.server_close();worker.join()
 

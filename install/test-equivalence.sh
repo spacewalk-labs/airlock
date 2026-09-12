@@ -107,13 +107,29 @@ chmod +x "$TMP/bin/loginctl"
 export PATH="$TMP/bin:$PATH"
 
 normalise() {
-  # \b on the bare-user substitution: an unanchored s|root|USER| would eat
-  # the substring inside "webroot" for a root-named runner.
+  # The only bare username in these transcripts is this exact linger command.
+  # Do not substitute a word-bounded username everywhere: GNU sed correctly
+  # treats \broot\b as a word, so a root-named runner used to rewrite nginx's
+  # `root` directives and comments as well.
+  local runner_user="${1:-$(id -un)}" runner_group="${2:-$(id -gn)}"
   sed -e "s|$ROOT|ROOT|g" \
       -e "s|$TMP|TMP|g" \
-      -e "s|$(id -un):$(id -gn)|USER:GROUP|g" \
-      -e "s|\b$(id -un)\b|USER|g"
+      -e "s|$runner_user:$runner_group|USER:GROUP|g" \
+      -e "s|^\(\[dry\] loginctl enable-linger \)$runner_user$|\1USER|"
 }
+
+# This deliberately uses root even if the runner is not root. It is the
+# positive control for the bug above: a token whose spelling happens to be a
+# common username must remain ordinary transcript content unless it is the
+# one dynamic field we intend to erase.
+normalise_fixture=$'[dry] loginctl enable-linger root\nroot TMP/web\n# the root location remains literal'
+normalise_expected=$'[dry] loginctl enable-linger USER\nroot TMP/web\n# the root location remains literal'
+normalise_actual="$(printf '%s\n' "$normalise_fixture" | normalise root root)"
+normalise_ok=1
+if [ "$normalise_actual" != "$normalise_expected" ]; then
+  normalise_ok=0
+  echo "FAIL equivalence: normalise rewrote a literal root token or missed the linger user"
+fi
 
 # ---- the three transcripts ---------------------------------------------------
 rc=0
@@ -164,6 +180,142 @@ for name in install render webjson; do
   fi
 done
 [ "$MODE" = "--regen" ] && exit 0
+
+# The normal invocation is the card's entry.verify.  Its child runs need only
+# the three byte comparisons above, otherwise the hermeticity suite's D/E
+# controls would recursively start this suite again.
+hermetic_ok=UNMEASURED
+installed_paths=0
+for host_path in /opt/airlock /etc/airlock /etc/systemd/system; do
+  if [ -d "$host_path" ] && [ -n "$(find "$host_path" -mindepth 1 -print -quit)" ]; then
+    installed_paths=$((installed_paths + 1))
+  fi
+done
+clean_paths=UNMEASURED
+installed_golden_diff_files=UNMEASURED
+clean_golden_diff_files=UNMEASURED
+clean_mount_capable=UNMEASURED
+negative_control=UNMEASURED
+host_samples_verdict=UNMEASURED
+
+# This narrow mode is executed inside the deliberately clean mount namespace
+# below. It is an anti-vacuity control: the same entrypoint must refuse to call
+# a box "installed" when its three measured roots are empty.
+if [ "${AIRLOCK_EQUIVALENCE_EXPECT_UNMEASURED:-0}" = 1 ]; then
+  if [ "$installed_paths" != 0 ]; then
+    echo "FAIL equivalence: clean-host negative control still saw $installed_paths populated installation root(s)"
+    fail=1
+    host_samples_verdict=FAIL
+  fi
+elif [ "${AIRLOCK_EQUIVALENCE_CORE_ONLY:-0}" != 1 ]; then
+  if bash "$HERE/test-equivalence-hermetic.sh"; then
+    hermetic_ok=1
+  else
+    hermetic_ok=0
+    fail=1
+    echo "FAIL equivalence: pinned-host-read controls failed"
+  fi
+
+  # Regenerate outside this worktree. First assert that this is actually an
+  # installed host, then compare it with an unshared namespace which bind
+  # mounts EMPTY /opt, /etc/airlock, and /etc/systemd/system. The source
+  # goldens are inputs to diff only, never rewritten by this proof.
+  if [ "$installed_paths" = 0 ]; then
+    echo "UNMEASURED equivalence: no populated installation root among /opt/airlock, /etc/airlock, /etc/systemd/system"
+  else
+    SAMPLE="$(mktemp -d)"
+    trap 'rm -rf "$TMP" "$SAMPLE"' EXIT
+    if git -C "$ROOT" archive --format=tar HEAD | tar -xf - -C "$SAMPLE" \
+        && cp "$HERE/test-equivalence.sh" "$SAMPLE/install/test-equivalence.sh" \
+        && bash "$SAMPLE/install/test-equivalence.sh" --regen \
+        && diff -ruN "$GOLDEN_DIR" "$SAMPLE/install/golden" >/dev/null; then
+      installed_golden_diff_files=0
+    else
+      installed_golden_diff_files=1
+      echo "FAIL equivalence: installed-host --regen diverged from committed goldens"
+    fi
+
+    if [ "$installed_golden_diff_files" != 0 ]; then
+      host_samples_verdict=FAIL
+      fail=1
+    elif clean_mount_error="$(unshare --user --map-root-user --mount --fork bash -ceu '
+        clean=$(mktemp -d)
+        mkdir -p "$clean/opt" "$clean/etc-airlock" "$clean/systemd"
+        mount --bind "$clean/opt" /opt
+        mount --bind "$clean/etc-airlock" /etc/airlock
+        mount --bind "$clean/systemd" /etc/systemd/system
+        for path in /opt /etc/airlock /etc/systemd/system; do
+          test -z "$(find "$path" -mindepth 1 -print -quit)"
+        done
+      ' 2>&1)"; then
+      clean_mount_capable=1
+      clean_paths=0
+      if unshare --user --map-root-user --mount --fork bash -ceu '
+          clean=$(mktemp -d)
+          mkdir -p "$clean/opt" "$clean/etc-airlock" "$clean/systemd"
+          mount --bind "$clean/opt" /opt
+          mount --bind "$clean/etc-airlock" /etc/airlock
+          mount --bind "$clean/systemd" /etc/systemd/system
+          for path in /opt /etc/airlock /etc/systemd/system; do
+            test -z "$(find "$path" -mindepth 1 -print -quit)"
+          done
+          bash "$1/install/test-equivalence.sh" --regen
+        ' bash "$SAMPLE" \
+        && diff -ruN "$GOLDEN_DIR" "$SAMPLE/install/golden" >/dev/null; then
+        clean_golden_diff_files=0
+      else
+        clean_golden_diff_files=1
+        echo "FAIL equivalence: clean-host --regen diverged from committed goldens"
+      fi
+
+      # Negative control for the exact boundary above: when all three roots are
+      # clean, this entrypoint must emit AC-GH-04 as UNMEASURED, never PASS.
+      if negative_out="$(unshare --user --map-root-user --mount --fork bash -ceu '
+        clean=$(mktemp -d)
+        mkdir -p "$clean/opt" "$clean/etc-airlock" "$clean/systemd"
+        mount --bind "$clean/opt" /opt
+        mount --bind "$clean/etc-airlock" /etc/airlock
+        mount --bind "$clean/systemd" /etc/systemd/system
+        for path in /opt /etc/airlock /etc/systemd/system; do
+          test -z "$(find "$path" -mindepth 1 -print -quit)"
+        done
+        AIRLOCK_EQUIVALENCE_EXPECT_UNMEASURED=1 bash "$1"
+      ' bash "$HERE/test-equivalence.sh" 2>&1)" \
+          && grep -q '^AC-GH-04 .*verdict: UNMEASURED ' <<<"$negative_out"; then
+        negative_control=1
+      else
+        negative_control=0
+        echo "FAIL equivalence: clean-host negative control emitted host_samples PASS or did not measure UNMEASURED"
+      fi
+
+      if [ "$clean_golden_diff_files" = 0 ] && [ "$negative_control" = 1 ]; then
+        host_samples_verdict=PASS
+      else
+        host_samples_verdict=FAIL
+        fail=1
+      fi
+    else
+      # A CI runner can create a user namespace yet forbid mount(2). That says
+      # nothing about golden equivalence: report this axis as UNMEASURED, while
+      # retaining the separately measured installed-host golden diff above.
+      echo "UNMEASURED equivalence: clean mount namespace unavailable: ${clean_mount_error##*$'\n'}"
+    fi
+  fi
+fi
+
+if [ "$normalise_ok" = 0 ]; then fail=1; fi
 echo "---"
 if [ "$fail" = 0 ]; then echo "passed=3 failed=0"; else echo "equivalence FAILED"; fi
+
+# AC rows are intentionally emitted only by the public entrypoint, not its
+# core-only children.  The card acceptor reruns this exact command at HEAD.
+if [ "${AIRLOCK_EQUIVALENCE_CORE_ONLY:-0}" != 1 ]; then
+  rev="$(git -C "$ROOT" rev-parse --short=7 HEAD)"
+  verdict() { [ "$1" = 1 ] && printf PASS || printf FAIL; }
+  printf 'AC-GH-01 | expected: hermetic_controls == 1 | observed: hermetic_controls=%s | verdict: %s | signal: fixture | evidence: install/test-equivalence-hermetic.sh@%s\n' "$hermetic_ok" "$(verdict "$hermetic_ok")" "$rev"
+  printf 'AC-GH-02 | expected: hermetic_controls == 1 | observed: hermetic_controls=%s | verdict: %s | signal: fixture | evidence: apps/publish/install.sh@%s\n' "$hermetic_ok" "$(verdict "$hermetic_ok")" "$rev"
+  printf 'AC-GH-03 | expected: hermetic_controls == 1 | observed: hermetic_controls=%s | verdict: %s | signal: fixture | evidence: install/test-equivalence.sh@%s\n' "$hermetic_ok" "$(verdict "$hermetic_ok")" "$rev"
+  printf 'AC-GH-04 | expected: installed_paths >= 1 && installed_golden_diff_files == 0 && clean_mount_capable == 1 && clean_paths == 0 && clean_golden_diff_files == 0 && negative_control == 1 | observed: installed_paths=%s,installed_golden_diff_files=%s,clean_mount_capable=%s,clean_paths=%s,clean_golden_diff_files=%s,negative_control=%s | verdict: %s | signal: replay | evidence: install/test-equivalence.sh@%s\n' "$installed_paths" "$installed_golden_diff_files" "$clean_mount_capable" "$clean_paths" "$clean_golden_diff_files" "$negative_control" "$host_samples_verdict" "$rev"
+  printf 'AC-GH-05 | expected: normalise_literal_root == 1 | observed: normalise_literal_root=%s | verdict: %s | signal: fixture | evidence: install/test-equivalence.sh@%s\n' "$normalise_ok" "$(verdict "$normalise_ok")" "$rev"
+fi
 exit "$fail"

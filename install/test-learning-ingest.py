@@ -26,6 +26,7 @@ import ast
 import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -49,12 +50,12 @@ if mode == "save":
     doc = ('---\ntitle: "worker"\nvideo_id: xxxxxxxxxx1\n'
            'added: 2026-08-22\n---\n\n' + body + '\n').encode("utf-8")
     subprocess.run([sys.executable, os.environ["AIRLOCK_LEARNING_SAVE"],
-                    "--path", "worker.md", "--video-id", "xxxxxxxxxx1"],
+                    "--path", "2026-08-22--worker--xxxxxxxxxx1.md", "--video-id", "xxxxxxxxxx1"],
                    input=doc, check=True)
-    print("LEARNING-INGEST-DONE worker.md", file=sys.stderr)
+    print("LEARNING-INGEST-DONE 2026-08-22--worker--xxxxxxxxxx1.md", file=sys.stderr)
 else:
     # 헬퍼를 쓰지 않고 완료 표시만 낸다 — 이미 있는 문서를 가리킨다.
-    print("LEARNING-INGEST-DONE worker2.md", file=sys.stderr)
+    print("LEARNING-INGEST-DONE 2026-08-22--worker--xxxxxxxxxx2.md", file=sys.stderr)
 '''
 
 PASS = 0
@@ -119,6 +120,83 @@ def main(argv):
     RUNNER = load(os.path.join(backend_dir, "ingest_runner.py"), "learning_ingest_runner_test")
     BACKEND = RUNNER.BACKEND
 
+    # 접수 시점 제목은 실제 네트워크 대신 가짜 oEmbed 응답으로 검증한다.
+    oembed_call = {}
+
+    class FakeOembedResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return json.dumps({"title": "접수 즉시 제목",
+                               "author_name": "임시 채널"}).encode("utf-8")
+
+    def fake_urlopen(url, timeout):
+        oembed_call.update(url=url, timeout=timeout)
+        return FakeOembedResponse()
+
+    real_urlopen = BACKEND.urlopen
+    BACKEND.urlopen = fake_urlopen
+    try:
+        metadata = BACKEND.fetch_oembed_metadata("https://youtu.be/metafake001")
+    finally:
+        BACKEND.urlopen = real_urlopen
+    check("oEmbed 제목·채널을 2초 제한으로 받는다",
+          metadata == {"title": "접수 즉시 제목", "channel": "임시 채널"}
+          and oembed_call.get("timeout") == 2
+          and "url=https%3A%2F%2Fyoutu.be%2Fmetafake001" in oembed_call.get("url", ""),
+          f"{metadata} / {oembed_call}")
+
+    real_oembed = BACKEND.fetch_oembed_metadata
+    real_relay = BACKEND.fetch_relay_metadata
+    relay_calls = []
+
+    def failed_oembed(_url):
+        raise TimeoutError("fake timeout")
+
+    def failed_relay(url):
+        relay_calls.append(url)
+        raise RuntimeError("fake relay failure")
+
+    BACKEND.fetch_oembed_metadata = failed_oembed
+    BACKEND.fetch_relay_metadata = failed_relay
+    fallback_url = "https://youtu.be/metafake002"
+    try:
+        fallback = BACKEND.prefill_ingest_metadata(fallback_url)
+    finally:
+        BACKEND.fetch_oembed_metadata = real_oembed
+        BACKEND.fetch_relay_metadata = real_relay
+    check("oEmbed 실패 시 free-relay 한 번 후 링크를 보여 준다",
+          fallback == {"title": fallback_url} and relay_calls == [fallback_url],
+          f"{fallback} / {relay_calls}")
+
+    real_relay_script = BACKEND._freerelay_script
+    real_subprocess_run = BACKEND.subprocess.run
+    relay_argv = []
+
+    def fake_relay_run(argv, **_kwargs):
+        relay_argv.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0,
+            stdout='```json\n{"title":"relay title","channel":"relay channel"}\n```\n',
+            stderr="")
+
+    BACKEND._freerelay_script = lambda: "/fake/freerelay_call.py"
+    BACKEND.subprocess.run = fake_relay_run
+    try:
+        relay_meta = BACKEND.fetch_relay_metadata(fallback_url)
+    finally:
+        BACKEND._freerelay_script = real_relay_script
+        BACKEND.subprocess.run = real_subprocess_run
+    check("oEmbed 실패 대안은 freerelay-short의 fenced JSON도 한 번에 읽는다",
+          relay_meta == {"title": "relay title", "channel": "relay channel"}
+          and len(relay_argv) == 1
+          and relay_argv[0][relay_argv[0].index("--model") + 1] == "freerelay-short",
+          f"{relay_meta} / {relay_argv}")
+
     try:
         # ---- 1. 문서 경로 문법. 완료 마커가 읽는 모양과 같아야 한다 ----
         for label, relative in (
@@ -146,6 +224,55 @@ def main(argv):
             check("라이브러리 밖으로 나가는 심볼릭 링크를 거절한다",
                   exc.reason == "outside-library", f"reason={exc.reason}")
         os.unlink(os.path.join(library, "elsewhere"))
+
+        # 신규 문서만 이름을 고정한다. 날짜·슬러그·video_id 중 하나라도 어긋나면 쓰기 전에
+        # 거절하고, 계약 도입 전에 있던 문서는 이름을 바꾸지 않은 채 같은 영상으로 재저장된다.
+        for label, relative, expected_reason in (
+            ("날짜·ID 없는 새 파일 이름", "plain-name.md", "filename-shape"),
+            ("실제 달력에 없는 적재일", "2026-02-31--plain-name--aaaaaaaaaaa.md",
+             "filename-shape"),
+            ("프론트매터 added 와 다른 적재일",
+             "2026-08-23--plain-name--aaaaaaaaaaa.md", "filename-date"),
+            ("대문자가 든 슬러그", "2026-08-22--Plain-Name--aaaaaaaaaaa.md",
+             "filename-shape"),
+            ("요청과 다른 파일 이름의 video_id",
+             "2026-08-22--plain-name--bbbbbbbbbbb.md", "filename-video-id"),
+        ):
+            try:
+                SAVE.save(library, relative, document("aaaaaaaaaaa"),
+                          video_id="aaaaaaaaaaa", state_dir=state)
+                bad(f"{label}을 저장이 받았다")
+            except SAVE.SaveError as exc:
+                check(f"{label}을 거절한다", exc.reason == expected_reason,
+                      f"reason={exc.reason}")
+        no_added = document("aaaaaaaaaaa").replace(b"added: 2026-08-22\n", b"")
+        try:
+            SAVE.save(library, "2026-08-22--no-added--aaaaaaaaaaa.md", no_added,
+                      video_id="aaaaaaaaaaa", state_dir=state)
+            bad("added 없는 새 문서를 저장이 받았다")
+        except SAVE.SaveError as exc:
+            check("added 없는 새 문서를 거절한다", exc.reason == "filename-date",
+                  f"reason={exc.reason}")
+        check("어긋난 새 파일 이름은 문서를 만들지 않는다",
+              not any("plain-name" in name for name in os.listdir(library)))
+
+        valid_named = "2026-08-22--plain-name--aaaaaaaaaaa.md"
+        valid_receipt, _ = SAVE.save(
+            library, valid_named, document("aaaaaaaaaaa"),
+            video_id="aaaaaaaaaaa", state_dir=state)
+        check("고정 형식의 새 파일 이름은 저장한다",
+              valid_receipt["path"] == valid_named
+              and os.path.isfile(os.path.join(library, valid_named)))
+
+        legacy_named = "legacy-name.md"
+        legacy_blob = document("legacy00001")
+        with open(os.path.join(library, legacy_named), "wb") as handle:
+            handle.write(legacy_blob)
+        legacy_receipt, _ = SAVE.save(
+            library, legacy_named, legacy_blob, video_id="legacy00001", state_dir=state)
+        check("이미 있던 문서는 옛 이름 그대로 재저장할 수 있다",
+              legacy_receipt["path"] == legacy_named
+              and os.path.isfile(os.path.join(library, legacy_named)))
 
         # ---- 2. 내용 판정. 거절은 아무것도 남기지 않는다 ----
         for label, blob, reason in (
@@ -190,10 +317,10 @@ def main(argv):
         receipt_path = os.path.join(state, "probe", "main.json")
         os.makedirs(os.path.dirname(receipt_path), exist_ok=True)
         blob = document()
-        receipt, warnings = SAVE.save(library, "ai/attention.md", blob,
+        receipt, warnings = SAVE.save(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", blob,
                                       video_id="dQw4w9WgXcQ", receipt_path=receipt_path)
         check("정상 저장은 경고를 남기지 않는다", warnings == [], str(warnings))
-        target = os.path.join(library, "ai", "attention.md")
+        target = os.path.join(library, "ai", "2026-08-22--attention--dQw4w9WgXcQ.md")
         check("카테고리 폴더가 없으면 만들고 저장한다", os.path.isfile(target))
         check("저장된 문서는 644 다", oct(os.stat(target).st_mode & 0o777) == "0o644",
               oct(os.stat(target).st_mode & 0o777))
@@ -202,7 +329,7 @@ def main(argv):
         check("저장된 내용이 건네준 바이트와 같다", written == blob)
         check("영수증 다이제스트가 디스크의 파일과 같다",
               receipt["sha256"] == hashlib.sha256(written).hexdigest())
-        check("영수증이 라이브러리 상대경로를 싣는다", receipt["path"] == "ai/attention.md",
+        check("영수증이 라이브러리 상대경로를 싣는다", receipt["path"] == "ai/2026-08-22--attention--dQw4w9WgXcQ.md",
               receipt["path"])
         check("영수증이 단계를 밝힌다", receipt["phase"] == SAVE.PHASE_DOCUMENT_SAVED)
         on_disk = SAVE.read_receipt(receipt_path)
@@ -213,7 +340,7 @@ def main(argv):
 
         # 덮어쓰기가 거절되면 **원래 내용이 그대로 있어야** 한다.
         try:
-            SAVE.save(library, "ai/attention.md", "---\nx: 1\n---\n짧다\n".encode("utf-8"))
+            SAVE.save(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", "---\nx: 1\n---\n짧다\n".encode("utf-8"))
             bad("짧은 내용으로 덮어쓰는 것을 저장이 받았다")
         except SAVE.SaveError:
             with open(target, "rb") as handle:
@@ -225,7 +352,7 @@ def main(argv):
         env["AIRLOCK_LEARNING_STATE_DIR"] = state
         env["AIRLOCK_LEARNING_RECEIPT"] = os.path.join(state, "probe", "cli.json")
         result = subprocess.run(
-            [sys.executable, save_path, "--path", "cli.md", "--video-id", "cccccccccc1"],
+            [sys.executable, save_path, "--path", "2026-08-22--cli--cccccccccc1.md", "--video-id", "cccccccccc1"],
             input=document("cccccccccc1"), env=env, capture_output=True, timeout=60)
         check("CLI 는 성공하면 exit 0", result.returncode == 0,
               result.stderr.decode("utf-8", "replace")[:200])
@@ -234,7 +361,7 @@ def main(argv):
         except ValueError:
             printed = None
         check("CLI 는 영수증 JSON 한 줄을 표준출력에 찍는다",
-              isinstance(printed, dict) and printed.get("path") == "cli.md", str(printed)[:200])
+              isinstance(printed, dict) and printed.get("path") == "2026-08-22--cli--cccccccccc1.md", str(printed)[:200])
         check("CLI 가 영수증 파일도 남긴다",
               SAVE.read_receipt(env["AIRLOCK_LEARNING_RECEIPT"]) == printed)
 
@@ -242,10 +369,10 @@ def main(argv):
         with open(draft, "wb") as handle:
             handle.write(document("ddddddddd12"))
         result = subprocess.run(
-            [sys.executable, save_path, "--path", "from-file.md", "--from", draft,
+            [sys.executable, save_path, "--path", "2026-08-22--from-file--ddddddddd12.md", "--from", draft,
              "--video-id", "ddddddddd12"], env=env, capture_output=True, timeout=60)
         check("CLI 는 --from 으로 초안 파일도 받는다",
-              result.returncode == 0 and os.path.isfile(os.path.join(library, "from-file.md")),
+              result.returncode == 0 and os.path.isfile(os.path.join(library, "2026-08-22--from-file--ddddddddd12.md")),
               result.stderr.decode("utf-8", "replace")[:200])
 
         result = subprocess.run(
@@ -260,7 +387,7 @@ def main(argv):
 
         env_no_library = {k: v for k, v in env.items() if k != "AIRLOCK_LEARNING_LIBRARY"}
         result = subprocess.run(
-            [sys.executable, save_path, "--path", "cli.md"],
+            [sys.executable, save_path, "--path", "2026-08-22--cli--cccccccccc1.md"],
             input=document(), env=env_no_library, capture_output=True, timeout=60)
         check("라이브러리를 모르면 cwd 로 조용히 내려앉지 않는다", result.returncode == 2,
               str(result.returncode))
@@ -279,32 +406,32 @@ def main(argv):
             print("skip learning-ingest: 읽기 전용 폴더 판정은 root 로는 못 잰다")
 
         saved_receipt = SAVE.read_receipt(receipt_path)
-        reason, error = RUNNER._verify_document(library, "ai/attention.md", "dQw4w9WgXcQ",
+        reason, error = RUNNER._verify_document(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", "dQw4w9WgXcQ",
                                                 saved_receipt)
         check("git 없이 저장된 문서가 완료로 판정된다", reason is None, f"{reason}: {error}")
 
-        reason, _ = RUNNER._verify_document(library, "ai/attention.md", "dQw4w9WgXcQ", None)
+        reason, _ = RUNNER._verify_document(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", "dQw4w9WgXcQ", None)
         check("영수증이 없어도 파일 자체로 판정된다", reason is None, str(reason))
 
-        reason, _ = RUNNER._verify_document(library, "ai/attention.md", "dQw4w9WgXcQ",
+        reason, _ = RUNNER._verify_document(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", "dQw4w9WgXcQ",
                                             dict(saved_receipt, path="other.md"))
         check("영수증이 다른 문서를 가리키면 완료가 아니다",
               reason == "marker-receipt-other-document", str(reason))
 
         with open(target, "ab") as handle:
             handle.write("\n나중에 덧붙인 줄\n".encode("utf-8"))
-        reason, _ = RUNNER._verify_document(library, "ai/attention.md", "dQw4w9WgXcQ",
+        reason, _ = RUNNER._verify_document(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", "dQw4w9WgXcQ",
                                             saved_receipt)
         check("저장 뒤 문서가 바뀌면 완료가 아니다",
               reason == "marker-receipt-content-changed", str(reason))
-        SAVE.save(library, "ai/attention.md", blob, video_id="dQw4w9WgXcQ",
+        SAVE.save(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", blob, video_id="dQw4w9WgXcQ",
                   receipt_path=receipt_path)
         saved_receipt = SAVE.read_receipt(receipt_path)
 
         reason, _ = RUNNER._verify_document(library, "ai/missing.md", "dQw4w9WgXcQ", None)
         check("없는 문서는 완료가 아니다", reason == "marker-document-missing", str(reason))
 
-        reason, _ = RUNNER._verify_document(library, "ai/attention.md", "zzzzzzzzzzz",
+        reason, _ = RUNNER._verify_document(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", "zzzzzzzzzzz",
                                             saved_receipt)
         check("다른 영상의 문서는 완료가 아니다", reason == "marker-document-other-video", str(reason))
 
@@ -325,8 +452,8 @@ def main(argv):
             os.makedirs(git_library)
             subprocess.run(["git", "init", "-q", git_library], check=True, timeout=60,
                            capture_output=True)
-            SAVE.save(git_library, "notes.md", document("gggggggggg1"), video_id="gggggggggg1")
-            reason, error = RUNNER._verify_document(git_library, "notes.md", "gggggggggg1", None)
+            SAVE.save(git_library, "2026-08-22--notes--gggggggggg1.md", document("gggggggggg1"), video_id="gggggggggg1")
+            reason, error = RUNNER._verify_document(git_library, "2026-08-22--notes--gggggggggg1.md", "gggggggggg1", None)
             check("git 라이브러리의 커밋되지 않은 문서도 완료로 판정된다",
                   reason is None, f"{reason}: {error}")
         else:
@@ -337,7 +464,7 @@ def main(argv):
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "w", encoding="utf-8") as handle:
             handle.write("[ingest] 시작\n"
-                         f"{BACKEND.INGEST_DONE_MARKER} ai/attention.md\n")
+                         f"{BACKEND.INGEST_DONE_MARKER} ai/2026-08-22--attention--dQw4w9WgXcQ.md\n")
         row = {"video_id": "dQw4w9WgXcQ"}
         row_done, log_done = row, log_path
         state_name, fields = RUNNER.verdict(library, row, 0, log_path, True, receipt_path)
@@ -345,13 +472,23 @@ def main(argv):
         check("영수증이 있었다는 사실이 기록된다", fields.get("reason") == "completed",
               str(fields.get("reason")))
 
+        success_with_error = os.path.join(state, "ingest", "9-sentinel.log")
+        with open(success_with_error, "w", encoding="utf-8") as handle:
+            handle.write("[ingest] 시작\n"
+                         'LEARNING-INGEST-ERROR {"error":"rate-limited"}\n'
+                         f"{BACKEND.INGEST_DONE_MARKER} ai/2026-08-22--attention--dQw4w9WgXcQ.md\n")
+        state_name, fields = RUNNER.verdict(
+            library, row, 0, success_with_error, True, receipt_path)
+        check("유효한 DONE+영수증은 sentinel보다 먼저 성공한다",
+              state_name == "done" and fields.get("reason") == "completed", str(fields))
+
         state_name, fields = RUNNER.verdict(library, row, 0, log_path, True, None)
         check("영수증 없이 통과한 적재는 그 사실이 남는다",
               state_name == "done" and fields.get("reason") == "completed-without-receipt",
               str(fields))
 
-        state_name, fields = RUNNER.verdict(library, row, 1, log_path, True, receipt_path)
-        check("CLI 가 실패하면 마커가 있어도 done 이 아니다",
+        state_name, fields = RUNNER.verdict(library, row, 1, log_path, True, None)
+        check("강한 영수증 없이 CLI 가 실패하면 마커만으로 done 이 아니다",
               state_name == "failed" and fields.get("reason") == "cli-failed", str(fields))
 
         # 이해 못 한 줄이 있으면 판정이 **다른 원인**을 말한다 — 스킬이 멈춘 것과
@@ -366,6 +503,16 @@ def main(argv):
               state_name == "failed" and fields.get("reason") == "unreadable-stream",
               str(fields))
 
+        rate_log = os.path.join(state, "ingest", "11-rate.log")
+        with open(rate_log, "w", encoding="utf-8") as handle:
+            handle.write(RUNNER.PROVIDERS.UNKNOWN_EVENT_PREFIX
+                         + '{"type":"new-cli-event","status":429}\n')
+            handle.write('[결과·오류] 유튜브 HTTP 429 '
+                         'LEARNING-INGEST-ERROR {"error":"rate-limited"}\n')
+        state_name, fields = RUNNER.verdict(library, row, 0, rate_log, True, None)
+        check("429 sentinel은 unreadable-stream보다 rate-limited로 분류된다",
+              state_name == "failed" and fields.get("reason") == "rate-limited", str(fields))
+
         bare = os.path.join(state, "ingest", "10.log")
         with open(bare, "w", encoding="utf-8") as handle:
             handle.write("[ingest] 시작\n스킬이 되물었습니다\n")
@@ -374,22 +521,187 @@ def main(argv):
               state_name == "failed" and fields.get("reason") == "no-completion-marker",
               str(fields))
 
+        clock_value = [10.0]
+        slept = []
+
+        def advance(delay):
+            slept.append(delay)
+            clock_value[0] += delay
+
+        RUNNER.wait_until_next_ingest(
+            clock_value[0] + RUNNER.MIN_INGEST_INTERVAL_SECONDS,
+            clock=lambda: clock_value[0], sleep=advance)
+        check("연속 적재 전에 최소 5초 간격을 둔다",
+              abs(sum(slept) - RUNNER.MIN_INGEST_INTERVAL_SECONDS) < 0.001,
+              str(slept))
+
+        # ---- v3. 설정된 슬롯만큼만 claim 하고, 구 DB 인덱스도 이관한다 ----
+        migration_state = os.path.join(tmp, "slots-migration")
+        migration_conn = BACKEND.QUEUE.connect(migration_state)
+        migration_conn.close()
+        legacy_conn = BACKEND.sqlite3.connect(BACKEND.QUEUE.db_path(migration_state))
+        legacy_conn.execute(
+            "CREATE UNIQUE INDEX one_running ON attempts(state) WHERE state = 'running'")
+        legacy_conn.close()
+        migrated_conn = BACKEND.QUEUE.connect(migration_state)
+        try:
+            old_index = migrated_conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'one_running'"
+            ).fetchone()
+            check("기존 DB 의 1슬롯 인덱스를 연결 시 제거한다", old_index is None)
+            slot_ids = [
+                BACKEND.QUEUE.enqueue(
+                    migrated_conn, f"https://youtu.be/slotclaim{i:02d}",
+                    f"slotclaim{i:02d}", RUNNER.now_iso())
+                for i in range(4)
+            ]
+            claimed = [BACKEND.QUEUE.claim_next(migrated_conn, RUNNER.now_iso(), 3)
+                       for _ in range(3)]
+            capped = BACKEND.QUEUE.claim_next(migrated_conn, RUNNER.now_iso(), 3)
+            running_count = migrated_conn.execute(
+                "SELECT COUNT(*) FROM attempts WHERE state = 'running'").fetchone()[0]
+            check("슬롯 3에서 동시에 3건이 running 이 된다",
+                  all(claimed) and capped is None and running_count == 3,
+                  f"claimed={claimed} running={running_count}")
+            BACKEND.QUEUE.finish(
+                migrated_conn, slot_ids[0], "done", RUNNER.now_iso(), reason="test")
+            fourth = BACKEND.QUEUE.claim_next(migrated_conn, RUNNER.now_iso(), 3)
+            check("빈 슬롯이 생기면 다음 대기 건을 집는다",
+                  fourth and fourth["id"] == slot_ids[3], str(fourth))
+        finally:
+            migrated_conn.close()
+
+        serial_state = os.path.join(tmp, "slots-serial")
+        serial_conn = BACKEND.QUEUE.connect(serial_state)
+        try:
+            for i in range(2):
+                BACKEND.QUEUE.enqueue(
+                    serial_conn, f"https://youtu.be/serialslot{i}",
+                    f"serialslot{i}", RUNNER.now_iso())
+            first_serial = BACKEND.QUEUE.claim_next(serial_conn, RUNNER.now_iso(), 1)
+            second_serial = BACKEND.QUEUE.claim_next(serial_conn, RUNNER.now_iso(), 1)
+            check("슬롯 1이면 예전처럼 하나만 running 이 된다",
+                  first_serial is not None and second_serial is None)
+        finally:
+            serial_conn.close()
+
+        # 코디네이터가 세 슬롯을 실제로 같이 돌리는지, git tick 은 메인에서
+        # 배치당 한 번만 도는지 네트워크·CLI 없이 재다.
+        worker_state = os.path.join(tmp, "slots-worker")
+        worker_conn = BACKEND.QUEUE.connect(worker_state)
+        worker_paths = {"repo": library, "state": worker_state}
+        for i in range(3):
+            BACKEND.QUEUE.enqueue(
+                worker_conn, f"https://youtu.be/workslot{i:02d}",
+                f"workslot{i:02d}", RUNNER.now_iso())
+        real_run_attempt = RUNNER.run_attempt
+        real_poll = RUNNER.POLL_SECONDS
+        real_interval = RUNNER.MIN_INGEST_INTERVAL_SECONDS
+        active_now = [0]
+        max_active = [0]
+        finished_count = [0]
+        observed_running = [0]
+        slot_guard = threading.Lock()
+        all_started = threading.Event()
+        git_ticks = []
+
+        def fake_run_attempt(slot_conn, _paths, slot_row):
+            with slot_guard:
+                active_now[0] += 1
+                max_active[0] = max(max_active[0], active_now[0])
+                if active_now[0] == 3:
+                    side = BACKEND.QUEUE.connect(worker_state)
+                    observed_running[0] = side.execute(
+                        "SELECT COUNT(*) FROM attempts WHERE state = 'running'").fetchone()[0]
+                    side.close()
+                    all_started.set()
+            all_started.wait(timeout=2)
+            BACKEND.QUEUE.finish(
+                slot_conn, slot_row["id"], "done", RUNNER.now_iso(), reason="test")
+            with slot_guard:
+                active_now[0] -= 1
+                finished_count[0] += 1
+                if finished_count[0] == 3:
+                    RUNNER.STOPPING = True
+
+        RUNNER.run_attempt = fake_run_attempt
+        RUNNER.POLL_SECONDS = 0.01
+        RUNNER.MIN_INGEST_INTERVAL_SECONDS = 0
+        RUNNER.STOPPING = False
+        try:
+            RUNNER.run_worker_loop(
+                worker_paths, worker_conn, 3,
+                lambda force=False: git_ticks.append(force))
+        finally:
+            RUNNER.run_attempt = real_run_attempt
+            RUNNER.POLL_SECONDS = real_poll
+            RUNNER.MIN_INGEST_INTERVAL_SECONDS = real_interval
+            RUNNER.STOPPING = False
+            worker_conn.close()
+        check("워커가 슬롯 3개의 프로세스를 병렬로 돌린다",
+              max_active[0] == 3 and observed_running[0] == 3,
+              f"active={max_active[0]} running={observed_running[0]}")
+        check("동시 저장의 git sync 는 메인이 한 tick으로 모은다",
+              git_ticks == [True], str(git_ticks))
+
+        serial_worker_state = os.path.join(tmp, "serial-worker")
+        serial_worker_conn = BACKEND.QUEUE.connect(serial_worker_state)
+        serial_worker_paths = {"repo": library, "state": serial_worker_state}
+        for i in range(3):
+            BACKEND.QUEUE.enqueue(
+                serial_worker_conn, f"https://youtu.be/serialwork{i}",
+                f"serialwork{i}", RUNNER.now_iso())
+        serial_active = [0]
+        serial_max = [0]
+        serial_finished = [0]
+        serial_guard = threading.Lock()
+
+        def fake_serial_attempt(slot_conn, _paths, slot_row):
+            with serial_guard:
+                serial_active[0] += 1
+                serial_max[0] = max(serial_max[0], serial_active[0])
+            time.sleep(0.03)
+            BACKEND.QUEUE.finish(
+                slot_conn, slot_row["id"], "done", RUNNER.now_iso(), reason="test")
+            with serial_guard:
+                serial_active[0] -= 1
+                serial_finished[0] += 1
+                if serial_finished[0] == 3:
+                    RUNNER.STOPPING = True
+
+        RUNNER.run_attempt = fake_serial_attempt
+        RUNNER.POLL_SECONDS = 0.01
+        RUNNER.MIN_INGEST_INTERVAL_SECONDS = 0
+        RUNNER.STOPPING = False
+        try:
+            RUNNER.run_worker_loop(
+                serial_worker_paths, serial_worker_conn, 1, lambda force=False: None)
+        finally:
+            RUNNER.run_attempt = real_run_attempt
+            RUNNER.POLL_SECONDS = real_poll
+            RUNNER.MIN_INGEST_INTERVAL_SECONDS = real_interval
+            RUNNER.STOPPING = False
+            serial_worker_conn.close()
+        check("워커 슬롯 1이면 실행도 예전처럼 직렬이다",
+              serial_max[0] == 1 and serial_finished[0] == 3,
+              f"active={serial_max[0]} finished={serial_finished[0]}")
+
         # ---- 6b. 적대검증(2026-08-22)이 잡은 것들의 회귀 시험 ----
         # 심볼릭 링크로 정리한 라이브러리. 저장이 성공한 뒤 "영수증이 다른 문서를
         # 가리킵니다" 로 실패했다 — 헬퍼는 해석 전 경로를, 러너는 해석 후 경로를 봤다.
         os.makedirs(os.path.join(library, "topics", "ml"), exist_ok=True)
         os.symlink(os.path.join(library, "topics", "ml"), os.path.join(library, "ml"))
         link_receipt = os.path.join(state, "probe", "link.json")
-        linked, _ = SAVE.save(library, "ml/linked.md", document("lllllllllll"),
+        linked, _ = SAVE.save(library, "ml/2026-08-22--linked--lllllllllll.md", document("lllllllllll"),
                               video_id="lllllllllll", receipt_path=link_receipt)
         check("심볼릭 링크로 만든 카테고리에도 저장된다",
-              os.path.isfile(os.path.join(library, "topics", "ml", "linked.md")))
-        reason, error = RUNNER._verify_document(library, "ml/linked.md", "lllllllllll",
+              os.path.isfile(os.path.join(library, "topics", "ml", "2026-08-22--linked--lllllllllll.md")))
+        reason, error = RUNNER._verify_document(library, "ml/2026-08-22--linked--lllllllllll.md", "lllllllllll",
                                                 SAVE.read_receipt(link_receipt))
         check("심볼릭 링크 카테고리의 저장이 완료로 판정된다", reason is None,
               f"{reason}: {error}")
         check("영수증은 완료 표시가 되받을 수 있는 경로를 싣는다",
-              linked["path"] == "ml/linked.md"
+              linked["path"] == "ml/2026-08-22--linked--lllllllllll.md"
               and SAVE.DOCUMENT_PATH_RE.fullmatch(linked["path"]) is not None
               and BACKEND.INGEST_DONE_RE.search(
                   f"{BACKEND.INGEST_DONE_MARKER} {linked['path']}\n") is not None,
@@ -399,9 +711,9 @@ def main(argv):
         os.symlink(os.path.join(library, "topics", "deep", "nn"),
                    os.path.join(library, "nn"))
         deep_receipt = os.path.join(state, "probe", "deep.json")
-        SAVE.save(library, "nn/deep.md", document("nnnnnnnnnn1"), video_id="nnnnnnnnnn1",
+        SAVE.save(library, "nn/2026-08-22--deep--nnnnnnnnnn1.md", document("nnnnnnnnnn1"), video_id="nnnnnnnnnn1",
                   receipt_path=deep_receipt)
-        reason, error = RUNNER._verify_document(library, "nn/deep.md", "nnnnnnnnnn1",
+        reason, error = RUNNER._verify_document(library, "nn/2026-08-22--deep--nnnnnnnnnn1.md", "nnnnnnnnnn1",
                                                 SAVE.read_receipt(deep_receipt))
         check("두 단계 심볼릭 링크에서도 완료로 판정된다", reason is None, f"{reason}: {error}")
 
@@ -415,7 +727,7 @@ def main(argv):
             ("앞의 빈 줄", "\n\n" + base_doc),
         ):
             try:
-                saved, _ = SAVE.save(library, "fence.md", variant.encode("utf-8"),
+                saved, _ = SAVE.save(library, "2026-08-22--fence--ppppppppp12.md", variant.encode("utf-8"),
                                      video_id="ppppppppp12")
                 check(f"{label}이 있어도 저장된다", saved["video_id"] == "ppppppppp12")
             except SAVE.SaveError as exc:
@@ -425,7 +737,7 @@ def main(argv):
         unterminated = ('---\ntitle: "x"\nvideo_id: qqqqqqqqq12\n\n'
                         + "본문 " * 200).encode("utf-8")
         try:
-            SAVE.save(library, "unterminated.md", unterminated, video_id="qqqqqqqqq12")
+            SAVE.save(library, "2026-08-22--unterminated--qqqqqqqqq12.md", unterminated, video_id="qqqqqqqqq12")
             bad("닫히지 않은 프론트매터를 저장이 받았다")
         except SAVE.SaveError as exc:
             check("닫히지 않은 프론트매터는 프론트매터가 아니다", exc.reason == "empty",
@@ -433,10 +745,10 @@ def main(argv):
 
         # CRLF 문서와 제목에 `---` 가 든 문서. 둘 다 저장 자체가 막히면 안 된다.
         crlf = document("rrrrrrrrrrr").replace(b"\n", b"\r\n")
-        saved, _ = SAVE.save(library, "crlf.md", crlf, video_id="rrrrrrrrrrr")
+        saved, _ = SAVE.save(library, "2026-08-22--crlf--rrrrrrrrrrr.md", crlf, video_id="rrrrrrrrrrr")
         check("CRLF 문서도 저장된다", saved["video_id"] == "rrrrrrrrrrr", str(saved))
         dashed = document("ssssssssss1", title="Rust --- part 1")
-        saved, _ = SAVE.save(library, "dashed.md", dashed, video_id="ssssssssss1")
+        saved, _ = SAVE.save(library, "2026-08-22--dashed--ssssssssss1.md", dashed, video_id="ssssssssss1")
         check("제목에 --- 가 있어도 프론트매터를 끝까지 읽는다",
               saved["video_id"] == "ssssssssss1", str(saved))
 
@@ -446,17 +758,17 @@ def main(argv):
             locked_dir = os.path.join(tmp, "no-receipts")
             os.makedirs(locked_dir)
             os.chmod(locked_dir, 0o500)
-            blocked, warned = SAVE.save(library, "after-replace.md", document("ttttttttt12"),
+            blocked, warned = SAVE.save(library, "2026-08-22--after-replace--ttttttttt12.md", document("ttttttttt12"),
                                         video_id="ttttttttt12",
                                         receipt_path=os.path.join(locked_dir, "r.json"))
             os.chmod(locked_dir, 0o755)
             check("영수증을 못 써도 문서는 저장된다",
-                  os.path.isfile(os.path.join(library, "after-replace.md")))
+                  os.path.isfile(os.path.join(library, "2026-08-22--after-replace--ttttttttt12.md")))
             check("영수증을 못 쓰면 영수증이 아니라 경고가 나온다",
                   blocked is None and len(warned) == 1, f"{blocked} / {warned}")
             os.chmod(locked_dir, 0o500)
             result = subprocess.run(
-                [sys.executable, save_path, "--path", "after-replace-cli.md",
+                [sys.executable, save_path, "--path", "2026-08-22--after-replace-cli--ttttttttt13.md",
                  "--video-id", "ttttttttt13", "--receipt",
                  os.path.join(locked_dir, "sub", "r.json")],
                 input=document("ttttttttt13"), env=env, capture_output=True, timeout=60)
@@ -477,11 +789,11 @@ def main(argv):
         check("읽을 수 없는 영수증은 조용히 없는 것으로 치지 않는다",
               state_name == "failed" and fields.get("reason") == "receipt-unreadable",
               str(fields))
-        reason, _ = RUNNER._verify_document(library, "ai/attention.md", "dQw4w9WgXcQ",
+        reason, _ = RUNNER._verify_document(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", "dQw4w9WgXcQ",
                                             dict(saved_receipt, schema=99))
         check("모르는 형식의 영수증은 완료가 아니다",
               reason == "marker-receipt-unreadable", str(reason))
-        reason, _ = RUNNER._verify_document(library, "ai/attention.md", "dQw4w9WgXcQ",
+        reason, _ = RUNNER._verify_document(library, "ai/2026-08-22--attention--dQw4w9WgXcQ.md", "dQw4w9WgXcQ",
                                             dict(saved_receipt, video_id="zzzzzzzzzzz"))
         check("다른 영상의 영수증은 완료가 아니다",
               reason == "marker-receipt-other-video", str(reason))
@@ -498,11 +810,11 @@ def main(argv):
         atomic_receipt = os.path.join(state, "probe", "atomic.json")
         os.replace = spy_replace
         try:
-            SAVE.save(library, "atomic.md", document("uuuuuuuuuu1"), video_id="uuuuuuuuuu1",
+            SAVE.save(library, "2026-08-22--atomic--uuuuuuuuuu1.md", document("uuuuuuuuuu1"), video_id="uuuuuuuuuu1",
                       receipt_path=atomic_receipt)
         finally:
             os.replace = real_replace
-        target_atomic = os.path.join(library, "atomic.md")
+        target_atomic = os.path.join(library, "2026-08-22--atomic--uuuuuuuuuu1.md")
 
         def renamed_into(destination):
             """그 자리에 rename 으로 들어왔나 — 같은 디렉터리의 임시 파일에서."""
@@ -526,7 +838,7 @@ def main(argv):
             os.makedirs(nofsync, exist_ok=True)
             os.chmod(nofsync, 0o300)   # 쓰기·통과는 되고 O_RDONLY 열기는 안 된다
             try:
-                kept, warned = SAVE.save(library, "nofsync/doc.md", document("yyyyyyyyy12"),
+                kept, warned = SAVE.save(library, "nofsync/2026-08-22--doc--yyyyyyyyy12.md", document("yyyyyyyyy12"),
                                          video_id="yyyyyyyyy12", state_dir=state)
             finally:
                 os.chmod(nofsync, 0o755)
@@ -544,7 +856,7 @@ def main(argv):
 
         SAVE.atomic_write = lying_atomic
         try:
-            SAVE.save(library, "digest.md", document("vvvvvvvvvv1"), video_id="vvvvvvvvvv1")
+            SAVE.save(library, "2026-08-22--digest--vvvvvvvvvv1.md", document("vvvvvvvvvv1"), video_id="vvvvvvvvvv1")
             bad("디스크의 내용이 달라졌는데 저장이 통과했다")
         except SAVE.SaveError as exc:
             check("다이제스트는 디스크에서 뜬다", exc.reason == "write-verify-failed",
@@ -556,17 +868,17 @@ def main(argv):
         real_timeout = SAVE.LOCK_TIMEOUT_SECONDS
         SAVE.LOCK_TIMEOUT_SECONDS = 0.5
         try:
-            with SAVE.document_lock(state, "held.md"):
+            with SAVE.document_lock(state, "2026-08-22--held--wwwwwwwww12.md"):
                 try:
-                    SAVE.save(library, "held.md", document("wwwwwwwww12"),
+                    SAVE.save(library, "2026-08-22--held--wwwwwwwww12.md", document("wwwwwwwww12"),
                               video_id="wwwwwwwww12", state_dir=state)
                     bad("이미 잡힌 문서에 두 번째 저장이 들어갔다")
                 except SAVE.SaveError as exc:
                     check("문서 단위 락이 두 번째 쓰기를 막는다", exc.reason == "locked",
                           f"reason={exc.reason}")
-            saved, _ = SAVE.save(library, "held.md", document("wwwwwwwww12"),
+            saved, _ = SAVE.save(library, "2026-08-22--held--wwwwwwwww12.md", document("wwwwwwwww12"),
                                  video_id="wwwwwwwww12", state_dir=state)
-            check("락이 풀리면 같은 문서를 저장할 수 있다", saved["path"] == "held.md")
+            check("락이 풀리면 같은 문서를 저장할 수 있다", saved["path"] == "2026-08-22--held--wwwwwwwww12.md")
         finally:
             SAVE.LOCK_TIMEOUT_SECONDS = real_timeout
 
@@ -582,6 +894,27 @@ def main(argv):
         os.environ["AIRLOCK_LEARNING_CLAUDE_BIN"] = fake_cli
         os.environ["AIRLOCK_LEARNING_FAILURE_SUMMARY"] = "0"
         paths = {"repo": library, "state": state}
+
+        meta_state = os.path.join(tmp, "metadata-enqueue")
+        previous_state = os.environ["AIRLOCK_LEARNING_STATE_DIR"]
+        os.environ["AIRLOCK_LEARNING_STATE_DIR"] = meta_state
+        BACKEND.urlopen = fake_urlopen
+        try:
+            created = BACKEND.create_ingest_run("https://youtu.be/metastore01")
+            meta_conn = BACKEND.QUEUE.connect(meta_state)
+            try:
+                meta_row = BACKEND.QUEUE.get(meta_conn, created["id"])
+            finally:
+                meta_conn.close()
+        finally:
+            BACKEND.urlopen = real_urlopen
+            os.environ["AIRLOCK_LEARNING_STATE_DIR"] = previous_state
+        check("적재 run 접수가 oEmbed 제목·채널을 큐 행에 즉시 저장한다",
+              meta_row["state"] == "queued"
+              and meta_row["title"] == "접수 즉시 제목"
+              and meta_row["channel"] == "임시 채널",
+              str(meta_row))
+
         conn = BACKEND.QUEUE.connect(state)
         try:
             os.environ["FAKE_CLI_MODE"] = "save"
@@ -594,7 +927,7 @@ def main(argv):
                   f"{done_row['state']} / {done_row.get('error')}")
             check("자식이 저장 헬퍼와 라이브러리를 환경에서 받았다",
                   done_row["reason"] == "completed"
-                  and os.path.isfile(os.path.join(library, "worker.md")),
+                  and os.path.isfile(os.path.join(library, "2026-08-22--worker--xxxxxxxxxx1.md")),
                   f"{done_row['reason']}")
 
             # 🔴 낡은 영수증. 이번 실행이 만들지 않은 영수증이 남아 있는데 스킬이 헬퍼를
@@ -603,7 +936,7 @@ def main(argv):
             attempt2 = BACKEND.QUEUE.enqueue(conn, "https://youtu.be/xxxxxxxxxx2",
                                              "xxxxxxxxxx2", RUNNER.now_iso())
             stale = BACKEND.QUEUE.receipt_path(state, attempt2)
-            SAVE.save(library, "worker2.md", document("xxxxxxxxxx2"),
+            SAVE.save(library, "2026-08-22--worker--xxxxxxxxxx2.md", document("xxxxxxxxxx2"),
                       video_id="xxxxxxxxxx2", state_dir=state, receipt_path=stale)
             claimed2 = BACKEND.QUEUE.claim_next(conn, RUNNER.now_iso())
             RUNNER.run_attempt(conn, paths, claimed2)
@@ -626,12 +959,12 @@ def main(argv):
             check("저장 전에는 진행 중 적재가 문서를 가리키지 않는다",
                   not view.get("document"), str(view.get("document")))
 
-            SAVE.save(library, "ml/live.md", document("aaaaaaaaaa9"),
+            SAVE.save(library, "ml/2026-08-22--live--aaaaaaaaaa9.md", document("aaaaaaaaaa9"),
                       video_id="aaaaaaaaaa9", state_dir=state,
                       receipt_path=BACKEND.QUEUE.receipt_path(state, live_id))
             view = BACKEND._view(BACKEND.QUEUE.get(live_conn, live_id))
             check("저장하는 순간 진행 중 적재가 그 문서를 가리킨다",
-                  view.get("document") == "ml/live.md", str(view.get("document")))
+                  view.get("document") == "ml/2026-08-22--live--aaaaaaaaaa9.md", str(view.get("document")))
             check("단계도 함께 실린다", view.get("phase") == SAVE.PHASE_DOCUMENT_SAVED,
                   str(view.get("phase")))
             # 🔴 목록은 폴더를 걸어 만들어지므로 **물리 경로**를 쓴다. 영수증은 스킬이 준
@@ -644,10 +977,25 @@ def main(argv):
                   f"{view.get('document')} not in {sorted(listed)[:5]}")
 
             BACKEND.QUEUE.finish(live_conn, live_id, "done", RUNNER.now_iso(),
-                                 reason="completed", document="ml/live.md")
+                                 reason="completed", document="ml/2026-08-22--live--aaaaaaaaaa9.md")
             done_view = BACKEND._view(BACKEND.QUEUE.get(live_conn, live_id))
             check("끝난 적재의 문서는 DB 가 쓴 것을 그대로 쓴다",
-                  done_view.get("document") == "ml/live.md", str(done_view.get("document")))
+                  done_view.get("document") == "ml/2026-08-22--live--aaaaaaaaaa9.md", str(done_view.get("document")))
+
+            failed_id = BACKEND.QUEUE.enqueue(
+                live_conn, "https://youtu.be/retrychain1", "retrychain1", RUNNER.now_iso())
+            BACKEND.QUEUE.claim_next(live_conn, RUNNER.now_iso())
+            BACKEND.QUEUE.finish(
+                live_conn, failed_id, "failed", RUNNER.now_iso(),
+                reason="rate-limited", error="rate limited")
+            retry_id = BACKEND.QUEUE.enqueue(
+                live_conn, "https://youtu.be/retrychain1", "retrychain1", RUNNER.now_iso(),
+                retry_of=failed_id)
+            recent_ids = {record["id"] for record in BACKEND.QUEUE.recent(live_conn)}
+            check("재시도 뒤 옛 행은 DB 에 남고 최근 카드에서는 숨는다",
+                  BACKEND.QUEUE.get(live_conn, failed_id) is not None
+                  and failed_id not in recent_ids and retry_id in recent_ids,
+                  f"old={failed_id} retry={retry_id} recent={sorted(recent_ids)}")
         finally:
             live_conn.close()
 
@@ -661,10 +1009,10 @@ def main(argv):
         os.makedirs(os.path.dirname(bad_receipt), exist_ok=True)
         with open(bad_receipt, "w", encoding="utf-8") as handle:
             handle.write(json.dumps({"schema": SAVE.RECEIPT_SCHEMA,
-                                     "phase": "document_saved", "path": "ai/attention.md"}))
+                                     "phase": "document_saved", "path": "ai/2026-08-22--attention--dQw4w9WgXcQ.md"}))
         check("양성 대조군 — 그 자리의 정상 영수증은 읽힌다",
               BACKEND.attempt_document(state, library, {"id": 0})
-              == ("ai/attention.md", "document_saved"),
+              == ("ai/2026-08-22--attention--dQw4w9WgXcQ.md", "document_saved"),
               str(BACKEND.attempt_document(state, library, {"id": 0})))
         for label, payload in (("숫자", 123), ("목록", ["a"]), ("null", None)):
             with open(bad_receipt, "w", encoding="utf-8") as handle:
@@ -682,10 +1030,10 @@ def main(argv):
         # 오너 결정 2: 별표·보관은 문서의 프론트매터에 있다. 라이브러리 폴더를 통째로
         # 위키로 옮겨도 상태가 따라가야 하기 때문이다.
         state_doc = document("ffffffffff1", title='"따옴표" 가 든 제목')
-        SAVE.save(library, "flags.md", state_doc, video_id="ffffffffff1")
-        flag_target = os.path.join(library, "flags.md")
+        SAVE.save(library, "2026-08-22--flags--ffffffffff1.md", state_doc, video_id="ffffffffff1")
+        flag_target = os.path.join(library, "2026-08-22--flags--ffffffffff1.md")
 
-        SAVE.patch_frontmatter(library, "flags.md", {"starred": "true"}, state_dir=state)
+        SAVE.patch_frontmatter(library, "2026-08-22--flags--ffffffffff1.md", {"starred": "true"}, state_dir=state)
         with open(flag_target, "rb") as handle:
             after = handle.read()
         check("별표가 문서에 적힌다", b"\nstarred: true\n" in after)
@@ -695,25 +1043,25 @@ def main(argv):
               after.replace(b"starred: true\n", b"") == state_doc,
               repr(after[:120]))
 
-        SAVE.patch_frontmatter(library, "flags.md", {"starred": None}, state_dir=state)
+        SAVE.patch_frontmatter(library, "2026-08-22--flags--ffffffffff1.md", {"starred": None}, state_dir=state)
         with open(flag_target, "rb") as handle:
             check("별표를 해제하면 그 줄이 사라지고 원본으로 돌아온다",
                   handle.read() == state_doc)
 
         # 이미 있는 키는 제자리에서 값만 바뀐다 — 순서가 바뀌면 diff 가 시끄러워진다.
         seeded = state_doc.replace(b"video_id:", b"starred: false\nvideo_id:")
-        SAVE.save(library, "seeded.md", seeded, video_id="ffffffffff1")
-        SAVE.patch_frontmatter(library, "seeded.md", {"starred": "true"}, state_dir=state)
-        with open(os.path.join(library, "seeded.md"), "rb") as handle:
+        SAVE.save(library, "2026-08-22--seeded--ffffffffff1.md", seeded, video_id="ffffffffff1")
+        SAVE.patch_frontmatter(library, "2026-08-22--seeded--ffffffffff1.md", {"starred": "true"}, state_dir=state)
+        with open(os.path.join(library, "2026-08-22--seeded--ffffffffff1.md"), "rb") as handle:
             patched = handle.read()
         check("있던 키는 제자리에서 값만 바뀐다",
               patched == seeded.replace(b"starred: false", b"starred: true"), repr(patched[:120]))
 
         # CRLF 문서도 줄 끝을 지킨다.
         crlf_doc = document("ffffffffff2").replace(b"\n", b"\r\n")
-        SAVE.save(library, "crlf-flags.md", crlf_doc, video_id="ffffffffff2")
-        SAVE.patch_frontmatter(library, "crlf-flags.md", {"starred": "true"}, state_dir=state)
-        with open(os.path.join(library, "crlf-flags.md"), "rb") as handle:
+        SAVE.save(library, "2026-08-22--crlf-flags--ffffffffff2.md", crlf_doc, video_id="ffffffffff2")
+        SAVE.patch_frontmatter(library, "2026-08-22--crlf-flags--ffffffffff2.md", {"starred": "true"}, state_dir=state)
+        with open(os.path.join(library, "2026-08-22--crlf-flags--ffffffffff2.md"), "rb") as handle:
             crlf_after = handle.read()
         check("CRLF 문서의 줄 끝이 지켜진다",
               b"starred: true\r\n" in crlf_after and b"starred: true\n\r" not in crlf_after,
@@ -733,7 +1081,7 @@ def main(argv):
 
         # 이 앱이 고칠 수 있는 키는 자기가 만든 상태뿐이다.
         try:
-            SAVE.patch_frontmatter(library, "flags.md", {"title": "가로채기"}, state_dir=state)
+            SAVE.patch_frontmatter(library, "2026-08-22--flags--ffffffffff1.md", {"title": "가로채기"}, state_dir=state)
             bad("제목을 고치는 것을 상태 패치가 받았다")
         except SAVE.SaveError as exc:
             check("상태 아닌 키는 고치지 않는다", exc.reason == "unpatchable-key", exc.reason)
@@ -748,7 +1096,7 @@ def main(argv):
 
         SAVE.apply_frontmatter_updates = racing_apply
         try:
-            SAVE.patch_frontmatter(library, "flags.md", {"starred": "true"}, state_dir=state)
+            SAVE.patch_frontmatter(library, "2026-08-22--flags--ffffffffff1.md", {"starred": "true"}, state_dir=state)
             bad("읽은 뒤 바뀐 문서를 덮어썼다")
         except SAVE.SaveError as exc:
             check("읽은 뒤 바뀐 문서는 덮어쓰지 않는다", exc.reason == "document-changed", exc.reason)
@@ -762,63 +1110,65 @@ def main(argv):
         legacy_state = os.path.join(tmp, "legacy-state-dir")
         os.makedirs(legacy_lib)
         os.makedirs(legacy_state)
-        SAVE.save(legacy_lib, "in-file.md", document("ggggggggg11"), video_id="ggggggggg11",
+        SAVE.save(legacy_lib, "2026-08-22--in-file--ggggggggg11.md", document("ggggggggg11"), video_id="ggggggggg11",
                   state_dir=legacy_state)
-        SAVE.save(legacy_lib, "in-json.md", document("ggggggggg12"), video_id="ggggggggg12",
+        SAVE.save(legacy_lib, "2026-08-22--in-json--ggggggggg12.md", document("ggggggggg12"), video_id="ggggggggg12",
                   state_dir=legacy_state)
-        SAVE.patch_frontmatter(legacy_lib, "in-file.md", {"starred": "true"},
+        SAVE.patch_frontmatter(legacy_lib, "2026-08-22--in-file--ggggggggg11.md", {"starred": "true"},
                                state_dir=legacy_state)
-        BACKEND.write_starred(legacy_state, {"in-json.md": True})
+        BACKEND.write_starred(legacy_state, {"2026-08-22--in-json--ggggggggg12.md": True})
         previous = (os.environ["AIRLOCK_LEARNING_LIBRARY"], os.environ["AIRLOCK_LEARNING_STATE_DIR"])
         os.environ["AIRLOCK_LEARNING_LIBRARY"] = legacy_lib
         os.environ["AIRLOCK_LEARNING_STATE_DIR"] = legacy_state
         try:
             snap = BACKEND.build_snapshot()
             stars = {i["path"]: i["starred"] for i in snap["items"]}
-            check("문서에 적힌 별표를 목록이 읽는다", stars.get("in-file.md") is True, str(stars))
+            check("문서에 적힌 별표를 목록이 읽는다", stars.get("2026-08-22--in-file--ggggggggg11.md") is True, str(stars))
             # 🔴 이관은 사용자가 그 문서를 건드릴 때 한 건씩 일어난다. 그 사이에 빼기로
             #    읽으면 이미 별표해 둔 것이 화면에서 한꺼번에 사라진다.
             check("아직 옮기지 않은 옛 JSON 의 별표도 살아 있다",
-                  stars.get("in-json.md") is True, str(stars))
+                  stars.get("2026-08-22--in-json--ggggggggg12.md") is True, str(stars))
 
-            BACKEND.star_path("in-json.md", True)
-            with open(os.path.join(legacy_lib, "in-json.md"), "rb") as handle:
+            BACKEND.star_path("2026-08-22--in-json--ggggggggg12.md", True)
+            with open(os.path.join(legacy_lib, "2026-08-22--in-json--ggggggggg12.md"), "rb") as handle:
                 check("별표를 누르면 그 문서로 이관된다", b"starred: true" in handle.read())
             check("이관된 항목은 옛 JSON 에서 빠진다",
-                  "in-json.md" not in BACKEND.read_starred(legacy_state),
+                  "2026-08-22--in-json--ggggggggg12.md" not in BACKEND.read_starred(legacy_state),
                   str(BACKEND.read_starred(legacy_state)))
 
             # 🔴 해제가 먹으려면 두 자리에서 다 빠져야 한다. 옛 JSON 에 남으면 합집합이
             #    다시 참으로 만든다 — 해제 버튼이 아무 일도 안 하는 것처럼 보인다.
-            BACKEND.star_path("in-json.md", False)
+            BACKEND.star_path("2026-08-22--in-json--ggggggggg12.md", False)
             snap = BACKEND.build_snapshot()
             stars = {i["path"]: i["starred"] for i in snap["items"]}
-            check("해제가 실제로 먹는다", stars.get("in-json.md") is False, str(stars))
+            check("해제가 실제로 먹는다", stars.get("2026-08-22--in-json--ggggggggg12.md") is False, str(stars))
 
             # --- 보관도 문서가 정본이다 ---
             # `mutable` 이 참이려면 html 짝과 `source: youtube` 가 있어야 한다(기존 규칙).
             arch_doc = document("ggggggggg13").replace(
                 b"added: 2026-08-22", b"added: 2026-08-22\nsource: youtube")
-            SAVE.save(legacy_lib, "arch.md", arch_doc, video_id="ggggggggg13",
+            SAVE.save(legacy_lib, "2026-08-22--arch--ggggggggg13.md", arch_doc, video_id="ggggggggg13",
                       state_dir=legacy_state)
-            with open(os.path.join(legacy_lib, "arch.html"), "w", encoding="utf-8") as handle:
+            with open(os.path.join(
+                    legacy_lib, "2026-08-22--arch--ggggggggg13.html"),
+                    "w", encoding="utf-8") as handle:
                 handle.write("<html><body>arch</body></html>")
-            status, _payload = BACKEND.archive_paths(["arch.md"])
+            status, _payload = BACKEND.archive_paths(["2026-08-22--arch--ggggggggg13.md"])
             check("보관이 받아들여진다", status == 200, str(status))
-            with open(os.path.join(legacy_lib, "arch.md"), "rb") as handle:
+            with open(os.path.join(legacy_lib, "2026-08-22--arch--ggggggggg13.md"), "rb") as handle:
                 check("보관이 문서에 적힌다", b"archived: true" in handle.read())
             snap = BACKEND.build_snapshot()
             check("보관된 문서는 목록에서 빠지고 보관함에 있다",
-                  "arch.md" not in {i["path"] for i in snap["items"]}
-                  and "arch.md" in {a["path"] for a in snap["archive"]["archived"]},
+                  "2026-08-22--arch--ggggggggg13.md" not in {i["path"] for i in snap["items"]}
+                  and "2026-08-22--arch--ggggggggg13.md" in {a["path"] for a in snap["archive"]["archived"]},
                   str([i["path"] for i in snap["items"]]))
 
-            BACKEND.restore_path("arch.md")
-            with open(os.path.join(legacy_lib, "arch.md"), "rb") as handle:
+            BACKEND.restore_path("2026-08-22--arch--ggggggggg13.md")
+            with open(os.path.join(legacy_lib, "2026-08-22--arch--ggggggggg13.md"), "rb") as handle:
                 check("복구하면 문서에서 그 키가 사라진다", b"archived" not in handle.read())
             snap = BACKEND.build_snapshot()
             check("복구된 문서가 목록으로 돌아온다",
-                  "arch.md" in {i["path"] for i in snap["items"]})
+                  "2026-08-22--arch--ggggggggg13.md" in {i["path"] for i in snap["items"]})
 
             # 프론트매터가 없는 문서는 읽기 전용이다 — 수리하지 않는다.
             with open(os.path.join(legacy_lib, "bare.md"), "wb") as handle:
@@ -1111,6 +1461,16 @@ def main(argv):
         check("서버 유닛이 PATH 를 받는다", "Environment=PATH=/probe/bin" in server_unit,
               repr(server_unit[:200]))
         check("워커 유닛도 같은 PATH 를 받는다", "Environment=PATH=/probe/bin" in ingest_unit)
+        check("워커 유닛의 기본 적재 슬롯은 3이다",
+              "AIRLOCK_LEARNING_WORKER_SLOTS=3" in ingest_unit)
+        serial_unit = subprocess.run(
+            ["bash", "-c",
+             f'. "{root}/apps/learning/render.sh"; '
+             'render_learning_unit_ingest /lib /state auto "/probe/bin" /backend '
+             '"A_KEY B_KEY" /platform/status off 1'],
+            capture_output=True, text=True, timeout=60).stdout
+        check("적재 슬롯 1 설정이 워커 유닛에 실린다",
+              "AIRLOCK_LEARNING_WORKER_SLOTS=1" in serial_unit)
         check("서버 유닛이 플랫폼 로그인 probe 를 D5 이름으로 받는다",
               "AIRLOCK_LEARNING_ACCOUNTS_STATUS_BIN=/platform/status" in server_unit)
         check("워커 유닛도 같은 플랫폼 로그인 probe 를 받는다",
@@ -1170,10 +1530,56 @@ def main(argv):
         check("스킬이 저장 헬퍼를 환경에서 받는다", "AIRLOCK_LEARNING_SAVE" in skill_text)
         check("스킬이 완료 표시를 정확한 마커로 적는다",
               BACKEND.INGEST_DONE_MARKER in skill_text)
+        check("스킬이 새 문서 파일명 계약을 그대로 안내한다",
+              "<적재일 YYYY-MM-DD>--<슬러그>--<video_id>.md" in skill_text)
         check("스킬이 렌더된 짝을 함께 넘긴다", "--html" in skill_text)
 
         TRANSCRIPT = load(os.path.join(skill_dir, "transcript.py"),
                           "learning_transcript_test")
+        check("전사본 실패 sentinel은 계약의 일곱 코드로 닫혀 있다",
+              TRANSCRIPT.ERROR_CODES == {
+                  "tool-missing", "rate-limited", "video-unavailable",
+                  "metadata-invalid", "no-subs", "subtitle-unreadable",
+                  "transcript-write-failed",
+              }, str(TRANSCRIPT.ERROR_CODES))
+        check("자막 트랙은 사람 원어를 가장 먼저 고른다",
+              TRANSCRIPT.caption_choice({
+                  "language": "en",
+                  "subtitles": {"ko": [{}], "ja": [{}]},
+                  "automatic_captions": {"ko-orig": [{}], "en": [{}]},
+              }) == ("--write-subs", "manual", "ko"))
+        check("사람 원어가 없어도 다른 사람 자막이 자동 원어보다 먼저다",
+              TRANSCRIPT.caption_choice({
+                  "language": "en",
+                  "subtitles": {"ja": [{}]},
+                  "automatic_captions": {"ko-orig": [{}], "en": [{}]},
+              }) == ("--write-subs", "manual", "ja"))
+        check("사람 자막이 없으면 자동 원어 -orig를 고른다",
+              TRANSCRIPT.caption_choice({
+                  "language": "en", "subtitles": {},
+                  "automatic_captions": {"ko-orig": [{}], "en": [{}]},
+              }) == ("--write-auto-subs", "auto", "ko-orig"))
+
+        class RateLimited:
+            returncode = 1
+            stdout = b""
+            stderr = b"ERROR: HTTP Error 429: Too Many Requests"
+
+        original_patiently = TRANSCRIPT.run_patiently
+        TRANSCRIPT.run_patiently = lambda *_args, **_kwargs: RateLimited()
+        rate_stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(rate_stderr):
+                TRANSCRIPT.metadata("yt-dlp", "https://youtu.be/rate0000001")
+            rate_exit = None
+        except SystemExit as exc:
+            rate_exit = exc.code
+        finally:
+            TRANSCRIPT.run_patiently = original_patiently
+        check("429는 rate-limited sentinel로 나온다",
+              rate_exit == 2
+              and 'LEARNING-INGEST-ERROR {"error":"rate-limited"}'
+              in rate_stderr.getvalue(), rate_stderr.getvalue()[:200])
         check("자막 이벤트가 시각과 문장으로 풀린다",
               TRANSCRIPT.lines_from([
                   {"tStartMs": 1500, "segs": [{"utf8": "안녕"}, {"utf8": " 하세요"}]},
@@ -1188,13 +1594,16 @@ def main(argv):
 
         # 저장 헬퍼가 렌더된 짝을 같은 락 안에서 함께 넣는다 — 없으면 공유가 영영 안 된다.
         pair_receipt = os.path.join(state, "probe", "pair.json")
-        pair, _warn = SAVE.save(library, "paired.md", document("iiiiiiiiii1"),
+        pair, _warn = SAVE.save(library, "2026-08-22--paired--iiiiiiiiii1.md", document("iiiiiiiiii1"),
                                 video_id="iiiiiiiiii1", state_dir=state,
                                 receipt_path=pair_receipt,
                                 html=b"<!doctype html><meta charset=utf-8><title>x</title>")
         check("렌더된 짝이 문서 옆에 생긴다",
-              os.path.isfile(os.path.join(library, "paired.html")))
-        check("영수증이 짝을 밝힌다", pair.get("html") == "paired.html", str(pair.get("html")))
+              os.path.isfile(os.path.join(
+                  library, "2026-08-22--paired--iiiiiiiiii1.html")))
+        check("영수증이 짝을 밝힌다",
+              pair.get("html") == "2026-08-22--paired--iiiiiiiiii1.html",
+              str(pair.get("html")))
         # 🔴 짝이 없으면 `mutable` 이 거짓이 되어 공유도 보관도 안 된다. 그 연결을 잰다.
         snap_env = (os.environ["AIRLOCK_LEARNING_LIBRARY"],
                     os.environ["AIRLOCK_LEARNING_STATE_DIR"])
@@ -1202,17 +1611,17 @@ def main(argv):
         os.makedirs(pair_lib, exist_ok=True)
         with_source = document("iiiiiiiiii2").replace(
             b"added: 2026-08-22", b"added: 2026-08-22\nsource: youtube")
-        SAVE.save(pair_lib, "with-pair.md", with_source, video_id="iiiiiiiiii2",
+        SAVE.save(pair_lib, "2026-08-22--with-pair--iiiiiiiiii2.md", with_source, video_id="iiiiiiiiii2",
                   state_dir=state, html=b"<!doctype html><title>y</title>")
-        SAVE.save(pair_lib, "no-pair.md",
+        SAVE.save(pair_lib, "2026-08-22--no-pair--iiiiiiiiii3.md",
                   with_source.replace(b"iiiiiiiiii2", b"iiiiiiiiii3"),
                   video_id="iiiiiiiiii3", state_dir=state)
         os.environ["AIRLOCK_LEARNING_LIBRARY"] = pair_lib
         try:
             mutables = {i["path"]: i["mutable"] for i in BACKEND.build_snapshot()["items"]}
             check("짝이 있는 문서만 공유·보관 대상이 된다",
-                  mutables.get("with-pair.md") is True
-                  and mutables.get("no-pair.md") is False, str(mutables))
+                  mutables.get("2026-08-22--with-pair--iiiiiiiiii2.md") is True
+                  and mutables.get("2026-08-22--no-pair--iiiiiiiiii3.md") is False, str(mutables))
         finally:
             (os.environ["AIRLOCK_LEARNING_LIBRARY"],
              os.environ["AIRLOCK_LEARNING_STATE_DIR"]) = snap_env
@@ -1249,23 +1658,39 @@ def main(argv):
         try:
             cid = BACKEND.QUEUE.enqueue(cancel_conn, "https://youtu.be/cancelme01",
                                         "cancelme01", RUNNER.now_iso())
-            crow = BACKEND.QUEUE.claim_next(cancel_conn, RUNNER.now_iso())
+            peer_id = BACKEND.QUEUE.enqueue(cancel_conn, "https://youtu.be/cancelpeer1",
+                                            "cancelpeer1", RUNNER.now_iso())
+            crow = BACKEND.QUEUE.claim_next(cancel_conn, RUNNER.now_iso(), 2)
+            peer_row = BACKEND.QUEUE.claim_next(cancel_conn, RUNNER.now_iso(), 2)
 
-            def ask_cancel():
-                time.sleep(3)
+            def run_slow(row, name):
                 side = BACKEND.QUEUE.connect(cancel_state)
-                BACKEND.QUEUE.request_cancel(side, cid)
-                side.close()
+                try:
+                    RUNNER.run_attempt(
+                        side, {"repo": cancel_lib, "state": cancel_state}, row)
+                finally:
+                    side.close()
 
-            watcher = threading.Thread(target=ask_cancel, daemon=True)
-            watcher.start()
             before = subprocess.run(["pgrep", "-f", "while :; do sleep 1"],
                                     capture_output=True, text=True).stdout.split()
-            RUNNER.run_attempt(cancel_conn, {"repo": cancel_lib, "state": cancel_state}, crow)
-            watcher.join(timeout=5)
+            cancelled_thread = threading.Thread(
+                target=run_slow, args=(crow, "cancelled"), name="cancelled-slot")
+            peer_thread = threading.Thread(
+                target=run_slow, args=(peer_row, "peer"), name="peer-slot")
+            cancelled_thread.start()
+            peer_thread.start()
+            time.sleep(3)
+            BACKEND.QUEUE.request_cancel(cancel_conn, cid)
+            cancelled_thread.join(timeout=15)
             crecord = BACKEND.QUEUE.get(cancel_conn, cid)
             check("취소하면 cancelled 로 종결된다", crecord["state"] == "cancelled",
                   f"{crecord['state']} / {crecord.get('reason')}")
+            peer_record = BACKEND.QUEUE.get(cancel_conn, peer_id)
+            check("취소가 그 슬롯의 프로세스 그룹만 종료한다",
+                  peer_thread.is_alive() and peer_record["state"] == "running",
+                  f"alive={peer_thread.is_alive()} state={peer_record['state']}")
+            BACKEND.QUEUE.request_cancel(cancel_conn, peer_id)
+            peer_thread.join(timeout=15)
             # 🔴 고정 대기(예전 `time.sleep(1.5)`) 한 번만 재면 안 된다. SIGKILL 전달과
             # 실제 소멸 사이에는 커널 스케줄링만큼의 창이 있고, 부하가 큰 CI 러너에서는
             # 그 창이 1.5초를 넘는다 — 2026-09-01 lint 에서 손자 하나가 그렇게 잡혔다.
@@ -1283,6 +1708,40 @@ def main(argv):
             check("자식도 손자도 살아남지 않는다", not survivors, str(survivors))
             check("취소된 적재는 라이브러리에 아무것도 남기지 않는다",
                   os.listdir(cancel_lib) == [], str(os.listdir(cancel_lib)))
+
+            # 타임아웃도 같은 _terminate 경로를 쓴다. 한 슬롯의 예산만 짧게 해
+            # 다른 슬롯의 프로세스 그룹이 계속 살아 있는지 실제 자식으로 재다.
+            timeout_id = BACKEND.QUEUE.enqueue(
+                cancel_conn, "https://youtu.be/timeout001", "timeout001", RUNNER.now_iso())
+            timeout_peer_id = BACKEND.QUEUE.enqueue(
+                cancel_conn, "https://youtu.be/timeoutpeer", "timeoutpeer", RUNNER.now_iso())
+            timeout_row = BACKEND.QUEUE.claim_next(cancel_conn, RUNNER.now_iso(), 2)
+            timeout_peer_row = BACKEND.QUEUE.claim_next(cancel_conn, RUNNER.now_iso(), 2)
+            real_timeout_seconds = RUNNER.timeout_seconds
+            RUNNER.timeout_seconds = lambda: (
+                0.1 if threading.current_thread().name == "timeout-slot" else 60)
+            timeout_thread = threading.Thread(
+                target=run_slow, args=(timeout_row, "timeout"), name="timeout-slot")
+            timeout_peer_thread = threading.Thread(
+                target=run_slow, args=(timeout_peer_row, "timeout-peer"),
+                name="timeout-peer-slot")
+            try:
+                timeout_thread.start()
+                timeout_peer_thread.start()
+                timeout_thread.join(timeout=15)
+                timeout_record = BACKEND.QUEUE.get(cancel_conn, timeout_id)
+                timeout_peer_record = BACKEND.QUEUE.get(cancel_conn, timeout_peer_id)
+                check("타임아웃이 그 슬롯의 프로세스 그룹만 종료한다",
+                      timeout_record["state"] == "failed"
+                      and timeout_record["reason"] == "timeout"
+                      and timeout_peer_thread.is_alive()
+                      and timeout_peer_record["state"] == "running",
+                      f"target={timeout_record['state']}/{timeout_record['reason']} "
+                      f"peer={timeout_peer_record['state']} alive={timeout_peer_thread.is_alive()}")
+                BACKEND.QUEUE.request_cancel(cancel_conn, timeout_peer_id)
+                timeout_peer_thread.join(timeout=15)
+            finally:
+                RUNNER.timeout_seconds = real_timeout_seconds
         finally:
             cancel_conn.close()
             os.environ.pop("AIRLOCK_LEARNING_AGENT", None)
@@ -1297,28 +1756,35 @@ def main(argv):
         clobber_lib = os.path.join(tmp, "clobber")
         os.makedirs(clobber_lib, exist_ok=True)
         precious = document("zzzzzzzzzzz", title="전혀 다른 영상의 소중한 문서")
-        SAVE.save(clobber_lib, "shared-name.md", precious, video_id="zzzzzzzzzzz",
+        SAVE.save(clobber_lib, "2026-08-22--shared-name--zzzzzzzzzzz.md", precious, video_id="zzzzzzzzzzz",
                   state_dir=state)
         try:
-            SAVE.save(clobber_lib, "shared-name.md", document("wwwwwwwwww1"),
+            SAVE.save(clobber_lib, "2026-08-22--shared-name--zzzzzzzzzzz.md", document("wwwwwwwwww1"),
                       video_id="wwwwwwwwww1", state_dir=state)
             bad("남의 문서를 덮어썼다")
         except SAVE.SaveError as exc:
-            check("이미 있는 자리는 거절한다", exc.reason == "path-taken", exc.reason)
-        with open(os.path.join(clobber_lib, "shared-name.md"), "rb") as handle:
+            check("이미 있는 자리는 파일명 검증보다 path-taken 으로 거절한다",
+                  exc.reason == "path-taken", exc.reason)
+        with open(os.path.join(clobber_lib, "2026-08-22--shared-name--zzzzzzzzzzz.md"), "rb") as handle:
             check("거절된 뒤 원래 문서가 바이트 그대로다", handle.read() == precious)
+        renamed_after_collision, _ = SAVE.save(
+            clobber_lib, "2026-08-22--shared-name-channel--wwwwwwwwww1.md",
+            document("wwwwwwwwww1"), video_id="wwwwwwwwww1", state_dir=state)
+        check("path-taken 뒤 슬러그를 바꾼 재호출이 실제로 저장한다",
+              renamed_after_collision["path"]
+              == "2026-08-22--shared-name-channel--wwwwwwwwww1.md")
         # 같은 영상을 다시 쓰는 것(재시도)은 우리 것이므로 허용한다.
-        again, _w = SAVE.save(clobber_lib, "shared-name.md", precious,
+        again, _w = SAVE.save(clobber_lib, "2026-08-22--shared-name--zzzzzzzzzzz.md", precious,
                               video_id="zzzzzzzzzzz", state_dir=state)
         check("같은 영상의 재저장은 된다", again["video_id"] == "zzzzzzzzzzz")
         # 읽을 수 없는 파일이 있으면 **비었다고 답하지 않는다**.
-        unreadable = os.path.join(clobber_lib, "locked.md")
+        unreadable = os.path.join(clobber_lib, "2026-08-22--locked--zzzzzzzzzzz.md")
         with open(unreadable, "wb") as handle:
             handle.write(precious)
         if os.geteuid() != 0:
             os.chmod(unreadable, 0o000)
             try:
-                SAVE.save(clobber_lib, "locked.md", document("vvvvvvvvvv9"),
+                SAVE.save(clobber_lib, "2026-08-22--locked--zzzzzzzzzzz.md", document("vvvvvvvvvv9"),
                           video_id="vvvvvvvvvv9", state_dir=state)
                 bad("읽을 수 없는 파일을 덮어썼다")
             except SAVE.SaveError as exc:
@@ -1388,7 +1854,12 @@ if "--dump-json" in sys.argv:
     print(json.dumps({{"id": "aircAruvnKk", "title": "t", "uploader": "c",
                        "duration": 61, "upload_date": "20200101",
                        "webpage_url": "https://youtu.be/aircAruvnKk",
-                       "language": "ko"}}))
+                       "language": "ko",
+                       "subtitles": {{"ko": [{{"ext": "json3"}}]}},
+                       "automatic_captions": {{
+                           "ko-orig": [{{"ext": "json3"}}],
+                           "en": [{{"ext": "json3"}}]
+                       }}}}))
     raise SystemExit(0)
 out = sys.argv[sys.argv.index("-o") + 1] if "-o" in sys.argv else "s.%(ext)s"
 fmt = sys.argv[sys.argv.index("--sub-format") + 1] if "--sub-format" in sys.argv else "vtt"
@@ -1407,7 +1878,8 @@ with open(target, "w", encoding="utf-8") as fh:
         check("스텁으로도 전사본이 나온다", ran.returncode == 0, ran.stderr[:200])
         with open(recorder, encoding="utf-8") as handle:
             calls = [json.loads(line) for line in handle if line.strip()]
-        check("yt-dlp 를 두 번 이상 부른다", len(calls) >= 2, str(len(calls)))
+        check("사람 자막이 있으면 yt-dlp 요청은 정보 1회 + 자막 1회다",
+              len(calls) == 2, str(len(calls)))
         # 🔴 `list=` 가 붙은 평범한 watch 주소가 통째로 실패했다 — 접수는 통과시키는데.
         missing = [c for c in calls if "--no-playlist" not in c]
         check("모든 yt-dlp 호출이 영상 하나만 본다", not missing, str(missing[:1]))
@@ -1420,6 +1892,39 @@ with open(target, "w", encoding="utf-8") as fh:
               subs_calls and all("--sub-langs" in c
                                  and c[c.index("--sub-langs") + 1].startswith("ko")
                                  for c in subs_calls), str(subs_calls[:1]))
+        check("사람 자막을 자동 자막보다 먼저 고른다",
+              len(subs_calls) == 1 and "--write-subs" in subs_calls[0]
+              and "--write-auto-subs" not in subs_calls[0], str(subs_calls))
+
+        # 메타 목록이 비었으면 두 번째 yt-dlp 호출이나 음성 인식으로 넘어가지 않는다.
+        with open(recorder, "w", encoding="utf-8"):
+            pass
+        with open(os.path.join(stub_bin, "yt-dlp"), "w", encoding="utf-8") as handle:
+            handle.write(f"""#!{sys.executable}
+import json, sys
+with open({recorder!r}, "a", encoding="utf-8") as log:
+    log.write(json.dumps(sys.argv[1:], ensure_ascii=False) + chr(10))
+if "--dump-json" in sys.argv:
+    print(json.dumps({{"id": "nosubs00001", "title": "t", "language": "ko",
+                       "subtitles": {{}}, "automatic_captions": {{}}}}))
+    raise SystemExit(0)
+raise SystemExit(99)
+""")
+        os.chmod(os.path.join(stub_bin, "yt-dlp"), 0o755)
+        no_subs_out = os.path.join(tmp, "no-subs-transcript.txt")
+        no_subs = subprocess.run(
+            [sys.executable, os.path.join(skill_dir, "transcript.py"),
+             "--url", "https://youtu.be/nosubs00001", "--out", no_subs_out],
+            capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, PATH=stub_bin))
+        with open(recorder, encoding="utf-8") as handle:
+            no_subs_calls = [json.loads(line) for line in handle if line.strip()]
+        check("자막 목록이 비면 추가 요청 없이 no-subs로 끝난다",
+              no_subs.returncode == 2 and len(no_subs_calls) == 1
+              and not os.path.exists(no_subs_out)
+              and "이 영상은 자막이 없어 적재할 수 없습니다" in no_subs.stderr
+              and 'LEARNING-INGEST-ERROR {"error":"no-subs"}' in no_subs.stderr,
+              f"rc={no_subs.returncode} calls={len(no_subs_calls)} stderr={no_subs.stderr[:200]!r}")
 
         with open(os.path.join(skill_dir, "transcript.py"), encoding="utf-8") as handle:
             transcript_source = handle.read()

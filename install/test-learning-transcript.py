@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """learning 앱의 자막 취득이 유튜브 레이트리밋에 무너지지 않는지 고정한다.
 
-지키는 계약은 하나다 — **부수 언어 하나의 429 가 이미 손에 쥔 자막을 버리게 하지 않는다.**
+지키는 계약은 하나다 — **자막은 메타 목록에서 고른 트랙 하나만 청한다.** 부수 언어의 429 가
+이미 손에 쥔 자막을 버리게 하지 않고, 없는 자막을 네 번 찔러 스스로 레이트리밋을 부르지 않는다.
 yt-dlp 는 `--sub-langs` 로 청한 언어 중 하나라도 못 받으면 비영으로 끝난다. 그래서 한국어
 영상에 `ko,ko-orig,en` 을 한 번에 청하면, ko 자막이 정상으로 와 있어도 en 의 429 하나로
 전체가 "자막 없음" 이 된다 (실측 2026-09-02~05: 적재 잡 118건 중 18건이 이 경로로 죽었고
@@ -89,50 +90,68 @@ def main():
         and module.source_language({}) is None,
         None)
 
+    # 2026-09-12 이후 계약: 메타의 자막 목록에서 트랙 **하나**를 고르고 그것만 청한다.
+    # 네 라운드를 차례로 찌르던 옛 방식은 영상 하나에 최악 17회를 청해 스스로 429 를 불렀다.
     passed &= check(
-        "영상 언어를 먼저, en 은 대비책으로",
-        module.language_rounds("ko") == (["ko", "ko-orig"], ["en"])
-        and module.language_rounds("en") == (["en"],)
-        and module.language_rounds(None) == (["en"],),
-        module.language_rounds("ko"))
+        "사람 자막 원어가 있으면 그것 하나를 고른다",
+        module.caption_choice({"language": "ko", "subtitles": {"ko": [], "en": []},
+                               "automatic_captions": {"ko-orig": []}})
+        == ("--write-subs", "manual", "ko"),
+        None)
+    passed &= check(
+        "사람 자막이 없으면 자동 자막의 원어(-orig)를 고른다",
+        module.caption_choice({"language": "en",
+                               "automatic_captions": {"en": [], "ko": [], "ko-orig": []}})
+        == ("--write-auto-subs", "auto", "ko-orig"),
+        None)
+    passed &= check(
+        "자막 목록이 비면 아무것도 고르지 않는다",
+        module.caption_choice({"language": "ko"}) is None
+        and module.caption_choice({"subtitles": {}, "automatic_captions": {}}) is None,
+        None)
 
-    # 급소. 이 검사가 잡는 결함이 실제로 18건을 죽였다.
+    # 급소. 한 번에 여러 언어를 청하면 부수 언어 하나의 429 가 손에 쥔 자막을 버린다.
     with tempfile.TemporaryDirectory() as workdir:
-        asked, naps = harness(module, workdir, {("auto", "ko,ko-orig")})
-        events, kind = module.subtitle_events("yt-dlp", "u", workdir, "ko", [])
-        passed &= check("en 이 429 여도 한국어 자막으로 성공한다",
-                        events and kind == "auto", (events, kind))
-        passed &= check("자막을 얻었으면 en 을 더 청하지 않는다",
-                        ("auto", "en") not in asked, asked)
-        passed &= check("대비책 라운드에서는 429 를 기다리지 않는다", naps == [], naps)
+        info = {"language": "ko", "automatic_captions": {"ko-orig": [], "en": []}}
+        asked, naps = harness(module, workdir, {("auto", "ko-orig")})
+        events, kind = module.subtitle_events("yt-dlp", "u", workdir, info, [])
+        passed &= check("자막은 고른 트랙 하나만 청한다",
+                        events and kind == "auto" and asked == [("auto", "ko-orig")],
+                        (asked, kind))
+        passed &= check("en 은 아예 청하지 않는다",
+                        all(lang != "en" for _, lang in asked), asked)
+        passed &= check("정상 경로에서는 기다리지 않는다", naps == [], naps)
 
     with tempfile.TemporaryDirectory() as workdir:
-        asked, _ = harness(module, workdir, {("manual", "ko,ko-orig")})
-        events, kind = module.subtitle_events("yt-dlp", "u", workdir, "ko", [])
+        info = {"language": "ko", "subtitles": {"ko": []}}
+        asked, _ = harness(module, workdir, {("manual", "ko")})
+        events, kind = module.subtitle_events("yt-dlp", "u", workdir, info, [])
         passed &= check("사람 자막이 있으면 요청 한 번으로 끝난다",
-                        events and kind == "manual" and asked == [("manual", "ko,ko-orig")],
-                        asked)
+                        events and kind == "manual" and asked == [("manual", "ko")], asked)
 
     with tempfile.TemporaryDirectory() as workdir:
-        asked, _ = harness(module, workdir, set(), throttled=())
-        module.subtitle_events("yt-dlp", "u", workdir, "en", [])
-        passed &= check("영어 영상은 같은 언어를 두 번 청하지 않는다",
-                        asked == [("manual", "en"), ("auto", "en")], asked)
+        asked, _ = harness(module, workdir, set())
+        events, kind = module.subtitle_events("yt-dlp", "u", workdir, {"language": "en"}, [])
+        passed &= check("트랙이 없으면 yt-dlp 를 부르지 않는다",
+                        events is None and asked == [], asked)
 
-    # 1순위 라운드의 429 는 기다려 준다 — 재시도가 실제로 고칠 수 있는 유일한 실패다.
+    # 고른 트랙의 429 는 기다려 준다 — 재시도가 실제로 고칠 수 있는 유일한 실패다.
     with tempfile.TemporaryDirectory() as workdir:
-        _, naps = harness(module, workdir, set(), throttled=("ko,ko-orig",))
-        module.subtitle_events("yt-dlp", "u", workdir, "ko", [])
-        passed &= check("1순위 언어의 429 는 물러서서 다시 청한다",
-                        naps == list(module.YT_DLP_RETRY_DELAYS) * 2, naps)
+        info = {"language": "ko", "automatic_captions": {"ko-orig": []}}
+        _, naps = harness(module, workdir, set(), throttled=("ko-orig",))
+        module.subtitle_events("yt-dlp", "u", workdir, info, [])
+        passed &= check("고른 트랙의 429 는 물러서서 다시 청한다",
+                        naps == list(module.YT_DLP_RETRY_DELAYS), naps)
 
     with tempfile.TemporaryDirectory() as workdir:
-        failures = []
-        harness(module, workdir, set())
-        module.subtitle_events("yt-dlp", "u", workdir, "ko", failures)
-        passed &= check("실패 사유에 어느 언어였는지가 남는다",
-                        any(item.startswith("manual/en") and "429" in item
-                            for item in failures), failures)
+        info = {"language": "ko", "automatic_captions": {"ko-orig": []}}
+        failures, codes = [], []
+        harness(module, workdir, set(), throttled=("ko-orig",))
+        module.subtitle_events("yt-dlp", "u", workdir, info, failures, codes)
+        passed &= check("실패 사유에 어느 트랙이었는지와 코드가 남는다",
+                        any(item.startswith("auto/ko-orig") and "429" in item
+                            for item in failures) and codes == ["rate-limited"],
+                        (failures, codes))
 
     # 429 가 아닌 실패를 세 번 더 물어봐야 답은 같다. 시간만 잃는다.
     calls, naps = [], []

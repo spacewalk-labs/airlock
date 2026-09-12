@@ -72,12 +72,14 @@ PATTERN='spacewalk|sparrow-spectrum|\b[a-z0-9]+-(dev|mgmt)\b|TeamSPWK|swk[-:_.]|
 # (c) One name of ours the SHAPE pattern cannot tell from a box: `airlock-dev`,
 #     this project's own app name. It is not a host. `airlock-devterm` needs no
 #     entry — `\bdev\b` does not fire inside it.
+# (d) Three public document-component name families. They are CSS/JS API identifiers shipped by
+#     the public renderer and consumed by public apps, not infrastructure names.
 #
 # Do not grow either group casually: (a) is closed, and (b) needs an owner
 # decision, because it is the one place a real internal string could hide.
-ALLOW='swk-airlock-return|swk-airlock-slot|swk-panel-close|swk:airlock-btn-pos-v1|spacewalk-labs|cho@spacewalk\.tech|airlock-dev'
+ALLOW='swk-airlock-return|swk-airlock-slot|swk-panel-close|swk:airlock-btn-pos-v1|swk-doc|swk-quiz|swk-q|spacewalk-labs|cho@spacewalk\.tech|airlock-dev'
 ALLOW_LIST=(swk-airlock-return swk-airlock-slot swk-panel-close swk:airlock-btn-pos-v1
-            spacewalk-labs cho@spacewalk.tech airlock-dev)
+            swk-doc swk-quiz swk-q spacewalk-labs cho@spacewalk.tech airlock-dev)
 
 # This file necessarily names every pattern, so it excludes itself — the same
 # carve-out ci.yml used to need for holding them.

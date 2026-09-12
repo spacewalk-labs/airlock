@@ -24,6 +24,7 @@
 })();
 </script>
 <link rel="stylesheet" href="/assets/airlock-tokens.css">
+<link rel="stylesheet" href="/assets/devmon-card-ui.css">
 <link rel="icon" type="image/png" href="/assets/favicon.png">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -277,17 +278,39 @@
   .ms-quiet .ok { color: var(--airlock-ink); font-weight: 500; }
   .ms-card { border: 1px solid var(--airlock-hairline); border-radius: 14px; background: var(--airlock-surface-1);
              padding: 0.9rem 1.1rem 0.3rem; }
-  .ms-hd { display: flex; align-items: baseline; gap: 10px; margin-bottom: 0.4rem; }
+  .ms-hd { display: flex; align-items: baseline; gap: 10px; margin-bottom: 0.4rem; cursor: pointer; }
   .ms-hd .ms-ttl { font-weight: 700; font-size: 0.95rem; }
   .ms-hd .ms-cnt { color: var(--airlock-mute); font-size: 0.85rem; }
   .ms-hd .ms-cnt b { color: var(--airlock-ink); }
+  .ms-hd .ms-hb { color: var(--airlock-mute); font-size: 0.76rem; white-space: nowrap; }
   .ms-hd a { margin-left: auto; color: var(--airlock-primary); font-size: 0.82rem; text-decoration: none; }
-  .ms-row { display: flex; align-items: baseline; gap: 8px; padding: 7px 0;
-            border-top: 1px solid var(--airlock-hairline); text-decoration: none; color: inherit; }
+  .ms-card.ms-collapsed .ms-body { display: none; }
+  .ms-row { display: flex; align-items: center; gap: 8px; padding: 7px 0;
+            border-top: 1px solid var(--airlock-hairline); color: inherit; }
   .ms-row:first-of-type { border-top: 0; }
-  .ms-row .ms-t { font-size: 0.88rem; font-weight: 500; flex: 1; min-width: 0;
-                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ms-row .ms-s { color: var(--airlock-mute); font-size: 0.76rem; white-space: nowrap; }
+  .ms-title { min-width: 0; flex: 1; overflow: hidden; padding: 0; border: 0;
+              background: transparent; color: inherit; cursor: pointer; text-align: left;
+              text-overflow: ellipsis; white-space: nowrap; font: inherit; font-size: 0.88rem;
+              font-weight: 600; }
+  .ms-title:focus-visible { outline: none; box-shadow: var(--airlock-focus); border-radius: 4px; }
+  .ms-read .ms-title { font-weight: 400; }
+  .ms-mark { flex: none; width: 14px; text-align: center; font-size: 0.8rem; font-weight: 800;
+             color: var(--airlock-mute); }
+  .ms-mark.ms-urgent { color: var(--airlock-danger); }
+  .ms-mark.ms-ok { color: #16a34a; }
+  .ms-row .ms-s { color: var(--airlock-mute); font-size: 0.76rem; white-space: nowrap;
+                  overflow: hidden; text-overflow: ellipsis; }
+  .ms-row .dmc-actions { flex: none; }
+  .ms-row .dmc-button { min-height: 30px; padding: 4px 9px; font-size: 0.72rem; }
+  .ms-row .ms-x { padding: 4px 9px; font-size: 1rem; line-height: 1; }
+  .ms-more { padding: 7px 0 4px; border-top: 1px solid var(--airlock-hairline);
+             color: var(--airlock-mute); font-size: 0.78rem; }
+  @media (max-width: 640px) {
+    .ms-row { flex-wrap: nowrap; }
+    .ms-title { flex: 1 1 auto; }
+    .ms-row .ms-s { flex: none; max-width: 34vw; }
+    .ms-hd .ms-hb { display: none; }
+  }
 
   /* Owner tools share one header control grammar. Updates belong to the app-store
      entrance; the gear is now only agent and harness settings. */
@@ -1345,6 +1368,7 @@ if (("standalone" in navigator) && navigator.standalone) {
 }
 </script>
 
+<script src="/assets/devmon-card-ui.js"></script>
 <script>
 // Message strip — dev-monitor's "needs a person" preview, above the tool grid: the
 // screen a person meets BEFORE choosing a tool. Owner-only (the API 403s everyone
@@ -1364,81 +1388,221 @@ if (("standalone" in navigator) && navigator.standalone) {
   try { me = await j("/whoami"); } catch (_) {}
   if (!me || me.role !== "owner") return;      // stays hidden — collaborators draw no fetch
 
-  function fmtClock(iso) {
-    try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
-    catch (_) { return iso; }
+  const OWNER_API = "/monitor/api/owner";
+  let lastPayload = null;
+  let rowNodes = {};
+  let unreadNode = null;
+
+  function ownerFetch(path, options) {
+    options = options || {};
+    options.cache = "no-store";
+    if (options.method === "POST") {
+      options.headers = Object.assign({"content-type": "application/json"}, options.headers || {});
+      if (options.body == null) options.body = "{}";
+    }
+    return fetch(OWNER_API + path, options);
   }
-  // Same-day: a clock time ("마지막 수집 08:41") reads fine. Older than a day, a bare clock
-  // time silently relabels itself "today" every time this renders — that is exactly the
-  // quiet/dead confusion this strip exists to end, so it switches to a relative age instead.
-  function fmtCollected(iso, ageSeconds) {
-    if (!iso) return "-";
-    if (ageSeconds == null || ageSeconds < 86400) return fmtClock(iso);
-    const days = Math.floor(ageSeconds / 86400);
-    return days + "일 전 (" + fmtClock(iso) + ")";
+  function ownerResponse(response) {
+    return response.json().catch(() => ({})).then(data => {
+      if (!response.ok || !data.ok) throw new Error(data.error || "Action returned " + response.status + ".");
+      return data;
+    });
+  }
+  function action(card, name) {
+    return ownerFetch("/messages/" + encodeURIComponent(card.card_id) + "/" + name,
+      {method: "POST"}).then(ownerResponse);
+  }
+  function isHeartbeat(card) {
+    return card && (card.source === "heartbeat" || card.group === "heartbeat" ||
+      String(card.card_id || "").indexOf("heartbeat:") === 0);
+  }
+  function age(iso) {
+    const then = new Date(iso).getTime();
+    if (!Number.isFinite(then)) return "-";
+    const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
+    if (seconds < 60) return seconds + "s";
+    if (seconds < 3600) return Math.floor(seconds / 60) + "m";
+    if (seconds < 86400) return Math.floor(seconds / 3600) + "h";
+    return Math.floor(seconds / 86400) + "d";
+  }
+  function heartbeatDate(messages) {
+    const heartbeat = messages.filter(isHeartbeat).sort((a, b) =>
+      String(b.last_at || "").localeCompare(String(a.last_at || "")))[0];
+    if (!heartbeat) return null;
+    const id = String(heartbeat.card_id || "");
+    if (/^heartbeat:\d{4}-\d{2}-\d{2}$/.test(id)) return id.slice("heartbeat:".length);
+    const parsed = new Date(heartbeat.last_at);
+    return Number.isFinite(parsed.getTime()) ? parsed.toISOString().slice(0, 10) : null;
+  }
+
+  const cardUI = window.DevmonCardUI.create({
+    read: card => action(card, "read"),
+    archive: card => action(card, "archive"),
+    run: (card, params, note) => ownerFetch("/run", {method: "POST", body: JSON.stringify({
+      card_id: card.card_id, params: params, note: note
+    })}).then(ownerResponse),
+    selectWindow: card => ownerFetch("/run/window", {method: "POST", body: JSON.stringify({
+      card_id: card.card_id
+    })}).then(ownerResponse),
+    devtermUrl: session => j("/__airlock.json").then(cfg => {
+      const app = cfg && cfg.apps && cfg.apps.devterm;
+      const host = cfg && cfg.fqdn && cfg.fqdn.indexOf(".") > 0 ? cfg.fqdn : location.hostname;
+      return app && app.port && host
+        ? "https://" + host + ":" + app.port + "/?arg=" + encodeURIComponent(session) : "";
+    }),
+    changed: (card, kind) => {
+      const node = rowNodes[card.card_id];
+      if (!node || !lastPayload) return;
+      if (kind === "read" && !node.row.classList.contains("ms-read")) {
+        node.row.classList.add("ms-read");
+        lastPayload.unread_count = Math.max(0, lastPayload.unread_count - 1);
+        if (unreadNode) unreadNode.textContent = String(lastPayload.unread_count);
+      } else if (kind === "read-failed" && node.row.classList.contains("ms-read")) {
+        node.row.classList.remove("ms-read");
+        lastPayload.unread_count += 1;
+        if (unreadNode) unreadNode.textContent = String(lastPayload.unread_count);
+      } else if (kind === "ran") {
+        const replacement = cardUI.createActions(card);
+        node.actions.parentNode.appendChild(replacement);
+        node.actions.remove();
+        node.actions = replacement;
+      }
+    },
+    removed: card => {
+      if (!lastPayload) return;
+      lastPayload.messages = lastPayload.messages.filter(item => item.card_id !== card.card_id);
+      lastPayload.top = lastPayload.top.filter(item => item.card_id !== card.card_id);
+      if (!card.read_at) lastPayload.unread_count = Math.max(0, lastPayload.unread_count - 1);
+      renderPayload(lastPayload);
+    },
+    toast: message => console.warn("[dev-monitor] " + message)
+  });
+
+  function visibleCards(payload) {
+    const seen = {};
+    return payload.top.concat(payload.messages).filter(card => {
+      if (!card || !card.card_id || card.read_at || isHeartbeat(card) || seen[card.card_id]) return false;
+      seen[card.card_id] = true;
+      return true;
+    }).slice(0, 3);
+  }
+  function isNarrow() {
+    return !!(window.matchMedia && window.matchMedia("(max-width: 640px)").matches);
+  }
+  function metaText(card) {
+    if (isNarrow()) return "×" + (card.count || 1) + " · " + age(card.last_at);
+    const bits = [card.source || ""];
+    if (card.count > 1) bits.push("×" + card.count);
+    bits.push(age(card.last_at));
+    return bits.join(" · ");
   }
   function row(card) {
-    const a = document.createElement("a");
-    a.className = "ms-row"; a.href = "/monitor/";
-    const t = document.createElement("span");
-    t.className = "ms-t"; t.textContent = card.title || "";
+    const item = document.createElement("div");
+    item.className = "ms-row" + (card.read_at ? " ms-read" : "");
+    item.dataset.cardId = card.card_id;
+    const mark = document.createElement("span");
+    mark.className = "ms-mark" + (card.level === "urgent" ? " ms-urgent" : (card.level === "ok" ? " ms-ok" : ""));
+    mark.textContent = card.level === "urgent" ? "!" : (card.level === "ok" ? "✓" : "");
+    const title = document.createElement("button");
+    title.type = "button";
+    title.className = "ms-title";
+    title.textContent = card.title || "";
+    title.addEventListener("click", () => cardUI.openTitle(card));
     const s = document.createElement("span");
     s.className = "ms-s";
-    const bits = [card.source || ""];
-    if (card.occurrence_count > 1) bits.push("×" + card.occurrence_count);
-    s.textContent = bits.join(" · ");
-    a.append(t, s);
-    return a;
+    s.textContent = metaText(card);
+    const actions = cardUI.createActions(card);
+    const kids = actions.children ? Array.prototype.slice.call(actions.children) : [];
+    const archiveBtn = kids.find(node => node.textContent === "Archive");
+    if (archiveBtn) {
+      archiveBtn.textContent = "×";
+      archiveBtn.classList.add("ms-x");
+      archiveBtn.setAttribute("aria-label", "Archive");
+    }
+    item.append(mark, title, s, actions);
+    rowNodes[card.card_id] = {row: item, actions: actions};
+    return item;
   }
 
-  async function render() {
-    let r;
-    try { r = await fetch("/monitor/api/owner/messages/preview", { cache: "no-store" }); }
-    catch (_) { return; }                       // network failure — keep the last render
-    if (r.status === 403 || r.status === 404) { strip.hidden = true; strip.textContent = ""; return; }
-    if (!r.ok) return;                           // unexpected status — keep the last render
-    let d; try { d = await r.json(); } catch (_) { return; }
-
+  function renderPayload(d) {
+    rowNodes = {};
+    unreadNode = null;
     strip.textContent = "";
     strip.hidden = false;
-    const n = d.needs_action_count || 0;
+    const n = d.unread_count;
     if (n === 0) {
       const wrap = document.createElement("div");
       wrap.className = "ms-quiet";
       const ok = document.createElement("span");
       ok.className = "ok"; ok.textContent = "지금 하실 일이 없습니다.";
-      const when = document.createElement("span");
-      when.textContent = "마지막 수집 " + fmtCollected(d.collected_at, d.collected_age_seconds);
-      wrap.append(ok, when);
+      const heartbeat = heartbeatDate(d.messages);
+      const state = document.createElement("span");
+      state.textContent = heartbeat ? "heartbeat alive " + heartbeat + " ✓" : "heartbeat not observed";
+      wrap.append(ok, state);
       strip.appendChild(wrap);
       return;
     }
     const card = document.createElement("div");
-    card.className = "ms-card";
+    let collapsed = false;
+    try { collapsed = window.localStorage && window.localStorage.getItem("devmon-hub-collapsed") === "1"; } catch (_) {}
+    card.className = "ms-card" + (collapsed ? " ms-collapsed" : "");
     const hd = document.createElement("div");
     hd.className = "ms-hd";
     const ttl = document.createElement("span");
-    ttl.className = "ms-ttl"; ttl.textContent = "받은함";
+    ttl.className = "ms-ttl"; ttl.textContent = "Inbox";
     const cnt = document.createElement("span");
     cnt.className = "ms-cnt";
-    cnt.append("해야 할 일 ");
+    cnt.append(" ");
     const b = document.createElement("b"); b.textContent = String(n);
+    unreadNode = b;
     cnt.appendChild(b);
+    cnt.append(" unread");
+    const heartbeat = heartbeatDate(d.messages);
+    const hb = document.createElement("span");
+    hb.className = "ms-hb";
+    hb.textContent = heartbeat ? "heartbeat alive " + heartbeat + " ✓" : "heartbeat not observed";
     const open = document.createElement("a");
-    open.href = "/monitor/"; open.textContent = "받은함 열기 →";
-    hd.append(ttl, cnt, open);
+    open.href = "/monitor/"; open.textContent = "Open →";
+    open.addEventListener("click", e => e.stopPropagation());
+    hd.append(ttl, cnt, hb, open);
+    hd.addEventListener("click", () => {
+      const isCollapsed = card.classList.toggle("ms-collapsed");
+      try { window.localStorage && window.localStorage.setItem("devmon-hub-collapsed", isCollapsed ? "1" : "0"); } catch (_) {}
+    });
     card.appendChild(hd);
-    const top = d.top || [];
-    top.forEach(c => card.appendChild(row(c)));
-    if (n > top.length) {
-      const more = document.createElement("a");
-      more.className = "ms-row"; more.href = "/monitor/";
-      const t = document.createElement("span");
-      t.className = "ms-t"; t.textContent = "그 밖에 " + (n - top.length) + "건";
-      more.appendChild(t);
-      card.appendChild(more);
-    }
+    const body = document.createElement("div");
+    body.className = "ms-body";
+    const top = visibleCards(d);
+    top.forEach(c => body.appendChild(row(c)));
+    const moreCount = Math.max(0, n - top.length);
+    const more = document.createElement("div");
+    more.className = "ms-more";
+    more.textContent = moreCount + " more group" + (moreCount === 1 ? "" : "s");
+    body.appendChild(more);
+    card.appendChild(body);
     strip.appendChild(card);
+  }
+
+  async function render() {
+    if (document.querySelector && document.querySelector(".dmc-overlay")) return;
+    let response;
+    try { response = await fetch("/monitor/api/owner/messages/preview", {cache: "no-store"}); }
+    catch (_) { return; }                       // network failure — keep the last render
+    if (response.status === 403 || response.status === 404) {
+      strip.hidden = true;
+      strip.textContent = "";
+      lastPayload = null;
+      rowNodes = {};
+      unreadNode = null;
+      return;
+    }
+    if (!response.ok) return;                  // unexpected status — keep the last render
+    let payload;
+    try { payload = await response.json(); } catch (_) { return; }
+    if (!payload || !Array.isArray(payload.messages) || !Array.isArray(payload.top) ||
+        !Number.isInteger(payload.unread_count) || payload.unread_count < 0) return;
+    lastPayload = payload;
+    renderPayload(lastPayload);
   }
   render();
   setInterval(render, 30000);
@@ -1750,11 +1914,11 @@ if (("standalone" in navigator) && navigator.standalone) {
     const conflict = value.conflict ? "설정 충돌: " + value.conflict : "";
     const deniedText = rejected.size ? "거부된 capability를 manifest에서 빼야 합니다: " + Array.from(rejected).join(", ") : "";
     const registered = value.registered === true;
-    const reapprove = registered && value.requires_reapproval === true;
-    const action = reapprove ? "reapprove" : "register";
+    const reapprove = value.requires_reapproval === true;
+    const action = registered && reapprove ? "reapprove" : "register";
     const title = deniedText || conflict || (registered && !reapprove ? "현재 digest가 이미 승인되어 있습니다." : "");
     const disabled = value.installable !== true || (registered && !reapprove);
-    detailActions.appendChild(actionButton(reapprove ? "재승인" : registered ? "이미 승인됨" : "승인하고 설치",
+    detailActions.appendChild(actionButton(reapprove ? (registered ? "재승인" : "재승인하고 설치") : registered ? "이미 승인됨" : "승인하고 설치",
       action, value.id, true, disabled, title));
     progressNote.textContent = reapprove
       ? "digest가 바뀌었습니다. 재승인하면 airlock.lock을 갱신하고 전체 설치기를 다시 실행합니다."

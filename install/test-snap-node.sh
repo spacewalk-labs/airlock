@@ -12,8 +12,8 @@
 # does a developer box that installed node any other way. So the detection is written
 # as a pure function of three strings the caller measures — install/lib.sh's
 # airlock_snap_probe — and this file drives it over a truth table plus the two
-# install paths (refuse / override) under AIRLOCK_DRY_RUN with a fabricated snap
-# layout on PATH. What is NOT claimed anywhere here is that the kernel behaves as
+# install paths (snap: warn and render the reason / native: silent) under
+# AIRLOCK_DRY_RUN with a fabricated snap layout on PATH. What is NOT claimed anywhere here is that the kernel behaves as
 # described; that was measured on a real box once, and the harness in step 3 of
 # docs/tasks/active/live-verification-and-recurrence-gates.md is what keeps measuring it.
 set -uo pipefail
@@ -55,11 +55,11 @@ done <<'TABLE'
 /usr/bin/node|/usr/lib/snapd/snap|/snap/node/current/bin/node|resolved runtime|snapd launcher outside /snap
 TABLE
 
-# ---- 2. the refusal ----
+# ---- 2. the snap path ----
 # A dry run of the real installer with a fabricated snap layout first on PATH.
 # The fixture is a directory, not a mock of the classifier: the thing worth testing
-# is that install.sh measures the box and reaches the refusal, not that a function
-# returns what it was told to.
+# is that install.sh measures the box and reaches the snap branch, not that a
+# function returns what it was told to.
 make_box() {   # make_box <dir> <node-kind>   ; echoes the PATH to use
   local d="$1" kind="$2"
   mkdir -p "$d/home" "$d/render" "$d/shim" "$d/snapbin" "$d/usrbin" "$d/realnode"
@@ -115,42 +115,19 @@ run_paseo_dry() {   # run_paseo_dry <dir> <path> [VAR=VAL ...]  ; echoes output,
   return "$rc"
 }
 
-d="$TMP/refuse"; p="$(make_box "$d" snap)"
+d="$TMP/snap"; p="$(make_box "$d" snap)"
 out="$(run_paseo_dry "$d" "$p")"; rc=$?
-if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q 'paseo install refused' \
-   && printf '%s' "$out" | grep -q 'snap-confine'; then
-  ok "a snap-wrapped node is refused before anything is installed"
-else
-  bad "a snap-wrapped node was not refused (rc=$rc)"
-  printf '%s\n' "$out" | tail -12 | sed 's/^/    /'
-fi
-# The refusal must show all three readings. An operator who cannot see which probe
-# fired is being asked to trust a verdict instead of checking it.
-for field in 'probes=\[' 'found=' 'resolved=' 'runtime='; do
-  printf '%s' "$out" | grep -qE "$field" \
-    && ok "refusal names $field" \
-    || bad "refusal does not name $field"
-done
-printf '%s' "$out" | grep -q 'AIRLOCK_ALLOW_SNAP_NODE=1' \
-  && ok "refusal names the explicit override" \
-  || bad "refusal does not tell the operator how to proceed anyway"
-printf '%s' "$out" | grep -qi 'snap install node' \
-  && bad "refusal still suggests installing node from snap" \
-  || ok "refusal does not suggest the thing it just refused"
-[ -f "$d/render/units/airlock-paseo.service" ] \
-  && bad "the refusal still wrote a unit" \
-  || ok "the refusal wrote nothing"
-
-# ---- 3. the override ----
-d="$TMP/override"; p="$(make_box "$d" snap)"
-out="$(run_paseo_dry "$d" "$p" AIRLOCK_ALLOW_SNAP_NODE=1)"; rc=$?
 unit="$d/render/units/airlock-paseo.service"
+# Until 2026-09-12 this was a refusal behind an AIRLOCK_ALLOW_SNAP_NODE=1 override,
+# whose only effect was to turn NoNewPrivileges off for this unit. The directive is
+# off by default now (owner, 2026-09-02), so the failure the refusal guarded cannot
+# occur, and the gate went with the override. The measurement stays: a snap node
+# installs, says so in the log, and writes the reason into the unit.
 if [ "$rc" -eq 0 ] && [ -f "$unit" ]; then
-  ok "AIRLOCK_ALLOW_SNAP_NODE=1 lets the install proceed"
+  ok "a snap-wrapped node installs (the refusal is gone with the override)"
   grep -qx 'NoNewPrivileges=no' "$unit" \
-    && ok "the override renders NoNewPrivileges=no" \
-    || { bad "the override did not turn the directive off"; grep -n 'NoNewPrivileges' "$unit" | sed 's/^/    /'; }
+    && ok "the unit keeps NoNewPrivileges=no" \
+    || { bad "the snap path did not keep the directive off"; grep -n 'NoNewPrivileges' "$unit" | sed 's/^/    /'; }
   grep -q 'deliberately OFF for this unit' "$unit" \
     && ok "the unit says the directive is off on purpose" \
     || bad "the unit turns the directive off without saying why"
@@ -161,37 +138,50 @@ if [ "$rc" -eq 0 ] && [ -f "$unit" ]; then
   # assembled by the installer and passed as one argument precisely so it is never
   # re-scanned. If anything in it had been substituted, words would be missing.
   grep -q 'command not found' <<<"$out" \
-    && bad "rendering the override reason executed something" \
+    && bad "rendering the snap reason executed something" \
     || ok "the reason text reached the unit literally"
   grep -qx 'MemoryMax=30720M' "$unit" \
-    && ok "the override changed only the one directive (memory backstop intact)" \
-    || { bad "the override moved something else"; grep -E '^(Memory|Tasks)' "$unit" | sed 's/^/    /'; }
-  printf '%s' "$out" | grep -q 'WARNING: paseo is being installed against a snap-wrapped node' \
-    && ok "the override is loud in the install log too" \
-    || bad "the override is silent in the log"
+    && ok "the snap path changed only the one directive (memory backstop intact)" \
+    || { bad "the snap path moved something else"; grep -E '^(Memory|Tasks)' "$unit" | sed 's/^/    /'; }
+  printf '%s' "$out" | grep -q 'WARNING: node on this box is behind a snap wrapper' \
+    && ok "the snap path is loud in the install log too" \
+    || bad "the snap path is silent in the log"
+  # The warning must show all three readings. An operator who cannot see which probe
+  # fired is being asked to trust a verdict instead of checking it.
+  for field in 'probes=\[' 'found=' 'resolved=' 'runtime='; do
+    printf '%s' "$out" | grep -qE "$field" \
+      && ok "warning names $field" \
+      || bad "warning does not name $field"
+  done
+  printf '%s' "$out" | grep -q 'AIRLOCK_ALLOW_SNAP_NODE' \
+    && bad "the install log still names the removed override" \
+    || ok "the removed override is not offered"
+  printf '%s' "$out" | grep -qi 'snap install node' \
+    && bad "the warning suggests installing node from snap" \
+    || ok "the warning does not suggest snap"
 else
-  bad "the override did not produce a unit (rc=$rc)"
+  bad "a snap-wrapped node did not install (rc=$rc)"
   printf '%s\n' "$out" | tail -12 | sed 's/^/    /'
 fi
 
-# ---- 4. a native node is untouched ----
+# ---- 3. a native node is untouched ----
 # NoNewPrivileges is OFF on the ordinary path too since 2026-09-02: this unit is the
 # parent of the operator's agent sessions and the directive is inherited, so setting it
 # removed sudo AND setgid (crontab) from the human's own shell. See apps/paseo/install.sh.
 # What this test still guards is that the ordinary path is NOT the snap path: it must
-# install without the override and without the snap reason text.
+# install without the snap reason text.
 d="$TMP/native"; p="$(make_box "$d" native)"
 out="$(run_paseo_dry "$d" "$p")"; rc=$?
 unit="$d/render/units/airlock-paseo.service"
 if [ "$rc" -eq 0 ] && [ -f "$unit" ] && grep -qx 'NoNewPrivileges=no' "$unit" \
    && ! grep -q 'snap' "$unit"; then
-  ok "a non-snap node installs normally, without the snap override or its reason text"
+  ok "a non-snap node installs normally, without the snap reason text"
 else
   bad "a non-snap node did not take the ordinary path (rc=$rc)"
   printf '%s\n' "$out" | tail -12 | sed 's/^/    /'
 fi
 
-# ---- 5. the inventory of units that set the directive ----
+# ---- 4. the inventory of units that set the directive ----
 # paseo is exonerated by measurement; code-server is exonerated structurally (the
 # directive is on the Python manager unit, and the slot unit that actually runs
 # code-server carries none); orca is NOT exonerated — its unit execs an extracted

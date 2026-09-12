@@ -53,6 +53,49 @@ run() { AIRLOCK_CONFIG="$1" python3 "$CFG" "${@:2}"; }
 # 1. valid config validates
 if run "$TMP/good.toml" validate >/dev/null 2>&1; then ok "validate: good"; else bad "validate: good"; fi
 
+# Card ICON_GLYPH_GATE accepts this fixture suite, which covers the shortcut
+# surface here and the packaged-manifest surface in test-manifest.sh.  Normal
+# `validate` retains its stable one-line operator output; this explicit fixture
+# mode carries the machine-readable acceptance observations instead.
+glyph_ac="$(AIRLOCK_EMIT_AC=1 run "$TMP/good.toml" validate 2>&1)"
+if grep -Eq '^AC-GLYPH-SPRITE \| expected: sprite_symbols > 0 \| observed: sprite_symbols=[1-9][0-9]* \| verdict: PASS \| signal: fixture \| evidence: hub/index.html@[0-9a-f]{7,}$' <<<"$glyph_ac" \
+   && grep -Eq '^AC-GLYPH-DECLARATIONS \| expected: shipped_glyphs_checked == shipped_glyphs_declared && shortcut_glyphs_checked == shortcut_glyphs_declared \| observed: active_package_glyphs_checked=[0-9]+,shipped_glyphs_checked=[0-9]+,shipped_glyphs_declared=[0-9]+,shortcut_glyphs_checked=[0-9]+,shortcut_glyphs_declared=[0-9]+ \| verdict: PASS \| signal: fixture \| evidence: bin/airlock-config@[0-9a-f]{7,}$' <<<"$glyph_ac"; then
+  ok "validate: emits glyph AC observations with checkout evidence"
+else
+  bad "validate: emits glyph AC observations with checkout evidence"
+fi
+printf '%s\n' "$glyph_ac" | sed -n '/^AC-GLYPH-/p'
+
+# Disabled shipped packages still render when later enabled, so their tile
+# glyphs are part of this repository's launcher contract.  The config enables
+# only hub; corrupting the copied notes manifest must still make validate red.
+REPRO="$TMP/glyph-repro"
+mkdir -p "$REPRO/bin" "$REPRO/hub" "$REPRO/apps"
+cp "$CFG" "$REPRO/bin/airlock-config"
+cp "$HERE/../bin/agent_provider.py" "$REPRO/bin/agent_provider.py"
+cp "$HERE/../hub/index.html" "$REPRO/hub/index.html"
+for manifest in "$HERE"/../apps/*/airlock-app.toml; do
+  app="$(basename "$(dirname "$manifest")")"
+  mkdir -p "$REPRO/apps/$app"
+  cp "$manifest" "$REPRO/apps/$app/airlock-app.toml"
+done
+sed -i 's/glyph = "app-silverbullet"/glyph = "definitely-not-in-sprite"/' \
+  "$REPRO/apps/notes/airlock-app.toml"
+cat >"$REPRO/repro.toml" <<'TOML'
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+TOML
+inactive_glyph_out="$(AIRLOCK_CONFIG="$REPRO/repro.toml" \
+  AIRLOCK_STATE_DIR="$REPRO/state" python3 "$REPRO/bin/airlock-config" validate 2>&1)"
+if [ $? -ne 0 ] && grep -Fq 'definitely-not-in-sprite' <<<"$inactive_glyph_out" \
+   && grep -Fq "shipped package 'notes'" <<<"$inactive_glyph_out"; then
+  ok "validate: disabled shipped manifest glyph absent from sprite is fatal"
+else
+  bad "validate: disabled shipped manifest glyph absent from sprite is fatal"
+fi
+
 # 2. non-tailscale provider fails closed
 if run "$TMP/badprovider.toml" validate >/dev/null 2>&1; then bad "validate: rejects non-tailscale"; else ok "validate: rejects non-tailscale"; fi
 

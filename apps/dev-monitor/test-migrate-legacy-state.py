@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -15,6 +17,8 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / 'migrate-legacy-state.py'
+REPO = HERE.parent.parent
+AC6 = {'invariants': 0, 'compensation': 0}
 
 
 LEGACY_SCHEMA = """
@@ -81,6 +85,201 @@ def make_legacy(root: Path, duplicate: bool = False) -> sqlite3.Connection:
                  ('safe.json', now, 'test'))
     conn.commit()
     return conn
+
+
+def make_coalesce_fixture(path: Path, schema: str = 'phase1') -> None:
+    module = load_module()
+    messages = module._load_messages()
+    if schema not in {'fresh', 'phase1', 'phase2'}:
+        raise ValueError('unknown fixture schema')
+    if schema == 'fresh':
+        messages.init_db(str(path))
+    else:
+        conn = sqlite3.connect(path)
+        conn.executescript(messages._SCHEMA)
+        conn.close()
+        if schema == 'phase2':
+            messages.init_db(str(path))
+    conn = sqlite3.connect(path)
+    columns = ('card_id', 'group', 'level', 'title', 'body', 'link', 'run', 'count',
+               'first_at', 'last_at', 'read_at', 'archived_at', 'ran_at', 'sent_at',
+               'send_attempts', 'send_next_at')
+    insert = 'INSERT INTO cards(%s) VALUES(%s)' % (
+        ','.join('"group"' if item == 'group' else item for item in columns),
+        ','.join('?' for _ in columns))
+    run_a = '{"cwd":"/work","prompt":"inspect"}'
+    run_b = '{ "prompt": "inspect", "cwd": "/work" }'
+    rows = [
+        ('a-new', 'same', 'normal', 'new', '', 'https://example.test/doc', run_a, 2,
+         '2026-07-01T00:00:00.000000Z', '2026-09-10T00:00:00.000000Z',
+         '2026-09-10T01:00:00.000000Z', None, None,
+         '2026-09-10T02:00:00.000000Z', 2, None),
+        ('z-new', 'same', 'urgent', 'tie', '', 'https://example.test/doc', run_b, 3,
+         '2026-06-01T00:00:00.000000Z', '2026-09-10T00:00:00.000000Z',
+         None, None, None, None, 0, '2026-09-10T00:00:00.000000Z'),
+        ('old', 'same', 'normal', 'old', '', 'https://example.test/doc', run_a, 4,
+         '2026-05-01T00:00:00.000000Z', '2026-08-01T00:00:00.000000Z',
+         '2026-08-01T01:00:00.000000Z', None, None, None, 0, None),
+        ('different-run', 'same', 'normal', 'run', '', 'https://example.test/doc',
+         '{"cwd":"/work","prompt":"other"}', 5,
+         '2026-05-02T00:00:00.000000Z', '2026-08-02T00:00:00.000000Z',
+         None, None, None, None, 0, None),
+        ('different-link', 'same', 'normal', 'link', '', 'https://example.test/other',
+         run_a, 6, '2026-05-03T00:00:00.000000Z', '2026-08-03T00:00:00.000000Z',
+         None, None, None, None, 0, None),
+        ('cron:a1eedad1a93544b3beee223b', 'cron-job:a1eedad1a93544b3beee223b',
+         'urgent', 'before evidence', '', None, run_a, 8,
+         '2026-09-12T06:25:00.000000Z', '2026-09-12T07:57:00.000000Z',
+         None, None, None, '2026-09-12T06:25:03.000000Z', 1, None),
+        ('heartbeat:2026-09-09', 'heartbeat', 'urgent', 'heartbeat', '', None, None, 7,
+         '2026-09-09T00:00:00.000000Z', '2026-09-09T00:00:00.000000Z',
+         None, None, None, None, 0, None),
+        ('heartbeat:2026-09-10', 'heartbeat', 'urgent', 'heartbeat', '', None, None, 8,
+         '2026-09-10T00:00:00.000000Z', '2026-09-10T00:00:00.000000Z',
+         None, None, None, None, 0, None),
+    ]
+    conn.executemany(insert, rows)
+    conn.executemany(
+        'INSERT INTO ledger VALUES(?,?,?,?,?)',
+        [('event-a', 'same', 'fixture', '2026-09-10T00:00:00.000000Z', '{}'),
+         ('event-heartbeat', 'heartbeat', 'fixture',
+          '2026-09-10T00:00:01.000000Z', '{}')])
+    if schema in {'fresh', 'phase2'}:
+        conn.execute(
+            'UPDATE cards SET ran_at=?,ran_input=?,ran_window=? WHERE card_id=?',
+            ('2026-09-10T03:00:00.000000Z', '{"note":"","params":{}}',
+             'dev-monitor:ac20-fixture', 'a-new'))
+        conn.execute(
+            'UPDATE cards SET ran_at=?,ran_input=?,ran_window=? WHERE card_id=?',
+            ('2026-09-09T03:00:00.000000Z', '{"note":"loser","params":{}}',
+             'dev-monitor:archived-fixture', 'old'))
+    conn.commit()
+    conn.execute('PRAGMA journal_mode=DELETE')
+    conn.close()
+    os.chmod(path, 0o600)
+
+
+def _decoded_identity(row: sqlite3.Row) -> tuple[object, ...] | None:
+    if row['card_id'].startswith('heartbeat:'):
+        return None
+    try:
+        decoded = json.loads(row['run']) if row['run'] else None
+        run_key = json.dumps(decoded, sort_keys=True, separators=(',', ':'))
+    except (TypeError, ValueError):
+        return None
+    return (row['group'], run_key, row['link'])
+
+
+def _coalesce_expectations(path: Path) -> dict[str, object]:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            'SELECT * FROM cards WHERE archived_at IS NULL '
+            'ORDER BY last_at DESC,card_id ASC').fetchall()
+        all_rows = conn.execute('SELECT card_id,count FROM cards').fetchall()
+        ledger = [tuple(row) for row in conn.execute(
+            'SELECT * FROM ledger ORDER BY id')]
+    finally:
+        conn.close()
+    groups: dict[tuple[object, ...], list[sqlite3.Row]] = {}
+    untouched: dict[str, tuple[object, ...]] = {}
+    for row in rows:
+        identity = _decoded_identity(row)
+        if identity is None:
+            untouched[row['card_id']] = tuple(row)
+        else:
+            groups.setdefault(identity, []).append(row)
+    survivor_mutations = {'level', 'count', 'first_at', 'last_at', 'read_at'}
+    survivors = {items[0]['card_id']: {
+        'level': 'urgent' if any(item['level'] == 'urgent' for item in items)
+        else 'normal',
+        'count': sum(item['count'] for item in items),
+        'first_at': min(item['first_at'] for item in items),
+        'last_at': max(item['last_at'] for item in items),
+        'read_at': None if any(item['read_at'] is None for item in items)
+        else items[0]['read_at'],
+        'delivery': tuple(items[0][key] for key in
+                          ('sent_at', 'send_attempts', 'send_next_at')),
+        'preserved': {key: items[0][key] for key in items[0].keys()
+                      if key not in survivor_mutations},
+    } for items in groups.values()}
+    loser_mutations = {'count', 'archived_at'}
+    losers = {item['card_id']: {
+        key: item[key] for key in item.keys() if key not in loser_mutations
+    } for items in groups.values() for item in items[1:]}
+    return {
+        'row_count': len(all_rows),
+        'count_sum': sum(row['count'] for row in all_rows),
+        'survivors': survivors,
+        'losers': losers,
+        'untouched': untouched,
+        'ledger': ledger,
+        'cron_before': {row['card_id']: tuple(row) for row in rows
+                        if row['card_id'].startswith(
+                            'cron:a1eedad1a93544b3beee223b')},
+    }
+
+
+def check_coalesce_round_trip(path: Path) -> dict[str, int]:
+    expected = _coalesce_expectations(path)
+    before_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), '--coalesce-open-cards', str(path), '--offline'],
+        text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise AssertionError(result.stderr)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = {row['card_id']: row for row in conn.execute('SELECT * FROM cards')}
+        assert len(rows) == expected['row_count']
+        assert sum(row['count'] for row in rows.values()) == expected['count_sum']
+        for card_id, values in expected['survivors'].items():
+            row = rows[card_id]
+            assert row['archived_at'] is None
+            assert row['level'] == values['level']
+            assert row['count'] == values['count']
+            assert row['first_at'] == values['first_at']
+            assert row['last_at'] == values['last_at']
+            assert row['read_at'] == values['read_at']
+            assert tuple(row[key] for key in
+                         ('sent_at', 'send_attempts', 'send_next_at')) == values['delivery']
+            for key, value in values['preserved'].items():
+                assert row[key] == value
+        for card_id, preserved in expected['losers'].items():
+            assert rows[card_id]['archived_at'] is not None
+            assert rows[card_id]['count'] == 0
+            for key, value in preserved.items():
+                assert rows[card_id][key] == value
+        for card_id, values in expected['untouched'].items():
+            assert tuple(rows[card_id]) == values
+        assert [tuple(row) for row in conn.execute(
+            'SELECT * FROM ledger ORDER BY id')] == expected['ledger']
+        for card_id, values in expected['cron_before'].items():
+            assert tuple(rows[card_id]) == values
+        assert conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+    finally:
+        conn.close()
+    after_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    repeated = subprocess.run(
+        [sys.executable, str(SCRIPT), '--coalesce-open-cards', str(path), '--offline'],
+        text=True, capture_output=True, check=False)
+    assert repeated.returncode == 0, repeated.stderr
+    assert 'coalesced=0' in repeated.stdout
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == after_hash
+    compensated = subprocess.run(
+        [sys.executable, str(SCRIPT), '--compensate-coalesce-open-cards', str(path),
+         '--offline'], text=True, capture_output=True, check=False)
+    assert compensated.returncode == 0, compensated.stderr
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before_hash
+    return {
+        'survivors': len(expected['survivors']),
+        'losers': len(expected['losers']),
+        'rows': expected['row_count'],
+        'invariants': 1,
+        'compensation': 1,
+    }
 
 
 class MigrationTests(unittest.TestCase):
@@ -799,5 +998,179 @@ module.migrate(sys.argv[2], sys.argv[3], sys.argv[4], offline=True)
             recovered.close()
 
 
+class CoalesceOpenCardsTests(unittest.TestCase):
+    def test_official_schema_generations_are_accepted(self):
+        for schema in ('fresh', 'phase1', 'phase2'):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory(
+                    prefix='devmon-coalesce-schema-') as raw:
+                path = Path(raw) / 'messages.db'
+                make_coalesce_fixture(path, schema=schema)
+                self.assertIn(
+                    'cron:a1eedad1a93544b3beee223b',
+                    _coalesce_expectations(path)['cron_before'])
+                observed = check_coalesce_round_trip(path)
+                self.assertEqual(observed['invariants'], 1)
+                self.assertEqual(observed['compensation'], 1)
+
+    def test_unknown_column_and_wrong_table_are_rejected_without_mutation(self):
+        cases = {
+            'unknown-column': 'ALTER TABLE cards ADD COLUMN surprise TEXT',
+            'wrong-table': 'CREATE TABLE surprise(value TEXT)',
+        }
+        for name, statement in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory(
+                    prefix='devmon-coalesce-bad-schema-') as raw:
+                path = Path(raw) / 'messages.db'
+                make_coalesce_fixture(path, schema='phase2')
+                conn = sqlite3.connect(path)
+                try:
+                    conn.execute(statement)
+                    conn.commit()
+                    conn.execute('PRAGMA journal_mode=DELETE')
+                finally:
+                    conn.close()
+                before = hashlib.sha256(path.read_bytes()).hexdigest()
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), '--coalesce-open-cards',
+                     str(path), '--offline'], text=True, capture_output=True,
+                    check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('canonical', result.stderr)
+                self.assertEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
+                self.assertFalse(Path(
+                    str(path) + '.pre-coalesce-open-cards').exists())
+
+    def test_forward_and_compensation_require_offline_attestation(self):
+        with tempfile.TemporaryDirectory(prefix='devmon-coalesce-gate-') as raw:
+            path = Path(raw) / 'messages.db'
+            make_coalesce_fixture(path)
+            forward = subprocess.run(
+                [sys.executable, str(SCRIPT), '--coalesce-open-cards', str(path)],
+                text=True, capture_output=True, check=False)
+            compensate = subprocess.run(
+                [sys.executable, str(SCRIPT), '--compensate-coalesce-open-cards',
+                 str(path)], text=True, capture_output=True, check=False)
+            self.assertNotEqual(forward.returncode, 0)
+            self.assertNotEqual(compensate.returncode, 0)
+            self.assertIn('--offline is required', forward.stderr)
+            self.assertIn('--offline is required', compensate.stderr)
+
+    def test_fixture_folds_decoded_identity_and_mixed_level_then_exactly_compensates(self):
+        with tempfile.TemporaryDirectory(prefix='devmon-coalesce-') as raw:
+            path = Path(raw) / 'messages.db'
+            make_coalesce_fixture(path)
+            self.assertEqual(
+                _coalesce_expectations(path)['survivors']['a-new']['level'], 'urgent')
+            observed = check_coalesce_round_trip(path)
+            self.assertEqual(observed, {
+                'survivors': 4, 'losers': 2, 'rows': 8,
+                'invariants': 1, 'compensation': 1,
+            })
+            backup = Path(str(path) + '.pre-coalesce-open-cards')
+            self.assertTrue(backup.is_file())
+            self.assertTrue(Path(str(backup) + '.manifest.json').is_file())
+            self.assertTrue(Path(str(backup) + '.target.json').is_file())
+            wal = Path(str(path) + '-wal')
+            wal.write_bytes(b'uncheckpointed-state')
+            unsafe_noop = subprocess.run(
+                [sys.executable, str(SCRIPT), '--compensate-coalesce-open-cards',
+                 str(path), '--offline'], text=True, capture_output=True, check=False)
+            self.assertNotEqual(unsafe_noop.returncode, 0)
+            self.assertIn('SQLite journal state', unsafe_noop.stderr)
+            AC6.update({
+                'invariants': observed['invariants'],
+                'compensation': observed['compensation'],
+            })
+
+    def test_forward_resumes_after_receipt_is_durable_before_database_replace(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory(prefix='devmon-coalesce-resume-') as raw:
+            path = Path(raw) / 'messages.db'
+            make_coalesce_fixture(path)
+            backup = Path(str(path) + module.COALESCE_BACKUP_SUFFIX)
+            module._exact_copy(path, backup, no_clobber=True)
+            module._write_backup_manifest(backup, path)
+            clone = Path(raw) / 'interrupted.db'
+            shutil.copyfile(backup, clone)
+            module._coalesce_clone(clone)
+            expected_sha256 = module._file_sha256(clone)
+            module._write_target_marker(backup, expected_sha256)
+            clone.unlink()
+
+            resumed = subprocess.run(
+                [sys.executable, str(SCRIPT), '--coalesce-open-cards', str(path),
+                 '--offline'], text=True, capture_output=True, check=False)
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertIn('coalesced=1', resumed.stdout)
+            self.assertEqual(module._file_sha256(path), expected_sha256)
+
+            repeated = subprocess.run(
+                [sys.executable, str(SCRIPT), '--coalesce-open-cards', str(path),
+                 '--offline'], text=True, capture_output=True, check=False)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertIn('coalesced=0', repeated.stdout)
+
+    def test_compensation_refuses_to_discard_a_later_write(self):
+        with tempfile.TemporaryDirectory(prefix='devmon-coalesce-later-write-') as raw:
+            path = Path(raw) / 'messages.db'
+            make_coalesce_fixture(path)
+            forward = subprocess.run(
+                [sys.executable, str(SCRIPT), '--coalesce-open-cards', str(path),
+                 '--offline'], text=True, capture_output=True, check=False)
+            self.assertEqual(forward.returncode, 0, forward.stderr)
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    'UPDATE cards SET title=? WHERE card_id=?',
+                    ('later write', 'a-new'))
+                conn.commit()
+            finally:
+                conn.close()
+            changed_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            compensate = subprocess.run(
+                [sys.executable, str(SCRIPT), '--compensate-coalesce-open-cards',
+                 str(path), '--offline'], text=True, capture_output=True, check=False)
+            self.assertNotEqual(compensate.returncode, 0)
+            self.assertIn('does not match the backup', compensate.stderr)
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), changed_hash)
+
+    def test_compensation_refuses_journal_state_even_when_main_file_matches_backup(self):
+        with tempfile.TemporaryDirectory(prefix='devmon-coalesce-journal-') as raw:
+            path = Path(raw) / 'messages.db'
+            make_coalesce_fixture(path)
+            check_coalesce_round_trip(path)
+            Path(str(path) + '-wal').touch()
+            compensate = subprocess.run(
+                [sys.executable, str(SCRIPT), '--compensate-coalesce-open-cards',
+                 str(path), '--offline'], text=True, capture_output=True, check=False)
+            self.assertNotEqual(compensate.returncode, 0)
+            self.assertIn('database has SQLite journal state', compensate.stderr)
+
+
 if __name__ == '__main__':
-    unittest.main()
+    if '--live-copy' in sys.argv:
+        index = sys.argv.index('--live-copy')
+        try:
+            path = Path(sys.argv[index + 1])
+        except IndexError:
+            raise SystemExit('--live-copy requires a database path')
+        observed = check_coalesce_round_trip(path)
+        revision = subprocess.check_output(
+            ['git', 'rev-parse', '--short=12', 'HEAD'], cwd=REPO, text=True).strip()
+        print('AC-6 | expected: invariants == 1 && compensation == 1 | '
+              'observed: invariants=%d,compensation=%d | verdict: PASS | signal: replay | '
+              'evidence: apps/dev-monitor/test-migrate-legacy-state.py@%s'
+              % (observed['invariants'], observed['compensation'], revision))
+        print('LIVE-COPY: rows=%d survivors=%d losers=%d' % (
+            observed['rows'], observed['survivors'], observed['losers']))
+    else:
+        program = unittest.main(exit=False)
+        if not program.result.wasSuccessful():
+            raise SystemExit(1)
+        revision = subprocess.check_output(
+            ['git', 'rev-parse', '--short=12', 'HEAD'], cwd=REPO, text=True).strip()
+        verdict = 'PASS' if all(value == 1 for value in AC6.values()) else 'FAIL'
+        print('AC-6 | expected: invariants == 1 && compensation == 1 | '
+              'observed: invariants=%d,compensation=%d | verdict: %s | signal: fixture | '
+              'evidence: apps/dev-monitor/test-migrate-legacy-state.py@%s'
+              % (AC6['invariants'], AC6['compensation'], verdict, revision))

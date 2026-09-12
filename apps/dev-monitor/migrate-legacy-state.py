@@ -13,6 +13,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import sqlite3
@@ -27,6 +28,7 @@ TABLES = (
     'ingest_errors',
 )
 SQLITE_SIDECARS = ('-wal', '-shm', '-journal')
+COALESCE_BACKUP_SUFFIX = '.pre-coalesce-open-cards'
 
 
 class MigrationError(RuntimeError):
@@ -223,14 +225,25 @@ def _write_target_marker(backup: Path, target_sha256: str) -> None:
             temp.unlink()
 
 
-def _verify_target_marker(backup: Path, target: Path) -> None:
+def _read_target_marker(backup: Path) -> dict[str, object]:
     marker = _target_marker_path(backup)
     try:
         actual = json.loads(marker.read_text(encoding='utf-8'))
     except (OSError, ValueError) as exc:
         raise MigrationError('--resume requires a valid canonical target marker') from exc
-    expected = _target_marker_payload(backup, _file_sha256(target))
-    if actual != expected:
+    if (not isinstance(actual, dict)
+            or set(actual) != {'version', 'backup_sha256', 'target_sha256'}
+            or actual['version'] != 1
+            or actual['backup_sha256'] != _file_sha256(backup)
+            or not isinstance(actual['target_sha256'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', actual['target_sha256'])):
+        raise MigrationError('canonical target marker does not match the backup')
+    return actual
+
+
+def _verify_target_marker(backup: Path, target: Path) -> None:
+    actual = _read_target_marker(backup)
+    if actual['target_sha256'] != _file_sha256(target):
         raise MigrationError('existing canonical database does not match the backup')
 
 
@@ -311,6 +324,33 @@ def _sqlite_backup(source: Path, target: Path, *, exclusive: bool) -> None:
             if sidecar.exists():
                 sidecar.unlink()
     _fsync_dir(target.parent)
+
+
+def _exact_copy(source: Path, target: Path, *, no_clobber: bool) -> None:
+    """Atomically publish byte-identical standalone SQLite state."""
+    _mkdir_private(target.parent)
+    if no_clobber and target.exists():
+        raise MigrationError('database backup already exists')
+    fd, raw_temp = tempfile.mkstemp(
+        prefix='.messages-exact.', suffix='.db', dir=target.parent)
+    os.close(fd)
+    temp = Path(raw_temp)
+    try:
+        shutil.copyfile(source, temp)
+        os.chmod(temp, 0o600)
+        _fsync_file(temp)
+        if no_clobber:
+            try:
+                os.link(temp, target)
+            except FileExistsError as exc:
+                raise MigrationError('database backup already exists') from exc
+        else:
+            os.replace(temp, target)
+        os.chmod(target, 0o600)
+        _fsync_file(target)
+        _fsync_dir(target.parent)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _integrity(path: Path) -> None:
@@ -648,6 +688,152 @@ def restore(backup_raw: str, target_raw: str, offline: bool = False) -> int:
     return 0
 
 
+def _run_identity(row: sqlite3.Row) -> tuple[str, str, str] | None:
+    if row['card_id'].startswith('heartbeat:'):
+        return None
+    try:
+        decoded = json.loads(row['run']) if row['run'] else None
+    except (TypeError, ValueError):
+        return None
+    return (row['group'], json.dumps(decoded, sort_keys=True, separators=(',', ':')),
+            row['link'])
+
+
+def _coalesce_clone(path: Path) -> tuple[int, int]:
+    """Fold duplicate active identities in a private clone, retaining tombstone rows."""
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    folded = 0
+    survivors = 0
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        before_rows = conn.execute('SELECT COUNT(*) FROM cards').fetchone()[0]
+        before_count = conn.execute('SELECT COALESCE(SUM(count),0) FROM cards').fetchone()[0]
+        rows = conn.execute(
+            'SELECT * FROM cards WHERE archived_at IS NULL '
+            'ORDER BY last_at DESC,card_id ASC').fetchall()
+        groups: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            identity = _run_identity(row)
+            if identity is not None:
+                groups.setdefault(identity, []).append(row)
+        for items in groups.values():
+            survivor = items[0]
+            survivors += 1
+            if len(items) == 1:
+                continue
+            losers = items[1:]
+            read_at = None if any(item['read_at'] is None for item in items) \
+                else survivor['read_at']
+            level = 'urgent' if any(item['level'] == 'urgent' for item in items) \
+                else 'normal'
+            conn.execute(
+                'UPDATE cards SET level=?,count=?,first_at=?,last_at=?,read_at=? '
+                'WHERE card_id=?',
+                (level,
+                 sum(item['count'] for item in items),
+                 min(item['first_at'] for item in items),
+                 max(item['last_at'] for item in items), read_at, survivor['card_id']))
+            for loser in losers:
+                conn.execute(
+                    'UPDATE cards SET count=0,archived_at=? WHERE card_id=?',
+                    (survivor['last_at'], loser['card_id']))
+            folded += len(losers)
+        after_rows = conn.execute('SELECT COUNT(*) FROM cards').fetchone()[0]
+        after_count = conn.execute('SELECT COALESCE(SUM(count),0) FROM cards').fetchone()[0]
+        if after_rows != before_rows or after_count != before_count:
+            raise MigrationError('coalescing changed row or occurrence totals')
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    _make_standalone(path)
+    return survivors, folded
+
+
+def coalesce_open_cards(raw: str, offline: bool = False) -> int:
+    if not offline:
+        raise MigrationError('--offline is required: stop all database writers first')
+    target = _endstate_path(raw)
+    backup = target.with_name(target.name + COALESCE_BACKUP_SUFFIX)
+    _require_canonical_columns(target)
+    _require_exact_canonical_schema(target)
+    if any(Path(str(target) + suffix).exists() for suffix in SQLITE_SIDECARS):
+        raise MigrationError('database has SQLite journal state; stop and checkpoint writers')
+
+    expected_target_sha256 = None
+    if backup.exists():
+        if backup.is_symlink() or not backup.is_file():
+            raise MigrationError('database backup is not a regular file')
+        _verify_backup_manifest(backup, target)
+        _integrity(backup)
+        marker = _target_marker_path(backup)
+        if marker.exists():
+            receipt = _read_target_marker(backup)
+            target_sha256 = _file_sha256(target)
+            if target_sha256 == receipt['target_sha256']:
+                print('coalesced=0 backup_retained=1')
+                return 0
+            if target_sha256 != receipt['backup_sha256']:
+                raise MigrationError('existing canonical database does not match the backup')
+            expected_target_sha256 = receipt['target_sha256']
+        if _file_sha256(target) != _file_sha256(backup):
+            raise MigrationError('source changed since database backup')
+    else:
+        if (_manifest_path(backup).exists() or _target_marker_path(backup).exists()):
+            raise MigrationError('coalescing receipt exists without its database backup')
+        _exact_copy(target, backup, no_clobber=True)
+        _write_backup_manifest(backup, target)
+
+    fd, raw_temp = tempfile.mkstemp(
+        prefix='.messages-coalesce.', suffix='.db', dir=target.parent)
+    os.close(fd)
+    temp = Path(raw_temp)
+    try:
+        shutil.copyfile(backup, temp)
+        os.chmod(temp, 0o600)
+        survivors, folded = _coalesce_clone(temp)
+        _require_exact_canonical_schema(temp)
+        _integrity(temp)
+        target_sha256 = _file_sha256(temp)
+        if (expected_target_sha256 is not None
+                and target_sha256 != expected_target_sha256):
+            raise MigrationError('resumed coalescing result changed')
+        _write_target_marker(backup, target_sha256)
+        os.replace(temp, target)
+        os.chmod(target, 0o600)
+        _fsync_dir(target.parent)
+    finally:
+        temp.unlink(missing_ok=True)
+        for suffix in SQLITE_SIDECARS:
+            Path(str(temp) + suffix).unlink(missing_ok=True)
+    print('coalesced=1 survivors=%d archived=%d backup_retained=1' %
+          (survivors, folded))
+    return 0
+
+
+def compensate_coalesce_open_cards(raw: str, offline: bool = False) -> int:
+    if not offline:
+        raise MigrationError('--offline is required: stop all database writers first')
+    target = _endstate_path(raw)
+    backup = target.with_name(target.name + COALESCE_BACKUP_SUFFIX)
+    if any(Path(str(target) + suffix).exists() for suffix in SQLITE_SIDECARS):
+        raise MigrationError('database has SQLite journal state; stop and checkpoint writers')
+    if backup.is_symlink() or not backup.is_file():
+        raise MigrationError('database backup is not a regular file')
+    _verify_backup_manifest(backup, target)
+    _integrity(backup)
+    if _file_sha256(target) == _file_sha256(backup):
+        print('compensated=0 already_restored=1 backup_retained=1')
+        return 0
+    _verify_target_marker(backup, target)
+    _exact_copy(backup, target, no_clobber=False)
+    print('restore=ok backup_retained=1')
+    return 0
+
+
 def compensate_endstate(raw: str, offline: bool = False) -> int:
     """Restore only an unchanged conversion result; never discard later writes."""
     if not offline:
@@ -665,6 +851,104 @@ def compensate_endstate(raw: str, offline: bool = False) -> int:
     _integrity(backup)
     _verify_target_marker(backup, target)
     return restore(str(backup), str(target), offline=True)
+
+
+def _require_exact_canonical_schema(path: Path) -> None:
+    """Accept only schemas produced by the backend, including its additive upgrade."""
+    messages = _load_messages()
+    reference = sqlite3.connect(':memory:')
+    try:
+        reference.executescript(messages._SCHEMA)
+        phase_one = _schema_rows(reference)
+    finally:
+        reference.close()
+    with tempfile.TemporaryDirectory(prefix='devmon-schema-reference-') as raw:
+        current = Path(raw) / 'messages.db'
+        if os.environ.get('AIRLOCK_DEV_MONITOR_MESSAGES') == 'true':
+            os.chmod(raw, 0o710)
+        messages.init_db(str(current))
+        reference = sqlite3.connect(current)
+        try:
+            current_schema = _schema_rows(reference)
+        finally:
+            reference.close()
+    conn = _open_source(path)
+    try:
+        actual = _schema_rows(conn)
+    finally:
+        conn.close()
+    if actual not in (phase_one, current_schema):
+        raise MigrationError('canonical database schema does not match the backend definition')
+
+
+def _schema_rows(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").fetchall()
+    return [(t, n, tb, ' '.join((sql or '').split())) for t, n, tb, sql in rows]
+
+
+def _require_private_file(path: Path, what: str) -> None:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        raise MigrationError('%s is not a regular file' % what)
+    if info.st_uid != os.getuid() or (info.st_mode & 0o077):
+        raise MigrationError('%s has unsafe ownership or mode' % what)
+
+
+def forward_check(raw: str, offline: bool = False) -> int:
+    """Classify a refused compensation: is the converted DB a sound candidate to keep?
+
+    Prints `restorable=1` when compensation would succeed as-is, `forward=1` only when
+    every condition below holds, and refuses otherwise. It changes no data beyond the
+    WAL checkpoint the caller's offline attestation already permits.
+    """
+    if not offline:
+        raise MigrationError(
+            '--offline is required: stop all target database users before classification')
+    target = _endstate_path(raw)
+    backup = target.with_name(target.name + '.pre-endstate')
+    for path, what in ((backup, 'database backup'), (target, 'canonical database'),
+                       (_manifest_path(backup), 'database backup manifest'),
+                       (_target_marker_path(backup), 'canonical target marker')):
+        if not os.path.lexists(path):
+            raise MigrationError('%s is missing' % what)
+        _require_private_file(path, what)
+    if any(Path(str(backup) + suffix).exists() for suffix in SQLITE_SIDECARS):
+        raise MigrationError('database backup has SQLite journal state')
+    # The manifest ties the backup to this database as its source and to its bytes.
+    _verify_backup_manifest(backup, target)
+    _integrity(backup)
+    if 'ledger' in _counts(backup):
+        raise MigrationError('database backup is not a legacy snapshot')
+    marker = _target_marker_path(backup)
+    try:
+        actual = json.loads(marker.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise MigrationError('canonical target marker is unreadable') from exc
+    if (not isinstance(actual, dict)
+            or set(actual) != {'version', 'backup_sha256', 'target_sha256'}
+            or actual['version'] != 1
+            or actual['backup_sha256'] != _file_sha256(backup)
+            or not isinstance(actual['target_sha256'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', actual['target_sha256'])):
+        raise MigrationError('canonical target marker does not match the backup')
+    # Fold journal state in so the hash names one consistent file, as the marker did.
+    conn = sqlite3.connect(target)
+    try:
+        if conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]:
+            raise MigrationError('database checkpoint busy; stop all database users')
+    finally:
+        conn.close()
+    _integrity(target)
+    if _file_sha256(target) == actual['target_sha256']:
+        print('restorable=1')
+        return 0
+    _require_canonical_columns(target)
+    _require_exact_canonical_schema(target)
+    print('forward=1 backup_sha256=%s target_sha256=%s'
+          % (actual['backup_sha256'], _file_sha256(target)))
+    return 0
 
 
 def endstate(raw: str, offline: bool = False) -> int:
@@ -713,6 +997,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--schema-state', metavar='DB')
     result.add_argument('--endstate', metavar='DB')
     result.add_argument('--compensate-endstate', metavar='DB')
+    result.add_argument('--coalesce-open-cards', metavar='DB')
+    result.add_argument('--compensate-coalesce-open-cards', metavar='DB')
+    result.add_argument('--forward-check', metavar='DB')
     result.add_argument('--restore-backup', metavar='DB')
     result.add_argument('--restore-to', metavar='DB')
     result.add_argument(
@@ -727,13 +1014,38 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.coalesce_open_cards:
+            if any((args.legacy_root, args.canonical_root, args.db_backup,
+                    args.backup_source, args.verify, args.schema_state, args.endstate,
+                    args.compensate_endstate, args.compensate_coalesce_open_cards,
+                    args.forward_check, args.restore_backup, args.restore_to, args.resume)):
+                raise MigrationError(
+                    '--coalesce-open-cards cannot be combined with other operations')
+            return coalesce_open_cards(args.coalesce_open_cards, args.offline)
+        if args.compensate_coalesce_open_cards:
+            if any((args.legacy_root, args.canonical_root, args.db_backup,
+                    args.backup_source, args.verify, args.schema_state, args.endstate,
+                    args.compensate_endstate, args.coalesce_open_cards,
+                    args.forward_check, args.restore_backup, args.restore_to, args.resume)):
+                raise MigrationError(
+                    '--compensate-coalesce-open-cards cannot be combined with other operations')
+            return compensate_coalesce_open_cards(
+                args.compensate_coalesce_open_cards, args.offline)
         if args.endstate:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.verify, args.schema_state,
-                    args.compensate_endstate, args.restore_backup,
+                    args.compensate_endstate, args.forward_check, args.restore_backup,
                     args.restore_to, args.resume)):
                 raise MigrationError('--endstate cannot be combined with other operations')
             return endstate(args.endstate, args.offline)
+        if args.forward_check:
+            if any((args.legacy_root, args.canonical_root, args.db_backup,
+                    args.backup_source, args.verify, args.schema_state,
+                    args.endstate, args.compensate_endstate,
+                    args.restore_backup, args.restore_to, args.resume)):
+                raise MigrationError(
+                    '--forward-check cannot be combined with other operations')
+            return forward_check(args.forward_check, args.offline)
         if args.compensate_endstate:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.verify, args.schema_state,
@@ -744,14 +1056,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.schema_state:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.verify, args.endstate,
-                    args.compensate_endstate, args.restore_backup,
+                    args.compensate_endstate, args.forward_check, args.restore_backup,
                     args.restore_to, args.resume, args.offline)):
                 raise MigrationError('--schema-state cannot be combined with other operations')
             return schema_state(args.schema_state)
         if args.verify:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.schema_state,
-                    args.compensate_endstate, args.restore_backup,
+                    args.compensate_endstate, args.forward_check, args.restore_backup,
                     args.restore_to, args.resume, args.offline)):
                 raise MigrationError('--verify cannot be combined with migration or restore')
             return verify(args.verify)
@@ -759,7 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.db_backup:
                 raise MigrationError('--backup-source requires --db-backup')
             if any((args.legacy_root, args.canonical_root, args.restore_backup,
-                    args.restore_to, args.compensate_endstate, args.resume,
+                    args.restore_to, args.compensate_endstate, args.forward_check, args.resume,
                     args.offline)):
                 raise MigrationError('online backup cannot be combined with migration or restore')
             return backup_only(args.backup_source, args.db_backup)
@@ -767,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.restore_backup or not args.restore_to:
                 raise MigrationError('--restore-backup and --restore-to are required together')
             if any((args.legacy_root, args.canonical_root, args.db_backup,
-                    args.backup_source, args.compensate_endstate,
+                    args.backup_source, args.compensate_endstate, args.forward_check,
                     args.resume)):
                 raise MigrationError('restore cannot be combined with migration')
             return restore(args.restore_backup, args.restore_to, args.offline)

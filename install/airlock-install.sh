@@ -28,10 +28,10 @@ unset AIRLOCK_LEDGER_LOCK_HELD AIRLOCK_CONFIG_SNAPSHOT \
   AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT \
   AIRLOCK_INSTALL_TRANSACTION_ID AIRLOCK_DEVMON_MIGRATION_RECEIPT
 
-# A converted messages DB is retained operator data and therefore sits outside the
-# package checkpoint.  Its one app-specific receipt lives inside that checkpoint so
-# commit removes it, while failure and crash recovery can compensate it before the
-# old package is allowed to run.
+# dev-monitor's messages DB is retained operator data and therefore sits outside the
+# package checkpoint.  Inside a transaction it is never converted (see
+# apps/dev-monitor/activation-record.py); failure and crash recovery take back the
+# deferral record before the old package is allowed to run.
 _airlock_devmon_compensate() {
   local state_dir="$1" transaction_id="$2" receipt expected_db metadata
   local database writer tmp_mode new_mode active_csv devmon_state
@@ -39,6 +39,14 @@ _airlock_devmon_compensate() {
     log "WARN: invalid install transaction id for database compensation"
     return 1
   }
+  # A deferred activation touched no data: taking its record back is the whole
+  # compensation, and it must happen before any restore makes the old package live.
+  devmon_activation_compensate "$state_dir" "$transaction_id" || {
+    log "WARN: cannot take back the deferred dev-monitor activation record"
+    return 1
+  }
+  # Receipts below are written only by installers from before activation was
+  # deferred; a box that stopped mid-transaction on one still needs them honoured.
   receipt="$state_dir/install-checkpoints/$transaction_id/dev-monitor-migration.json"
   [ -e "$receipt" ] || [ -L "$receipt" ] || return 0
   if [ ! -f "$receipt" ] || [ -L "$receipt" ]; then
@@ -92,9 +100,75 @@ PY
   devmon_migration_load_active "$active_csv" || return 1
   devmon_migration_quiesce || return 1
   devmon_migration_fence "$devmon_state" "$writer" || return 1
-  devmon_migration_restore_db marker-safe "$database" \
-    "$ROOT/apps/dev-monitor/migrate-legacy-state.py" || return 1
+  _airlock_devmon_receipt_database="$database"
+  _airlock_devmon_receipt_writer="$writer"
+  # Restore only an unchanged conversion. A candidate that already ran on the
+  # converted database is kept instead -- under every condition forward_check
+  # names (backup, marker and current DB all sound, exact canonical schema) plus a
+  # candidate tree that still matches its journaled intent. Anything less stays
+  # refused: a mismatched hash alone is what corruption looks like too.
+  local verdict backup_sha target_sha kept_forward=0 db_lock_fd
+  # The classification and the decision made on it happen under the one lock every
+  # activation of this database takes, so no other run can change the bytes between
+  # the two. The lock is held until the receipt is gone.
+  exec {db_lock_fd}>>"$database.activation.lock" || return 1
+  flock -w 60 "$db_lock_fd" || {
+    log "WARN: another run holds the messages database"
+    exec {db_lock_fd}>&-
+    return 1
+  }
+  _airlock_devmon_compensate_locked "$@"
+  local rc=$?
+  exec {db_lock_fd}>&-
+  return "$rc"
+}
+
+_airlock_devmon_compensate_locked() {
+  local state_dir="$1" transaction_id="$2" receipt database writer devmon_state
+  local verdict backup_sha target_sha kept_forward=0 candidate_state=inactive
+  receipt="$state_dir/install-checkpoints/$transaction_id/dev-monitor-migration.json"
+  database="$_airlock_devmon_receipt_database"; writer="$_airlock_devmon_receipt_writer"
+  devmon_state="${database%/messages.db}"
+  verdict="$(python3 "$ROOT/apps/dev-monitor/migrate-legacy-state.py" \
+    --forward-check "$database" --offline 2>&1)" || {
+    log "WARN: cannot classify the dev-monitor database for compensation: $verdict"
+    return 1
+  }
+  case "$verdict" in
+    restorable=1)
+      devmon_migration_restore_db marker-safe "$database" \
+        "$ROOT/apps/dev-monitor/migrate-legacy-state.py" || return 1
+      ;;
+    "forward=1 backup_sha256="*)
+      backup_sha="${verdict#forward=1 backup_sha256=}"; backup_sha="${backup_sha%% *}"
+      target_sha="${verdict##* target_sha256=}"
+      # The decision is durable, in the transaction body, before the receipt goes: a
+      # crash between the two re-enters here and finds the same answer, not half of it.
+      "$ROOT/bin/airlock-ledger" transaction-keep-forward dev-monitor "$database" "$backup_sha" "$target_sha" \
+        || return 1
+      kept_forward=1
+      log "dev-monitor's candidate already wrote to the converted database; keeping it (backup ${backup_sha:0:12}) rather than discarding those writes"
+      ;;
+    *)
+      log "WARN: unexpected dev-monitor compensation verdict: $verdict"
+      return 1 ;;
+  esac
   devmon_migration_restore_spool "$devmon_state" || return 1
+  if [ "$kept_forward" = 1 ]; then
+    # Best effort: the kept candidate is an uncommitted intent either way, and the
+    # next run finishes it. A start failure must not turn a decided keep into degraded,
+    # but it is recorded so airlock-status can say the candidate is down.
+    if timeout 30 systemctl --user start airlock-dev-monitor.service; then
+      candidate_state=active
+      [ ! -f "$HOME/.config/systemd/user/airlock-devmon-heartbeat.timer" ] \
+        || timeout 30 systemctl --user start airlock-devmon-heartbeat.timer \
+        || log "WARN: kept dev-monitor heartbeat timer did not start"
+    else
+      log "WARN: kept dev-monitor candidate did not start; re-run the installer"
+    fi
+    "$ROOT/bin/airlock-ledger" transaction-keep-forward-candidate "$candidate_state" \
+      || log "WARN: could not record the kept candidate's state"
+  fi
   devmon_migration_start_saved unmanaged || return 1
   rm -f -- "$receipt" || return 1
   python3 - "$(dirname "$receipt")" <<'PY' || return 1
@@ -106,6 +180,43 @@ try:
 finally:
     os.close(fd)
 PY
+}
+
+# Forward-only: runs only for a committed transaction's deferral. The record is the
+# app's durable smoke debt as well as its conversion debt, so it is cleared only after
+# the smoke the pre-commit pass skipped has passed. A failure keeps it for the next run.
+_airlock_devmon_activate_owed() {
+  local mode="$1" state due rc=0 tx database writer port app pkg_dir
+  state="$(devmon_migration_state_dir)"
+  due="$(devmon_activation_due "$state")" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) log "dev-monitor activation record is unusable; it was preserved for inspection"; return 1 ;;
+  esac
+  IFS=$'\t' read -r tx database writer port app <<<"$due"
+  if ! python3 -c '
+import json, sys
+try:
+    store = json.load(open(sys.argv[1], encoding="utf-8"))
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0 if (store.get("entries", {}).get(sys.argv[2]) or {}).get("committed") else 1)
+' "$state/app-ledger.json" "$app"; then
+    log "dropping the dev-monitor activation of transaction ${tx:0:12}: '$app' is no longer installed"
+    devmon_activation_clear "$state" "$tx"
+    return
+  fi
+  log "activating $app for committed transaction ${tx:0:12}: converting the messages database, then starting it"
+  devmon_activation_run "$database" "$writer" "$port" || return 1
+  pkg_dir="$(airlock_pkg_dir "$app")"
+  log "smoke: $app (after activation, $mode)"
+  (cd "$pkg_dir" && AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$pkg_dir" AIRLOCK_APP_ID="$app" \
+    AIRLOCK_CONFIG_BIN="$_airlock_lifecycle_config_bin" \
+    bash "$pkg_dir/smoke.sh" </dev/null) 9>&- \
+    || { log "smoke FAILED: $app"; return 1; }
+  devmon_activation_clear "$state" "$tx" || return 1
+  log "$app activated"
 }
 
 # Before anything is stopped: if this run is hosted by one of the units it is about
@@ -452,6 +563,13 @@ _candidate_preflight="$(printf '%s' "$AIRLOCK_PKG_INFO" \
 airlock_verify_prerequisite_receipt \
   || die "prerequisites changed after preflight — no app was deactivated"
 
+# A committed install whose dev-monitor activation did not finish is resumed first.
+# It is not a gate: the new candidate may be the fix, so a failure only warns.
+if [ "$_ledger_gate" = 1 ]; then
+  _airlock_devmon_activate_owed resume \
+    || log "WARN: dev-monitor activation is still owed; continuing with the new candidate"
+fi
+
 # 1) hub static + frontend config
 # WEBROOT and CONFD live under system paths nginx can read. Create them with sudo
 # and hand ownership to the installing user, so the hub write + each app's fragment
@@ -560,8 +678,7 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
       || die "could not create a verified install checkpoint — no app was deactivated"
     _airlock_transaction_active=1
     AIRLOCK_INSTALL_TRANSACTION_ID="$_airlock_transaction_id"
-    AIRLOCK_DEVMON_MIGRATION_RECEIPT="$(devmon_migration_receipt_path "$_airlock_transaction_id")"
-    export AIRLOCK_INSTALL_TRANSACTION_ID AIRLOCK_DEVMON_MIGRATION_RECEIPT
+    export AIRLOCK_INSTALL_TRANSACTION_ID
     log "install transaction prepared: $_airlock_transaction_id"
   fi
 
@@ -794,8 +911,17 @@ ts_reconcile_plaintext_ports "$want_ports" \
 if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   smoke_fail=0
   _smoke_failed=""
+  # Any owed activation, not only this transaction's: an app still awaiting one is
+  # stopped, so smoking it here would fail a healthy run and roll back other apps.
+  _devmon_deferred_app="$(devmon_activation_app "$(devmon_migration_state_dir)")" \
+    || _devmon_deferred_app=""
   while read -r app; do
     [ "$app" = hub ] && continue
+    if [ "$app" = "$_devmon_deferred_app" ]; then
+      # Stopped on purpose until commit; its smoke runs right after activation.
+      log "smoke: $app deferred until its post-commit activation"
+      continue
+    fi
     _airlock_failure_phase="smoke"
     _airlock_failure_app="$app"
     pkg_dir="$(airlock_pkg_dir "$app")"
@@ -817,7 +943,9 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   # script exists, so "or absent" is gone from the condition). Committed
   # BEFORE the any-smoke-failed die below, so app B's clean install is
   # recorded even when app A's smoke fails — the failed app stays an intent
-  # the next run repairs.
+  # the next run repairs. The one app whose activation this transaction deferred
+  # commits on its install alone: it cannot run before commit, so its smoke
+  # follows the activation, and a failure there stays owed (never rolled back).
   _commit_fail=0
   for app in $_installed_pkgs; do
     case " $_smoke_failed " in *" $app "*) continue ;; esac
@@ -873,6 +1001,13 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
     _airlock_failure_phase="transaction-commit"
     "$ROOT/bin/airlock-ledger" transaction-finish committed
     _airlock_transaction_active=0
+  fi
+  # Past the commit there is nothing to roll back to: activation moves forward or
+  # stops and says so, with the legacy DB and its backup intact for the next run.
+  if [ "$_ledger_gate" = 1 ]; then
+    _airlock_failure_phase="post-commit-activation"
+    _airlock_devmon_activate_owed commit \
+      || die "the install is committed but dev-monitor activation did not finish; its messages database is intact — re-run the installer to resume (bin/airlock-status)"
   fi
 fi
 

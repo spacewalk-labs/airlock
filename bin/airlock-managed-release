@@ -1,0 +1,1028 @@
+#!/usr/bin/env python3
+"""Build, sign, verify, and promote immutable managed-app releases.
+
+This is a release-side tool. It never installs a package, changes enrollment,
+or grants publisher authority. Promotion reads the authority directory's current
+root-signed membership and fails before changing the current release pointer.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any, NoReturn
+
+
+SCHEMA_VERSION = 1
+SCHEMA_IDS = {
+    "catalog": "airlock.managed.catalog/v1",
+    "lock": "airlock.managed.release-lock/v1",
+    "provenance": "airlock.managed.provenance/v1",
+    "snapshot": "airlock.managed.snapshot/v1",
+    "signature": "airlock.managed.signature/v1",
+    "membership": "airlock.managed.membership/v1",
+    "receipt": "airlock.managed.promotion-receipt/v1",
+    "state": "airlock.managed.release-state/v1",
+}
+SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+APP_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
+CAPABILITY_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
+UTC_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+MAX_JSON_BYTES = 8 * 1024 * 1024
+MAX_BLOB_BYTES = 128 * 1024 * 1024
+PREPARED_NAMES = {"bundle.tar", "catalog.json", "packages", "provenance.json", "release.lock", "snapshot.json"}
+SIGNED_NAMES = PREPARED_NAMES | {"signature.json"}
+
+
+class ReleaseError(Exception):
+    pass
+
+
+def fail(message: str) -> NoReturn:
+    raise ReleaseError(message)
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode()
+
+
+def digest_bytes(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def digest_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def exact_keys(value: Any, required: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail(f"{label}: expected object")
+    keys = set(value)
+    if keys != required:
+        fail(f"{label}: fields differ (missing={sorted(required - keys)}, extra={sorted(keys - required)})")
+    return value
+
+
+def expect_string(value: Any, label: str, pattern: re.Pattern[str] | None = None) -> str:
+    if not isinstance(value, str) or not value:
+        fail(f"{label}: expected non-empty string")
+    if pattern is not None and pattern.fullmatch(value) is None:
+        fail(f"{label}: invalid value")
+    return value
+
+
+def expect_int(value: Any, label: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        fail(f"{label}: expected integer >= {minimum}")
+    return value
+
+
+def expect_sorted_unique_strings(value: Any, label: str, pattern: re.Pattern[str] = CAPABILITY_RE) -> list[str]:
+    if not isinstance(value, list):
+        fail(f"{label}: expected array")
+    out = [expect_string(item, f"{label}[]", pattern) for item in value]
+    if out != sorted(set(out)):
+        fail(f"{label}: must be sorted and unique")
+    return out
+
+
+def parse_time(value: Any, label: str) -> datetime:
+    text = expect_string(value, label, UTC_RE)
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        fail(f"{label}: invalid UTC timestamp: {exc}")
+
+
+def load_json_bytes(raw: bytes, label: str, require_canonical: bool = True) -> Any:
+    if len(raw) > MAX_JSON_BYTES:
+        fail(f"{label}: JSON exceeds {MAX_JSON_BYTES} bytes")
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                fail(f"{label}: duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw, object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"{label}: invalid JSON: {exc}")
+    if require_canonical and raw != canonical_bytes(value):
+        fail(f"{label}: bytes are not canonical JSON")
+    return value
+
+
+def read_regular(path: Path, label: str, max_bytes: int = MAX_JSON_BYTES) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        fail(f"{label}: cannot open {path}: {exc}")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{label}: must be a regular non-symlink file")
+        if info.st_size > max_bytes:
+            fail(f"{label}: exceeds {max_bytes} bytes")
+        raw = b""
+        while chunk := os.read(fd, min(1024 * 1024, max_bytes + 1 - len(raw))):
+            raw += chunk
+            if len(raw) > max_bytes:
+                fail(f"{label}: exceeds {max_bytes} bytes")
+        return raw
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path: Path, raw: bytes, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb", closefd=False) as target:
+            target.write(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def run(command: list[str], *, input_bytes: bytes | None = None) -> bytes:
+    result = subprocess.run(command, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        fail(f"{' '.join(command[:3])} failed: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+@dataclass(frozen=True)
+class GitEntry:
+    relative: str
+    mode: int
+    raw: bytes
+    symlink: bool
+
+
+def git_entries(repository: Path, revision: str, prefix: str) -> tuple[str, list[GitEntry]]:
+    if SHA_RE.fullmatch(revision) is None:
+        fail("revision: expected a full lowercase 40-character commit SHA")
+    resolved = run(["git", "-C", os.fspath(repository), "rev-parse", "--verify", f"{revision}^{{commit}}"])
+    if resolved.decode().strip() != revision:
+        fail("revision does not resolve to the exact reviewed commit")
+    normalized = PurePosixPath(prefix)
+    if normalized.is_absolute() or ".." in normalized.parts or str(normalized) in {"", "."}:
+        fail("input-prefix must be a non-empty relative path")
+    raw_listing = run(["git", "-C", os.fspath(repository), "ls-tree", "-rz", revision, "--", str(normalized)])
+    entries: list[GitEntry] = []
+    prefix_text = str(normalized).rstrip("/") + "/"
+    for row in filter(None, raw_listing.split(b"\0")):
+        try:
+            header, encoded_path = row.split(b"\t", 1)
+            mode_raw, kind_raw, object_raw = header.split(b" ", 2)
+            path = encoded_path.decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            fail(f"reviewed tree: malformed git entry: {exc}")
+        if not path.startswith(prefix_text):
+            fail("reviewed tree: entry escaped input prefix")
+        relative = path[len(prefix_text):]
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or not pure.parts or ".." in pure.parts:
+            fail(f"reviewed tree: unsafe path {relative!r}")
+        kind = kind_raw.decode()
+        mode_text = mode_raw.decode()
+        if kind != "blob" or mode_text not in {"100644", "100755", "120000"}:
+            fail(f"reviewed tree: unsupported entry {relative} ({mode_text} {kind})")
+        blob = run(["git", "-C", os.fspath(repository), "cat-file", "blob", object_raw.decode()])
+        if len(blob) > MAX_BLOB_BYTES:
+            fail(f"reviewed tree: blob too large: {relative}")
+        symlink = mode_text == "120000"
+        if symlink:
+            try:
+                target = blob.decode("utf-8")
+            except UnicodeDecodeError:
+                fail(f"reviewed tree: symlink target is not UTF-8: {relative}")
+            target_path = PurePosixPath(target)
+            if target_path.is_absolute() or ".." in target_path.parts:
+                fail(f"reviewed tree: symlink escapes package tree: {relative}")
+        entries.append(GitEntry(relative, 0o777 if symlink else int(mode_text[-3:], 8), blob, symlink))
+    if not entries:
+        fail("reviewed tree: input prefix has no tracked files")
+    return revision, sorted(entries, key=lambda item: item.relative.encode())
+
+
+def entry_map(entries: list[GitEntry]) -> dict[str, GitEntry]:
+    result = {entry.relative: entry for entry in entries}
+    if len(result) != len(entries):
+        fail("reviewed tree: duplicate relative path")
+    return result
+
+
+def tree_manifest(entries: list[GitEntry]) -> list[dict[str, Any]]:
+    manifest = []
+    for entry in entries:
+        row: dict[str, Any] = {
+            "mode": f"{entry.mode:04o}",
+            "path": entry.relative,
+            "type": "symlink" if entry.symlink else "file",
+        }
+        if entry.symlink:
+            row["target"] = entry.raw.decode()
+        else:
+            row["digest"] = digest_bytes(entry.raw)
+        manifest.append(row)
+    return manifest
+
+
+def tree_digest(entries: list[GitEntry]) -> str:
+    return digest_bytes(canonical_bytes(tree_manifest(entries)))
+
+
+def validate_catalog(value: Any) -> dict[str, Any]:
+    obj = exact_keys(value, {"apps", "channel_id", "organization_id", "schema"}, "catalog")
+    if obj["schema"] != SCHEMA_IDS["catalog"]:
+        fail("catalog.schema: unsupported schema")
+    expect_string(obj["organization_id"], "catalog.organization_id", ID_RE)
+    expect_string(obj["channel_id"], "catalog.channel_id", ID_RE)
+    if not isinstance(obj["apps"], list):
+        fail("catalog.apps: expected array")
+    ids: list[str] = []
+    for index, raw in enumerate(obj["apps"]):
+        app = exact_keys(raw, {"compatibility", "id", "metadata", "policy", "source_label"}, f"catalog.apps[{index}]")
+        ids.append(expect_string(app["id"], f"catalog.apps[{index}].id", APP_ID_RE))
+        expect_string(app["source_label"], f"catalog.apps[{index}].source_label")
+        if app["policy"] not in {"available", "blocked", "required"}:
+            fail(f"catalog.apps[{index}].policy: invalid policy")
+        compatibility = exact_keys(app["compatibility"], {"platforms", "profiles"}, f"catalog.apps[{index}].compatibility")
+        expect_sorted_unique_strings(compatibility["platforms"], f"catalog.apps[{index}].compatibility.platforms", ID_RE)
+        expect_sorted_unique_strings(compatibility["profiles"], f"catalog.apps[{index}].compatibility.profiles", ID_RE)
+        metadata = exact_keys(app["metadata"], {"name", "version"}, f"catalog.apps[{index}].metadata")
+        expect_string(metadata["name"], f"catalog.apps[{index}].metadata.name")
+        expect_string(metadata["version"], f"catalog.apps[{index}].metadata.version")
+    if ids != sorted(set(ids)):
+        fail("catalog.apps: ids must be sorted and unique")
+    return obj
+
+
+def validate_lock(value: Any) -> dict[str, Any]:
+    obj = exact_keys(value, {"channel_id", "core", "organization_id", "packages", "schema", "target_profile"}, "release.lock")
+    if obj["schema"] != SCHEMA_IDS["lock"]:
+        fail("release.lock.schema: unsupported schema")
+    expect_string(obj["organization_id"], "release.lock.organization_id", ID_RE)
+    expect_string(obj["channel_id"], "release.lock.channel_id", ID_RE)
+    expect_string(obj["target_profile"], "release.lock.target_profile", ID_RE)
+    core = exact_keys(obj["core"], {"digest", "revision"}, "release.lock.core")
+    expect_string(core["digest"], "release.lock.core.digest", SHA256_RE)
+    expect_string(core["revision"], "release.lock.core.revision", SHA_RE)
+    if not isinstance(obj["packages"], list):
+        fail("release.lock.packages: expected array")
+    ids: list[str] = []
+    for index, raw in enumerate(obj["packages"]):
+        package = exact_keys(raw, {"capabilities", "data_compatibility", "deactivator", "digest", "id", "path"}, f"release.lock.packages[{index}]")
+        app_id = expect_string(package["id"], f"release.lock.packages[{index}].id", APP_ID_RE)
+        ids.append(app_id)
+        if package["path"] != f"packages/{app_id}":
+            fail(f"release.lock.packages[{index}].path: must equal packages/{app_id}")
+        expect_string(package["digest"], f"release.lock.packages[{index}].digest", SHA256_RE)
+        expect_sorted_unique_strings(package["capabilities"], f"release.lock.packages[{index}].capabilities")
+        if package["data_compatibility"] not in {"backward-compatible-data", "maintenance-required", "stateless"}:
+            fail(f"release.lock.packages[{index}].data_compatibility: invalid classification")
+        expect_string(package["deactivator"], f"release.lock.packages[{index}].deactivator")
+    if ids != sorted(set(ids)):
+        fail("release.lock.packages: ids must be sorted and unique")
+    return obj
+
+
+def validate_provenance(value: Any) -> dict[str, Any]:
+    obj = exact_keys(value, {"ci", "created_at", "publisher_id", "reviewed_revision", "reviewed_tree_digest", "schema", "source_repository"}, "provenance")
+    if obj["schema"] != SCHEMA_IDS["provenance"]:
+        fail("provenance.schema: unsupported schema")
+    expect_string(obj["reviewed_revision"], "provenance.reviewed_revision", SHA_RE)
+    expect_string(obj["reviewed_tree_digest"], "provenance.reviewed_tree_digest", SHA256_RE)
+    expect_string(obj["publisher_id"], "provenance.publisher_id", ID_RE)
+    expect_string(obj["source_repository"], "provenance.source_repository")
+    parse_time(obj["created_at"], "provenance.created_at")
+    ci = exact_keys(obj["ci"], {"evidence_digest", "result"}, "provenance.ci")
+    if ci["result"] != "passed":
+        fail("provenance.ci.result: only passed reviewed revisions can be prepared")
+    expect_string(ci["evidence_digest"], "provenance.ci.evidence_digest", SHA256_RE)
+    return obj
+
+
+def validate_snapshot(value: Any) -> dict[str, Any]:
+    obj = exact_keys(value, {"artifacts", "channel_id", "created_at", "epoch", "organization_id", "publisher_id", "requested_capabilities", "schema", "sequence", "target_profile"}, "snapshot")
+    if obj["schema"] != SCHEMA_IDS["snapshot"]:
+        fail("snapshot.schema: unsupported schema")
+    expect_string(obj["organization_id"], "snapshot.organization_id", ID_RE)
+    expect_string(obj["channel_id"], "snapshot.channel_id", ID_RE)
+    expect_string(obj["publisher_id"], "snapshot.publisher_id", ID_RE)
+    expect_string(obj["target_profile"], "snapshot.target_profile", ID_RE)
+    expect_int(obj["epoch"], "snapshot.epoch", 1)
+    expect_int(obj["sequence"], "snapshot.sequence", 1)
+    parse_time(obj["created_at"], "snapshot.created_at")
+    expect_sorted_unique_strings(obj["requested_capabilities"], "snapshot.requested_capabilities")
+    artifacts = exact_keys(obj["artifacts"], {"bundle.tar", "catalog.json", "packages", "provenance.json", "release.lock"}, "snapshot.artifacts")
+    for name, value_digest in artifacts.items():
+        expect_string(value_digest, f"snapshot.artifacts.{name}", SHA256_RE)
+    return obj
+
+
+def validate_signature(value: Any) -> dict[str, Any]:
+    obj = exact_keys(value, {"algorithm", "key_id", "publisher_id", "schema", "signature", "snapshot_digest"}, "signature")
+    if obj["schema"] != SCHEMA_IDS["signature"] or obj["algorithm"] != "ed25519":
+        fail("signature: unsupported schema or algorithm")
+    expect_string(obj["publisher_id"], "signature.publisher_id", ID_RE)
+    expect_string(obj["key_id"], "signature.key_id", SHA256_RE)
+    expect_string(obj["snapshot_digest"], "signature.snapshot_digest", SHA256_RE)
+    try:
+        decoded = base64.b64decode(expect_string(obj["signature"], "signature.signature"), validate=True)
+    except ValueError as exc:
+        fail(f"signature.signature: invalid base64: {exc}")
+    if len(decoded) != 64:
+        fail("signature.signature: Ed25519 signature must be 64 bytes")
+    return obj
+
+
+def validate_membership(value: Any) -> dict[str, Any]:
+    obj = exact_keys(value, {"channels", "issued_at", "organization_id", "publishers", "root_key_id", "root_signature", "schema", "sequence"}, "membership")
+    if obj["schema"] != SCHEMA_IDS["membership"]:
+        fail("membership.schema: unsupported schema")
+    expect_string(obj["organization_id"], "membership.organization_id", ID_RE)
+    expect_int(obj["sequence"], "membership.sequence", 1)
+    parse_time(obj["issued_at"], "membership.issued_at")
+    expect_string(obj["root_key_id"], "membership.root_key_id", SHA256_RE)
+    channels: list[str] = []
+    if not isinstance(obj["channels"], list) or not obj["channels"]:
+        fail("membership.channels: expected non-empty array")
+    for index, raw in enumerate(obj["channels"]):
+        channel = exact_keys(raw, {"channel_id", "epoch"}, f"membership.channels[{index}]")
+        channels.append(expect_string(channel["channel_id"], f"membership.channels[{index}].channel_id", ID_RE))
+        expect_int(channel["epoch"], f"membership.channels[{index}].epoch", 1)
+    if channels != sorted(set(channels)):
+        fail("membership.channels: ids must be sorted and unique")
+    publishers: list[tuple[str, str]] = []
+    if not isinstance(obj["publishers"], list) or not obj["publishers"]:
+        fail("membership.publishers: expected non-empty array")
+    for index, raw in enumerate(obj["publishers"]):
+        publisher = exact_keys(raw, {"capability_ceiling", "key_id", "not_after", "not_before", "public_key_der", "publisher_id", "status"}, f"membership.publishers[{index}]")
+        publisher_id = expect_string(publisher["publisher_id"], f"membership.publishers[{index}].publisher_id", ID_RE)
+        key_id = expect_string(publisher["key_id"], f"membership.publishers[{index}].key_id", SHA256_RE)
+        publishers.append((publisher_id, key_id))
+        if publisher["status"] not in {"active", "revoked"}:
+            fail(f"membership.publishers[{index}].status: invalid status")
+        expect_sorted_unique_strings(publisher["capability_ceiling"], f"membership.publishers[{index}].capability_ceiling")
+        if parse_time(publisher["not_before"], f"membership.publishers[{index}].not_before") >= parse_time(publisher["not_after"], f"membership.publishers[{index}].not_after"):
+            fail(f"membership.publishers[{index}]: invalid validity window")
+        try:
+            public_der = base64.b64decode(expect_string(publisher["public_key_der"], f"membership.publishers[{index}].public_key_der"), validate=True)
+        except ValueError as exc:
+            fail(f"membership.publishers[{index}].public_key_der: invalid base64: {exc}")
+        if digest_bytes(public_der) != key_id:
+            fail(f"membership.publishers[{index}]: key id does not match public key")
+    if publishers != sorted(set(publishers)):
+        fail("membership.publishers: publisher/key pairs must be sorted and unique")
+    root_signature = exact_keys(obj["root_signature"], {"algorithm", "signature"}, "membership.root_signature")
+    if root_signature["algorithm"] != "ed25519":
+        fail("membership.root_signature.algorithm: unsupported algorithm")
+    try:
+        signature = base64.b64decode(expect_string(root_signature["signature"], "membership.root_signature.signature"), validate=True)
+    except ValueError as exc:
+        fail(f"membership.root_signature.signature: invalid base64: {exc}")
+    if len(signature) != 64:
+        fail("membership.root_signature.signature: Ed25519 signature must be 64 bytes")
+    return obj
+
+
+def unsigned_membership_bytes(membership: dict[str, Any]) -> bytes:
+    unsigned = dict(membership)
+    del unsigned["root_signature"]
+    return canonical_bytes(unsigned)
+
+
+def public_der_from_private(private_key: Path) -> bytes:
+    return run(["openssl", "pkey", "-in", os.fspath(private_key), "-pubout", "-outform", "DER"])
+
+
+def openssl_sign(private_key: Path, payload: bytes) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="airlock-release-sign-") as temporary:
+        payload_path = Path(temporary) / "payload"
+        payload_path.write_bytes(payload)
+        return run(["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", os.fspath(private_key), "-in", os.fspath(payload_path)])
+
+
+def openssl_verify(public_der: bytes, payload: bytes, signature: bytes, label: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="airlock-release-verify-") as temporary:
+        root = Path(temporary)
+        public_path = root / "public.der"
+        payload_path = root / "payload"
+        signature_path = root / "signature.bin"
+        public_path.write_bytes(public_der)
+        payload_path.write_bytes(payload)
+        signature_path.write_bytes(signature)
+        result = subprocess.run(
+            ["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER", "-inkey", os.fspath(public_path), "-in", os.fspath(payload_path), "-sigfile", os.fspath(signature_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            fail(f"{label}: Ed25519 verification failed")
+
+
+def write_bundle(path: Path, entries: list[GitEntry], catalog_raw: bytes, lock_raw: bytes, provenance_raw: bytes) -> None:
+    sources = [
+        GitEntry("catalog.json", 0o644, catalog_raw, False),
+        GitEntry("release.lock", 0o644, lock_raw, False),
+        *[GitEntry(entry.relative, entry.mode, entry.raw, entry.symlink) for entry in entries if entry.relative.startswith("packages/")],
+        GitEntry("provenance.json", 0o644, provenance_raw, False),
+    ]
+    with path.open("wb") as raw_target:
+        with tarfile.open(fileobj=raw_target, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            directories: set[str] = set()
+            for source in sources:
+                parent = PurePosixPath(source.relative).parent
+                while str(parent) not in {"", "."}:
+                    directories.add(str(parent))
+                    parent = parent.parent
+            for directory in sorted(directories, key=lambda item: item.encode()):
+                info = tarfile.TarInfo(directory + "/")
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                info.uid = info.gid = info.mtime = 0
+                info.uname = info.gname = ""
+                archive.addfile(info)
+            for source in sorted(sources, key=lambda item: item.relative.encode()):
+                info = tarfile.TarInfo(source.relative)
+                info.mode = source.mode
+                info.uid = info.gid = info.mtime = 0
+                info.uname = info.gname = ""
+                if source.symlink:
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = source.raw.decode()
+                    info.size = 0
+                    archive.addfile(info)
+                else:
+                    import io
+                    info.size = len(source.raw)
+                    archive.addfile(info, io.BytesIO(source.raw))
+        raw_target.flush()
+        os.fsync(raw_target.fileno())
+
+
+def copy_prepared_tree(output: Path, entries: list[GitEntry], catalog_raw: bytes, lock_raw: bytes, provenance_raw: bytes) -> None:
+    output.mkdir(mode=0o755)
+    atomic_write(output / "catalog.json", catalog_raw)
+    atomic_write(output / "release.lock", lock_raw)
+    atomic_write(output / "provenance.json", provenance_raw)
+    for entry in entries:
+        if not entry.relative.startswith("packages/"):
+            continue
+        target = output / entry.relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if entry.symlink:
+            os.symlink(entry.raw.decode(), target)
+        else:
+            atomic_write(target, entry.raw, entry.mode)
+
+
+def command_prepare(args: argparse.Namespace) -> dict[str, Any]:
+    repository = Path(args.source_repo).resolve()
+    output = Path(args.out).resolve()
+    if output.exists():
+        fail("output already exists; refusing to merge or overwrite a prepared release")
+    revision, entries = git_entries(repository, args.revision, args.input_prefix)
+    by_path = entry_map(entries)
+    if "catalog.json" not in by_path or "release.lock" not in by_path:
+        fail("reviewed tree must contain catalog.json and release.lock")
+    if set(path for path in by_path if not path.startswith("packages/")) != {"catalog.json", "release.lock"}:
+        fail("reviewed tree contains an unexpected top-level artifact")
+    catalog_raw = by_path["catalog.json"].raw
+    lock_raw = by_path["release.lock"].raw
+    catalog = validate_catalog(load_json_bytes(catalog_raw, "catalog.json"))
+    lock = validate_lock(load_json_bytes(lock_raw, "release.lock"))
+    if catalog["organization_id"] != lock["organization_id"] or catalog["channel_id"] != lock["channel_id"]:
+        fail("catalog and release.lock organisation/channel differ")
+    if lock["channel_id"] != args.channel:
+        fail("release.lock channel differs from requested channel")
+    if catalog["organization_id"] != args.organization:
+        fail("catalog organisation differs from requested organisation")
+    package_ids = {package["id"] for package in lock["packages"]}
+    catalog_ids = {app["id"] for app in catalog["apps"] if app["policy"] != "blocked"}
+    if package_ids != catalog_ids:
+        fail("release.lock packages must exactly match non-blocked catalog apps")
+    actual_package_ids = {path.split("/", 2)[1] for path in by_path if path.startswith("packages/") and len(path.split("/", 2)) >= 3}
+    if actual_package_ids != package_ids:
+        fail("packages tree must exactly match release.lock package ids")
+    requested_capabilities: set[str] = set()
+    for package in lock["packages"]:
+        package_entries = [
+            GitEntry(entry.relative[len(package["path"]) + 1:], entry.mode, entry.raw, entry.symlink)
+            for entry in entries if entry.relative.startswith(package["path"] + "/")
+        ]
+        if not package_entries:
+            fail(f"package {package['id']}: tree is empty")
+        if tree_digest(package_entries) != package["digest"]:
+            fail(f"package {package['id']}: digest does not match release.lock")
+        requested_capabilities.update(package["capabilities"])
+    reviewed_digest = tree_digest(entries)
+    provenance = {
+        "ci": {"evidence_digest": args.ci_evidence_digest, "result": "passed"},
+        "created_at": args.created_at,
+        "publisher_id": args.publisher,
+        "reviewed_revision": revision,
+        "reviewed_tree_digest": reviewed_digest,
+        "schema": SCHEMA_IDS["provenance"],
+        "source_repository": args.source_repository,
+    }
+    validate_provenance(provenance)
+    provenance_raw = canonical_bytes(provenance)
+    try:
+        copy_prepared_tree(output, entries, catalog_raw, lock_raw, provenance_raw)
+        write_bundle(output / "bundle.tar", entries, catalog_raw, lock_raw, provenance_raw)
+        packages_entries = [entry for entry in entries if entry.relative.startswith("packages/")]
+        snapshot = {
+            "artifacts": {
+                "bundle.tar": digest_file(output / "bundle.tar"),
+                "catalog.json": digest_bytes(catalog_raw),
+                "packages": tree_digest(packages_entries),
+                "provenance.json": digest_bytes(provenance_raw),
+                "release.lock": digest_bytes(lock_raw),
+            },
+            "channel_id": args.channel,
+            "created_at": args.created_at,
+            "epoch": args.epoch,
+            "organization_id": args.organization,
+            "publisher_id": args.publisher,
+            "requested_capabilities": sorted(requested_capabilities),
+            "schema": SCHEMA_IDS["snapshot"],
+            "sequence": args.sequence,
+            "target_profile": lock["target_profile"],
+        }
+        validate_snapshot(snapshot)
+        atomic_write(output / "snapshot.json", canonical_bytes(snapshot))
+        verify_stage(output, signed=False)
+    except Exception:
+        shutil.rmtree(output, ignore_errors=True)
+        raise
+    return {"bundle_digest": snapshot["artifacts"]["bundle.tar"], "reviewed_revision": revision, "snapshot_digest": digest_bytes(canonical_bytes(snapshot)), "stage": os.fspath(output)}
+
+
+def directory_names(path: Path) -> set[str]:
+    try:
+        return {entry.name for entry in path.iterdir()}
+    except OSError as exc:
+        fail(f"cannot list {path}: {exc}")
+
+
+def disk_package_entries(stage: Path) -> list[GitEntry]:
+    packages = stage / "packages"
+    if not packages.is_dir() or packages.is_symlink():
+        fail("stage packages must be a real directory")
+    entries: list[GitEntry] = []
+    for path in sorted(packages.rglob("*"), key=lambda item: item.relative_to(stage).as_posix().encode()):
+        relative = path.relative_to(stage).as_posix()
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            target = os.readlink(path)
+            target_path = PurePosixPath(target)
+            if target_path.is_absolute() or ".." in target_path.parts:
+                fail(f"stage package symlink escapes tree: {relative}")
+            entries.append(GitEntry(relative, 0o777, target.encode(), True))
+        elif stat.S_ISREG(info.st_mode):
+            entries.append(GitEntry(relative, stat.S_IMODE(info.st_mode), read_regular(path, relative, MAX_BLOB_BYTES), False))
+        else:
+            fail(f"stage package has unsupported entry: {relative}")
+    return entries
+
+
+def bundle_entries(path: Path) -> dict[str, tuple[str, int, bytes | str]]:
+    result: dict[str, tuple[str, int, bytes | str]] = {}
+    try:
+        archive = tarfile.open(path, mode="r:")
+    except (OSError, tarfile.TarError) as exc:
+        fail(f"bundle.tar: cannot read archive: {exc}")
+    with archive:
+        for member in archive.getmembers():
+            name = member.name.rstrip("/")
+            pure = PurePosixPath(name)
+            if pure.is_absolute() or not pure.parts or ".." in pure.parts or name in result:
+                fail(f"bundle.tar: unsafe or duplicate member {member.name!r}")
+            if member.uid != 0 or member.gid != 0 or member.mtime != 0 or member.uname or member.gname:
+                fail(f"bundle.tar: non-canonical metadata for {name}")
+            if member.isdir():
+                result[name] = ("dir", member.mode, b"")
+            elif member.issym():
+                target = PurePosixPath(member.linkname)
+                if target.is_absolute() or ".." in target.parts:
+                    fail(f"bundle.tar: unsafe symlink {name}")
+                result[name] = ("symlink", member.mode, member.linkname)
+            elif member.isfile():
+                source = archive.extractfile(member)
+                if source is None:
+                    fail(f"bundle.tar: cannot read {name}")
+                raw = source.read(MAX_BLOB_BYTES + 1)
+                if len(raw) > MAX_BLOB_BYTES:
+                    fail(f"bundle.tar: member too large: {name}")
+                result[name] = ("file", member.mode, raw)
+            else:
+                fail(f"bundle.tar: unsupported member type: {name}")
+    return result
+
+
+def verify_stage(stage: Path, *, signed: bool) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    expected_names = SIGNED_NAMES if signed else PREPARED_NAMES
+    if not stage.is_dir() or stage.is_symlink() or directory_names(stage) != expected_names:
+        fail(f"stage: expected exactly {sorted(expected_names)}")
+    catalog_raw = read_regular(stage / "catalog.json", "catalog.json")
+    lock_raw = read_regular(stage / "release.lock", "release.lock")
+    provenance_raw = read_regular(stage / "provenance.json", "provenance.json")
+    snapshot_raw = read_regular(stage / "snapshot.json", "snapshot.json")
+    catalog = validate_catalog(load_json_bytes(catalog_raw, "catalog.json"))
+    lock = validate_lock(load_json_bytes(lock_raw, "release.lock"))
+    provenance = validate_provenance(load_json_bytes(provenance_raw, "provenance.json"))
+    snapshot = validate_snapshot(load_json_bytes(snapshot_raw, "snapshot.json"))
+    package_entries = disk_package_entries(stage)
+    expected_artifacts = {
+        "bundle.tar": digest_file(stage / "bundle.tar"),
+        "catalog.json": digest_bytes(catalog_raw),
+        "packages": tree_digest(package_entries),
+        "provenance.json": digest_bytes(provenance_raw),
+        "release.lock": digest_bytes(lock_raw),
+    }
+    if snapshot["artifacts"] != expected_artifacts:
+        fail("stage: snapshot artifact digests do not match staged bytes")
+    if not (catalog["organization_id"] == lock["organization_id"] == snapshot["organization_id"]):
+        fail("stage: organisation identity differs across artifacts")
+    if not (catalog["channel_id"] == lock["channel_id"] == snapshot["channel_id"]):
+        fail("stage: channel identity differs across artifacts")
+    if provenance["publisher_id"] != snapshot["publisher_id"] or provenance["created_at"] != snapshot["created_at"]:
+        fail("stage: provenance and snapshot identity differ")
+    capabilities = sorted({cap for package in lock["packages"] for cap in package["capabilities"]})
+    if capabilities != snapshot["requested_capabilities"]:
+        fail("stage: snapshot capability set differs from release.lock")
+    package_ids = {package["id"] for package in lock["packages"]}
+    actual_ids = {entry.relative.split("/", 2)[1] for entry in package_entries}
+    if actual_ids != package_ids:
+        fail("stage: package set differs from release.lock")
+    for package in lock["packages"]:
+        package_entries_relative = [
+            GitEntry(entry.relative[len(package["path"]) + 1:], entry.mode, entry.raw, entry.symlink)
+            for entry in package_entries if entry.relative.startswith(package["path"] + "/")
+        ]
+        if tree_digest(package_entries_relative) != package["digest"]:
+            fail(f"stage: package {package['id']} digest mismatch")
+    archive = bundle_entries(stage / "bundle.tar")
+    for name, raw in (("catalog.json", catalog_raw), ("release.lock", lock_raw), ("provenance.json", provenance_raw)):
+        if archive.get(name) != ("file", 0o644, raw):
+            fail(f"bundle.tar: {name} differs from staged artifact")
+    expected_archive_files = {"catalog.json", "release.lock", "provenance.json"}
+    for entry in package_entries:
+        expected_archive_files.add(entry.relative)
+        expected = ("symlink", entry.mode, entry.raw.decode()) if entry.symlink else ("file", entry.mode, entry.raw)
+        if archive.get(entry.relative) != expected:
+            fail(f"bundle.tar: package entry differs: {entry.relative}")
+    actual_archive_files = {name for name, (kind, _mode, _raw) in archive.items() if kind != "dir"}
+    if actual_archive_files != expected_archive_files:
+        fail("bundle.tar: member set differs from staged artifacts")
+    signature: dict[str, Any] | None = None
+    if signed:
+        signature = validate_signature(load_json_bytes(read_regular(stage / "signature.json", "signature.json"), "signature.json"))
+        if signature["publisher_id"] != snapshot["publisher_id"] or signature["snapshot_digest"] != digest_bytes(snapshot_raw):
+            fail("signature: does not identify this snapshot/publisher")
+    return snapshot, signature
+
+
+def command_sign(args: argparse.Namespace) -> dict[str, Any]:
+    stage = Path(args.stage).resolve()
+    snapshot, _ = verify_stage(stage, signed=False)
+    private_key = Path(args.publisher_key).resolve()
+    key_info = private_key.stat()
+    if not stat.S_ISREG(key_info.st_mode) or stat.S_IMODE(key_info.st_mode) & 0o077:
+        fail("publisher key must be a regular file with no group/other permissions")
+    public_der = public_der_from_private(private_key)
+    key_id = digest_bytes(public_der)
+    snapshot_raw = read_regular(stage / "snapshot.json", "snapshot.json")
+    signature = {
+        "algorithm": "ed25519",
+        "key_id": key_id,
+        "publisher_id": snapshot["publisher_id"],
+        "schema": SCHEMA_IDS["signature"],
+        "signature": base64.b64encode(openssl_sign(private_key, snapshot_raw)).decode(),
+        "snapshot_digest": digest_bytes(snapshot_raw),
+    }
+    validate_signature(signature)
+    atomic_write(stage / "signature.json", canonical_bytes(signature))
+    verify_stage(stage, signed=True)
+    return {"key_id": key_id, "signature": os.fspath(stage / "signature.json"), "snapshot_digest": signature["snapshot_digest"]}
+
+
+def load_authority(authority: Path) -> tuple[dict[str, Any], str]:
+    if not authority.is_dir() or authority.is_symlink():
+        fail("authority must be a real directory")
+    root_der = read_regular(authority / "root-public.der", "authority root", 64 * 1024)
+    membership_raw = read_regular(authority / "current-membership.json", "current membership")
+    membership = validate_membership(load_json_bytes(membership_raw, "current-membership.json"))
+    if membership["root_key_id"] != digest_bytes(root_der):
+        fail("current membership root key id does not match pinned root")
+    root_signature = base64.b64decode(membership["root_signature"]["signature"], validate=True)
+    openssl_verify(root_der, unsigned_membership_bytes(membership), root_signature, "current membership")
+    return membership, digest_bytes(membership_raw)
+
+
+def empty_state() -> dict[str, Any]:
+    return {"channels": {}, "membership_floors": {}, "schema": SCHEMA_IDS["state"]}
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return empty_state()
+    obj = exact_keys(load_json_bytes(read_regular(path, "release state"), "release-state.json"), {"channels", "membership_floors", "schema"}, "release state")
+    if obj["schema"] != SCHEMA_IDS["state"] or not isinstance(obj["channels"], dict) or not isinstance(obj["membership_floors"], dict):
+        fail("release state: unsupported schema, channels or membership floors")
+    for channel_id, raw in obj["channels"].items():
+        expect_string(channel_id, "release state channel id", ID_RE)
+        channel = exact_keys(raw, {"epoch", "receipt_digest", "sequence", "snapshot_digest"}, f"release state channel {channel_id}")
+        expect_int(channel["epoch"], f"release state channel {channel_id}.epoch", 1)
+        expect_int(channel["sequence"], f"release state channel {channel_id}.sequence", 1)
+        expect_string(channel["receipt_digest"], f"release state channel {channel_id}.receipt_digest", SHA256_RE)
+        expect_string(channel["snapshot_digest"], f"release state channel {channel_id}.snapshot_digest", SHA256_RE)
+    for organization_id, raw in obj["membership_floors"].items():
+        expect_string(organization_id, "release state organisation id", ID_RE)
+        floor = exact_keys(raw, {"membership_digest", "sequence"}, f"release state membership floor {organization_id}")
+        expect_int(floor["sequence"], f"release state membership floor {organization_id}.sequence", 1)
+        expect_string(floor["membership_digest"], f"release state membership floor {organization_id}.membership_digest", SHA256_RE)
+    return obj
+
+
+def observe_membership(state: dict[str, Any], membership: dict[str, Any], membership_digest: str) -> tuple[dict[str, Any], bool]:
+    organization_id = membership["organization_id"]
+    candidate_sequence = membership["sequence"]
+    current = state["membership_floors"].get(organization_id)
+    if current is not None:
+        if candidate_sequence < current["sequence"]:
+            fail("current membership rollback rejected by authority floor")
+        if candidate_sequence == current["sequence"] and membership_digest != current["membership_digest"]:
+            fail("current membership sequence reused with different signed bytes")
+        if candidate_sequence == current["sequence"]:
+            return state, False
+    updated = json.loads(json.dumps(state))
+    updated["membership_floors"][organization_id] = {
+        "membership_digest": membership_digest,
+        "sequence": candidate_sequence,
+    }
+    return updated, True
+
+
+def select_publisher(membership: dict[str, Any], snapshot: dict[str, Any], signature: dict[str, Any], promoted_at: str) -> dict[str, Any]:
+    if membership["organization_id"] != snapshot["organization_id"]:
+        fail("current membership belongs to another organisation")
+    channel_epochs = {channel["channel_id"]: channel["epoch"] for channel in membership["channels"]}
+    if channel_epochs.get(snapshot["channel_id"]) != snapshot["epoch"]:
+        fail("snapshot epoch is not the root-authorized current channel epoch")
+    matches = [
+        publisher for publisher in membership["publishers"]
+        if publisher["publisher_id"] == snapshot["publisher_id"] and publisher["key_id"] == signature["key_id"]
+    ]
+    if len(matches) != 1:
+        fail("signer is not a member of the current publisher set")
+    publisher = matches[0]
+    if publisher["status"] != "active":
+        fail("publisher key is revoked")
+    moment = parse_time(promoted_at, "promoted-at")
+    if not (parse_time(publisher["not_before"], "publisher.not_before") <= moment < parse_time(publisher["not_after"], "publisher.not_after")):
+        fail("publisher key is outside its validity window")
+    requested = set(snapshot["requested_capabilities"])
+    ceiling = set(publisher["capability_ceiling"])
+    if not requested <= ceiling:
+        fail(f"publisher capability ceiling exceeded: {sorted(requested - ceiling)}")
+    return publisher
+
+
+def release_matches_stage(destination: Path, stage: Path, receipt_raw: bytes) -> bool:
+    if not destination.is_dir() or destination.is_symlink():
+        return False
+    if directory_names(destination) != SIGNED_NAMES | {"promotion-receipt.json"}:
+        return False
+    for name in SIGNED_NAMES - {"packages"}:
+        if read_regular(destination / name, f"existing release {name}", MAX_BLOB_BYTES) != read_regular(stage / name, f"stage {name}", MAX_BLOB_BYTES):
+            return False
+    if disk_package_entries(destination) != disk_package_entries(stage):
+        return False
+    return read_regular(destination / "promotion-receipt.json", "existing promotion receipt") == receipt_raw
+
+
+def command_promote(args: argparse.Namespace) -> dict[str, Any]:
+    stage = Path(args.stage).resolve()
+    store = Path(args.store).resolve()
+    authority = Path(args.authority).resolve()
+    parse_time(args.promoted_at, "promoted-at")
+    authorization_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snapshot, signature = verify_stage(stage, signed=True)
+    assert signature is not None
+    membership, membership_digest = load_authority(authority)
+    snapshot_raw = read_regular(stage / "snapshot.json", "snapshot.json")
+
+    if not store.is_dir() or store.is_symlink():
+        fail("store must be an existing real directory")
+    releases = store / "releases"
+    if not releases.is_dir() or releases.is_symlink():
+        fail("store/releases must be an existing real directory")
+    lock_path = store / ".promotion.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        membership_now, membership_digest_now = load_authority(authority)
+        if membership_digest_now != membership_digest or membership_now != membership:
+            fail("current membership changed during promotion")
+        state_path = store / "release-state.json"
+        state = load_state(state_path)
+        state, membership_advanced = observe_membership(state, membership_now, membership_digest_now)
+        if membership_advanced:
+            atomic_write(state_path, canonical_bytes(state), 0o600)
+        publisher = select_publisher(membership_now, snapshot, signature, authorization_at)
+        public_der = base64.b64decode(publisher["public_key_der"], validate=True)
+        openssl_verify(public_der, snapshot_raw, base64.b64decode(signature["signature"], validate=True), "snapshot signature")
+        current = state["channels"].get(snapshot["channel_id"])
+        if current is not None:
+            current_pair = (current["epoch"], current["sequence"])
+            candidate_pair = (snapshot["epoch"], snapshot["sequence"])
+            if candidate_pair <= current_pair:
+                fail("release replay or downgrade rejected by acceptance floor")
+        snapshot_digest = digest_bytes(snapshot_raw)
+        release_id = snapshot_digest.removeprefix("sha256:")
+        destination = releases / release_id
+        previous_snapshot = current["snapshot_digest"] if current else None
+        receipt_base = {
+            "bundle_digest": snapshot["artifacts"]["bundle.tar"],
+            "channel_id": snapshot["channel_id"],
+            "epoch": snapshot["epoch"],
+            "membership_digest": membership_digest,
+            "organization_id": snapshot["organization_id"],
+            "previous_snapshot_digest": previous_snapshot,
+            "promoted_at": args.promoted_at,
+            "publisher_id": snapshot["publisher_id"],
+            "publisher_key_id": signature["key_id"],
+            "schema": SCHEMA_IDS["receipt"],
+            "sequence": snapshot["sequence"],
+            "snapshot_digest": snapshot_digest,
+        }
+        receipt = dict(receipt_base)
+        receipt["receipt_id"] = digest_bytes(canonical_bytes(receipt_base))
+        receipt_raw = canonical_bytes(receipt)
+        next_channel = {
+            "epoch": snapshot["epoch"],
+            "receipt_digest": digest_bytes(receipt_raw),
+            "sequence": snapshot["sequence"],
+            "snapshot_digest": snapshot_digest,
+        }
+        if destination.exists():
+            if not release_matches_stage(destination, stage, receipt_raw):
+                fail("release snapshot path exists with different or incomplete bytes")
+            recovered_state = json.loads(json.dumps(state))
+            recovered_state["channels"][snapshot["channel_id"]] = next_channel
+            atomic_write(state_path, canonical_bytes(recovered_state), 0o600)
+            return {"receipt": os.fspath(destination / "promotion-receipt.json"), "receipt_id": receipt["receipt_id"], "recovered": True, "release": os.fspath(destination), "snapshot_digest": snapshot_digest}
+        temporary = Path(tempfile.mkdtemp(prefix=".promote-", dir=releases))
+        try:
+            for name in sorted(SIGNED_NAMES):
+                source = stage / name
+                target = temporary / name
+                if source.is_dir():
+                    shutil.copytree(source, target, symlinks=True)
+                else:
+                    shutil.copy2(source, target, follow_symlinks=False)
+            atomic_write(temporary / "promotion-receipt.json", receipt_raw)
+            os.replace(temporary, destination)
+            temporary = Path()
+            directory_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary != Path():
+                shutil.rmtree(temporary, ignore_errors=True)
+        new_state = json.loads(json.dumps(state))
+        new_state["channels"][snapshot["channel_id"]] = next_channel
+        atomic_write(state_path, canonical_bytes(new_state), 0o600)
+        return {"receipt": os.fspath(destination / "promotion-receipt.json"), "receipt_id": receipt["receipt_id"], "recovered": False, "release": os.fspath(destination), "snapshot_digest": snapshot_digest}
+    finally:
+        os.close(lock_fd)
+
+
+def command_verify(args: argparse.Namespace) -> dict[str, Any]:
+    stage = Path(args.stage).resolve()
+    snapshot, signature = verify_stage(stage, signed=args.signed)
+    result: dict[str, Any] = {"bundle_digest": snapshot["artifacts"]["bundle.tar"], "snapshot_digest": digest_bytes(read_regular(stage / "snapshot.json", "snapshot.json"))}
+    if args.signed:
+        assert signature is not None
+        membership, membership_digest = load_authority(Path(args.authority).resolve())
+        publisher = select_publisher(membership, snapshot, signature, args.at)
+        public_der = base64.b64decode(publisher["public_key_der"], validate=True)
+        openssl_verify(public_der, read_regular(stage / "snapshot.json", "snapshot.json"), base64.b64decode(signature["signature"], validate=True), "snapshot signature")
+        result["membership_digest"] = membership_digest
+        result["publisher_key_id"] = publisher["key_id"]
+    return result
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    commands = root.add_subparsers(dest="command", required=True)
+    prepare = commands.add_parser("prepare", help="materialize a reviewed Git revision as canonical release artifacts")
+    prepare.add_argument("--source-repo", required=True)
+    prepare.add_argument("--revision", required=True)
+    prepare.add_argument("--input-prefix", required=True)
+    prepare.add_argument("--source-repository", required=True)
+    prepare.add_argument("--organization", required=True)
+    prepare.add_argument("--channel", required=True)
+    prepare.add_argument("--epoch", required=True, type=int)
+    prepare.add_argument("--sequence", required=True, type=int)
+    prepare.add_argument("--publisher", required=True)
+    prepare.add_argument("--created-at", required=True)
+    prepare.add_argument("--ci-evidence-digest", required=True)
+    prepare.add_argument("--out", required=True)
+    prepare.set_defaults(handler=command_prepare)
+
+    sign = commands.add_parser("sign", help="sign a complete prepared snapshot with an Ed25519 publisher key")
+    sign.add_argument("--stage", required=True)
+    sign.add_argument("--publisher-key", required=True)
+    sign.set_defaults(handler=command_sign)
+
+    verify = commands.add_parser("verify", help="verify staged bytes and optionally current publisher authority")
+    verify.add_argument("--stage", required=True)
+    verify.add_argument("--signed", action="store_true")
+    verify.add_argument("--authority")
+    verify.add_argument("--at")
+    verify.set_defaults(handler=command_verify)
+
+    promote = commands.add_parser("promote", help="atomically promote a signed snapshot under current authority")
+    promote.add_argument("--stage", required=True)
+    promote.add_argument("--authority", required=True)
+    promote.add_argument("--store", required=True)
+    promote.add_argument("--promoted-at", required=True)
+    promote.set_defaults(handler=command_promote)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.command == "prepare":
+        expect_string(args.organization, "organization", ID_RE)
+        expect_string(args.channel, "channel", ID_RE)
+        expect_string(args.publisher, "publisher", ID_RE)
+        expect_int(args.epoch, "epoch", 1)
+        expect_int(args.sequence, "sequence", 1)
+        parse_time(args.created_at, "created-at")
+        expect_string(args.ci_evidence_digest, "ci-evidence-digest", SHA256_RE)
+        expect_string(args.source_repository, "source-repository")
+    if args.command == "verify" and args.signed and (not args.authority or not args.at):
+        fail("verify --signed requires --authority and --at")
+    result = args.handler(args)
+    sys.stdout.buffer.write(canonical_bytes(result))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ReleaseError as exc:
+        print(f"airlock-managed-release: {exc}", file=sys.stderr)
+        raise SystemExit(2)

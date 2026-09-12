@@ -14,7 +14,8 @@
 // fresh-install font-size defaults move to 18 (ui) / 14 (code); the sidebar order
 // store points at the airlock ui-state backend so the order follows the owner across
 // devices instead of living in one browser; an already-open tab rehydrates that order
-// when it becomes visible; a device that cannot hover is treated as
+// when it becomes visible and polls its revision while it stays visible; a device
+// that cannot hover is treated as
 // compact for the tooltip gate; a coarse pointer gets the project row's trailing
 // actions without having to manufacture a hover first; and a sidebar tap stops being
 // swallowed by the long-press/drag machinery web never arms. The optional browse
@@ -60,34 +61,34 @@ const KNOWN_BUNDLE_SHAPES = [
     edits: ["provider-subagent-visible-parent"] },
   { sha: "c0e1972ed7be9fff2df9d4c1fb9c90ba4dc39fd412a522d98ae3776fb0741de6",
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes"] },
-  { sha: "d28bbda4c1fc9337b094b48ceb6f23c53672474d3ef7044a9cacebf29bfb546f",
-    legacyShas: ["670b7048aaac21d29a04e4a7e44fcee049c65d81b98ded03fad71b79e8afadba"],
+  { sha: "b79d8ce072ae84d36d92a4a0ea9c970b5430202da28a567036fafa72c2c82363",
+    legacyShas: ["d28bbda4c1fc9337b094b48ceb6f23c53672474d3ef7044a9cacebf29bfb546f", "670b7048aaac21d29a04e4a7e44fcee049c65d81b98ded03fad71b79e8afadba"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage"] },
   // The shape every browse-less box carried before the coarse-pointer edit moved in.
-  { sha: "3bc72e9f6bc0f3b440e2a1353d0d2f0f2fcde25d0b988895871be53414e0ba92",
-    legacyShas: ["702134b78675e2323e094db041086c53f70020f19aa0b1bc32492d2cb2cebaea"],
+  { sha: "f1ad068d7abcbe4639009a34affcfb6a274961a8454a6b4f44e8de28b455e925",
+    legacyShas: ["3bc72e9f6bc0f3b440e2a1353d0d2f0f2fcde25d0b988895871be53414e0ba92", "702134b78675e2323e094db041086c53f70020f19aa0b1bc32492d2cb2cebaea"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "tooltip-hover-none-is-compact"] },
   // ...and the shape this revision installs there instead: the tablet "+" fix no
   // longer costs a 150MB chromium download to receive.
-  { sha: "15c2daf833748d97a1b7aef28a2c855597e32ebacb4c372256d85f47c1a09c95",
-    legacyShas: ["6a6acb81ced1dfd6982f19e0c5f0c7fa80fea7738ef4f4def28dbe6eb1ca064e"],
+  { sha: "0aa422349b2c4103e80d5d88ae7117f1e6a40429e16ef278cf56bb334e945856",
+    legacyShas: ["15c2daf833748d97a1b7aef28a2c855597e32ebacb4c372256d85f47c1a09c95", "6a6acb81ced1dfd6982f19e0c5f0c7fa80fea7738ef4f4def28dbe6eb1ca064e"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
             "project-actions-coarse-pointer"] },
   // A device that was already open now rehydrates the shared order when its tab
   // becomes visible.
-  { sha: "2a363947ca567d3da1aefbdbdbe706994fa173fd03691862b440dc9dc60e0528",
-    legacyShas: ["b9aa1eac972a2030f03e8c786830a07d40f13839c658664c20c628dcb47c0cea"],
+  { sha: "fc9815e243b3cfe2ed416f358cc16eb55fbef40455d75ac4797aaac573beb485",
+    legacyShas: ["2a363947ca567d3da1aefbdbdbe706994fa173fd03691862b440dc9dc60e0528", "b9aa1eac972a2030f03e8c786830a07d40f13839c658664c20c628dcb47c0cea"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
             "tooltip-hover-none-is-compact", "project-actions-coarse-pointer"] },
   // ...and the current browse-less shape: a sidebar tap is no longer swallowed by the
   // long-press/drag machinery web never arms. A browse box passes through here too —
   // the always-on group runs first, so this is also its mid-install state.
-  { sha: "2eb226a06326740fe56f54be59e55c06493f715f216909c6ee7be202131a91bb",
-    legacyShas: ["e77864d635f9699e555e83d5a456425694b78745b98cc8249a010ac0c10223d3"],
+  { sha: "f440860c5f10abda72f6e8eab0053143d08cfb5d7f9510e78a3771fbabbc4f8d",
+    legacyShas: ["2eb226a06326740fe56f54be59e55c06493f715f216909c6ee7be202131a91bb", "e77864d635f9699e555e83d5a456425694b78745b98cc8249a010ac0c10223d3"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
             "tooltip-hover-none-is-compact", "project-actions-coarse-pointer",
@@ -116,41 +117,41 @@ const KNOWN_BUNDLE_SHAPES = [
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
             "project-actions-coarse-pointer"] },
-  { sha: "420849d03e093988fdfa395c6a511020fe583868bf287bdb33960aa25d0c8b82",
-    legacyShas: ["9f5c599500b78a69b8771ff3df7cb05dc58982354d4b22df24d9072182cf65bb"],
+  { sha: "ed4bd10aef38e6836591061c5cf4716cd55f78fc8358df9e8079a352ebeeefd7",
+    legacyShas: ["420849d03e093988fdfa395c6a511020fe583868bf287bdb33960aa25d0c8b82", "9f5c599500b78a69b8771ff3df7cb05dc58982354d4b22df24d9072182cf65bb"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage",
             "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
-  { sha: "5dc74b4dce187e7e55cb471707b8ff2e9ec50dffb8c6064292d0037fde836254",
-    legacyShas: ["f89ae3ae99905c0c1e1c8e6090e0e44dcd10fd8043c80338aa1792704fcb0e67"],
+  { sha: "81bf658d877f9267c13f367355fe1e01ebaaf5499613c12dfc8f36123dd473d7",
+    legacyShas: ["5dc74b4dce187e7e55cb471707b8ff2e9ec50dffb8c6064292d0037fde836254", "f89ae3ae99905c0c1e1c8e6090e0e44dcd10fd8043c80338aa1792704fcb0e67"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage",
             "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
             "project-actions-coarse-pointer"] },
-  { sha: "ae8c2e29eb783360f08a1fb154016cb6b62758e0d8b8f683b71f517297665c77",
-    legacyShas: ["0d175c93d202803e17ea539ab4ce17fd109004fb062141ffa72d2e0e6bbbd82a"],
+  { sha: "09c3fb6f8b2e67693e85a295991ab8d99030e0c9f8e624bd600d5c8c3cf764a0",
+    legacyShas: ["ae8c2e29eb783360f08a1fb154016cb6b62758e0d8b8f683b71f517297665c77", "0d175c93d202803e17ea539ab4ce17fd109004fb062141ffa72d2e0e6bbbd82a"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
             "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
   // Fully patched: identical bytes before and after the move, because the move
   // changed which group owns an edit and not which edits the bundle carries.
-  { sha: "f3ce77bd649c1409bbbbd28385f2e33af8b282d9bcf2be336e51a06c8a1156d4",
-    legacyShas: ["32719926ca9df3ce3600cd11aef9c4d7ceb1d5ee9a36e9b8e64310eca301aabd"],
+  { sha: "6dbfe0de05bcd682c6162f41dd3f3b1584251974940befd034fceaaad398f5b7",
+    legacyShas: ["f3ce77bd649c1409bbbbd28385f2e33af8b282d9bcf2be336e51a06c8a1156d4", "32719926ca9df3ce3600cd11aef9c4d7ceb1d5ee9a36e9b8e64310eca301aabd"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
             "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
             "project-actions-coarse-pointer"] },
   // Fully patched, including visibility-triggered shared-order rehydration.
-  { sha: "cff2de26a81bf08f4bf5c4c0d6ef0a8bf7ca5514286fa45e3be099376c3a4d57",
-    legacyShas: ["9f0ef2a3fd13ec714d4d9b95324d6b21136ef85bcb1ecf3e1e1baee81339a8b6"],
+  { sha: "78dabb290ae651dae8b8cacdb19dd4cad1b5bb9254ce88ad1af21b321196a8c8",
+    legacyShas: ["cff2de26a81bf08f4bf5c4c0d6ef0a8bf7ca5514286fa45e3be099376c3a4d57", "9f0ef2a3fd13ec714d4d9b95324d6b21136ef85bcb1ecf3e1e1baee81339a8b6"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
             "tooltip-hover-none-is-compact", "new-browser-gate-vo",
             "new-browser-gate-Wo", "browserpane-marker",
             "project-actions-coarse-pointer"] },
   // Fully patched, this revision: the same browse box after the sidebar-tap fix.
-  { sha: "75abafed0f4c766829067bf3f5322e0efd0da49ee128c0255a06874cf4164990",
-    legacyShas: ["9dc8c8fbd96032688977bc3b219587884930a3e53c94309d04a297fd76cb9d3c"],
+  { sha: "84acd94533ac1bfb7c062f5ddcad20c5e992213ce438cedebc3fbb78cfe77f98",
+    legacyShas: ["75abafed0f4c766829067bf3f5322e0efd0da49ee128c0255a06874cf4164990", "9dc8c8fbd96032688977bc3b219587884930a3e53c94309d04a297fd76cb9d3c"],
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
             "tooltip-hover-none-is-compact", "new-browser-gate-vo",
@@ -182,7 +183,7 @@ const BROWSE_PATCHES = [
 ];
 const SIDEBAR_STORAGE_LEGACY = '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e);return{getItem:async e=>{try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok)return await t.text()}catch(t){}return l.getItem(e)},setItem:async(e,t)=>{await l.setItem(e,t);try{await fetch(u(e),{method:"PUT",headers:{"content-type":"application/json"},body:t})}catch(n){}},removeItem:async e=>{await l.removeItem(e);try{await fetch(u(e),{method:"DELETE"})}catch(t){}}}})(o.default))),partialize:';
 const SIDEBAR_STORAGE_DURABLE = '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e),p=e=>"@airlock-pending:"+e;let q=Promise.resolve(),r=Promise.resolve(),h=0;const v=new Map,x=e=>{const t=q.catch(()=>{}).then(e);return q=t,t},b=e=>{const t=r.catch(()=>{}).then(e);return r=t,t},y=(e,t)=>{const n={i:++h,v:t};return v.set(e,n),n},z=e=>v.get(e).v,s=async(e,t,n)=>{const o=null===t?"":t;if(n&&v.get(e)!==n||await l.getItem(p(e))!==o)return;const c=await fetch(u(e),null===t?{method:"DELETE"}:{method:"PUT",headers:{"content-type":"application/json"},body:t});if(!c.ok)throw Error("ui-state write failed: "+c.status);(n?v.get(e)===n:!v.has(e))&&(await l.getItem(p(e)))===o&&await l.removeItem(p(e))};return{getItem:e=>x(async()=>{if(v.has(e))return z(e);const t=await l.getItem(p(e));if(null!==t){const n=""===t?null:t;try{await s(e,n)}catch(o){}return v.has(e)?z(e):n}try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok){const n=await t.text();if(v.has(e))return z(e);return await l.setItem(e,n),v.has(e)?z(e):n}}catch(t){}return v.has(e)?z(e):l.getItem(e)}),setItem:(e,t)=>{const n=y(e,t),o=b(async()=>{if(v.get(e)!==n)return;await l.setItem(e,t),await l.setItem(p(e),t)});return x(async()=>{await o;if(v.get(e)!==n)return;try{await s(e,t,n)}catch(c){}v.get(e)===n&&v.delete(e)})},removeItem:e=>{const t=y(e,null),n=b(async()=>{if(v.get(e)!==t)return;await l.removeItem(e),await l.setItem(p(e),"")});return x(async()=>{await n;if(v.get(e)!==t)return;try{await s(e,null,t)}catch(o){}v.get(e)===t&&v.delete(e)})}}})(o.default))),partialize:';
-const SIDEBAR_STORAGE_REVISIONED = `{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(local=>{
+const SIDEBAR_STORAGE_REVISIONED_V1 = `{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(local=>{
   const url=key=>"/airlock-ui-state/v2/"+encodeURIComponent(key);
   const pendingKey=key=>"@airlock-pending:"+key;
   const instance=Math.random().toString(36).slice(2)+Date.now().toString(36);
@@ -263,7 +264,94 @@ const SIDEBAR_STORAGE_REVISIONED = `{name:"sidebar-project-workspace-order",stor
     removeItem:key=>mutate(key,null)
   }
 })(o.default))),partialize:`;
-const SIDEBAR_REHYDRATE_REVISIONED = '"undefined"!=typeof document&&(()=>{const e=()=>f.persist.rehydrate();document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&e()}),document.addEventListener("airlock-ui-state-stale",e)})()';
+const SIDEBAR_STORAGE_REVISIONED = `{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(local=>{
+  const url=key=>"/airlock-ui-state/v2/"+encodeURIComponent(key);
+  const pendingKey=key=>"@airlock-pending:"+key;
+  const instance=Math.random().toString(36).slice(2)+Date.now().toString(36);
+  let networkQueue=Promise.resolve(),localQueue=Promise.resolve(),generation=0;
+  const observedRevision=new Map(),observedValue=new Map(),live=new Map(),syncing=new Set();
+  const enqueueNetwork=fn=>{const next=networkQueue.catch(()=>{}).then(fn);networkQueue=next;return next};
+  const enqueueLocal=fn=>{const next=localQueue.catch(()=>{}).then(fn);localQueue=next;return next};
+  const begin=(key,value)=>{const token={id:instance+":"+(++generation),value};live.set(key,token);return token};
+  const revision=response=>{const value=response.headers?.get?.("x-airlock-revision");return null!==value&&/^\\d+$/.test(value)?value:null};
+  const parsePending=raw=>{if(null===raw)return null;try{const value=JSON.parse(raw);return 1===value?.format&&"string"==typeof value.id&&(null===value.base||"string"==typeof value.base&&/^\\d+$/.test(value.base))&&(null===value.value||"string"==typeof value.value)&&(null==value.prior||"string"==typeof value.prior)?value:{legacy:!0,value:""===raw?null:raw}}catch(error){return{legacy:!0,value:""===raw?null:raw}}};
+  const savePending=(key,pending)=>local.setItem(pendingKey(key),JSON.stringify({format:1,id:pending.id,base:pending.base,value:pending.value,prior:pending.prior??null}));
+  const writeLocal=async(key,value)=>{null===value?await local.removeItem(key):await local.setItem(key,value)};
+  const notifyStale=()=>{"undefined"!=typeof document&&document.dispatchEvent(new Event("airlock-ui-state-stale"))};
+  const basedPending=async key=>{const pending=parsePending(await local.getItem(pendingKey(key)));return!!(pending&&!pending.legacy&&null!==pending.base)};
+  const fetchRemote=async key=>{const response=await fetch(url(key),{cache:"no-store"}),nextRevision=revision(response);if(null===nextRevision)return null;if(200===response.status)return{revision:nextRevision,value:await response.text()};if(404===response.status)return{revision:nextRevision,value:null};return null};
+  const send=async(key,pending,token)=>{
+    if(null===pending.base||pending.legacy||token&&live.get(key)!==token)return{kind:"unsent"};
+    const response=await fetch(url(key),null===pending.value?{method:"DELETE",headers:{"X-Airlock-Base-Revision":pending.base}}:{method:"PUT",headers:{"content-type":"application/json","X-Airlock-Base-Revision":pending.base},body:pending.value});
+    const nextRevision=revision(response);
+    if(204===response.status&&null!==nextRevision){
+      let resultValue=pending.value;
+      await enqueueLocal(async()=>{
+        observedRevision.set(key,nextRevision);observedValue.set(key,pending.value);
+        const current=parsePending(await local.getItem(pendingKey(key))),currentToken=live.get(key);
+        if(current&&!current.legacy&&current.id===pending.id)await local.removeItem(pendingKey(key));
+        else if(current&&!current.legacy&&(currentToken&&current.id===currentToken.id||current.prior===pending.value)){current.base=nextRevision;await savePending(key,current);resultValue=await local.getItem(key)}
+        else if(current)resultValue=await local.getItem(key);
+      });
+      return{kind:"sent",revision:nextRevision,value:resultValue};
+    }
+    if(409===response.status&&null!==nextRevision){
+      const text=await response.text(),remote=text||null;
+      let resultValue=remote;
+      await enqueueLocal(async()=>{
+        observedRevision.set(key,nextRevision);observedValue.set(key,remote);
+        const current=parsePending(await local.getItem(pendingKey(key))),currentToken=live.get(key);
+        if(token&&currentToken===token)live.delete(key);
+        if(!current||current.id===pending.id){await writeLocal(key,remote);current&&await local.removeItem(pendingKey(key))}
+        else resultValue=await local.getItem(key);
+      });
+      notifyStale();
+      return{kind:"conflict",revision:nextRevision,value:resultValue};
+    }
+    return{kind:"unsent"};
+  };
+  const integrateRemote=async(key,remote)=>{
+    let stale=!1,result;
+    await enqueueLocal(async()=>{
+      const token=live.get(key),pending=parsePending(await local.getItem(pendingKey(key)));
+      if(token){
+        if(pending&&!pending.legacy&&pending.id===token.id&&pending.value===token.value&&(pending.base===remote.revision||"0"===remote.revision&&null===remote.value||null!==pending.base&&pending.prior===remote.value)){
+          observedRevision.set(key,remote.revision);observedValue.set(key,remote.value);pending.base=remote.revision;await savePending(key,pending);result={value:token.value};return;
+        }
+        live.delete(key);observedRevision.set(key,remote.revision);observedValue.set(key,remote.value);stale=!0;
+        if(pending&&!pending.legacy&&pending.id!==token.id){result={value:await local.getItem(key)};return}
+      }
+      observedRevision.set(key,remote.revision);observedValue.set(key,remote.value);await writeLocal(key,remote.value);await local.removeItem(pendingKey(key));result=remote;
+    });
+    stale&&notifyStale();
+    return result;
+  };
+  const refresh=async(key,allowSeed)=>{
+    const remote=await fetchRemote(key);if(null===remote)return null;
+    if(allowSeed&&"0"===remote.revision&&null===remote.value&&!live.has(key)){
+      let seed=null;
+      await enqueueLocal(async()=>{if(live.has(key)||null!==await local.getItem(pendingKey(key)))return;const value=await local.getItem(key);if(null!==value){seed={id:instance+":seed:"+(++generation),base:"0",value,prior:null};await savePending(key,seed)}});
+      if(seed){const sent=await send(key,seed);if("sent"===sent.kind||"conflict"===sent.kind)return sent;return null}
+    }
+    return integrateRemote(key,remote);
+  };
+  const mutate=(key,value)=>{
+    const token=begin(key,value);
+    const durable=enqueueLocal(async()=>{if(live.get(key)!==token)return;await writeLocal(key,value);await savePending(key,{id:token.id,base:observedRevision.get(key)??null,value,prior:observedValue.has(key)?observedValue.get(key):null})});
+    return enqueueNetwork(async()=>{await durable;if(live.get(key)!==token)return;const pending=parsePending(await local.getItem(pendingKey(key)));if(pending&&!pending.legacy&&pending.id===token.id&&null!==pending.base)try{await send(key,pending,token)}catch(error){}live.get(key)===token&&live.delete(key)});
+  };
+  return{
+    getItem:key=>enqueueNetwork(async()=>{if(live.has(key))return live.get(key).value;const pending=parsePending(await local.getItem(pendingKey(key)));if(pending&&!pending.legacy&&null!==pending.base)try{const sent=await send(key,pending);if("sent"===sent.kind||"conflict"===sent.kind)return sent.value}catch(error){return pending.value}try{const remote=await refresh(key,!pending);if(remote)return remote.value}catch(error){}return live.has(key)?live.get(key).value:local.getItem(key)}),
+    setItem:(key,value)=>mutate(key,value),
+    sync:key=>{if(syncing.has(key))return Promise.resolve();syncing.add(key);return enqueueNetwork(async()=>{try{if(live.has(key))return;if(await basedPending(key)){notifyStale();return}let remote=null;try{remote=await fetchRemote(key)}catch(error){return}if(null===remote||live.has(key)||await basedPending(key))return;observedRevision.get(key)!==remote.revision&&notifyStale()}finally{syncing.delete(key)}})},
+    removeItem:key=>mutate(key,null)
+  }
+})(o.default))),partialize:`;
+// Interval for the revision-checked poll while the tab stays visible. One tiny GET;
+// the store is only touched when the server revision moved (or was never observed).
+const SIDEBAR_POLL_MS = 60000;
+const SIDEBAR_REHYDRATE_REVISIONED_V1 = '"undefined"!=typeof document&&(()=>{const e=()=>f.persist.rehydrate();document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&e()}),document.addEventListener("airlock-ui-state-stale",e)})()';
+const SIDEBAR_REHYDRATE_REVISIONED = '"undefined"!=typeof document&&(()=>{const e=()=>f.persist.rehydrate(),s=()=>g.__airlockUiState?.sync?.("sidebar-project-workspace-order");document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&e()}),document.addEventListener("airlock-ui-state-stale",e),"undefined"!=typeof window&&(window.addEventListener("focus",s),window.addEventListener("online",s),window.setInterval(()=>{"visible"===document.visibilityState&&s()},' + SIDEBAR_POLL_MS + '))})()';
 const SIDEBAR_REHYDRATE_LEGACY = 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));"undefined"!=typeof document&&document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&f.persist.rehydrate()})},3544,[3368,3273,3276]);';
 const SUBAGENT_STREAM_PATCHES = [
   {
@@ -300,7 +388,7 @@ const SUBAGENT_STREAM_PATCHES = [
     // PR #256 shipped the first adapter without an outbox or write queue. Treat its
     // exact bytes as a named migration source: the SHA still has to match a known
     // fleet shape, then this patch upgrades it in place.
-    legacyRepls: [SIDEBAR_STORAGE_LEGACY, SIDEBAR_STORAGE_DURABLE],
+    legacyRepls: [SIDEBAR_STORAGE_LEGACY, SIDEBAR_STORAGE_DURABLE, SIDEBAR_STORAGE_REVISIONED_V1],
   },
   {
     // A second device commonly already has Paseo open. Persist hydrates only once,
@@ -312,7 +400,10 @@ const SUBAGENT_STREAM_PATCHES = [
     name: "sidebar-order-rehydrate-on-visibility",
     find: 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}))},3544,[3368,3273,3276]);',
     repl: 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));' + SIDEBAR_REHYDRATE_REVISIONED + '},3544,[3368,3273,3276]);',
-    legacyRepls: [SIDEBAR_REHYDRATE_LEGACY],
+    // The previous revision's listener, with the anchor bytes around it: the patcher
+    // swaps a legacy replacement for the current one verbatim, so a bare expression
+    // here would duplicate the surrounding `partialize:…}));` on an installed bundle.
+    legacyRepls: [SIDEBAR_REHYDRATE_LEGACY, 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));' + SIDEBAR_REHYDRATE_REVISIONED_V1 + '},3544,[3368,3273,3276]);'],
   },
   {
     // Tooltips are gated on useIsCompactFormFactor() — the xs/sm breakpoint — and a
@@ -723,6 +814,7 @@ module.exports = {
   BROWSE_PATCHES,
   KNOWN_BUNDLE_SHAPES,
   PINNED_SHA,
+  SIDEBAR_POLL_MS,
   SIDEBAR_REHYDRATE_REVISIONED,
   SUBAGENT_STREAM_PATCHES,
   patchBundleContent,

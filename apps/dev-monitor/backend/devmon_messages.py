@@ -14,7 +14,9 @@ ID_RE = re.compile(r'^[A-Za-z0-9._:-]{1,128}\Z')
 RESERVED_GROUP_PREFIX = 'dev-monitor:'
 MAX_PAYLOAD = 16 * 1024
 MAX_URL = 2048
-COALESCE_WINDOW = timedelta(hours=24)
+MAX_RUN_PARAMS = 8
+MAX_PARAM_CHOICES = 32
+MAX_PARAM_TEXT = 200
 ARCHIVE_IDLE = timedelta(hours=48)
 ARCHIVE_ACTIVE_MIN = 20
 RETENTION = timedelta(days=180)
@@ -54,6 +56,52 @@ def validate_link_url(url):
     if u.scheme not in ('http', 'https') or not u.hostname:
         raise ValidationError('link url must be http(s) with host')  # hostname rather than netloc rejects ":443", etc.
     return url.strip()
+
+
+def validate_run(run):
+    """Validate and normalize the producer-owned execution declaration."""
+    if not isinstance(run, dict) or not {'cwd', 'prompt'} <= set(run):
+        raise ValidationError('run requires cwd and prompt')
+    if set(run) - {'cwd', 'prompt', 'params'}:
+        raise ValidationError('run has unknown fields')
+    if any(not isinstance(run[key], str) or not run[key].strip() or '\0' in run[key]
+           for key in ('cwd', 'prompt')):
+        raise ValidationError('run cwd and prompt must be nonempty text')
+    if 'params' not in run:
+        return {'cwd': run['cwd'], 'prompt': run['prompt']}
+    params = run['params']
+    if not isinstance(params, list) or len(params) > MAX_RUN_PARAMS:
+        raise ValidationError('run params must be an array of at most 8 entries')
+    normalized = []
+    seen = set()
+    for item in params:
+        if (not isinstance(item, dict) or not {'key', 'label'} <= set(item)
+                or set(item) - {'key', 'label', 'choices', 'default'}):
+            raise ValidationError('invalid run param declaration')
+        key, label = item['key'], item['label']
+        if not isinstance(key, str) or not ID_RE.fullmatch(key) or key in seen:
+            raise ValidationError('invalid or duplicate run param key')
+        if not isinstance(label, str) or not label.strip() or len(label) > MAX_PARAM_TEXT:
+            raise ValidationError('invalid run param label')
+        seen.add(key)
+        entry = {'key': key, 'label': label}
+        choices = item.get('choices')
+        if 'choices' in item:
+            if (not isinstance(choices, list) or not (1 <= len(choices) <= MAX_PARAM_CHOICES)
+                    or any(not isinstance(value, str) or not value.strip()
+                           or len(value) > MAX_PARAM_TEXT for value in choices)
+                    or len(set(choices)) != len(choices)):
+                raise ValidationError('invalid run param choices')
+            entry['choices'] = list(choices)
+        if 'default' in item:
+            default = item['default']
+            if not isinstance(default, str) or len(default) > MAX_PARAM_TEXT:
+                raise ValidationError('invalid run param default')
+            if choices is not None and default not in choices:
+                raise ValidationError('run param default is not a choice')
+            entry['default'] = default
+        normalized.append(entry)
+    return {'cwd': run['cwd'], 'prompt': run['prompt'], 'params': normalized}
 
 def validate_payload(payload):
     """Normalize a message; legacy identity/time and urgency remain readable."""
@@ -101,11 +149,7 @@ def validate_payload(payload):
             raise ValidationError('heartbeat requires the canonical daily payload')
     run = out.get('run')
     if run is not None:
-        if not isinstance(run, dict) or set(run) != {'cwd', 'prompt'}:
-            raise ValidationError('run requires cwd and prompt')
-        if any(not isinstance(run[key], str) or not run[key].strip() or '\0' in run[key]
-               for key in ('cwd', 'prompt')):
-            raise ValidationError('run cwd and prompt must be nonempty text')
+        run = validate_run(run)
     link = out.get('link')
     if isinstance(link, dict):
         link = link.get('url')
@@ -134,7 +178,12 @@ def init_db(path):
         if tables and tables != {'ledger', 'cards'}:
             raise RuntimeError('offline messages database conversion required')
         conn.executescript(_SCHEMA)
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(cards)')}
+        for column in ('ran_input', 'ran_window'):
+            if column not in columns:
+                conn.execute('ALTER TABLE cards ADD COLUMN %s TEXT' % column)
         conn.execute('PRAGMA journal_mode=WAL')
+        conn.commit()
     finally:
         conn.close()
     os.chmod(path, 0o600)
@@ -185,8 +234,8 @@ def ingest(payload):
         if has_receipt(p['id']):
             return 'duplicate'
         candidates = conn.execute(
-            'SELECT * FROM cards WHERE "group"=? AND archived_at IS NULL AND first_at>=? '
-            'ORDER BY first_at DESC', (p['group'], iso(now_utc() - COALESCE_WINDOW))).fetchall()
+            'SELECT * FROM cards WHERE "group"=? AND archived_at IS NULL '
+            'ORDER BY last_at DESC,card_id ASC', (p['group'],)).fetchall()
         card = None
         for candidate in candidates:
             try:
@@ -249,8 +298,8 @@ def _card_to_dict(row):
 
 def feed(scope='active'):
     where = '' if scope == 'all' else 'WHERE c.archived_at IS ' + ('NOT NULL ' if scope=='archived' else 'NULL ')
-    rows = _conn().execute(_CARD_SELECT + where +
-                           'ORDER BY (c.read_at IS NULL) DESC,c.first_at DESC').fetchall()
+    rows = _conn().execute(
+        _CARD_SELECT + where + 'ORDER BY c.last_at DESC,c.card_id ASC').fetchall()
     return {'messages':[_card_to_dict(row) for row in rows], 'counts':counts()}
 
 
@@ -282,17 +331,19 @@ def get_card(card_id):
     return _card_to_dict(row) if row else None
 
 
-def mark_ran(card_id):
+def mark_ran(card_id, ran_input, ran_window):
     at = iso(now_utc())
     with _conn():
-        _conn().execute('UPDATE cards SET ran_at=? WHERE card_id=?', (at,card_id))
+        _conn().execute(
+            'UPDATE cards SET ran_at=?,ran_input=?,ran_window=? WHERE card_id=?',
+            (at, ran_input, ran_window, card_id))
     return at
 
 
 def delivery_health():
     row = _conn().execute(
         "SELECT SUM(send_next_at IS NOT NULL AND sent_at IS NULL AND send_attempts<?),MAX(sent_at),"
-        "SUM(sent_at IS NULL AND send_attempts>=?) FROM cards",
+        "SUM(archived_at IS NULL AND sent_at IS NULL AND send_attempts>=?) FROM cards",
         (MAX_DELIVERY_ATTEMPTS,MAX_DELIVERY_ATTEMPTS)).fetchone()
     return {'pending_count':row[0] or 0,'last_sent_at':row[1],'failed_count':row[2] or 0}
 

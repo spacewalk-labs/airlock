@@ -27,10 +27,11 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 # 다음 실행이 이만큼 지나도 안 돌았으면 late (원격판과 같은 유예)
 LATE_GRACE_SEC = 300
@@ -1874,6 +1875,198 @@ def count_jobs(jobs: list[dict]) -> dict:
             if key:
                 c[key] += 1
     return c
+
+
+def cron_job_key(job_id: str) -> str:
+    """The message identity for a Cron-tab job, safe even for ids containing ``/`` or ``@``."""
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("cron job id must be nonempty text")
+    return hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:24]
+
+
+def _message_time(value) -> str:
+    """Keep the useful verdict times human-readable without exposing collector internals."""
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return "unknown"
+
+
+_ABOUT_KEY_RE = re.compile(r"^X-Airlock-About=(.*)\Z")
+
+
+def _read_unit_about_key(fragment_path: str | None) -> str | None:
+    """``[Unit]`` 섹션의 ``X-Airlock-About=`` 값. systemd 는 ``X-`` 키를 무시하므로 안전하다."""
+    if not fragment_path:
+        return None
+    try:
+        with open(fragment_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                match = _ABOUT_KEY_RE.match(line.strip())
+                if match:
+                    value = match.group(1).strip()
+                    if value:
+                        return value
+    except OSError:
+        return None
+    return None
+
+
+def _job_about(job: dict) -> str:
+    """이 잡이 무엇인지. 유닛의 ``X-Airlock-About=`` 우선, 없으면 Description + 「(설명 미등록)」.
+
+    dev-monitor 자신의 크론 카드는 이 about 이 없어도 반드시 낸다 — 보고서 규격의
+    「about 없으면 카드를 내지 않는다」는 외부 생산자 규칙이라 여기엔 적용하지 않는다.
+    """
+    if job.get("kind") != "systemd":
+        description = job.get("description")
+        return description or "(설명 미등록)"
+    scope = job.get("scope")
+    unit_name = job.get("service") or job.get("unit")
+    description = job.get("description")
+    if scope and unit_name:
+        rc, out, _err = run_cmd(systemctl(scope) + ["show", unit_name, "-p", "FragmentPath,Description"])
+        if rc == 0:
+            blocks = parse_show_blocks(out)
+            props = blocks[0] if blocks else {}
+            about = _read_unit_about_key(first(props, "FragmentPath") or None)
+            if about:
+                return about
+            description = first(props, "Description") or description
+    return ("%s (설명 미등록)" % description) if description else "(설명 미등록)"
+
+
+def _mask_home(text: str, home: str) -> str:
+    if home and home not in ("/", ""):
+        return text.replace(home, "~")
+    return text
+
+
+def _job_evidence(job: dict, home: str) -> list[str]:
+    """그 유닛 저널의 마지막 3줄. systemd 잡이 아니면 (또는 조회 실패 시) 비운다."""
+    if job.get("kind") != "systemd":
+        return []
+    scope = job.get("scope")
+    unit_name = job.get("service") or job.get("unit")
+    if not scope or not unit_name:
+        return []
+    if scope == "user":
+        argv = ["journalctl", "--user", "-u", unit_name, "-n", "3", "--no-pager", "-o", "cat"]
+    else:
+        argv = [SUDO, "-n", "--", JOURNALCTL, "-u", unit_name, "-n", "3", "--no-pager", "-o", "cat"]
+    rc, out, _err = run_cmd(argv, timeout=10)
+    if rc != 0:
+        return []
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    return [_mask_home(ln, home) for ln in lines[-3:]]
+
+
+def _cron_body(about: str, evidence: list[str], next_run) -> str:
+    lines = ["무엇: %s" % about]
+    lines.append("증거: " + (" / ".join(evidence) if evidence else "(없음)"))
+    lines.append("다음: %s" % _message_time(next_run))
+    return "\n".join(lines)
+
+
+def _load_cron_verdicts(path: str) -> tuple[dict, bool]:
+    """(verdicts, 정상 로드 여부). 파일이 없거나 깨졌으면 빈 dict + False — 호출자가 첫 스캔을
+    전이로 간주해 한 번 더 내도록(허용된 동작) 신호를 준다."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}, False
+    if not isinstance(data, dict):
+        return {}, False
+    return data, True
+
+
+def _save_cron_verdicts(path: str, verdicts: dict) -> None:
+    """원자적 교체(tmp + rename)로 직전 판정 파일을 쓴다."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".cron-verdicts-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(verdicts, f)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def cron_message_payloads(measured: dict | None = None, verdicts_path: str | None = None) -> list[dict]:
+    """Cron-tab 잡의 상태 *전이*만 메시지 receipt 로 바꾼다 — 같은 실패가 이어지는 동안은 없음.
+
+    직전 판정은 ``verdicts_path`` 의 파일 하나에 저장한다(원자적 교체). 이 함수는 스풀·DB에
+    의존하지 않는다: 메시지 루프가 유일한 호출자이고, 반환된 receipt 는 그쪽이
+    ``devmon_messages.ingest`` 로 커밋한다. ``verdicts_path`` 가 없으면 판정을 지속할 수
+    없으므로 명시적으로 실패한다 — messages=false 설치는 이 함수를 아예 부르지 않는다.
+    """
+    if not verdicts_path:
+        raise ValueError("cron_message_payloads requires verdicts_path")
+    measured = snapshot() if measured is None else measured
+    snapshot_now = measured.get("now")
+    if not isinstance(snapshot_now, (int, float)) or not math.isfinite(snapshot_now):
+        raise ValueError("cron snapshot missing finite now")
+    created_at = datetime.fromtimestamp(snapshot_now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    home = os.path.expanduser("~")
+
+    verdicts, verdicts_ok = _load_cron_verdicts(verdicts_path)
+    next_verdicts: dict = {}
+    payloads: list[dict] = []
+
+    for job in measured.get("jobs", []):
+        if not isinstance(job, dict):
+            continue
+        raw_id = job.get("id")
+        if not isinstance(raw_id, str) or not raw_id:
+            continue
+        key = cron_job_key(raw_id)
+        name = str(job.get("name") or raw_id)
+        failed = job.get("lastResult") == "failed"
+        late = job.get("timeliness") == "late"
+        bad = failed or late
+        run_token = _message_time(job.get("lastRun"))
+
+        prior = verdicts.get(key)
+        prior_bad = bool(prior and prior.get("state") == "bad")
+        # 상태 파일이 없거나 깨졌으면 첫 스캔 한 번은 전이로 본다 — 청사진 결정 01, 허용.
+        transitioned_bad = bad and (not prior_bad or not verdicts_ok)
+        transitioned_ok = (not bad) and prior_bad
+
+        if transitioned_bad:
+            about = _job_about(job)
+            evidence = _job_evidence(job, home)
+            payloads.append({
+                "id": "cron:%s:fail:%s" % (key, run_token),
+                "group": "cron:" + key,
+                "source": "cron",
+                "level": "urgent",
+                "title": "%s %s" % (name, "실패" if failed else "지연"),
+                "body": _cron_body(about, evidence, job.get("nextRun")),
+                "created_at": created_at,
+            })
+        elif transitioned_ok:
+            about = _job_about(job)
+            payloads.append({
+                "id": "cron:%s:ok:%s" % (key, run_token),
+                "group": "cron:" + key,
+                "source": "cron",
+                "level": "normal",
+                "title": "%s 다시 정상" % name,
+                "body": _cron_body(about, [], job.get("nextRun")),
+                "created_at": created_at,
+            })
+
+        if bad:
+            next_verdicts[key] = {"state": "bad", "lastRun": run_token}
+
+    _save_cron_verdicts(verdicts_path, next_verdicts)
+    return payloads
 
 
 def _strip_internal_fields(job: dict) -> dict:

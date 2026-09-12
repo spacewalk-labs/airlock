@@ -50,13 +50,15 @@ fragment is **written directly** by `install.sh` — but it replicates
 
 - **node >= 20.** The daemon and its `node-pty` fail on node 18; the installer
   hard-checks and aborts with a clear message on older boxes.
-- **Pinned `@getpaseo/cli@0.2.5`** installed into a fixed, user-writable npm
-  prefix (`~/.npm-global`). The version is pinned deliberately — paseo is pre-1.0
-  and a floating install would drift the web-ui bundle and the depth4 anchor.
-  Override with `version` under `[apps.paseo]` in `airlock.toml`; note that this
-  reinstalls a different package against a tree whose anchors still target the pin,
-  so it is not a rollback. To go back, revert the commit that moved the pin and
-  re-run the installer.
+- **Pinned guarded Paseo 0.2.5 package set** installed into a fixed,
+  user-writable npm prefix (`~/.npm-global`). Airlock ships the six modified
+  `@getpaseo` tarballs together and verifies their checksums before install; see
+  [`vendor/guarded-0.2.5/README.md`](vendor/guarded-0.2.5/README.md) for source and
+  review provenance. The set is pinned deliberately — Paseo is pre-1.0 and a
+  floating install would drift the web-ui bundle and patch anchors. Setting
+  `version` under `[apps.paseo]` explicitly selects that ordinary npm registry
+  version instead of the bundled set. Reverting the Airlock commit and rerunning
+  the installer restores the previous stock default.
 - **A systemd `--user` unit** with an explicit `PATH` (npm global bin + provider
   CLI dirs + node + system). The daemon spawns provider CLIs against this PATH; a
   mismatch ("provider not found") is the #1 pilot gotcha.
@@ -149,11 +151,15 @@ Three properties are the design, not incidental:
   unconditional write, while the new backend rejects writes from already-open legacy
   tabs until those tabs reload the cache-busted bundle.
 
-What it deliberately does NOT do: push while a tab remains visible. The store reads
-the server when the page loads and whenever a hidden tab becomes visible again, and
-writes on every change. Switching back to Paseo on another device therefore updates
-the existing sidebar without a full page reload. A continuously live channel would
-mean holding a socket open for a list of strings and is not needed for device return.
+What it deliberately does NOT do: hold a push channel open. The store reads the
+server when the page loads and whenever a hidden tab becomes visible again, and
+writes on every change. A tab that stays visible polls instead: once a minute
+(`SIDEBAR_POLL_MS`), and on window `focus` / `online`, it fetches the key's revision
+and raises the same stale event a rejected write does only when that revision moved —
+an unchanged tab re-renders nothing, and a mutation in flight or a queued outbox
+takes precedence over the poll. Two windows side by side therefore converge within
+about a minute without a reload or a focus change. A live socket would buy seconds of
+latency for a list of strings that changes a few times a day.
 
 The patch uses two anchors in the always-on group of
 `browse-host/bin/patch-web-ui.js`: `sidebar-order-shared-storage` swaps the storage of

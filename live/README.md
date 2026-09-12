@@ -143,8 +143,10 @@ are different claims. Closing the second one needs a human opening the URL from 
 phone once. No amount of harness fixes that, and pretending otherwise is how a
 skipped check becomes indistinguishable from a passing one.
 
-**The `AIRLOCK_ALLOW_SNAP_NODE` path.** Now that the manifests prescribe a non-snap
-node, a normal run never reaches the override, so it is exercised only by fixtures
-in `install/test-snap-node.sh`. A second variant that installs a snap node on
-purpose would close it; it has not been built, because it has not been worth the
-cost yet.
+**The snap-node path.** The paseo installer no longer refuses a snap-wrapped node
+(the directive that broke it, NoNewPrivileges, is off for that unit by default);
+it warns and writes the reason into the unit. The manifests prescribe a non-snap
+node, so a normal run never reaches that branch and it is exercised only by
+fixtures in `install/test-snap-node.sh`. A second variant that installs a snap
+node on purpose would close it; it has not been built, because it has not been
+worth the cost yet.

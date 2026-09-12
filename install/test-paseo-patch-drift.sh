@@ -257,16 +257,31 @@ else
 fi
 
 # The server filter and child->parent UI subscription are one correctness unit.
-# Assert that main install runs the general group outside the BROWSE=true block and
-# treats any half failure as fatal, while browse-host explicitly requests only its
-# optional group.
+# Assert that main install runs the general group outside the BROWSE=true block, that
+# the server candidate is installed only inside the branch where the UI patch
+# succeeded (a UI failure discards it — never the new server against the old UI),
+# and that browse-host explicitly requests only its optional group. Since 2026-09-12
+# a lookup miss (target, anchor, patcher) is a warning, not a platform rollback; only
+# the served tree being wrong (invalid JS, failed rename) stays fatal.
 if grep -qF 'node "$WEBUI_PATCHER" --subagent-stream "$WEBUI_DIR"' "$ROOT/apps/paseo/install.sh" \
-  && grep -qF 'die "provider-subagent web-ui subscription patch failed"' "$ROOT/apps/paseo/install.sh" \
-  && grep -qF 'provider-subagent server filter behavior check failed on candidate' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'log "warning: provider-subagent web-ui subscription patch failed' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'die "provider-subagent web-ui patch produced invalid JS"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'die "provider-subagent server filter mv failed"' "$ROOT/apps/paseo/install.sh" \
+  && ! grep -qF 'die "session.js not found' "$ROOT/apps/paseo/install.sh" \
   && grep -qF 'node "$INSTALL_DIR/bin/patch-web-ui.js" --browse "$WEBUI_DIR"' "$ROOT/apps/paseo/browse-host/install.sh"; then
-  ok "provider-subagent install wiring: always-on pair is fail-hard and optional browse is explicit"
+  ok "provider-subagent install wiring: pair installs together, lookups warn, served-tree faults die, optional browse is explicit"
 else
-  bad "provider-subagent install wiring: server/UI pair or explicit browse mode is missing"
+  bad "provider-subagent install wiring: server/UI pair contract or explicit browse mode is missing"
+fi
+# Ordering, not just presence: the mv must sit inside the UI-success branch.
+ui_ok_line="$(grep -nF 'if node "$WEBUI_PATCHER" --subagent-stream "$WEBUI_DIR"; then' "$ROOT/apps/paseo/install.sh" | cut -d: -f1)"
+mv_line="$(grep -nF 'mv "$sf_tmp" "$SESSION_JS"' "$ROOT/apps/paseo/install.sh" | cut -d: -f1)"
+ui_fail_line="$(grep -nF 'log "warning: provider-subagent web-ui subscription patch failed' "$ROOT/apps/paseo/install.sh" | cut -d: -f1)"
+if [ -n "$ui_ok_line" ] && [ -n "$mv_line" ] && [ -n "$ui_fail_line" ] \
+  && [ "$ui_ok_line" -lt "$mv_line" ] && [ "$mv_line" -lt "$ui_fail_line" ]; then
+  ok "provider-subagent install wiring: server candidate is renamed only after the UI patch succeeded"
+else
+  bad "provider-subagent install wiring: server candidate rename is not gated on UI success (ui_ok=$ui_ok_line mv=$mv_line ui_fail=$ui_fail_line)"
 fi
 
 # ------------------------------------------------------------------ model fable 5.1

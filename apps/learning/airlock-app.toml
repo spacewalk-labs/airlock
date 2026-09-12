@@ -28,6 +28,9 @@ provider = "auto"
 #        and not auto. Failures are warnings, never a failed ingest — the
 #        coupling between the success verdict and git is what this app removed.
 git_sync = "off"
+# Maximum number of agent CLI processes the ingest worker runs at once. Set to
+# 1 to retain the former strictly serial behavior.
+ingest_slots = 3
 
 # Env vars this installer WRITES onto the units and the backend reads at runtime.
 # Knobs live in [config] above — the same split publish documents. A name is one
@@ -52,6 +55,9 @@ runtime_env = [
   # declared because every AIRLOCK_LEARNING_* the app reads has to be declared:
   # an undeclared one is indistinguishable from a typo that silently never fires.
   "AIRLOCK_LEARNING_FAILURE_SUMMARY",
+  # The resolved ingest_slots knob. The distinct runtime name keeps config input
+  # separate from the value written to the worker unit.
+  "AIRLOCK_LEARNING_WORKER_SLOTS",
   "AIRLOCK_LEARNING_INGEST_TIMEOUT_SECONDS",
   "AIRLOCK_LEARNING_LIBRARY",
   "AIRLOCK_LEARNING_LISTING",

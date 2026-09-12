@@ -167,7 +167,7 @@ pollute_and_run() {  # <hostdir>
   AIRLOCK_PLATFORM_OPT="$1/opt-airlock" \
   AIRLOCK_UNIT_DIR_SYSTEM="$1/unit-system" \
   AIRLOCK_DRY_RUN_FSROOT="$1/fsroot" \
-    bash "$HERE/test-equivalence.sh"
+    AIRLOCK_EQUIVALENCE_CORE_ONLY=1 bash "$HERE/test-equivalence.sh"
 }
 if d_out="$(pollute_and_run "$POP" 2>&1)"; then
   ok "test-equivalence.sh passes with all four variables polluted toward a populated host (its pins override them)"

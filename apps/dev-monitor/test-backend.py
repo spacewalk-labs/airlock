@@ -48,6 +48,7 @@ def _load_backend():
 
 DM = _load_backend()
 MSG = DM.MSG
+AC7 = {'archived_filtered': 0, 'active_counted': 0}
 
 # The platform CLI has no .py extension. Importing it runs no command because main()
 # is guarded; tests can point its whitelisted raw extractor at scratch credentials.
@@ -718,6 +719,48 @@ class OwnerRouteTest(unittest.TestCase):
             'X-Devmon-Owner': 'me@example.test',
             'X-Devmon-Proxy-Secret': 's3cr3t',
         })
+
+    def test_health_failed_count_excludes_archived_exhausted_cards(self):
+        saved_state = DM._MESSAGES_STATE
+        archived_id = 'health-archived-exhausted'
+        active_id = 'health-active-exhausted'
+        try:
+            DM._MESSAGES_STATE = 'on'
+            status, baseline = self._get('/api/health')
+            self.assertEqual(status, 200)
+            MSG.ingest({
+                'id': archived_id, 'group': archived_id, 'source': 'test',
+                'level': 'urgent', 'title': 'archived exhausted',
+            })
+            with MSG._conn():
+                MSG._conn().execute(
+                    'UPDATE cards SET send_attempts=?,send_next_at=NULL WHERE card_id=?',
+                    (MSG.MAX_DELIVERY_ATTEMPTS, archived_id))
+            MSG.archive(archived_id)
+            status, archived = self._get('/api/health')
+            self.assertEqual(status, 200)
+            self.assertEqual(archived['failed_count'], baseline['failed_count'])
+            AC7['archived_filtered'] = 1
+
+            MSG.ingest({
+                'id': active_id, 'group': active_id, 'source': 'test',
+                'level': 'urgent', 'title': 'active exhausted',
+            })
+            with MSG._conn():
+                MSG._conn().execute(
+                    'UPDATE cards SET send_attempts=?,send_next_at=NULL WHERE card_id=?',
+                    (MSG.MAX_DELIVERY_ATTEMPTS, active_id))
+            status, active = self._get('/api/health')
+            self.assertEqual(status, 200)
+            self.assertEqual(active['failed_count'], baseline['failed_count'] + 1)
+            AC7['active_counted'] = 1
+        finally:
+            with MSG._conn():
+                MSG._conn().execute(
+                    'DELETE FROM ledger WHERE id IN (?,?)', (archived_id, active_id))
+                MSG._conn().execute(
+                    'DELETE FROM cards WHERE card_id IN (?,?)', (archived_id, active_id))
+            DM._MESSAGES_STATE = saved_state
 
 
     def test_percent_encoded_card_id_also_works_for_read(self):
@@ -1883,6 +1926,154 @@ class AppConfigMutationTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 'config_invalid')
 
 
+class PackageReregistrationTest(unittest.TestCase):
+    """A stale trust record is retained and explicitly approved, never erased."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        case = Path(self.tmp.name)
+        source = Path(HERE).parents[1]
+        self.root = case / 'checkout'
+        self.package = case / 'personal-package'
+        self.data = case / 'data' / 'db.sqlite'
+        (self.root / 'apps').mkdir(parents=True)
+        shutil.copytree(source / 'bin', self.root / 'bin')
+        # airlock-config 는 glyph 이름을 hub 스프라이트(hub/index.html)에서 대조한다 —
+        # 체크아웃에 그 파일이 없으면 validate 가 fail-closed 로 죽는다(c8370f4).
+        (self.root / 'hub').mkdir()
+        shutil.copy2(source / 'hub' / 'index.html', self.root / 'hub' / 'index.html')
+        for manifest in sorted((source / 'apps').glob('*/airlock-app.toml')):
+            target = self.root / 'apps' / manifest.parent.name
+            target.mkdir()
+            shutil.copy2(manifest, target / manifest.name)
+        self.package.mkdir()
+        (self.package / 'airlock-app.toml').write_text(
+            'contract = 1\nid = "retained-app"\n')
+        for script in ('install.sh', 'smoke.sh', 'deactivate.sh'):
+            path = self.package / script
+            path.write_text('#!/usr/bin/env bash\nset -euo pipefail\n')
+            path.chmod(0o755)
+        (self.package / 'payload.txt').write_text('approved bytes\n')
+        self.data.parent.mkdir()
+        self.data.write_text('operator data\n')
+        self.config = self.root / 'airlock.toml'
+        self.config.write_text(
+            '[airlock]\nconfig_version = 2\n'
+            '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n'
+            '[apps.hub]\n')
+        self.saved_env = {name: os.environ.get(name) for name in (
+            'AIRLOCK_CONFIG', 'AIRLOCK_STATE_DIR', 'AIRLOCK_CONFIG_SNAPSHOT',
+            'AIRLOCK_CONFIG_SNAPSHOT_SHA256', 'AIRLOCK_INSTALL_PKG_INFO_SHA256')}
+        os.environ['AIRLOCK_CONFIG'] = str(self.config)
+        os.environ['AIRLOCK_STATE_DIR'] = str(case / 'state')
+        for name in ('AIRLOCK_CONFIG_SNAPSHOT', 'AIRLOCK_CONFIG_SNAPSHOT_SHA256',
+                     'AIRLOCK_INSTALL_PKG_INFO_SHA256'):
+            os.environ.pop(name, None)
+        self.saved_root = APPSTORE.default_root
+        APPSTORE.default_root = lambda: self.root
+
+    def tearDown(self):
+        APPSTORE.default_root = self.saved_root
+        for name, value in self.saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.tmp.cleanup()
+
+    def _config(self, *args):
+        return subprocess.run(
+            [sys.executable, str(self.root / 'bin' / 'airlock-config'), *args],
+            cwd=self.root, env=os.environ.copy(), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+
+    def _establish_lock_then_disable(self):
+        APPSTORE.register(self.config, 'retained-app', {'path': str(self.package)})
+        finalized = self._config('lock-finalize')
+        self.assertEqual(finalized.returncode, 0, finalized.stderr)
+        lock = self.root / 'airlock.lock'
+        lock_before = lock.read_bytes()
+        APPSTORE.mutate_enabled(self.config, 'retained-app', False)
+        disabled = self.config.read_bytes()
+        self.assertNotIn('retained-app', APPSTORE._load(self.config).get('apps', {}))
+        self.assertEqual(lock.read_bytes(), lock_before)
+        self.assertEqual(self.data.read_text(), 'operator data\n')
+        return lock, lock_before, disabled
+
+    def test_same_bytes_register_after_disable_without_rewriting_trust_or_data(self):
+        lock, lock_before, _disabled = self._establish_lock_then_disable()
+        preview = APPSTORE.package_preview(self.root, str(self.package))
+        self.assertFalse(preview['registered'])
+        self.assertFalse(preview['requires_reapproval'])
+
+        result = APPSTORE.register(
+            self.config, 'retained-app', {'path': preview['path'],
+                                          'grant': preview['grants']})
+        self.assertTrue(result['changed'])
+        self.assertEqual(self._config('validate').returncode, 0)
+        self.assertEqual(lock.read_bytes(), lock_before)
+        self.assertEqual(self.data.read_text(), 'operator data\n')
+
+    def test_changed_bytes_require_exact_digest_and_preserve_failed_state(self):
+        lock, lock_before, disabled = self._establish_lock_then_disable()
+        (self.package / 'payload.txt').write_text('changed bytes\n')
+        preview = APPSTORE.package_preview(self.root, str(self.package))
+        self.assertFalse(preview['registered'])
+        self.assertTrue(preview['requires_reapproval'])
+        backup = Path(str(self.config) + '.bak')
+        backup_before = backup.read_bytes()
+
+        with self.assertRaises(APPSTORE.AppsError) as strict:
+            APPSTORE.register(self.config, 'retained-app', {
+                'path': preview['path'], 'grant': preview['grants']})
+        self.assertEqual(strict.exception.code, 'config_invalid')
+        with self.assertRaises(APPSTORE.AppsError) as changed:
+            APPSTORE.register(self.config, 'retained-app', {
+                'path': preview['path'], 'grant': preview['grants']},
+                approved_digest='0' * 64)
+        self.assertEqual(changed.exception.code, 'config_invalid')
+        self.assertEqual(self.config.read_bytes(), disabled)
+        self.assertEqual(backup.read_bytes(), backup_before)
+        self.assertEqual(lock.read_bytes(), lock_before)
+
+        result = APPSTORE.register(self.config, 'retained-app', {
+            'path': preview['path'], 'grant': preview['grants']},
+            approved_digest=preview['digest'])
+        self.assertTrue(result['changed'])
+        self.assertNotEqual(self.config.read_bytes(), disabled)
+        self.assertEqual(backup.read_bytes(), disabled)
+        self.assertEqual(lock.read_bytes(), lock_before)
+        self.assertEqual(self.data.read_text(), 'operator data\n')
+        self.assertNotEqual(self._config('validate').returncode, 0)
+        approved = self._config(
+            'package-register-validate', 'retained-app', preview['digest'])
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+
+    def test_capability_change_is_rejected_until_its_grant_is_in_the_candidate(self):
+        lock, lock_before, disabled = self._establish_lock_then_disable()
+        (self.package / 'airlock-app.toml').write_text(
+            'contract = 1\nid = "retained-app"\n'
+            '[artifacts]\nunits = [{name = "retained-app.service", scope = "system"}]\n')
+        preview = APPSTORE.package_preview(self.root, str(self.package))
+        self.assertEqual(preview['grants'], ['system-unit'])
+        with self.assertRaises(APPSTORE.AppsError) as missing_grant:
+            APPSTORE.register(self.config, 'retained-app', {
+                'path': preview['path'], 'grant': []},
+                approved_digest=preview['digest'])
+        self.assertEqual(missing_grant.exception.code, 'config_invalid')
+        self.assertEqual(self.config.read_bytes(), disabled)
+        self.assertEqual(lock.read_bytes(), lock_before)
+
+        APPSTORE.register(self.config, 'retained-app', {
+            'path': preview['path'], 'grant': preview['grants']},
+            approved_digest=preview['digest'])
+        self.assertEqual(
+            APPSTORE._load(self.config)['packages']['retained-app']['grant'],
+            ['system-unit'])
+        self.assertEqual(lock.read_bytes(), lock_before)
+        self.assertEqual(self.data.read_text(), 'operator data\n')
+
+
 class UpdateExecRouteTest(unittest.TestCase):
     """The two new owner routes, driven through the real handler."""
 
@@ -1982,6 +2173,8 @@ class UpdateExecRouteTest(unittest.TestCase):
             steady_package = case / 'steady-app'
             (root / 'apps').mkdir(parents=True)
             shutil.copytree(source / 'bin', root / 'bin')
+            (root / 'hub').mkdir()
+            shutil.copy2(source / 'hub' / 'index.html', root / 'hub' / 'index.html')
             for manifest in sorted((source / 'apps').glob('*/airlock-app.toml')):
                 target = root / 'apps' / manifest.parent.name
                 target.mkdir()
@@ -2158,6 +2351,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             status, payload = self._req('POST', '/api/owner/apps/notes/remove', b'{}')
             self.assertEqual((status, payload['action']), (200, 'remove'))
             self.assertEqual(payload['execution'], 'install')
+            self.assertEqual(calls[-1], ('enabled', 'notes', False))
         finally:
             (DM.APPS.list_apps, DM.APPS.config_path,
              DM.APPS.register, DM.APPS.mutate_enabled) = saved
@@ -2242,6 +2436,35 @@ class UpdateExecRouteTest(unittest.TestCase):
             argv = self.launched[-1][1]['exec']
             self.assertIn(row['tree_digest'], argv)
             self.assertIn(str(package.resolve()), argv)
+        finally:
+            (DM.APPS.config_path, DM.APPS.package_preview, DM.APPS.register,
+             DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
+
+    def test_company_stale_lock_registration_uses_the_approved_reapproval_path(self):
+        saved = (DM.APPS.config_path, DM.APPS.package_preview, DM.APPS.register,
+                 DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry)
+        calls = []
+        row = {"id": "widget", "repo": "example/widgets", "commit": "1" * 40,
+               "tree_digest": "2" * 64, "label": "Widget", "sub": "apps/widget",
+               "installable": True, "reason": None}
+        config = Path('/tmp/catalog-fixture.toml')
+        package = Path('/tmp/catalog-stage/widget')
+        DM.APPS.config_path = lambda root: config
+        DM.APPS.package_preview = lambda root, path: {
+            'id': 'widget', 'path': path, 'digest': row['tree_digest'],
+            'installable': True, 'registered': False,
+            'requires_reapproval': True, 'grants': [],
+        }
+        DM.APPS.register = lambda *args, **kwargs: calls.append((args, kwargs))
+        DM.COMPANY_CATALOG.list_catalog = lambda path: [row]
+        DM.COMPANY_CATALOG.stage_entry = lambda root, path, entry: package
+        try:
+            status, payload = self._req(
+                'POST', '/api/owner/apps/widget/install-company', b'{}')
+            self.assertEqual((status, payload['action'], payload['execution']),
+                             (200, 'install-company', 'install'))
+            self.assertEqual(calls[0][1], {'approved_digest': row['tree_digest']})
+            self.assertIn('--reapprove', self.launched[-1][1]['exec'])
         finally:
             (DM.APPS.config_path, DM.APPS.package_preview, DM.APPS.register,
              DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
@@ -2334,6 +2557,29 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertIn('--approved-digest', argv)
             self.assertIn('--package-path', argv)
             self.assertNotIn('--reapprove', argv)
+        finally:
+            DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register = saved
+
+    def test_personal_stale_lock_registration_keeps_register_route_and_reapproves(self):
+        digest = 'e' * 64
+        package = '/srv/personal/returning'
+        saved = (DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register)
+        calls = []
+        DM.APPS.package_preview = lambda root, path: {
+            'id': 'returning', 'path': package, 'digest': digest,
+            'installable': True, 'registered': False,
+            'requires_reapproval': True, 'grants': [],
+        }
+        DM.APPS.config_path = lambda root: Path('/tmp/airlock.toml')
+        DM.APPS.register = lambda *args, **kwargs: calls.append((args, kwargs))
+        try:
+            status, payload = self._req(
+                'POST', '/api/owner/apps/returning/register',
+                json.dumps({'path': package, 'digest': digest}).encode())
+            self.assertEqual((status, payload['action'], payload['execution']),
+                             (200, 'register', 'install'))
+            self.assertEqual(calls[0][1], {'approved_digest': digest})
+            self.assertIn('--reapprove', self.launched[-1][1]['exec'])
         finally:
             DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register = saved
 
@@ -3133,4 +3379,14 @@ class HomeOrderRouteTest(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main(verbosity=1)
+    program = unittest.main(verbosity=1, exit=False)
+    if not program.result.wasSuccessful():
+        raise SystemExit(1)
+    revision = subprocess.check_output(
+        ['git', 'rev-parse', '--short=12', 'HEAD'],
+        cwd=Path(HERE).parent.parent, text=True).strip()
+    verdict = 'PASS' if all(value == 1 for value in AC7.values()) else 'FAIL'
+    print('AC-7 | expected: archived_filtered == 1 && active_counted == 1 | '
+          'observed: archived_filtered=%d,active_counted=%d | verdict: %s | '
+          'signal: fixture | evidence: apps/dev-monitor/test-backend.py@%s'
+          % (AC7['archived_filtered'], AC7['active_counted'], verdict, revision))
