@@ -59,11 +59,6 @@ Wants=airlock-devterm.service
 [Service]
 Type=simple
 ${gate_env}ExecStart=${PY} ${GATE_PY}
-# KillMode=process, same reason as the ttyd unit: the gate starts a detached
-# \`codex login --device-auth\` that must outlive a redeploy. setsid does not leave the
-# cgroup, so the default (control-group) kills the pending login while the user is
-# entering the code on their phone — and the old credential is already backed out.
-KillMode=process
 Restart=on-failure
 RestartSec=2
 
@@ -153,16 +148,9 @@ NGINX
 # why a per-location guard rather than widening the map on `location /`.
 # Trailing args beyond those are ignored: D-DEVTERM-9900 retired the plaintext redirect.
 #
-# ACCOUNT_PANEL_DIR (optional) is the platform's account-panel asset directory in the
-# webroot. When given, this gate serves panel.html and accounts.js from THERE instead
-# of from devterm's own web root — the panel is a platform asset (ACCT_OWN), and an
-# alias keeps one deployed copy rather than a per-app duplicate that can drift. Same
-# arrangement emit_owner_gate already uses for airlock-return.js, with one difference
-# that matters: these two carry their own owner guard. An nginx `if` only covers the
-# location it is written in, so a location added beside `location /` inherits nothing
-# from it, and the account panel is not a thing to hand to a passing collaborator.
-# The same directory carries the platform secret drop UI (secretdrop.js), aliased the
-# same way: devterm's page loads it and injects only terminal delivery + session target.
+# ACCOUNT_PANEL_DIR (optional) is the platform asset directory that carries the secret
+# drop UI (secretdrop.js). Devterm aliases only that adapter asset; account panel and
+# accounts.js are served exclusively below the hub's /airlock-accounts/ prefix.
 #
 # ACCOUNTS_PORT (optional) is the platform account/secret surface's loopback port
 # (bin/airlock-accounts-api). When given, the three secret-drop routes on this origin are
@@ -187,20 +175,6 @@ render_devterm_nginx() {
     # in 2026-08.
     sed -e "s|@@PANEL_DIR@@|${PANEL_DIR}|g" >"$extra" <<'NGINX'
 
-    # platform account panel (hub/assets/accounts) — served here, not by the hub,
-    # because accounts.js fetches root-absolute paths on the API's own origin.
-    location = /panel.html {
-        if ($owner_ok = 0) { return 403; }
-        alias @@PANEL_DIR@@/panel.html;
-        default_type text/html;
-        add_header Cache-Control "no-cache" always;
-    }
-    location = /accounts.js {
-        if ($owner_ok = 0) { return 403; }
-        alias @@PANEL_DIR@@/accounts.js;
-        default_type application/javascript;
-        add_header Cache-Control "no-cache" always;
-    }
     # platform secret drop UI — devterm's index.html loads it; the terminal injects only
     # delivery and the session's target box.
     location = /secretdrop.js {

@@ -29,16 +29,15 @@
  * navigates as before (never a dead menu entry). If a panel does not load within 6s the
  * modal says so and prints the address it tried, instead of showing a blank box.
  *
- * Subscription ring (all modes, legacy data-panel only): polls /acct-alert every 30s — the
- * same endpoint devterm's own account icon and the hub's pill use, so all three turn
- * amber (warn) or red-and-blinking (critical) at the same instant. The thresholds live
- * only in the backend, so there is no second copy here to drift. A failed poll clears
- * the ring: no reading is not a warning.
+ * Subscription ring (all modes): data-account-alert is a separate, explicit read
+ * authority for the exact /acct-alert URL. A panel destination only permits an iframe
+ * navigation and never implies cross-origin fetch permission. The one-release legacy
+ * data-panel alias remains both its account destination and its measured alert base.
+ * A failed poll clears the ring: no reading is not a warning.
  *
- * The new platform panel attributes do not silently become an alert authority: opening
- * an iframe is not the same browser permission as a cross-origin fetch. A legacy render
- * keeps its measured devterm ring; a new render makes no alert poll until that contract
- * is moved explicitly.
+ * The platform backend emits Access-Control-Allow-Origin only for /acct-alert and only
+ * when Origin is HTTPS on the exact Host hostname. The hub owner gate still decides who
+ * reaches it; this attribute decides which widget may ask the browser to expose it.
  *
  * Needs-action badge (all modes unless data-badge="0"): polls Dev Monitor's owner
  * message preview every 30s and shows the "still needs a person" count (falling back to
@@ -95,10 +94,12 @@
   // data-menu="1" + a destination: tap opens a small menu instead of navigating
   // immediately, so a tool that owns the whole screen can still reach the panels.
   // accountBase and secretBase are separate authorities; new renders point both at the
-  // platform surface. legacyBase is an account-only compatibility input.
+  // platform surface. accountAlert is a separate fetch authority; legacyBase is an
+  // account-only compatibility input.
   var wantMenu = false;
   var accountBase = "";
   var secretBase = "";
+  var accountAlert = "";
   var legacyBase = "";                              // data-panel as given (ring source)
   function baseUrl(v) { return String(v).replace(/\/+$/, "") + "/"; }
   // data-badge="0": skip the unread-badge poll entirely. Set only where the page's
@@ -122,6 +123,7 @@
       if (self.dataset.menu === "1") wantMenu = true;
       if (self.dataset.accountPanel) accountBase = baseUrl(self.dataset.accountPanel);
       if (self.dataset.secretPanel) secretBase = baseUrl(self.dataset.secretPanel);
+      if (self.dataset.accountAlert) accountAlert = String(self.dataset.accountAlert);
       // Legacy alias, one release: ACCOUNT only, never secret. An old gate points it at
       // devterm, so honouring it keeps that box's subscription entry working; reading it
       // as "both" would re-create exactly the coupling this split removes.
@@ -142,10 +144,9 @@
   // any tool origin). 404s (and the badge stays hidden) unless dev-monitor's
   // message console is enabled.
   var UNREAD_URL = AIRLOCK + "monitor/api/owner/messages/preview";
-  // The legacy devterm account base remains the only subscription-warning source. The
-  // platform panel destinations are iframe authorities, not implicit CORS permission.
-  var alertBase = legacyBase;
-  var ALERT_URL = alertBase ? alertBase + "acct-alert" : "";
+  // The legacy alias carries its old measured behavior for one release, but neither
+  // panel destination grants a fetch. New renders authorize the exact endpoint.
+  var ALERT_URL = accountAlert || (legacyBase ? legacyBase + "acct-alert" : "");
   var POLL_MS = 30000;
 
   var POS_KEY = "airlock:btn-pos-v1";               // per-device position (floating)

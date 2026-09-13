@@ -11,8 +11,6 @@
  *
  * Site facts (ports, hub origin, feature flags) come from window.__DEVTERM, templated
  * in by the installer. Nothing is hardcoded. Optional features degrade cleanly:
- *   accounts  — Claude account pool + Codex login UI (needs the account tools)
- *   xai       — OpenCode xAI login UI
  *   fileview  — click a file path in the terminal to open it in fileview
  *   orca      — the Orca worktree sidebar layout
  */
@@ -20,8 +18,7 @@
 
 // Runtime config + feature flags (see index.html). Absent keys => feature off.
 const DT = window.__DEVTERM || {};
-const FEAT = { accounts: !!DT.accounts, xai: !!DT.xai,
-               fileview: !!DT.fileview, orca: !!DT.orca };
+const FEAT = { fileview: !!DT.fileview, orca: !!DT.orca };
 
 (async function main() {
 
@@ -67,8 +64,6 @@ const insertUploadToken = (label, n, path) => sendInput(uploadTokenStr(label, n,
 function currentSession() {
   return new URLSearchParams(location.search).get('arg') || 'main';
 }
-
-let acct = null;   // account API (accounts.js initAccounts return) — injected below. seam: openAcctMenu / applyAcctIconCls / startAcctIconWatch / hideAcctTip
 
 // ---- terminal color themes — popular classics + a couple of lights. xterm ITheme + localStorage. ----
 const THEMES = {
@@ -807,7 +802,6 @@ function buildMobileKeys() {
   addKeep(mkIconKey(ICONS.paste, 'Paste — clipboard (text/image) straight to the terminal (one tap, no keyboard)', function () { pasteFromClipboard(); }));
   addKeep(mkIconKey(ICONS.grid, 'More (font, theme, upload, annotate, settings, keys)', function (b) { openMobileMenu(b); }));
   addKeep(mkIconKey(ICONS.panes, 'tmux (split, kill pane, scroll)', function (b) { openTmuxMenu(b); }));
-  if (FEAT.accounts || FEAT.xai) addKeep(mkIconKey(ICONS.claude, 'Switch account / subscriptions', function (b) { acct.openAcctMenu(b); }));
   addKeep(mkKey('A-', null, function () { stepFontSize(-1); mkFocus(); }));   // one step smaller
   addKeep(mkKey('A+', null, function () { stepFontSize(1); mkFocus(); }));    // one step larger (skips sizes that only thicken)
   addKeep(mkKey('esc', null, function () { sendInput('\x1b'); clearMobileMods('esc'); mkFocus(); }));   // esc — kept when collapsed (no ESC on some keyboards)
@@ -943,10 +937,6 @@ function openTmuxMenu(anchor) {
   placePop(pop, r.left, r.bottom + 6);
 }
 
-// ---- Claude account switch — code lives in accounts.js (DI boundary). Wire it here. ----
-// If accounts.js fails to load, the terminal still works (no-op fallback).
-acct = (window.initAccounts || function () { const n = function () {}; return { openAcctMenu: n, applyAcctIconCls: n, startAcctIconWatch: n, hideAcctTip: n }; })({ flash: flash, postJson: postJson, mkFocus: mkFocus, closeTabPops: closeTabPops, placePop: placePop });
-
 // ---- secret drop (value -> a file on this box -> the terminal gets only a path token) ----
 // The drop is the PLATFORM's (docs/tasks/active/platform-secret-drop.md): secretdrop.js
 // is hub/assets/accounts/secretdrop.js, aliased onto this origin by nginx, and its
@@ -971,7 +961,6 @@ const secretUI = (window.initSecretDrop || function () {
 });
 if (!window.initSecretDrop) console.warn('[devterm] secretdrop.js not loaded — secret drop disabled (the terminal is unaffected)');
 function openSecretDrop() { secretUI.openSecretDrop(); }   // declaration: hoisted for the menu above
-if (!window.initAccounts) console.warn('[devterm] accounts.js not loaded — account UI disabled (terminal still works)');
 
 // activate (capability + pref) — build/show bar + rebuild top controls. Re-run on matchMedia change.
 function applyMobileKeys() {
@@ -1609,10 +1598,6 @@ function buildControls() {   // right-side controls — square line icons
   ensureAirlock();           // left Airlock (once, idempotent) — before the MK.active early-return
   ctrlsEl.textContent = '';
   if (MK.active) return;                  // mobile: no top controls (all in the bottom bar). paneZoomBtn owned by buildMobileKeys.
-  if (FEAT.accounts || FEAT.xai) {
-    ctrlsEl.appendChild(mkIconBtn(ICONS.claude, 'Switch account / subscriptions', acct.openAcctMenu));
-    if (FEAT.accounts) { acct.applyAcctIconCls(); acct.startAcctIconWatch(); }
-  }
   // desktop: inline icons + pane-zoom
   paneZoomBtn = mkIconBtn(ICONS.paneZoom, 'Zoom pane (current only)', paneZoomToggle);
   const utils = [
@@ -1637,7 +1622,7 @@ function buildControls() {   // right-side controls — square line icons
 // ---- tab popups (right-click menu / overflow list) ----
 let _popOpener = null;
 let _popClosedAnchor = null;
-function closeTabPops() { document.querySelectorAll('.tab-pop').forEach((p) => p.remove()); _popOpener = null; if (acct) acct.hideAcctTip(); }
+function closeTabPops() { document.querySelectorAll('.tab-pop').forEach((p) => p.remove()); _popOpener = null; }
 document.addEventListener('pointerdown', (e) => {
   if (!e.target || !e.target.closest) return;
   if (e.target.closest('.tab-pop')) return;

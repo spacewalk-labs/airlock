@@ -388,10 +388,8 @@ fi
 
 # ===========================================================================
 # devterm — apps/devterm/render.sh
-# Branch: ACCOUNTS (true vs false) adds four Environment= lines (claude
-# switch/status, fleet store) to the gate unit's gate_env block. The nginx
-# fragment is unaffected by ACCOUNTS (composed via emit_owner_gate plus the
-# platform account-panel alias block). Sets: accounts-off, accounts-on.
+# Retired account flags no longer change the gate unit or nginx fragment. The two sets
+# remain as an order-independence control and still exercise compatibility-shim output.
 # ===========================================================================
 APP="$ROOT/apps/devterm"
 . "$APP/render.sh"
@@ -401,8 +399,9 @@ for SET in accounts-off accounts-on; do
   PY="/usr/bin/python3"; GATE_PY="$APP/backend/devterm-gate.py"
   WEB_ROOT="/home/example/.local/share/airlock-devterm/web"
   IDENTITY_HEADER="Tailscale-User-Login"; AIRLOCK_OWNER="owner@fixture.dev"
-  CODE_ROOT=""; FILEVIEW=false; REMOTE_HOSTS=""; ORCA_SHIM=""
-  XAI=false
+  FILEVIEW=false; REMOTE_HOSTS=""; ORCA_SHIM=""
+  FLEET_READ_DOMAIN=""; FLEET_STORE=""
+  CLAUDE_STATUS="$ROOT/bin/airlock-accounts-status"
   REV="deadbeefcafe"
   CANON="https://box.example.ts.net:${GATE_PORT}"
   ACCOUNT_PANEL_DIR="/opt/airlock/hub/assets/accounts"
@@ -419,12 +418,9 @@ for SET in accounts-off accounts-on; do
 "; }
   add_env PATH "$UNIT_PATH"
   case "$SET" in
-    accounts-off) ACCOUNTS=false ;;
+    accounts-off) ;;
     accounts-on)
-      ACCOUNTS=true
       CLAUDE_SWITCH="$ROOT/bin/airlock-accounts"
-      CLAUDE_STATUS="$ROOT/bin/airlock-accounts-status"
-      FLEET_STORE=""; FLEET_STORE_URL=""
       ;;
   esac
   add_env DEVTERM_REV "$REV"
@@ -435,19 +431,12 @@ for SET in accounts-off accounts-on; do
   add_env DEVTERM_WEB "$WEB_ROOT"
   add_env AIRLOCK_IDENTITY_HEADER "$IDENTITY_HEADER"
   add_env AIRLOCK_OWNER "$AIRLOCK_OWNER"
-  add_env AIRLOCK_CODE_ROOT "$CODE_ROOT"
   add_env DEVTERM_FILEVIEW "$FILEVIEW"
-  add_env DEVTERM_ACCOUNTS "$ACCOUNTS"
-  add_env DEVTERM_XAI "$XAI"
   add_env DEVTERM_REMOTE_HOSTS "$REMOTE_HOSTS"
   add_env DEVTERM_ORCA_SHIM "$ORCA_SHIM"
-  add_env DEVTERM_ACCOUNTS_BIN "$ROOT/bin/airlock-accounts"
-  if [ "$ACCOUNTS" = true ]; then
-    add_env DEVTERM_CLAUDE_STATUS "$CLAUDE_STATUS"
-    add_env DEVTERM_CLAUDE_SWITCH "$CLAUDE_SWITCH"
-    add_env DEVTERM_FLEET_STORE "$FLEET_STORE"
-    add_env DEVTERM_FLEET_STORE_URL "$FLEET_STORE_URL"
-  fi
+  add_env DEVTERM_FLEET_READ_DOMAIN "$FLEET_READ_DOMAIN"
+  add_env DEVTERM_CLAUDE_STATUS "$CLAUDE_STATUS"
+  [ -z "$FLEET_STORE" ] || add_env DEVTERM_FLEET_STORE "$FLEET_STORE"
 
   f="$(out_file)"; render_to "$f" render_devterm_unit_ttyd "$DEVTERM_LANG" "$TTYD_PORT" "$TTYD_BIN" "$FONT_SIZE"
   golden_check_file "devterm/$SET/unit-ttyd.service" "$f"
@@ -455,7 +444,7 @@ for SET in accounts-off accounts-on; do
   f="$(out_file)"; render_to "$f" render_devterm_unit_gate "$BACKEND_PORT" "$gate_env" "$PY" "$GATE_PY"
   golden_check_file "devterm/$SET/unit-gate.service" "$f"
 
-  if [ "$ACCOUNTS" = true ]; then
+  if [ "$SET" = accounts-on ]; then
     f="$(out_file)"; render_to "$f" render_devterm_exec_shim "$CLAUDE_SWITCH"
     golden_check_file "devterm/$SET/shim-claude-switch" "$f"
     f="$(out_file)"; render_to "$f" render_devterm_exec_shim "$CLAUDE_STATUS"
@@ -2004,11 +1993,11 @@ fi
 SHIM_XAI="$TMP/devterm-shim-xai-only"
 run_devterm_shim_install "$SHIM_XAI" $'accounts = false\nxai = true'
 if [ "$(cat "$SHIM_XAI/rc")" = 0 ] \
-   && [ ! -e "$SHIM_XAI/home/.local/bin/claude-switch" ] \
+   && cmp -s "$SHIM_EXPECT_SWITCH" "$SHIM_XAI/home/.local/bin/claude-switch" \
    && cmp -s "$SHIM_EXPECT_STATUS" "$SHIM_XAI/home/.local/bin/claude-status"; then
-  ok "devterm xAI-only install creates only the platform status shim"
+  ok "devterm compatibility shims are independent of retired account flags"
 else
-  bad "devterm xAI-only install produced the wrong compatibility shims"
+  bad "retired account flags still change devterm compatibility shims"
   tail -25 "$SHIM_XAI/out" | sed 's/^/    /'
 fi
 

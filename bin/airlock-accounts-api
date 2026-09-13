@@ -37,9 +37,10 @@ SECRET DROP
 
 BINDING
     127.0.0.1 only. The hub's nginx proxies /airlock-accounts/ here behind
-    `if ($owner_ok = 0) { return 403; }` — see install/render-nginx.sh, where that guard
-    is the ONLY declaration of this surface's audience because the hub is platform core
-    and has no manifest to declare it in a second time.
+    a composed owner/fleet-read guard — see install/render-nginx.sh. The owner retains
+    the complete surface; a configured identity domain gets only four exact GET routes.
+    Nginx overwrites the verified ingress facts and this service re-checks them before
+    dispatch because the hub is platform core and has no manifest audience declaration.
 """
 
 import json
@@ -75,6 +76,19 @@ OPENCODE_BIN = os.environ.get("AIRLOCK_OPENCODE_BIN", "").strip()
 # The platform secret-drop CLI. Handed in like the account CLIs; unset means every secret
 # route answers the fixed failure below rather than guessing a path.
 SECRET_BIN = os.environ.get("AIRLOCK_SECRET_BIN", "").strip()
+
+# The platform nginx surface widens exactly four GETs for a configured fleet identity
+# domain. It overwrites these headers before proxying so this loopback service can
+# independently re-check method, route and whole email domain without needing a second
+# systemd/config wiring path. Requests without the platform marker are the temporary
+# devterm compatibility proxy and retain their existing guards until its consumer moves.
+PLATFORM_GATE_HEADER = "X-Airlock-Platform-Account-Gate"
+PLATFORM_OWNER_HEADER = "X-Airlock-Owner-Ok"
+PLATFORM_LOGIN_HEADER = "X-Airlock-Verified-Login"
+PLATFORM_FLEET_DOMAIN_HEADER = "X-Airlock-Fleet-Read-Domain"
+FLEET_READ_PATHS = frozenset({"/claude-status", "/claude-usage",
+                              "/claude-usage-store", "/codex-usage"})
+_FLEET_DOMAIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\Z")
 
 # ---- secret drop HTTP boundary -------------------------------------------------------
 # The CLI owns the store, validation, modes, atomicity, cap and lifetime. What only an
@@ -1420,15 +1434,89 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "airlock-accounts-api"
     sys_version = ""
 
-    def _send(self, status, payload):
+    def _account_alert_cors_origin(self):
+        """Return an exact same-box HTTPS Origin, or None.
+
+        A panel URL permits iframe navigation; it does not permit a cross-origin read.
+        Only /acct-alert calls this helper, and its widget consumer carries a separate
+        data-account-alert authority. Compare the complete hostname, not its first label,
+        and refuse paths, credentials, non-HTTPS origins and malformed ports.
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        host = (self.headers.get("Host") or "").strip()
+        if not origin or not host:
+            return None
+        try:
+            parsed_origin = urllib.parse.urlsplit(origin)
+            parsed_host = urllib.parse.urlsplit("//" + host)
+            if (parsed_origin.scheme != "https"
+                    or parsed_origin.username is not None
+                    or parsed_origin.password is not None
+                    or parsed_host.username is not None
+                    or parsed_host.password is not None
+                    or parsed_origin.path
+                    or parsed_origin.query
+                    or parsed_origin.fragment
+                    or parsed_host.path
+                    or parsed_host.query
+                    or parsed_host.fragment
+                    or not parsed_origin.hostname
+                    or not parsed_host.hostname
+                    or parsed_origin.hostname.lower() != parsed_host.hostname.lower()):
+                return None
+            # Force validation now; malformed ports raise ValueError.
+            parsed_origin.port
+            parsed_host.port
+        except (TypeError, ValueError):
+            return None
+        return origin
+
+    def _send(self, status, payload, cors_origin=None):
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         # The answer is login state and usage. A cached one is a wrong one.
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        if cors_origin:
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
+
+    def _platform_ingress_allowed(self):
+        """Apply the platform prefix's defense-in-depth audience guard.
+
+        The old devterm proxy does not carry the platform marker, so it stays under its
+        own two guards during the caller overlap. A marked request is owner-wide or one
+        exact fleet GET; missing identity/domain, other domains, other methods and other
+        routes all receive 403 before dispatch.
+        """
+        if self.headers.get(PLATFORM_GATE_HEADER) != "1":
+            return True
+        if self.headers.get(PLATFORM_OWNER_HEADER) == "1":
+            return True
+        if self.command != "GET":
+            self._send(403, {"ok": False, "error": "platform account route not allowed"})
+            return False
+        path = urllib.parse.urlsplit(self.path).path
+        if path not in FLEET_READ_PATHS:
+            self._send(403, {"ok": False, "error": "platform account route not allowed"})
+            return False
+        login = (self.headers.get(PLATFORM_LOGIN_HEADER) or "").strip().lower()
+        domain = (self.headers.get(PLATFORM_FLEET_DOMAIN_HEADER) or "").strip().lower()
+        domain = domain.removeprefix("@")
+        if not _FLEET_DOMAIN_RE.fullmatch(domain):
+            self._send(403, {"ok": False, "error": "platform account route not allowed"})
+            return False
+        if not login:
+            self._send(403, {"ok": False, "error": "platform account route not allowed"})
+            return False
+        local, sep, login_domain = login.partition("@")
+        if not local or sep != "@" or login_domain != domain:
+            self._send(403, {"ok": False, "error": "platform account route not allowed"})
+            return False
+        return True
 
     def _not_found(self):
         """A route this surface does not serve.
@@ -1454,6 +1542,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):  # noqa: N802
         # Answer the same status as GET, without a body. Explicit because the fallback
         # for a missing method is the HTML page above.
+        if not self._platform_ingress_allowed():
+            return
         if self.path == "/claude-status":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1491,6 +1581,8 @@ class Handler(BaseHTTPRequestHandler):
         # AIRLOCK_ACCOUNTS_PANEL_MOUNT_END
 
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
+        if not self._platform_ingress_allowed():
+            return
         if self._panel_route():
             return
         if self.path == "/claude-status":
@@ -1518,7 +1610,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(status, payload)
             return
         if self.path == "/acct-alert":
-            self._send(200, _acct_alert_payload())
+            self._send(200, _acct_alert_payload(), self._account_alert_cors_origin())
             return
         if self.path == "/codex-usage":
             self._send(200, _codex_usage_cached(wait=True))
@@ -1616,6 +1708,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(_secret_status(payload), payload)
 
     def do_POST(self):  # noqa: N802
+        if not self._platform_ingress_allowed():
+            return
         if self.path == "/secret-put":
             self._serve_secret_put()
             return

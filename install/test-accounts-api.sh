@@ -13,8 +13,16 @@
 # (T4/T5 below are the checks that would have caught it).
 set -euo pipefail
 
+EMIT_AC=0
+case "${1:-}" in
+  "") ;;
+  --emit-ac) EMIT_AC=1 ;;
+  *) echo "usage: $0 [--emit-ac]" >&2; exit 2 ;;
+esac
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+API_SOURCE="${AIRLOCK_ACCOUNTS_API_SOURCE:-$ROOT/bin/airlock-accounts-api}"
 
 TMP="$(mktemp -d)"
 STATE_ROOT="$TMP/state"
@@ -112,7 +120,7 @@ start() {
   AIRLOCK_HUB_ACCOUNTS_PORT="$PORT" AIRLOCK_ACCOUNTS_STATUS_BIN="$1" \
     AIRLOCK_STATE_DIR="$STATE_ROOT" \
     AIRLOCK_ACCOUNTS_BIN="$1" \
-    python3 "$ROOT/bin/airlock-accounts-api" >"$TMP/srv.log" 2>&1 &
+    python3 "$API_SOURCE" >"$TMP/srv.log" 2>&1 &
   SRV_PID=$!
   for _ in $(seq 1 40); do
     curl -s -o /dev/null "http://127.0.0.1:$PORT/claude-status" && return 0
@@ -129,6 +137,11 @@ start "$TMP/fake-status" || { bad "server did not come up: $(cat "$TMP/srv.log")
 body() { curl -s "http://127.0.0.1:$PORT$1"; }
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 ctype() { curl -s -D- -o /dev/null "$@" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type"{print $2}'; }
+header_value() {
+  local name="$1"; shift
+  curl -sS -D- -o /dev/null "$@" | tr -d '\r' \
+    | awk -F': ' -v wanted="$name" 'tolower($1)==tolower(wanted){print $2}'
+}
 
 # ---- T1: the one route it serves forwards the CLI's JSON ----
 [ "$(body /claude-status)" = '{"enabled": true, "active": "someone@example.test", "kind": "max"}' ] \
@@ -363,6 +376,108 @@ a="$(body /acct-alert)"
 printf '%s' "$a" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is True; assert d["level"] in ("none","warn","crit"); assert d["thresholds"]["warn5"]' 2>/dev/null \
   && ok "T20: /acct-alert returns a grade and the thresholds behind it" \
   || bad "T20: unexpected acct-alert payload: $a"
+
+# ---- T20b: cross-origin alert read is exact, route-scoped and explicit ----
+# The browser executes the return widget on owner-gated app ports. Its separate
+# data-account-alert authority points here, so this one non-secret read needs CORS from
+# the service that owns the answer. A panel URL alone grants nothing in the widget, and
+# this backend must not turn that into CORS on the rest of the account surface.
+cors_origin='https://box.example.ts.net:19953'
+cors_host='box.example.ts.net'
+cors_allowed=0 cors_varies=0 cors_route_scoped=0 cors_denied=0
+acao="$(header_value Access-Control-Allow-Origin \
+  -H "Host: $cors_host" -H "Origin: $cors_origin" \
+  "http://127.0.0.1:$PORT/acct-alert")"
+vary="$(header_value Vary \
+  -H "Host: $cors_host" -H "Origin: $cors_origin" \
+  "http://127.0.0.1:$PORT/acct-alert")"
+if [ "$acao" = "$cors_origin" ]; then
+  cors_allowed=1
+  ok "T20b: /acct-alert reflects an exact same-box HTTPS app origin"
+else
+  bad "T20b: exact same-box origin got Access-Control-Allow-Origin=${acao:-<absent>}"
+fi
+if [ "$vary" = Origin ]; then
+  cors_varies=1
+  ok "T20b: the reflected alert response varies by Origin"
+else
+  bad "T20b: the reflected alert response lacks Vary: Origin"
+fi
+if [ -z "$(header_value Access-Control-Allow-Origin \
+  -H "Host: $cors_host" -H "Origin: $cors_origin" \
+  "http://127.0.0.1:$PORT/accounts")" ]; then
+  cors_route_scoped=1
+  ok "T20b: the same explicit origin gets no CORS authority on /accounts"
+else
+  bad "T20b: CORS authority escaped /acct-alert onto /accounts"
+fi
+for refused_origin in \
+  'https://other.example.ts.net:19953' \
+  'https://box.example.ts.net.evil.test:19953' \
+  'http://box.example.ts.net:19953' \
+  'https://user@box.example.ts.net:19953' \
+  'https://box.example.ts.net:19953/path'
+do
+  acao="$(header_value Access-Control-Allow-Origin \
+    -H "Host: $cors_host" -H "Origin: $refused_origin" \
+    "http://127.0.0.1:$PORT/acct-alert")"
+  if [ -z "$acao" ]; then
+    cors_denied=$((cors_denied + 1))
+  else
+    bad "T20b: refused origin was reflected: $refused_origin"
+  fi
+done
+[ "$cors_denied" -eq 5 ] \
+  && ok "T20b: other host, suffix host, HTTP, credentials and path origins get no CORS" \
+  || bad "T20b: only $cors_denied/5 malformed or foreign origins were denied"
+
+# ---- T20c: platform fleet read-open is re-checked behind nginx ----
+# render-nginx overwrites these four facts on the platform prefix. Supplying them here
+# exercises the backend half directly: the temporary devterm compatibility proxy sends
+# no marker and therefore continues to use its own two guards until the caller moves.
+platform_code() {
+  local login="$1" method="$2" path="$3"
+  local -a headers=(
+    -H 'X-Airlock-Platform-Account-Gate: 1'
+    -H 'X-Airlock-Owner-Ok: 0'
+    -H 'X-Airlock-Fleet-Read-Domain: fixture.dev'
+  )
+  [ -z "$login" ] || headers+=( -H "X-Airlock-Verified-Login: $login" )
+  curl -sS -o /dev/null -w '%{http_code}' -X "$method" "${headers[@]}" \
+    "http://127.0.0.1:$PORT$path"
+}
+fleet_allowed=0
+for fleet_path in /claude-status '/claude-usage?slot=live' /claude-usage-store /codex-usage; do
+  [ "$(platform_code collector@fixture.dev GET "$fleet_path")" = 200 ] \
+    && fleet_allowed=$((fleet_allowed + 1))
+done
+[ "$fleet_allowed" = 4 ] \
+  && ok "T20c: in-domain platform identity reads all four declared fleet routes" \
+  || bad "T20c: in-domain identity read only $fleet_allowed/4 declared fleet routes"
+
+fleet_denied=0
+[ "$(platform_code collector@outside.invalid GET /claude-status)" = 403 ] \
+  && fleet_denied=$((fleet_denied + 1)) \
+  || bad "T20c: out-of-domain platform identity was not denied"
+[ "$(platform_code '' GET /claude-status)" = 403 ] \
+  && fleet_denied=$((fleet_denied + 1)) \
+  || bad "T20c: missing platform identity was not denied"
+[ "$(platform_code collector@fixture.dev POST /acct-switch)" = 403 ] \
+  && fleet_denied=$((fleet_denied + 1)) \
+  || bad "T20c: in-domain platform identity reached a mutation"
+[ "$(platform_code collector@fixture.dev GET /accounts)" = 403 ] \
+  && fleet_denied=$((fleet_denied + 1)) \
+  || bad "T20c: in-domain platform identity reached an undeclared read"
+[ "$fleet_denied" = 4 ] \
+  && ok "T20c: out-of-domain, missing, mutation and undeclared reads all return 403" \
+  || bad "T20c: only $fleet_denied/4 platform denial controls returned 403"
+
+owner_platform_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H 'X-Airlock-Platform-Account-Gate: 1' -H 'X-Airlock-Owner-Ok: 1' \
+  "http://127.0.0.1:$PORT/accounts")"
+[ "$owner_platform_code" = 200 ] \
+  && ok "T20c: the platform owner retains the complete account surface" \
+  || bad "T20c: platform owner account read returned $owner_platform_code"
 # 🔴 The alert must NOT carry an identity. It is polled by the return widget from other
 # apps' origins, so a login or email here would cross a boundary the panel does not.
 printf '%s' "$a" | grep -qiE 'someone@example|"email"|"active"' \
@@ -483,6 +598,25 @@ case "$r" in
 esac
 c="$(curl -s -o /dev/null -w '%{http_code}' -I "http://127.0.0.1:$PORT/codex-status")"
 [ "$c" = 404 ] && ok "T16: /codex-status is GET-only — HEAD is a JSON 404, not a 200 that ignores the probe" || bad "T16: HEAD /codex-status answered $c"
+
+if [ "$EMIT_AC" = 1 ]; then
+  cors_verdict=FAIL
+  [ "$cors_allowed" = 1 ] && [ "$cors_varies" = 1 ] \
+    && [ "$cors_route_scoped" = 1 ] && [ "$cors_denied" = 5 ] \
+    && cors_verdict=PASS
+  revision="$(git -C "$ROOT" rev-parse HEAD)"
+  printf 'AC-DTI-P2H | expected: cors_allowed==1 && cors_varies==1 && cors_route_scoped==1 && cors_denied==5 | observed: cors_allowed=%s,cors_varies=%s,cors_route_scoped=%s,cors_denied=%s | verdict: %s | signal: fixture | evidence: install/test-accounts-api.sh@%s\n' \
+    "$cors_allowed" "$cors_varies" "$cors_route_scoped" "$cors_denied" "$cors_verdict" "$revision"
+  fleet_allow_verdict=FAIL
+  [ "$fleet_allowed" = 4 ] && [ "$owner_platform_code" = 200 ] \
+    && fleet_allow_verdict=PASS
+  printf 'AC-DTI-P3A | expected: declared_reads==4 && owner_surface==200 | observed: declared_reads=%s,owner_surface=%s | verdict: %s | signal: fixture | evidence: install/test-accounts-api.sh@%s\n' \
+    "$fleet_allowed" "$owner_platform_code" "$fleet_allow_verdict" "$revision"
+  fleet_deny_verdict=FAIL
+  [ "$fleet_denied" = 4 ] && fleet_deny_verdict=PASS
+  printf 'AC-DTI-P3B | expected: out_domain==403 && missing_identity==403 && mutation==403 && undeclared_read==403 | observed: denial_controls=%s/4 | verdict: %s | signal: fixture | evidence: install/test-accounts-api.sh@%s\n' \
+    "$fleet_denied" "$fleet_deny_verdict" "$revision"
+fi
 
 if [ "$fails" -gt 0 ]; then
   printf '\n%d check(s) failed\n' "$fails" >&2

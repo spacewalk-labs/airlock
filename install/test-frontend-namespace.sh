@@ -40,14 +40,13 @@ grep -qF 'var LEGACY_POS_KEY = "swk:airlock-btn-pos-v1";' "$JS" || bad "the lega
 grep -qF "window.parent.postMessage('swk-panel-close', '*');" "$PANEL" \
   || bad "panel.html no longer emits the legacy close message (an old parent stops closing)"
 
-# ---- ACCT_OWN: three hosts, one panel ----
-# The return widget, the hub's identity pill and devterm's own page must open the SAME
-# account panel — that is what "promoted, not copied" means, and it is a property no
-# single file's test can see. All three are asserted here because the URL is built
-# independently in two places and loaded by a third, and a drift in any one of them is
-# a second implementation nobody decided to create.
+# ---- ACCT_OWN: platform consumers share one panel; devterm owns none ----
+# The return widget and hub identity pill open the same platform account panel. Phase 4
+# removes devterm's temporary account consumer, aliases, and account stylesheet surface.
 HUB="$ROOT/hub/index.html"
 DEVTERM_INDEX="$ROOT/apps/devterm/web/index.html"
+DEVTERM_APP="$ROOT/apps/devterm/web/app.js"
+DEVTERM_CONTROL="$ROOT/apps/devterm/web/platform-account-control.js"
 # The widget takes one authority per destination. Both account and secret destinations
 # now point at the platform prefix, but remain separate attributes; the split must not
 # turn into a second panel implementation or make the legacy account alias grant secret.
@@ -71,10 +70,15 @@ grep -qF 'data-account-panel="https://box.example.ts.net/airlock-accounts/"' \
 grep -qF 'data-secret-panel="https://box.example.ts.net/airlock-accounts/"' \
   "$ROOT/install/golden/render/orca/installer-path/nginx.conf" \
   || bad "the return widget is no longer injected with the platform secret prefix"
-# devterm loads the aliased platform file, not a copy of its own. `src="accounts.js"`
-# resolves to /accounts.js from the gate's root page, which is the alias.
+# Devterm no longer owns an account entrance. It must not load accounts.js or retain the
+# thin phase-2 account adapter.
 grep -qF '<script src="accounts.js"></script>' "$DEVTERM_INDEX" \
-  || bad "devterm no longer loads the platform account list"
+  && bad "devterm still loads accounts.js on its own origin" || true
+grep -qF '<script src="platform-account-control.js"></script>' "$DEVTERM_INDEX" \
+  && bad "devterm still loads its retired platform account consumer" || true
+grep -qF "window.initPlatformAccountControl" "$DEVTERM_APP" \
+  && bad "devterm app still wires its retired account consumer" || true
+[ -e "$DEVTERM_CONTROL" ] && bad "devterm still ships its retired account control" || true
 [ -e "$ROOT/apps/devterm/web/accounts.js" ] || [ -e "$ROOT/apps/devterm/web/panel.html" ] \
   && bad "devterm has a second copy of the account panel again" || true
 # The secret drop UI is the platform's the same way (docs/tasks/active/platform-secret-
@@ -83,7 +87,7 @@ grep -qF '<script src="secretdrop.js"></script>' "$DEVTERM_INDEX" \
   || bad "devterm no longer loads the platform secret drop"
 [ -e "$ROOT/apps/devterm/web/secretdrop.js" ] \
   && bad "devterm has a second copy of the secret drop UI again" || true
-[ "$fail" = 0 ] && ok "widget, hub pill and devterm all open one account panel"
+[ "$fail" = 0 ] && ok "widget and hub pill share one panel; devterm owns no account UI"
 
 # ---- wiring: the rules are called, not merely defined ----
 grep -qF 'if (document.getElementById(ID) || document.getElementById(LEGACY_ID)) return;' "$JS" \
@@ -138,20 +142,6 @@ t("undefined is not a close", airlockIsCloseMessage(undefined), false);
 if (bad) process.exit(1);
 console.log("ok   frontend-namespace: 11 rule cases");
 JS
-
-# The card's machine verdict for the consumer half: two independent consumers name the
-# same owner-gated mount, and the panel they open is still one implementation.
-#
-# The evidence strings are the MATCHES, not a line count. `grep -c f1 f2` prints one
-# line per file whether anything matched or not, so piping that to `wc -l` produced a
-# constant 2 that read like a finding (independent review of ae1b504). The verdict was
-# never wrong — the `grep -qF` gates above decide it — but an observed value that
-# cannot vary is not an observation.
-printf 'AC-DTI-P2F | expected: hub pill base == "/airlock-accounts/" && widget account+secret bases == https://<fqdn>/airlock-accounts/ && both open one panel.html | observed: pill_base=%s,widget_golden=%s,panel_paths=%s | verdict: %s | signal: fixture | evidence: install/test-frontend-namespace.sh\n' \
-  "$(grep -o 'return "/airlock-accounts/";' "$HUB" | wc -l | tr -d ' ')" \
-  "$(grep -o 'data-\(account\|secret\)-panel="[^"]*"' "$ROOT/install/golden/render/orca/installer-path/nginx.conf" | sort -u | tr '\n' ' ')" \
-  "hub=$(grep -ho 'panel\.html?p=[^;]*embed=1' "$HUB" | sort -u | tr -d '\n') widget=$(grep -ho 'panel\.html?p=[^;]*embed=1' "$JS" | sort -u | tr -d '\n')" \
-  "$([ "$fail" = 0 ] && echo PASS || echo FAIL)"
 
 if [ "$fail" != 0 ]; then echo "---"; echo "frontend-namespace: FAILED"; exit 1; fi
 echo "---"

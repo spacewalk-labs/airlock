@@ -55,7 +55,7 @@ airlock_load orca
 WIDGET_MENU_ATTRS=""
 PLATFORM_PANEL_URL="$(airlock_secret_panel_url || true)"
 if [ -n "$PLATFORM_PANEL_URL" ]; then
-  WIDGET_MENU_ATTRS=" data-menu=\"1\" data-account-panel=\"${PLATFORM_PANEL_URL}\" data-secret-panel=\"${PLATFORM_PANEL_URL}\""
+  WIDGET_MENU_ATTRS=" data-menu=\"1\" data-account-panel=\"${PLATFORM_PANEL_URL}\" data-secret-panel=\"${PLATFORM_PANEL_URL}\" data-account-alert=\"${PLATFORM_PANEL_URL}acct-alert\""
 fi
 
 GATE_PORT="${AIRLOCK_ORCA_GATE_PORT:?}"

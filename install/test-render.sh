@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Test install/render-nginx.sh: renders a valid site and passes `nginx -t`.
 set -uo pipefail
+EMIT_AC=0
+case "${1:-}" in
+  "") ;;
+  --emit-ac) EMIT_AC=1 ;;
+  *) echo "usage: $0 [--emit-ac]" >&2; exit 2 ;;
+esac
 # Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
 # this suite depends on the RAM of whichever box runs it: the share is 15/16 of the
 # box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
@@ -116,8 +122,8 @@ ACCT_LOC="$(awk '/location \/airlock-accounts\/ \{/{f=1} f{print} f&&/^    \}/{e
 [ -n "$ACCT_LOC" ] && ok "account surface: the prefix location is rendered" \
   || bad "account surface: no /airlock-accounts/ location in the hub block"
 grep -q 'if ($owner_ok = 0) { return 403; }' <<<"$ACCT_LOC" \
-  && ok "account surface: owner guard present (the hub gate admits collaborators)" \
-  || bad "account surface: NO owner guard — \$hub_ok admits collaborators, so this location is open to them"
+  && ok "account surface: owner guard remains the default without a fleet domain" \
+  || bad "account surface: default owner guard is absent"
 # $hub_ok here would be the fail-open spelling: it is what the server block already
 # applied, so writing it would look like a guard and gate nothing further.
 grep -q 'hub_ok' <<<"$ACCT_LOC" \
@@ -132,6 +138,76 @@ grep -qE 'proxy_pass http://127\.0\.0\.1:[0-9]+/;' <<<"$ACCT_LOC" \
 [ "$(grep -c 'location /airlock-accounts/' <<<"$SITE")" = 1 ] \
   && ok "account surface: exactly one location carries the whole surface" \
   || bad "account surface: more than one account location — each would need its own guard"
+
+# The platform fleet overlap consumes the existing devterm scalar at render time. It
+# must widen only four GETs at both the server gate and the account-prefix gate, then
+# standardize the same facts for the backend's independent re-check.
+FLEET_CONFIG="$TMP/fleet.toml"
+cat >"$FLEET_CONFIG" <<'TOML'
+[site]
+name = "My Dev Hub"
+[auth]
+provider = "tailscale"
+owner = "owner@owner.invalid"
+[apps.hub]
+[apps.publish]
+title_meta = true
+[apps.devterm]
+fleet_read_domain = "fixture.dev"
+TOML
+FLEET_SITE="$(AIRLOCK_CONFIG="$FLEET_CONFIG" bash "$HERE/render-nginx.sh" 2>"$TMP/fleet.err")" \
+  || { bad "fleet account surface render exited non-zero"; cat "$TMP/fleet.err"; }
+fleet_routes=0
+for fleet_path in claude-status claude-usage claude-usage-store codex-usage; do
+  count="$(grep -cF "\"0:1:GET:/airlock-accounts/$fleet_path\" 1;" <<<"$FLEET_SITE")"
+  [ "$count" = 2 ] && fleet_routes=$((fleet_routes + 1))
+done
+[ "$fleet_routes" = 4 ] \
+  && ok "fleet account surface: exactly four GET routes are admitted by both maps" \
+  || bad "fleet account surface: only $fleet_routes/4 routes appear in both maps"
+grep -qF '"~*^[^@]+@fixture\.dev$" 1;' <<<"$FLEET_SITE" \
+  && ok "fleet account surface: configured email domain is whole-match anchored" \
+  || bad "fleet account surface: domain map is absent or unanchored"
+grep -qF 'if ($airlock_accounts_hub_ok = 0) { return 403; }' <<<"$FLEET_SITE" \
+  && grep -qF 'if ($airlock_accounts_surface_ok = 0) { return 403; }' <<<"$FLEET_SITE" \
+  && ok "fleet account surface: server and prefix use separate composed guards" \
+  || bad "fleet account surface: one of the two guards is not active"
+fleet_base_composed=0
+grep -qF 'map "$publish_hub_ok:$airlock_accounts_fleet_identity_ok:$request_method:$uri" $airlock_accounts_hub_ok {' <<<"$FLEET_SITE" \
+  && fleet_base_composed=1
+[ "$fleet_base_composed" = 1 ] \
+  && ok "fleet account surface: composes with the existing exact publish exception" \
+  || bad "fleet account surface: replaced the existing publish hub selector"
+fleet_headers=0
+for header in \
+  'proxy_set_header X-Airlock-Platform-Account-Gate 1;' \
+  'proxy_set_header X-Airlock-Owner-Ok $owner_ok;' \
+  'proxy_set_header X-Airlock-Verified-Login $http_tailscale_user_login;' \
+  'proxy_set_header X-Airlock-Fleet-Read-Domain "fixture.dev";'
+do
+  grep -qF "$header" <<<"$FLEET_SITE" && fleet_headers=$((fleet_headers + 1))
+done
+[ "$fleet_headers" = 4 ] \
+  && ok "fleet account surface: backend re-check receives all overwritten facts" \
+  || bad "fleet account surface: only $fleet_headers/4 backend guard headers are wired"
+grep -q '0:1:POST:/airlock-accounts/' <<<"$FLEET_SITE" \
+  && bad "fleet account surface: a mutation appears in the exception map" \
+  || ok "fleet account surface: no mutation is admitted"
+grep -q '0:1:GET:/airlock-accounts/accounts' <<<"$FLEET_SITE" \
+  && bad "fleet account surface: undeclared account read is admitted" \
+  || ok "fleet account surface: undeclared reads stay closed"
+
+BAD_FLEET_CONFIG="$TMP/bad-fleet.toml"
+sed 's/fleet_read_domain = "fixture.dev"/fleet_read_domain = "fixture.dev; return 1"/' \
+  "$FLEET_CONFIG" >"$BAD_FLEET_CONFIG"
+malformed_refused=0
+if AIRLOCK_CONFIG="$BAD_FLEET_CONFIG" bash "$HERE/render-nginx.sh" \
+     >"$TMP/bad-fleet.out" 2>"$TMP/bad-fleet.err"; then
+  bad "fleet account surface: malformed domain reached nginx"
+else
+  malformed_refused=1
+  ok "fleet account surface: malformed domain is refused before nginx"
+fi
 
 grep -q 'listen 127.0.0.1:19903;'                  <<<"$SITE" && ok "hub redirect loopback port (default)" || bad "hub redirect port"
 # the authority must be the pinned FQDN — NOT $host (client-controlled = open
@@ -497,6 +573,24 @@ if command -v nginx >/dev/null 2>&1; then
   fi
 else
   echo "skip gated nginx e2e (nginx not installed)"
+fi
+
+if [ "$EMIT_AC" = 1 ]; then
+  fleet_guard_count="$(grep -cF 'if ($airlock_accounts_hub_ok = 0) { return 403; }' <<<"$FLEET_SITE")"
+  fleet_guard_count=$((fleet_guard_count + $(grep -cF 'if ($airlock_accounts_surface_ok = 0) { return 403; }' <<<"$FLEET_SITE")))
+  fleet_mutation_entries="$(grep -c '0:1:POST:/airlock-accounts/' <<<"$FLEET_SITE" || true)"
+  fleet_undeclared_entries="$(grep -c '0:1:GET:/airlock-accounts/accounts' <<<"$FLEET_SITE" || true)"
+  fleet_render_verdict=FAIL
+  [ "$fleet_routes" = 4 ] && [ "$fleet_guard_count" = 2 ] \
+    && [ "$fleet_headers" = 4 ] && [ "$fleet_mutation_entries" = 0 ] \
+    && [ "$fleet_undeclared_entries" = 0 ] && [ "$malformed_refused" = 1 ] \
+    && [ "$fleet_base_composed" = 1 ] \
+    && fleet_render_verdict=PASS
+  revision="$(git -C "$ROOT" rev-parse HEAD)"
+  printf 'AC-DTI-P3C | expected: route_maps==4 && guards==2 && proxy_facts==4 && mutation_entries==0 && undeclared_entries==0 && malformed_refused==1 && prior_gate_composed==1 | observed: route_maps=%s,guards=%s,proxy_facts=%s,mutation_entries=%s,undeclared_entries=%s,malformed_refused=%s,prior_gate_composed=%s | verdict: %s | signal: fixture | evidence: install/test-render.sh@%s\n' \
+    "$fleet_routes" "$fleet_guard_count" "$fleet_headers" "$fleet_mutation_entries" \
+    "$fleet_undeclared_entries" "$malformed_refused" "$fleet_base_composed" \
+    "$fleet_render_verdict" "$revision"
 fi
 
 echo "---"; echo "passed=$pass failed=$fail"

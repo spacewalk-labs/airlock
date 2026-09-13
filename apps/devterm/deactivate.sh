@@ -3,7 +3,7 @@
 # classes cover everything declared: "units" stops/disables/deletes both
 # airlock-devterm.service (ttyd) and airlock-devterm-gate.service;
 # "fragments" removes the servers.d nginx fragment; "files" removes ttyd,
-# devterm-shell, the optional claude-switch/claude-status tools, and the
+# devterm-shell, the platform compatibility claude-switch/claude-status shims, and the
 # web client's staged share dir; the ledger also retires the serve.https
 # tailscale mapping and the plaintext_redirect row (orchestrator-owned,
 # config-driven — nothing here to do for it either).

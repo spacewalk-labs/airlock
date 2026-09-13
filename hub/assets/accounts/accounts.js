@@ -3,9 +3,9 @@
  * Airlock subscription account pool — the one implementation of the account list.
  *   A PLATFORM asset (hub/assets/accounts/) since ACCT_OWN, 2026-09-01; it began as
  *   part of devterm's app.js, which is why the injected deps below are shaped like a
- *   terminal's. Its three hosts — devterm's own page, panel.html in the return
- *   widget's modal, and the hub's identity pill — all open THIS file, so a fix lands
- *   in all three at once.
+ *   terminal's. Its launchers — devterm's control, the return widget and the hub's
+ *   identity pill — all open panel.html on this platform origin, so this file executes
+ *   beside the platform API exactly once rather than being loaded on each app origin.
  *   Optional feature (the account icon is only shown when the accounts feature is
  *   enabled). Switch / usage / pool-login UI. Coupling to a terminal is only the
  *   injected functions below (no core vars), which is what let it move.
@@ -15,8 +15,7 @@
  *   that serves the account API, so the page hosting it must be served by that same
  *   gate and from the same directory. That is why the devterm gate aliases this file
  *   rather than the hub serving it at its own origin — until the surface moves.
- * Load order: before app.js in devterm's index.html; app.js calls this factory while
- *   running.
+ * Load order: before panel.html's inline host; the panel calls this factory.
  */
 window.initAccounts = function initAccounts(deps) {
   // Where the account API answers. Every fetch below is same-origin to the page that

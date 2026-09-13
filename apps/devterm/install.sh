@@ -6,9 +6,8 @@
 #           --(owner only / else 403)--> devterm-gate 127.0.0.1:BACKEND
 #                                        --> serves web/ + API, proxies /ws,/token --> ttyd --> tmux
 #
-# Config comes from airlock.toml ([apps.devterm]). Optional features (Claude account
-# pool, Codex login, fileview file-open, Orca worktree sidebar) turn on only when their
-# config + tools are present; otherwise they no-op cleanly.
+# Config comes from airlock.toml ([apps.devterm]). Optional terminal features (fileview
+# file-open and the Orca worktree sidebar) turn on only when their dependencies exist.
 # Honors AIRLOCK_DRY_RUN=1 (print system-mutating steps instead of running them).
 set -euo pipefail
 
@@ -39,21 +38,15 @@ TTYD_BIN="${TTYD_BIN:-$HOME/.local/bin/ttyd}"
 DEVTERM_LANG="${AIRLOCK_DEVTERM_LANG:-C.UTF-8}"
 FONT_SIZE="${AIRLOCK_DEVTERM_FONT_SIZE:-15}"
 IDENTITY_HEADER="${AIRLOCK_IDENTITY_HEADER:?}"
-ACCOUNTS="${AIRLOCK_DEVTERM_ACCOUNTS:-false}"
-XAI="${AIRLOCK_DEVTERM_XAI:-false}"
 REMOTE_HOSTS="${AIRLOCK_DEVTERM_REMOTE_HOSTS:-}"
-CLAUDE_SWITCH_CFG="${AIRLOCK_DEVTERM_CLAUDE_SWITCH:-}"
-CLAUDE_STATUS_CFG="${AIRLOCK_DEVTERM_CLAUDE_STATUS:-}"
 FLEET_STORE="${AIRLOCK_DEVTERM_FLEET_STORE:-}"
-FLEET_STORE_URL="${AIRLOCK_DEVTERM_FLEET_STORE_URL:-}"
 FLEET_READ_DOMAIN="${AIRLOCK_DEVTERM_FLEET_READ_DOMAIN:-}"
+# Kept schema-valid during the rollout but intentionally has no runtime effect: the
+# remaining compatibility route reads only the local fleet file.
+: "${AIRLOCK_DEVTERM_FLEET_STORE_URL:-}"
 ORCA_SHIM_CFG="${AIRLOCK_DEVTERM_ORCA_SHIM:-}"
 WEB_ROOT="$HOME/.local/share/airlock-devterm/web"
-# The subscription account panel is a platform asset (hub/assets/accounts), deployed
-# with the rest of hub/assets by the orchestrator. devterm serves it rather than
-# shipping a copy: accounts.js fetches root-absolute paths that only exist on this
-# gate, so the page has to be on this origin — but the implementation is not ours.
-# Same shape as paseo reading the shared return widget out of the webroot.
+# Devterm consumes only the platform-owned secret-drop adapter from this directory.
 ACCOUNT_PANEL_DIR="${AIRLOCK_WEBROOT:-/opt/airlock/hub}/assets/accounts"
 # The secret drop is the platform's too (docs/tasks/active/platform-secret-drop.md): its
 # UI is secretdrop.js in that same directory and its three routes belong to the platform
@@ -102,11 +95,10 @@ PY
 PLATFORM_ACCOUNTS_BIN="$(resolve_platform_bin AIRLOCK_ACCOUNTS_BIN "$AIRLOCK_ACCOUNTS_BIN")"
 PLATFORM_ACCOUNTS_STATUS_BIN="$(resolve_platform_bin AIRLOCK_ACCOUNTS_STATUS_BIN "$AIRLOCK_ACCOUNTS_STATUS_BIN")"
 
-# These app config keys remain compatibility overrides. Their empty default now means
-# the platform-owned binary rather than an app-bundled copy; see airlock-app.toml for
-# why the fail-closed config schema prevents retiring them without a real replacement.
-CLAUDE_SWITCH="${CLAUDE_SWITCH_CFG:-$PLATFORM_ACCOUNTS_BIN}"
-CLAUDE_STATUS="${CLAUDE_STATUS_CFG:-$PLATFORM_ACCOUNTS_STATUS_BIN}"
+# The orchestrator deliberately keeps passing the retired account feature/config
+# variables during the rollout. Devterm does not read them: the compatibility commands
+# and the temporary fleet status probe always target the platform-owned binaries.
+CLAUDE_STATUS="$PLATFORM_ACCOUNTS_STATUS_BIN"
 
 # is app <name> enabled in airlock.toml?
 app_enabled() { airlock_config apps | grep -qx "$1"; }
@@ -178,21 +170,15 @@ install_exec_shim() {
   fi
 }
 
-# Feature flags decide whether a fresh install promises the terminal affordance, but
-# they must not protect a stale file from an upgrade. Both paths are unconditional
-# manifest artifacts, so record-diff deliberately leaves them alone; if an older
-# devterm already installed its full credential writer, replace that existing path
-# even when the feature has since been disabled. -L also catches a broken symlink.
-if [ "$ACCOUNTS" = true ] || [ -e "$HOME/.local/bin/claude-switch" ] || [ -L "$HOME/.local/bin/claude-switch" ]; then
-  install_exec_shim "$PLATFORM_ACCOUNTS_BIN" "$HOME/.local/bin/claude-switch"
-fi
-if [ "$ACCOUNTS" = true ] || [ "$XAI" = true ] \
-   || [ -e "$HOME/.local/bin/claude-status" ] || [ -L "$HOME/.local/bin/claude-status" ]; then
-  install_exec_shim "$PLATFORM_ACCOUNTS_STATUS_BIN" "$HOME/.local/bin/claude-status"
-fi
+# Both paths are unconditional manifest artifacts. Install the platform shims
+# unconditionally too, so retired accounts/xai flags cannot change devterm's output and
+# an older full credential writer is replaced even when components upgrade in either
+# order.
+install_exec_shim "$PLATFORM_ACCOUNTS_BIN" "$HOME/.local/bin/claude-switch"
+install_exec_shim "$PLATFORM_ACCOUNTS_STATUS_BIN" "$HOME/.local/bin/claude-status"
 
 # --- 3. custom web client into WEB_ROOT (index.html templated with runtime config) ---
-CFG_JSON="{\"accounts\":${ACCOUNTS},\"xai\":${XAI},\"fileview\":${FILEVIEW},\"orca\":$([ -n "$ORCA_SHIM" ] && echo true || echo false)}"
+CFG_JSON="{\"fileview\":${FILEVIEW},\"orca\":$([ -n "$ORCA_SHIM" ] && echo true || echo false)}"
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] install web/ -> $WEB_ROOT (index.html config=${CFG_JSON}, + ui.js/popup.css)"
 else
@@ -204,7 +190,7 @@ else
   # /secretdrop.js to the platform asset, so the local one is unreachable — and an
   # unreachable stale copy of a secret-drop UI is exactly the file a later reader
   # mistakes for the live one.
-  rm -f "$WEB_ROOT/secretdrop.js"
+  rm -f "$WEB_ROOT/secretdrop.js" "$WEB_ROOT/platform-account-control.js"
   # template the config placeholder (JSON has no sed metachars; use | as delimiter)
   sed "s|%%DEVTERM_CONFIG%%|${CFG_JSON}|" "$HERE/web/index.html" > "$WEB_ROOT/index.html"
   chmod 644 "$WEB_ROOT/index.html"
@@ -242,14 +228,10 @@ REV="$(cat "$GATE_PY" "$HERE"/backend/bin_discovery.py \
         "$HERE"/web/app.js "$HERE"/web/ui.js "$HERE"/web/popup.css \
         "$HERE"/web/index.html 2>/dev/null | sha256sum | cut -c1-12)"
 
-# Unit PATH. This unit was the only one of the four that shipped without one, and it
-# is the one that spawns the most: codex, claude-switch/claude-status, and through
-# them `claude`. A systemd --user unit inherits a PATH with none of the directories a
-# node CLI installs into, so every `which` in the gate came back empty and the whole
-# Codex feature reported itself unavailable on a box where codex worked fine from a
-# shell. The gate now resolves those binaries itself (backend/bin_discovery.py), but
-# resolving is not enough: `codex` and `claude` are `#!/usr/bin/env node` scripts, so
-# node has to be findable through PATH or the exec fails after a successful lookup.
+# Unit PATH. Terminal helpers and the temporary platform status probe may spawn tools
+# installed in user-level node directories. A systemd --user unit does not reliably
+# inherit those paths, and resolving a `#!/usr/bin/env node` executable is not enough
+# unless node itself is findable too.
 #
 # Same shape as apps/paseo/install.sh: entries are added whether or not they exist
 # yet (the agent CLIs normally arrive after Airlock, and a non-existent PATH entry
@@ -278,35 +260,24 @@ add_env DEVTERM_WEB "$WEB_ROOT"
 add_env AIRLOCK_IDENTITY_HEADER "$IDENTITY_HEADER"
 add_env AIRLOCK_OWNER "$AIRLOCK_OWNER"
 add_env DEVTERM_FILEVIEW "$FILEVIEW"
-add_env DEVTERM_ACCOUNTS "$ACCOUNTS"
-add_env DEVTERM_XAI "$XAI"
 add_env DEVTERM_REMOTE_HOSTS "$REMOTE_HOSTS"
 add_env DEVTERM_ORCA_SHIM "$ORCA_SHIM"
 # The gate re-checks identity itself, so the read-open has to be known at BOTH layers
 # or nginx would forward a request the gate then 403s — a widened route that answers
 # 403 anyway is worse than a closed one, because the config says it is open.
 add_env DEVTERM_FLEET_READ_DOMAIN "$FLEET_READ_DOMAIN"
-# Always hand the non-overridable platform account path to the Codex lifecycle
-# endpoints. DEVTERM_CLAUDE_SWITCH may intentionally name an operator compatibility
-# tool, which is not required to know the platform-only codex-auth verb.
-add_env DEVTERM_ACCOUNTS_BIN "$PLATFORM_ACCOUNTS_BIN"
-# claude-status also carries the xAI adapter, so wire it for either feature.
-if [ "$ACCOUNTS" = true ] || [ "$XAI" = true ]; then
-  add_env DEVTERM_CLAUDE_STATUS "$CLAUDE_STATUS"
-fi
-# Claude pool-only tools and stores remain behind accounts.
-if [ "$ACCOUNTS" = true ]; then
-  add_env DEVTERM_CLAUDE_SWITCH "$CLAUDE_SWITCH"
-  add_env DEVTERM_FLEET_STORE "$FLEET_STORE"
-  add_env DEVTERM_FLEET_STORE_URL "$FLEET_STORE_URL"
-fi
+# Temporary fleet compatibility reads need only the status probe and optional store.
+# Account feature inputs may still be passed by an older orchestrator, but none enter
+# the devterm process environment or revive account routes/state.
+add_env DEVTERM_CLAUDE_STATUS "$CLAUDE_STATUS"
+[ -z "$FLEET_STORE" ] || add_env DEVTERM_FLEET_STORE "$FLEET_STORE"
 
 changed_gate=0
 # AIRLOCK_RENDER_DIR forces this write branch even under AIRLOCK_DRY_RUN=1 — see
 # install/lib.sh's fail-closed guard (RENDER_DIR without DRY_RUN=1 never reaches
 # this line) and apps/feedback/install.sh's identical comment.
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -z "${AIRLOCK_RENDER_DIR:-}" ]; then
-  log "[dry] write $UNIT_DIR/airlock-devterm-gate.service (127.0.0.1:$BACKEND_PORT; accounts=$ACCOUNTS xai=$XAI fileview=$FILEVIEW orca=$([ -n "$ORCA_SHIM" ] && echo true || echo false))"
+  log "[dry] write $UNIT_DIR/airlock-devterm-gate.service (127.0.0.1:$BACKEND_PORT; fleet_compat=$([ -n "$FLEET_READ_DOMAIN" ] && echo true || echo false) fileview=$FILEVIEW orca=$([ -n "$ORCA_SHIM" ] && echo true || echo false))"
 else
   if render_devterm_unit_gate "$BACKEND_PORT" "$gate_env" "$PY" "$GATE_PY" \
      | write_if_changed "$UNIT_DIR/airlock-devterm-gate.service"
@@ -345,4 +316,4 @@ log "wrote nginx fragment: $frag"
 # orchestrator will not open :9900 from this manifest.
 
 # NOTE: smoke runs from the orchestrator AFTER nginx is rendered + reloaded.
-log "devterm installed (owner: ${AIRLOCK_OWNER}; accounts=${ACCOUNTS}, xai=${XAI}, fileview=${FILEVIEW}, orca=$([ -n "$ORCA_SHIM" ] && echo true || echo false))"
+log "devterm installed (owner: ${AIRLOCK_OWNER}; fileview=${FILEVIEW}, orca=$([ -n "$ORCA_SHIM" ] && echo true || echo false))"

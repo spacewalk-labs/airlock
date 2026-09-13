@@ -96,6 +96,61 @@ map "$hub_ok:$tailnet_ok:$request_method:$uri" $publish_hub_ok {
 NGINX
 fi
 
+# The central fleet collector still declares its read domain on devterm while its
+# caller points at devterm's compatibility port.  The platform account surface needs
+# the same value during the overlap, but reading it here does not make devterm a runtime
+# dependency: airlock-config resolves one scalar while rendering nginx, and the emitted
+# maps and proxy headers stand alone afterwards.  Keep the read in a subshell so the
+# app-specific env cannot overwrite the hub values already selected above.
+ACCOUNTS_FLEET_READ_DOMAIN=""
+if airlock_config apps | grep -qx devterm; then
+  ACCOUNTS_FLEET_READ_DOMAIN="$({
+    eval "$(airlock_config env devterm)"
+    printf '%s' "${AIRLOCK_DEVTERM_FLEET_READ_DOMAIN:-}"
+  })"
+fi
+ACCOUNTS_FLEET_READ_DOMAIN="${ACCOUNTS_FLEET_READ_DOMAIN#@}"
+if [ -n "$ACCOUNTS_FLEET_READ_DOMAIN" ] \
+   && ! printf '%s' "$ACCOUNTS_FLEET_READ_DOMAIN" \
+        | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'; then
+  die "refusing malformed fleet_read_domain: $ACCOUNTS_FLEET_READ_DOMAIN"
+fi
+ACCOUNTS_FLEET_READ_ESCAPED="${ACCOUNTS_FLEET_READ_DOMAIN//./\\.}"
+ACCOUNTS_LOCATION_GATE=owner_ok
+ACCOUNTS_FLEET_SED=(-e '/@@ACCTFLEET@@/d')
+
+# Two maps are required because the hub and the account surface have different base
+# audiences: hub_ok includes collaborators, while owner_ok does not.  In both maps the
+# exception is exact: one configured identity domain, GET, and one of four paths.  A
+# future route or method therefore stays closed without anyone remembering to add a
+# second guard.  The backend re-checks the standardized proxy headers below.
+if [ -n "$ACCOUNTS_FLEET_READ_ESCAPED" ]; then
+  printf 'map $%s $airlock_accounts_fleet_identity_ok {\n    default 0;\n' "$IDENT"
+  printf '    "~*^[^@]+@%s$" 1;\n' "$ACCOUNTS_FLEET_READ_ESCAPED"
+  printf '}\n'
+  printf 'map "$%s:$airlock_accounts_fleet_identity_ok:$request_method:$uri" $airlock_accounts_hub_ok {\n' "$HUB_GATE"
+  printf '    default 0;\n    ~^1: 1;\n'
+  printf '    "0:1:GET:%s" 1;\n' \
+    /airlock-accounts/claude-status \
+    /airlock-accounts/claude-usage \
+    /airlock-accounts/claude-usage-store \
+    /airlock-accounts/codex-usage
+  printf '}\n'
+  cat <<'NGINX'
+map "$owner_ok:$airlock_accounts_fleet_identity_ok:$request_method:$uri" $airlock_accounts_surface_ok {
+    default 0;
+    ~^1: 1;
+    "0:1:GET:/airlock-accounts/claude-status" 1;
+    "0:1:GET:/airlock-accounts/claude-usage" 1;
+    "0:1:GET:/airlock-accounts/claude-usage-store" 1;
+    "0:1:GET:/airlock-accounts/codex-usage" 1;
+}
+NGINX
+  HUB_GATE=airlock_accounts_hub_ok
+  ACCOUNTS_LOCATION_GATE=airlock_accounts_surface_ok
+  ACCOUNTS_FLEET_SED=(-e 's/@@ACCTFLEET@@//')
+fi
+
 # Plaintext entrance -> canonical https. `tailscale serve --http=<http_port>`
 # points at this loopback port (never at the hub server), so the hub is only ever
 # SERVED over TLS. Redirect to the FQDN literal: the short tailnet hostname has no
@@ -128,6 +183,7 @@ printf 'map $owner_ok $airlock_role { 1 "owner"; default "collaborator"; }\n'
 ROLE_FIELD=',"role":"$airlock_role"'
 
 sed -e "s/@@PORT@@/${HUB_PORT}/g" \
+    "${ACCOUNTS_FLEET_SED[@]}" \
     -e "s|@@WEBROOT@@|${WEBROOT}|g" \
     -e "s/@@IDENT@@/${IDENT}/g" \
     -e "s/@@HUB_GATE@@/${HUB_GATE}/g" \
@@ -135,6 +191,8 @@ sed -e "s/@@PORT@@/${HUB_PORT}/g" \
     -e "s/@@HUB_EXACT_SCOPE@@/${HUB_EXACT_SCOPE}/g" \
     -e "s|@@ROLE@@|${ROLE_FIELD}|g" \
     -e "s/@@ACCTPORT@@/${ACCOUNTS_PORT}/g" \
+    -e "s/@@ACCTGATE@@/${ACCOUNTS_LOCATION_GATE}/g" \
+    -e "s/@@ACCTFLEETDOMAIN@@/${ACCOUNTS_FLEET_READ_DOMAIN}/g" \
     -e "s|@@CONFD@@|${CONFD}|g" <<'NGINX'
 server {
     listen 127.0.0.1:@@PORT@@;
@@ -224,13 +282,20 @@ server {
     # backend that has never heard of the prefix and 404 every request
     # (apps/learning/render.sh says the same thing about the same character).
     location /airlock-accounts/ {
-        if ($owner_ok = 0) { return 403; }
+        if ($@@ACCTGATE@@ = 0) { return 403; }
         proxy_pass http://127.0.0.1:@@ACCTPORT@@/;
         proxy_http_version 1.1;
         # $http_host, not $host: $host drops the port, and an upstream that compares the
         # browser's Origin against Host then sees a mismatch on every same-origin
         # request. That exact defect answered the owner's own page with 403 in #318.
         proxy_set_header Host $http_host;
+@@ACCTFLEET@@        # Standardize the trusted ingress facts for the backend's second guard. These
+@@ACCTFLEET@@        # overwrite any client-supplied values; the loopback service treats requests
+@@ACCTFLEET@@        # without the marker as the still-live devterm compatibility ingress.
+@@ACCTFLEET@@        proxy_set_header X-Airlock-Platform-Account-Gate 1;
+@@ACCTFLEET@@        proxy_set_header X-Airlock-Owner-Ok $owner_ok;
+@@ACCTFLEET@@        proxy_set_header X-Airlock-Verified-Login $@@IDENT@@;
+@@ACCTFLEET@@        proxy_set_header X-Airlock-Fleet-Read-Domain "@@ACCTFLEETDOMAIN@@";
         proxy_read_timeout 300s;
         # The account surface is never a cached answer: usage numbers and login state
         # are the whole point of asking.

@@ -17,12 +17,10 @@ lang = "C.UTF-8"
 accounts = false
 xai = false
 remote_hosts = ""
-# These keys now override platform-owned AIRLOCK_ACCOUNTS_BIN and
-# AIRLOCK_ACCOUNTS_STATUS_BIN; empty means use those platform defaults. They cannot use
-# [config.deprecated]: airlock-config requires `replacement` to name a different scalar
-# key declared by this same package, and no honest app-local replacement exists. Keeping
-# both keys working preserves validation for existing operator configs while moving the
-# default implementation out of the app.
+# Retired account inputs remain schema-valid during the platform rollout, but devterm's
+# installer deliberately ignores them. They cannot use [config.deprecated]:
+# airlock-config requires `replacement` to name a different scalar key in this package,
+# and no honest app-local replacement exists.
 claude_switch = ""
 claude_status = ""
 fleet_store = ""
@@ -85,13 +83,12 @@ expected = "-"
 fix = "su -c 'apt-get update && apt-get install -y sudo'"
 note = "Privileged ingress setup"
 
-# Appendix: two user units, one servers.d fragment, ttyd + the devterm shell
-# wrapper + the account-tool compatibility shims (fresh claude-switch when accounts=true;
-# fresh claude-status when accounts=true or xai=true; either existing path is replaced
-# even after its feature is disabled). Both stay declared unconditionally because D6
+# Appendix: two user units, one servers.d fragment, ttyd + the devterm shell wrapper +
+# two unconditional account-tool compatibility shims. Both stay declared because D6
 # record-diff would otherwise delete the terminal paths on upgrade. The real account
 # tools are platform binaries; the shims bake their resolved absolute paths at install
-# time. The web client's staged share dir follows. Deliberately NOT declared
+# time and retired account flags do not affect them. The web client's staged share dir
+# follows. Deliberately NOT declared
 # (retained operator data): ~/.config/airlock-devterm/tabs.json (user tabs).
 # serve_ports/[serve.https]: HTTPS only. D-DEVTERM-9900 retired the
 # plaintext 9900 mapping (board 0ff93d05). Live close is a later step.

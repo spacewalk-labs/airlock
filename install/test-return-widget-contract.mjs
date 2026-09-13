@@ -16,9 +16,18 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+
+const args = process.argv.slice(2);
+if (args.some((arg) => arg !== "--emit-ac")) {
+  console.error("usage: node install/test-return-widget-contract.mjs [--emit-ac]");
+  process.exit(2);
+}
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const WIDGET = join(ROOT, "hub/assets/airlock-return.js");
+const REVISION = execFileSync("git", ["-C", ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const WIDGET = process.env.AIRLOCK_RETURN_WIDGET_SOURCE
+  || join(ROOT, "hub/assets/airlock-return.js");
 const SRC = readFileSync(WIDGET, "utf8");
 
 let pass = 0;
@@ -172,11 +181,12 @@ const HUB = "https://box.example.ts.net/airlock-accounts/";
 const DEVTERM = "https://box.example.ts.net:19300/";
 const ACCOUNT_PAGE = HUB + "panel.html?p=accounts&embed=1";
 const SECRET_PAGE = HUB + "panel.html?p=secret&embed=1";
+const ACCOUNT_ALERT = HUB + "acct-alert";
 
 // ------------------------------------------------- 1. both destinations given
 let bothRows = "", bothAcctSrc = "", bothSecretSrc = "", bothFetch = "";
 {
-  const w = run({ menu: "1", accountPanel: HUB, secretPanel: HUB });
+  const w = run({ menu: "1", accountPanel: HUB, secretPanel: HUB, accountAlert: ACCOUNT_ALERT });
   w.tap();
   const m = w.menu();
   check("both: the tap opens the menu", !!m);
@@ -193,8 +203,8 @@ let bothRows = "", bothAcctSrc = "", bothSecretSrc = "", bothFetch = "";
     bothAcctSrc === ACCOUNT_PAGE && bothSecretSrc === SECRET_PAGE,
     `${bothAcctSrc} | ${bothSecretSrc}`);
   bothFetch = JSON.stringify(w.fetched);
-  check("both: platform panel attributes do not imply a cross-origin alert poll",
-    !w.fetched.some((u) => u.includes("acct-alert")), bothFetch);
+  check("both: the explicit alert authority polls exactly the named endpoint",
+    w.fetched.filter((u) => u === ACCOUNT_ALERT).length === 1, bothFetch);
 }
 
 // -------------------------- 2. explicit account authority without secret authority
@@ -244,10 +254,24 @@ let legacyRows = "", legacySrc = "";
 }
 
 // --------------------------------------------- 5. only the legacy account alias is a ring source
+let panelImpliedAlert = 0, secretImpliedAlert = 0, explicitAlertFetch = 0;
 {
   const w = run({ menu: "1", accountPanel: HUB, secretPanel: HUB });
+  panelImpliedAlert = w.fetched.filter((u) => u.includes("acct-alert")).length;
   check("ring: platform panel destinations do not silently grant alert-fetch authority",
-    !w.fetched.some((u) => u.includes("acct-alert")), JSON.stringify(w.fetched));
+    panelImpliedAlert === 0, JSON.stringify(w.fetched));
+}
+{
+  const w = run({ menu: "1", secretPanel: HUB });
+  secretImpliedAlert = w.fetched.filter((u) => u.includes("acct-alert")).length;
+  check("ring: a secret destination grants no account alert authority",
+    secretImpliedAlert === 0, JSON.stringify(w.fetched));
+}
+{
+  const w = run({ menu: "1", accountAlert: ACCOUNT_ALERT });
+  explicitAlertFetch = w.fetched.filter((u) => u === ACCOUNT_ALERT).length;
+  check("ring: data-account-alert explicitly grants one exact fetch",
+    explicitAlertFetch === 1, JSON.stringify(w.fetched));
 }
 
 // ------------------------------------------------------------------- wiring
@@ -263,8 +287,8 @@ for (const [path, text] of Object.entries(injectors)) {
   check(`${path}: emits separate account and secret authorities and no legacy data-panel`,
     text.includes("data-account-panel=") && text.includes("data-secret-panel=") &&
       !text.includes("data-panel="));
-  check(`${path}: feeds both destinations the same platform URL`,
-    text.includes('data-account-panel=\\"${PLATFORM_PANEL_URL}\\" data-secret-panel=\\"${PLATFORM_PANEL_URL}\\"'));
+  check(`${path}: feeds both destinations and the explicit alert authority from the platform URL`,
+    text.includes('data-account-panel=\\"${PLATFORM_PANEL_URL}\\" data-secret-panel=\\"${PLATFORM_PANEL_URL}\\" data-account-alert=\\"${PLATFORM_PANEL_URL}acct-alert\\"'));
 }
 // The installer-path goldens are rendered by running the real installer on a box
 // without devterm — the delivered form of case 2 above.
@@ -278,7 +302,8 @@ for (const g of ["orca/installer-path", "paseo/installer-path"]) {
   check(`golden ${g}: devterm absent injects both platform destinations, exactly once`,
     menuLines.length === 1 &&
       line.includes('data-account-panel="https://box.example.ts.net/airlock-accounts/"') &&
-      line.includes('data-secret-panel="https://box.example.ts.net/airlock-accounts/"'),
+      line.includes('data-secret-panel="https://box.example.ts.net/airlock-accounts/"') &&
+      line.includes('data-account-alert="https://box.example.ts.net/airlock-accounts/acct-alert"'),
     line.trim() || "(no menu-bearing injection)");
   check(`golden ${g}: emits no legacy account alias`,
     !line.includes("data-panel="), line.trim());
@@ -298,10 +323,13 @@ const ac = [
   ["AC-DTI-P2D",
     "the legacy data-panel alias grants account authority only",
     `rows=${legacyRows} src=${legacySrc}`],
+  ["AC-DTI-P2G",
+    "only data-account-alert grants the platform alert fetch; panel destinations grant none",
+    `explicit_alert_fetch=${explicitAlertFetch},panel_implied_alert=${panelImpliedAlert},secret_implied_alert=${secretImpliedAlert},injectors_authorize=${Object.values(injectors).filter((text) => text.includes("data-account-alert=")).length}`],
 ];
 console.log("");
 for (const [id, expected, observed] of ac) {
-  console.log(`${id} | expected: ${expected} | observed: ${observed} | verdict: ${failures.length ? "SEE FAILURES" : "PASS"} | signal: fixture | evidence: install/test-return-widget-contract.mjs`);
+  console.log(`${id} | expected: ${expected} | observed: ${observed} | verdict: ${failures.length ? "FAIL" : "PASS"} | signal: fixture | evidence: install/test-return-widget-contract.mjs@${REVISION}`);
 }
 console.log("");
 console.log(`return-widget-contract: ${pass} ok, ${failures.length} failed`);

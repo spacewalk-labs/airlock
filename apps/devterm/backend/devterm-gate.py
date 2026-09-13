@@ -22,9 +22,8 @@ with `Connection: close` (one request per connection = one identity check); a
 WebSocket upgrade dedicates its connection.
 
 Everything site-specific comes from the environment (set by the installer from
-airlock.toml). Optional features (Claude account pool, Codex login, the fileview
-file-open, the Orca worktree sidebar) are gated on config + tool presence and
-degrade to a clean "disabled" response when their dependencies are absent.
+airlock.toml). Account management belongs to the platform account service. This gate
+temporarily retains only the four fleet reads while that external caller migrates.
 
 Env:
   AIRLOCK_IDENTITY_HEADER  identity header name (e.g. Tailscale-User-Login)
@@ -35,12 +34,8 @@ Env:
   DEVTERM_TTYD_HOST/PORT   ttyd backend (default 127.0.0.1:19912)
   DEVTERM_WEB              web root to serve (the custom client)
   DEVTERM_FILEVIEW         "true" to enable the terminal file-path -> fileview link
-  DEVTERM_ACCOUNTS         "true" to enable the Claude account pool UI
-  DEVTERM_ACCOUNTS_BIN     platform account CLI (credential lifecycle/generation)
-  DEVTERM_CLAUDE_SWITCH    path to the platform airlock-accounts CLI
   DEVTERM_CLAUDE_STATUS    path to the platform airlock-accounts-status probe
   DEVTERM_FLEET_STORE      path to a shared usage store file (optional)
-  DEVTERM_FLEET_STORE_URL  URL of a shared usage store (optional, no default host)
   DEVTERM_ORCA_SHIM        path to the Orca CLI shim (optional; worktree sidebar)
   DEVTERM_REMOTE_HOSTS     comma-separated ssh hosts to also list tmux from (optional)
   DEVTERM_UPLOADS          uploads dir (default ~/uploads)
@@ -48,41 +43,14 @@ Env:
 import asyncio
 import base64
 import json
-import math
 import os
 import re
 import shlex
-import shutil
 import signal
-import socket
-import subprocess
 import sys
 import time
 import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
-
-# The shared binary-discovery module, vendored byte-identically next to this file
-# (bin_discovery.py + bin-discovery-cases.json + test_bin_discovery.py). Imported by
-# path, not as a package: this file is started as a bare script by the unit AND loaded
-# by absolute path from the offline suites, so neither run has backend/ on sys.path by
-# construction.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import bin_discovery  # noqa: E402
-
-
-def _account_tool(env_name):
-    """Return the platform tool path handed in through the rendered unit.
-
-    Account features are optional, but their platform dependency is not optional once
-    enabled. Falling back to an app sibling or PATH would let a stale pre-move copy run
-    after ownership changed. Refuse the broken unit at import time instead, with the
-    missing ABI bridge named explicitly.
-    """
-    configured = os.environ.get(env_name, "").strip()
-    if not configured:
-        raise RuntimeError(f"{env_name} is required when its devterm account feature is enabled")
-    return os.path.expanduser(configured)
+from datetime import datetime
 
 
 ALLOW = {s.strip().lower() for s in os.environ.get("AIRLOCK_OWNER", "").split(",") if s.strip()}
@@ -97,61 +65,9 @@ WEB_ROOT = os.path.realpath(os.environ.get("DEVTERM_WEB", os.path.expanduser("~/
 
 # ---- optional feature config (all degrade to disabled when unset/absent) ----
 FILEVIEW = os.environ.get("DEVTERM_FILEVIEW", "false").lower() == "true"
-ACCOUNTS = os.environ.get("DEVTERM_ACCOUNTS", "false").lower() == "true"
-XAI = os.environ.get("DEVTERM_XAI", "false").lower() == "true"
-CLAUDE_SWITCH = _account_tool("DEVTERM_CLAUDE_SWITCH") if ACCOUNTS else ""
-CLAUDE_STATUS = _account_tool("DEVTERM_CLAUDE_STATUS") \
-    if (ACCOUNTS or XAI) else ""
-# Credential lifecycle must bypass the deprecated claude_switch compatibility
-# override: an operator-supplied legacy tool is allowed to implement the old account
-# verbs, but it cannot be assumed to implement the platform-only Codex preservation
-# verb added in P2b. The installer therefore hands the platform binary in separately.
-PLATFORM_ACCOUNTS = os.environ.get("DEVTERM_ACCOUNTS_BIN", "").strip()
-# A shared usage store used to annotate the account pool with utilization. Both are
-# optional; no host is hardcoded. Left empty => the account list still works, just
-# without usage numbers.
+CLAUDE_STATUS = os.path.expanduser(os.environ.get("DEVTERM_CLAUDE_STATUS", "").strip())
 FLEET_STORE = os.path.expanduser(os.environ["DEVTERM_FLEET_STORE"]) if os.environ.get("DEVTERM_FLEET_STORE") else ""
-FLEET_STORE_URL = os.environ.get("DEVTERM_FLEET_STORE_URL", "")
 ORCA_SHIM = os.path.expanduser(os.environ.get("DEVTERM_ORCA_SHIM", ""))
-
-# ---- subscription warning thresholds (the single source of truth) ----
-# These numbers live here and nowhere else. /accounts ships them to the frontend as
-# `thresholds` and /acct-alert ships the *verdict*; if a frontend kept its own copy,
-# the row colour and the widget ring would disagree the moment one of them changed.
-#   warn5/crit5 = 5h window %, warn7/crit7 = 7d window %,
-#   rtWarnDays  = warn when the refresh token expires within this many days.
-# There is deliberately no "spent" threshold above crit5. One existed (lock5 = 100) and
-# both graders read it as "stop looking at the 5h axis", so a window at 100% scored
-# healthy — the exhausted account rendered green while a 95% one rendered red. 100 is
-# already >= crit5; a separate number for it only bought a way to exempt it.
-USAGE_TH = {"warn5": 78, "crit5": 88, "warn7": 88, "crit7": 93, "rtWarnDays": 5}
-ACCT_ALERT_TTL = 30          # /acct-alert response cache (s): N tabs polling every 30s
-                             # still costs one claude-switch call per window.
-LIVE_USAGE_TTL = 60          # cache for the live account's own usage probe (s) — used
-                             # when no shared store is configured (the common case for a
-                             # single box). Long enough that a ring poll never bursts.
-CODEX_USAGE_TTL = 300        # 5 min. The weekly window moves a couple of % per day, so
-                             # this resolution is plenty and one app-server spawn is not.
-CODEX_USAGE_WAIT = 20        # how long a /codex-usage request waits for a fresh reading
-CODEX_USAGE_RETRY = 30       # retry backoff after a failure — a failure must not buy
-                             # itself a full TTL of silence
-CODEX_USAGE_SWEEP = CODEX_USAGE_TTL   # how often the gate refreshes Codex usage with
-                             # nobody watching. Tied to the TTL on purpose: at any
-                             # shorter period the extra spawns buy a value the cache
-                             # already considers fresh, and at any longer one the panel
-                             # opens on "(last value)" and pays the CODEX_USAGE_WAIT.
-                             # The sweep forces its refresh — see _codex_usage_sweeper
-                             # for why equality here needs that to mean what it says.
-# Must be comfortably larger than claude-status's own CODEX_REAP_GRACE (0.5s): that
-# script promotes SIGTERM to SIGKILL itself, and we only step in if it never got there.
-PROBE_KILL_GRACE = 3.0
-XAI_LOGOUT_WAIT = 20
-_acct_alert_cache = {"at": 0.0, "payload": None}
-_live_usage_cache = {"at": 0.0, "payload": None}
-_acct_cache_generation = 0
-_codex_usage_cache = {"valueAt": 0.0, "lastTryAt": 0.0,
-                      "payload": None, "authMtime": None, "task": None}
-_CODEX_AUTH_GENERATION_UNAVAILABLE = object()
 
 # Claude Code session logs (used to reconstruct conversation text for the copy
 # modal when the pane is running `claude`; degrades to screen capture otherwise).
@@ -159,7 +75,6 @@ CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
 
 MAX_HEAD = 64 * 1024
 MAX_BODY = 210 * 1024 * 1024         # inbound body cap — accommodates a 200MB raw file upload plus headroom
-LOGIN_CODE_BODY_MAX = 1024            # one <=400-byte code plus small JSON framing
 IDENT_HEADER = os.environ.get("AIRLOCK_IDENTITY_HEADER", "").strip().lower().encode("latin1")
 TTYD_PATHS = (b"/ws", b"/token")
 # Fleet read-open ([apps.devterm] fleet_read_domain, rendered as the nginx
@@ -185,11 +100,6 @@ def _fleet_read_ok(login, path):
         return False
     local, sep, domain = login.partition("@")
     return bool(local) and sep == "@" and domain == FLEET_READ_DOMAIN
-DEVTERM_STATE_DIR = os.path.expanduser("~/.local/share/airlock-devterm/state")
-XAI_LOGIN_OUT = os.path.join(DEVTERM_STATE_DIR, "xai-login.out")
-_xai_login_process = None
-_xai_operation_lock = asyncio.Lock()
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # ---- clipboard image / file uploads — shared ~/uploads drop (24h TTL) ----
 UPLOADS = os.path.expanduser(os.environ.get("DEVTERM_UPLOADS", "~/uploads"))
@@ -204,29 +114,6 @@ FILE_MAX_BYTES = 200 * 1024 * 1024            # file upload save cap (arbitrary 
 PREFS_DIR = os.path.expanduser("~/.config/airlock-devterm")
 PREFS_PATH = os.path.join(PREFS_DIR, "tabs.json")
 PREFS_MAX = 256 * 1024
-
-# ---- last known Codex usage, kept across restarts ----
-# The in-memory cache dies with the process, and the reading costs an app-server spawn
-# that takes up to CODEX_USAGE_WAIT seconds. So every gate restart used to open the panel
-# on a blank Codex row and hold it there while the probe ran. The number is a few minutes
-# old at worst and the row already has a vocabulary for that ("(last value)"), so showing
-# the remembered one immediately and correcting it when the probe lands beats showing
-# nothing. State, not config — it is derived and disposable.
-# This app-owned directory is covered by devterm's declared share artifact. The
-# platform's ~/.local/state/airlock directory owns the install ledger and lock, so an
-# app package must not claim a child of it for lifecycle cleanup.
-CODEX_USAGE_STATE_DIR = DEVTERM_STATE_DIR
-CODEX_USAGE_STATE = os.path.join(CODEX_USAGE_STATE_DIR, "codex-usage.json")
-LEGACY_CODEX_USAGE_STATE = os.path.expanduser(
-    "~/.local/state/airlock/devterm/codex-usage.json")
-# The Claude account pool has a separate Airlock-owned display cache. It deliberately
-# shares the directory with Codex state, but never writes the fleet store (whose owner
-# is the out-of-process collector).
-CLAUDE_USAGE_STATE_DIR = CODEX_USAGE_STATE_DIR
-CLAUDE_USAGE_STATE = os.path.join(CLAUDE_USAGE_STATE_DIR, "claude-usage.json")
-CLAUDE_USAGE_MAX_AGE = 30 * 86400
-CLAUDE_USAGE_FUTURE_SKEW = 5 * 60
-_claude_usage_write_logged = False
 
 _CTYPES = {
     ".html": b"text/html; charset=utf-8", ".js": b"text/javascript; charset=utf-8",
@@ -494,26 +381,12 @@ async def _serve_static(path, cw):
     await cw.drain()
 
 
-def _secret_origin_ok(headers):
-    """Same-origin guard for every endpoint on this gate that WRITES.
+def _same_origin_write_ok(headers):
+    """Same-origin guard for terminal/session writes.
 
-    Named for the secret drop because that is what it was written for; it now guards
-    every write on this gate — the account mutations and the terminal itself (sessions,
-    uploads, layout, prefs). The secret drop itself left this gate on 2026-09-13: its
-    routes are the platform's (bin/airlock-accounts-api), reached through devterm's nginx
-    proxy, so no /secret-* request arrives here. 🔴 Until 2026-09-04 it guarded ONE of the six
-    (/acct-login-code) and /acct-switch, /acct-remove, /acct-login-url and
-    /codex-logout were reachable cross-origin. The identity header is injected by the
-    ingress, not the browser, so a request that arrives here already carries the owner's
-    identity whichever page caused it — another origin could make the owner's browser
-    switch or delete an account. Found while porting these routes to the platform
-    surface, which guards all of them; the owner chose to close the live exposure here
-    too rather than wait for these routes to retire.
-
-    Unlike the read-only alert, these WRITE. The identity header cannot be forged from
-    the tailnet (this gate is loopback-only), but a page on another origin could still
-    make the browser POST here, so a cross-origin request is refused outright rather
-    than answered. No Origin header at all (curl, the terminal itself) is fine."""
+    The ingress injects identity, but another origin could still make the owner's
+    browser POST to this loopback-backed surface. No Origin (curl or the terminal
+    itself) is allowed; an explicit foreign Origin is refused."""
     origin = headers.get(b"origin", b"")
     if not origin:
         return True
@@ -650,48 +523,9 @@ async def _read_json_body(cr, headers, leftover, limit=MAX_BODY):
     return obj if isinstance(obj, dict) else None
 
 
-def _finite_number(value):
-    """The value if it is a real finite number, else None. Guards every threshold
-    comparison: a NaN would silently compare False and mute a warning."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        try:
-            if math.isfinite(value):
-                return value
-        except (OverflowError, ValueError):
-            pass
-    return None
-
-
-def _cors_origin(headers):
-    """The request Origin if it is *this box on another port*, else None.
-
-    Why: the Airlock return widget is injected into upstream bundles that run on their
-    own ports (a browser IDE, an agent runner, ...), so it reads /acct-alert
-    cross-origin. Identity comes from the ingress header, not a cookie, so a simple
-    credential-less GET needs nothing but an echoed ACAO (no preflight, no ACAC).
-
-    Never '*' and never an arbitrary origin: tailnet domains are public suffixes, so a
-    *different node* would also be same-site. Echo only when the origin's first
-    hostname label equals this host's — same box, any port.
-    """
-    origin = headers.get(b"origin", b"")
-    if not origin:
-        return None
-    try:
-        h = urllib.parse.urlsplit(origin.decode("latin1")).hostname or ""
-    except (UnicodeError, ValueError):
-        return None
-    if h and h.split(".")[0] == socket.gethostname().split(".")[0]:
-        return origin
-    return None
-
-
-async def _send_json(cw, status, payload, cors=None):
-    extra = b""
-    if cors:
-        extra = b"Access-Control-Allow-Origin: " + cors + b"\r\nVary: Origin\r\n"
+async def _send_json(cw, status, payload):
     cw.write(_resp(status, json.dumps(payload).encode(),
-                   b"application/json; charset=utf-8", extra=extra))
+                   b"application/json; charset=utf-8"))
     await cw.drain()
 
 
@@ -917,7 +751,7 @@ async def _serve_orca_repo_add(cr, headers, leftover, cw):
 
 
 async def _serve_upload_image(cr, headers, leftover, cw):
-    if not _secret_origin_ok(headers):
+    if not _same_origin_write_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
     body = await _read_body(cr, headers, leftover)
@@ -937,7 +771,7 @@ async def _serve_upload_image(cr, headers, leftover, cw):
 async def _serve_list_dir(cr, headers, leftover, cw):
     """Directory listing for the folder-picker GUI. Read-only (the owner has shell
     access anyway)."""
-    if not _secret_origin_ok(headers):
+    if not _same_origin_write_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
     d = await _read_json_body(cr, headers, leftover)
@@ -1270,7 +1104,7 @@ _LAYOUTS = {"even-horizontal", "even-vertical", "tiled", "main-vertical", "main-
 async def _serve_layout(cr, headers, leftover, cw):
     """tmux select-layout — arrange the active window's panes. even-horizontal = equal
     widths. Remote (RMT__) sessions supported when host is in REMOTE_HOSTS."""
-    if not _secret_origin_ok(headers):
+    if not _same_origin_write_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
     d = await _read_json_body(cr, headers, leftover)
@@ -1322,7 +1156,7 @@ async def _serve_pane(cr, headers, leftover, cw):
     action: zoom / next / split-h / split-v / kill / zoom-next / zoom-prev /
             capture (active pane text -> copy modal) / buffer (paste buffer) / state.
     Remote (RMT__<host>__<sess>) supported via ssh when host is in REMOTE_HOSTS."""
-    if not _secret_origin_ok(headers):
+    if not _same_origin_write_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
     d = await _read_json_body(cr, headers, leftover) or {}
@@ -1421,7 +1255,7 @@ async def _serve_get_prefs(cw):
 
 async def _serve_put_prefs(cr, headers, leftover, cw):
     """Store tab prefs (atomic rename). dict JSON only, size-capped."""
-    if not _secret_origin_ok(headers):
+    if not _same_origin_write_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
     obj = await _read_json_body(cr, headers, leftover, limit=PREFS_MAX)
@@ -1441,7 +1275,7 @@ async def _serve_put_prefs(cr, headers, leftover, cw):
 
 async def _serve_kill_session(cr, headers, leftover, cw):
     """Kill a tmux session (destructive). Client confirms first. Name is sanitized."""
-    if not _secret_origin_ok(headers):
+    if not _same_origin_write_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
     d = await _read_json_body(cr, headers, leftover)
@@ -1456,7 +1290,7 @@ async def _serve_kill_session(cr, headers, leftover, cw):
 
 async def _serve_rename_session(cr, headers, leftover, cw):
     """Rename a tmux session. from/to both sanitized. Re-attach is handled client-side via URL."""
-    if not _secret_origin_ok(headers):
+    if not _same_origin_write_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
     d = await _read_json_body(cr, headers, leftover) or {}
@@ -1472,7 +1306,7 @@ async def _serve_rename_session(cr, headers, leftover, cw):
 
 async def _serve_upload_file(cr, headers, leftover, cw):
     """Arbitrary file raw upload -> ~/uploads/fileNNN.ext. Original name in X-Filename (extension only)."""
-    if not _secret_origin_ok(headers):
+    if not _same_origin_write_ok(headers):
         await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
         return
     body = await _read_body(cr, headers, leftover)
@@ -1485,1397 +1319,11 @@ async def _serve_upload_file(cr, headers, leftover, cw):
     await _send_json(cw, b"200 OK" if ok else b"400 Bad Request", payload)
 
 
-# ============================ optional: Claude account pool ============================
-# All of the following degrade to a clean "disabled" response unless DEVTERM_ACCOUNTS
-# is true and the configured platform account tools are present. A missing configured
-# file remains a runtime-disabled dependency; a missing unit variable is a broken ABI
-# bridge and fails at import above rather than falling back to stale app code.
-
-def _accounts_enabled():
-    return ACCOUNTS and CLAUDE_SWITCH and os.path.isfile(CLAUDE_SWITCH)
-
-
-def _xai_enabled():
-    return XAI and CLAUDE_STATUS and os.path.isfile(CLAUDE_STATUS)
-
-
-_CLAUDE_KIND_ALIASES = {
-    "personal": "personal", "개인": "personal",
-    "team": "team", "팀": "team",
-}
-_CLAUDE_KIND_VARIANTS = {
-    "personal": ("personal", "개인"),
-    "team": ("team", "팀"),
-}
-
-
-def _claude_kind(kind):
-    """Canonicalize the two legacy localized pool labels without guessing unknowns."""
-    if not isinstance(kind, str):
-        return ""
-    value = kind.strip()
-    return _CLAUDE_KIND_ALIASES.get(value.casefold(),
-                                    _CLAUDE_KIND_ALIASES.get(value, value))
-
-
-def _claude_store_entry(store, email, kind):
-    """Pick the newest canonical/legacy fleet entry for one account identity."""
-    if not isinstance(store, dict) or not isinstance(email, str) or not email:
-        return {}
-    original = kind.strip() if isinstance(kind, str) else kind
-    canonical = _claude_kind(original)
-    variants = []
-    for value in (original, canonical, *_CLAUDE_KIND_VARIANTS.get(canonical, ())):
-        if isinstance(value, str) and value and value not in variants:
-            variants.append(value)
-    best = None
-    best_at = None
-    best_is_canonical = False
-    for value in variants:
-        entry = store.get(f"{email}|{value}")
-        if not isinstance(entry, dict):
-            continue
-        observed_at = _finite_number(entry.get("observedAt"))
-        is_canonical = value == canonical
-        if best is None or (observed_at is not None
-                            and (best_at is None or observed_at > best_at)) \
-                or (observed_at == best_at and is_canonical
-                    and not best_is_canonical):
-            best, best_at, best_is_canonical = entry, observed_at, is_canonical
-    return best or {}
-
-
-def _opencode_bin():
-    return bin_discovery.find_bin("opencode")[0]
-
-
-def _opencode_missing_error():
-    return bin_discovery.not_found_message(
-        "opencode", bin_discovery.find_bin("opencode")[1])
-
-
-async def _acct_list_with_usage():
-    """`claude-switch list --json` + usage merged from the shared store (if any).
-    Shared by /accounts and /acct-alert so both see exactly the same account state."""
-    data = {"active": None, "accounts": []}
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            CLAUDE_SWITCH, "list", "--json",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-        except asyncio.TimeoutError:
-            proc.kill(); await proc.wait(); out = b""
-        if proc.returncode == 0 and out.strip():
-            data = json.loads(out)
-    except (FileNotFoundError, ValueError, OSError):
-        pass
-    store = await asyncio.get_running_loop().run_in_executor(None, _fetch_fleet_store)
-    now = time.time()
-    # "nothing here yet" and "nothing will ever be here" are different operator states,
-    # and only one of them resolves by waiting. With no store configured this gate has no
-    # source for any account but the active one, so reporting the transient (which the UI
-    # words as "Collecting") promises a collector that does not exist — measured on this
-    # box as seven rows that had been "collecting" indefinitely, with a healthy collector
-    # running beside an unset fleet_store. Say which state it is; the UI words each.
-    no_source = not (FLEET_STORE or FLEET_STORE_URL)
-    for a in data.get("accounts", []):
-        ent = _claude_store_entry(store, a.get("email"), a.get("kind"))
-        a["kind"] = _claude_kind(a.get("kind"))
-        if ent.get("usage"):
-            # age = how old the reading is. Without it a number cannot be trusted.
-            a["usage"] = dict(ent["usage"],
-                               age=int(now - (ent.get("observedAt") or now)),
-                               observedAt=ent.get("observedAt"))
-        else:
-            a["usage"] = {"err": "no store" if no_source else "no data"}
-        # Which boxes hold this account (identity only, never a secret). Two boxes on
-        # one account burn the 5h window twice as fast, so it is worth seeing before a
-        # swap. Empty unless a shared store is configured.
-        a["holders"] = ent.get("holders") or []
-    return data
-
-
-async def _serve_accounts(cw):
-    """Account list + usage + the warning thresholds the frontend colours rows with.
-
-    When accounts are disabled or claude-switch is absent, returns a clean disabled
-    payload so the UI can hide itself."""
-    if not _accounts_enabled():
-        await _send_json(cw, b"200 OK", {"enabled": False, "active": None, "accounts": []})
-        return
-    data = await _acct_list_with_usage()
-    now = time.time()
-    local_store = _claude_usage_state_load(now)
-    # Keep this merge at the /accounts boundary. /acct-alert deliberately consumes the
-    # unmerged list so a human's last panel read cannot replace its live-probe fallback.
-    for account in data.get("accounts", []) if isinstance(data, dict) else []:
-        if not isinstance(account, dict):
-            continue
-        account["kind"] = _claude_kind(account.get("kind"))
-        email, kind = account.get("email"), account.get("kind")
-        key = f"{email}|{kind}" if isinstance(email, str) and email and kind else ""
-        local = local_store.get(key) if key else None
-        fleet_usage = account.get("usage")
-        fleet_at = (_finite_number(fleet_usage.get("observedAt"))
-                    if isinstance(fleet_usage, dict) else None)
-        if not local or (fleet_at is not None and local["valueAt"] <= fleet_at):
-            continue
-        merged = dict(local["usage"])
-        merged["age"] = max(0, int(now - local["valueAt"]))
-        merged["stale"] = True
-        merged["observedAt"] = local["valueAt"]
-        account["usage"] = merged
-    # Ship the thresholds too: if the frontend held its own numbers they would drift
-    # from the /acct-alert verdict (USAGE_TH is the only source).
-    data["thresholds"] = dict(USAGE_TH)
-    data["enabled"] = True
-    await _send_json(cw, b"200 OK", data)
-
-
-async def _live_usage_cached():
-    """The active account's own 5h/7d reading, cached for LIVE_USAGE_TTL.
-
-    This is the fallback source for /acct-alert on a box with no shared usage store —
-    i.e. the default single-box install. The probe queries with this box's own token, so
-    only numbers leave. Returns {} when there is nothing to report."""
-    now = time.time()
-    payload = _live_usage_cache.get("payload")
-    if payload is not None and now - _live_usage_cache.get("at", 0.0) <= LIVE_USAGE_TTL:
-        return payload
-    generation = _acct_cache_generation
-    result = await _probe_json(["--usage", "live"])
-    # Same reading /acct-usage-now already persists, taken on a cadence a human does not
-    # have to trigger: the widget polls /acct-alert, so an account in actual use keeps a
-    # fresh stored value and still reads "(last value)" tomorrow instead of falling back
-    # to "no data". Filed under the probe's OWN identity, so a reading that raced a swap
-    # lands on the account it actually describes. Display memory only — /acct-alert
-    # deliberately grades from the unmerged list, so this cannot feed its own verdict.
-    _claude_usage_state_save(result)
-    usage = {}
-    if isinstance(result, dict):
-        u = result.get("usage")
-        if isinstance(u, dict):
-            usage = dict(u)
-        rt_days = _finite_number(result.get("rtDaysLeft"))
-        if rt_days is not None:
-            usage["rtDaysLeft"] = rt_days
-    # A login/swap/remove may have happened while the probe was in flight. Return the
-    # result to the caller that started it, but never make it the new account's cache.
-    if generation == _acct_cache_generation:
-        _live_usage_cache.update(at=now, payload=usage)
-    return usage
-
-
-def _acct_alert_level(u5, u7, rt_days, codex_u7=None, codex_err=None):
-    """The active account's warning level — (level, reason). level = none|warn|crit.
-
-    Each axis is graded on its own, then the worst (severity, reason-priority) wins.
-    Reason priority is login=3 > usage=2 > codex=1: at equal severity a looming login
-    expiry is the more actionable message, and codex is the newest axis so it never
-    displaces the two that were there before.
-    A spent 5h window mutes nothing, including itself. "5h exhausted" and "7d critical"
-    are separate facts and collapsing them hides the one that lasts longer — and a 5h
-    window at 100% is not a quiet state, it is the account being unusable right now.
-    Grading it as anything but crit reported an exhausted account as healthy.
-    codex_err="auth" (claude-status's verdict that the stored Codex credential was
-    revoked) is graded as crit on the codex axis: the panel still shows a healthy
-    email + plan, so without this the first report is an agent failing mid-run."""
-    u5 = _finite_number(u5)
-    u7 = _finite_number(u7)
-    rt_days = _finite_number(rt_days)
-    codex_u7 = _finite_number(codex_u7)
-    candidates = []
-    if u5 is not None:
-        if u5 >= USAGE_TH["crit5"]:
-            candidates.append((2, 2, "crit", "usage"))
-        elif u5 >= USAGE_TH["warn5"]:
-            candidates.append((1, 2, "warn", "usage"))
-    if u7 is not None:
-        if u7 >= USAGE_TH["crit7"]:
-            candidates.append((2, 2, "crit", "usage"))
-        elif u7 >= USAGE_TH["warn7"]:
-            candidates.append((1, 2, "warn", "usage"))
-    if rt_days is not None and rt_days <= USAGE_TH["rtWarnDays"]:
-        candidates.append((1, 3, "warn", "login"))
-    if codex_u7 is not None:
-        if codex_u7 >= USAGE_TH["crit7"]:
-            candidates.append((2, 1, "crit", "codex"))
-        elif codex_u7 >= USAGE_TH["warn7"]:
-            candidates.append((1, 1, "warn", "codex"))
-    if codex_err == "auth":
-        # Not a usage problem: no Codex agent runs until someone re-logs in. Its own
-        # reason so the widget says "re-login" instead of quoting a percentage.
-        candidates.append((2, 1, "crit", "codex-login"))
-    if not candidates:
-        return "none", None
-    _, _, level, reason = max(candidates, key=lambda item: (item[0], item[1]))
-    return level, reason
-
-
-async def _serve_acct_alert(headers, cw, _generation_retry=False):
-    """`GET /acct-alert` — only the active account's warning level. No email, no token
-    (level + numbers + time remaining).
-
-    Who reads it: devterm's own account icon, and the Airlock return widget injected
-    into tools that run on other ports. Because the verdict comes from one place
-    (USAGE_TH), devterm and the widget change colour at the same instant.
-
-    Where the numbers come from, in order — a single-box install has no collector, so
-    this must still work without one:
-      1. the shared usage store, when one is configured (a fleet has a collector);
-      2. otherwise this box probing its own live account (cached LIVE_USAGE_TTL);
-      3. otherwise level="none" — no data is not a warning. Silence beats inventing one.
-    """
-    now = time.time()
-    payload = _acct_alert_cache["payload"]
-    if payload is None or now - _acct_alert_cache["at"] > ACCT_ALERT_TTL:
-        generation = _acct_cache_generation
-        claude_error = None
-        u = {}
-        rt_days = None
-        u5 = u7 = None
-        try:
-            data = await _acct_list_with_usage()
-            if not isinstance(data, dict):
-                raise ValueError("accounts payload is not an object")
-            accounts = data.get("accounts", [])
-            if not isinstance(accounts, list):
-                raise ValueError("accounts payload is not a list")
-            act = next((a for a in accounts if isinstance(a, dict) and a.get("active")), None)
-            u = (act or {}).get("usage") or {}
-            if not isinstance(u, dict):
-                raise ValueError("usage payload is not an object")
-            u5 = _finite_number(u.get("use5h"))
-            u7 = _finite_number(u.get("use7d"))
-            rt = _finite_number((act or {}).get("rtExpiry"))
-            rt_days = _finite_number(((rt / 1000.0) - now) / 86400.0 if rt is not None else None)
-            if u5 is None and u7 is None:
-                # No shared store (or nothing in it for this account): ask this box.
-                live = await _live_usage_cached()
-                if isinstance(live, dict) and live:
-                    u = dict(live)
-                    u5 = _finite_number(live.get("use5h"))
-                    u7 = _finite_number(live.get("use7d"))
-                    if rt_days is None:
-                        rt_days = _finite_number(live.get("rtDaysLeft"))
-        except Exception as exc:
-            # Isolated from the codex axis. Only the exception type is reported — never
-            # a token, a path, or raw response text.
-            claude_error = f"accounts-{type(exc).__name__}"
-            u = {}
-            u5, u7 = None, None
-        try:
-            codex = await _codex_usage_cached()
-        except Exception as exc:
-            codex = {"stale": True, "err": f"cache-{type(exc).__name__}"}
-        if not isinstance(codex, dict):
-            codex = {"stale": True, "err": "cache-invalid"}
-        codex_u7 = _finite_number(codex.get("use7d"))
-        codex_err = codex.get("lastErr") or codex.get("err")
-        level, reason = _acct_alert_level(u5, u7, rt_days, codex_u7, codex_err)
-        payload = {"ok": True, "level": level, "reason": reason,
-                   "use5h": u5, "use7d": u7,
-                   "reset5h": u.get("reset5h"), "reset7d": u.get("reset7d"),
-                   "rtDays": (int(rt_days) if rt_days is not None else None),
-                   "stale": bool(u.get("stale")), "err": u.get("err") or claude_error,
-                   "codexUse7d": codex_u7,
-                   "codexReset7d": codex.get("reset7d"),
-                   "codexPlan": codex.get("plan"),
-                   "codexCredits": codex.get("resetCredits"),
-                   "codexStale": bool(codex.get("stale")),
-                   "codexErr": codex_err,
-                   "thresholds": dict(USAGE_TH)}
-        if generation != _acct_cache_generation:
-            # A login mutation won the race while the old-account probes were in
-            # flight. Recompute once; a second mutation still prevents caching.
-            if not _generation_retry:
-                return await _serve_acct_alert(headers, cw, _generation_retry=True)
-        else:
-            _acct_alert_cache.update(at=now, payload=payload)
-    await _send_json(cw, b"200 OK", payload, cors=_cors_origin(headers))
-
-
-async def _serve_acct_switch(cr, headers, leftover, cw):
-    """Switch the active Claude account — run `claude-switch swap <name>` server-side.
-    Replaces the live credential; a running `claude` picks it up on --continue restart."""
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    if not _accounts_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "accounts disabled"})
-        return
-    d = await _read_json_body(cr, headers, leftover) or {}
-    name = (d.get("name") or "").strip()
-    if not name or "/" in name or name.startswith("."):
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "invalid name"})
-        return
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            CLAUDE_SWITCH, "swap", name,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await proc.communicate()
-        ok = proc.returncode == 0
-        payload = {"ok": ok, "active": name if ok else None}
-        if ok:
-            _invalidate_acct_caches()
-        if not ok:
-            payload["error"] = (err or out or b"").decode("utf-8", "replace")[:200]
-    except (FileNotFoundError, OSError) as e:
-        payload = {"ok": False, "error": str(e)}
-    await _send_json(cw, b"200 OK" if payload.get("ok") else b"400 Bad Request", payload)
-
-
-async def _codex_auth_call(action, timeout):
-    """Run one platform-owned Codex credential action and return its JSON payload.
-
-    Every Codex credential operation — preserve, restore, log in, log out — belongs to
-    `airlock-accounts codex-auth` (ACCT_OWN, 2026-09-01). devterm is the caller: it owns
-    the button, not the decision about what the button does to this box's login.
-
-    Only the platform tool's own JSON crosses back. Its stdout is parsed, never
-    forwarded, and codex's stdout/stderr never reaches devterm at all — a future
-    regression must not be able to turn arbitrary process output into a credential
-    exfiltration path. `ok: false` with an `error` string is an operation that failed
-    for a reason a person can act on; a non-zero exit is the tool itself failing.
-    """
-    if not PLATFORM_ACCOUNTS:
-        return None, "platform accounts tool is not wired"
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            PLATFORM_ACCOUNTS, "codex-auth", action, "--json",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (asyncio.TimeoutError, FileNotFoundError, OSError):
-        return None, "platform accounts operation failed"
-    if proc.returncode != 0:
-        return None, "platform accounts operation failed"
-    try:
-        payload = json.loads((out or b"").decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return None, "platform accounts operation returned invalid JSON"
-    if not isinstance(payload, dict):
-        return None, "platform accounts operation returned an invalid shape"
-    if payload.get("ok") is not True:
-        # The platform CLI's own message (no codex on this box, no code captured).
-        # Bounded and type-checked here so a malformed payload cannot inject a body.
-        detail = payload.get("error")
-        return None, detail[:400] if isinstance(detail, str) and detail else \
-            "platform accounts operation failed"
-    return payload, None
-
-
-async def _codex_auth_lifecycle(action):
-    """backup / restore — the two that answer with a single boolean."""
-    payload, error = await _codex_auth_call(action, 10)
-    if error:
-        return None, error
-    key = "backedUp" if action == "backup" else "restored"
-    if not isinstance(payload.get(key), bool):
-        return None, "platform accounts operation returned an invalid shape"
-    return payload[key], None
-
-
-async def _serve_codex_login_start(headers, cw):
-    """Codex re-login 1/2 — ask the platform to start `codex login --device-auth`.
-
-    device-auth needs no port-forward/callback: the user opens the link in any browser
-    and enters the code. The backup-before-wipe rule, the capture and the timing all
-    live in `airlock-accounts codex-auth login-start`; this endpoint hands its two
-    display strings to the panel and nothing else.
-    """
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    _invalidate_codex_usage_cache()   # login wipes auth.json: cached numbers are void
-    # The capture polls for up to ~10s inside the platform CLI, so this wait has to
-    # clear that ceiling; too short would report a failure for a login that started.
-    payload, error = await _codex_auth_call("login-start", 30)
-    if error:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": error})
-        return
-    url, code = payload.get("url"), payload.get("code")
-    if not isinstance(url, str) or not isinstance(code, str) or not code:
-        await _send_json(cw, b"400 Bad Request",
-                         {"ok": False, "error": "platform accounts operation returned an invalid shape"})
-        return
-    await _send_json(cw, b"200 OK", {"ok": True, "url": url, "code": code})
-
-
-async def _serve_codex_login_cancel(headers, cw):
-    """Codex re-login cancel — stop the pending device-auth and restore the previous
-    login. Re-login logs out immediately, so this undoes an abandoned attempt."""
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    payload, error = await _codex_auth_call("login-cancel", 15)
-    if error:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": error})
-        return
-    restored = payload.get("restored")
-    if not isinstance(restored, bool):
-        await _send_json(cw, b"400 Bad Request",
-                         {"ok": False, "error": "platform accounts operation returned an invalid shape"})
-        return
-    if restored:
-        _invalidate_codex_usage_cache()
-    await _send_json(cw, b"200 OK", {"ok": True, "restored": restored})
-
-
-async def _serve_codex_logout(headers, cw):
-    """Codex logout — removes auth.json. Codex is single-account, so this is
-    'remove account'; the re-login button reconnects."""
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    _payload, error = await _codex_auth_call("logout", 30)
-    if error:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": error})
-        return
-    _invalidate_codex_usage_cache()
-    await _send_json(cw, b"200 OK", {"ok": True})
-
-
-async def _serve_xai_status(cw):
-    """OpenCode xAI credential metadata only; access/refresh tokens never cross HTTP."""
-    if not _xai_enabled():
-        await _send_json(cw, b"200 OK", {"enabled": False})
-        return
-    result = await _probe_json(["--xai"])
-    if not isinstance(result, dict) or result.get("state") not in {
-            "none", "ok", "expired", "malformed", "err"}:
-        await _send_json(cw, b"500 Internal Server Error",
-                         {"enabled": True, "state": "err",
-                          "reason": "xAI status probe failed",
-                          "loginState": _xai_login_state()})
-        return
-    # The platform probe is outside this app's HTTP trust boundary, so keep the response
-    # an allowlist: a custom/older probe must never smuggle credential fields through.
-    payload = {"enabled": True, "state": result["state"],
-               "loginState": _xai_login_state()}
-    if (result["state"] in {"ok", "expired"}
-            and isinstance(result.get("expires"), int)
-            and not isinstance(result.get("expires"), bool)):
-        payload["expires"] = result["expires"]
-    if result["state"] == "none":
-        payload["reason"] = "no OpenCode xAI credential"
-    elif result["state"] == "malformed":
-        payload["reason"] = "expected OAuth access, refresh and non-negative expires fields"
-    elif result["state"] == "err":
-        # Probe error text is diagnostic, not display data. Do not reflect it: an
-        # older/custom probe could otherwise put a token-shaped value in ``reason``.
-        payload["reason"] = "credential status unavailable"
-    await _send_json(cw, b"200 OK", payload)
-
-
-def _xai_login_state():
-    proc = _xai_login_process
-    if proc is None:
-        return "idle"
-    if proc.returncode is None:
-        return "pending"
-    return "succeeded" if proc.returncode == 0 else "failed"
-
-
-async def _cancel_xai_login():
-    """Stop only the login process group Airlock started, promoting TERM to KILL.
-
-    OpenCode 1.18.18 ignores SIGINT in this flow. A broad pkill could hit a person's
-    terminal login, so the exact new-session group is retained and reaped here.
-    """
-    global _xai_login_process
-    proc = _xai_login_process
-    _xai_login_process = None
-    stopped = bool(proc is not None and proc.returncode is None)
-    if proc is not None:
-        await _terminate_xai_process(proc)
-    try:
-        os.unlink(XAI_LOGIN_OUT)
-    except OSError:
-        pass
-    return stopped
-
-
-def _xai_group_alive(pgid):
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-
-
-async def _terminate_xai_process(proc):
-    """TERM one tracked group and reap descendants that outlive their leader."""
-    if proc is None or proc.returncode is not None:
-        return
-    pgid = proc.pid
-    _signal_probe_group(pgid, signal.SIGTERM)
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=PROBE_KILL_GRACE)
-    except asyncio.TimeoutError:
-        _signal_probe_group(pgid, signal.SIGKILL)
-        try:
-            await proc.wait()
-        except (OSError, ChildProcessError):
-            pass
-        return
-    except asyncio.CancelledError:
-        _signal_probe_group(pgid, signal.SIGKILL)
-        try:
-            await asyncio.shield(proc.wait())
-        except (OSError, ChildProcessError, asyncio.CancelledError):
-            pass
-        raise
-    except (OSError, ChildProcessError):
-        return
-    # TERM may reap the leader while a child in the same group keeps polling. Only
-    # signal again when that exact group still exists; this avoids a blind post-reap
-    # kill while still cleaning descendants.
-    if _xai_group_alive(pgid):
-        _signal_probe_group(pgid, signal.SIGKILL)
-
-
-def _xai_device_values(text):
-    """Extract only OpenCode's documented device-flow URL/code labels."""
-    text = _ANSI_RE.sub("", text)
-    urls = re.findall(r"https://[^\s\x1b]+", text)
-    url = None
-    for item in urls:
-        candidate = item.rstrip("),.;")
-        # Browsers apply WHATWG backslash normalization while urlsplit follows RFC
-        # syntax. Reject that ambiguity (and userinfo) before trusting the hostname.
-        if "\\" in candidate:
-            continue
-        try:
-            parsed = urllib.parse.urlsplit(candidate)
-            host = (parsed.hostname or "").lower()
-        except ValueError:
-            continue
-        if (parsed.scheme == "https" and parsed.username is None
-                and parsed.password is None
-                and (host == "x.ai" or host.endswith(".x.ai")
-                or host == "grok.com" or host.endswith(".grok.com"))):
-            url = candidate
-            break
-    # OpenCode 1.18.18 emits "enter code: XXXX-XXXX". Keep this anchored to
-    # that label: a loose search once returned the literal word "CODE".
-    match = re.search(
-        r"\benter\s+code\s*:\s*([A-Z0-9]{4,}(?:-[A-Z0-9]{4,})*)\b", text)
-    code = match.group(1) if match and match.group(1) != "CODE" else None
-    return url, code
-
-
-def _open_xai_login_capture():
-    """Open the capture as 0600 without following a pre-planted symlink."""
-    os.makedirs(DEVTERM_STATE_DIR, mode=0o700, exist_ok=True)
-    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    dir_fd = os.open(DEVTERM_STATE_DIR, dir_flags)
-    try:
-        os.fchmod(dir_fd, 0o700)
-        flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
-        fd = os.open(os.path.basename(XAI_LOGIN_OUT), flags, 0o600, dir_fd=dir_fd)
-        try:
-            os.fchmod(fd, 0o600)
-        except BaseException:
-            os.close(fd)
-            raise
-        return fd
-    finally:
-        os.close(dir_fd)
-
-
-async def _serve_xai_login_start_owned(cw):
-    """Start OpenCode's headless SuperGrok device flow and return its URL + code."""
-    global _xai_login_process
-    if not _xai_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "xAI disabled"})
-        return
-    binary = _opencode_bin()
-    if binary is None:
-        await _send_json(cw, b"400 Bad Request",
-                         {"ok": False, "error": _opencode_missing_error()})
-        return
-    await _cancel_xai_login()
-    try:
-        fd = _open_xai_login_capture()
-        outf = os.fdopen(fd, "wb")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                binary, "auth", "login", "--provider", "xai", "--method",
-                "SuperGrok Subscription",
-                stdout=outf, stderr=asyncio.subprocess.STDOUT,
-                stdin=asyncio.subprocess.DEVNULL, start_new_session=True,
-                env={**os.environ, "BROWSER": "true"})
-        finally:
-            outf.close()
-        _xai_login_process = proc
-    except (FileNotFoundError, OSError) as exc:
-        await _send_json(cw, b"400 Bad Request",
-                         {"ok": False,
-                          "error": "OpenCode xAI login launch failed (" +
-                                   type(exc).__name__ + ")"})
-        return
-
-    url = code = None
-    for _ in range(20):
-        await asyncio.sleep(0.5)
-        try:
-            with open(XAI_LOGIN_OUT, encoding="utf-8", errors="replace") as f:
-                txt = _ANSI_RE.sub("", f.read())
-        except OSError:
-            txt = ""
-        url, code = _xai_device_values(txt)
-        if url and code:
-            break
-        if proc.returncode is not None:
-            break
-    if url and code:
-        # The response is the only place these short-lived device values go. Unlink the
-        # capture while the child still owns its fd so they cannot linger on disk.
-        try:
-            os.unlink(XAI_LOGIN_OUT)
-        except OSError:
-            pass
-        await _send_json(cw, b"200 OK", {"ok": True, "url": url, "code": code})
-        return
-    await _cancel_xai_login()
-    await _send_json(cw, b"400 Bad Request",
-                     {"ok": False, "error": "failed to capture OpenCode xAI device flow"})
-
-
-async def _xai_write_request_ok(headers, cw):
-    """Refuse cross-origin/form writes before any xAI process or credential mutation."""
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "forbidden origin"})
-        return False
-    content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
-    if content_type != b"application/json":
-        await _send_json(cw, b"415 Unsupported Media Type",
-                         {"ok": False, "error": "application/json required"})
-        return False
-    return True
-
-
-async def _serve_xai_login_start(headers, cw):
-    if not await _xai_write_request_ok(headers, cw):
-        return
-    if not _xai_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "xAI disabled"})
-        return
-    if _xai_operation_lock.locked():
-        await _send_json(cw, b"409 Conflict",
-                         {"ok": False, "error": "xAI operation already in progress"})
-        return
-    async with _xai_operation_lock:
-        await _serve_xai_login_start_owned(cw)
-
-
-async def _serve_xai_login_cancel(headers, cw):
-    if not await _xai_write_request_ok(headers, cw):
-        return
-    if not _xai_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "xAI disabled"})
-        return
-    if _xai_operation_lock.locked():
-        await _send_json(cw, b"409 Conflict",
-                         {"ok": False, "error": "xAI operation already in progress"})
-        return
-    async with _xai_operation_lock:
-        stopped = await _cancel_xai_login()
-        await _send_json(cw, b"200 OK", {"ok": True, "stopped": stopped})
-
-
-async def _serve_xai_logout_owned(cw):
-    if not _xai_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "xAI disabled"})
-        return
-    binary = _opencode_bin()
-    if binary is None:
-        await _send_json(cw, b"400 Bad Request",
-                         {"ok": False, "error": _opencode_missing_error()})
-        return
-    await _cancel_xai_login()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            binary, "auth", "logout", "xai",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True)
-        try:
-            await asyncio.wait_for(proc.communicate(), timeout=XAI_LOGOUT_WAIT)
-        except asyncio.TimeoutError:
-            await _terminate_xai_process(proc)
-            raise
-        payload = ({"ok": True} if proc.returncode == 0 else
-                   {"ok": False, "error": "OpenCode xAI logout failed"})
-    except asyncio.TimeoutError:
-        payload = {"ok": False, "error": "OpenCode xAI logout timed out"}
-    except (FileNotFoundError, OSError) as exc:
-        payload = {"ok": False, "error": "OpenCode xAI logout failed (" +
-                                           type(exc).__name__ + ")"}
-    await _send_json(cw, b"200 OK" if payload.get("ok") else b"400 Bad Request", payload)
-
-
-async def _serve_xai_logout(headers, cw):
-    if not await _xai_write_request_ok(headers, cw):
-        return
-    if not _xai_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "xAI disabled"})
-        return
-    if _xai_operation_lock.locked():
-        await _send_json(cw, b"409 Conflict",
-                         {"ok": False, "error": "xAI operation already in progress"})
-        return
-    async with _xai_operation_lock:
-        await _serve_xai_logout_owned(cw)
-
-
-async def _serve_acct_remove(cr, headers, leftover, cw):
-    """Remove an account slot — `claude-switch remove <name> --yes` server-side.
-    Not reversible, but name = id, so re-login revives the same slot."""
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    if not _accounts_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "accounts disabled"})
-        return
-    d = await _read_json_body(cr, headers, leftover) or {}
-    name = (d.get("name") or "").strip()
-    if not name or "/" in name or name.startswith("."):
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "invalid name"})
-        return
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            CLAUDE_SWITCH, "remove", name, "--yes",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await proc.communicate()
-        ok = proc.returncode == 0
-        if ok:
-            _invalidate_acct_caches()
-        payload = {"ok": ok}
-        if not ok:
-            payload["error"] = (err or out or b"").decode("utf-8", "replace")[:200]
-    except (FileNotFoundError, OSError) as e:
-        payload = {"ok": False, "error": str(e)}
-    await _send_json(cw, b"200 OK" if payload.get("ok") else b"400 Bad Request", payload)
-
-
-async def _claude_switch(args, timeout=40, stdin_bytes=None):
-    """Run a claude-switch subcommand -> (ok, stdout, stderr). Secrets never appear in
-    stdout (login-url = URL / login-code = a status string only). A login code crosses
-    this process boundary only through stdin, never argv or the environment."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *([CLAUDE_SWITCH] + args),
-            stdin=(asyncio.subprocess.PIPE if stdin_bytes is not None
-                   else asyncio.subprocess.DEVNULL),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    except (FileNotFoundError, OSError) as e:
-        return False, "", str(e)
-    try:
-        communicate = proc.communicate() if stdin_bytes is None else proc.communicate(stdin_bytes)
-        out, err = await asyncio.wait_for(communicate, timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill(); await proc.wait()
-        return False, "", "timed out"
-    return (proc.returncode == 0,
-            (out or b"").decode("utf-8", "replace").strip(),
-            (err or b"").decode("utf-8", "replace").strip())
-
-
-def _signal_probe_group(pgid, sig):
-    try:
-        os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-
-
-async def _kill_probe_group(proc, pgid):
-    """Reap a probe that was started in its own session, group and all.
-
-    The codex probe spawns an `app-server` child; if the probe dies without running its
-    own cleanup, that child outlives us. Killing the group takes it too."""
-    if proc is None or pgid is None:
-        return
-    if proc.returncode == 0:
-        # Clean exit: the probe already reaped its app-server group in its own finally,
-        # and communicate() has reaped the probe, so this pgid may already be recycled.
-        # Signalling now could only kill an unrelated process group.
-        return
-    _signal_probe_group(pgid, signal.SIGTERM)
-    try:
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=PROBE_KILL_GRACE)
-        except asyncio.TimeoutError:
-            pass
-        except (OSError, ChildProcessError):
-            pass
-    finally:
-        # A re-cancel must not let us skip the SIGKILL promotion.
-        _signal_probe_group(pgid, signal.SIGKILL)
-        try:
-            await proc.wait()
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            while current is not None and current.cancelling():
-                current.uncancel()
-            try:
-                await proc.wait()
-            except (OSError, ChildProcessError):
-                pass
-        except (OSError, ChildProcessError):
-            pass
-
-
-async def _probe_json(args, timeout=25):
-    """Run claude-status with args and return its parsed JSON (None on any failure).
-    Same probe as _run_probe, but for internal callers instead of an HTTP response."""
-    if not (CLAUDE_STATUS and os.path.isfile(CLAUDE_STATUS)):
-        return None
-    proc = None
-    probe_pgid = None
-    out = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, CLAUDE_STATUS, *args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True)
-        # A child of a new session is its own group leader, so we do not need to call
-        # getpgid() again at reap time (by then the pid may be gone).
-        probe_pgid = proc.pid
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        if proc.returncode != 0:
-            return None
-    except (FileNotFoundError, OSError):
-        return None
-    except asyncio.TimeoutError:
-        return None
-    except asyncio.CancelledError:
-        raise
-    finally:
-        await _kill_probe_group(proc, probe_pgid)
-    try:
-        result = json.loads((out or b"").decode().strip().splitlines()[-1])
-    except (ValueError, IndexError, UnicodeDecodeError):
-        return None
-    return result if isinstance(result, dict) else None
-
-
-# ---- persisted Claude usage -------------------------------------------------
-# This is display memory for /accounts, not an alerting source. The store contains
-# account addresses, so every accepted record is normalized before it is retained.
-
-def _claude_usage_key_parts(key):
-    if not isinstance(key, str):
-        return None
-    parts = key.split("|")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        return None
-    kind = _claude_kind(parts[1])
-    return (parts[0], kind) if kind else None
-
-
-def _claude_usage_normalize_usage(raw):
-    if not isinstance(raw, dict):
-        return None
-    usage = {}
-    has_value = False
-    for key in ("use5h", "use7d"):
-        value = raw.get(key)
-        if value is None:
-            usage[key] = None
-            continue
-        value = _finite_number(value)
-        if value is None or not 0 <= value <= 100:
-            return None
-        usage[key] = value
-        has_value = True
-    if not has_value:
-        return None
-    for key in ("reset5h", "reset7d"):
-        value = raw.get(key)
-        if value is not None and not isinstance(value, str):
-            return None
-        usage[key] = value
-    return usage
-
-
-def _claude_usage_validate_entry(raw, now):
-    if not isinstance(raw, dict):
-        return None
-    value_at = _finite_number(raw.get("valueAt"))
-    if (value_at is None or value_at <= 0
-            or value_at > now + CLAUDE_USAGE_FUTURE_SKEW):
-        return None
-    usage = _claude_usage_normalize_usage(raw.get("usage"))
-    if usage is None:
-        return None
-    return {"usage": usage, "valueAt": value_at}
-
-
-def _claude_usage_records(raw, now):
-    """Return only validated records from one versioned store object."""
-    if not isinstance(raw, dict) or isinstance(raw.get("version"), bool) \
-            or raw.get("version") != 1 or not isinstance(raw.get("accounts"), dict):
-        return {}
-    records = {}
-    for key, raw_entry in raw["accounts"].items():
-        parts = _claude_usage_key_parts(key)
-        if parts is None:
-            continue
-        entry = _claude_usage_validate_entry(raw_entry, now)
-        canonical_key = f"{parts[0]}|{parts[1]}"
-        current = records.get(canonical_key)
-        source_is_canonical = key == canonical_key
-        if entry is not None and (current is None
-                                  or entry["valueAt"] > current["valueAt"]
-                                  or (entry["valueAt"] == current["valueAt"]
-                                      and source_is_canonical)):
-            records[canonical_key] = entry
-    return records
-
-
-def _claude_usage_state_load(now=None):
-    """Load a cold/partially valid cache; malformed records are simply not usable."""
-    now = time.time() if now is None else now
-    try:
-        with open(CLAUDE_USAGE_STATE, encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, ValueError, UnicodeError, RecursionError):
-        return {}
-    return _claude_usage_records(raw, now)
-
-
-def _claude_usage_candidate(result, now):
-    if not isinstance(result, dict) or result.get("state") != "ok":
-        return None
-    email = result.get("email")
-    kind = result.get("kind")
-    if not isinstance(email, str) or not email or not isinstance(kind, str) or not kind:
-        return None
-    key = f"{email}|{_claude_kind(kind)}"
-    if _claude_usage_key_parts(key) is None:
-        return None
-    usage = _claude_usage_normalize_usage(result.get("usage"))
-    if usage is None:
-        return None
-    return key, {"usage": usage, "valueAt": now}
-
-
-def _claude_usage_state_save(result):
-    """Persist one good live probe without ever making the probe request fail.
-
-    This deliberately stays a plain synchronous function. The gate has one asyncio
-    loop, so its read-modify-prune-write sequence cannot interleave with another handler.
-    """
-    global _claude_usage_write_logged
-    now = time.time()
-    candidate = _claude_usage_candidate(result, now)
-    if candidate is None:
-        return False
-    key, entry = candidate
-    tmp = None
-    fd = None
-    try:
-        # Keep the load in this same synchronous call as merge, prune and replace. Moving
-        # only the load to run_in_executor would reintroduce a lost-update window.
-        try:
-            with open(CLAUDE_USAGE_STATE, encoding="utf-8") as f:
-                raw = json.load(f)
-        except (OSError, ValueError, UnicodeError, RecursionError):
-            raw = None
-        records = _claude_usage_records(raw, now)
-        cutoff = now - CLAUDE_USAGE_MAX_AGE
-        records = {k: v for k, v in records.items() if v["valueAt"] >= cutoff}
-        records[key] = entry
-        payload = {"version": 1, "accounts": records}
-
-        os.makedirs(CLAUDE_USAGE_STATE_DIR, mode=0o700, exist_ok=True)
-        tmp = f"{CLAUDE_USAGE_STATE}.tmp.{os.getpid()}"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC, 0o600)
-        stream = os.fdopen(fd, "w", encoding="utf-8")
-        fd = None
-        with stream:
-            json.dump(payload, stream, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, CLAUDE_USAGE_STATE)
-        return True
-    except (OSError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if tmp:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        if not _claude_usage_write_logged:
-            _claude_usage_write_logged = True
-            print("devterm-gate: warning: Claude usage state write failed "
-                  f"({type(exc).__name__})", file=sys.stderr, flush=True)
-        return False
-
-
-# ---- Codex usage cache ------------------------------------------------------
-# Reading Codex utilization costs an `app-server` spawn, so it is cached with a TTL and
-# refreshed in a single background task. Callers never block on more than one refresh,
-# and a login/logout invalidates the cache so a previous account's numbers cannot be
-# served under the new identity.
-
-def _codex_auth_mtime():
-    """Return login generation, absence, or a distinct unavailable sentinel.
-
-    Absence is a valid generation (`None`). Transport failure is not: treating two
-    failures as the same generation could let an in-flight result cross a login change.
-    """
-    if not PLATFORM_ACCOUNTS:
-        return _CODEX_AUTH_GENERATION_UNAVAILABLE
-    try:
-        proc = subprocess.run(
-            [PLATFORM_ACCOUNTS, "codex-auth", "generation", "--json"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return _CODEX_AUTH_GENERATION_UNAVAILABLE
-    if proc.returncode != 0 or len(proc.stdout) > 4096:
-        return _CODEX_AUTH_GENERATION_UNAVAILABLE
-    try:
-        payload = json.loads(proc.stdout.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return _CODEX_AUTH_GENERATION_UNAVAILABLE
-    if (not isinstance(payload, dict) or payload.get("ok") is not True
-            or not isinstance(payload.get("present"), bool)):
-        return _CODEX_AUTH_GENERATION_UNAVAILABLE
-    generation = payload.get("generation")
-    if not payload["present"]:
-        return None
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
-        return _CODEX_AUTH_GENERATION_UNAVAILABLE
-    return generation
-
-
-def _codex_observed_at(value_at):
-    if value_at <= 0:
-        return None
-    return datetime.fromtimestamp(value_at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _codex_cache_value_at():
-    return _codex_usage_cache.get("valueAt", 0.0)
-
-
-def _codex_has_usage_value(result):
-    return (isinstance(result, dict)
-            and any(_finite_number(result.get(key)) is not None
-                    for key in ("use5h", "use7d")))
-
-
-def _codex_usage_state_save():
-    """Remember the last good reading. Best effort — this is a cache, and failing to
-    write one must never disturb the request that produced it."""
-    payload = _codex_usage_cache.get("payload")
-    value_at = _codex_usage_cache.get("valueAt", 0.0)
-    if not _codex_has_usage_value(payload) or value_at <= 0:
-        return False
-    auth_mtime = _codex_usage_cache.get("authMtime")
-    if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
-        return False
-    record = {"payload": payload, "valueAt": value_at, "authMtime": auth_mtime}
-    try:
-        os.makedirs(CODEX_USAGE_STATE_DIR, exist_ok=True)
-        tmp = CODEX_USAGE_STATE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(record, f)
-        os.replace(tmp, CODEX_USAGE_STATE)
-        return True
-    except OSError:
-        return False
-
-
-def _codex_usage_state_drop():
-    try:
-        os.remove(CODEX_USAGE_STATE)
-    except OSError:
-        pass
-
-
-def _codex_usage_state_load():
-    """Seed the cache from the remembered reading. Called once, before serving.
-
-    Refused when it belongs to a different login: auth.json's mtime is stored with the
-    numbers, and after a login or logout the previous account's usage is not this
-    account's — the same rule the live cache already applies, applied to the file.
-    Restored as stale when it is older than the value TTL, so the row says
-    '(last value)' instead of presenting a remembered number as a fresh observation."""
-    source = CODEX_USAGE_STATE
-    if not os.path.isfile(source) and os.path.isfile(LEGACY_CODEX_USAGE_STATE):
-        source = LEGACY_CODEX_USAGE_STATE
-    try:
-        with open(source, encoding="utf-8") as f:
-            record = json.load(f)
-    except (OSError, ValueError):
-        return False
-    if not isinstance(record, dict):
-        return False
-    payload = record.get("payload")
-    value_at = _finite_number(record.get("valueAt"))
-    if not _codex_has_usage_value(payload) or value_at is None or value_at <= 0:
-        return False
-    auth_mtime = _codex_auth_mtime()
-    if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
-        return False
-    if record.get("authMtime") != auth_mtime:
-        try:
-            os.remove(source)          # a different login wrote it; its numbers are void
-        except OSError:
-            pass
-        return False
-    payload = dict(payload)
-    payload["stale"] = time.time() - value_at > CODEX_USAGE_TTL
-    # lastTryAt stays 0 so a value past its TTL is refreshed on the first request rather
-    # than riding the retry backoff of a probe this process never made.
-    _codex_usage_cache.update(valueAt=value_at, lastTryAt=0.0, payload=payload,
-                              authMtime=auth_mtime, task=None)
-    if source == LEGACY_CODEX_USAGE_STATE and _codex_usage_state_save():
-        try:
-            os.remove(LEGACY_CODEX_USAGE_STATE)
-        except OSError:
-            pass
-    return True
-
-
-def _invalidate_codex_usage_cache():
-    task = _codex_usage_cache.get("task")
-    if task is not None and not task.done():
-        task.cancel()
-    _acct_alert_cache.update(at=0.0, payload=None)
-    _codex_usage_cache.update(valueAt=0.0, lastTryAt=0.0, payload=None,
-                              authMtime=_codex_auth_mtime(), task=None)
-    # The file outlives the process, so leaving it here would resurrect the numbers of
-    # the account we just invalidated at the next restart.
-    _codex_usage_state_drop()
-
-
-def _invalidate_acct_caches():
-    """Drop the derived account caches after a mutation (swap / remove / login).
-    The alert verdict and the live-usage reading both describe "the account in use", so
-    a swap makes both wrong at once."""
-    global _acct_cache_generation
-    _acct_cache_generation += 1
-    _acct_alert_cache.update(at=0.0, payload=None)
-    _live_usage_cache.update(at=0.0, payload=None)
-
-
-def _codex_pending_payload(err="pending"):
-    return {"use5h": None, "use7d": None, "reset5h": None, "reset7d": None,
-            "plan": None, "resetCredits": None, "observedAt": None,
-            "err": err, "stale": True}
-
-
-async def _codex_usage_refresh(auth_mtime):
-    current_task = asyncio.current_task()
-    try_at = time.time()
-    _codex_usage_cache["lastTryAt"] = try_at
-    try:
-        probe_error = None
-        try:
-            result = await _probe_json(["--codex-usage"])
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            result = None
-            probe_error = f"probe-{type(exc).__name__}"
-
-        # A login/logout (or a newer refresh) invalidated this task: do not attribute
-        # the previous account's numbers to the current one.
-        current_auth_mtime = _codex_auth_mtime()
-        if (auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE
-                or current_auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE
-                or _codex_usage_cache.get("task") is not current_task
-                or _codex_usage_cache.get("authMtime") != auth_mtime
-                or current_auth_mtime != auth_mtime):
-            return
-        now = time.time()
-        result_error = result.get("err") if isinstance(result, dict) else None
-        last_err = result_error or probe_error or "probe-failed"
-        if _codex_has_usage_value(result):
-            payload = dict(result)
-            payload["observedAt"] = _codex_observed_at(now)
-            # The numbers are a fresh observation, so not stale; a partial parse error
-            # is kept as side information only.
-            payload["stale"] = False
-            if result_error:
-                payload["lastErr"] = last_err
-            else:
-                payload.pop("lastErr", None)
-            _codex_usage_cache.update(valueAt=now, lastTryAt=now, payload=payload)
-            _codex_usage_state_save()   # so the next restart opens on this, not on blank
-            _acct_alert_cache.update(at=0.0, payload=None)
-        elif _codex_usage_cache.get("payload") is not None:
-            # Keep the last good value, marked stale — better than blanking the UI.
-            payload = dict(_codex_usage_cache["payload"], stale=True, lastErr=last_err)
-            _codex_usage_cache.update(lastTryAt=now, payload=payload)
-        elif isinstance(result, dict):
-            payload = dict(result, stale=True, lastErr=last_err)
-            payload["observedAt"] = None
-            _codex_usage_cache.update(lastTryAt=now, valueAt=0.0, payload=payload)
-        else:
-            payload = _codex_pending_payload(last_err)
-            payload["lastErr"] = last_err
-            _codex_usage_cache.update(lastTryAt=now, valueAt=0.0, payload=payload)
-    finally:
-        if _codex_usage_cache.get("task") is current_task:
-            _codex_usage_cache["task"] = None
-
-
-def _codex_usage_refresh_start(auth_mtime):
-    task = _codex_usage_cache.get("task")
-    if task is None or task.done():
-        task = asyncio.create_task(_codex_usage_refresh(auth_mtime))
-        _codex_usage_cache["task"] = task
-    return task
-
-
-def _codex_usage_refresh_due(now, force=False):
-    if force:
-        return True
-    last_try = _codex_usage_cache.get("lastTryAt", 0.0)
-    if _codex_usage_cache.get("payload") is None:
-        return now - last_try >= CODEX_USAGE_RETRY
-    payload = _codex_usage_cache["payload"]
-    # Only a value-less failure (initial, or a preserved last-good) retries quickly. A
-    # partial reading is stale=False + lastErr, so it rides the normal value TTL.
-    if isinstance(payload, dict) and payload.get("stale") and payload.get("lastErr"):
-        return now - last_try >= CODEX_USAGE_RETRY
-    if not _codex_has_usage_value(payload):
-        return now - last_try >= CODEX_USAGE_RETRY
-    value_at = _codex_cache_value_at()
-    if value_at > 0 and now - value_at <= CODEX_USAGE_TTL:
-        return False
-    if value_at > 0 and last_try <= value_at:
-        return True
-    return now - last_try >= CODEX_USAGE_RETRY
-
-
-def _codex_timeout_payload():
-    payload = _codex_usage_cache.get("payload")
-    if payload is not None:
-        return dict(payload, stale=True, lastErr="timeout")
-    result = _codex_pending_payload("timeout")
-    result["lastErr"] = "timeout"
-    return result
-
-
-async def _codex_usage_cached(force=False, wait=False, wait_valued=False,
-                              force_if_stale=False):
-    retried_after_cancel = False
-    while True:
-        auth_mtime = _codex_auth_mtime()
-        if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
-            task = _codex_usage_cache.get("task")
-            if task is not None and not task.done():
-                task.cancel()
-            _codex_usage_cache.update(valueAt=0.0, lastTryAt=0.0, payload=None,
-                                      authMtime=auth_mtime, task=None)
-            return _codex_pending_payload("auth-generation-unavailable")
-        if auth_mtime != _codex_usage_cache.get("authMtime"):
-            _invalidate_codex_usage_cache()
-            auth_mtime = _codex_usage_cache["authMtime"]
-
-        now = time.time()
-        task = _codex_usage_cache.get("task")
-        if task is None or task.done():
-            task = None
-        payload = _codex_usage_cache.get("payload")
-        force_refresh = force or (force_if_stale and isinstance(payload, dict)
-                                  and payload.get("stale"))
-        if task is None and _codex_usage_refresh_due(now, force=force_refresh):
-            task = _codex_usage_refresh_start(auth_mtime)
-
-        # A remembered value is useful immediately; only a value-less cache needs
-        # the bounded wait that keeps the first paint from being blank.
-        if (wait and task is not None
-                and (wait_valued or not _codex_has_usage_value(_codex_usage_cache.get("payload")))):
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=CODEX_USAGE_WAIT)
-            except asyncio.TimeoutError:
-                return _codex_timeout_payload()
-            except asyncio.CancelledError:
-                if not task.cancelled():
-                    raise
-                # A login/logout cancelled the refresh we were waiting on: restart once
-                # against the new auth state, then give up rather than loop.
-                if retried_after_cancel:
-                    return _codex_pending_payload()
-                retried_after_cancel = True
-                if _codex_usage_cache.get("task") is task:
-                    _invalidate_codex_usage_cache()
-                auth_mtime = _codex_auth_mtime()
-                if auth_mtime is _CODEX_AUTH_GENERATION_UNAVAILABLE:
-                    return _codex_pending_payload("auth-generation-unavailable")
-                if auth_mtime != _codex_usage_cache.get("authMtime"):
-                    _invalidate_codex_usage_cache()
-                    auth_mtime = _codex_usage_cache["authMtime"]
-                _codex_usage_refresh_start(auth_mtime)
-                continue
-            task = _codex_usage_cache.get("task")
-            if task is None or task.done():
-                task = None
-        payload = _codex_usage_cache.get("payload")
-        if payload is None:
-            return _codex_pending_payload()
-        if task is None and not _codex_usage_refresh_due(time.time(), force=force):
-            return dict(payload)
-        return dict(payload, stale=True) if task is not None else dict(payload)
-
-
-async def _codex_usage_sweeper():
-    """Keep the Codex reading moving whether or not anyone has the panel open.
-
-    Every refresh above is demand-driven, so on a box where nobody opened the Codex
-    section the number simply stopped: after one restart the state file did not exist
-    for 7.5 hours. The Claude rows do not have this problem because their collector is
-    a timer that does not care whether anyone is looking. This is that timer, kept
-    inside the gate — the cache, the state file and the auth-generation invalidation
-    then keep their single owner, and periodically kicking the existing path needs no
-    second one.
-
-    `force=True` is required, and the reason is a phase trap. Without it the tick asks
-    `_codex_usage_refresh_due`, which declines while `now - valueAt <= CODEX_USAGE_TTL`.
-    A reading taken at the previous tick lands at `valueAt = tick + probe_duration`, so
-    one sweep period later the age is `SWEEP - probe_duration` — a hair UNDER the TTL,
-    every time. The tick is skipped and the value is only refreshed on the tick after
-    that: the effective interval is 2x the period, and for half of it the panel reads a
-    value the gate itself calls stale. Measured before this was fixed: ticks at
-    1000/1300/1600/1900/2200 produced probes at 1000/1600/2200.
-
-    Forcing costs nothing in rate: the sweeper's own period is the rate limit, and at
-    300s it is far slower than the CODEX_USAGE_RETRY (30s) backoff being bypassed — so
-    a box with a dead Codex login is still probed once per sweep, not more."""
-    while True:
-        try:
-            await _codex_usage_cached(force=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # A sweep is background work: it reports and keeps its schedule rather than
-            # letting one bad reading end the loop for the life of the process.
-            print("devterm-gate: codex usage sweep failed: "
-                  f"{type(exc).__name__}", flush=True)
-        await asyncio.sleep(CODEX_USAGE_SWEEP)
-
-
-async def _serve_codex_usage(headers, cw):
-    # The first panel read returns a remembered value immediately. Its one follow-up
-    # opts into waiting for the shared refresh task, so it cannot race the 12 s probe
-    # and get the same stale value merely because it asked after 3 s.
-    revalidate = headers.get(b"x-airlock-revalidate") == b"wait"
-    payload = await _codex_usage_cached(
-        wait=True, wait_valued=revalidate, force_if_stale=revalidate)
-    await _send_json(cw, b"200 OK", payload, cors=_cors_origin(headers))
+# Fleet compatibility remains until the external collector no longer uses DevTerm.
+# It is deliberately a fresh probe: account-owned caches and background sweepers live
+# only in the platform account service.
+async def _serve_codex_usage(cw):
+    await _run_probe(cw, ["--codex-usage"])
 
 
 async def _run_probe_result(args=()):
@@ -2920,24 +1368,6 @@ async def _serve_usage_store(cw):
         await _send_json(cw, b"200 OK", {})
 
 
-def _fetch_fleet_store():
-    """Fetch the shared usage store: from the local file if present, else over HTTP if
-    a URL is configured. Failures are non-fatal — the account list still renders."""
-    if FLEET_STORE:
-        try:
-            with open(FLEET_STORE) as f:
-                return json.load(f)
-        except (OSError, ValueError):
-            pass
-    if FLEET_STORE_URL:
-        try:
-            with urllib.request.urlopen(FLEET_STORE_URL, timeout=6) as r:
-                return json.load(r)
-        except Exception:
-            pass
-    return {}
-
-
 async def _serve_claude_usage(head, cw, read_only=False):
     """`GET /claude-usage?slot=<account|live>` — query just the one asked-for account.
     (Querying all accounts at once risks 429 when several boxes poll together.)
@@ -2950,14 +1380,6 @@ async def _serve_claude_usage(head, cw, read_only=False):
     await _run_probe(cw, ["--usage", slot] + (["--no-refresh"] if read_only else []))
 
 
-async def _serve_codex_status(cw):
-    """`GET /codex-status` — this box's Codex login identity, read locally from
-    auth.json (email/plan/account id, never a token). Answers in the time it takes to
-    read one file, so the panel's Codex row paints at once; /claude-status stays the
-    full network-verified probe and is no longer on the panel's first-paint path."""
-    await _run_probe(cw, ["--codex"])
-
-
 async def _serve_claude_status(cw, read_only=False):
     """`GET /claude-status` — which account this box is logged in as + health. No
     secrets. Usage is NOT queried here (per-account API call risks 429).
@@ -2968,73 +1390,6 @@ async def _serve_claude_status(cw, read_only=False):
     `_describe` -> `_refresh_pool`/`_mark_dead`), so a non-owner could rotate the
     owner's credentials merely by polling. The probe then reports the slot as stale."""
     await _run_probe(cw, ["--no-refresh"] if read_only else [])
-
-
-async def _serve_acct_usage_now(headers, cw):
-    """Query the live (active) account's usage right now — the popup wants the value
-    as of the moment it opened, while the collector runs on its own slower cadence.
-    Only the active account (querying all would risk 429)."""
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    status, payload = await _run_probe_result(["--usage", "live"])
-    # Keep the read-modify-prune-write inline on the single gate loop; the response is
-    # still the probe payload verbatim, and a cache failure must not fail this reading.
-    _claude_usage_state_save(payload)
-    await _send_json(cw, status, payload)
-
-
-async def _serve_acct_login_url(headers, cw):
-    """Add account 1/2 — issue a login link (PKCE). The verifier stays server-side."""
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    if not _accounts_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "accounts disabled"})
-        return
-    ok, out, err = await _claude_switch(["login-url"])
-    if ok and out.startswith("https://"):
-        await _send_json(cw, b"200 OK", {"ok": True, "url": out.splitlines()[0]})
-    else:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": (err or out or "failed to issue link")[:300]})
-
-
-async def _serve_acct_login_code(cr, headers, leftover, cw):
-    """Add account 2/2 — exchange the approval code for tokens -> saved to the pool
-    (name = the logged-in id). The code is a one-time short-lived secret — never logged/echoed."""
-    if not _accounts_enabled():
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "accounts disabled"})
-        return
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "forbidden origin"})
-        return
-    content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
-    if content_type != b"application/json":
-        await _send_json(cw, b"415 Unsupported Media Type",
-                         {"ok": False, "error": "application/json required"})
-        return
-    d = await _read_json_body(cr, headers, leftover, limit=LOGIN_CODE_BODY_MAX) or {}
-    code = (d.get("code") or "").strip()
-    try:
-        code_bytes = code.encode("utf-8")
-    except (AttributeError, UnicodeEncodeError):
-        code_bytes = b""
-    if (not code_bytes or len(code_bytes) > 400
-            or any(c.isspace() for c in code)):
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "not a code"})
-        return
-    ok, out, err = await _claude_switch(
-        ["login-code"], stdin_bytes=code_bytes)
-    if ok:
-        _invalidate_acct_caches()
-        # The target is a credential processor, not a trusted response formatter. It
-        # may reflect the submitted code even on rc=0, so return only a fixed message.
-        await _send_json(cw, b"200 OK", {"ok": True, "msg": "registered"})
-    else:
-        # The token endpoint is untrusted and may reflect the submitted one-time code in
-        # its error body. Keep all subprocess output behind this credential boundary.
-        await _send_json(cw, b"400 Bad Request",
-                         {"ok": False, "error": "registration failed — request a new login link"})
 
 
 async def handle(cr, cw):
@@ -3088,44 +1443,14 @@ async def handle(cr, cw):
             await _serve_layout(cr, headers, leftover, cw)
         elif path == b"/pane" and method == b"POST":
             await _serve_pane(cr, headers, leftover, cw)
-        elif path == b"/accounts" and method == b"GET":
-            await _serve_accounts(cw)
         elif path == b"/claude-status" and method == b"GET":
             await _serve_claude_status(cw, read_only)
-        elif path == b"/codex-status" and method == b"GET":
-            await _serve_codex_status(cw)
         elif path == b"/claude-usage-store" and method == b"GET":
             await _serve_usage_store(cw)
         elif path == b"/claude-usage" and method == b"GET":
             await _serve_claude_usage(head, cw, read_only)
-        elif path == b"/acct-usage-now" and method == b"POST":
-            await _serve_acct_usage_now(headers, cw)
         elif path == b"/codex-usage" and method == b"GET":
-            await _serve_codex_usage(headers, cw)
-        elif path == b"/acct-alert" and method == b"GET":
-            await _serve_acct_alert(headers, cw)
-        elif path == b"/acct-login-url" and method == b"POST":
-            await _serve_acct_login_url(headers, cw)
-        elif path == b"/acct-login-code" and method == b"POST":
-            await _serve_acct_login_code(cr, headers, leftover, cw)
-        elif path == b"/acct-switch" and method == b"POST":
-            await _serve_acct_switch(cr, headers, leftover, cw)
-        elif path == b"/acct-remove" and method == b"POST":
-            await _serve_acct_remove(cr, headers, leftover, cw)
-        elif path == b"/codex-login-start" and method == b"POST":
-            await _serve_codex_login_start(headers, cw)
-        elif path == b"/codex-login-cancel" and method == b"POST":
-            await _serve_codex_login_cancel(headers, cw)
-        elif path == b"/codex-logout" and method == b"POST":
-            await _serve_codex_logout(headers, cw)
-        elif path == b"/xai-status" and method == b"GET":
-            await _serve_xai_status(cw)
-        elif path == b"/xai-login-start" and method == b"POST":
-            await _serve_xai_login_start(headers, cw)
-        elif path == b"/xai-login-cancel" and method == b"POST":
-            await _serve_xai_login_cancel(headers, cw)
-        elif path == b"/xai-logout" and method == b"POST":
-            await _serve_xai_logout(headers, cw)
+            await _serve_codex_usage(cw)
         elif path == b"/orca/status" and method == b"GET":
             await _serve_orca_status(cw)
         elif path == b"/orca/tree" and method == b"GET":
@@ -3204,12 +1529,6 @@ async def main():
     if not ALLOW:
         sys.stderr.write("devterm-gate: warning: AIRLOCK_OWNER unset — no owner "
                          "allowed, all requests 403 (fail-closed)\n")
-    # Before the first request, so the first panel opened after a restart shows the last
-    # known Codex numbers instead of waiting out a probe on a blank row.
-    if _codex_usage_state_load():
-        print("devterm-gate: restored last known Codex usage "
-              f"({'stale' if _codex_usage_cache['payload'].get('stale') else 'fresh'})",
-              flush=True)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     signal_wait = True
@@ -3226,18 +1545,10 @@ async def main():
         task.add_done_callback(client_tasks.discard)
 
     server = await asyncio.start_server(accept_client, LISTEN_HOST, LISTEN_PORT)
-    # Started only once the listener is bound. Its first act is a login-generation
-    # read, which is a blocking subprocess; ahead of the bind that would hold the port
-    # closed for the length of its timeout on every restart.
-    # Both binaries are required for a sweep: one reports the login generation, the
-    # other takes the reading. Without them every sweep would be a no-op subprocess.
-    sweeper = (asyncio.create_task(_codex_usage_sweeper())
-               if PLATFORM_ACCOUNTS and CLAUDE_STATUS else None)
     where = ", ".join(str(s.getsockname()) for s in server.sockets)
     print(f"devterm-gate on {where} -> ttyd {TTYD_HOST}:{TTYD_PORT}; web={WEB_ROOT}; "
-          f"accounts={_accounts_enabled()}; xai={_xai_enabled()}; "
           f"fileview={FILEVIEW}; orca={bool(ORCA_SHIM)}; "
-          f"codex_usage_sweep={CODEX_USAGE_SWEEP if sweeper else 'off'}", flush=True)
+          f"fleet_compat={bool(FLEET_READ_DOMAIN)}", flush=True)
     try:
         if signal_wait:
             await stop.wait()
@@ -3255,17 +1566,6 @@ async def main():
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await server.wait_closed()
-        if sweeper is not None:
-            sweeper.cancel()
-            try:
-                await sweeper
-            except asyncio.CancelledError:
-                pass
-        # The unit intentionally uses KillMode=process so Codex device auth survives a
-        # redeploy. xAI keeps the old credential during re-login, so its detached poller
-        # has the opposite contract: stop the exact tracked group before this gate exits.
-        async with _xai_operation_lock:
-            await _cancel_xai_login()
 
 
 if __name__ == "__main__":
