@@ -56,10 +56,19 @@ TS_FQDN="$(tailscale status --json 2>/dev/null \
 [ -n "$TS_FQDN" ] || die "could not read guest FQDN"
 
 timedatectl set-timezone Asia/Seoul || die "could not set guest timezone"
+[ ! -e /etc/timezone ] || printf '%s\n' Asia/Seoul > /etc/timezone \
+  || die "could not update guest timezone metadata"
 TZ_NAME="$(timedatectl show -p Timezone --value 2>/dev/null)"
 TZ_OFFSET="$(date +%z)"
-if [ "$TZ_NAME" != Asia/Seoul ] || [ "$TZ_OFFSET" != +0900 ]; then
-  die "guest timezone gate failed: $TZ_NAME $TZ_OFFSET"
+TZ_METADATA=ABSENT
+if [ -e /etc/timezone ]; then
+  IFS= read -r TZ_METADATA < /etc/timezone || TZ_METADATA=""
+fi
+TZ_LOCALTIME="$(readlink /etc/localtime 2>/dev/null || true)"
+if [ "$TZ_NAME" != Asia/Seoul ] || [ "$TZ_OFFSET" != +0900 ] \
+    || { [ "$TZ_METADATA" != Asia/Seoul ] && [ "$TZ_METADATA" != ABSENT ]; } \
+    || [ "$TZ_LOCALTIME" != /usr/share/zoneinfo/Asia/Seoul ]; then
+  die "guest timezone gate failed: name=$TZ_NAME offset=$TZ_OFFSET metadata=$TZ_METADATA localtime=$TZ_LOCALTIME"
 fi
 
 chown -R "$LIVE_USER:$LIVE_USER" "$SRC" "$BASE"
@@ -330,12 +339,14 @@ case "$LIVE_RECOVERY_SCENARIO" in
 esac
 
 python3 - "$LIVE_RECOVERY_SCENARIO" "$LIVE_SHA" "$LIVE_BASE_SHA" "$TZ_NAME" "$TZ_OFFSET" \
-  "$TS_FQDN" "$EVIDENCE" "$DRIVER_STATE" <<'PY' > "$EVIDENCE/result-without-evidence-hash.json"
+  "$TZ_METADATA" "$TZ_LOCALTIME" "$TS_FQDN" "$EVIDENCE" "$DRIVER_STATE" \
+  <<'PY' > "$EVIDENCE/result-without-evidence-hash.json"
 import json
 from pathlib import Path
 import sys
 
-scenario, candidate, producer, tz_name, tz_offset, fqdn, evidence_raw, driver_raw = sys.argv[1:]
+scenario, candidate, producer, tz_name, tz_offset, tz_metadata, tz_localtime, \
+    fqdn, evidence_raw, driver_raw = sys.argv[1:]
 evidence, driver = Path(evidence_raw), Path(driver_raw)
 states = {p.name.removesuffix(".state.json"): json.loads(p.read_text())
           for p in evidence.glob("*.state.json")}
@@ -422,7 +433,8 @@ else:
 
 print(json.dumps({"schema": 1, "scenario": scenario, "candidate_commit": candidate,
                   "producer_commit": producer, "fqdn": fqdn,
-                  "timezone": {"name": tz_name, "offset": tz_offset},
+                  "timezone": {"name": tz_name, "offset": tz_offset,
+                               "metadata": tz_metadata, "localtime": tz_localtime},
                   "steps": steps, "facts": facts}, sort_keys=True))
 PY
 

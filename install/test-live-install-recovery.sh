@@ -118,7 +118,11 @@ def outer(scenario, facts):
         "inner": {
             "schema": 1, "scenario": scenario, "candidate_commit": sha,
             "producer_commit": "c" * 40,
-            "timezone": {"name": "Asia/Seoul", "offset": "+0900"},
+            "timezone": {
+                "name": "Asia/Seoul", "offset": "+0900",
+                "metadata": "Asia/Seoul",
+                "localtime": "/usr/share/zoneinfo/Asia/Seoul",
+            },
             "evidence_sha256": "d" * 64, "evidence_mode": "0600",
             "steps": [{"name": "fixture", "rc": 0}], "facts": facts,
         },
@@ -192,6 +196,22 @@ for scenario, facts in cases.items():
     value, reason = module.calculate(semantic)
     assert value == 1, (scenario, field, reason)
 
+timezone_mutations = {
+    "name": "Etc/UTC",
+    "offset": "+0000",
+    "metadata": "Etc/UTC",
+    "localtime": "/usr/share/zoneinfo/Etc/UTC",
+}
+for field, bad_value in timezone_mutations.items():
+    rejected = outer("r1", copy.deepcopy(cases["r1"]))
+    rejected["inner"]["timezone"][field] = bad_value
+    value, reason = module.calculate(rejected)
+    assert value == 1 and "timezone" in reason, (field, reason)
+absent_metadata = outer("r1", copy.deepcopy(cases["r1"]))
+absent_metadata["inner"]["timezone"]["metadata"] = "ABSENT"
+value, reason = module.calculate(absent_metadata)
+assert value == 0, ("absent metadata", reason)
+
 bad_unit_observations = {
     "unknown": unit_observation("unknown", "unknown"),
     "missing": {"show_rc": 0, "output": "SubState=dead\n"},
@@ -212,12 +232,14 @@ for scenario, state_name in (("r2", "after_fault"), ("r3-refuse", "after_refusal
     value, reason = module.calculate(allowed_failed)
     assert value == 0, (scenario, "failed allowlist", reason)
 print("unit observation boundaries ok")
+print("timezone mutation boundaries ok")
 print("verdict boundaries ok")
 PY
 if [ "$verdict_cases_rc" = 0 ] \
    && grep -q 'unit observation boundaries ok' "$TMP/verdict-cases" \
+   && grep -q 'timezone mutation boundaries ok' "$TMP/verdict-cases" \
    && grep -q 'verdict boundaries ok' "$TMP/verdict-cases"; then
-  ok "R2/R3-refuse reject unknown, missing, and failed unit observations"
+  ok "recovery verdict rejects unit-state and four-field timezone mutations"
 else
   bad "recovery verdict boundary cases failed"; sed 's/^/    /' "$TMP/verdict-cases"
 fi
@@ -294,7 +316,9 @@ after = dict(snapshot, unit_observation={
     "show_rc": 0, "output": "ActiveState=active\nSubState=running\n"})
 recovery = {
     "schema":1, "scenario":"r1", "candidate_commit":sha, "producer_commit":"c"*40,
-    "fqdn":"fixture.example.ts.net", "timezone":{"name":"Asia/Seoul","offset":"+0900"},
+    "fqdn":"fixture.example.ts.net",
+    "timezone":{"name":"Asia/Seoul","offset":"+0900","metadata":"Asia/Seoul",
+                "localtime":"/usr/share/zoneinfo/Asia/Seoul"},
     "evidence_sha256":bundle_sha, "evidence_mode":"0600",
     "steps":[{"name":"fixture","rc":0}],
     "facts":{"install_rc":86, "before":snapshot, "after":after,

@@ -104,8 +104,14 @@ def common(record: dict[str, Any], bundle: Path | None) -> tuple[str, dict[str, 
     require(isinstance(producer, str) and FULL_SHA.fullmatch(producer),
             "producer_commit must be a full SHA")
     timezone = mapping(inner.get("timezone"), "timezone")
-    require(timezone == {"name": "Asia/Seoul", "offset": "+0900"},
-            "guest timezone gate did not pass")
+    require(set(timezone) == {"name", "offset", "metadata", "localtime"},
+            "guest timezone evidence has an unexpected shape")
+    require(timezone["name"] == "Asia/Seoul", "guest timezone name did not pass")
+    require(timezone["offset"] == "+0900", "guest timezone offset did not pass")
+    require(timezone["metadata"] in {"Asia/Seoul", "ABSENT"},
+            "guest timezone metadata did not pass")
+    require(timezone["localtime"] == "/usr/share/zoneinfo/Asia/Seoul",
+            "guest timezone localtime target did not pass")
     evidence_sha = inner.get("evidence_sha256")
     require(isinstance(evidence_sha, str) and DIGEST.fullmatch(evidence_sha),
             "evidence_sha256 must be a sha256")

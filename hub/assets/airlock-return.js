@@ -165,6 +165,9 @@
     return data === "airlock-panel-close" || data === "swk-panel-close";
   }
   var FLOAT_SIZE = 44, CORNER_SIZE = 40, NATIVE_SIZE = 30, EDGE = 8, DRAG = 6;
+  // The badge protrudes above/right of the button. Keep the whole control, not just
+  // the button's box, outside phone notches and system gesture/status-bar areas.
+  var BADGE_OVERHANG = 5;
   var SIZE = mode === "corner" ? CORNER_SIZE : mode === "native" ? NATIVE_SIZE : FLOAT_SIZE;
 
   // The Airlock porthole mark (dome + perspective floor grid), white. Painted with
@@ -213,28 +216,58 @@
   btn.appendChild(lg);
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  var safeArea = { top: 0, right: 0, bottom: 0, left: 0 };
+  function readSafeArea() {
+    // CSS env() is the browser's authoritative safe-area value. Measure it once
+    // through computed style, then refresh it whenever the viewport changes.
+    var probe = document.createElement("div");
+    probe.style.cssText = "position:fixed;inset:0;visibility:hidden;pointer-events:none;" +
+      "padding-top:env(safe-area-inset-top,0px);" +
+      "padding-right:env(safe-area-inset-right,0px);" +
+      "padding-bottom:env(safe-area-inset-bottom,0px);" +
+      "padding-left:env(safe-area-inset-left,0px);";
+    var root = document.body || document.documentElement;
+    if (!root) return;
+    try {
+      root.appendChild(probe);
+      var cs = window.getComputedStyle(probe);
+      safeArea.top = parseFloat(cs.paddingTop) || 0;
+      safeArea.right = parseFloat(cs.paddingRight) || 0;
+      safeArea.bottom = parseFloat(cs.paddingBottom) || 0;
+      safeArea.left = parseFloat(cs.paddingLeft) || 0;
+    } catch (e) {
+      safeArea = { top: 0, right: 0, bottom: 0, left: 0 };
+    } finally {
+      if (probe.parent) probe.remove();
+      else if (probe.parentNode) probe.parentNode.removeChild(probe);
+    }
+  }
   function applyXY(x, y) {
-    var maxX = window.innerWidth - SIZE - EDGE, maxY = window.innerHeight - SIZE - EDGE;
-    S.left = clamp(x, EDGE, maxX) + "px";
-    S.top = clamp(y, EDGE, maxY) + "px";
+    var minX = safeArea.left + EDGE;
+    var minY = safeArea.top + EDGE + BADGE_OVERHANG;
+    var maxX = window.innerWidth - safeArea.right - SIZE - EDGE - BADGE_OVERHANG;
+    var maxY = window.innerHeight - safeArea.bottom - SIZE - EDGE;
+    S.left = clamp(x, minX, maxX) + "px";
+    S.top = clamp(y, minY, maxY) + "px";
     S.right = S.bottom = "auto";
   }
   function anchorCorner() {                            // corner = top-left (respect safe-area)
-    S.left = "max(12px, env(safe-area-inset-left, 0px))";
-    S.top = "max(12px, env(safe-area-inset-top, 0px))";
+    S.left = "calc(env(safe-area-inset-left, 0px) + 12px)";
+    S.top = "calc(env(safe-area-inset-top, 0px) + 12px)";
     S.right = S.bottom = "auto";
   }
   function anchorFloatDefault() {                      // floating with no saved pos
     if (anchor === "bottom-right") {
-      S.right = "max(14px, env(safe-area-inset-right, 0px))";
+      S.right = "calc(env(safe-area-inset-right, 0px) + 14px)";
       S.left = "auto";
     } else {
-      S.left = "max(14px, env(safe-area-inset-left, 0px))";
+      S.left = "calc(env(safe-area-inset-left, 0px) + 14px)";
       S.right = "auto";
     }
-    S.bottom = "max(20px, env(safe-area-inset-bottom, 0px))";
+    S.bottom = "calc(env(safe-area-inset-bottom, 0px) + 20px)";
     S.top = "auto";
   }
+  readSafeArea();
   var placed = false;                                // positioned via top/left (dragged/restored)
   if (mode === "corner") {
     anchorCorner();
@@ -572,6 +605,7 @@
       window.addEventListener("pointercancel", onUp, true);
     });
     window.addEventListener("resize", function () {     // keep it on-screen on rotate/resize
+      readSafeArea();
       if (!placed) return;
       var r = btn.getBoundingClientRect();
       applyXY(r.left, r.top);

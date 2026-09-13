@@ -74,12 +74,13 @@ function textOf(el) {
 // Runs the real widget with the given injected <script> dataset and returns handles to
 // what it built. Every global the widget touches is provided here and nowhere else, so
 // a new browser dependency shows up as a crash rather than as a silent pass.
-function run(dataset) {
+function run(dataset, options = {}) {
   const body = makeElement("body");
   const script = makeElement("script");
   Object.assign(script.dataset, dataset);
   const fetched = [];
   const timers = [];
+  const windowListeners = {};
   const doc = {
     currentScript: script,
     body,
@@ -95,12 +96,21 @@ function run(dataset) {
     innerHeight: 800,
     location: { hostname: "box.example.ts.net", href: "" },
     console,
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(type, fn) { (windowListeners[type] = windowListeners[type] || []).push(fn); },
+    removeEventListener(type, fn) {
+      windowListeners[type] = (windowListeners[type] || []).filter((f) => f !== fn);
+    },
   };
+  const safeArea = options.safeArea || {};
+  win.getComputedStyle = () => ({
+    paddingTop: `${safeArea.top || 0}px`,
+    paddingRight: `${safeArea.right || 0}px`,
+    paddingBottom: `${safeArea.bottom || 0}px`,
+    paddingLeft: `${safeArea.left || 0}px`,
+  });
   win.top = win;
   win.self = win;
-  const store = {};
+  const store = { ...(options.store || {}) };
   const storage = {
     getItem: (k) => (k in store ? store[k] : null),
     setItem: (k, v) => { store[k] = String(v); },
@@ -121,7 +131,7 @@ function run(dataset) {
   );
   const btn = body.children[0];
   return {
-    body, btn, fetched,
+    body, btn, fetched, store,
     // A tap: the widget navigates or opens its menu from the click handler.
     tap() { btn.dispatch("click", { preventDefault() {}, stopPropagation() {} }); },
     menu() { return body.children.find((c) => c !== btn && textOf(c).includes("Go to Airlock")); },
@@ -134,8 +144,28 @@ function run(dataset) {
       const frame = descendants(overlay).find((c) => c.tagName === "IFRAME");
       return frame ? frame.src : null;
     },
+    dispatchWindow(type, event = {}) {
+      for (const fn of (windowListeners[type] || []).slice()) fn(event);
+    },
     href() { return win.location.href; },
   };
+}
+
+// ------------------------- floating position cannot enter an iPhone unsafe area
+{
+  const safeArea = { top: 47, right: 0, bottom: 34, left: 0 };
+  const w = run({}, {
+    safeArea,
+    store: { "airlock:btn-pos-v1": JSON.stringify({ x: 1199, y: 0 }) },
+  });
+  check("floating: a restored position above the iPhone safe area is moved below it",
+    w.btn.style.top === "60px", w.btn.style.top);
+  check("floating: the right-side badge also stays inside the safe area",
+    w.btn.style.left === "1143px", w.btn.style.left);
+  safeArea.top = 59;
+  w.dispatchWindow("resize");
+  check("floating: a viewport change remeasures and reapplies the safe area",
+    w.btn.style.top === "72px", w.btn.style.top);
 }
 
 const HUB = "https://box.example.ts.net/airlock-accounts/";

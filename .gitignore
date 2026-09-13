@@ -1,5 +1,10 @@
 # The filled config — holds site-specific facts. Only the .example is tracked.
 airlock.toml
+# Operator backups of the filled config carry the same facts (hostname, ports).
+# `airlock-update` snapshots the checkout with `git add -A` before overwriting, and
+# on 2026-09-13 that vacuumed seven `airlock.toml.bak-*` copies into a box's history.
+airlock.toml.bak*
+airlock.toml.before-update
 # The external-package example must be tracked so a clean clone can copy it.
 !examples/app-package/airlock.toml
 
