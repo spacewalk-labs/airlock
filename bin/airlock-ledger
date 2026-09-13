@@ -7,6 +7,7 @@ input.
 
 Usage:
   airlock-ledger plan
+  airlock-ledger plan --dependency-snapshot <path>
   airlock-ledger intent <id>
   airlock-ledger commit <id> [--active-ports "18900 18901"]
   airlock-ledger preflight-remove <id> [--for-upgrade] [--active-ports "..."]
@@ -36,7 +37,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 
-LEDGER_VERSION = 6
+LEDGER_VERSION = 7
 LEDGER_FILENAME = "app-ledger.json"
 TRANSACTION_VERSION = 1
 TRANSACTION_FILENAME = "install-transaction.json"
@@ -46,6 +47,12 @@ TRANSACTION_PHASES = frozenset((
 TRANSACTION_TERMINAL_PHASES = frozenset(("committed", "rolled_back", "degraded"))
 TRANSACTION_ACTIONS = frozenset(("fresh", "reinstall", "upgrade-diff",
                                  "upgrade-deactivate", "remove", "teardown-intent"))
+RESOURCE_RESULT_SCHEMA = "airlock.resource-result/v1"
+RESOURCE_RESULT_CLASSES = ("filesystem", "systemd", "docker", "ingress")
+RESOURCE_RESULT_OPERATIONS = ("apply", "verify", "compensate")
+RESOURCE_RESULT_STATUSES = frozenset((
+    "applied", "verified", "compensated", "failed", "not_declared", "unsupported",
+))
 # What an install was AUTHORIZED to do, recorded on the record itself so a
 # later load checks the decision admission already made instead of re-deriving
 # policy against a config that may have changed since. Closed: an unknown name
@@ -55,6 +62,7 @@ TRANSACTION_ACTIONS = frozenset(("fresh", "reinstall", "upgrade-diff",
 # because no path writes it and `_intent_record` stores nothing to check such a
 # claim against, which would turn "checked" into "trusted" without saying so.
 CAPABILITIES = ("rooted-artifact", "system-unit")
+MANAGED_CAPABILITIES = CAPABILITIES
 ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "rooted", "serve_ports")
 LEGACY_ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "serve_ports")
 PACKAGE_ARTIFACT_CLASSES = ARTIFACT_CLASSES + ("containers",)
@@ -71,13 +79,31 @@ INTENT_RECORD_FIELDS_V5 = (
     "source_class", "capabilities",
 )
 INTENT_RECORD_FIELDS_V6 = INTENT_RECORD_FIELDS_V5 + ("container_runtime",)
+INTENT_RECORD_FIELDS_V7 = INTENT_RECORD_FIELDS_V6 + ("managed_authority",)
 COMMITTED_RECORD_FIELDS_V5 = (
     "path", "digest", "lifecycle", "artifacts", "deps", "serve_mappings",
     "unit_scopes", "order", "roots", "source_class", "capabilities",
 )
 COMMITTED_RECORD_FIELDS_V6 = COMMITTED_RECORD_FIELDS_V5 + ("container_runtime",)
+COMMITTED_RECORD_FIELDS_V7 = COMMITTED_RECORD_FIELDS_V6 + ("managed_authority",)
 STORE_FIELDS_V5 = ("version", "entries", "events")
 STORE_FIELDS_V6 = STORE_FIELDS_V5
+STORE_FIELDS_V7 = STORE_FIELDS_V6
+MANAGED_AUTHORITY_SCHEMA = "airlock.managed.intent-authority/v1"
+MANAGED_AUTHORITY_FIELDS = (
+    "anchor_sha256", "authority_membership_digest", "authority_sequence",
+    "capabilities", "channel_id", "config_sha256", "core_digest",
+    "core_revision", "enrollment_digest", "epoch", "fetched_public_revision",
+    "installed_measurer_sha256", "lock_digest", "next_measurer_sha256",
+    "organization_id", "package_digest", "promotion_receipt_digest",
+    "public_tree", "publisher_key_id", "receipt_sha256", "root_key_id",
+    "schema", "selection_digest", "selection_sequence", "sequence",
+    "snapshot_digest", "state_digest", "target_profile",
+)
+MANAGED_RUN_AUTHORITY_SCHEMA = "airlock.managed.run-authorities/v1"
+TRUSTED_MEASURER_ACTIVATION_SCHEMA = "airlock.trusted-measurer.activation/v1"
+TRUSTED_MEASURER_TARGET = "/opt/airlock/libexec/airlock-managed-release"
+TRUSTED_MEASURER_ACTIVATION_STATES = frozenset(("owed", "durable"))
 CONTAINER_RUNTIME_INTENT_FIELDS = (
     "runtime", "daemon_identity", "install_nonce", "declarations",
 )
@@ -87,6 +113,9 @@ CONTAINER_OBJECT_FIELDS = ("id", "name")
 # the store re-checks it so a hand-made entry cannot smuggle an id the CLI
 # cannot address, e.g. one starting with '-').
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
+_MANAGED_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
+_MANAGED_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+_GIT_OID_RE = re.compile(r"^[0-9a-f]{40}\Z")
 # Deps name CONFIGURED APP ids, not package ids: in stage 3 a dependency may
 # legitimately target a legacy-grammar app ([apps.My_App]), and rejecting it
 # here would wedge plan/remove — including the documented per-app teardown
@@ -107,6 +136,7 @@ _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}\Z")
 _DAEMON_ID_RE = re.compile(r"^docker:[A-Za-z0-9][A-Za-z0-9:_-]{0,255}\Z")
 _PACKAGE_LABEL = "io.airlock.package"
 _NONCE_LABEL = "io.airlock.install-nonce"
+_PACKAGE_INFO_INPUT_SHA256: str | None = None
 
 
 class LedgerError(Exception):
@@ -526,12 +556,15 @@ def _validate_order(value: Any, where: str) -> None:
         fail(f"{where}: order must be a positive integer or null")
 
 
-def _validate_source_class(value: Any, where: str) -> None:
-    if value not in ("shipped", "explicit"):
-        fail(f"{where}: source_class must be 'shipped' or 'explicit'")
+def _validate_source_class(value: Any, where: str, *, managed: bool = False) -> None:
+    allowed = ("shipped", "explicit", "managed") if managed else ("shipped", "explicit")
+    if value not in allowed:
+        names = ", ".join(repr(item) for item in allowed)
+        fail(f"{where}: source_class must be one of {names}")
 
 
-def _validate_capabilities(value: Any, where: str) -> None:
+def _validate_capabilities(value: Any, where: str, *,
+                           allowed: tuple[str, ...] = CAPABILITIES) -> None:
     """A record's claim about what it was authorized to do. Canonical form is
     part of the contract: `write_store` dumps with sort_keys=True, so a record
     that came back unsorted or with a repeat was hand-edited, and accepting it
@@ -542,13 +575,60 @@ def _validate_capabilities(value: Any, where: str) -> None:
     if any(not isinstance(item, str) for item in value):
         fail(f"{where}: capabilities must be a list of strings")
     for item in value:
-        if item not in CAPABILITIES:
+        if item not in allowed:
             fail(f"{where}: unknown capability {item!r} "
-                 f"(known: {', '.join(CAPABILITIES)})")
+                 f"(known: {', '.join(allowed)})")
     if len(set(value)) != len(value):
         fail(f"{where}: capabilities must not repeat a name")
     if value != sorted(value):
         fail(f"{where}: capabilities must be sorted")
+
+
+def _validate_managed_authority(value: Any, where: str) -> None:
+    if not isinstance(value, dict) or set(value) != set(MANAGED_AUTHORITY_FIELDS):
+        fail(f"{where}: invalid closed managed authority shape")
+    if value["schema"] != MANAGED_AUTHORITY_SCHEMA:
+        fail(f"{where}: unsupported managed authority schema")
+    for field in (
+        "anchor_sha256", "config_sha256", "installed_measurer_sha256",
+        "next_measurer_sha256", "receipt_sha256",
+    ):
+        if not _is_hex_digest(value[field]):
+            fail(f"{where}.{field}: must be a bare lowercase sha256")
+    for field in (
+        "authority_membership_digest", "core_digest", "enrollment_digest",
+        "lock_digest", "package_digest", "promotion_receipt_digest",
+        "publisher_key_id", "root_key_id", "selection_digest",
+        "snapshot_digest", "state_digest",
+    ):
+        if not isinstance(value[field], str) or not _MANAGED_DIGEST_RE.fullmatch(value[field]):
+            fail(f"{where}.{field}: must be a sha256-prefixed lowercase digest")
+    for field in ("core_revision", "fetched_public_revision", "public_tree"):
+        if not isinstance(value[field], str) or not _GIT_OID_RE.fullmatch(value[field]):
+            fail(f"{where}.{field}: must be a full lowercase 40-hex git identity")
+    for field in ("authority_sequence", "epoch", "selection_sequence", "sequence"):
+        if not _is_int(value[field]) or value[field] < 1:
+            fail(f"{where}.{field}: must be a positive integer")
+    for field in ("channel_id", "organization_id", "target_profile"):
+        if not isinstance(value[field], str) or not _MANAGED_ID_RE.fullmatch(value[field]):
+            fail(f"{where}.{field}: must be a managed identity")
+    _validate_capabilities(
+        value["capabilities"], f"{where}.capabilities", allowed=MANAGED_CAPABILITIES,
+    )
+
+
+def _validate_record_managed_authority(record: dict[str, Any], where: str) -> None:
+    authority = record["managed_authority"]
+    if record["source_class"] == "managed":
+        _validate_managed_authority(authority, f"{where}.managed_authority")
+        if authority["capabilities"] != record["capabilities"]:
+            fail(f"{where}: managed authority capabilities differ from the record")
+        # authority.package_digest is the signed release file-manifest digest;
+        # record.digest is the ledger's independent mutation digest. Admission
+        # and commit remeasure both ABIs, so a loader must preserve rather than
+        # incorrectly equate these deliberately different durable identities.
+    elif authority is not None:
+        fail(f"{where}: explicit/shipped records require managed_authority null")
 
 
 def _unit_scopes_include_system(unit_scopes: dict[str, str]) -> bool:
@@ -687,6 +767,8 @@ def _validate_record(record: Any, kind: str, where: str, *,
             required = set(INTENT_RECORD_FIELDS_V5)
         if version >= 6:
             required = set(INTENT_RECORD_FIELDS_V6)
+        if version >= 7:
+            required = set(INTENT_RECORD_FIELDS_V7)
         if set(record) != required:
             fail(f"{where}: invalid intent record shape")
         _validate_provenance(record, kind, where)
@@ -715,7 +797,9 @@ def _validate_record(record: Any, kind: str, where: str, *,
             _validate_serve_mappings(record["serve_mappings"], f"{where}.serve_mappings")
             _validate_unit_scopes(record["unit_scopes"], record["artifacts_declared"]["units"], f"{where}.unit_scopes")
             _validate_order(record["order"], f"{where}.order")
-            _validate_source_class(record["source_class"], f"{where}.source_class")
+            _validate_source_class(
+                record["source_class"], f"{where}.source_class", managed=version >= 7,
+            )
             if version == 3 and record["artifacts_declared"]["rooted"] and record["source_class"] != "shipped":
                 # v3 ONLY, and it stays. In v3 `source_class` was the
                 # authorisation record itself, so no legitimate writer of that
@@ -729,7 +813,12 @@ def _validate_record(record: Any, kind: str, where: str, *,
                 fail(f"{where}: artifacts_declared.rooted is shipped-only "
                      f"(source_class={record['source_class']!r})")
         if version >= 4:
-            _validate_capabilities(record["capabilities"], f"{where}.capabilities")
+            _validate_capabilities(
+                record["capabilities"], f"{where}.capabilities",
+                allowed=(MANAGED_CAPABILITIES
+                         if version >= 7 and record["source_class"] == "managed"
+                         else CAPABILITIES),
+            )
             # Successor to the shipped-only assertion (Blocker C), which
             # re-decided POLICY at load time: it read source_class, a fact the
             # record cannot prove and whose meaning lives in a config that may
@@ -755,6 +844,8 @@ def _validate_record(record: Any, kind: str, where: str, *,
             _validate_container_runtime(record["container_runtime"],
                                         f"{where}.container_runtime",
                                         committed=False)
+        if version >= 7:
+            _validate_record_managed_authority(record, where)
     else:
         required = {"path", "digest", "lifecycle", "artifacts"}
         if version >= 2:
@@ -767,6 +858,8 @@ def _validate_record(record: Any, kind: str, where: str, *,
             required = set(COMMITTED_RECORD_FIELDS_V5)
         if version >= 6:
             required = set(COMMITTED_RECORD_FIELDS_V6)
+        if version >= 7:
+            required = set(COMMITTED_RECORD_FIELDS_V7)
         if set(record) != required:
             fail(f"{where}: invalid committed record shape")
         _validate_provenance(record, kind, where)
@@ -778,7 +871,9 @@ def _validate_record(record: Any, kind: str, where: str, *,
             _validate_serve_mappings(record["serve_mappings"], f"{where}.serve_mappings")
             _validate_unit_scopes(record["unit_scopes"], record["artifacts"]["units"], f"{where}.unit_scopes")
             _validate_order(record["order"], f"{where}.order")
-            _validate_source_class(record["source_class"], f"{where}.source_class")
+            _validate_source_class(
+                record["source_class"], f"{where}.source_class", managed=version >= 7,
+            )
             if version == 3 and record["artifacts"]["rooted"] and record["source_class"] != "shipped":
                 # v3 only — the intent branch above says why.
                 fail(f"{where}: artifacts.rooted is shipped-only "
@@ -794,7 +889,12 @@ def _validate_record(record: Any, kind: str, where: str, *,
                            for v in croots.values())):
                 fail(f"{where}: roots must record the five absolute expansion bases")
         if version >= 4:
-            _validate_capabilities(record["capabilities"], f"{where}.capabilities")
+            _validate_capabilities(
+                record["capabilities"], f"{where}.capabilities",
+                allowed=(MANAGED_CAPABILITIES
+                         if version >= 7 and record["source_class"] == "managed"
+                         else CAPABILITIES),
+            )
             # ONE WAY here, unlike the intent record above. A committed
             # record holds the FOUND artifacts, not the declared ones (see
             # command_commit's unit_scopes comment), so a package whose
@@ -817,9 +917,11 @@ def _validate_record(record: Any, kind: str, where: str, *,
             _validate_container_runtime(record["container_runtime"],
                                         f"{where}.container_runtime",
                                         committed=True)
+        if version >= 7:
+            _validate_record_managed_authority(record, where)
 
 
-def _validate_store(store: Any, path: Path) -> dict[str, Any]:
+def _validate_store(store: Any, path: Path, *, upgrade_managed: bool = False) -> dict[str, Any]:
     if not isinstance(store, dict) or "version" not in store:
         fail(f"{path}: invalid ledger shape")
     version = store.get("version")
@@ -827,7 +929,7 @@ def _validate_store(store: Any, path: Path) -> dict[str, Any]:
     # version must stay in this set by NAME, or raising the constant silently
     # evicts the one version most boxes are actually on and kills them here —
     # before the normalisation below, which exists to upgrade them, ever runs.
-    if not _is_int(version) or version not in (1, 2, 3, 4, 5, LEDGER_VERSION):
+    if not _is_int(version) or version not in (1, 2, 3, 4, 5, 6, LEDGER_VERSION):
         hint = ""
         if _is_int(version) and version > LEDGER_VERSION:
             hint = ("; this state was written by a newer airlock, so the tree is "
@@ -835,7 +937,7 @@ def _validate_store(store: Any, path: Path) -> dict[str, Any]:
                     "airlock checkout rather than editing the ledger")
         fail(f"{path}: unsupported ledger version {store.get('version')!r}; "
              f"this airlock reads up to version {LEDGER_VERSION}{hint}")
-    expected_top = (set(STORE_FIELDS_V6)
+    expected_top = (set(STORE_FIELDS_V7)
                     if version >= 5 else {"version", "entries"})
     if set(store) != expected_top:
         fail(f"{path}: invalid ledger shape")
@@ -871,7 +973,12 @@ def _validate_store(store: Any, path: Path) -> dict[str, Any]:
     # come back stamped LEDGER_VERSION with the newest fields missing, and
     # write_store would then refuse its own output.
     normalised = copy.deepcopy(store)
-    normalised["version"] = LEDGER_VERSION
+    # Keep this validator's historical public normalisation contract at v6.
+    # Actual ledger read/write boundaries opt into the v7 managed-authority
+    # migration below. This lets callers which only validate legacy audit
+    # shapes keep observing v6 while no mutable ledger command can operate on
+    # or persist an un-upgraded store.
+    normalised["version"] = 6
     normalised.setdefault("events", [])
     if version in (1, 2):
         for entry in normalised["entries"].values():
@@ -923,6 +1030,16 @@ def _validate_store(store: Any, path: Path) -> dict[str, Any]:
             record = entry.get(kind)
             if record is not None:
                 record.setdefault("container_runtime", None)
+    if upgrade_managed:
+        # v1-v6 -> v7. No older record carried an authenticated managed issuer
+        # binding. Null preserves its existing explicit/shipped provenance
+        # without inventing authority during migration.
+        normalised["version"] = LEDGER_VERSION
+        for entry in normalised["entries"].values():
+            for kind in ("committed", "intent"):
+                record = entry.get(kind)
+                if record is not None:
+                    record.setdefault("managed_authority", None)
     return normalised
 
 
@@ -936,7 +1053,7 @@ def load_store() -> dict[str, Any]:
             raw = json.load(fh)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         fail(f"{path}: cannot parse ledger: {exc}")
-    return _validate_store(raw, path)
+    return _validate_store(raw, path, upgrade_managed=True)
 
 
 def _ensure_state_dir() -> Path:
@@ -958,7 +1075,7 @@ def write_store(store: dict[str, Any], *, require_directory_sync: bool = False) 
     # derived — so every persisted mutation is current by construction.
     # Persisting the caller's own dict instead would write back the shape the
     # file was read in and leave the upgrade permanently pending.
-    store = _validate_store(store, path)
+    store = _validate_store(store, path, upgrade_managed=True)
     directory = _ensure_state_dir()
     temp_name: str | None = None
     try:
@@ -987,7 +1104,13 @@ def write_store(store: dict[str, Any], *, require_directory_sync: bool = False) 
 
 
 def read_package_info() -> dict[str, Any]:
-    raw = sys.stdin.read()
+    global _PACKAGE_INFO_INPUT_SHA256
+    raw_bytes = sys.stdin.buffer.read()
+    _PACKAGE_INFO_INPUT_SHA256 = hashlib.sha256(raw_bytes).hexdigest()
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"stdin: package-info is not UTF-8: {exc}")
     if not raw.strip():
         return {}
     try:
@@ -1035,8 +1158,16 @@ def _normalise_package(app_id: str, raw: Any) -> dict[str, Any]:
     if any(v == "both" for v in raw_scopes.values()):
         fail(f"package-info: packages.{app_id}.unit_scopes may not declare both")
     source_class = raw.get("source_class", "explicit")
-    if source_class not in ("explicit", "shipped"):
-        fail(f"package-info: packages.{app_id}.source_class must be explicit or shipped")
+    if source_class not in ("explicit", "shipped", "managed"):
+        fail(f"package-info: packages.{app_id}.source_class must be explicit, shipped, or managed")
+    signed_package_digest = raw.get("signed_package_digest")
+    if source_class == "managed":
+        if (not isinstance(signed_package_digest, str)
+                or not _MANAGED_DIGEST_RE.fullmatch(signed_package_digest)):
+            fail(f"package-info: packages.{app_id}.signed_package_digest is required "
+                 "for managed source and must be a sha256-prefixed digest")
+    elif signed_package_digest is not None:
+        fail(f"package-info: packages.{app_id}.signed_package_digest is managed-only")
     # The ledger is a pure CONSUMER of this list: bin/airlock-config derives it
     # from the manifest request, where the policy that decides it lives. No
     # default here — a package-info without it is a producer that never learned
@@ -1046,7 +1177,10 @@ def _normalise_package(app_id: str, raw: Any) -> dict[str, Any]:
         fail(f"package-info: packages.{app_id}.capabilities is required at "
              f"ledger store v{LEDGER_VERSION} (derived by bin/airlock-config "
              "from the package's declared artifacts)")
-    _validate_capabilities(raw["capabilities"], f"package-info: packages.{app_id}.capabilities")
+    _validate_capabilities(
+        raw["capabilities"], f"package-info: packages.{app_id}.capabilities",
+        allowed=MANAGED_CAPABILITIES if source_class == "managed" else CAPABILITIES,
+    )
     # Consistency, not policy. WHETHER a package may use rooted artifacts is
     # decided at admission and stays there (bin/airlock-config's manifest gate
     # still refuses explicit + rooted); re-deciding it here would refuse the
@@ -1081,6 +1215,7 @@ def _normalise_package(app_id: str, raw: Any) -> dict[str, Any]:
         "serve_mappings": mappings,
         "unit_scopes": dict(raw_scopes),
         "source_class": source_class,
+        "signed_package_digest": signed_package_digest,
         "capabilities": list(raw["capabilities"]),
         "lifecycle": lifecycle,
         "deps": list(deps),
@@ -1160,7 +1295,104 @@ def digest_tree(root: str) -> str:
     return hasher.hexdigest()
 
 
-def _intent_record(app_id: str, package: dict[str, Any], store: dict[str, Any]) -> dict[str, Any]:
+def managed_release_package_digest(root: str) -> str:
+    """Re-measure a managed package with the signed release manifest ABI.
+
+    ``digest_tree`` is the ledger's mutation identity and includes directory
+    entries. UPDATE_CHANNEL release.lock instead signs canonical JSON over
+    file/symlink rows. Both measurements must hold; equating their unrelated
+    hashes rejects every authentic managed package.
+    """
+    try:
+        root_info = os.lstat(root)
+    except OSError as exc:
+        fail(f"cannot digest managed package tree {root}: {exc}")
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        fail(f"cannot digest managed package tree {root}: package path is not a real directory")
+
+    rows: list[tuple[bytes, dict[str, Any]]] = []
+
+    def visit(directory: str, prefix: str) -> None:
+        try:
+            children = list(os.scandir(directory))
+        except OSError as exc:
+            fail(f"cannot read managed package tree {root}: {exc}")
+        for child in children:
+            relative = child.name if not prefix else f"{prefix}/{child.name}"
+            try:
+                child_info = child.stat(follow_symlinks=False)
+            except OSError as exc:
+                fail(f"cannot stat managed package entry {os.path.join(root, relative)}: {exc}")
+            if stat.S_ISDIR(child_info.st_mode):
+                visit(child.path, relative)
+                continue
+            row: dict[str, Any] = {"path": relative}
+            if stat.S_ISREG(child_info.st_mode):
+                try:
+                    with open(child.path, "rb") as handle:
+                        raw = handle.read()
+                except OSError as exc:
+                    fail(f"cannot read managed package entry {os.path.join(root, relative)}: {exc}")
+                row.update({
+                    "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                    "mode": f"{stat.S_IMODE(child_info.st_mode):04o}",
+                    "type": "file",
+                })
+            elif stat.S_ISLNK(child_info.st_mode):
+                try:
+                    target = os.readlink(child.path)
+                    target.encode("utf-8")
+                except (OSError, UnicodeError) as exc:
+                    fail(f"cannot read managed package symlink {os.path.join(root, relative)}: {exc}")
+                target_path = Path(target)
+                if target_path.is_absolute() or ".." in target_path.parts:
+                    fail(f"managed package symlink escapes package tree: {relative}")
+                row.update({"mode": "0777", "target": target, "type": "symlink"})
+            else:
+                fail(f"special file is not allowed in managed package tree: {os.path.join(root, relative)}")
+            rows.append((os.fsencode(relative), row))
+
+    visit(root, "")
+    manifest = [row for _relative, row in sorted(rows, key=lambda item: item[0])]
+    raw = (json.dumps(
+        manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ) + "\n").encode()
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _managed_authority_for_intent(
+        app_id: str, package: dict[str, Any], package_digest: str,
+) -> dict[str, Any] | None:
+    tx = load_transaction(required=False)
+    active = tx is not None and tx["phase"] not in TRANSACTION_TERMINAL_PHASES
+    authorities = tx.get("managed_authorities", {}) if active else {}
+    if package["source_class"] != "managed":
+        if app_id in authorities:
+            fail(f"transaction managed authority for {app_id} cannot authorize "
+                 f"source_class={package['source_class']!r}")
+        return None
+    if not active or tx is None:
+        fail(f"managed package {app_id} requires an active bound install transaction")
+    if app_id not in tx["planned"] or app_id not in authorities:
+        fail(f"managed package {app_id} has no transaction-bound authority")
+    if (_PACKAGE_INFO_INPUT_SHA256 is None
+            or _PACKAGE_INFO_INPUT_SHA256 != tx["package_sha256"]):
+        fail(f"managed package {app_id} package-info differs from its transaction binding")
+    authority = authorities[app_id]
+    _validate_managed_authority(authority, f"managed package {app_id} authority")
+    expected_signed_digest = package.get("signed_package_digest")
+    if (authority["package_digest"] != expected_signed_digest
+            or managed_release_package_digest(package["dir"]) != expected_signed_digest):
+        fail(f"managed package {app_id} signed/tree/authority digests differ")
+    if authority["capabilities"] != package["capabilities"]:
+        fail(f"managed package {app_id} capabilities differ from transaction authority")
+    if authority["config_sha256"] != tx["config_sha256"]:
+        fail(f"managed package {app_id} config differs from transaction authority")
+    return copy.deepcopy(authority)
+
+
+def _intent_record(app_id: str, package: dict[str, Any], store: dict[str, Any], *,
+                   bind_managed: bool = False) -> dict[str, Any]:
     path = canonical_package_path(package)
     if "capabilities" not in package:
         # There is more than one producer of package facts (package-info via
@@ -1172,6 +1404,8 @@ def _intent_record(app_id: str, package: dict[str, Any], store: dict[str, Any]) 
              "must derive them (bin/airlock-config's manifest spec, or a copy of "
              "that spec's list on the adopt path)")
     digest = digest_tree(path)
+    managed_authority = (_managed_authority_for_intent(app_id, package, digest)
+                         if bind_managed else None)
     declarations = list(package.get("containers") or ())
     container_runtime = None
     if declarations and not is_dry_run():
@@ -1214,6 +1448,7 @@ def _intent_record(app_id: str, package: dict[str, Any], store: dict[str, Any]) 
         # long after the config that produced it may be gone, so this is
         # carried from the resolver's determination and never re-derived here.
         "capabilities": sorted(package["capabilities"]),
+        "managed_authority": managed_authority,
         "lifecycle": copy.deepcopy(package["lifecycle"]),
         "deps": copy.deepcopy(package["deps"]),
         # The roots the declaration meant AT INTENT TIME: repair after a
@@ -2548,6 +2783,46 @@ def _drop_entry(store: dict[str, Any], app_id: str) -> dict[str, Any]:
     return result
 
 
+def _dependency_record(store: dict[str, Any], app_id: str) -> tuple[dict[str, Any], str]:
+    """Return the one record the destructive planner already trusts."""
+    entry = store["entries"][app_id]
+    committed = entry.get("committed")
+    if committed is not None:
+        return committed, "committed"
+    intent = entry.get("intent")
+    if intent is not None:
+        return intent, "intent"
+    fail(f"removal plan has no dependency snapshot for {app_id}")
+
+
+def _dependency_snapshot(store: dict[str, Any], destructive_ids: list[str],
+                         packages: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Serialize removal deps plus selected-mode publication evidence."""
+    rows = []
+    for app_id in sorted(destructive_ids, key=os.fsencode):
+        record, record_kind = _dependency_record(store, app_id)
+        rows.append({
+            "app_id": app_id,
+            "deps": sorted(record["deps"], key=os.fsencode),
+            "record_kind": record_kind,
+        })
+    candidate_serve_mappings = []
+    for app_id in sorted(packages, key=os.fsencode):
+        committed = (store["entries"].get(app_id) or {}).get("committed")
+        candidate_serve_mappings.append({
+            "app_id": app_id,
+            "matches_committed": (
+                committed is not None
+                and packages[app_id]["serve_mappings"] == committed["serve_mappings"]
+            ),
+        })
+    return {
+        "schema": "airlock.ledger-dependencies/v2",
+        "rows": rows,
+        "candidate_serve_mappings": candidate_serve_mappings,
+    }
+
+
 def _removal_order(store: dict[str, Any], destructive_ids: list[str]) -> list[str]:
     """Return destructive ids in the one reverse-topological removal order.
 
@@ -2559,17 +2834,14 @@ def _removal_order(store: dict[str, Any], destructive_ids: list[str]) -> list[st
     graph: dict[str, set[str]] = {app_id: set() for app_id in destructive_ids}
     indegree: dict[str, int] = {app_id: 0 for app_id in destructive_ids}
     for app_id in destructive_ids:
-        entry = store["entries"][app_id]
-        record = entry.get("committed") or entry.get("intent")
-        if record is None:
-            fail(f"removal plan has no dependency snapshot for {app_id}")
+        record, _record_kind = _dependency_record(store, app_id)
         for dependency in record["deps"]:
             graph.setdefault(dependency, set()).add(app_id)
             indegree.setdefault(dependency, 0)
             indegree[app_id] += 1
 
     selected = set(destructive_ids)
-    ranks = {app_id: (store["entries"][app_id].get("committed") or store["entries"][app_id].get("intent"))["order"]
+    ranks = {app_id: _dependency_record(store, app_id)[0]["order"]
              for app_id in destructive_ids}
     ranked = all(v is not None for v in ranks.values()) and len(set(ranks.values())) == len(ranks)
     def sort_key(node: str):
@@ -2601,7 +2873,8 @@ def _desired_package_map(info: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return packages_from_info(info)
 
 
-def command_plan(store: dict[str, Any], info: dict[str, Any]) -> int:
+def command_plan(store: dict[str, Any], info: dict[str, Any],
+                 dependency_snapshot: str | None = None) -> int:
     packages = _desired_package_map(info)
     ids = sorted(set(packages) | set(store["entries"]))
     refusals: list[str] = []
@@ -2650,6 +2923,12 @@ def command_plan(store: dict[str, Any], info: dict[str, Any]) -> int:
             else:
                 ordered_lines.append((action, app_id))
         lines = ordered_lines
+
+    if dependency_snapshot is not None:
+        _atomic_json(
+            Path(dependency_snapshot),
+            _dependency_snapshot(store, destructive_ids, packages),
+        )
 
     for action, app_id in lines:
         print(f"{action}\t{app_id}")
@@ -2703,7 +2982,7 @@ def command_intent(store: dict[str, Any], info: dict[str, Any], app_id: str,
     package = packages.get(app_id)
     if package is None:
         fail(f"package-info has no configured package {app_id}")
-    record = _intent_record(app_id, package, store)
+    record = _intent_record(app_id, package, store, bind_managed=True)
     entry_now = store["entries"].get(app_id) or {}
     old_intent = entry_now.get("intent")
     committed_now = entry_now.get("committed")
@@ -2787,7 +3066,8 @@ def command_intent(store: dict[str, Any], info: dict[str, Any], app_id: str,
             or old_intent.get("unit_scopes") != record["unit_scopes"]
             or old_intent.get("serve_mappings") != record["serve_mappings"]
             or old_intent.get("source_class") != record["source_class"]
-            or old_intent.get("capabilities") != record["capabilities"]):
+            or old_intent.get("capabilities") != record["capabilities"]
+            or old_intent.get("managed_authority") != record["managed_authority"]):
         # The stale intent may have expanded under different roots or
         # declarations; replacing it would drop the only record naming what
         # its crashed install already created. Tear down ONLY what neither
@@ -2829,12 +3109,29 @@ def command_intent(store: dict[str, Any], info: dict[str, Any], app_id: str,
 def command_commit(store: dict[str, Any], info: dict[str, Any], app_id: str,
                    active_ports_raw: str | None) -> int:
     packages = _desired_package_map(info)
-    if app_id not in packages:
+    package = packages.get(app_id)
+    if package is None:
         fail(f"package-info has no configured package {app_id}")
     entry = store["entries"].get(app_id)
     if not entry or entry.get("intent") is None:
         fail(f"no intent record for {app_id}")
     intent = entry["intent"]
+    if package["source_class"] == "managed" or intent["source_class"] == "managed":
+        if package["source_class"] != "managed" or intent["source_class"] != "managed":
+            fail(f"managed package {app_id} source class changed between intent and commit")
+        current_digest = digest_tree(canonical_package_path(package))
+        if current_digest != intent["digest"]:
+            fail(f"managed package {app_id} tree changed between intent and commit")
+        authority_now = _managed_authority_for_intent(
+            app_id, package, current_digest,
+        )
+        if authority_now != intent["managed_authority"]:
+            fail(f"managed package {app_id} authority changed between intent and commit")
+    active_transaction = load_transaction(required=False)
+    if (active_transaction is not None
+            and active_transaction.get("app_scoped_plan") is not None
+            and app_id in active_transaction["planned"]):
+        _require_current_resource_result(app_id)
     active_ports = (parse_active_ports(active_ports_raw, info)
                     | _recorded_active_ports(store, app_id))
     new_artifacts = _intent_artifacts(intent)
@@ -2886,6 +3183,9 @@ def command_commit(store: dict[str, Any], info: dict[str, Any], app_id: str,
         # so a capability whose artifact turned out to be conditional would
         # vanish from the record teardown later reads.
         "capabilities": list(intent["capabilities"]),
+        # The issuer decision is immutable run evidence: commit copies it from
+        # the intent rather than accepting or deriving a later authority.
+        "managed_authority": copy.deepcopy(intent["managed_authority"]),
         "artifacts": _copy_artifacts(new_artifacts),
         "container_runtime": new_container_runtime,
     }
@@ -3192,11 +3492,44 @@ def _atomic_json(path: Path, value: Any) -> None:
         fail(f"cannot atomically write transaction {path}: {exc}")
 
 
+def _validate_trusted_measurer_activation(value: Any, tx: dict[str, Any], path: Path) -> None:
+    fields = {"new_path", "new_sha256", "old_path", "old_sha256",
+              "schema", "state", "target"}
+    if not isinstance(value, dict) or set(value) != fields:
+        fail(f"{path}: invalid trusted measurer activation shape")
+    if value["schema"] != TRUSTED_MEASURER_ACTIVATION_SCHEMA:
+        fail(f"{path}: unsupported trusted measurer activation schema")
+    if value["state"] not in TRUSTED_MEASURER_ACTIVATION_STATES:
+        fail(f"{path}: invalid trusted measurer activation state")
+    if value["target"] != TRUSTED_MEASURER_TARGET:
+        fail(f"{path}: trusted measurer activation target is not fixed")
+    expected = {
+        "new_path": f"/opt/airlock/libexec/.airlock-managed-release.{tx['id']}.new",
+        "old_path": f"/opt/airlock/libexec/.airlock-managed-release.{tx['id']}.old",
+    }
+    for key, expected_path in expected.items():
+        if value[key] != expected_path:
+            fail(f"{path}: trusted measurer {key} differs from the transaction id")
+    for key in ("new_sha256", "old_sha256"):
+        if not _is_hex_digest(value[key]):
+            fail(f"{path}: trusted measurer {key} must be a lowercase sha256")
+    authorities = tx.get("managed_authorities")
+    if not isinstance(authorities, dict) or not authorities:
+        fail(f"{path}: trusted measurer activation requires managed authorities")
+    old_hashes = {authority["installed_measurer_sha256"] for authority in authorities.values()}
+    new_hashes = {authority["next_measurer_sha256"] for authority in authorities.values()}
+    if old_hashes != {value["old_sha256"]} or new_hashes != {value["new_sha256"]}:
+        fail(f"{path}: trusted measurer hashes differ from managed authorities")
+
+
 def _validate_transaction(value: Any, path: Path) -> dict[str, Any]:
     fields = {"version", "id", "started_at", "config_sha256", "package_sha256",
               "phase", "planned", "actions", "touched", "deactivated", "checkpoints",
               "ledger_snapshot", "error", "restore_results"}
-    if not isinstance(value, dict) or not (fields <= set(value) <= fields | {"forward_keep"}):
+    optional_fields = {"forward_keep", "app_scoped_plan", "resource_results",
+                       "managed_authorities", "managed_authority_sha256",
+                       "trusted_measurer_activation"}
+    if not isinstance(value, dict) or not (fields <= set(value) <= fields | optional_fields):
         fail(f"{path}: invalid transaction shape")
     if "forward_keep" in value:
         _validate_forward_keep(value["forward_keep"], value, path)
@@ -3207,8 +3540,66 @@ def _validate_transaction(value: Any, path: Path) -> dict[str, Any]:
     for key in ("config_sha256", "package_sha256"):
         if not _is_hex_digest(value[key]):
             fail(f"{path}: {key} must be a lowercase sha256")
+    if "app_scoped_plan" in value:
+        binding = value["app_scoped_plan"]
+        if (not isinstance(binding, dict)
+                or set(binding) != {"plan_sha256", "dependency_snapshot_sha256"}
+                or not _is_hex_digest(binding.get("plan_sha256"))
+                or not _is_hex_digest(binding.get("dependency_snapshot_sha256"))):
+            fail(f"{path}: invalid app-scoped plan binding")
+    if "resource_results" in value:
+        results = value["resource_results"]
+        if (not isinstance(results, dict)
+                or not set(results).issubset(set(value.get("planned") or []))):
+            fail(f"{path}: invalid resource result owners")
+        for app_id, operations in results.items():
+            if (not isinstance(operations, dict)
+                    or not set(operations).issubset(RESOURCE_RESULT_OPERATIONS)):
+                fail(f"{path}: invalid resource results for {app_id}")
+            for operation, result in operations.items():
+                _validate_resource_result_shape(result, operation, app_id)
+    if ("managed_authorities" in value) != ("managed_authority_sha256" in value):
+        fail(f"{path}: managed authorities require their SHA-256 binding")
+    if "managed_authorities" in value:
+        authorities = value["managed_authorities"]
+        if (not isinstance(authorities, dict) or not authorities
+                or "app_scoped_plan" not in value
+                or not isinstance(value.get("actions"), dict)
+                or not isinstance(value.get("planned"), list)
+                or any(not isinstance(item, str) for item in value["planned"])
+                or not set(authorities).issubset(set(value["planned"]))):
+            fail(f"{path}: invalid managed authority owners")
+        for app_id, authority in authorities.items():
+            if (not isinstance(app_id, str) or not _ID_RE.fullmatch(app_id)
+                    or value["actions"].get(app_id) in DESTRUCTIVE_ACTIONS):
+                fail(f"{path}: invalid managed authority owner {app_id!r}")
+            _validate_managed_authority(
+                authority, f"{path}: managed authority {app_id!r}",
+            )
+            if authority["config_sha256"] != value["config_sha256"]:
+                fail(f"{path}: managed authority {app_id!r} differs from transaction config")
+        expected_authority_sha = hashlib.sha256(_canonical_json_bytes({
+            "authorities": authorities,
+            "schema": MANAGED_RUN_AUTHORITY_SCHEMA,
+        })).hexdigest()
+        if (not _is_hex_digest(value["managed_authority_sha256"])
+                or value["managed_authority_sha256"] != expected_authority_sha):
+            fail(f"{path}: managed authority SHA-256 differs from its durable mapping")
+    if "trusted_measurer_activation" in value:
+        _validate_trusted_measurer_activation(
+            value["trusted_measurer_activation"], value, path,
+        )
     if value["phase"] not in TRANSACTION_PHASES:
         fail(f"{path}: invalid transaction phase {value['phase']!r}")
+    activation = value.get("trusted_measurer_activation")
+    if isinstance(activation, dict):
+        if value["phase"] == "rolled_back":
+            fail(f"{path}: rolled-back transaction cannot retain trusted measurer activation")
+        if activation["state"] == "durable" and value["phase"] != "committed":
+            fail(f"{path}: durable trusted measurer activation requires committed apps")
+    if value.get("managed_authorities") and value["phase"] == "committed" \
+            and activation is None:
+        fail(f"{path}: committed managed transaction lacks trusted measurer activation")
     for key in ("planned", "touched", "deactivated"):
         items = value[key]
         if (not isinstance(items, list) or len(items) != len(set(items))
@@ -3556,7 +3947,7 @@ def _read_ledger_snapshot(tx: dict[str, Any]) -> dict[str, Any]:
             raw = json.load(fh)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         fail(f"transaction {tx['id']}: cannot parse ledger checkpoint: {exc}")
-    return _validate_store(raw, path)
+    return _validate_store(raw, path, upgrade_managed=True)
 
 
 def _validate_checkpoint_archives(tx: dict[str, Any]) -> None:
@@ -3634,7 +4025,447 @@ def _validate_checkpoint_archives(tx: dict[str, Any]) -> None:
             fail(f"transaction {tx['id']}: mappings differ from saved ledger for {app_id}")
 
 
-def command_transaction_begin(specs: list[str]) -> int:
+def _canonical_json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _resource_binding(tx: dict[str, Any], app_id: str,
+                      record: dict[str, Any]) -> dict[str, Any]:
+    scoped = tx.get("app_scoped_plan")
+    if scoped is None:
+        fail("resource results require an app-scoped transaction")
+    return {
+        "transaction_id": tx["id"],
+        "app_id": app_id,
+        "action": tx["actions"][app_id],
+        "config_sha256": tx["config_sha256"],
+        "package_sha256": tx["package_sha256"],
+        "source_sha256": record["digest"],
+        "plan_sha256": scoped["plan_sha256"],
+        "dependency_snapshot_sha256": scoped["dependency_snapshot_sha256"],
+    }
+
+
+def _resource_declared(record: dict[str, Any], resource_class: str) -> bool:
+    if resource_class == "filesystem":
+        if "artifacts_declared" in record:
+            return any(record["artifacts_declared"].get(name)
+                       for name in ("fragments", "webroot", "files", "rooted"))
+        return any(record["artifacts"].get(name)
+                   for name in ("fragments", "webroot", "files", "rooted"))
+    if resource_class == "systemd":
+        source = record.get("artifacts_declared") or record.get("artifacts") or {}
+        return bool(source.get("units"))
+    if resource_class == "docker":
+        return record.get("container_runtime") is not None
+    return bool(record.get("serve_mappings"))
+
+
+def _resource_owned(record: dict[str, Any], app_id: str) -> dict[str, list[dict[str, Any]]]:
+    artifacts = (_intent_artifacts(record) if "artifacts_declared" in record
+                 else _committed_artifacts(record))
+    filesystem = [
+        {"class": artifact_class, "path": str(path)}
+        for artifact_class in ("fragments", "webroot", "files", "rooted")
+        for path in artifacts[artifact_class]
+    ]
+    systemd = []
+    for path in artifacts["units"]:
+        resolved, scope = _unit_scope(str(path))
+        systemd.append({"name": os.path.basename(resolved), "path": resolved,
+                        "scope": scope})
+    runtime = record.get("container_runtime")
+    if runtime is None:
+        docker = []
+    elif "artifacts_declared" in record:
+        committed_runtime = None
+        current = (load_store()["entries"].get(app_id) or {}).get("committed")
+        if current is not None:
+            committed_runtime = current.get("container_runtime")
+        captured = _capture_container_runtime(app_id, runtime, committed_runtime)
+        docker = copy.deepcopy((captured or {}).get("objects") or [])
+    else:
+        docker = copy.deepcopy(runtime.get("objects") or [])
+    ingress = [
+        {"key": key, "listen": mapping["listen"], "mode": mapping["mode"],
+         "target": mapping["target"]}
+        for key, mapping in sorted(record.get("serve_mappings", {}).items())
+    ]
+    return {
+        "filesystem": sorted(filesystem, key=lambda item: (item["path"], item["class"])),
+        "systemd": sorted(systemd, key=lambda item: (item["scope"], item["name"])),
+        "docker": sorted(docker, key=lambda item: (item["name"], item["id"])),
+        "ingress": ingress,
+    }
+
+
+def _resource_path_observation(item: dict[str, Any]) -> dict[str, Any]:
+    path = item["path"]
+    try:
+        meta = os.lstat(path)
+        if stat.S_ISREG(meta.st_mode):
+            kind = "file"
+            digest = _sha256_file(Path(path))
+        elif stat.S_ISDIR(meta.st_mode):
+            kind = "directory"
+            digest = None
+        elif stat.S_ISLNK(meta.st_mode):
+            kind = "symlink"
+            digest = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+        else:
+            fail(f"owned filesystem artifact has unsupported type: {path}")
+    except OSError as exc:
+        fail(f"cannot observe owned filesystem artifact {path}: {exc}")
+    return {**item, "kind": kind, "mode": stat.S_IMODE(meta.st_mode),
+            "sha256": digest}
+
+
+def _resource_unit_observations(owned: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    observations = []
+    for item in owned:
+        if _is_service_template(item["name"]):
+            instances = {
+                name: _capture_unit_state(name, item["scope"])
+                for name in _unit_invocations(item["path"], item["scope"])
+            }
+            observations.append({**item, "instances": instances})
+        else:
+            observations.append({**item, **_capture_unit_state(
+                item["name"], item["scope"])})
+    return observations
+
+
+def _serve_status() -> dict[str, Any]:
+    try:
+        result = subprocess.run(["tailscale", "serve", "status", "--json"],
+                                check=False, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+    except OSError as exc:
+        fail(f"cannot inspect Tailscale serve state: {exc}")
+    if result.returncode != 0:
+        fail(f"Tailscale serve status failed with exit {result.returncode}")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        fail(f"Tailscale serve status returned invalid JSON: {exc}")
+    if not isinstance(value, dict) or not isinstance(value.get("TCP", {}), dict) \
+            or not isinstance(value.get("Web", {}), dict):
+        fail("Tailscale serve status returned an invalid shape")
+    return value
+
+
+def _resource_ingress_observations(owned: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not owned:
+        return []
+    status = _serve_status()
+    tcp = status.get("TCP") or {}
+    web = status.get("Web") or {}
+    observations = []
+    for item in owned:
+        port = str(item["listen"])
+        tcp_row = tcp.get(port, tcp.get(f":{port}"))
+        if not isinstance(tcp_row, dict):
+            fail(f"Tailscale serve mapping is absent for {item['mode']}:{port}")
+        actual_mode = "https" if tcp_row.get("HTTPS") is True else "http"
+        if actual_mode != item["mode"]:
+            fail(f"Tailscale serve mode differs at :{port}")
+        expected_proxy = f"http://127.0.0.1:{item['target']}"
+        proxies = []
+        for address, server in web.items():
+            if not isinstance(address, str) or not isinstance(server, dict):
+                continue
+            address_port = address.rsplit(":", 1)[-1]
+            if address_port != port:
+                continue
+            handlers = server.get("Handlers") or {}
+            if not isinstance(handlers, dict):
+                continue
+            for handler in handlers.values():
+                if isinstance(handler, dict) and isinstance(handler.get("Proxy"), str):
+                    proxies.append(handler["Proxy"])
+        if expected_proxy not in proxies:
+            fail(f"Tailscale serve target differs at {item['mode']}:{port}")
+        observations.append({**item, "proxy": expected_proxy})
+    return observations
+
+
+def _resource_result(tx: dict[str, Any], app_id: str, operation: str,
+                     provider_ok: bool, *, record: dict[str, Any] | None = None,
+                     owned_override: dict[str, list[dict[str, Any]]] | None = None,
+                     error: str | None = None) -> dict[str, Any]:
+    if operation not in RESOURCE_RESULT_OPERATIONS:
+        fail(f"unknown resource result operation: {operation}")
+    if app_id not in tx["planned"]:
+        fail(f"transaction {tx['id']} did not plan {app_id}")
+    if record is None:
+        entry = load_store()["entries"].get(app_id) or {}
+        record = entry.get("intent") or entry.get("committed")
+    if record is None:
+        fail(f"no resource authority exists for {app_id}")
+    classes: dict[str, Any] = {}
+    inventory_error = None
+    try:
+        owned = owned_override if owned_override is not None else _resource_owned(record, app_id)
+    except LedgerError as exc:
+        owned = {name: [] for name in RESOURCE_RESULT_CLASSES}
+        inventory_error = str(exc)
+    success_status = {"apply": "applied", "verify": "verified",
+                      "compensate": "compensated"}[operation]
+    for resource_class in RESOURCE_RESULT_CLASSES:
+        declared = _resource_declared(record, resource_class) or bool(owned[resource_class])
+        class_error = error or inventory_error
+        observations: list[dict[str, Any]] = []
+        if provider_ok and class_error is None and declared:
+            try:
+                if operation in {"apply", "compensate"}:
+                    observations = copy.deepcopy(owned[resource_class])
+                elif resource_class == "filesystem":
+                    observations = [_resource_path_observation(item)
+                                    for item in owned[resource_class]]
+                elif resource_class == "systemd":
+                    observations = _resource_unit_observations(owned[resource_class])
+                elif resource_class == "docker":
+                    observations = copy.deepcopy(owned[resource_class])
+                else:
+                    observations = _resource_ingress_observations(owned[resource_class])
+            except LedgerError as exc:
+                class_error = str(exc)
+        if not declared:
+            status = "not_declared"
+        elif not provider_ok or class_error is not None:
+            status = "failed"
+        else:
+            status = success_status
+        classes[resource_class] = {
+            "status": status,
+            "owned": copy.deepcopy(owned[resource_class]),
+            "observations": observations,
+            "error": class_error,
+        }
+    failed = [name for name, value in classes.items()
+              if value["status"] in {"failed", "unsupported"}]
+    body = {
+        "schema": RESOURCE_RESULT_SCHEMA,
+        "transaction_id": tx["id"],
+        "app_id": app_id,
+        "operation": operation,
+        "binding": _resource_binding(tx, app_id, record),
+        "classes": classes,
+        "verdict": "failed" if failed else "passed",
+        "error": (error or inventory_error or
+                  (f"resource class failure: {', '.join(failed)}" if failed else None)),
+    }
+    body["result_digest"] = hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+    return body
+
+
+def _validate_resource_result_shape(value: Any, operation: str | None = None,
+                                    app_id: str | None = None) -> dict[str, Any]:
+    fields = {"schema", "transaction_id", "app_id", "operation", "binding", "classes",
+              "verdict", "error", "result_digest"}
+    if not isinstance(value, dict) or set(value) != fields:
+        fail("invalid resource result shape")
+    if value["schema"] != RESOURCE_RESULT_SCHEMA:
+        fail("unsupported resource result schema")
+    if operation is not None and value["operation"] != operation:
+        fail("resource result operation mismatch")
+    if app_id is not None and value["app_id"] != app_id:
+        fail("resource result app mismatch")
+    if (value["operation"] not in RESOURCE_RESULT_OPERATIONS
+            or not _ID_RE.fullmatch(str(value["app_id"]))
+            or not re.fullmatch(r"[0-9a-f]{32}", str(value["transaction_id"]))
+            or value["verdict"] not in {"passed", "failed"}
+            or value["error"] is not None and not isinstance(value["error"], str)):
+        fail("invalid resource result values")
+    binding_fields = {"transaction_id", "app_id", "action", "config_sha256",
+                      "package_sha256", "source_sha256", "plan_sha256",
+                      "dependency_snapshot_sha256"}
+    binding = value["binding"]
+    if (not isinstance(binding, dict) or set(binding) != binding_fields
+            or binding["transaction_id"] != value["transaction_id"]
+            or binding["app_id"] != value["app_id"]
+            or binding["action"] not in TRANSACTION_ACTIONS
+            or any(not _is_hex_digest(binding[key]) for key in (
+                "config_sha256", "package_sha256", "source_sha256", "plan_sha256",
+                "dependency_snapshot_sha256"))):
+        fail("invalid resource result binding")
+    classes = value["classes"]
+    if not isinstance(classes, dict) or set(classes) != set(RESOURCE_RESULT_CLASSES):
+        fail("resource result must contain exactly four resource classes")
+    for resource_class, result in classes.items():
+        if (not isinstance(result, dict)
+                or set(result) != {"status", "owned", "observations", "error"}
+                or result["status"] not in RESOURCE_RESULT_STATUSES
+                or not isinstance(result["owned"], list)
+                or not isinstance(result["observations"], list)
+                or result["error"] is not None and not isinstance(result["error"], str)
+                or any(not isinstance(item, dict) for item in result["owned"])
+                or any(not isinstance(item, dict) for item in result["observations"])):
+            fail(f"invalid {resource_class} resource result")
+    digest = value["result_digest"]
+    body = dict(value)
+    body.pop("result_digest")
+    if not _is_hex_digest(digest) or digest != hashlib.sha256(
+            _canonical_json_bytes(body)).hexdigest():
+        fail("resource result digest mismatch")
+    return value
+
+
+def _write_resource_result(tx: dict[str, Any], result: dict[str, Any]) -> None:
+    _validate_resource_result_shape(result, result["operation"], result["app_id"])
+    tx.setdefault("resource_results", {}).setdefault(result["app_id"], {})[
+        result["operation"]] = result
+    write_transaction(tx)
+
+
+def _merge_resource_owned(*inventories: dict[str, list[dict[str, Any]]]
+                          ) -> dict[str, list[dict[str, Any]]]:
+    merged: dict[str, list[dict[str, Any]]] = {}
+    for resource_class in RESOURCE_RESULT_CLASSES:
+        by_value: dict[bytes, dict[str, Any]] = {}
+        for inventory in inventories:
+            for item in inventory[resource_class]:
+                by_value[_canonical_json_bytes(item)] = copy.deepcopy(item)
+        merged[resource_class] = [by_value[key] for key in sorted(by_value)]
+    return merged
+
+
+def command_transaction_resource_result(operation: str, app_id: str,
+                                        outcome: str) -> int:
+    if operation not in {"apply", "verify"} or outcome not in {"passed", "failed"}:
+        fail("transaction-resource-result requires <apply|verify> <id> <passed|failed>")
+    if not _ID_RE.fullmatch(app_id):
+        fail(f"invalid package id: {app_id!r}")
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] in TRANSACTION_TERMINAL_PHASES:
+        fail(f"transaction {tx['id']} is already {tx['phase']}")
+    if app_id not in tx["touched"]:
+        fail(f"transaction {tx['id']} has not touched {app_id}")
+    result = _resource_result(
+        tx, app_id, operation, outcome == "passed",
+        error=None if outcome == "passed" else f"{operation} provider returned failure",
+    )
+    _write_resource_result(tx, result)
+    sys.stdout.buffer.write(_canonical_json_bytes(result))
+    return 0 if result["verdict"] == "passed" else 1
+
+
+def _require_current_resource_result(app_id: str) -> None:
+    tx = load_transaction()
+    assert tx is not None
+    stored = ((tx.get("resource_results") or {}).get(app_id) or {}).get("verify")
+    if stored is None:
+        fail(f"app-scoped commit for {app_id} requires a verified resource result")
+    _validate_resource_result_shape(stored, "verify", app_id)
+    expected = _resource_result(tx, app_id, "verify", True)
+    if expected != stored:
+        fail(f"resource result for {app_id} is stale or its ownership/binding changed")
+    if stored["verdict"] != "passed":
+        fail(f"resource verification failed for {app_id}")
+
+
+def _managed_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"managed authority sidecar repeats JSON key {key!r}")
+        value[key] = item
+    return value
+
+
+def _read_managed_authority_sidecar(raw_path: str, expected_sha256: str) -> dict[str, dict[str, Any]]:
+    if not _is_hex_digest(expected_sha256):
+        fail("transaction-begin managed authority SHA-256 must be lowercase 64-hex")
+    if (not os.path.isabs(raw_path) or raw_path != os.path.normpath(raw_path)):
+        fail("transaction-begin managed authority file must be one normalized absolute path")
+    path = Path(raw_path)
+    parent = path.parent
+    try:
+        parent_info = os.lstat(parent)
+        path_info = os.lstat(path)
+        parent_resolved = parent.resolve(strict=True)
+    except OSError as exc:
+        fail(f"cannot inspect managed authority sidecar {path}: {exc}")
+    if (not stat.S_ISDIR(parent_info.st_mode) or parent.is_symlink()
+            or parent_resolved != parent
+            or parent_info.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_info.st_mode) != 0o700):
+        fail("managed authority sidecar parent must be a private invoking-user directory")
+    if (not stat.S_ISREG(path_info.st_mode) or path.is_symlink()
+            or path_info.st_uid != os.geteuid()
+            or stat.S_IMODE(path_info.st_mode) != 0o600):
+        fail("managed authority sidecar must be a private invoking-user regular file")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev != path_info.st_dev or opened.st_ino != path_info.st_ino
+                    or not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened.st_mode) != 0o600):
+                fail("managed authority sidecar changed while it was opened")
+            raw = handle.read(1024 * 1024 + 1)
+    except OSError as exc:
+        fail(f"cannot read managed authority sidecar {path}: {exc}")
+    if len(raw) > 1024 * 1024:
+        fail("managed authority sidecar exceeds 1 MiB")
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        fail("managed authority sidecar differs from its supplied SHA-256")
+    try:
+        value = json.loads(raw, object_pairs_hook=_managed_json_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"managed authority sidecar is invalid JSON: {exc}")
+    if raw != _canonical_json_bytes(value):
+        fail("managed authority sidecar must be canonical JSON with one trailing newline")
+    if (not isinstance(value, dict)
+            or set(value) != {"authorities", "schema"}
+            or value.get("schema") != MANAGED_RUN_AUTHORITY_SCHEMA
+            or not isinstance(value.get("authorities"), dict)
+            or not value["authorities"]):
+        fail("managed authority sidecar has an unsupported closed shape")
+    authorities = value["authorities"]
+    for app_id, authority in authorities.items():
+        if not isinstance(app_id, str) or not _ID_RE.fullmatch(app_id):
+            fail(f"managed authority sidecar has invalid package id {app_id!r}")
+        _validate_managed_authority(authority, f"managed authority sidecar {app_id!r}")
+    return copy.deepcopy(authorities)
+
+
+def _transaction_begin_arguments(
+        arguments: list[str],
+) -> tuple[list[str], dict[str, dict[str, Any]] | None, str | None]:
+    authority_path: str | None = None
+    authority_sha256: str | None = None
+    specs: list[str] = []
+    for argument in arguments:
+        if argument.startswith("--managed-authority-file="):
+            if authority_path is not None:
+                fail("transaction-begin accepts --managed-authority-file once")
+            authority_path = argument.split("=", 1)[1]
+            if not authority_path:
+                fail("transaction-begin requires --managed-authority-file=<path>")
+        elif argument.startswith("--managed-authority-sha256="):
+            if authority_sha256 is not None:
+                fail("transaction-begin accepts --managed-authority-sha256 once")
+            authority_sha256 = argument.split("=", 1)[1]
+        elif argument in {"--managed-authority-file", "--managed-authority-sha256"}:
+            fail(f"transaction-begin requires {argument}=<value>")
+        elif argument.startswith("-"):
+            fail(f"transaction-begin received unknown option {argument!r}")
+        else:
+            specs.append(argument)
+    if bool(authority_path) != bool(authority_sha256):
+        fail("transaction-begin requires managed authority file and SHA-256 together")
+    authorities = (_read_managed_authority_sidecar(authority_path, authority_sha256)
+                   if authority_path is not None and authority_sha256 is not None else None)
+    return specs, authorities, authority_sha256
+
+
+def command_transaction_begin(arguments: list[str]) -> int:
+    specs, managed_authorities, managed_authority_sha256 = _transaction_begin_arguments(arguments)
     actions: dict[str, str] = {}
     for spec in specs:
         action, separator, app_id = spec.partition(":")
@@ -3648,7 +4479,48 @@ def command_transaction_begin(specs: list[str]) -> int:
     for key in ("AIRLOCK_CONFIG_SNAPSHOT_SHA256", "AIRLOCK_INSTALL_PKG_INFO_SHA256"):
         if not _is_hex_digest(os.environ.get(key)):
             fail(f"transaction-begin requires {key}=<lowercase sha256>")
+    scoped_plan_sha = os.environ.get("AIRLOCK_APP_SCOPED_PLAN_SHA256")
+    dependency_snapshot_sha = os.environ.get("AIRLOCK_LEDGER_DEPENDENCIES_SHA256")
+    if bool(scoped_plan_sha) != bool(dependency_snapshot_sha):
+        fail("transaction-begin requires both app-scoped plan and dependency snapshot digests")
+    if scoped_plan_sha is not None:
+        if not _is_hex_digest(scoped_plan_sha):
+            fail("transaction-begin requires AIRLOCK_APP_SCOPED_PLAN_SHA256=<lowercase sha256>")
+        if not _is_hex_digest(dependency_snapshot_sha):
+            fail("transaction-begin requires AIRLOCK_LEDGER_DEPENDENCIES_SHA256=<lowercase sha256>")
+    if managed_authorities is not None:
+        if scoped_plan_sha is None:
+            fail("transaction-begin managed authorities require an app-scoped plan binding")
+        if not set(managed_authorities).issubset(actions):
+            fail("transaction-begin managed authorities must name planned apps")
+        for app_id, authority in managed_authorities.items():
+            if actions[app_id] in DESTRUCTIVE_ACTIONS:
+                fail(f"transaction-begin managed authority cannot bind destructive-only app {app_id}")
+            if authority["config_sha256"] != os.environ["AIRLOCK_CONFIG_SNAPSHOT_SHA256"]:
+                fail(f"transaction-begin managed authority for {app_id} differs from config binding")
+        package_info = read_package_info()
+        if _PACKAGE_INFO_INPUT_SHA256 != os.environ["AIRLOCK_INSTALL_PKG_INFO_SHA256"]:
+            fail("transaction-begin managed package-info differs from its supplied SHA-256")
+        packages = packages_from_info(package_info)
+        managed_planned = {
+            app_id for app_id in actions
+            if app_id in packages and packages[app_id]["source_class"] == "managed"
+        }
+        if managed_planned != set(managed_authorities):
+            fail("transaction-begin managed authorities differ from planned managed packages")
+        for app_id, authority in managed_authorities.items():
+            package = packages.get(app_id)
+            if package is None:
+                fail(f"transaction-begin managed authority has no package-info entry for {app_id}")
+            if package["signed_package_digest"] != authority["package_digest"]:
+                fail(f"transaction-begin managed authority for {app_id} differs from signed package digest")
+            if package["capabilities"] != authority["capabilities"]:
+                fail(f"transaction-begin managed authority for {app_id} differs from package capabilities")
     previous = load_transaction(required=False)
+    if (previous is not None
+            and (previous.get("trusted_measurer_activation") or {}).get("state") != "durable"
+            and "trusted_measurer_activation" in previous):
+        fail(f"transaction {previous['id']} still owes trusted measurer activation")
     if previous is not None and previous["phase"] not in {"committed", "rolled_back"}:
         fail(f"unfinished transaction {previous['id']} is {previous['phase']}; recover it before starting another")
     if previous is not None:
@@ -3683,6 +4555,15 @@ def command_transaction_begin(specs: list[str]) -> int:
             "ledger_snapshot": {"file": "ledger.json", "sha256": _sha256_file(snapshot_path)},
             "error": None, "restore_results": {},
         }
+        if scoped_plan_sha is not None:
+            tx["app_scoped_plan"] = {
+                "plan_sha256": scoped_plan_sha,
+                "dependency_snapshot_sha256": dependency_snapshot_sha,
+            }
+            tx["resource_results"] = {}
+        if managed_authorities is not None:
+            tx["managed_authorities"] = copy.deepcopy(managed_authorities)
+            tx["managed_authority_sha256"] = managed_authority_sha256
         for app_id in app_ids:
             tx["checkpoints"][app_id] = _checkpoint_record(store, app_id, actions[app_id], root)
         _validate_checkpoint_archives(tx)
@@ -3976,6 +4857,63 @@ def command_transaction_keep_forward_candidate(state: str) -> int:
     return 0
 
 
+def command_transaction_trusted_measurer_owed() -> int:
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] in TRANSACTION_TERMINAL_PHASES:
+        fail(f"transaction {tx['id']} is already {tx['phase']}")
+    authorities = tx.get("managed_authorities")
+    if not isinstance(authorities, dict) or not authorities:
+        fail(f"transaction {tx['id']} has no managed authorities")
+    old_hashes = {authority["installed_measurer_sha256"] for authority in authorities.values()}
+    new_hashes = {authority["next_measurer_sha256"] for authority in authorities.values()}
+    if len(old_hashes) != 1 or len(new_hashes) != 1:
+        fail("managed authorities disagree on trusted measurer rotation")
+    activation = {
+        "new_path": f"/opt/airlock/libexec/.airlock-managed-release.{tx['id']}.new",
+        "new_sha256": next(iter(new_hashes)),
+        "old_path": f"/opt/airlock/libexec/.airlock-managed-release.{tx['id']}.old",
+        "old_sha256": next(iter(old_hashes)),
+        "schema": TRUSTED_MEASURER_ACTIVATION_SCHEMA,
+        "state": "owed",
+        "target": TRUSTED_MEASURER_TARGET,
+    }
+    existing = tx.get("trusted_measurer_activation")
+    if existing is not None and existing != activation:
+        fail(f"transaction {tx['id']} already has different trusted measurer activation")
+    tx["trusted_measurer_activation"] = activation
+    write_transaction(tx)
+    return 0
+
+
+def command_transaction_trusted_measurer_durable() -> int:
+    tx = load_transaction()
+    assert tx is not None
+    activation = tx.get("trusted_measurer_activation")
+    if tx["phase"] != "committed" or not isinstance(activation, dict):
+        fail("trusted measurer activation can become durable only after commit")
+    if activation["state"] == "durable":
+        return 0
+    if activation["state"] != "owed":
+        fail("trusted measurer activation is not owed")
+    activation["state"] = "durable"
+    write_transaction(tx)
+    return 0
+
+
+def command_transaction_trusted_measurer_clear() -> int:
+    tx = load_transaction()
+    assert tx is not None
+    activation = tx.get("trusted_measurer_activation")
+    if tx["phase"] in {"committed", "rolled_back"} or not isinstance(activation, dict):
+        fail("trusted measurer activation can be cleared only before terminal restore")
+    if activation["state"] != "owed":
+        fail("only an owed trusted measurer activation can be cleared")
+    del tx["trusted_measurer_activation"]
+    write_transaction(tx)
+    return 0
+
+
 def command_transaction_restore() -> int:
     tx = load_transaction()
     assert tx is not None
@@ -3983,6 +4921,8 @@ def command_transaction_restore() -> int:
         return 0
     if tx["phase"] == "committed":
         fail(f"transaction {tx['id']} is committed and cannot be restored")
+    if "trusted_measurer_activation" in tx:
+        fail("trusted measurer activation must be restored and cleared before transaction restore")
     try:
         _validate_checkpoint_archives(tx)
         saved_store = _read_ledger_snapshot(tx)
@@ -4005,6 +4945,31 @@ def command_transaction_restore() -> int:
         if saved is not None:
             artifacts = _committed_artifacts(saved)
             _preflight_teardown_artifacts(artifacts, saved["capabilities"])
+    resource_records: dict[str, dict[str, Any]] = {}
+    resource_owned: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    resource_inventory_errors: dict[str, str] = {}
+    if tx.get("app_scoped_plan") is not None:
+        current_store = load_store()
+        for app_id in tx["touched"]:
+            current_entry = current_store["entries"].get(app_id) or {}
+            saved_entry = saved_store["entries"].get(app_id) or {}
+            records = [record for record in (
+                current_entry.get("intent"), current_entry.get("committed"),
+                saved_entry.get("committed"), saved_entry.get("intent"),
+            ) if record is not None]
+            if not records:
+                continue
+            resource_records[app_id] = records[0]
+            inventories = []
+            try:
+                for record in records:
+                    inventories.append(_resource_owned(record, app_id))
+                resource_owned[app_id] = _merge_resource_owned(*inventories)
+            except LedgerError as exc:
+                resource_owned[app_id] = {
+                    resource_class: [] for resource_class in RESOURCE_RESULT_CLASSES
+                }
+                resource_inventory_errors[app_id] = str(exc)
     kept = tx.get("forward_keep")
     if kept is not None:
         reason = _forward_keep_evidence_holds(kept)
@@ -4028,6 +4993,14 @@ def command_transaction_restore() -> int:
             tx["restore_results"][app_id] = {"status": status, "error": None}
             write_transaction(tx)
             log(f"kept {app_id} forward: candidate retained on its converted database ({kept['candidate']})")
+            if app_id in resource_records:
+                resource_result = _resource_result(
+                    tx, app_id, "compensate", False,
+                    record=resource_records[app_id],
+                    owned_override=resource_owned[app_id],
+                    error="candidate was kept forward and not compensated",
+                )
+                _write_resource_result(tx, resource_result)
             continue
         result = {"status": "restoring", "error": None}
         tx["restore_results"][app_id] = result
@@ -4072,6 +5045,15 @@ def command_transaction_restore() -> int:
             result["error"] = str(exc)[:1000]
             all_ok = False
             log(f"restore failed for {app_id}: {exc}")
+        if app_id in resource_records:
+            resource_error = resource_inventory_errors.get(app_id) or result["error"]
+            resource_result = _resource_result(
+                tx, app_id, "compensate", result["status"] == "restored",
+                record=resource_records[app_id],
+                owned_override=resource_owned[app_id],
+                error=resource_error,
+            )
+            _write_resource_result(tx, resource_result)
         write_transaction(tx)
     tx["phase"] = "rolled_back" if all_ok else "degraded"
     write_transaction(tx)
@@ -4095,6 +5077,10 @@ def command_transaction_finish(phase: str) -> int:
     assert tx is not None
     if tx["phase"] in TRANSACTION_TERMINAL_PHASES:
         fail(f"transaction {tx['id']} is already {tx['phase']}")
+    if tx.get("managed_authorities"):
+        activation = tx.get("trusted_measurer_activation")
+        if not isinstance(activation, dict) or activation.get("state") != "owed":
+            fail("managed transaction requires an owed trusted measurer activation before commit")
     tx["phase"] = "committed"
     write_transaction(tx)
     try:
@@ -4124,17 +5110,25 @@ def transaction_cli(argv: list[str]) -> int:
         return _transaction_update_list("touched" if command.endswith("touch") else "deactivated", argv[1])
     if command == "transaction-fail" and len(argv) == 3:
         return command_transaction_fail(argv[1], argv[2])
+    if command == "transaction-resource-result" and len(argv) == 4:
+        return command_transaction_resource_result(argv[1], argv[2], argv[3])
     if command == "transaction-restore" and len(argv) == 1:
         return command_transaction_restore()
     if command == "transaction-keep-forward" and len(argv) == 5:
         return command_transaction_keep_forward(argv[1], argv[2], argv[3], argv[4])
     if command == "transaction-keep-forward-candidate" and len(argv) == 2:
         return command_transaction_keep_forward_candidate(argv[1])
+    if command == "transaction-trusted-measurer-owed" and len(argv) == 1:
+        return command_transaction_trusted_measurer_owed()
+    if command == "transaction-trusted-measurer-durable" and len(argv) == 1:
+        return command_transaction_trusted_measurer_durable()
+    if command == "transaction-trusted-measurer-clear" and len(argv) == 1:
+        return command_transaction_trusted_measurer_clear()
     if command == "transaction-finish" and len(argv) == 2:
         return command_transaction_finish(argv[1])
     if command == "transaction-show" and len(argv) == 1:
         return command_transaction_show()
-    fail("usage: airlock-ledger transaction-{begin|touch|deactivated|fail|restore|keep-forward|finish|show} ...")
+    fail("usage: airlock-ledger transaction-{begin|touch|deactivated|fail|resource-result|restore|keep-forward|trusted-measurer-owed|trusted-measurer-durable|trusted-measurer-clear|finish|show} ...")
 
 
 def command_list(store: dict[str, Any]) -> int:
@@ -4209,7 +5203,7 @@ def command_audit_lock_override(store: dict[str, Any], info: dict[str, Any],
     return 0
 
 
-def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
+def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None, str | None]:
     if not argv:
         fail("usage: airlock-ledger "
              "{plan|handoffs|intent|commit|preflight-remove|remove|teardown|list|audit-lock-override} ...")
@@ -4220,6 +5214,7 @@ def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
     positional: list[str] = []
     for_upgrade = False
     active_ports: str | None = None
+    dependency_snapshot: str | None = None
     index = 1
     while index < len(argv):
         argument = argv[index]
@@ -4236,6 +5231,17 @@ def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
             if active_ports is not None:
                 fail("--active-ports is accepted only once")
             active_ports = argument.split("=", 1)[1]
+        elif argument == "--dependency-snapshot":
+            if command != "plan" or dependency_snapshot is not None or index + 1 >= len(argv):
+                fail("--dependency-snapshot requires one path and is accepted only once by plan")
+            index += 1
+            dependency_snapshot = argv[index]
+        elif argument.startswith("--dependency-snapshot="):
+            if command != "plan" or dependency_snapshot is not None:
+                fail("--dependency-snapshot is accepted only once by plan")
+            dependency_snapshot = argument.split("=", 1)[1]
+            if not dependency_snapshot:
+                fail("--dependency-snapshot requires a path")
         elif argument.startswith("-"):
             fail(f"unknown option: {argument}")
         else:
@@ -4248,7 +5254,8 @@ def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None]:
     if len(positional) != expected:
         fail(f"usage: airlock-ledger {command}"
              + (" <id>" if expected else ""))
-    return command, positional[0] if positional else None, for_upgrade, active_ports
+    return (command, positional[0] if positional else None, for_upgrade,
+            active_ports, dependency_snapshot)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4260,11 +5267,11 @@ def main(argv: list[str] | None = None) -> int:
             raw_argv[2], raw_argv[3], scope, raw_argv[5], raw_argv[6])
     if raw_argv and raw_argv[0].startswith("transaction-"):
         return transaction_cli(raw_argv)
-    command, app_id, for_upgrade, active_ports = parse_cli(raw_argv)
+    command, app_id, for_upgrade, active_ports, dependency_snapshot = parse_cli(raw_argv)
     store = load_store()
     info = read_package_info()
     if command == "plan":
-        return command_plan(store, info)
+        return command_plan(store, info, dependency_snapshot)
     if command == "handoffs":
         return command_handoffs(store, info, app_id or "")
     if command == "intent":

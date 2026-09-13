@@ -137,6 +137,16 @@ cat > "$SHIM/nginx" <<'STUB'
 #!/usr/bin/env bash
 if [ "${1:-}" = -t ] && [ -n "${AIRLOCK_FIXTURE_NGINX_FAIL:-}" ]; then
   case "$(cat "$AIRLOCK_FIXTURE_NGINX_FAIL")" in
+    personal-r4)
+      artifact="$AIRLOCK_WEBROOT/${AIRLOCK_FIXTURE_PERSONAL_ID:?}/marker"
+      data="${AIRLOCK_FIXTURE_DATA_FILE:?}"
+      receipt="${AIRLOCK_FIXTURE_MUTATION_RECEIPT:?}"
+      artifact_sha=absent data_sha=absent
+      [ ! -f "$artifact" ] || artifact_sha="$(sha256sum "$artifact" | cut -d' ' -f1)"
+      [ ! -f "$data" ] || data_sha="$(sha256sum "$data" | cut -d' ' -f1)"
+      printf 'artifact_sha256=%s\ndata_sha256=%s\n' "$artifact_sha" "$data_sha" >"$receipt"
+      exit 77
+      ;;
     modify)
       python3 - "$AIRLOCK_FIXTURE_DB" <<'PY'
 import sqlite3
@@ -611,6 +621,231 @@ EOF
   else
     bad "resource-handoff: rc=$rc"
     tail -30 "$TMP/handoff-second.log" | sed 's/^/    /'
+  fi
+}
+
+file_sha() {
+  [ -f "$1" ] && sha256sum "$1" | cut -d' ' -f1 || printf 'absent\n'
+}
+
+personal_r4_config() {
+  local cfg="$1" package="$2"
+  cat >"$cfg" <<EOF
+[airlock]
+config_version = 2
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+[apps.r4-personal]
+[packages.r4-personal]
+path = "$package"
+EOF
+}
+
+personal_r4_ledger_digest() {
+  python3 - "$STATE/app-ledger.json" <<'PY'
+import json, sys
+entry = json.load(open(sys.argv[1], encoding="utf-8"))["entries"]["r4-personal"]
+print(entry["committed"]["digest"])
+PY
+}
+
+personal_r4_start_record() {
+  local case_root="$1" run_dir="$2" run_id="$3"
+  python3 - "$case_root/apps/dev-monitor/backend/devmon_update_exec.py" \
+    "$run_dir" "$run_id" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fixture_update_exec", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+directory = Path(sys.argv[2])
+module.ensure_dirs(directory)
+module.write_record(directory, module.start_record(sys.argv[3], "install", "r4-personal"))
+PY
+}
+
+personal_r4_receipt_matches() {
+  local receipt="$1" artifact_sha="$2" data_sha="$3"
+  [ -f "$receipt" ] \
+    && grep -qx "artifact_sha256=$artifact_sha" "$receipt" \
+    && grep -qx "data_sha256=$data_sha" "$receipt"
+}
+
+personal_r4_contract_holds() {
+  [ "$PERSONAL_R4_WRAPPER_RC" = 77 ] \
+    && [ "$PERSONAL_R4_RECORD_STATUS" = failed ] \
+    && [ "$PERSONAL_R4_RECORD_EXIT" = 77 ] \
+    && [ "$PERSONAL_R4_RECORD_BEFORE" = present ] \
+    && [ "$PERSONAL_R4_RECORD_AFTER" = present ] \
+    && [ "$PERSONAL_R4_PHASE" = rolled_back ] \
+    && [ "$PERSONAL_R4_ERROR_PHASE" = install ] \
+    && [ "$PERSONAL_R4_ERROR_APP" = r4-personal ] \
+    && [[ "$PERSONAL_R4_ERROR_MESSAGE" == *"installer exited rc=77"* ]] \
+    && [ "$PERSONAL_R4_LEDGER_BEFORE" = "$PERSONAL_R4_LEDGER_AFTER" ] \
+    && [ "$PERSONAL_R4_CONFIG_AFTER" = "$PERSONAL_R4_CONFIG_APPROVED" ] \
+    && [ "$PERSONAL_R4_CONFIG_APPROVED" != "$PERSONAL_R4_CONFIG_RECOVERY" ] \
+    && [ "$PERSONAL_R4_CONFIG_BACKUP" = "$PERSONAL_R4_CONFIG_RECOVERY" ] \
+    && [ "$PERSONAL_R4_LOCK_AFTER" = "$PERSONAL_R4_LOCK_BEFORE" ] \
+    && [ "$PERSONAL_R4_ARTIFACT_AFTER" = "$PERSONAL_R4_ARTIFACT_RECOVERY" ] \
+    && [ "$PERSONAL_R4_DATA_AFTER" = "$PERSONAL_R4_DATA_EXPECTED" ] \
+    && [ "$PERSONAL_R4_DATA_AFTER" != "$PERSONAL_R4_DATA_BEFORE" ] \
+    && personal_r4_receipt_matches "$PERSONAL_R4_RECEIPT" \
+         "$PERSONAL_R4_ARTIFACT_MUTATED" "$PERSONAL_R4_DATA_EXPECTED"
+}
+
+personal_r4_run() {
+  local mode="$1" case_root="$TMP/personal-r4-root-$1"
+  local v1="$TMP/personal-r4-v1-$1" v2="$TMP/personal-r4-v2-$1"
+  local cfg="$case_root/airlock.toml" data="$DATA/r4-personal.data"
+  local receipt="$TMP/personal-r4-$1.receipt" run_dir="$TMP/personal-r4-run-$1"
+  local run_id="personal-r4-$1" preview wrapper_log="$TMP/personal-r4-$1.log"
+  local rc=0
+
+  reset_fixture
+  rm -rf "$case_root" "$v1" "$v2" "$run_dir"
+  rm -f "$receipt"
+  mkdir -p "$case_root"
+  # The package lock is rooted beside bin/airlock-config. Use an ephemeral copy of the
+  # current source so the real lock writer and wrapper run without touching this checkout.
+  tar -C "$ROOT" --exclude=.git -cf - . | tar -C "$case_root" -xf -
+
+  mkpkg "$v1" r4-personal 0
+  printf 'operator-data\n' >"$data"
+  personal_r4_config "$cfg" "$v1"
+  HOME="$FAKEHOME" AIRLOCK_CONFIG="$cfg" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" \
+    AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup" \
+    bash "$case_root/install/airlock-install.sh" >"$TMP/personal-r4-$1-setup.log" 2>&1 \
+    || return 1
+
+  PERSONAL_R4_CONFIG_RECOVERY="$(file_sha "$cfg")"
+  PERSONAL_R4_LOCK_BEFORE="$(file_sha "$case_root/airlock.lock")"
+  PERSONAL_R4_LEDGER_BEFORE="$(personal_r4_ledger_digest)"
+  PERSONAL_R4_ARTIFACT_RECOVERY="$(file_sha "$WEB/r4-personal/marker")"
+
+  mkpkg "$v2" r4-personal 0
+  cat >"$v2/install.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. "\$AIRLOCK_ROOT/install/lib.sh"
+if [ "$mode" = corrupt ]; then
+  archive="\$(find "\$AIRLOCK_STATE_DIR/install-checkpoints" -name '*.tar' -print -quit)"
+  printf 'fixture-corruption\n' >>"\$archive"
+fi
+if [ "$mode" != noop ]; then
+  mkdir -p "\$AIRLOCK_WEBROOT/\$AIRLOCK_APP_ID"
+  printf 'version=personal-r4-v2\n' >"\$AIRLOCK_WEBROOT/\$AIRLOCK_APP_ID/marker"
+  printf 'write-during-failure\n' >>"\${AIRLOCK_FIXTURE_DATA_FILE:?}"
+fi
+nginx -t
+EOF
+  chmod +x "$v2/install.sh"
+  cp "$cfg" "$cfg.bak"
+  personal_r4_config "$cfg" "$v2"
+  PERSONAL_R4_CONFIG_APPROVED="$(file_sha "$cfg")"
+  PERSONAL_R4_DATA_BEFORE="$(file_sha "$data")"
+  PERSONAL_R4_ARTIFACT_MUTATED="$(printf 'version=personal-r4-v2\n' | sha256sum | cut -d' ' -f1)"
+  PERSONAL_R4_DATA_EXPECTED="$(printf 'operator-data\nwrite-during-failure\n' | sha256sum | cut -d' ' -f1)"
+
+  preview="$(HOME="$FAKEHOME" AIRLOCK_CONFIG="$cfg" \
+    python3 "$case_root/bin/airlock-config" package-preview "$v2")" || return 1
+  PERSONAL_R4_APPROVED_DIGEST="$(printf '%s' "$preview" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')" || return 1
+  printf '%s' "$preview" | python3 -c 'import json,sys
+p=json.load(sys.stdin)
+raise SystemExit(0 if p["registered"] and p["requires_reapproval"] and p["installable"] else 1)' \
+    || return 1
+
+  personal_r4_start_record "$case_root" "$run_dir" "$run_id" || return 1
+  if [ "$mode" = noop ]; then
+    # Negative control: the wrapper still reaches the exact installer path, but a
+    # no-op replacement in the ephemeral checkout performs no transaction at all.
+    printf '%s\n' '#!/usr/bin/env bash' 'exit 77' >"$case_root/install/airlock-install.sh"
+    chmod +x "$case_root/install/airlock-install.sh"
+  fi
+  AIRLOCK_FIXTURE_NGINX_FAIL="$TMP/personal-r4-nginx-$1"; export AIRLOCK_FIXTURE_NGINX_FAIL
+  printf 'personal-r4\n' >"$AIRLOCK_FIXTURE_NGINX_FAIL"
+  AIRLOCK_FIXTURE_PERSONAL_ID=r4-personal \
+  AIRLOCK_FIXTURE_DATA_FILE="$data" AIRLOCK_FIXTURE_MUTATION_RECEIPT="$receipt" \
+  HOME="$FAKEHOME" AIRLOCK_CONFIG="$cfg" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" \
+  AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup" \
+    python3 "$case_root/apps/dev-monitor/backend/devmon_update_exec.py" \
+      --root "$case_root" --dir "$run_dir" --run "$run_id" --action install \
+      --app r4-personal --approved-digest "$PERSONAL_R4_APPROVED_DIGEST" \
+      --package-path "$v2" --reapprove >"$wrapper_log" 2>&1 || rc=$?
+  unset AIRLOCK_FIXTURE_NGINX_FAIL
+
+  PERSONAL_R4_WRAPPER_RC="$rc"
+  mapfile -t record_fields < <(python3 - "$run_dir/run.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+print(r.get("status", ""))
+print(r.get("exitCode", ""))
+print("present" if r.get("before") is not None else "missing")
+print("present" if r.get("after") is not None else "missing")
+PY
+  )
+  PERSONAL_R4_RECORD_STATUS="${record_fields[0]:-}"
+  PERSONAL_R4_RECORD_EXIT="${record_fields[1]:-}"
+  PERSONAL_R4_RECORD_BEFORE="${record_fields[2]:-}"
+  PERSONAL_R4_RECORD_AFTER="${record_fields[3]:-}"
+  mapfile -t tx_fields < <(python3 - "$STATE/install-transaction.json" <<'PY'
+import json, sys
+tx = json.load(open(sys.argv[1], encoding="utf-8"))
+error = tx.get("error") or {}
+print(tx.get("phase", ""))
+print(error.get("phase", ""))
+print(error.get("app", ""))
+print(error.get("message", ""))
+PY
+  )
+  PERSONAL_R4_PHASE="${tx_fields[0]:-}"
+  PERSONAL_R4_ERROR_PHASE="${tx_fields[1]:-}"
+  PERSONAL_R4_ERROR_APP="${tx_fields[2]:-}"
+  PERSONAL_R4_ERROR_MESSAGE="${tx_fields[3]:-}"
+  PERSONAL_R4_LEDGER_AFTER="$(personal_r4_ledger_digest 2>/dev/null || printf absent)"
+  PERSONAL_R4_CONFIG_AFTER="$(file_sha "$cfg")"
+  PERSONAL_R4_CONFIG_BACKUP="$(file_sha "$cfg.bak")"
+  PERSONAL_R4_LOCK_AFTER="$(file_sha "$case_root/airlock.lock")"
+  PERSONAL_R4_ARTIFACT_AFTER="$(file_sha "$WEB/r4-personal/marker")"
+  PERSONAL_R4_DATA_AFTER="$(file_sha "$data")"
+  PERSONAL_R4_RECEIPT="$receipt"
+}
+
+personal_path_r4_transaction() {
+  local positive=0 noop_installer_rejected=0 recovery_rejected=0 receipt_tamper_rejected=0
+
+  personal_r4_run positive \
+    && personal_r4_contract_holds \
+    && positive=1
+  local observed="approved_digest=$PERSONAL_R4_APPROVED_DIGEST,installer_rc=$PERSONAL_R4_WRAPPER_RC,record_status=$PERSONAL_R4_RECORD_STATUS,record_exit=$PERSONAL_R4_RECORD_EXIT,record_before=$PERSONAL_R4_RECORD_BEFORE,record_after=$PERSONAL_R4_RECORD_AFTER,transaction_phase=$PERSONAL_R4_PHASE,error_phase=$PERSONAL_R4_ERROR_PHASE,error_app=$PERSONAL_R4_ERROR_APP,error_message=$PERSONAL_R4_ERROR_MESSAGE,ledger_revision_before=$PERSONAL_R4_LEDGER_BEFORE,ledger_revision_after=$PERSONAL_R4_LEDGER_AFTER,config_recovery=$PERSONAL_R4_CONFIG_RECOVERY,config_approved=$PERSONAL_R4_CONFIG_APPROVED,config_backup=$PERSONAL_R4_CONFIG_BACKUP,config_after=$PERSONAL_R4_CONFIG_AFTER,lock_before=$PERSONAL_R4_LOCK_BEFORE,lock_after=$PERSONAL_R4_LOCK_AFTER,artifact_recovery=$PERSONAL_R4_ARTIFACT_RECOVERY,artifact_mutated=$PERSONAL_R4_ARTIFACT_MUTATED,artifact_after=$PERSONAL_R4_ARTIFACT_AFTER,data_before=$PERSONAL_R4_DATA_BEFORE,data_after=$PERSONAL_R4_DATA_AFTER,failure_write_survived=$positive"
+
+  personal_r4_run noop \
+    && ! personal_r4_contract_holds \
+    && noop_installer_rejected=1
+  local noop_phase="$PERSONAL_R4_PHASE" noop_data_after="$PERSONAL_R4_DATA_AFTER"
+  # A forged observation receipt alone must not turn a no-op installer into evidence.
+  printf 'artifact_sha256=%s\ndata_sha256=%s\n' \
+    "$PERSONAL_R4_ARTIFACT_MUTATED" "$PERSONAL_R4_DATA_EXPECTED" >"$PERSONAL_R4_RECEIPT"
+  ! personal_r4_contract_holds && receipt_tamper_rejected=1
+
+  personal_r4_run corrupt \
+    && [ "$PERSONAL_R4_PHASE" = degraded ] \
+    && ! personal_r4_contract_holds \
+    && recovery_rejected=1
+  local corrupt_phase="$PERSONAL_R4_PHASE"
+
+  if [ "$positive" = 1 ] && [ "$noop_installer_rejected" = 1 ] \
+      && [ "$recovery_rejected" = 1 ] && [ "$receipt_tamper_rejected" = 1 ]; then
+    ok "personal-path-r4-transaction: approved digest reaches real installer; rollback preserves the approved config, prior lock/ledger revision, and the failure-time data write"
+    printf 'AC-AST-R4-TRANSACTION | expected: positive=1 && noop_installer_rejected=1 && recovery_rejected=1 && receipt_tamper_rejected=1 | observed: positive=%s,noop_installer_rejected=%s,noop_phase=%s,noop_data_after=%s,recovery_rejected=%s,corrupt_phase=%s,receipt_tamper_rejected=%s,%s | verdict: PASS | signal: hermetic actual-installer | evidence: install/test-installer-transaction.sh\n' \
+      "$positive" "$noop_installer_rejected" "$noop_phase" "$noop_data_after" \
+      "$recovery_rejected" "$corrupt_phase" "$receipt_tamper_rejected" "$observed"
+  else
+    bad "personal-path-r4-transaction: positive=$positive noop_installer_rejected=$noop_installer_rejected recovery_rejected=$recovery_rejected receipt_tamper_rejected=$receipt_tamper_rejected $observed"
   fi
 }
 
@@ -1241,6 +1476,7 @@ case "$case_name" in
   crash-and-reenter) crash_and_reenter ;;
   signal-term) signal_term ;;
   resource-handoff) resource_handoff ;;
+  personal-path-r4-transaction) personal_path_r4_transaction ;;
   devmon-nginx-failure) devmon_nginx_failure ;;
   devmon-write-survives-rollback) devmon_write_survives_rollback ;;
   devmon-later-app-fails) devmon_later_app_fails ;;
@@ -1270,6 +1506,7 @@ case "$case_name" in
     crash_and_reenter
     signal_term
     resource_handoff
+    personal_path_r4_transaction
     devmon_nginx_failure
     devmon_write_survives_rollback
     devmon_later_app_fails

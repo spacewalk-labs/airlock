@@ -1,0 +1,12 @@
+--- a/@getpaseo/protocol/dist/schedule/types.js
++++ b/@getpaseo/protocol/dist/schedule/types.js
+@@ -70,6 +70,9 @@
+     pausedAt: z.string().nullable(),
+     expiresAt: z.string().nullable(),
+     maxRuns: z.number().int().positive().nullable(),
++    // [paseo-schedule-pending-schema] busy 인 좌석 때문에 못 보낸 틱 하나를 합쳐 두는 비트. 옛 저장본에는 없으므로 optional
++    // 이고, 기본값 false 로 읽는다(스키마만 있고 server 패치가 없으면 늘 false — 동작 변화 없음).
++    pendingAgentDelivery: z.boolean().optional().default(false),
+     runs: z.array(ScheduleRunSchema),
+ });
+ export const ScheduleSummarySchema = StoredScheduleSchema.omit({

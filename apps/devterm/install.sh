@@ -55,6 +55,13 @@ WEB_ROOT="$HOME/.local/share/airlock-devterm/web"
 # gate, so the page has to be on this origin — but the implementation is not ours.
 # Same shape as paseo reading the shared return widget out of the webroot.
 ACCOUNT_PANEL_DIR="${AIRLOCK_WEBROOT:-/opt/airlock/hub}/assets/accounts"
+# The secret drop is the platform's too (docs/tasks/active/platform-secret-drop.md): its
+# UI is secretdrop.js in that same directory and its three routes belong to the platform
+# account surface. devterm's fragment aliases the one and proxies the others to this
+# loopback port, so the terminal's in-page drop stays same-origin while devterm itself
+# runs no secret code and holds no secret CLI path.
+PLATFORM_ACCOUNTS_PORT="$(airlock_accounts_port)" \
+  || die "cannot resolve the platform account surface port (hub accounts_port)"
 GATE_PY="$HERE/backend/devterm-gate.py"
 UNIT_DIR="$HOME/.config/systemd/user"
 # AIRLOCK_RENDER_DIR: harness-only destination-root override (highest
@@ -94,7 +101,6 @@ PY
 
 PLATFORM_ACCOUNTS_BIN="$(resolve_platform_bin AIRLOCK_ACCOUNTS_BIN "$AIRLOCK_ACCOUNTS_BIN")"
 PLATFORM_ACCOUNTS_STATUS_BIN="$(resolve_platform_bin AIRLOCK_ACCOUNTS_STATUS_BIN "$AIRLOCK_ACCOUNTS_STATUS_BIN")"
-PLATFORM_SECRET_BIN="$(resolve_platform_bin AIRLOCK_SECRET_BIN "$AIRLOCK_SECRET_BIN")"
 
 # These app config keys remain compatibility overrides. Their empty default now means
 # the platform-owned binary rather than an app-bundled copy; see airlock-app.toml for
@@ -191,10 +197,14 @@ if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] install web/ -> $WEB_ROOT (index.html config=${CFG_JSON}, + ui.js/popup.css)"
 else
   install -d "$WEB_ROOT/vendor"
-  install -m644 "$HERE/web/app.js" "$HERE/web/ui.js" \
-                "$HERE/web/secretdrop.js" "$HERE/web/popup.css" \
+  install -m644 "$HERE/web/app.js" "$HERE/web/ui.js" "$HERE/web/popup.css" \
                 "$HERE/web/favicon.svg" "$HERE/web/apple-touch-icon.png" "$WEB_ROOT/"
   install -m644 "$HERE"/web/vendor/* "$WEB_ROOT/vendor/"
+  # An upgraded box still holds the copy this package used to ship. nginx aliases
+  # /secretdrop.js to the platform asset, so the local one is unreachable — and an
+  # unreachable stale copy of a secret-drop UI is exactly the file a later reader
+  # mistakes for the live one.
+  rm -f "$WEB_ROOT/secretdrop.js"
   # template the config placeholder (JSON has no sed metachars; use | as delimiter)
   sed "s|%%DEVTERM_CONFIG%%|${CFG_JSON}|" "$HERE/web/index.html" > "$WEB_ROOT/index.html"
   chmod 644 "$WEB_ROOT/index.html"
@@ -229,8 +239,7 @@ fi
 # straight off the platform webroot, so changing it needs no gate restart — hashing it
 # would bounce every terminal session on the box for a file the gate never reads.
 REV="$(cat "$GATE_PY" "$HERE"/backend/bin_discovery.py \
-        "$HERE"/web/app.js "$HERE"/web/ui.js \
-        "$HERE"/web/secretdrop.js "$HERE"/web/popup.css \
+        "$HERE"/web/app.js "$HERE"/web/ui.js "$HERE"/web/popup.css \
         "$HERE"/web/index.html 2>/dev/null | sha256sum | cut -c1-12)"
 
 # Unit PATH. This unit was the only one of the four that shipped without one, and it
@@ -281,10 +290,6 @@ add_env DEVTERM_FLEET_READ_DOMAIN "$FLEET_READ_DOMAIN"
 # endpoints. DEVTERM_CLAUDE_SWITCH may intentionally name an operator compatibility
 # tool, which is not required to know the platform-only codex-auth verb.
 add_env DEVTERM_ACCOUNTS_BIN "$PLATFORM_ACCOUNTS_BIN"
-# The drop exists independently of the account feature. Hand the platform store in on
-# every gate unit; deriving $ROOT/bin here would make this package depend on its source
-# layout again after the apps/ split.
-add_env DEVTERM_SECRET_BIN "$PLATFORM_SECRET_BIN"
 # claude-status also carries the xAI adapter, so wire it for either feature.
 if [ "$ACCOUNTS" = true ] || [ "$XAI" = true ]; then
   add_env DEVTERM_CLAUDE_STATUS "$CLAUDE_STATUS"
@@ -324,7 +329,8 @@ fi
 # Written unconditionally: it is config the renderer includes, not a system mutation.
 frag="$CONFD/servers.d/devterm.conf"
 install -d "$CONFD/servers.d"
-render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR" "$FLEET_READ_DOMAIN" > "$frag"
+render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR" "$FLEET_READ_DOMAIN" \
+  "$PLATFORM_ACCOUNTS_PORT" > "$frag"
 log "wrote nginx fragment: $frag"
 
 # --- 6. tailscale serve: HTTPS carries devterm ---

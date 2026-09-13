@@ -731,10 +731,20 @@ class TestCards(unittest.TestCase):
         MSG.ingest(msg(kind='info'))
         MSG.mark_read('resource-1')
         MSG.ingest(msg(event_id='second',kind='info',urgency='urgent'))
-        MSG.ingest(msg(event_id='third',kind='info'))
+        self.assertIsNotNone(MSG.get_card('resource-1')['read_at'])
+        MSG.ingest(msg(event_id='third',kind='info',title='Disk 93%'))
         card = MSG.feed()['messages'][0]
         self.assertEqual((card['level'],card['count'],card['read_at']),('urgent',3,None))
         self.assertEqual(MSG._conn().execute('SELECT count(*) FROM cards WHERE send_next_at IS NOT NULL').fetchone()[0],1)
+
+    def test_coalescing_body_change_revives_read_card(self):
+        MSG.ingest(msg(kind='info'))
+        MSG.mark_read('resource-1')
+        read_at = MSG.get_card('resource-1')['read_at']
+        MSG.ingest(msg(event_id='same-content',kind='info',urgency='urgent'))
+        self.assertEqual(MSG.get_card('resource-1')['read_at'], read_at)
+        MSG.ingest(msg(event_id='changed-body',kind='info',body='Clean up now'))
+        self.assertIsNone(MSG.get_card('resource-1')['read_at'])
 
     def test_coalescing_keeps_different_actions_links_and_heartbeats_separate(self):
         MSG.ingest(msg())
@@ -777,6 +787,12 @@ class TestCards(unittest.TestCase):
         self.assertEqual(MSG.counts()['active'],1)
         self.assertEqual(card['count'], 3)
         self.assertEqual(card['last_at'], MSG.iso(now + timedelta(days=40)))
+        self.assertIsNotNone(card['read_at'])
+        with unittest.mock.patch.object(MSG,'now_utc',return_value=now+timedelta(days=41)):
+            MSG.ingest(msg(event_id='changed',kind='info',title='Disk 93%'))
+        card = MSG.get_card('resource-1')
+        self.assertEqual(card['count'], 4)
+        self.assertEqual(card['last_at'], MSG.iso(now + timedelta(days=41)))
         self.assertIsNone(card['read_at'])
         AC['2'] = 1
 

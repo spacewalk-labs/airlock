@@ -12,6 +12,27 @@ choice; if that ever changed, these files would still be AGPL-3.0-only.
 
 ## What is here
 
+- **`schedule-busy-pending-delivery.mjs`** (+ `.patch`, `.test.mjs`) and its schema half
+  **`schedule-pending-delivery-schema.mjs`** (+ `.patch`) — when an agent-target schedule fires while
+  that seat is mid-turn, upstream records a FAILED run and jumps to the next cadence: the tick is
+  lost, failed runs eat `maxRuns`, and masters learn to end turns early so they are idle when their
+  clock ticks (pilot box 2026-09-13: 5 of 17 agent-target runs were exactly `already has an active
+  run`). The patch folds busy into one `pendingAgentDelivery` bit — no failed run, no queue — and
+  the next tick delivers exactly once as soon as the seat is idle. The schema half keeps the bit
+  across restarts (zod strips unknown keys); the two halves are safe in either order and alone.
+  Same discipline as the others: sentinel, all-or-nothing anchors, `node --check`, plus a behaviour
+  check that drives the candidate with stub seats before it is installed.
+
+- **`finish-notification-queue.mjs`** (+ `.patch`, `.test.mjs`) — a child's finish notification takes
+  Paseo's unguarded prompt path and interrupts its parent's running turn mid-tool. The patch queues
+  finish notifications (only those) durably per parent while the parent is running, and delivers
+  them as one message once the parent's turn ends normally — not after a cancel. Delivery uses the
+  non-replacing path only: if another send opens a turn between the idle check and the send, the
+  notification goes back to the queue instead of interrupting that turn (v1 interrupted it; the patcher
+  upgrades a v1-applied file in place). Queue failure
+  drops rather than interrupts; a crash-left lease is marked uncertain and never re-sent. Residual:
+  after a daemon restart the queue is resumed when that parent next sets up a child notification.
+
 - **`depth4-search.patch`** — caps the add-project name search to `maxDepth: 4`
   (paseo's default full-scans `$HOME` and times out on a large home). This is the
   reference / re-derivation copy of the edit; `../install.sh` applies it via an

@@ -54,7 +54,11 @@ const document = {
   createElement: tag => new Element(tag),
   addEventListener(name, callback) { this.events[name] = callback; }
 };
-const window = { document, navigator: { clipboard: { readText: async () => 'clipboard text' } } };
+let copiedText = '';
+const window = { document, navigator: { clipboard: {
+  readText: async () => 'clipboard text',
+  writeText: async text => { copiedText = text; }
+} } };
 const context = vm.createContext({ window, document, globalThis: window, Date, Promise, Object, String });
 const asset = readFileSync(new URL('../../hub/assets/devmon-card-ui.js', import.meta.url), 'utf8');
 vm.runInContext(asset, context);
@@ -87,17 +91,30 @@ const both = {...base, card_id: 'both', link: link.link, run: {cwd: '/work', pro
            {key: 'scope', label: 'Scope', default: ''}]}};
 const neither = {...base, card_id: 'neither'};
 const about = {...base, card_id: 'about', about: 'This job checks the daily heartbeat.'};
+const templated = {...base, run: {template: 'fixture-template', week: '2026-09-18',
+  cwd: '/home/me/workspace/wiki', prompt: 'Server-owned fixed prompt.',
+  default_note: 'Prefilled owner note.',
+  examples: ['First template note', 'Second template note']}};
 
 const html = readFileSync(new URL('./frontend/dev-monitor.html', import.meta.url), 'utf8');
-assert.match(html, /\/assets\/devmon-card-ui\.js/);
-assert.match(html, /\/assets\/devmon-card-ui\.css/);
-assert.match(html, /cardUI\.openTitle\(message\)/);
+assert.match(html, /\/assets\/devmon-card-ui\.js\?v=4/);
+assert.match(html, /\/assets\/devmon-card-ui\.css\?v=4/);
+assert.match(html, /\/assets\/devmon-inbox\.js\?v=3/);
+assert.match(html, /function setStat\(id, value\)/, 'dashboard keeps the stats callback used by Inbox refreshes');
+assert.match(html, /DevmonInbox\.mount\([\s\S]*mode:\s*'full'/);
+assert.doesNotMatch(html, /function\s+(?:renderMessages|buildMessageCard)\s*\(/,
+  'Dev Monitor must not keep a second Inbox row renderer');
 const order = [link, run, both, neither].map(card => card.card_id);
 ui.openMessage(run);
 await tick();
 const indexStable = JSON.stringify(order) === JSON.stringify([link, run, both, neither].map(card => card.card_id));
 assert.deepEqual(calls.read, ['run']);
-assert.ok(latestOverlay(document).textContent.includes('marked read · stays in place'));
+assert.ok(latestOverlay(document).textContent.includes('읽음 표시됨'));
+assert.ok(latestOverlay(document).textContent.includes('자리 그대로'));
+const messageRunDetails = descendants(latestOverlay(document)).find(x => x.tagName === 'details');
+assert.ok(messageRunDetails, 'mechanical run content is disclosed as optional detail');
+assert.equal(messageRunDetails.attributes.open, undefined, 'mechanical run content starts collapsed');
+assert.ok(messageRunDetails.textContent.includes('실행용 카드 내용'));
 
 // Title click resolves to the doc when a link is present, and to the plain card
 // otherwise — there is no separate "Doc" action anymore (AGENTS.md decision #6).
@@ -107,10 +124,17 @@ assert.deepEqual(buttons(ui.createActions(both)), ['Run', 'Archive']);
 assert.deepEqual(buttons(ui.createActions(neither)), ['Archive']);
 ui.openTitle(link);
 assert.equal(latestOverlay(document).querySelector('iframe').src, link.link);
+assert.ok(buttons(latestOverlay(document)).includes('← Inbox'), 'DOC view has an explicit way back to Inbox');
+assert.ok(buttons(latestOverlay(document)).includes('링크 복사'), 'DOC view exposes its shareable URL');
+assert.ok(!latestOverlay(document).textContent.includes('Copy Markdown in the document'), 'DOC wrapper does not duplicate the document workflow');
+const copyLink = descendants(latestOverlay(document)).find(x => x.tagName === 'button' && x.textContent === '링크 복사');
+copyLink.events.click({stopPropagation() {}}); await tick();
+assert.equal(copiedText, link.link);
+assert.ok(!buttons(latestOverlay(document)).includes('← Message'), 'DOC view is the report, not a second message screen');
 await tick();
 assert.deepEqual(calls.read, ['run', 'link'], 'opening the document marks the card read');
 ui.openTitle(neither);
-assert.ok(latestOverlay(document).textContent.includes('marked read · stays in place'));
+assert.ok(latestOverlay(document).textContent.includes('읽음 표시됨'));
 
 // "About" box — shown only when the card carries it (A1's report format, or its
 // fallback: the plain card body otherwise).
@@ -123,7 +147,11 @@ const archiveAction = ui.createActions(neither).children.find(x => x.textContent
 archiveAction.events.click({stopPropagation() {}}); await tick();
 ui.openRun(both);
 const runOverlay = latestOverlay(document);
-assert.ok(runOverlay.textContent.includes('PROMPT (fixed)'));
+assert.ok(runOverlay.textContent.includes('이 박스의 DevTerm 새 작업창에서 실행합니다.'));
+const runDetails = descendants(runOverlay).find(x => x.tagName === 'details');
+assert.ok(runDetails, 'Run sheet keeps the mechanical card content available');
+assert.equal(runDetails.attributes.open, undefined, 'Run sheet mechanical content starts collapsed');
+assert.ok(runDetails.textContent.includes('실행용 카드 내용'));
 assert.ok(runOverlay.textContent.includes('YOUR DECISIONS / NOTES'));
 assert.equal(runOverlay.querySelector('textarea').value, '');
 // `both` already has a params dropdown — the example chips must not be added on
@@ -149,6 +177,12 @@ assert.ok(chipOverlay.textContent.includes('이 타이머 꺼 줘'));
 const chip = descendants(chipOverlay).find(x => x.tagName === 'button' && x.textContent === '고쳐 줘');
 chip.events.click({stopPropagation() {}});
 assert.equal(chipOverlay.querySelector('textarea').value, '고쳐 줘');
+
+ui.openRun(templated);
+const templateOverlay = latestOverlay(document);
+for (const text of templated.run.examples) assert.ok(templateOverlay.textContent.includes(text));
+assert.ok(!templateOverlay.textContent.includes('이 타이머 꺼 줘'));
+assert.equal(templateOverlay.querySelector('textarea').value, 'Prefilled owner note.');
 
 // A Run is a one-shot mutation: coalesce clicks while pending, permit a retry only
 // when the callback fails, and keep a stale button inert after success.
@@ -193,11 +227,16 @@ await ui.openWindow(both);
 assert.ok(latestOverlay(document).textContent.includes('This run has ended.'));
 const css = readFileSync(new URL('../../hub/assets/devmon-card-ui.css', import.meta.url), 'utf8');
 assert.match(css, /@media \(max-width: 640px\)/);
-assert.match(css, /height: 100vh/);
+assert.match(css, /height: 100dvh/);
+assert.match(css, /safe-area-inset-top/);
+assert.match(css, /safe-area-inset-bottom/);
 assert.match(css, /position: sticky; bottom: 0/);
+assert.match(html, /id="airlock-slot"/);
+assert.match(html, /data-mode="native"/);
 
 const revision = execFileSync('git', ['rev-parse', '--short=12', 'HEAD'], {encoding: 'utf8'}).trim();
 if (!process.env.DEVMON_FRONTEND_NESTED) {
   console.log(`AC-8 | expected: shared_loaded==1&&modal_click==1&&read_marked==1&&index_stable==1 | observed: shared_loaded=1,modal_click=1,read_marked=${calls.read.length ? 1 : 0},index_stable=${indexStable ? 1 : 0} | verdict: PASS | signal: fixture | evidence: apps/dev-monitor/test-frontend-contract.mjs@${revision}`);
   console.log(`AC-9 | expected: four_shapes==1&&actions_executed==3&&explicit_paste==1&&mobile_sheet==1 | observed: four_shapes=1,actions_executed=3,explicit_paste=1,mobile_sheet=1 | verdict: PASS | signal: fixture | evidence: apps/dev-monitor/test-frontend-contract.mjs@${revision}`);
+  console.log(`TEMPLATE-RUN-SHEET | expected: existing_openRun==1&&server_chips==2&&default_note==1 | observed: existing_openRun=1,server_chips=2,default_note=1 | verdict: PASS | signal: fixture | evidence: apps/dev-monitor/test-frontend-contract.mjs@${revision}`);
 }

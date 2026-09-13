@@ -3,18 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>devterm panel</title>
-<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<title>Airlock panel</title>
 <link rel="stylesheet" href="popup.css">
 <!--
-  panel.html — the Airlock subscription account panel, on a page with NO terminal.
+  panel.html — the Airlock subscription account panel and secret drop, on a page with
+  NO terminal.
 
   A PLATFORM asset (hub/assets/accounts/), not devterm's. It was devterm's until
   ACCT_OWN (2026-09-01): a box's logins are the platform's business, and an app that
   happens to have a terminal in it is not where "which subscription am I on" belongs.
+  The secret drop followed on 2026-09-13 (docs/tasks/active/platform-secret-drop.md).
   It is deployed to <webroot>/assets/accounts/ with the rest of hub/assets and served
-  BY the devterm owner gate (alias, no copy), because the account API answers on that
-  origin — the same arrangement airlock-return.js already has.
+  by the platform surface under the hub's /airlock-accounts/ prefix, verbatim — so every
+  asset it names must be one that mount serves (install/test-accounts-panel-mount.sh
+  checks each reference). devterm's gate still aliases it for devterm's account icon.
 
   Who opens it: the Airlock return widget injected into tools that run on their own
   ports (an agent runner, a browser IDE), devterm's own account icon, and the hub's
@@ -61,7 +63,6 @@
 </div>
 <div id="body"><div id="host"></div></div>
 
-<script src="ui.js"></script>
 <script src="accounts.js"></script>
 <script src="secretdrop.js"></script>
 <script>
@@ -100,12 +101,13 @@
   document.getElementById('closeBtn').addEventListener('click', requestClose);
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') requestClose(); });
 
-  window.uiRefocus = function () {};   // nothing to focus back to here
   var host = document.getElementById('host');
 
   if (page === 'secret') {
     // No sendInput here: without a terminal the secret drop runs in clipboard mode — it
     // stores the value and copies the PATH TOKEN for the user to paste wherever they are.
+    // No tokenTarget either: the token names this box's path, which is right for an agent
+    // on this box. Only devterm knows a session is remote, and it injects that itself.
     var secret = window.initSecretDrop({ flash: flash, postJson: postJson });
     // Embedded, the modal header already carries a close button, so passing one here
     // would draw a second. Standalone, this is the only way out.

@@ -341,6 +341,14 @@ for SET in messages-off messages-on messages-off-no-cors token-freshness-on; do
   f="$(out_file)"; render_to "$f" render_dev_monitor_nginx \
     "$BACKEND_PORT" "$updates_location" "$owner_location"
   golden_check_file "dev-monitor/$SET/nginx.conf" "$f"
+  if grep -qxF 'location = /monitor/ {' "$f" \
+      && grep -qxF '    add_header Cache-Control "no-cache, no-store, must-revalidate" always;' "$f" \
+      && grep -qxF 'location = /api/owner/messages { rewrite ^ /monitor$uri last; }' "$f" \
+      && grep -qxF 'location = /api/owner/run/window { rewrite ^ /monitor$uri last; }' "$f"; then
+    ok "dev-monitor $SET: dashboard revalidates and old Inbox shells redirect"
+  else
+    bad "dev-monitor $SET: dashboard cache or old Inbox compatibility route missing"
+  fi
   if grep -qxF 'location = /monitor/api/owner/apps {' "$f" \
       && grep -qxF 'location /monitor/api/owner/apps/ {' "$f" \
       && grep -qxF 'location = /monitor/api/owner/home/order {' "$f"; then
@@ -434,7 +442,6 @@ for SET in accounts-off accounts-on; do
   add_env DEVTERM_REMOTE_HOSTS "$REMOTE_HOSTS"
   add_env DEVTERM_ORCA_SHIM "$ORCA_SHIM"
   add_env DEVTERM_ACCOUNTS_BIN "$ROOT/bin/airlock-accounts"
-  add_env DEVTERM_SECRET_BIN "$ROOT/bin/airlock-secret"
   if [ "$ACCOUNTS" = true ]; then
     add_env DEVTERM_CLAUDE_STATUS "$CLAUDE_STATUS"
     add_env DEVTERM_CLAUDE_SWITCH "$CLAUDE_SWITCH"
@@ -458,7 +465,9 @@ for SET in accounts-off accounts-on; do
   # Arg 3 is the platform account-panel directory (ACCT_OWN). It used to be the
   # retired redirect port, which the function ignored; it does not ignore this one, so
   # the fixture names a webroot path rather than leaving a port to be read as one.
-  f="$(out_file)"; render_to "$f" render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR"
+  # Arg 5 is the platform account/secret surface port: devterm proxies the three secret
+  # routes there (docs/tasks/active/platform-secret-drop.md), 19904 being hub's default.
+  f="$(out_file)"; render_to "$f" render_devterm_nginx "$GATE_PORT" "$BACKEND_PORT" "$ACCOUNT_PANEL_DIR" "" 19904
   golden_check_file "devterm/$SET/nginx.conf" "$f"
 
   # The gate must forward the client Host VERBATIM. nginx's $host drops the port, and
@@ -528,8 +537,9 @@ golden_check_file "fileview/$SET/nginx.conf" "$f"
 # fragment; pairing_frag (whether the pairing blob was captured yet) changes
 # the map's default target within the web-enabled branch — a real content
 # difference, so it is its own set rather than a fixed value inside
-# web-enabled. WIDGET_MENU_ATTRS empty (no devterm installed) is covered too
-# — it feeds directly into the sub_filter line. The REAP script, xvfb unit,
+# web-enabled. The widget attrs feed directly into the sub_filter line, so
+# both of their reduced states are covered: account-only (no devterm) and
+# empty (no FQDN, nothing addressable). The REAP script, xvfb unit,
 # serve unit and firewall unit heredocs carry no branch (values only).
 # ===========================================================================
 APP="$ROOT/apps/orca"
@@ -555,13 +565,20 @@ f="$(out_file)"; render_to "$f" render_orca_unit_firewall "$BACKEND_PORT" "$NFT_
 golden_check_file "orca/$SET/unit-firewall.service" "$f"
 
 WEBROOT="/opt/airlock/hub"; ORCA_DIST_SERVE="/opt/airlock/orca-web/dist"
-for SET in web-disabled web-enabled web-enabled-no-pairing web-enabled-no-widget-menu; do
+# WIDGET_ACCOUNT_ATTRS/WIDGET_SECRET_ATTRS mirror apps/orca/install.sh's two
+# independent destinations (DEVTERM_INDEPENDENCE phase 2-1). account-only is the state
+# a box without devterm renders, and it is a set of its own because "the subscription
+# entry survives devterm's absence" is the property the split exists for — a fixture
+# that only ever passes both attributes together cannot fail when they re-couple.
+WIDGET_ACCOUNT_ATTRS=" data-menu=\"1\" data-account-panel=\"https://box.example.ts.net/airlock-accounts/\""
+for SET in web-disabled web-enabled web-enabled-no-pairing web-enabled-account-only web-enabled-no-widget-menu; do
   GATE_PORT=19602
-  WIDGET_MENU_ATTRS=" data-menu=\"1\" data-panel=\"https://box.example.ts.net:19700/\""
+  WIDGET_MENU_ATTRS="${WIDGET_ACCOUNT_ATTRS} data-secret-panel=\"https://box.example.ts.net:19700/\""
   case "$SET" in
     web-disabled)               ORCA_WEB_ENABLED=0; pairing_frag="" ;;
     web-enabled)                ORCA_WEB_ENABLED=1; pairing_frag="#pairing=deadbeef1234" ;;
     web-enabled-no-pairing)     ORCA_WEB_ENABLED=1; pairing_frag="" ;;
+    web-enabled-account-only)   ORCA_WEB_ENABLED=1; pairing_frag="#pairing=deadbeef1234"; WIDGET_MENU_ATTRS="$WIDGET_ACCOUNT_ATTRS" ;;
     web-enabled-no-widget-menu) ORCA_WEB_ENABLED=1; pairing_frag="#pairing=deadbeef1234"; WIDGET_MENU_ATTRS="" ;;
   esac
 
@@ -579,7 +596,8 @@ done
 # "}    location / {"), fixed by P1b's `printf '%s\n'`. These icon-on sets
 # exist specifically to pin that fix: reverting the fix back to `printf
 # '%s'` must fail these two golden checks. WIDGET_MENU_ATTRS empty is
-# covered too. Sets: browse-off, browse-on, icon-on, icon-on-variants,
+# covered too, and account-only covers the devterm-absent widget attrs.
+# Sets: browse-off, browse-on, icon-on, icon-on-variants, account-only,
 # no-widget-menu.
 # ===========================================================================
 APP="$ROOT/apps/paseo"
@@ -619,9 +637,9 @@ BROWSE_WS_PORT=19953
 UISTATE_PORT=19954
 CONFD_FIXTURE="/etc/airlock/nginx"
 
-for SET in browse-off browse-on icon-on icon-on-variants no-widget-menu; do
+for SET in browse-off browse-on icon-on icon-on-variants account-only no-widget-menu; do
   BROWSE=false
-  WIDGET_MENU_ATTRS=" data-menu=\"1\" data-panel=\"https://box.example.ts.net:19300/\""
+  WIDGET_MENU_ATTRS="${WIDGET_ACCOUNT_ATTRS} data-secret-panel=\"https://box.example.ts.net:19300/\""
   ICON_LOC_BODY=""
   case "$SET" in
     browse-off) : ;;
@@ -637,6 +655,7 @@ for SET in browse-off browse-on icon-on icon-on-variants no-widget-menu; do
       ICON_LOC_BODY="$ICON_LOC_BODY
 $(cat "$f")"
       ;;
+    account-only) WIDGET_MENU_ATTRS="$WIDGET_ACCOUNT_ATTRS" ;;
     no-widget-menu) WIDGET_MENU_ATTRS="" ;;
   esac
   f="$(out_file)"; render_to "$f" render_paseo_nginx "$GATE_PORT" "$BACKEND_PORT" "$FQDN" "$HTTPS_PORT" "$WIDGET" "$WIDGET_MENU_ATTRS" "$BROWSE" "$BROWSE_WS_PORT" "$ICON_LOC_BODY" "$UISTATE_PORT"
@@ -1708,6 +1727,9 @@ run_installer_path() {
     # (install/check-app-abi.sh), because after the apps/ cutover that derivation
     # points at the app repository instead of the platform.
     export AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/$app" AIRLOCK_APP_ID="$app"
+    # The orchestrator also exports the hub port it validated (devterm proxies the
+    # platform secret routes to it); these fixture configs carry no [apps.hub] table.
+    export AIRLOCK_HUB_ACCOUNTS_PORT=19904
     bash "$ROOT/apps/$app/install.sh" 2>&1
   )" || rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -1951,6 +1973,7 @@ run_devterm_shim_install() {
       AIRLOCK_TS_FQDN=box.example.ts.net AIRLOCK_CONFD="$case_dir/confd" \
       TTYD_BIN="$case_dir/home/.local/bin/ttyd" \
       AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/devterm" AIRLOCK_APP_ID=devterm \
+      AIRLOCK_HUB_ACCOUNTS_PORT=19904 \
       PATH="$case_dir/shim:$PATH" bash "$ROOT/apps/devterm/install.sh" 2>&1
   )" || rc=$?
   printf '%s\n' "$rc" > "$case_dir/rc"

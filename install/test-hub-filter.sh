@@ -114,6 +114,25 @@ grep -qF 'applyRunState();' "$ROOT/hub/index.html" \
 # contract fixtures, and is recorded in the PR rather than run here — CI has no
 # browser, and a suite that silently skips its only real assertion is worse than
 # one that says where the assertion lives.
+# STORE_EXPERIENCE S1/S5: what the sheet says about WHEN it was measured, and what it
+# says when the run state cannot be read. Both are single lines that a refactor can
+# drop without any node assertion noticing.
+grep -qF 'const snap = updates(data);' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the store no longer dates its numbers from the snapshot it counted"; exit 1; }
+grep -qF 'const when = airlockWhen(snap.checkedAt);' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the store's reading time no longer comes from that same object"; exit 1; }
+grep -qF '"확인 기록 없음 — 아래 숫자가 언제 측정된 것인지 알 수 없습니다";' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: an undated snapshot no longer says so"; exit 1; }
+grep -qF '"실행 상태를 읽지 못했습니다 (HTTP " + response.status +' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: a failed run poll leaves the previous progress line standing"; exit 1; }
+grep -qF '"실행 상태 응답을 해석하지 못했습니다 — 끝났는지 아직 알 수 없습니다.";' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: an unparseable run answer leaves the previous progress line standing"; exit 1; }
+# S5: the three codes the backend really answers on these paths. A missing entry is not
+# a crash — it is a bare HTTP number where a sentence belongs.
+for code in app_not_pending bad_action bad_package_path; do
+  grep -qF "$code:" "$ROOT/hub/index.html" \
+    || { echo "FAIL hub-filter: the store has no words for the backend's $code"; exit 1; }
+done
 echo "ok   hub-filter: settings harness and app-store badge/dots poll discipline are wired"
 
 # ACCT_OWN: the identity pill is the entrance to subscription accounts, and the
@@ -121,9 +140,21 @@ echo "ok   hub-filter: settings harness and app-store badge/dots poll discipline
 # and the pill inert or lying. The pill only becomes an entrance once /acct-alert
 # has actually answered, so `arm()` inside the poll is the whole gate; hoisting it
 # to load time would put a modal on a pill with nothing behind it.
-grep -qF 'base = airlockAccountPanelBase(cfg && cfg.apps, cfg && cfg.fqdn, location.hostname);' \
+grep -qF 'base = airlockAccountPanelBase();                 // this origin, always' \
   "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the pill no longer derives the account panel from webjson"; exit 1; }
+  || { echo "FAIL hub-filter: the pill no longer takes its base from the one deciding function"; exit 1; }
+# DEVTERM_INDEPENDENCE phase 2-1..2-2: the entrance must not be able to come back to
+# depending on devterm. The derivation is gone from the source, not just unused — a
+# reinstated `apps.devterm.port` read here is the exact regression this card closed.
+# Scoped to the pill block and to CODE (comment lines are stripped): elsewhere on the
+# page `apps.devterm` is legitimate — the message cards link to a devterm session.
+acct_code="$(awk '/^\/\/ Identity pill -> subscription accounts\./,0' "$ROOT/hub/index.html" \
+  | grep -vE '^[[:space:]]*(//|\*|/\*)')"
+if grep -qE 'apps\.devterm|devterm[^"]*\.port' <<<"$acct_code"; then
+  echo "FAIL hub-filter: the account entrance derives from devterm again"
+  grep -nE 'apps\.devterm|devterm[^"]*\.port' <<<"$acct_code"
+  exit 1
+fi
 grep -qF 'arm();                                            // it answered: there is a panel' \
   "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the pill is armed somewhere other than a successful /acct-alert"; exit 1; }
@@ -134,14 +165,21 @@ grep -qF 'if (!me || me.role !== "owner") return;           // collaborators dra
 # not grow a second copy of the account list on this origin.
 grep -qF 'frame.src = base + "panel.html?p=accounts&embed=1";' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the pill no longer opens the platform account panel"; exit 1; }
-# The close message is cross-origin by construction (the panel is on devterm's
-# port). Without the origin comparison any framed page on the hub could close the
-# modal — and accepting the legacy spelling here would be a new reason to keep an
+# The close message now arrives from this same origin (the panel is served under the
+# hub prefix), which makes the comparison easier to get wrong, not less necessary:
+# without it any framed page on the hub could close the modal. A relative base has to
+# be resolved against the page before the origins can be compared at all — and
+# accepting the legacy spelling here would be a new reason to keep an
 # already-scheduled deletion alive.
 grep -qF 'if (!base || e.data !== "airlock-panel-close") return;' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the pill accepts a close message it should not"; exit 1; }
 grep -qF 'if (e.origin === want) closePanel();' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the pill closes on a message from any origin"; exit 1; }
+# `new URL("/airlock-accounts/")` throws, so a relative base that is not resolved
+# against the page makes the comparison unreachable and the modal uncloseable by the
+# panel it contains — a defect the origin grep above cannot see.
+grep -qF 'want = new URL(base, location.href).origin;' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the close-message origin is not resolved against this page"; exit 1; }
 echo "ok   hub-filter: the identity pill entrance, its owner gate and its close message are wired"
 
 node - "$ROOT/hub/index.html" <<'JS'
@@ -531,31 +569,154 @@ check("harness run: a failure does not block the next attempt",
       harness.run({ enabled: true, run: { status: "failed", exitCode: 1 } }).blocked, false);
 check("harness run: a null state is total", harness.run(null).blocked, false);
 
+// ---- STORE_EXPERIENCE: the platform row's three states --------------------
+// measured-and-behind, measured-and-current, and not-measured. The third used to be
+// spelled like the second, and "could not check" reading as "nothing to do" is the
+// one answer this row must never give. changedCount/ref are shown only when the
+// detector supplied them — nothing here computes a size or a base.
+const mP = html.match(/function platformSub\([\s\S]*?\n  \}/);
+if (!mP) { console.log("FAIL hub-filter: platformSub not found in hub/index.html"); process.exit(1); }
+const platformSub = eval("(" + mP[0] + ")");
+check("platform row: behind, with the size and base the detector measured",
+      platformSub({ available: true, changedCount: 12, ref: "abc1234" }),
+      "새 플랫폼 버전이 있습니다 · 파일 12개 변경 · 기준 abc1234");
+check("platform row: behind with no size measured says only what it knows",
+      platformSub({ available: true, ref: "abc1234" }), "새 플랫폼 버전이 있습니다 · 기준 abc1234");
+check("platform row: a zero count is not printed as a change",
+      platformSub({ available: true, changedCount: 0, ref: "abc1234" }),
+      "새 플랫폼 버전이 있습니다 · 기준 abc1234");
+check("platform row: measured and current",
+      platformSub({ available: false, changedCount: 0, ref: "abc1234" }),
+      "새 플랫폼 버전 없음 · 기준 abc1234");
+check("platform row: no snapshot is NOT 'nothing to do'",
+      platformSub({}), "플랫폼 업데이트를 확인하지 못했습니다");
+check("platform row: a truncated platform object is not read as current",
+      platformSub({ ref: "abc1234" }), "플랫폼 업데이트를 확인하지 못했습니다");
+check("platform row: no platform key at all",
+      platformSub(undefined), "플랫폼 업데이트를 확인하지 못했습니다");
+
+// ---- STORE_EXPERIENCE: the source grade in words -------------------------
+// Only the four values the backend emits are translated. An unknown value is shown as
+// it came: inventing a grade for it is how a local package starts reading as signed.
+// The REAL sourceLabel, not a restatement of it: an earlier draft of this block
+// rebuilt the one-line body here, so mutating the page's own function left every
+// assertion below green. Extract all three parts and run the shipped code.
+const mS = html.match(/const SOURCE_WORDS = \{[\s\S]*?\n  \}/);
+const mSrc = html.match(/  function source\(row\) \{[\s\S]*?\n  \}/);
+const mLbl = html.match(/  function sourceLabel\(row\) \{[\s\S]*?\n  \}/);
+if (!mS || !mSrc || !mLbl) { console.log("FAIL hub-filter: sourceLabel's parts not found in hub/index.html"); process.exit(1); }
+const sourceLabel = eval("(function(){" + mSrc[0] + "\n" + mS[0] + ";\n" + mLbl[0]
+  + "\nreturn sourceLabel;})()");
+check("source grade: platform", sourceLabel({ source: "platform" }), "플랫폼 릴리스");
+check("source grade: shipped", sourceLabel({ source: "shipped" }), "플랫폼 동봉");
+check("source grade: builtin", sourceLabel({ source: "builtin" }), "공개 릴리스");
+check("source grade: explicit names the local path it is", sourceLabel({ source: "explicit" }), "개인 앱 · 로컬 경로");
+check("source grade: an unknown value is passed through, not graded",
+      sourceLabel({ source: "/srv/pkg/mine" }), "/srv/pkg/mine");
+check("source grade: no source is no claim", sourceLabel({}), "");
+check("source grade: a row that never arrived is no claim", sourceLabel(null), "");
+
 // ---- ACCT_OWN: where the pill sends you ----------------------------------
-// The pill opens devterm's origin, and the cert covers the FQDN only: a short
-// hostname or a missing port would produce a link the browser cannot verify or
-// an entrance to nowhere. Both are "" here rather than a best guess, because the
-// caller reads "" as "this box has no account panel" and leaves the pill alone.
+// The pill opens the PLATFORM account surface on this same origin, under the hub's
+// owner-gated /airlock-accounts/ prefix. It used to be built from
+// `apps.devterm.port` + the measured FQDN, and each failure of that derivation (no
+// devterm, no public port, a short hostname the cert does not cover) removed the
+// subscription entrance from a box whose account surface was up the whole time.
+// So the property under test is now the opposite one: the base does not vary.
 const mB = html.match(/function airlockAccountPanelBase\([\s\S]*?\n  \}/);
 if (!mB) { console.log("FAIL hub-filter: airlockAccountPanelBase not found in hub/index.html"); process.exit(1); }
 const panelBase = eval("(" + mB[0] + ")");
-check("panel base: devterm's public port on the measured FQDN",
-      panelBase({ devterm: { port: 8443 } }, "box.tail.ts.net", "box"), "https://box.tail.ts.net:8443/");
-check("panel base: no FQDN falls back to the origin's host",
-      panelBase({ devterm: { port: 8443 } }, "", "box.tail.ts.net"), "https://box.tail.ts.net:8443/");
-// A short hostname has no certificate — same rule as the tile hrefs above.
-check("panel base: an undotted FQDN is not used",
-      panelBase({ devterm: { port: 8443 } }, "box", "box.tail.ts.net"), "https://box.tail.ts.net:8443/");
-check("panel base: no devterm on this box -> no entrance",
-      panelBase({ paseo: { port: 8444 } }, "box.tail.ts.net", "box.tail.ts.net"), "");
-check("panel base: devterm without a public port -> no entrance",
-      panelBase({ devterm: {} }, "box.tail.ts.net", "box.tail.ts.net"), "");
-check("panel base: a config that never arrived -> no entrance",
-      panelBase(null, "box.tail.ts.net", "box.tail.ts.net"), "");
-check("panel base: no host to be had -> no entrance, not a hostless URL",
-      panelBase({ devterm: { port: 8443 } }, "", ""), "");
+check("panel base: the hub's owner-gated account prefix", panelBase(), "/airlock-accounts/");
+// Relative on purpose: same origin means no certificate to match, no port to agree
+// on, and no cross-origin read to authorise. An absolute URL here would reintroduce
+// every one of those questions.
+check("panel base: relative to this origin, not an absolute URL",
+      /^\/[^/]/.test(panelBase()), true);
+check("panel base: the account API resolves under the same prefix",
+      new URL(panelBase() + "acct-alert", "https://box.tail.ts.net/").href,
+      "https://box.tail.ts.net/airlock-accounts/acct-alert");
+// The counterexamples that used to return "" must now all return the same entrance:
+// devterm absent, devterm present but portless, and no config at all.
+check("panel base: no devterm on this box -> still the same entrance",
+      panelBase({ paseo: { port: 8444 } }, "box.tail.ts.net", "box.tail.ts.net"), "/airlock-accounts/");
+check("panel base: devterm without a public port -> still the same entrance",
+      panelBase({ devterm: {} }, "box.tail.ts.net", "box.tail.ts.net"), "/airlock-accounts/");
+check("panel base: a config that never arrived -> still the same entrance",
+      panelBase(null, "", ""), "/airlock-accounts/");
 
-process.exit(failed);
+// ---- STORE_EXPERIENCE S5: what the run poller says when it cannot read ----
+// The real pollRun, sliced out of the page and run against a stubbed fetch, because
+// the defect this covers was invisible to every grep: the network-reject branch kept
+// the retry timer AND left the previous "진행 중입니다" standing, so a dropped request
+// read as an install still going. The three failure paths must each say the state is
+// unknown; the two working paths must be untouched.
+const runStart = html.indexOf("  async function pollRun() {");
+const runEnd = html.indexOf("  async function mutate(", runStart);
+if (runStart < 0 || runEnd < runStart) {
+  console.log("FAIL hub-filter: pollRun not found in hub/index.html");
+  process.exit(1);
+}
+const runSource = html.slice(runStart, runEnd);
+const RUNNING = "전체 설치기 재실행 — 진행 중입니다. 연결이 잠시 끊길 수 있습니다.";
+function runCase(kind) {
+  const vm = require("node:vm");
+  const progressNote = { textContent: RUNNING };
+  const timers = [];
+  const context = {
+    progressNote, runTimer: null, installRun: false,
+    setTab() {}, pollApps() {},
+    setTimeout(fn, ms) { timers.push(ms); return 1; },
+    fetch: async () => {
+      if (kind === "network") throw new TypeError("Failed to fetch");
+      return { ok: kind !== "http", status: kind === "http" ? 503 : 200,
+               json: async () => {
+                 if (kind === "json") throw new SyntaxError("bad JSON");
+                 return { run: { status: kind } };
+               } };
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(runSource + ";globalThis.__pollRun = pollRun;", context);
+  return context.__pollRun().then(() => ({ text: progressNote.textContent, timers }));
+}
+(async () => {
+  const net = await runCase("network");
+  check("run poll: a dropped request does not leave 'in progress' as the last word",
+        net.text.includes("끝났는지 아직 알 수 없습니다") && !net.text.includes("진행 중입니다"),
+        true);
+  check("run poll: and it still retries on the same 4s cadence",
+        JSON.stringify(net.timers), "[4000]");
+  const http = await runCase("http");
+  check("run poll: an error status says the state is unknown, with the status",
+        http.text.includes("HTTP 503") && http.text.includes("알 수 없습니다"), true);
+  const json = await runCase("json");
+  check("run poll: an unparseable answer says the state is unknown",
+        json.text.includes("알 수 없습니다"), true);
+  // The two paths that DO have a reading must be exactly as before: this fix is about
+  // the absence of a reading, and turning a real "running" into "unknown" would be the
+  // same defect pointing the other way.
+  const running = await runCase("running");
+  check("run poll: a real running run still reads as running", running.text, RUNNING);
+  check("run poll: and keeps its own 2.5s cadence", JSON.stringify(running.timers), "[2500]");
+  const done = await runCase("done");
+  check("run poll: a finished run still reads as finished",
+        done.text, "전체 설치기 재실행 — 완료되었습니다.");
+
+  // The card's machine verdict for this slice, with the values it was read from.
+  const observed = [
+    "base=" + JSON.stringify(panelBase()),
+    "relative=" + /^\/[^/]/.test(panelBase()),
+    "no_devterm=" + JSON.stringify(panelBase({ paseo: { port: 8444 } }, "box.tail.ts.net", "box.tail.ts.net")),
+    "no_port=" + JSON.stringify(panelBase({ devterm: {} }, "box.tail.ts.net", "box.tail.ts.net")),
+    "no_config=" + JSON.stringify(panelBase(null, "", "")),
+  ].join(",");
+  console.log("");
+  console.log('AC-DTI-P2E | expected: the hub identity pill\'s account base is the literal ' +
+    'owner-gated hub prefix and does not vary with devterm being absent, portless or unconfigured' +
+    ' | observed: ' + observed + ' | verdict: ' + (failed ? "FAIL" : "PASS") +
+    ' | signal: fixture | evidence: install/test-hub-filter.sh');
+  process.exit(failed);
+})();
 JS
 echo "---"
 echo "hub-filter: all assertions passed"

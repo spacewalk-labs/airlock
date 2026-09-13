@@ -27,6 +27,7 @@
         "sequence": {"type": "integer", "minimum": 1},
         "selections": {
           "type": "array",
+          "uniqueItems": true,
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -57,16 +58,23 @@
         "inputs": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["catalog_digest", "local_config_digest", "lock_digest", "selection_digest"],
+          "required": ["catalog_digest", "local_config_digest", "lock_digest", "selection_digest", "state_digest"],
           "properties": {
             "catalog_digest": {"$ref": "#/$defs/digest"},
             "local_config_digest": {"$ref": "#/$defs/digest"},
             "lock_digest": {"$ref": "#/$defs/digest"},
-            "selection_digest": {"$ref": "#/$defs/digest"}
+            "selection_digest": {"$ref": "#/$defs/digest"},
+            "state_digest": {
+              "oneOf": [
+                {"$ref": "#/$defs/digest"},
+                {"type": "null"}
+              ]
+            }
           }
         },
         "apps": {
           "type": "array",
+          "uniqueItems": true,
           "items": {
             "type": "object",
             "additionalProperties": false,

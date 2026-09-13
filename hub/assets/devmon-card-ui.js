@@ -28,6 +28,12 @@
       var message = error && error.message ? error.message : String(error || 'Action failed.');
       if (options.toast) options.toast(message);
     }
+    function copyText(value) {
+      if (!root.navigator || !root.navigator.clipboard || !root.navigator.clipboard.writeText) {
+        throw new Error('링크를 복사할 수 없습니다. 새 탭에서 주소를 복사해 주세요.');
+      }
+      return root.navigator.clipboard.writeText(value);
+    }
     function hasDoc(card) {
       return card && typeof card.link === 'string' && /^https?:\/\//i.test(card.link);
     }
@@ -47,7 +53,9 @@
       var head = el('header', 'dmc-head');
       head.appendChild(el('span', 'dmc-kind', kind));
       head.appendChild(el('h2', '', card.title));
-      head.appendChild(action('×', 'dmc-close', close));
+      var closeButton = action('← Inbox', 'dmc-close', close);
+      closeButton.setAttribute('aria-label', 'Close and return to Inbox');
+      head.appendChild(closeButton);
       modal.appendChild(head);
       overlay.appendChild(modal);
       overlay.addEventListener('click', function (event) { if (event.target === overlay) close(); });
@@ -88,6 +96,15 @@
       appendMessageActions(actions, card, includeArchive !== false);
       return actions;
     }
+    function runDetails(card) {
+      var details = el('details', 'dmc-runbox dmc-run-details');
+      var summary = el('summary', '', '실행용 카드 내용');
+      summary.appendChild(el('span', '', '자동으로 전달되는 기계적 정보'));
+      details.appendChild(summary);
+      details.appendChild(el('code', 'dmc-cwd', 'cwd  ' + card.run.cwd));
+      details.appendChild(el('pre', 'dmc-prompt', card.run.prompt));
+      return details;
+    }
     function openTitle(card) {
       return hasDoc(card) ? openDoc(card) : openMessage(card);
     }
@@ -95,8 +112,8 @@
       markRead(card).catch(report);
       var modal = frame(card.level === 'urgent' ? 'URGENT' : 'MESSAGE', card, false);
       var meta = el('div', 'dmc-meta');
-      [card.source, card.count > 1 ? '×' + card.count : '', card.first_at ? 'first ' + card.first_at : '',
-       card.last_at ? 'last ' + card.last_at : '', '● marked read · stays in place']
+      [card.source, card.count > 1 ? '×' + card.count : '', humanWhen(card.last_at),
+       '읽음 표시됨', '자리 그대로']
         .filter(Boolean).forEach(function (text) { meta.appendChild(el('span', '', text)); });
       modal.appendChild(meta);
       if (card.about) {
@@ -117,11 +134,7 @@
         modal.appendChild(body);
       }
       if (card.run) {
-        var summary = el('section', 'dmc-runbox');
-        summary.appendChild(el('div', 'dmc-label', 'RUN'));
-        summary.appendChild(el('code', 'dmc-cwd', 'cwd  ' + card.run.cwd));
-        summary.appendChild(el('pre', 'dmc-prompt', card.run.prompt));
-        modal.appendChild(summary);
+        modal.appendChild(runDetails(card));
       }
       var foot = footer();
       if (card.ran_at) foot.appendChild(el('span', 'dmc-status', '▶ Ran ' + card.ran_at));
@@ -129,34 +142,45 @@
       modal.appendChild(foot);
       return modal;
     }
+    function humanWhen(value) {
+      var date = new Date(value);
+      if (isNaN(date.getTime())) return '';
+      function pad(n) { return n < 10 ? '0' + n : String(n); }
+      return (date.getMonth() + 1) + '/' + date.getDate() + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+    }
     function openDoc(card) {
       // Opening the document is reading the card, same as opening the plain card —
       // without this a card that carries a link could never leave the unread count.
       markRead(card).catch(report);
       var modal = frame('DOC', card, true);
+      var tools = el('div', 'dmc-doc-tools');
+      var address = el('code', 'dmc-doc-url', card.link);
+      address.title = card.link;
+      tools.appendChild(address);
+      var copyLink = action('링크 복사', '', function () {
+        return copyText(card.link).then(function () { copyLink.textContent = '복사됨 ✓'; });
+      });
+      tools.appendChild(copyLink);
+      var external = el('a', 'dmc-button', '새 탭에서 열기 ↗');
+      external.href = card.link;
+      external.target = '_blank';
+      external.rel = 'noopener noreferrer';
+      tools.appendChild(external);
+      if (card.run) tools.appendChild(action('이 보고서로 실행', 'dmc-primary', function () { openRun(card); }));
+      modal.appendChild(tools);
       var iframe = el('iframe', 'dmc-iframe');
       iframe.src = card.link;
       iframe.title = card.title;
       modal.appendChild(iframe);
-      var foot = footer();
-      foot.appendChild(el('span', 'dmc-status', 'Copy Markdown in the document, then paste it into Run.'));
-      var external = el('a', 'dmc-button', 'Open in new tab ↗');
-      external.href = card.link;
-      external.target = '_blank';
-      external.rel = 'noopener noreferrer';
-      foot.appendChild(external);
-      foot.appendChild(action('← Message', '', function () { openMessage(card); }));
-      if (card.run) foot.appendChild(action('Run', 'dmc-primary', function () { openRun(card); }));
-      modal.appendChild(foot);
       return modal;
     }
     function openRun(card) {
       var modal = frame('RUN', card, false);
-      var fixed = el('section', 'dmc-runbox');
-      fixed.appendChild(el('div', 'dmc-label', 'PROMPT (fixed)'));
-      fixed.appendChild(el('code', 'dmc-cwd', 'cwd  ' + card.run.cwd));
-      fixed.appendChild(el('pre', 'dmc-prompt', card.run.prompt));
-      modal.appendChild(fixed);
+      var intro = el('section', 'dmc-runintro');
+      intro.appendChild(el('b', '', '어디서 실행되나요?'));
+      intro.appendChild(el('div', '', '이 박스의 DevTerm 새 작업창에서 실행합니다. 실행 뒤에는 그 작업창을 바로 보여 드립니다.'));
+      modal.appendChild(intro);
+      modal.appendChild(runDetails(card));
       var inputs = {};
       if (card.run.params && card.run.params.length) {
         var params = el('section', 'dmc-runbox');
@@ -186,10 +210,12 @@
       var textarea = el('textarea');
       textarea.maxLength = 8000;
       textarea.placeholder = 'Paste the Markdown from the report, or type freely.';
+      textarea.value = typeof card.run.default_note === 'string' ? card.run.default_note : '';
       notes.appendChild(textarea);
       if (!card.run.params || !card.run.params.length) {
         var examples = el('div', 'dmc-examples');
-        EXAMPLE_CHIPS.forEach(function (text) {
+        var exampleChips = Array.isArray(card.run.examples) ? card.run.examples : EXAMPLE_CHIPS;
+        exampleChips.forEach(function (text) {
           examples.appendChild(action(text, 'dmc-chip', function () {
             textarea.value = (textarea.value ? textarea.value + '\n' : '') + text;
             if (textarea.focus) textarea.focus();

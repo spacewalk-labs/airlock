@@ -187,8 +187,12 @@ STILL_IN_DEVTERM = {
 TERMINAL_ROUTES = {
     "/sessions", "/upload-image", "/upload-file", "/kill-session", "/list-dir",
     "/rename-session", "/tab-prefs", "/recent-images", "/recent-image", "/resolve",
-    "/layout", "/pane", "/secret-put", "/secret-list", "/secret-del",
+    "/layout", "/pane",
 }
+# The secret drop is the reverse case: it MOVED OUT of devterm entirely (2026-09-13,
+# docs/tasks/active/platform-secret-drop.md). It is the platform's alone, so it is
+# neither an account route the gate must mirror nor a route the gate may carry again.
+PLATFORM_ONLY = {"/secret-put", "/secret-list", "/secret-del"}
 
 _gate_txt = open(os.path.join(ROOT, "apps/devterm/backend/devterm-gate.py")).read()
 _all = {r for r, _ in re.findall(
@@ -216,11 +220,18 @@ _stale = STILL_IN_DEVTERM & _api
 check("the not-yet-moved list has no stale entries"
       + (f" (already implemented: {', '.join(sorted(_stale))})" if _stale else ""),
       not _stale)
-_unknown = _api - _gate_acct
+_back = PLATFORM_ONLY & _all
+check("the gate carries no platform-only secret route"
+      + (f" (back in devterm: {', '.join(sorted(_back))})" if _back else ""),
+      not _back)
+_secret_api = {r for r in PLATFORM_ONLY
+               if f'"{r}"' in _api_txt}
+check("the platform surface serves every secret route", _secret_api == PLATFORM_ONLY)
+_unknown = _api - _gate_acct - PLATFORM_ONLY
 check("the platform serves no route the gate does not have"
       + (f" (extra: {', '.join(sorted(_unknown))})" if _unknown else ""),
       not _unknown)
-print(f"     route parity: {len(_api)}/{len(_gate_acct)} moved, "
+print(f"     route parity: {len(_api - PLATFORM_ONLY)}/{len(_gate_acct)} moved, "
       f"{len(STILL_IN_DEVTERM)} declared still in devterm")
 
 if fails:

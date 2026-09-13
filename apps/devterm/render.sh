@@ -82,7 +82,8 @@ UNIT
 # account this box is logged in as and how much of its quota is left. No token, no
 # refresh token, no hash. /acct-alert is a GET too and is NOT here: it is the owner's
 # own alert state. Everything that writes — /acct-login-*, /acct-switch,
-# /acct-remove, /secret-* — stays behind `location /`.
+# /acct-remove — stays behind `location /`; /secret-* has its own owner-only locations
+# (proxied to the platform surface).
 #
 # Per-location guards, not a wider map on `location /`: an nginx `if` covers only the
 # location it is written in, so opening these four cannot leak into the terminal, the
@@ -143,7 +144,7 @@ NGINX
   done
 }
 
-# render_devterm_nginx GATE_PORT BACKEND_PORT [ACCOUNT_PANEL_DIR] [FLEET_READ_DOMAIN]
+# render_devterm_nginx GATE_PORT BACKEND_PORT [ACCOUNT_PANEL_DIR] [FLEET_READ_DOMAIN] [ACCOUNTS_PORT]
 #
 # FLEET_READ_DOMAIN (optional, [apps.devterm] fleet_read_domain) opens the four
 # account-state read routes to any identity in that domain, so a central console can
@@ -160,9 +161,24 @@ NGINX
 # that matters: these two carry their own owner guard. An nginx `if` only covers the
 # location it is written in, so a location added beside `location /` inherits nothing
 # from it, and the account panel is not a thing to hand to a passing collaborator.
+# The same directory carries the platform secret drop UI (secretdrop.js), aliased the
+# same way: devterm's page loads it and injects only terminal delivery + session target.
+#
+# ACCOUNTS_PORT (optional) is the platform account/secret surface's loopback port
+# (bin/airlock-accounts-api). When given, the three secret-drop routes on this origin are
+# proxied THERE, so the in-terminal drop stays same-origin while the guard, the store and
+# the TTL remain the platform's — devterm's gate has no secret handler at all
+# (docs/tasks/active/platform-secret-drop.md). Exact locations, each with its own owner
+# guard, for the reason above.
 render_devterm_nginx() {
   local GATE_PORT="$1" BACKEND_PORT="$2" PANEL_DIR="${3:-}" FLEET_DOMAIN="${4:-}"
-  local extra=""
+  local ACCOUNTS_PORT="${5:-}"
+  local extra="" path
+  case "$ACCOUNTS_PORT" in
+    '') ;;
+    *[!0-9]*) printf 'render_devterm_nginx: refusing non-numeric accounts port %s\n' "$ACCOUNTS_PORT" >&2
+              return 1 ;;
+  esac
   if [ -n "$PANEL_DIR" ]; then
     extra="$(mktemp)"
     # QUOTED heredoc + sed placeholder, the convention gate/nginx-lib.sh states and the
@@ -185,7 +201,32 @@ render_devterm_nginx() {
         default_type application/javascript;
         add_header Cache-Control "no-cache" always;
     }
+    # platform secret drop UI — devterm's index.html loads it; the terminal injects only
+    # delivery and the session's target box.
+    location = /secretdrop.js {
+        if ($owner_ok = 0) { return 403; }
+        alias @@PANEL_DIR@@/secretdrop.js;
+        default_type application/javascript;
+        add_header Cache-Control "no-cache" always;
+    }
 NGINX
+  fi
+  if [ -n "$ACCOUNTS_PORT" ]; then
+    [ -n "$extra" ] || extra="$(mktemp)"
+    printf '\n    # platform secret drop API (bin/airlock-accounts-api) — never devterm-gate.\n' >>"$extra"
+    for path in /secret-put /secret-list /secret-del; do
+      sed -e "s|@@PATH@@|${path}|g" -e "s|@@ACCTPORT@@|${ACCOUNTS_PORT}|g" >>"$extra" <<'NGINX'
+    location = @@PATH@@ {
+        if ($owner_ok = 0) { return 403; }
+        proxy_pass http://127.0.0.1:@@ACCTPORT@@;
+        proxy_http_version 1.1;
+        # $http_host: the platform's same-origin guard compares the browser Origin
+        # (always ported) against Host, exactly as devterm's own gate does.
+        proxy_set_header Host $http_host;
+        proxy_read_timeout 30s;
+    }
+NGINX
+    done
   fi
   if [ -n "$FLEET_DOMAIN" ]; then
     [ -n "$extra" ] || extra="$(mktemp)"

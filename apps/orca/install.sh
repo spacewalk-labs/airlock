@@ -45,14 +45,17 @@ AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-orca}"
 . "$HERE/render.sh"
 
 airlock_load orca
-# Return-widget menu attributes. With devterm installed the widget's tap opens a small
-# menu (return to Airlock / subscription accounts) instead of navigating straight away —
-# this app owns the whole screen, so the account panel has no other way in. Without
-# devterm there is nothing to open, so the attributes stay empty and a tap navigates.
+# Return-widget menu attributes. Both destinations are platform-owned and live under
+# the hub's owner-gated /airlock-accounts/ prefix: Subscription accounts and Secret
+# drop survive devterm being absent, stopped, or unreachable. They remain separate
+# attributes so each row keeps a single authority; the legacy data-panel input is
+# accepted by the widget as an account-only alias but is no longer emitted here.
+# Without an FQDN the platform URL cannot be addressed, so the widget keeps its plain
+# return-to-Airlock behavior instead of rendering dead rows.
 WIDGET_MENU_ATTRS=""
-PANEL_URL="$(airlock_panel_url || true)"
-if [ -n "$PANEL_URL" ]; then
-  WIDGET_MENU_ATTRS=" data-menu=\"1\" data-panel=\"${PANEL_URL}\""
+PLATFORM_PANEL_URL="$(airlock_secret_panel_url || true)"
+if [ -n "$PLATFORM_PANEL_URL" ]; then
+  WIDGET_MENU_ATTRS=" data-menu=\"1\" data-account-panel=\"${PLATFORM_PANEL_URL}\" data-secret-panel=\"${PLATFORM_PANEL_URL}\""
 fi
 
 GATE_PORT="${AIRLOCK_ORCA_GATE_PORT:?}"

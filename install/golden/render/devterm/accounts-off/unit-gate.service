@@ -21,7 +21,6 @@ Environment=DEVTERM_XAI=false
 Environment=DEVTERM_REMOTE_HOSTS=
 Environment=DEVTERM_ORCA_SHIM=
 Environment=DEVTERM_ACCOUNTS_BIN=ROOT/bin/airlock-accounts
-Environment=DEVTERM_SECRET_BIN=ROOT/bin/airlock-secret
 ExecStart=/usr/bin/python3 ROOT/apps/devterm/backend/devterm-gate.py
 # KillMode=process, same reason as the ttyd unit: the gate starts a detached
 # `codex login --device-auth` that must outlive a redeploy. setsid does not leave the

@@ -28,6 +28,13 @@ SURFACE
     `grep` for FLEET/_fetch_fleet_store across every _serve_* account handler in
     apps/devterm/backend/devterm-gate.py returns exactly those two.
 
+SECRET DROP
+    POST /secret-put, GET /secret-list, POST /secret-del are the platform's secret drop
+    (docs/tasks/active/platform-secret-drop.md). The store, its lifetime and the
+    never-return-the-value rule are bin/airlock-secret's; this is only its HTTP boundary,
+    moved here from devterm's gate so the drop no longer depends on devterm being up.
+    devterm reaches these same routes through an nginx proxy on its own origin.
+
 BINDING
     127.0.0.1 only. The hub's nginx proxies /airlock-accounts/ here behind
     `if ($owner_ok = 0) { return 403; }` — see install/render-nginx.sh, where that guard
@@ -65,6 +72,23 @@ LOGIN_CODE_BODY_MAX = 400
 STATUS_BIN = os.environ.get("AIRLOCK_ACCOUNTS_STATUS_BIN", "").strip()
 ACCOUNTS_BIN = os.environ.get("AIRLOCK_ACCOUNTS_BIN", "").strip()
 OPENCODE_BIN = os.environ.get("AIRLOCK_OPENCODE_BIN", "").strip()
+# The platform secret-drop CLI. Handed in like the account CLIs; unset means every secret
+# route answers the fixed failure below rather than guessing a path.
+SECRET_BIN = os.environ.get("AIRLOCK_SECRET_BIN", "").strip()
+
+# ---- secret drop HTTP boundary -------------------------------------------------------
+# The CLI owns the store, validation, modes, atomicity, cap and lifetime. What only an
+# HTTP layer can own stays here: Content-Type, body size, same-origin refusal, and
+# rebuilding the CLI's answer before it crosses HTTP. Moved from devterm's gate unchanged
+# in behaviour; the numbers are inherited, not reinvented.
+SECRET_BODY_MAX = 96 * 1024     # a 64 KiB value plus JSON escaping headroom
+SECRET_TIMEOUT = 10
+_SECRET_ERRORS = {
+    "invalid name", "value required", "value not encodable", "value too large",
+    "secret limit reached", "secret storage failed", "secret deletion failed",
+    "secret configuration failed", "secret operation failed", "usage",
+}
+_SECRET_FAILED = {"ok": False, "error": "secret operation failed"}
 
 # The account panel is served from HERE, under the owner-gated /airlock-accounts/
 # prefix, so the subscription surface stops depending on devterm's origin being up.
@@ -83,32 +107,18 @@ PANEL_DIR = os.environ.get("AIRLOCK_ACCOUNTS_PANEL_DIR", "").strip()
 # "every asset the page needs" true with devterm absent, uninstalled or stopped.
 PANEL_STYLE_DIR = os.environ.get("AIRLOCK_ACCOUNTS_PANEL_STYLE_DIR", "").strip()
 
-# Exactly the files the account view needs, by exact name, each with the directory it
-# comes from. A whitelist rather than a path join: nothing the caller sends is ever used
-# to build a filesystem path, so traversal, absolute paths and encoded separators have no
-# route to try. Nothing devterm-only is here -- ui.js is unused by accounts.js and
-# secretdrop.js belongs to a surface that stays with devterm; the account-only page drops
-# both rather than promising files this mount cannot serve.
+# Exactly the files the panel needs, by exact name, each with the directory it comes
+# from. A whitelist rather than a path join: nothing the caller sends is ever used to
+# build a filesystem path, so traversal, absolute paths and encoded separators have no
+# route to try. panel.html carries both views (?p=accounts|secret) and references only
+# these names, so it is served verbatim -- there is no devterm-only asset left to strip.
 PANEL_ASSETS = {
     "panel.html": ("text/html; charset=utf-8", "panel"),
     "accounts.js": ("text/javascript; charset=utf-8", "panel"),
+    "secretdrop.js": ("text/javascript; charset=utf-8", "panel"),
     "popup.css": ("text/css; charset=utf-8", "style"),
 }
 MAX_ASSET_BYTES = 1024 * 1024
-# The one line that makes the shared panel depend on devterm. `secretdrop.js` is
-# devterm's asset (apps/devterm/web/secretdrop.js) and secret delivery deliberately
-# stays coupled to devterm, so this mount serves the panel WITHOUT it. Removing a known
-# exact line -- and refusing to serve at all when that line is not exactly there -- is
-# the whole transform: no templating, no second copy of the panel to drift.
-SECRET_SCRIPT_TAG = '<script src="secretdrop.js"></script>'
-# Dropped for the same reason, and with the same "exactly once or refuse" discipline:
-# accounts.js calls nothing from ui.js (measured against apps/devterm/web/ui.js's
-# exported functions), and the favicon is devterm's file too. A reference this mount
-# cannot serve would be a 404 in the page it just promised to serve whole.
-UNSERVED_TAGS = (
-    '<script src="ui.js"></script>',
-    '<link rel="icon" type="image/svg+xml" href="favicon.svg">',
-)
 
 
 class PanelError(Exception):
@@ -144,26 +154,14 @@ def _panel_bytes(name):
         os.close(fd)
 
 
-def account_only_panel():
-    """The shared panel with its secret dependency removed, or an explicit failure.
+def panel_page():
+    """panel.html, or an explicit failure when the page it promises cannot be whole.
 
-    A silently-transformed page is worse than none: if the upstream panel stops matching
-    what this expects, the mount says so with 500 instead of shipping a page whose
-    secret branch would call routes this surface does not serve.
+    No fallback for a missing stylesheet: the surface ships it, so an absent one is a
+    broken installation that must be visible, not a page quietly served unstyled.
     """
-    raw = _panel_bytes("panel.html").decode("utf-8", errors="strict")
-    drop = (SECRET_SCRIPT_TAG,) + UNSERVED_TAGS
-    # No fallback for a missing stylesheet: the surface ships it, so an absent one is a
-    # broken installation that must be visible, not a page quietly served unstyled.
     _panel_bytes("popup.css")
-    for tag in drop:
-        if raw.count(tag) != 1:
-            raise PanelError(500, "account panel template does not match the expected account-only contract")
-    out = "\n".join(line for line in raw.split("\n") if not any(tag in line for tag in drop))
-    for unserved in ("secretdrop.js", "ui.js", "favicon.svg"):
-        if unserved in out:
-            raise PanelError(500, f"account panel still references an asset this mount does not serve: {unserved}")
-    return out.encode()
+    return _panel_bytes("panel.html")
 
 # Where the detached xAI login child writes. The device code passes through this file for
 # at most the capture window below; see docs/design/account-surface-restart-contract.md.
@@ -533,6 +531,84 @@ def _cli(args, timeout=SWITCH_TIMEOUT, stdin_bytes=None):
     return (proc.returncode == 0,
             proc.stdout.decode("utf-8", "replace").strip(),
             proc.stderr.decode("utf-8", "replace").strip())
+
+
+def _secret_payload(command, payload, expected_name=None):
+    """Validate and rebuild CLI output before it crosses the HTTP boundary.
+
+    stdout is a platform contract, not a response body to reflect blindly. Rebuilding
+    the bounded metadata shape means a future CLI regression cannot add a value field
+    and turn this relay into an exfiltration path.
+    """
+    if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
+        return None
+    if payload["ok"] is False:
+        error = payload.get("error")
+        if error not in _SECRET_ERRORS:
+            error = "secret operation failed"
+        return {"ok": False, "error": error}
+    if command == "put":
+        if payload.get("name") != expected_name or not isinstance(payload.get("path"), str) \
+                or type(payload.get("ttl_sec")) is not int \
+                or type(payload.get("remain_sec")) is not int:
+            return None
+        return {key: payload[key] for key in ("ok", "name", "path", "ttl_sec", "remain_sec")}
+    if command == "del":
+        if payload.get("name") != expected_name:
+            return None
+        return {"ok": True, "name": expected_name}
+    if command == "list":
+        if type(payload.get("ttl_sec")) is not int or not isinstance(payload.get("secrets"), list):
+            return None
+        items = []
+        for item in payload["secrets"]:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str) \
+                    or not isinstance(item.get("path"), str) \
+                    or type(item.get("bytes")) is not int \
+                    or type(item.get("remain_sec")) is not int:
+                return None
+            items.append({key: item[key] for key in ("name", "path", "bytes", "remain_sec")})
+        return {"ok": True, "secrets": items, "ttl_sec": payload["ttl_sec"]}
+    return None
+
+
+def _secret_cli(command, name=None, raw=None):
+    """Run one platform secret operation; the value is the subprocess stdin only.
+
+    stderr is discarded, not captured: the CLI promises never to print a value there, and
+    this process does not need to be the one that finds out it broke that promise.
+    """
+    if not SECRET_BIN:
+        return dict(_SECRET_FAILED)
+    argv = [SECRET_BIN, command]
+    if name is not None:
+        argv.extend(("--", name))
+    try:
+        proc = subprocess.run(
+            argv, input=raw, stdin=(None if raw is not None else subprocess.DEVNULL),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=SECRET_TIMEOUT, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return dict(_SECRET_FAILED)
+    try:
+        decoded = json.loads((proc.stdout or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return dict(_SECRET_FAILED)
+    payload = _secret_payload(command, decoded, expected_name=name)
+    if payload is None or (proc.returncode == 0) != payload.get("ok"):
+        return dict(_SECRET_FAILED)
+    return payload
+
+
+def _secret_status(payload):
+    if payload.get("ok"):
+        return 200
+    if payload.get("error") == "value too large":
+        return 413
+    if payload.get("error") in {
+            "invalid name", "value required", "value not encodable", "secret limit reached"}:
+        return 400
+    return 500
 
 
 def _valid_slot(name):
@@ -1396,25 +1472,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _panel_route(self):
-        """Serve the account-only panel and its assets. True when this handled the path.
+        """Serve the panel (accounts + secret drop) and its assets. True when handled.
 
         AIRLOCK_ACCOUNTS_PANEL_MOUNT_BEGIN (negative control marker: install/test-accounts-panel-mount.sh
         removes everything up to the END marker and requires the mount to disappear).
         """
-        path, _, query = self.path.partition("?")
+        path = self.path.partition("?")[0]
         name = path.lstrip("/")
         if name not in PANEL_ASSETS:
             return False
         try:
-            if name == "panel.html":
-                # Secret delivery stays devterm's. Rather than shipping a page whose
-                # secret branch has nothing behind it, this mount refuses the request
-                # outright -- no secret route is ever called from the hub origin.
-                if "p=secret" in query:
-                    raise PanelError(400, "secret drop is not served on the account surface; it stays with devterm")
-                body = account_only_panel()
-            else:
-                body = _panel_bytes(name)
+            body = panel_page() if name == "panel.html" else _panel_bytes(name)
         except PanelError as exc:
             self._send(exc.status, {"error": exc.message})
             return True
@@ -1458,6 +1526,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/claude-usage-store":
             self._send(200, _fetch_fleet_store() if FLEET_STORE else {})
             return
+        if self.path.partition("?")[0] == "/secret-list":
+            # Metadata only — names, sizes, time left. Guarded like a write because the
+            # names alone say which credentials the owner is handing to agents right now.
+            if not self._guarded():
+                return
+            payload = _secret_cli("list")
+            self._send(_secret_status(payload), payload)
+            return
         self._not_found()
 
     def _json_body(self):
@@ -1480,7 +1556,72 @@ class Handler(BaseHTTPRequestHandler):
         self._send(403, {"ok": False, "error": "origin not allowed"})
         return False
 
+    def _secret_body(self):
+        """The secret route's JSON body, or None after answering the refusal.
+
+        Order is the contract: Content-Type, origin and declared size are all refused
+        BEFORE a byte of the body is read or a CLI is spawned, so a refused request never
+        puts a value into this process at all.
+        """
+        ctype = (self.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            self._send(415, {"ok": False, "error": "Content-Type must be application/json"})
+            return None
+        if not self._guarded():
+            return None
+        try:
+            declared = int(self.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        if declared > SECRET_BODY_MAX:
+            self._send(413, {"ok": False, "error": "secret body too large"})
+            return None
+        body = None
+        if declared > 0:
+            try:
+                body = json.loads(self.rfile.read(declared).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError, OSError):
+                body = None
+        return body if isinstance(body, dict) else {}
+
+    def _serve_secret_put(self):
+        body = self._secret_body()
+        if body is None:
+            return
+        name, value = body.get("name"), body.get("value")
+        if not isinstance(name, str):
+            self._send(400, {"ok": False, "error": "invalid name"})
+            return
+        if not isinstance(value, str):
+            self._send(400, {"ok": False, "error": "value required"})
+            return
+        try:
+            raw = value.encode("utf-8")
+        except UnicodeEncodeError:
+            self._send(400, {"ok": False, "error": "value not encodable"})
+            return
+        payload = _secret_cli("put", name=name, raw=raw)
+        self._send(_secret_status(payload), payload)
+
+    def _serve_secret_del(self):
+        """A valid name that is already gone is still a success: the caller wanted it gone."""
+        body = self._secret_body()
+        if body is None:
+            return
+        name = body.get("name")
+        if not isinstance(name, str):
+            self._send(400, {"ok": False, "error": "invalid name"})
+            return
+        payload = _secret_cli("del", name=name)
+        self._send(_secret_status(payload), payload)
+
     def do_POST(self):  # noqa: N802
+        if self.path == "/secret-put":
+            self._serve_secret_put()
+            return
+        if self.path == "/secret-del":
+            self._serve_secret_del()
+            return
         if self.path == "/acct-login-url":
             if not self._guarded():
                 return

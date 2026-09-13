@@ -15,23 +15,30 @@
  *   - native: an inline tile appended into a data-target placeholder
  *     (default #airlock-slot) so a frontend can place it in its own header.
  *
- * Menu (only when the injected script carries data-menu="1" AND data-panel="<base url
- * of the gate that answers the account API>", i.e. the separate-port tools): a tap
- * opens a small menu instead of navigating: "Go to Airlock", "Subscription accounts",
- * "Secret drop". The latter two open panel.html in a modal iframe rather than
- * reimplementing it. That page is a PLATFORM asset (hub/assets/accounts/panel.html,
- * ACCT_OWN) served by devterm's gate, because its fetches are root-absolute paths only
- * that gate answers — so this widget, devterm's own account icon and the hub's identity
- * pill all open the one implementation. Without data-panel there is nothing to open, so
- * the menu stays off and a tap navigates as before (never a dead menu entry). If the
- * panel does not load within 6s the modal says so and prints the address it tried,
- * instead of showing a blank box.
+ * Menu (only when the injected script carries data-menu="1" AND at least one panel
+ * destination, i.e. the separate-port tools): a tap opens a small menu instead of
+ * navigating: "Go to Airlock", then one row per destination it was given. The two
+ * destinations are independently authorized attributes even though new renders point
+ * both at the platform-owned /airlock-accounts/ surface:
+ *   data-account-panel="<base url>" — "Subscription accounts".
+ *   data-secret-panel="<base url>"  — "Secret drop".
+ *   data-panel="<base url>"         — LEGACY alias, accepted for one release and
+ *     interpreted as the ACCOUNT destination only. It never enables Secret drop.
+ * Both platform destinations survive devterm being absent, stopped, or unreachable.
+ * With neither destination there is nothing to open, so the menu stays off and a tap
+ * navigates as before (never a dead menu entry). If a panel does not load within 6s the
+ * modal says so and prints the address it tried, instead of showing a blank box.
  *
- * Subscription ring (all modes, needs data-panel): polls /acct-alert every 30s — the
+ * Subscription ring (all modes, legacy data-panel only): polls /acct-alert every 30s — the
  * same endpoint devterm's own account icon and the hub's pill use, so all three turn
  * amber (warn) or red-and-blinking (critical) at the same instant. The thresholds live
  * only in the backend, so there is no second copy here to drift. A failed poll clears
  * the ring: no reading is not a warning.
+ *
+ * The new platform panel attributes do not silently become an alert authority: opening
+ * an iframe is not the same browser permission as a cross-origin fetch. A legacy render
+ * keeps its measured devterm ring; a new render makes no alert poll until that contract
+ * is moved explicitly.
  *
  * Needs-action badge (all modes unless data-badge="0"): polls Dev Monitor's owner
  * message preview every 30s and shows the "still needs a person" count (falling back to
@@ -85,12 +92,15 @@
   var LEGACY_SLOT = "#swk-airlock-slot";            // remove 2026-09-07
   var targetExplicit = false;                       // operator named a slot via data-target
   var anchor = "bottom-left";
-  // data-menu="1" + data-panel="<devterm base url>": tap opens a small menu instead of
-  // navigating immediately, so a tool that owns the whole screen can still reach the
-  // account panel. Without data-panel there is nothing to open, so the menu stays off
-  // and a tap navigates as before (no dead menu entries).
+  // data-menu="1" + a destination: tap opens a small menu instead of navigating
+  // immediately, so a tool that owns the whole screen can still reach the panels.
+  // accountBase and secretBase are separate authorities; new renders point both at the
+  // platform surface. legacyBase is an account-only compatibility input.
   var wantMenu = false;
-  var panelBase = "";
+  var accountBase = "";
+  var secretBase = "";
+  var legacyBase = "";                              // data-panel as given (ring source)
+  function baseUrl(v) { return String(v).replace(/\/+$/, "") + "/"; }
   // data-badge="0": skip the unread-badge poll entirely. Set only where the page's
   // audience is wider than who UNREAD_URL will ever answer for (the publish document
   // port under tailnet_view: any tailnet member can open the document, but the badge
@@ -110,11 +120,17 @@
       if (self.dataset.target) { targetSelector = self.dataset.target; targetExplicit = true; }
       if (self.dataset.anchor === "bottom-right") anchor = "bottom-right";
       if (self.dataset.menu === "1") wantMenu = true;
-      if (self.dataset.panel) panelBase = String(self.dataset.panel).replace(/\/+$/, "") + "/";
+      if (self.dataset.accountPanel) accountBase = baseUrl(self.dataset.accountPanel);
+      if (self.dataset.secretPanel) secretBase = baseUrl(self.dataset.secretPanel);
+      // Legacy alias, one release: ACCOUNT only, never secret. An old gate points it at
+      // devterm, so honouring it keeps that box's subscription entry working; reading it
+      // as "both" would re-create exactly the coupling this split removes.
+      if (!accountBase && self.dataset.panel) accountBase = baseUrl(self.dataset.panel);
+      if (self.dataset.panel) legacyBase = baseUrl(self.dataset.panel);
       if (self.dataset.badge === "0") wantBadge = false;
     }
   } catch (e) {}
-  var useMenu = wantMenu && !!panelBase;
+  var useMenu = wantMenu && !!(accountBase || secretBase);
 
   // Canonical hub origin = https://<host>/ (443, no port). The launcher opens
   // every tool via the deployment's FQDN, so location.hostname here is already the
@@ -126,10 +142,10 @@
   // any tool origin). 404s (and the badge stays hidden) unless dev-monitor's
   // message console is enabled.
   var UNREAD_URL = AIRLOCK + "monitor/api/owner/messages/preview";
-  // Subscription warning source. The verdict is the backend's (devterm's /acct-alert,
-  // which owns the thresholds), so this button turns amber/red at the same instant
-  // devterm's own account icon does — no second copy of the rules to drift.
-  var ALERT_URL = panelBase ? panelBase + "acct-alert" : "";
+  // The legacy devterm account base remains the only subscription-warning source. The
+  // platform panel destinations are iframe authorities, not implicit CORS permission.
+  var alertBase = legacyBase;
+  var ALERT_URL = alertBase ? alertBase + "acct-alert" : "";
   var POLL_MS = 30000;
 
   var POS_KEY = "airlock:btn-pos-v1";               // per-device position (floating)
@@ -269,7 +285,10 @@
   badge.setAttribute("aria-hidden", "true");
   btn.appendChild(badge);
 
+  var unreadCount = 0;
   function setUnread(n) {
+    unreadCount = Math.max(0, Number(n) || 0);
+    n = unreadCount;
     if (n > 0) {
       badge.textContent = n > 99 ? "99+" : String(n);
       badge.style.display = "block";
@@ -347,7 +366,7 @@
       .catch(function () { alertInfo = null; alertLevel = ""; paintRing(); });
   }
 
-  // ---- menu (only when data-menu + data-panel are both given) ----
+  // ---- menu (only when data-menu + at least one destination are given) ----
   var menuEl = null, modalEl = null;
   function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
   function closeModal() { if (modalEl) { modalEl.remove(); modalEl = null; } }
@@ -368,19 +387,19 @@
     b.addEventListener("click", function (e) { e.preventDefault(); e.stopPropagation(); onClick(); });
     return b;
   }
-  // The panel is shown in a modal iframe: it is the platform's account panel, served
-  // by the gate whose API it calls, so its fetches are same-origin there — nothing has
-  // to be duplicated here and no CORS is involved.
-  function openPanel(which, title) {
+  // The panel is shown in a modal iframe: it is the platform's panel, served by the
+  // surface whose API it calls, so its fetches are same-origin there — nothing has to
+  // be duplicated here and no CORS is involved.
+  function openPanel(which, title, base) {
     closeMenu();
     closeModal();
     var ov = document.createElement("div");
     ov.style.cssText = "position:fixed;inset:0;z-index:2147483100;background:rgba(0,0,0,.6);" +
-      "display:flex;align-items:center;justify-content:center;padding:16px;";
+      "display:flex;align-items:center;justify-content:center;" + safePad(16);
     var box = document.createElement("div");
     box.style.cssText = "background:#1b1f29;border:1px solid #3a4254;border-radius:12px;" +
       "box-shadow:0 18px 48px rgba(0,0,0,.5);width:min(420px,100%);height:min(560px,92vh);" +
-      "display:flex;flex-direction:column;overflow:hidden;";
+      "box-sizing:border-box;max-height:100%;display:flex;flex-direction:column;overflow:hidden;";
     var head = document.createElement("div");
     head.style.cssText = "flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:10px 12px;" +
       "border-bottom:1px solid #2c3240;color:#f2f5fa;font:600 14px -apple-system,system-ui,sans-serif;";
@@ -393,7 +412,11 @@
     x.addEventListener("click", function (e) { e.preventDefault(); closeModal(); });
     head.appendChild(ttl); head.appendChild(x);
     var frame = document.createElement("iframe");
-    frame.src = panelBase + "panel.html?p=" + which + "&embed=1";
+    frame.src = base + "panel.html?p=" + which + "&embed=1";
+    // The secret drop's delivery IS a clipboard copy, and a cross-origin iframe gets the
+    // Clipboard API only when its embedder delegates it (measured: Chromium blocks it
+    // by permissions policy and the panel falls back to execCommand).
+    frame.setAttribute("allow", "clipboard-write");
     frame.style.cssText = "flex:1 1 auto;width:100%;border:none;background:#1b1f29;";
     var note = document.createElement("div");
     note.style.cssText = "display:none;padding:14px;color:#c3c9d4;font:12.5px/1.6 -apple-system,system-ui,sans-serif;";
@@ -402,17 +425,53 @@
     ov.addEventListener("click", function (e) { if (e.target === ov) closeModal(); });
     (document.body || document.documentElement).appendChild(ov);
     modalEl = ov;
-    // A blank rectangle is not an error message: if the panel never loads (devterm not
-    // installed, wrong port), say so and show the address that was tried.
+    // A blank rectangle is not an error message: if the panel never loads (its surface
+    // not installed, wrong port), say so and show the address that was tried.
     var loaded = false;
     frame.addEventListener("load", function () { loaded = true; });
     setTimeout(function () {
       if (loaded || modalEl !== ov) return;
       frame.style.display = "none";
       note.style.display = "block";
-      note.textContent = "The account panel did not load within 6s: " + frame.src +
-        " — check that devterm is installed and reachable on that address.";
+      note.textContent = "The panel did not load within 6s: " + frame.src +
+        " — check that its surface is installed and reachable on that address.";
     }, 6000);
+  }
+  // Modals stay inside the notch/status bar and home indicator on phones, so the
+  // close button is never under the clock or battery.
+  function safePad(px) {
+    return "padding:max(" + px + "px, env(safe-area-inset-top, 0px)) max(" + px + "px, env(safe-area-inset-right, 0px)) " +
+      "max(" + px + "px, env(safe-area-inset-bottom, 0px)) max(" + px + "px, env(safe-area-inset-left, 0px));";
+  }
+  // Inbox is a hub page inside an iframe, rather than CSS injected into a host app.
+  // That preserves the host's isolation while still mounting the same full module.
+  function openInbox() {
+    closeMenu();
+    closeModal();
+    var ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;z-index:2147483100;background:rgba(0,0,0,.6);" +
+      "display:flex;align-items:center;justify-content:center;" + safePad(8);
+    var box = document.createElement("div");
+    box.style.cssText = "background:#1b1f29;border:1px solid #3a4254;border-radius:12px;" +
+      "box-shadow:0 18px 48px rgba(0,0,0,.5);height:88vh;width:min(clamp(360px,44vh,480px),63vh,calc(100vw - 16px));" +
+      "box-sizing:border-box;max-height:100%;display:flex;flex-direction:column;overflow:hidden;";
+    var head = document.createElement("div");
+    head.style.cssText = "flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:10px 12px;" +
+      "border-bottom:1px solid #2c3240;color:#f2f5fa;font:600 14px -apple-system,system-ui,sans-serif;";
+    var title = document.createElement("span"); title.textContent = "Inbox"; title.style.flex = "1";
+    var x = document.createElement("button");
+    x.type = "button"; x.textContent = "✕"; x.setAttribute("aria-label", "Close");
+    x.style.cssText = "width:34px;height:30px;border:none;border-radius:8px;background:#3a4254;color:#fff;font-size:17px;line-height:1;cursor:pointer;";
+    x.addEventListener("click", function (e) { e.preventDefault(); closeModal(); });
+    head.appendChild(title); head.appendChild(x);
+    var frame = document.createElement("iframe");
+    frame.src = AIRLOCK + "inbox.html";
+    frame.title = "Inbox";
+    frame.style.cssText = "flex:1 1 auto;width:100%;border:none;background:#1b1f29;";
+    box.appendChild(head); box.appendChild(frame); ov.appendChild(box);
+    ov.addEventListener("click", function (e) { if (e.target === ov) closeModal(); });
+    (document.body || document.documentElement).appendChild(ov);
+    modalEl = ov;
   }
   function openMenu() {
     if (menuEl) { closeMenu(); return; }
@@ -421,12 +480,18 @@
       "border:1px solid #3a4254;border-radius:10px;box-shadow:0 14px 36px rgba(0,0,0,.45);" +
       "padding:5px 0;overflow:hidden;";
     m.appendChild(menuRow("Go to Airlock", "", function () { closeMenu(); go(); }));
-    m.appendChild(menuRow("Subscription accounts", alertReason(alertInfo), function () {
-      openPanel("accounts", "Subscription accounts");
-    }));
-    m.appendChild(menuRow("Secret drop", "value stays on the box · path only", function () {
-      openPanel("secret", "Secret drop");
-    }));
+    m.appendChild(menuRow("Inbox · " + unreadCount + " unread", "", openInbox));
+    if (accountBase) {
+      m.appendChild(menuRow("Subscription accounts", alertReason(alertInfo), function () {
+        openPanel("accounts", "Subscription accounts", accountBase);
+      }));
+    }
+    // Secret drop is authorized only by data-secret-panel, never the legacy account alias.
+    if (secretBase) {
+      m.appendChild(menuRow("Secret drop", "value stays on the box · path only", function () {
+        openPanel("secret", "Secret drop", secretBase);
+      }));
+    }
     (document.body || document.documentElement).appendChild(m);
     // place next to the button, then pull back inside the viewport
     var r = btn.getBoundingClientRect(), mh = m.offsetHeight, mw = m.offsetWidth;

@@ -427,10 +427,10 @@ else
   bad "v1 committed ride-through+teardown (rc=$td_rc)"
   failure_detail "$td_out"
 fi
-if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["version"] == 6 and d["events"] == []' "$STATE/app-ledger.json"; then
-  ok "v1 ride-through's teardown persisted the store as v6 with empty audit history"
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["version"] == 7 and d["events"] == []' "$STATE/app-ledger.json"; then
+  ok "v1 ride-through's teardown persisted the store as v7 with empty audit history"
 else
-  bad "store was not rewritten as v6 after the v1 teardown"
+  bad "store was not rewritten as v7 after the v1 teardown"
 fi
 
 # v2 committed ride-through: same, through the ordinary remove path (deps
@@ -487,7 +487,7 @@ else
   failure_detail "$td_out"
 fi
 
-# v3 -> v6 normalisation, PERSISTED. Tearing the v3 record down would prove
+# v3 -> v7 normalisation, PERSISTED. Tearing the v3 record down would prove
 # nothing: teardown drops the entry, so its current shape never reaches disk and a
 # normalisation that forgot `capabilities` entirely would still go green. The
 # mutation is therefore driven through a DIFFERENT app, so the record under
@@ -534,10 +534,10 @@ r = d["entries"]["v3keep"]["committed"]
 print(d["version"], r["digest"] == "d" * 64, json.dumps(r["capabilities"]))
 ' "$STATE/app-ledger.json" 2>&1)"
 if [ "$rc_v3i" = 0 ] && [ "$rc_v3c" = 0 ] \
-   && [ "$v3_disk" = '6 True ["rooted-artifact", "system-unit"]' ]; then
-  ok "v3 record normalises through v4 capabilities to v6 ON DISK"
+   && [ "$v3_disk" = '7 True ["rooted-artifact", "system-unit"]' ]; then
+  ok "v3 record normalises through v4 capabilities to v7 ON DISK"
 else
-  bad "v3 -> v6 persist (intent=$rc_v3i commit=$rc_v3c disk=$v3_disk)"
+  bad "v3 -> v7 persist (intent=$rc_v3i commit=$rc_v3c disk=$v3_disk)"
   failure_detail "$v3i_out
 $v3c_out"
 fi
@@ -614,7 +614,7 @@ d["entries"]["og-c"] = {
         "artifacts": {"units": [], "fragments": [], "webroot": [], "files": [], "rooted": [], "serve_ports": []},
         "serve_mappings": {"k": {"listen": 19999, "mode": "https", "target": 1}},
         "unit_scopes": {}, "order": None, "roots": common_roots, "source_class": "explicit",
-        "capabilities": [], "container_runtime": None,
+        "capabilities": [], "container_runtime": None, "managed_authority": None,
     },
     "intent": {
         "path": "/nonexistent/og-c", "digest": "e" * 64,
@@ -623,7 +623,7 @@ d["entries"]["og-c"] = {
         "deps": [], "anchors": {}, "roots": common_roots,
         "serve_mappings": {"k": {"listen": 18543, "mode": "https", "target": 2}},
         "unit_scopes": {}, "order": None, "source_class": "explicit",
-        "capabilities": [], "container_runtime": None,
+        "capabilities": [], "container_runtime": None, "managed_authority": None,
     },
 }
 json.dump(d, open(p, "w"))
@@ -666,7 +666,7 @@ d["entries"]["og-d"] = {
         "artifacts": {"units": [], "fragments": [], "webroot": [], "files": [], "rooted": [], "serve_ports": []},
         "serve_mappings": {"k": {"listen": 18643, "mode": "https", "target": 1}},
         "unit_scopes": {}, "order": None, "roots": common_roots, "source_class": "explicit",
-        "capabilities": [], "container_runtime": None,
+        "capabilities": [], "container_runtime": None, "managed_authority": None,
     },
     "intent": {
         "path": "/nonexistent/og-d", "digest": "e" * 64,
@@ -675,7 +675,7 @@ d["entries"]["og-d"] = {
         "deps": [], "anchors": {}, "roots": common_roots,
         "serve_mappings": {"k": {"listen": 29999, "mode": "https", "target": 2}},
         "unit_scopes": {}, "order": None, "source_class": "explicit",
-        "capabilities": [], "container_runtime": None,
+        "capabilities": [], "container_runtime": None, "managed_authority": None,
     },
 }
 json.dump(d, open(p, "w"))

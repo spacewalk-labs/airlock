@@ -1,5 +1,6 @@
 [Unit]
 Description=airlock dev-monitor daily heartbeat producer
+X-Airlock-About=매일 한 번 Dev Monitor 메시지 스풀에 heartbeat 카드를 남겨 수집 경로가 살아 있는지 확인합니다. 타이머가 돈 뒤 카드가 보이지 않거나 오래된 날짜면 생산자·스풀·수집 경로 중 하나가 멈춘 이상입니다.
 
 [Service]
 Type=oneshot

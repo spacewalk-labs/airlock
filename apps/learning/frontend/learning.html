@@ -1356,6 +1356,7 @@ window.__LEARNING_DATA__ = null;
   var root = document.getElementById("learning-app");
   var SVG_NS = "http://www.w3.org/2000/svg";
   var THEME_STORAGE_KEY = "learning-reader-theme";
+  var DOC_THEME_KEY = "swk-theme";
   var THEMES = ["Auto", "Light", "Dark"];
   /* 에러 카드가 "무엇을 돌렸는지" 를 보여줄 때의 폴백. 서버가 실제 argv 를 함께 주므로
      이건 그게 없을 때만 쓰이고, 내장 생산자에는 실행한 명령 자체가 없다. 특정 사람의
@@ -1483,6 +1484,11 @@ window.__LEARNING_DATA__ = null;
     );
     if (persist) {
       try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (_) {}
+      /* 🔴 문서(뷰어 iframe)의 테마 주인은 공용 문서 자산이고 그 키는 이것이다. 목록에서
+         고른 테마가 문서에도 가려면 여기서도 적어야 한다 — 안 적으면 목록만 바뀌고 열어 둔
+         자료는 옛 테마로 남는다. 리더도 같은 짝으로 두 키를 함께 쓴다. 허브 전체의 테마
+         정본이 정해지면 이 짝은 사라진다. */
+      try { localStorage.setItem(DOC_THEME_KEY, theme.toLowerCase()); } catch (_) {}
     }
   }
 

@@ -25,6 +25,7 @@
 </script>
 <link rel="stylesheet" href="/assets/airlock-tokens.css">
 <link rel="stylesheet" href="/assets/devmon-card-ui.css">
+<link rel="stylesheet" href="/assets/devmon-inbox.css">
 <link rel="icon" type="image/png" href="/assets/favicon.png">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -70,7 +71,8 @@
   .who[data-acct] { cursor: pointer; color: var(--airlock-ink); }
   .who[data-acct]:hover { background: var(--airlock-surface-1); }
   .who[data-acct]:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
-  /* Warning ring. The level comes from devterm's /acct-alert — the same verdict
+  /* Warning ring. The level comes from the platform account surface's /acct-alert
+     (hub prefix, same origin) — the same verdict
      devterm's own account icon and the return widget's ring read, so all three
      change colour at the same instant and no threshold is restated here. Amber
      warns; red blinks, because a static ring on something you have learnt to
@@ -269,48 +271,7 @@
   .launcher-find input:focus { outline: none; border-color: var(--airlock-primary); }
   .empty { color: var(--airlock-mute); }
 
-  /* message strip — dev-monitor's "needs a person" preview, above the tool grid.
-     Owner-only (matches the API's own gate); hidden entirely for anyone else, same as
-     the feedback box below is hidden when its backend is off. */
   .msgstrip { max-width: var(--airlock-page); margin: 0 auto 1.75rem; }
-  .msgstrip[hidden] { display: none; }
-  .ms-quiet { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; color: var(--airlock-mute); }
-  .ms-quiet .ok { color: var(--airlock-ink); font-weight: 500; }
-  .ms-card { border: 1px solid var(--airlock-hairline); border-radius: 14px; background: var(--airlock-surface-1);
-             padding: 0.9rem 1.1rem 0.3rem; }
-  .ms-hd { display: flex; align-items: baseline; gap: 10px; margin-bottom: 0.4rem; cursor: pointer; }
-  .ms-hd .ms-ttl { font-weight: 700; font-size: 0.95rem; }
-  .ms-hd .ms-cnt { color: var(--airlock-mute); font-size: 0.85rem; }
-  .ms-hd .ms-cnt b { color: var(--airlock-ink); }
-  .ms-hd .ms-hb { color: var(--airlock-mute); font-size: 0.76rem; white-space: nowrap; }
-  .ms-hd a { margin-left: auto; color: var(--airlock-primary); font-size: 0.82rem; text-decoration: none; }
-  .ms-card.ms-collapsed .ms-body { display: none; }
-  .ms-row { display: flex; align-items: center; gap: 8px; padding: 7px 0;
-            border-top: 1px solid var(--airlock-hairline); color: inherit; }
-  .ms-row:first-of-type { border-top: 0; }
-  .ms-title { min-width: 0; flex: 1; overflow: hidden; padding: 0; border: 0;
-              background: transparent; color: inherit; cursor: pointer; text-align: left;
-              text-overflow: ellipsis; white-space: nowrap; font: inherit; font-size: 0.88rem;
-              font-weight: 600; }
-  .ms-title:focus-visible { outline: none; box-shadow: var(--airlock-focus); border-radius: 4px; }
-  .ms-read .ms-title { font-weight: 400; }
-  .ms-mark { flex: none; width: 14px; text-align: center; font-size: 0.8rem; font-weight: 800;
-             color: var(--airlock-mute); }
-  .ms-mark.ms-urgent { color: var(--airlock-danger); }
-  .ms-mark.ms-ok { color: #16a34a; }
-  .ms-row .ms-s { color: var(--airlock-mute); font-size: 0.76rem; white-space: nowrap;
-                  overflow: hidden; text-overflow: ellipsis; }
-  .ms-row .dmc-actions { flex: none; }
-  .ms-row .dmc-button { min-height: 30px; padding: 4px 9px; font-size: 0.72rem; }
-  .ms-row .ms-x { padding: 4px 9px; font-size: 1rem; line-height: 1; }
-  .ms-more { padding: 7px 0 4px; border-top: 1px solid var(--airlock-hairline);
-             color: var(--airlock-mute); font-size: 0.78rem; }
-  @media (max-width: 640px) {
-    .ms-row { flex-wrap: nowrap; }
-    .ms-title { flex: 1 1 auto; }
-    .ms-row .ms-s { flex: none; max-width: 34vw; }
-    .ms-hd .ms-hb { display: none; }
-  }
 
   /* Owner tools share one header control grammar. Updates belong to the app-store
      entrance; the gear is now only agent and harness settings. */
@@ -674,6 +635,10 @@
               aria-selected="false" aria-controls="store-pane-personal" data-store-tab="personal" tabindex="-1">개인 앱</button>
     </div>
     <div class="store-body" id="store-body">
+      <!-- When the numbers below were measured. The badge on the entrance counts the
+           same snapshot, so a stale or missing reading has to be legible here rather
+           than left to look current. -->
+      <div class="store-progress-note" id="store-checked"></div>
       <div class="store-alert" id="store-alert" role="status" hidden></div>
       <section class="store-pane" id="store-pane-installed" role="tabpanel" aria-labelledby="store-tab-installed">
         <div id="store-installed"></div>
@@ -1369,243 +1334,14 @@ if (("standalone" in navigator) && navigator.standalone) {
 </script>
 
 <script src="/assets/devmon-card-ui.js"></script>
+<script src="/assets/devmon-inbox.js"></script>
 <script>
-// Message strip — dev-monitor's "needs a person" preview, above the tool grid: the
-// screen a person meets BEFORE choosing a tool. Owner-only (the API 403s everyone
-// else anyway; the role check just avoids a doomed fetch). Polls the same endpoint
-// the shared return-widget badge reads (hub/assets/airlock-return.js), same-origin
-// here so no CORS is involved.
-//
-// Failure discipline matches the widget's: 403/404 are real "nothing to show" and
-// hide the strip; any other failure (5xx, network, bad JSON) leaves the strip exactly
-// as it last rendered rather than flashing it away — see airlock-return.js's
-// pollUnread for why collapsing every failure to one state was the bug this campaign
-// exists to fix.
-(async () => {
+(() => {
   const strip = document.getElementById("msgstrip");
-  if (!strip) return;
-  let me = null;
-  try { me = await j("/whoami"); } catch (_) {}
-  if (!me || me.role !== "owner") return;      // stays hidden — collaborators draw no fetch
-
-  const OWNER_API = "/monitor/api/owner";
-  let lastPayload = null;
-  let rowNodes = {};
-  let unreadNode = null;
-
-  function ownerFetch(path, options) {
-    options = options || {};
-    options.cache = "no-store";
-    if (options.method === "POST") {
-      options.headers = Object.assign({"content-type": "application/json"}, options.headers || {});
-      if (options.body == null) options.body = "{}";
-    }
-    return fetch(OWNER_API + path, options);
+  if (strip) {
+    strip.classList.add("devmon-inbox");
+    DevmonInbox.mount(strip, {mode: "strip"});
   }
-  function ownerResponse(response) {
-    return response.json().catch(() => ({})).then(data => {
-      if (!response.ok || !data.ok) throw new Error(data.error || "Action returned " + response.status + ".");
-      return data;
-    });
-  }
-  function action(card, name) {
-    return ownerFetch("/messages/" + encodeURIComponent(card.card_id) + "/" + name,
-      {method: "POST"}).then(ownerResponse);
-  }
-  function isHeartbeat(card) {
-    return card && (card.source === "heartbeat" || card.group === "heartbeat" ||
-      String(card.card_id || "").indexOf("heartbeat:") === 0);
-  }
-  function age(iso) {
-    const then = new Date(iso).getTime();
-    if (!Number.isFinite(then)) return "-";
-    const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
-    if (seconds < 60) return seconds + "s";
-    if (seconds < 3600) return Math.floor(seconds / 60) + "m";
-    if (seconds < 86400) return Math.floor(seconds / 3600) + "h";
-    return Math.floor(seconds / 86400) + "d";
-  }
-  function heartbeatDate(messages) {
-    const heartbeat = messages.filter(isHeartbeat).sort((a, b) =>
-      String(b.last_at || "").localeCompare(String(a.last_at || "")))[0];
-    if (!heartbeat) return null;
-    const id = String(heartbeat.card_id || "");
-    if (/^heartbeat:\d{4}-\d{2}-\d{2}$/.test(id)) return id.slice("heartbeat:".length);
-    const parsed = new Date(heartbeat.last_at);
-    return Number.isFinite(parsed.getTime()) ? parsed.toISOString().slice(0, 10) : null;
-  }
-
-  const cardUI = window.DevmonCardUI.create({
-    read: card => action(card, "read"),
-    archive: card => action(card, "archive"),
-    run: (card, params, note) => ownerFetch("/run", {method: "POST", body: JSON.stringify({
-      card_id: card.card_id, params: params, note: note
-    })}).then(ownerResponse),
-    selectWindow: card => ownerFetch("/run/window", {method: "POST", body: JSON.stringify({
-      card_id: card.card_id
-    })}).then(ownerResponse),
-    devtermUrl: session => j("/__airlock.json").then(cfg => {
-      const app = cfg && cfg.apps && cfg.apps.devterm;
-      const host = cfg && cfg.fqdn && cfg.fqdn.indexOf(".") > 0 ? cfg.fqdn : location.hostname;
-      return app && app.port && host
-        ? "https://" + host + ":" + app.port + "/?arg=" + encodeURIComponent(session) : "";
-    }),
-    changed: (card, kind) => {
-      const node = rowNodes[card.card_id];
-      if (!node || !lastPayload) return;
-      if (kind === "read" && !node.row.classList.contains("ms-read")) {
-        node.row.classList.add("ms-read");
-        lastPayload.unread_count = Math.max(0, lastPayload.unread_count - 1);
-        if (unreadNode) unreadNode.textContent = String(lastPayload.unread_count);
-      } else if (kind === "read-failed" && node.row.classList.contains("ms-read")) {
-        node.row.classList.remove("ms-read");
-        lastPayload.unread_count += 1;
-        if (unreadNode) unreadNode.textContent = String(lastPayload.unread_count);
-      } else if (kind === "ran") {
-        const replacement = cardUI.createActions(card);
-        node.actions.parentNode.appendChild(replacement);
-        node.actions.remove();
-        node.actions = replacement;
-      }
-    },
-    removed: card => {
-      if (!lastPayload) return;
-      lastPayload.messages = lastPayload.messages.filter(item => item.card_id !== card.card_id);
-      lastPayload.top = lastPayload.top.filter(item => item.card_id !== card.card_id);
-      if (!card.read_at) lastPayload.unread_count = Math.max(0, lastPayload.unread_count - 1);
-      renderPayload(lastPayload);
-    },
-    toast: message => console.warn("[dev-monitor] " + message)
-  });
-
-  function visibleCards(payload) {
-    const seen = {};
-    return payload.top.concat(payload.messages).filter(card => {
-      if (!card || !card.card_id || card.read_at || isHeartbeat(card) || seen[card.card_id]) return false;
-      seen[card.card_id] = true;
-      return true;
-    }).slice(0, 3);
-  }
-  function isNarrow() {
-    return !!(window.matchMedia && window.matchMedia("(max-width: 640px)").matches);
-  }
-  function metaText(card) {
-    if (isNarrow()) return "×" + (card.count || 1) + " · " + age(card.last_at);
-    const bits = [card.source || ""];
-    if (card.count > 1) bits.push("×" + card.count);
-    bits.push(age(card.last_at));
-    return bits.join(" · ");
-  }
-  function row(card) {
-    const item = document.createElement("div");
-    item.className = "ms-row" + (card.read_at ? " ms-read" : "");
-    item.dataset.cardId = card.card_id;
-    const mark = document.createElement("span");
-    mark.className = "ms-mark" + (card.level === "urgent" ? " ms-urgent" : (card.level === "ok" ? " ms-ok" : ""));
-    mark.textContent = card.level === "urgent" ? "!" : (card.level === "ok" ? "✓" : "");
-    const title = document.createElement("button");
-    title.type = "button";
-    title.className = "ms-title";
-    title.textContent = card.title || "";
-    title.addEventListener("click", () => cardUI.openTitle(card));
-    const s = document.createElement("span");
-    s.className = "ms-s";
-    s.textContent = metaText(card);
-    const actions = cardUI.createActions(card);
-    const kids = actions.children ? Array.prototype.slice.call(actions.children) : [];
-    const archiveBtn = kids.find(node => node.textContent === "Archive");
-    if (archiveBtn) {
-      archiveBtn.textContent = "×";
-      archiveBtn.classList.add("ms-x");
-      archiveBtn.setAttribute("aria-label", "Archive");
-    }
-    item.append(mark, title, s, actions);
-    rowNodes[card.card_id] = {row: item, actions: actions};
-    return item;
-  }
-
-  function renderPayload(d) {
-    rowNodes = {};
-    unreadNode = null;
-    strip.textContent = "";
-    strip.hidden = false;
-    const n = d.unread_count;
-    if (n === 0) {
-      const wrap = document.createElement("div");
-      wrap.className = "ms-quiet";
-      const ok = document.createElement("span");
-      ok.className = "ok"; ok.textContent = "지금 하실 일이 없습니다.";
-      const heartbeat = heartbeatDate(d.messages);
-      const state = document.createElement("span");
-      state.textContent = heartbeat ? "heartbeat alive " + heartbeat + " ✓" : "heartbeat not observed";
-      wrap.append(ok, state);
-      strip.appendChild(wrap);
-      return;
-    }
-    const card = document.createElement("div");
-    let collapsed = false;
-    try { collapsed = window.localStorage && window.localStorage.getItem("devmon-hub-collapsed") === "1"; } catch (_) {}
-    card.className = "ms-card" + (collapsed ? " ms-collapsed" : "");
-    const hd = document.createElement("div");
-    hd.className = "ms-hd";
-    const ttl = document.createElement("span");
-    ttl.className = "ms-ttl"; ttl.textContent = "Inbox";
-    const cnt = document.createElement("span");
-    cnt.className = "ms-cnt";
-    cnt.append(" ");
-    const b = document.createElement("b"); b.textContent = String(n);
-    unreadNode = b;
-    cnt.appendChild(b);
-    cnt.append(" unread");
-    const heartbeat = heartbeatDate(d.messages);
-    const hb = document.createElement("span");
-    hb.className = "ms-hb";
-    hb.textContent = heartbeat ? "heartbeat alive " + heartbeat + " ✓" : "heartbeat not observed";
-    const open = document.createElement("a");
-    open.href = "/monitor/"; open.textContent = "Open →";
-    open.addEventListener("click", e => e.stopPropagation());
-    hd.append(ttl, cnt, hb, open);
-    hd.addEventListener("click", () => {
-      const isCollapsed = card.classList.toggle("ms-collapsed");
-      try { window.localStorage && window.localStorage.setItem("devmon-hub-collapsed", isCollapsed ? "1" : "0"); } catch (_) {}
-    });
-    card.appendChild(hd);
-    const body = document.createElement("div");
-    body.className = "ms-body";
-    const top = visibleCards(d);
-    top.forEach(c => body.appendChild(row(c)));
-    const moreCount = Math.max(0, n - top.length);
-    const more = document.createElement("div");
-    more.className = "ms-more";
-    more.textContent = moreCount + " more group" + (moreCount === 1 ? "" : "s");
-    body.appendChild(more);
-    card.appendChild(body);
-    strip.appendChild(card);
-  }
-
-  async function render() {
-    if (document.querySelector && document.querySelector(".dmc-overlay")) return;
-    let response;
-    try { response = await fetch("/monitor/api/owner/messages/preview", {cache: "no-store"}); }
-    catch (_) { return; }                       // network failure — keep the last render
-    if (response.status === 403 || response.status === 404) {
-      strip.hidden = true;
-      strip.textContent = "";
-      lastPayload = null;
-      rowNodes = {};
-      unreadNode = null;
-      return;
-    }
-    if (!response.ok) return;                  // unexpected status — keep the last render
-    let payload;
-    try { payload = await response.json(); } catch (_) { return; }
-    if (!payload || !Array.isArray(payload.messages) || !Array.isArray(payload.top) ||
-        !Number.isInteger(payload.unread_count) || payload.unread_count < 0) return;
-    lastPayload = payload;
-    renderPayload(lastPayload);
-  }
-  render();
-  setInterval(render, 30000);
 })();
 </script>
 
@@ -1638,6 +1374,7 @@ if (("standalone" in navigator) && navigator.standalone) {
   const tabs = Array.from(modal.querySelectorAll("[data-store-tab]"));
   const panes = Array.from(modal.querySelectorAll(".store-pane"));
   const badge = document.getElementById("store-badge");
+  const checkedEl = document.getElementById("store-checked");
   if (!open || !modal || !close || !body) return;
 
   let snapshot = null;
@@ -1657,6 +1394,18 @@ if (("standalone" in navigator) && navigator.standalone) {
     if (!value) return "";
     if (typeof value === "string") return value;
     return String(value.path || value.repo || value.kind || "");
+  }
+  // The source class the projection reports, in words. It is the difference between
+  // "the platform release vouches for these bytes" and "this box's owner pointed at a
+  // local path", which is the whole reason the digest line below reads differently for
+  // each. Only the four values the backend actually emits are translated; anything else
+  // (a path, a repo) is shown as it came, because inventing a grade for an unknown
+  // value is how a personal package starts looking platform-signed.
+  const SOURCE_WORDS = { platform: "플랫폼 릴리스", builtin: "공개 릴리스",
+                         shipped: "플랫폼 동봉", explicit: "개인 앱 · 로컬 경로" };
+  function sourceLabel(row) {
+    const value = source(row);
+    return value ? (SOURCE_WORDS[value] || value) : "";
   }
   function digest(row) {
     if (row && (row.digest || row.tree_digest)) return String(row.digest || row.tree_digest);
@@ -1747,12 +1496,14 @@ if (("standalone" in navigator) && navigator.standalone) {
       ? "설치됨 · 사내 카탈로그"
       : kind === "company" && item.installable !== true
       ? "설치 불가 · " + (companyReason(item) || "이유 없음")
+      : needsReview(item)
+      ? "설치된 바이트가 airlock.lock 과 다릅니다 — 개인 앱 탭에서 재승인이 필요합니다"
       : note(item) || (kind === "public" ? "Airlock 공개 릴리스에 포함된 앱"
         : kind === "company" ? "사내 카탈로그" : "설치됨");
     text.append(name, sub);
-    if (source(item)) {
+    if (sourceLabel(item)) {
       const src = document.createElement("div");
-      src.className = "store-row-source"; src.textContent = source(item);
+      src.className = "store-row-source"; src.textContent = sourceLabel(item);
       text.appendChild(src);
     }
     const actions = document.createElement("div");
@@ -1767,10 +1518,25 @@ if (("standalone" in navigator) && navigator.standalone) {
     wrap.append(text, actions);
     return wrap;
   }
+  // What the platform row says, in three states that must stay distinguishable:
+  // measured-and-behind, measured-and-current, and not-measured. The third one used to
+  // read like the second — an absent snapshot fell into the "manage" wording — and
+  // "we could not check" showing as "nothing to do" is the one reading this row must
+  // never produce. `changedCount` and `ref` are shown only when the detector supplied
+  // them; neither is computed here.
+  function platformSub(value) {
+    if (!value || typeof value !== "object" || typeof value.available !== "boolean") {
+      return "플랫폼 업데이트를 확인하지 못했습니다";
+    }
+    const where = value.ref ? " · 기준 " + value.ref : "";
+    if (!value.available) return "새 플랫폼 버전 없음" + where;
+    const size = typeof value.changedCount === "number" && value.changedCount > 0
+      ? " · 파일 " + value.changedCount + "개 변경" : "";
+    return "새 플랫폼 버전이 있습니다" + size + where;
+  }
   function platformRow() {
     const value = updates(snapshot).platform || {};
-    const item = { id: "platform", tile: { label: "Airlock 플랫폼",
-      sub: value.available ? "새 플랫폼 버전이 있습니다" : "허브·설치기·원장을 함께 관리합니다" },
+    const item = { id: "platform", tile: { label: "Airlock 플랫폼", sub: platformSub(value) },
       source: "platform" };
     const wrap = row(item, "installed");
     const button = wrap.querySelector("button");
@@ -1816,6 +1582,16 @@ if (("standalone" in navigator) && navigator.standalone) {
         ? "deactivate.sh가 없어 끌 수 없습니다."
         : "앱 끄기";
     }
+    // One object, two readings: the count on the entrance and the time on this line
+    // come from the same `updates(data)`, so the badge can never advertise a number
+    // from one collection while the sheet dates it to another. An absent or unusable
+    // `checkedAt` says so — a number with no time behind it is not fresh, it is
+    // undated, and the store's own reading of it must not round that up.
+    const snap = updates(data);
+    const when = airlockWhen(snap.checkedAt);
+    checkedEl.textContent = when
+      ? "마지막 확인 " + when
+      : "확인 기록 없음 — 아래 숫자가 언제 측정된 것인지 알 수 없습니다";
     const count = updateCount(data);
     badge.hidden = count === 0;
     badge.textContent = String(count);
@@ -1847,7 +1623,7 @@ if (("standalone" in navigator) && navigator.standalone) {
     detailNote.textContent = item.id === "platform" ? "Airlock 플랫폼 업데이트" : note(item);
     detailKv.textContent = "";
     kv("ID", item.id);
-    kv("소스", source(item));
+    kv("소스", sourceLabel(item));
     kv("digest", digest(item));
     detailCaps.textContent = "";
     const values = caps(item);
@@ -1927,9 +1703,29 @@ if (("standalone" in navigator) && navigator.standalone) {
   async function pollRun() {
     let response;
     try { response = await fetch("/monitor/api/owner/updates/run", { cache: "no-store" }); }
-    catch (_) { runTimer = setTimeout(pollRun, 4000); return; }
-    if (!response.ok) return;
-    let value; try { value = await response.json(); } catch (_) { return; }
+    catch (_) {
+      // A dropped request is not a finished run. The retry below is unchanged — this
+      // line only stops the previous "진행 중입니다" from standing as the last word
+      // while nothing is being read, which is the same rule the two branches below
+      // already follow and the one this branch was missing.
+      progressNote.textContent = "실행 상태를 읽지 못했습니다 (연결 끊김) — 끝났는지 아직 알 수 없습니다.";
+      runTimer = setTimeout(pollRun, 4000);
+      return;
+    }
+    // A failed read is not a finished run. Leaving the previous line up would let
+    // "진행 중입니다" stand as the last word after the answer stopped coming, which
+    // reads as an install still going or, worse, one that finished.
+    if (!response.ok) {
+      progressNote.textContent = "실행 상태를 읽지 못했습니다 (HTTP " + response.status +
+        ") — 끝났는지 아직 알 수 없습니다.";
+      return;
+    }
+    let value;
+    try { value = await response.json(); }
+    catch (_) {
+      progressNote.textContent = "실행 상태 응답을 해석하지 못했습니다 — 끝났는지 아직 알 수 없습니다.";
+      return;
+    }
     const run = value && value.run;
     if (run && (run.status === "starting" || run.status === "running")) {
       progressNote.textContent = "전체 설치기 재실행 — 진행 중입니다. 연결이 잠시 끊길 수 있습니다.";
@@ -1972,6 +1768,12 @@ if (("standalone" in navigator) && navigator.standalone) {
         disable_unavailable: "deactivate.sh가 없어 끌 수 없습니다.",
         app_not_installed: "이미 꺼진 앱입니다.", app_already_enabled: "이미 설치된 앱입니다.",
         bad_app_id: "앱 이름을 알아보지 못했습니다.", run_active: "이미 설치기가 실행 중입니다.",
+        // Measured against the handlers, not guessed: airlock-dev-monitor.py answers
+        // these three on this very path and the map had no words for any of them, so
+        // each arrived as a bare HTTP number.
+        app_not_pending: "이 앱은 지금 업데이트 대상이 아닙니다. 목록을 새로 읽어 주십시오.",
+        bad_action: "이 동작을 알아보지 못했습니다.",
+        bad_package_path: "패키지 경로를 알아보지 못했습니다.",
         package_preview_changed: "미리보기 뒤 패키지 내용이 바뀌었습니다. 다시 미리보기 하십시오.",
         package_not_installable: "거부된 capability나 설정 충돌을 먼저 해결해야 합니다.",
         package_already_registered: "이미 등록된 개인 앱입니다.",
@@ -1980,7 +1782,12 @@ if (("standalone" in navigator) && navigator.standalone) {
         digest_mismatch: "핀 소스의 digest가 카탈로그와 다릅니다.",
         catalog_unavailable: "사내 카탈로그를 읽지 못했습니다." };
       const reason = value && value.reason ? " (" + value.reason + ")" : "";
-      setAlert((messages[value && value.error] || "요청이 거부됐습니다 (HTTP " + response.status + ").") + reason, true);
+      // The two "not enabled" answers are sentences, not codes, and they mean the
+      // feature is off on this box rather than the request being wrong.
+      const raw = String(value && value.error || "");
+      const off = raw.endsWith("not enabled")
+        ? "이 박스에서 꺼져 있는 기능입니다 (" + raw + ")." : "";
+      setAlert((messages[raw] || off || "요청이 거부됐습니다 (HTTP " + response.status + ").") + reason, true);
       return;
     }
     setAlert("요청을 시작했습니다. 전체 설치기 재실행 상태를 확인합니다.", false);
@@ -2560,16 +2367,21 @@ if (("standalone" in navigator) && navigator.standalone) {
 //
 // What opens is the SAME panel devterm's own account icon and the return widget's
 // menu open — hub/assets/accounts/panel.html, one implementation with three hosts.
-// It is an iframe on devterm's origin and not a copy of the UI here, because every
-// fetch inside it is a root-absolute path that only that gate answers. That is also
-// why the gate aliases the file out of the webroot instead of the hub serving it
-// from /assets/: moving the file would not have moved the API with it.
+// It is an iframe rather than a copy of the UI here, because every fetch inside it
+// is a root-absolute path that the serving gate answers.
+//
+// That gate is now this same origin: the platform account surface is mounted under
+// the hub's owner-gated /airlock-accounts/ prefix and installed with the platform
+// itself (install/render-nginx.sh, install/airlock-install.sh). So the entrance no
+// longer depends on devterm being installed, running or reachable — which is the
+// whole of DEVTERM_INDEPENDENCE phase 2-2.
 //
 // Failure discipline, split on purpose — the two halves fail differently:
-//   - becoming an entrance at all needs a definite yes: devterm installed with a
-//     public port, a verified owner, and /acct-alert actually answering. Short of
-//     that the pill stays the plain label it is today. An entrance that opens a
-//     modal saying "could not load" is worse than no entrance.
+//   - becoming an entrance at all needs a definite yes: a verified owner and
+//     /acct-alert actually answering. Short of that the pill stays the plain label
+//     it is today. An entrance that opens a modal saying "could not load" is worse
+//     than no entrance. What is gone from that list is devterm: the surface behind
+//     the prefix is the platform's, so its absence is no longer a reason to hide.
 //   - once it IS an entrance, a later failed poll clears the RING and keeps the
 //     entrance. No reading is not a warning (the widget's rule, same endpoint), and
 //     it is not a reason to take the way in away either.
@@ -2577,23 +2389,20 @@ if (("standalone" in navigator) && navigator.standalone) {
   const pill = document.querySelector("[data-account-entry]");
   if (!pill) return;
 
-  // Where the account panel lives, from the launcher config the page already
-  // fetches. devterm by name, deliberately: the account API is that gate's, which
-  // is the same thing install/lib.sh's airlock_panel_url decides for the return
-  // widget — two derivations of one fact, so they name the same app.
+  // Where the account panel lives. There is nothing to derive any more: the panel
+  // and its API are the platform's own surface, mounted on THIS origin under the
+  // hub's owner-gated /airlock-accounts/ prefix. It used to be built out of
+  // `apps.devterm.port` plus the measured FQDN, and every failure mode of that
+  // derivation — no devterm, no public port, a short hostname the Tailscale cert
+  // does not cover — was a way for the subscription entrance to disappear from a box
+  // whose account surface was up the whole time.
   //
-  // The port key is webjson's public port, and the host is the FQDN the installer
-  // measured, because a separate-port URL has to match the Tailscale cert — the
-  // cert covers the FQDN only, so a short hostname would give the browser a link it
-  // cannot verify. Pure (host passed in, nothing read off `location`) so that
-  // install/test-hub-filter.sh can exercise it in node.
-  function airlockAccountPanelBase(apps, fqdn, fallbackHost) {
-    const devterm = apps && apps.devterm;
-    const port = devterm && devterm.port;
-    if (!port) return "";
-    const host = (fqdn && fqdn.indexOf(".") > 0) ? fqdn : fallbackHost;
-    if (!host) return "";
-    return "https://" + host + ":" + port + "/";
+  // A relative path, not an absolute URL: same origin means no certificate question,
+  // no port to agree on, and no cross-origin read to authorise. Kept as a named
+  // function so the one place that decides this stays one place and
+  // install/test-hub-filter.sh can still exercise the value in node.
+  function airlockAccountPanelBase() {
+    return "/airlock-accounts/";
   }
 
   let base = "", modal = null, level = "";
@@ -2651,7 +2460,7 @@ if (("standalone" in navigator) && navigator.standalone) {
       frame.hidden = true;
       note.hidden = false;
       note.textContent = "구독 계정 패널이 6초 안에 열리지 않았습니다: " + frame.src +
-        " — devterm 이 이 주소에서 응답하는지 확인해 주십시오.";
+        " — 이 주소가 응답하는지 확인해 주십시오.";
     }, 6000);
   }
 
@@ -2663,7 +2472,9 @@ if (("standalone" in navigator) && navigator.standalone) {
   // and a new listener must not be a fresh reason to keep it alive.
   window.addEventListener("message", (e) => {
     if (!base || e.data !== "airlock-panel-close") return;
-    let want; try { want = new URL(base).origin; } catch (_) { return; }
+    // base is relative now, so resolve it against this page before comparing: the
+    // comparison is the point, and `new URL("/airlock-accounts/")` alone throws.
+    let want; try { want = new URL(base, location.href).origin; } catch (_) { return; }
     if (e.origin === want) closePanel();
   });
 
@@ -2692,11 +2503,10 @@ if (("standalone" in navigator) && navigator.standalone) {
   }
 
   (async () => {
-    const [cfg, me] = [await j("/__airlock.json"), await j("/whoami")];
+    const me = await j("/whoami");                    // no config read: the base is fixed
     if (!me || me.role !== "owner") return;           // collaborators draw no fetch
-    base = airlockAccountPanelBase(cfg && cfg.apps, cfg && cfg.fqdn, location.hostname);
-    if (!base) return;                                // no devterm on this box
-    poll();
+    base = airlockAccountPanelBase();                 // this origin, always
+    poll();                                           // arm() still waits for a yes
     setInterval(poll, 30000);
   })();
 })();

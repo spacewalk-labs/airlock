@@ -3,16 +3,14 @@
  * ui.js — devterm's shared UI primitives (modal tone + clipboard copy), moved verbatim
  *   out of app.js.
  *
- * Why it is separate: the same UI has to work on a page with no terminal — panel.html,
- *   which the Airlock return widget opens in an iframe to show the accounts / secret
- *   panels. app.js attaches a terminal as soon as it loads, so it cannot be used there,
- *   and duplicating the copy logic (Safari's execCommand fallback in particular) is how
- *   two copies of a subtle behaviour start to differ. One source, two pages.
+ * Why it is separate: it was split out so panel.html (a page with no terminal) could share
+ *   it. That page and secretdrop.js are platform assets now (hub/assets/accounts/) and do
+ *   not load this file — secretdrop.js carries its own copy of the few primitives it
+ *   needs, because a platform asset cannot depend on one app's globals. This file is
+ *   devterm's terminal UI only.
  *
- * Shape: plain globals (classic script). app.js, accounts.js, secretdrop.js and
- *   panel.html all use them by name, so ui.js loads FIRST on every page.
- * The only per-page difference is where focus returns after a copy (devterm = the
- *   terminal, panel = the field), which is the uiRefocus hook.
+ * Shape: plain globals (classic script) used by app.js by name, so ui.js loads FIRST.
+ * Where focus returns after a copy (the terminal) is the uiRefocus hook.
  */
 
 // Focus target after a copy. Each page overrides it; the default is a no-op so a page

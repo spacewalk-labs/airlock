@@ -49,6 +49,14 @@ only-work	apps/devterm/test-accounts-js.mjs
 #    uses for codex-strip-ambient-openai-key below, only on the other side: a patch that
 #    exists on one repo and lands on the other at the next publish sync. It is only-work
 #    today because that sync has not run, not because it is work-only by design.
+only-work	apps/paseo/patches/schedule-busy-pending-delivery.mjs
+only-work	apps/paseo/patches/schedule-busy-pending-delivery.patch
+only-work	apps/paseo/patches/schedule-busy-pending-delivery.test.mjs
+only-work	apps/paseo/patches/schedule-pending-delivery-schema.mjs
+only-work	apps/paseo/patches/schedule-pending-delivery-schema.patch
+only-work	apps/paseo/patches/finish-notification-queue.mjs
+only-work	apps/paseo/patches/finish-notification-queue.patch
+only-work	apps/paseo/patches/finish-notification-queue.test.mjs
 only-work	apps/paseo/patches/claude-model-fable51.mjs
 only-work	apps/paseo/patches/provider-subagent-stream-filter.mjs
 only-work	apps/paseo/patches/provider-subagent-stream-filter.patch
@@ -197,7 +205,6 @@ content	apps/publish/install.sh
 # the platform CLI through the HTTP relay, and paseo's installer comment names the
 # platform pool-record schema it is preserving. These are content changes awaiting the
 # next public mirror sync; neither is an intentional long-term implementation fork.
-content	apps/devterm/test-secrets.py
 content	apps/paseo/patches/credential-key-preservation.test.mjs
 # 11) 2026-08-24 platform-owned credentials P3: the transport boundary is a new
 # work-ahead backend module. It invokes the handed-in platform CLI while
@@ -223,6 +230,7 @@ only-work	apps/dev-monitor/backend/devmon_apps.py
 # dev-monitor package files. This source PR does not publish the separate app mirror;
 # keep the temporary work-ahead split to these two new paths until that release sync.
 only-work	apps/dev-monitor/test-hub-msgstrip-contract.mjs
+only-work	apps/dev-monitor/test-inbox-module-contract.mjs
 only-work	apps/dev-monitor/verify-inbox-hub-live.py
 # 8) 2026-08-22 secret drop double header: the embedded panel drew a second title bar
 #    inside the widget's own, because the guard keyed on `close` (which panel.html hands
@@ -234,8 +242,6 @@ only-work	apps/dev-monitor/verify-inbox-hub-live.py
 #    🔴 Both paths are inside the 15-file set the pending public release decision covers
 #    (alp-release-scope) — web/secretdrop.js is NOT in that set today, so releasing the
 #    recommended 15 files does NOT carry this fix. It needs the next publish sync.
-only-work	apps/devterm/test-secretdrop-js.mjs
-content	apps/devterm/web/secretdrop.js
 # 9) 2026-08-23 D5 ABI enforcement (apps/ cutover prerequisite): every app package
 #    stopped deriving the platform root by climbing "$0/../..", stopped defaulting
 #    AIRLOCK_ROOT, and stopped reading platform paths outside install/lib.sh and
@@ -516,3 +522,21 @@ only-work	apps/learning/backend/timestamp_links.py
 # (`<날짜>--<슬러그>--<video_id>.md`)을 검사한다. 공개 앱에 속하는 기존 파일이며, 공개
 # 미러가 다음 앱 릴리스에서 같은 변경을 받을 때까지 work 쪽이 앞선 content drift로 기록한다.
 content	apps/learning/backend/save_document.py
+
+# 2026-09-13 platform secret drop: the drop's UI and HTTP API moved from devterm to the
+# platform (hub/assets/accounts/secretdrop.js, bin/airlock-accounts-api), and its tests
+# with them (install/test-secret-drop.py, install/test-secret-drop-ui.mjs). The public
+# mirror still carries devterm's old copies until the next app release, which is when
+# these three become healed deletions — a designed move, not new drift. ui.js is content
+# drift for one reason only: its header no longer claims consumers it lost.
+# docs/tasks/active/platform-secret-drop.md.
+only-apps	apps/devterm/test-secrets.py
+only-apps	apps/devterm/web/secretdrop.js
+content	apps/devterm/web/ui.js
+
+# 2026-09-13 weekly-docs run template: these two files are an intentional permanent
+# work-only overlay. Their fixed prompt and exact contract name private company paths,
+# while the public dev-monitor keeps only the generic receiver and no-overlay tests.
+# `install/public-manifest.sh` independently excludes both exact paths from export.
+only-work	apps/dev-monitor/backend/devmon_weekly_docs.py
+only-work	apps/dev-monitor/backend/test_devmon_weekly_docs.py

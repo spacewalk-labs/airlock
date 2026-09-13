@@ -37,7 +37,6 @@ Env:
   DEVTERM_FILEVIEW         "true" to enable the terminal file-path -> fileview link
   DEVTERM_ACCOUNTS         "true" to enable the Claude account pool UI
   DEVTERM_ACCOUNTS_BIN     platform account CLI (credential lifecycle/generation)
-  DEVTERM_SECRET_BIN       platform secret-drop CLI (store/lifetime/metadata)
   DEVTERM_CLAUDE_SWITCH    path to the platform airlock-accounts CLI
   DEVTERM_CLAUDE_STATUS    path to the platform airlock-accounts-status probe
   DEVTERM_FLEET_STORE      path to a shared usage store file (optional)
@@ -108,9 +107,6 @@ CLAUDE_STATUS = _account_tool("DEVTERM_CLAUDE_STATUS") \
 # verbs, but it cannot be assumed to implement the platform-only Codex preservation
 # verb added in P2b. The installer therefore hands the platform binary in separately.
 PLATFORM_ACCOUNTS = os.environ.get("DEVTERM_ACCOUNTS_BIN", "").strip()
-# No sibling/PATH fallback: after the ownership move either the D5 hand-in is present or
-# the relay fails visibly. Finding a stale app copy would be a silent split-brain store.
-PLATFORM_SECRET = os.environ.get("DEVTERM_SECRET_BIN", "").strip()
 # A shared usage store used to annotate the account pool with utilization. Both are
 # optional; no host is hardcoded. Left empty => the account list still works, just
 # without usage numbers.
@@ -202,18 +198,6 @@ _RE_UPLOAD_FILE = re.compile(r"^file([0-9]{3,})-[0-9]{8}-[0-9]{6}\.")   # upload
 UPLOAD_TTL_SEC = 24 * 3600
 UPLOAD_MAX_BYTES = 12 * 1024 * 1024           # image save cap (paste/annotate — canvas-encoded, so far smaller in practice)
 FILE_MAX_BYTES = 200 * 1024 * 1024            # file upload save cap (arbitrary binary). ~/uploads has a 24h TTL so no disk creep
-
-# ---- secret drop HTTP relay -------------------------------------------------
-# The platform CLI owns the store, validation, modes, atomicity, cap and lifetime. This
-# app still owns the HTTP boundary: Content-Type, body size and same-origin refusal are
-# meaningful only here. A divergent guard refuses visibly; a divergent store silently
-# leaves a value alive or world-readable, which is why only the latter consolidates.
-SECRET_BODY_MAX = 96 * 1024
-_SECRET_ERRORS = {
-    "invalid name", "value required", "value not encodable", "value too large",
-    "secret limit reached", "secret storage failed", "secret deletion failed",
-    "secret configuration failed", "secret operation failed", "usage",
-}
 
 # ---- tab prefs (order / hidden / color / theme) stored server-side so any device
 #      or browser sees the same layout. Owner is singular, so one file. ----
@@ -514,8 +498,10 @@ def _secret_origin_ok(headers):
     """Same-origin guard for every endpoint on this gate that WRITES.
 
     Named for the secret drop because that is what it was written for; it now guards
-    every write on this gate — the secret drop, the account mutations, and the terminal
-    itself (sessions, uploads, layout, prefs). 🔴 Until 2026-09-04 it guarded ONE of the six
+    every write on this gate — the account mutations and the terminal itself (sessions,
+    uploads, layout, prefs). The secret drop itself left this gate on 2026-09-13: its
+    routes are the platform's (bin/airlock-accounts-api), reached through devterm's nginx
+    proxy, so no /secret-* request arrives here. 🔴 Until 2026-09-04 it guarded ONE of the six
     (/acct-login-code) and /acct-switch, /acct-remove, /acct-login-url and
     /codex-logout were reachable cross-origin. The identity header is injected by the
     ingress, not the browser, so a request that arrives here already carries the owner's
@@ -538,158 +524,6 @@ def _secret_origin_ok(headers):
     except (UnicodeError, ValueError):
         return False
     return bool(host) and same
-
-
-def _secret_payload(command, payload, expected_name=None):
-    """Validate and rebuild CLI output before it crosses the HTTP boundary.
-
-    stdout is a platform contract, not a response body to reflect blindly. Rebuilding
-    the bounded metadata shape means a future CLI regression cannot add a value field
-    and turn this relay into an exfiltration path.
-    """
-    if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
-        return None
-    if payload["ok"] is False:
-        error = payload.get("error")
-        if error not in _SECRET_ERRORS:
-            error = "secret operation failed"
-        return {"ok": False, "error": error}
-    if command == "put":
-        if payload.get("name") != expected_name or not isinstance(payload.get("path"), str) \
-                or type(payload.get("ttl_sec")) is not int \
-                or type(payload.get("remain_sec")) is not int:
-            return None
-        return {key: payload[key] for key in ("ok", "name", "path", "ttl_sec", "remain_sec")}
-    if command == "del":
-        if payload.get("name") != expected_name:
-            return None
-        return {"ok": True, "name": expected_name}
-    if command == "list":
-        if type(payload.get("ttl_sec")) is not int or not isinstance(payload.get("secrets"), list):
-            return None
-        items = []
-        for item in payload["secrets"]:
-            if not isinstance(item, dict) or not isinstance(item.get("name"), str) \
-                    or not isinstance(item.get("path"), str) \
-                    or type(item.get("bytes")) is not int \
-                    or type(item.get("remain_sec")) is not int:
-                return None
-            items.append({key: item[key] for key in ("name", "path", "bytes", "remain_sec")})
-        return {"ok": True, "secrets": items, "ttl_sec": payload["ttl_sec"]}
-    return None
-
-
-async def _secret_cli(command, name=None, raw=None):
-    """Run one platform secret operation; the value is the subprocess stdin only."""
-    if not PLATFORM_SECRET:
-        return {"ok": False, "error": "secret operation failed"}
-    argv = [PLATFORM_SECRET, command]
-    if name is not None:
-        argv.extend(("--", name))
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE if raw is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(raw), timeout=10)
-    except asyncio.TimeoutError:
-        if proc is not None:
-            proc.kill()
-            await proc.wait()
-        return {"ok": False, "error": "secret operation failed"}
-    except (FileNotFoundError, OSError):
-        return {"ok": False, "error": "secret operation failed"}
-    try:
-        decoded = json.loads((out or b"").decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return {"ok": False, "error": "secret operation failed"}
-    payload = _secret_payload(command, decoded, expected_name=name)
-    if payload is None or (proc.returncode == 0) != payload.get("ok"):
-        return {"ok": False, "error": "secret operation failed"}
-    return payload
-
-
-def _secret_status(payload):
-    if payload.get("ok"):
-        return b"200 OK"
-    if payload.get("error") == "value too large":
-        return b"413 Payload Too Large"
-    if payload.get("error") in {
-            "invalid name", "value required", "value not encodable", "secret limit reached"}:
-        return b"400 Bad Request"
-    return b"500 Internal Server Error"
-
-
-async def _serve_secret_put(cr, headers, leftover, cw):
-    """HTTP guard + stdin-only relay. Storage and value normalization are platform-owned."""
-    if headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower() != b"application/json":
-        await _send_json(cw, b"415 Unsupported Media Type",
-                         {"ok": False, "error": "Content-Type must be application/json"})
-        return
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    try:
-        declared = int(headers.get(b"content-length", b"0"))
-    except ValueError:
-        declared = 0
-    if declared > SECRET_BODY_MAX:
-        await _send_json(cw, b"413 Payload Too Large", {"ok": False, "error": "secret body too large"})
-        return
-    d = await _read_json_body(cr, headers, leftover, limit=SECRET_BODY_MAX)
-    name = d.get("name") if d is not None else None
-    value = d.get("value") if d is not None else None
-    if not isinstance(name, str):
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "invalid name"})
-        return
-    if not isinstance(value, str):
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "value required"})
-        return
-    try:
-        raw = value.encode("utf-8")
-    except UnicodeEncodeError:
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "value not encodable"})
-        return
-    payload = await _secret_cli("put", name=name, raw=raw)
-    await _send_json(cw, _secret_status(payload), payload)
-
-
-async def _serve_secret_list(headers, cw):
-    """Metadata for the unexpired secrets — names, sizes, time left. Never a value."""
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    payload = await _secret_cli("list")
-    await _send_json(cw, _secret_status(payload), payload)
-
-
-async def _serve_secret_del(cr, headers, leftover, cw):
-    """Delete by name. A valid name that is already gone is still a success (the caller
-    wanted it gone, and it is)."""
-    if headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower() != b"application/json":
-        await _send_json(cw, b"415 Unsupported Media Type",
-                         {"ok": False, "error": "Content-Type must be application/json"})
-        return
-    if not _secret_origin_ok(headers):
-        await _send_json(cw, b"403 Forbidden", {"ok": False, "error": "origin not allowed"})
-        return
-    try:
-        declared = int(headers.get(b"content-length", b"0"))
-    except ValueError:
-        declared = 0
-    if declared > SECRET_BODY_MAX:
-        await _send_json(cw, b"413 Payload Too Large", {"ok": False, "error": "secret body too large"})
-        return
-    d = await _read_json_body(cr, headers, leftover, limit=SECRET_BODY_MAX)
-    name = d.get("name") if d is not None else None
-    if not isinstance(name, str):
-        await _send_json(cw, b"400 Bad Request", {"ok": False, "error": "invalid name"})
-        return
-    payload = await _secret_cli("del", name=name)
-    await _send_json(cw, _secret_status(payload), payload)
 
 
 def _cleanup_old_uploads():
@@ -3270,12 +3104,6 @@ async def handle(cr, cw):
             await _serve_codex_usage(headers, cw)
         elif path == b"/acct-alert" and method == b"GET":
             await _serve_acct_alert(headers, cw)
-        elif path == b"/secret-put" and method == b"POST":
-            await _serve_secret_put(cr, headers, leftover, cw)
-        elif path == b"/secret-list" and method == b"GET":
-            await _serve_secret_list(headers, cw)
-        elif path == b"/secret-del" and method == b"POST":
-            await _serve_secret_del(cr, headers, leftover, cw)
         elif path == b"/acct-login-url" and method == b"POST":
             await _serve_acct_login_url(headers, cw)
         elif path == b"/acct-login-code" and method == b"POST":
@@ -3409,7 +3237,6 @@ async def main():
     print(f"devterm-gate on {where} -> ttyd {TTYD_HOST}:{TTYD_PORT}; web={WEB_ROOT}; "
           f"accounts={_accounts_enabled()}; xai={_xai_enabled()}; "
           f"fileview={FILEVIEW}; orca={bool(ORCA_SHIM)}; "
-          f"secret_cli={bool(PLATFORM_SECRET)}; "
           f"codex_usage_sweep={CODEX_USAGE_SWEEP if sweeper else 'off'}", flush=True)
     try:
         if signal_wait:

@@ -6,7 +6,7 @@ Wants=airlock-devterm.service
 [Service]
 Type=simple
 Environment=PATH=WDIR/home/.local/bin:WDIR/home/.npm-global/bin:NODE_BIN:/usr/local/bin:/usr/bin:/bin
-Environment=DEVTERM_REV=ed0dd820e6fe
+Environment=DEVTERM_REV=f4beb33d28b9
 Environment=DEVTERM_LISTEN_HOST=127.0.0.1
 Environment=DEVTERM_LISTEN_PORT=19913
 Environment=DEVTERM_TTYD_HOST=127.0.0.1
@@ -21,7 +21,6 @@ Environment=DEVTERM_REMOTE_HOSTS=
 Environment=DEVTERM_ORCA_SHIM=
 Environment=DEVTERM_FLEET_READ_DOMAIN=
 Environment=DEVTERM_ACCOUNTS_BIN=ROOT/bin/airlock-accounts
-Environment=DEVTERM_SECRET_BIN=ROOT/bin/airlock-secret
 Environment=DEVTERM_CLAUDE_STATUS=ROOT/bin/airlock-accounts-status
 Environment=DEVTERM_CLAUDE_SWITCH=ROOT/bin/airlock-accounts
 Environment=DEVTERM_FLEET_STORE=

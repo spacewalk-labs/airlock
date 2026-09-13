@@ -951,12 +951,13 @@ if [ -f "$STATE/app-ledger.json" ]; then
   python3 -c '
 import json, sys
 d=json.load(open(sys.argv[1]))
-assert d["version"] == 6 and d["events"] == []
+assert d["version"] == 7 and d["events"] == []
 for e in d["entries"].values():
   for kind in ("committed", "intent"):
     if kind in e:
       assert "deps" in e[kind]
       assert e[kind]["container_runtime"] is None
+      assert e[kind]["managed_authority"] is None
 ' "$STATE/app-ledger.json" >/dev/null 2>&1 && version_deps=1
 fi
 if [ "$rc_info" = 0 ] && [ "$rc_intent" = 0 ] && [ "$version_deps" = 1 ]; then

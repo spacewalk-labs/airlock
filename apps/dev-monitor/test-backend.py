@@ -49,6 +49,26 @@ def _load_backend():
 DM = _load_backend()
 MSG = DM.MSG
 AC7 = {'archived_filtered': 0, 'active_counted': 0}
+AC7_SELECTED = {'value': False}
+AST_REREG_SELECTED = set()
+AST_REREG = {
+    'same_bytes': 0,
+    'changed_bytes': 0,
+    'disable_remove': 0,
+    'registered_reapproval': 0,
+    'personal_remove_reregister': 0,
+    'company_remove_reregister': 0,
+    'company_noop_remove_rejected': 0,
+    'company_noop_register_rejected': 0,
+    'digest_rejected_no_mutation': 0,
+    'capability_rejected_no_mutation': 0,
+    'drift_no_execution': 0,
+    'committed_config_preserved': 0,
+    'preinstall_digest_rechecked': 0,
+    'failure_execution_started': 0,
+    'failure_visible': 0,
+    'unrelated_rollback_rejected': 0,
+}
 
 # The platform CLI has no .py extension. Importing it runs no command because main()
 # is guarded; tests can point its whitelisted raw extractor at scratch credentials.
@@ -721,6 +741,7 @@ class OwnerRouteTest(unittest.TestCase):
         })
 
     def test_health_failed_count_excludes_archived_exhausted_cards(self):
+        AC7_SELECTED['value'] = True
         saved_state = DM._MESSAGES_STATE
         archived_id = 'health-archived-exhausted'
         active_id = 'health-active-exhausted'
@@ -1930,6 +1951,7 @@ class PackageReregistrationTest(unittest.TestCase):
     """A stale trust record is retained and explicitly approved, never erased."""
 
     def setUp(self):
+        AST_REREG_SELECTED.add('package-suite')
         self.tmp = tempfile.TemporaryDirectory()
         case = Path(self.tmp.name)
         source = Path(HERE).parents[1]
@@ -2013,6 +2035,7 @@ class PackageReregistrationTest(unittest.TestCase):
         self.assertEqual(self._config('validate').returncode, 0)
         self.assertEqual(lock.read_bytes(), lock_before)
         self.assertEqual(self.data.read_text(), 'operator data\n')
+        AST_REREG['same_bytes'] = 1
 
     def test_changed_bytes_require_exact_digest_and_preserve_failed_state(self):
         lock, lock_before, disabled = self._establish_lock_then_disable()
@@ -2048,6 +2071,8 @@ class PackageReregistrationTest(unittest.TestCase):
         approved = self._config(
             'package-register-validate', 'retained-app', preview['digest'])
         self.assertEqual(approved.returncode, 0, approved.stderr)
+        AST_REREG['changed_bytes'] = 1
+        AST_REREG['digest_rejected_no_mutation'] = 1
 
     def test_capability_change_is_rejected_until_its_grant_is_in_the_candidate(self):
         lock, lock_before, disabled = self._establish_lock_then_disable()
@@ -2072,6 +2097,82 @@ class PackageReregistrationTest(unittest.TestCase):
             ['system-unit'])
         self.assertEqual(lock.read_bytes(), lock_before)
         self.assertEqual(self.data.read_text(), 'operator data\n')
+        AST_REREG['capability_rejected_no_mutation'] = 1
+
+    def test_remove_then_reregister_is_one_measured_personal_transition(self):
+        lock, lock_before, removed = self._establish_lock_then_disable()
+        self.assertNotIn('retained-app', APPSTORE._load(self.config).get('packages', {}))
+        preview = APPSTORE.package_preview(self.root, str(self.package))
+        result = APPSTORE.register(
+            self.config, 'retained-app', {'path': preview['path'],
+                                          'grant': preview['grants']})
+        self.assertTrue(result['changed'])
+        self.assertNotEqual(self.config.read_bytes(), removed)
+        self.assertIn('retained-app', APPSTORE._load(self.config)['packages'])
+        self.assertEqual(lock.read_bytes(), lock_before)
+        self.assertEqual(self.data.read_text(), 'operator data\n')
+        AST_REREG['disable_remove'] = 1
+        AST_REREG['personal_remove_reregister'] = 1
+
+    def test_company_remove_then_reregister_uses_the_real_writer_with_noop_controls(self):
+        # Company staging ends before the shared package writer. Exercise the exact
+        # staged path/digest handoff with the production mutation functions here.
+        company_package = Path(self.tmp.name) / 'company-stage' / 'retained-app'
+        company_package.parent.mkdir()
+        shutil.copytree(self.package, company_package)
+        APPSTORE.register(
+            self.config, 'retained-app', {'path': str(company_package), 'grant': []})
+        finalized = self._config('lock-finalize')
+        self.assertEqual(finalized.returncode, 0, finalized.stderr)
+        lock = self.root / 'airlock.lock'
+
+        def snapshot():
+            document = APPSTORE._load(self.config)
+            return {
+                'config': self.config.read_bytes(),
+                'app': 'retained-app' in (document.get('apps') or {}),
+                'package': 'retained-app' in (document.get('packages') or {}),
+                'lock': lock.read_bytes(),
+                'data': self.data.read_bytes(),
+            }
+
+        def complete_transition(before, removed, restored):
+            return bool(
+                before['app'] and before['package']
+                and not removed['app'] and not removed['package']
+                and restored['app'] and restored['package']
+                and before['config'] != removed['config']
+                and removed['config'] != restored['config']
+                and before['lock'] == removed['lock'] == restored['lock']
+                and before['data'] == removed['data'] == restored['data'])
+
+        before = snapshot()
+        removed_result = APPSTORE.mutate_enabled(
+            self.config, 'retained-app', False)
+        self.assertTrue(removed_result['changed'])
+        removed = snapshot()
+
+        (company_package / 'payload.txt').write_text('company changed bytes\n')
+        preview = APPSTORE.package_preview(self.root, str(company_package))
+        self.assertFalse(preview['registered'])
+        self.assertTrue(preview['requires_reapproval'])
+        registered_result = APPSTORE.register(
+            self.config, 'retained-app', {
+                'path': preview['path'], 'grant': preview['grants']},
+            approved_digest=preview['digest'])
+        self.assertTrue(registered_result['changed'])
+        restored = snapshot()
+
+        self.assertTrue(complete_transition(before, removed, restored))
+        self.assertFalse(
+            complete_transition(before, before, restored),
+            'a no-op remove must not satisfy the transition')
+        self.assertFalse(
+            complete_transition(before, removed, removed),
+            'a no-op register must not satisfy the transition')
+        AST_REREG['company_remove_reregister'] = 1
+        AST_REREG['company_noop_remove_rejected'] = 1
+        AST_REREG['company_noop_register_rejected'] = 1
 
 
 class UpdateExecRouteTest(unittest.TestCase):
@@ -2616,6 +2717,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register = saved
 
     def test_personal_reapproval_uses_the_closed_install_action_and_break_glass(self):
+        AST_REREG_SELECTED.add('registered-reapproval')
         digest = 'd' * 64
         package = '/srv/personal/moved'
         preview = {
@@ -2638,6 +2740,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertEqual(UPX.read_record(self.dir)['action'], 'install')
             self.assertIn('--reapprove', plan['exec'])
             self.assertNotIn('teardown', plan['exec'])
+            AST_REREG['registered_reapproval'] = 1
         finally:
             (DM.APPS.package_preview, DM.APPS.config_path,
              DM.APPS.registered_package_path) = saved
@@ -2838,8 +2941,12 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         self.assertEqual(self.counter.read_text(), 'installed')
 
     def test_personal_install_rechecks_the_approved_digest_before_running(self):
+        AST_REREG_SELECTED.add('digest-drift')
         digest = 'e' * 64
         package = '/srv/personal/my-app'
+        config = self.root / 'airlock.toml'
+        config.write_text('[apps.my-app]\n[packages.my-app]\npath = %r\n' % package)
+        committed_config = config.read_bytes()
         (self.root / 'bin' / 'airlock-config').write_text(
             'import json\nprint(json.dumps({"id":"my-app","digest":%r,'
             '"installable":True,"registered":True,'
@@ -2852,6 +2959,7 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(record['status'], 'done')
         self.assertEqual(self.counter.read_text(), 'installed')
+        AST_REREG['preinstall_digest_rechecked'] = 1
 
         (self.root / 'bin' / 'airlock-config').write_text(
             'import json\nprint(json.dumps({"id":"my-app","digest":"%s",'
@@ -2865,6 +2973,9 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         self.assertEqual(record['status'], 'failed')
         self.assertIn('digest', record['note'])
         self.assertEqual(self.counter.read_text(), 'not-run')
+        self.assertEqual(config.read_bytes(), committed_config)
+        AST_REREG['drift_no_execution'] = 1
+        AST_REREG['committed_config_preserved'] = 1
 
     def test_reapproval_passes_only_the_scoped_break_glass_flag_to_installer(self):
         digest = '1' * 64
@@ -2894,16 +3005,25 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         self.assertEqual(seen.read_text(), 'notes')
 
     def test_failed_install_has_no_unrelated_update_rollback(self):
+        AST_REREG_SELECTED.add('failed-install')
         armed = UPX.git_dir(self.root) / 'airlock-update-rollback'
         armed.mkdir(parents=True)
         (armed / 'airlock-update').write_text('#!/usr/bin/env bash\n')
+        started = Path(self.tmp.name) / 'installer-started'
         (self.root / 'install' / 'airlock-install.sh').write_text(
-            '#!/usr/bin/env bash\nexit 1\n')
+            '#!/usr/bin/env bash\nprintf started > %r\nexit 1\n' % str(started))
         proc, record = self._run(action='install', app_id='notes')
         self.assertEqual(proc.returncode, 1)
+        self.assertEqual(started.read_text(), 'started')
+        self.assertEqual((record['status'], record['exitCode']), ('failed', 1))
+        self.assertIsNotNone(record['after'])
         self.assertIsNone(record['recovery'])
         self.assertIn('전체 설치기', record['note'])
+        self.assertIn('airlock.toml.bak', record['note'])
         self.assertNotIn('--rollback', record['note'])
+        AST_REREG['failure_execution_started'] = 1
+        AST_REREG['failure_visible'] = 1
+        AST_REREG['unrelated_rollback_rejected'] = 1
 
     def test_failed_teardown_has_no_unrelated_update_rollback(self):
         teardown = self.root / 'bin' / 'airlock-teardown'
@@ -3380,13 +3500,37 @@ class HomeOrderRouteTest(unittest.TestCase):
 
 if __name__ == '__main__':
     program = unittest.main(verbosity=1, exit=False)
-    if not program.result.wasSuccessful():
-        raise SystemExit(1)
     revision = subprocess.check_output(
         ['git', 'rev-parse', '--short=12', 'HEAD'],
         cwd=Path(HERE).parent.parent, text=True).strip()
-    verdict = 'PASS' if all(value == 1 for value in AC7.values()) else 'FAIL'
-    print('AC-7 | expected: archived_filtered == 1 && active_counted == 1 | '
-          'observed: archived_filtered=%d,active_counted=%d | verdict: %s | '
-          'signal: fixture | evidence: apps/dev-monitor/test-backend.py@%s'
-          % (AC7['archived_filtered'], AC7['active_counted'], verdict, revision))
+    if AC7_SELECTED['value']:
+        verdict = 'PASS' if all(value == 1 for value in AC7.values()) else 'FAIL'
+        print('AC-7 | expected: archived_filtered == 1 && active_counted == 1 | '
+              'observed: archived_filtered=%d,active_counted=%d | verdict: %s | '
+              'signal: fixture | evidence: apps/dev-monitor/test-backend.py@%s'
+              % (AC7['archived_filtered'], AC7['active_counted'], verdict, revision))
+    ast_focus = {'package-suite', 'registered-reapproval',
+                 'digest-drift', 'failed-install'}
+    if ast_focus <= AST_REREG_SELECTED:
+        rows = {
+            'R1': ('same_bytes', 'changed_bytes', 'disable_remove'),
+            'R2': ('registered_reapproval', 'personal_remove_reregister',
+                   'company_remove_reregister', 'company_noop_remove_rejected',
+                   'company_noop_register_rejected'),
+            'R3': ('digest_rejected_no_mutation',
+                   'capability_rejected_no_mutation', 'drift_no_execution',
+                   'committed_config_preserved'),
+            'R4-WRAPPER': ('preinstall_digest_rechecked',
+                           'failure_execution_started', 'failure_visible',
+                           'unrelated_rollback_rejected'),
+        }
+        for requirement, names in rows.items():
+            expected = ' && '.join('%s == 1' % name for name in names)
+            observed = ','.join('%s=%d' % (name, AST_REREG[name]) for name in names)
+            verdict = ('PASS' if all(AST_REREG[name] == 1 for name in names)
+                       else 'FAIL')
+            print('AC-AST-%s | expected: %s | observed: %s | verdict: %s | '
+                  'signal: fixture | evidence: apps/dev-monitor/test-backend.py@%s'
+                  % (requirement, expected, observed, verdict, revision))
+    if not program.result.wasSuccessful():
+        raise SystemExit(1)

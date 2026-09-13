@@ -291,12 +291,18 @@ contract('reader-markdown-copy', () => {
 
 // --- 5. 글자 크기와 테마 저장 계약 ---
 contract('reader-preferences-persistence', () => {
-  assert.match(backend, /F=\[100,112,125,140,160\]/,
-    '글자 크기는 합의한 다섯 단계여야 한다');
-  assert.match(backend, /T=\["Auto","Light","Dark"\]/,
-    '테마 어휘는 허브와 같은 Auto, Light, Dark여야 한다');
-  assert.match(backend, /FK="learning-reader-font-size"/);
-  assert.match(backend, /TK="learning-reader-theme"/);
+  assert.match(backend, /F=\[1,1\.1,1\.25,1\.4,1\.6\]/,
+    '글자 크기는 합의한 다섯 단계여야 한다 — 공용 배율(`--swk-fs-scale`)과 같은 단위(배수)로 센다');
+  assert.match(backend, /setProperty\("--swk-fs-scale"/,
+    '글자 크기는 이 리더만의 변수가 아니라 공용 문서 CSS 의 배율 훅을 돌려야 한다');
+  assert.match(backend, /T=\["auto","light","dark"\]/,
+    '테마 어휘는 공용 문서 자산의 것이어야 한다 — 리더가 자기 어휘를 따로 두지 않는다');
+  assert.match(backend, /setAttribute\("data-theme",theme\)/,
+    '테마 적용은 공용 규약인 `data-theme` 여야 한다');
+  assert.doesNotMatch(backend, /data-learning-reader-theme=dark/,
+    '리더가 들고 있던 자체 다크 팔레트는 남아 있으면 안 된다 — 테마 주인은 공용 자산 하나다');
+  assert.match(backend, /FK="swk-fontscale"/, '배율 저장 키는 공용 문서 뷰어와 같아야 한다');
+  assert.match(backend, /TK="swk-theme"/, '테마 저장 키는 공용 문서 뷰어와 같아야 한다');
   assert.match(backend, /localStorage\.getItem\(k\)/);
   assert.match(backend, /localStorage\.setItem\(k,v\)/);
   assert.match(backend, /learning-reader-font-value[^>]+title="글자 크기"[^>]+aria-label="글자 크기">100%/);
@@ -355,7 +361,13 @@ contract('list-theme-shares-reader-key', () => {
     assert.match(html, new RegExp(`--${alias}: var\\(--airlock-${token}\\)`));
   }
   assert.match(html, /var THEME_STORAGE_KEY = "learning-reader-theme"/);
-  assert.match(backend, /TK="learning-reader-theme"/);
+  // 앱 셸은 아직 자기 키를 읽는다(허브 테마 정본은 별도 카드). 리더는 공용 키를 쓰면서
+  // 이 키에 미러해, 문서에서 바꾼 테마가 목록에도 반영되는 동작을 잃지 않는다.
+  assert.match(backend, /AK="learning-reader-theme"/);
+  assert.match(backend, /put\(AK,LABEL\[theme\]\)/);
+  // 반대 방향도 같은 짝이어야 한다 — 목록에서 고른 테마가 문서에 가지 않으면 반쪽이다.
+  assert.match(html, /var DOC_THEME_KEY = "swk-theme"/);
+  assert.match(html, /localStorage\.setItem\(DOC_THEME_KEY, theme\.toLowerCase\(\)\)/);
   assert.match(html, /var THEMES = \["Auto", "Light", "Dark"\]/);
   for (const theme of ['Auto', 'Light', 'Dark']) {
     assert.match(html, new RegExp(`el\\("button", "theme-button", theme\\)`));

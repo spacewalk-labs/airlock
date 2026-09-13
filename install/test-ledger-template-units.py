@@ -113,6 +113,7 @@ class TemplateUnitTests(unittest.TestCase):
             "deps": [], "artifacts": artifacts, "roots": self.roots,
             "unit_scopes": {TEMPLATE: "user"}, "serve_mappings": {}, "order": None,
             "source_class": "explicit", "capabilities": [], "container_runtime": None,
+            "managed_authority": None,
         }
         self.store = {"version": ledger.LEDGER_VERSION,
                       "entries": {"probe": {"committed": record}}, "events": []}

@@ -31,6 +31,13 @@ Usage:
   airlock-config install-snapshot <private-path>
                                      # ORCHESTRATOR-INTERNAL: freeze the exact
                                      #   operator config bytes for one run
+  airlock-config managed-config-snapshot --state <private-state.json>
+                        --release <signed-release-dir>
+                        --authority <current-authority-dir>
+                        <private-output.toml>
+                                     # ORCHESTRATOR-INTERNAL: verify the enrolled
+                                     #   selection at current UTC and materialize
+                                     #   one effective config; receipt is stdout
   airlock-config install-preflight [--package-info-stdin]
                                      # ORCHESTRATOR-INTERNAL: resolve every
                                      #   candidate projection before reconcile
@@ -283,6 +290,11 @@ BUNDLE_CERTIFICATIONS = ("dry-run-exec", "strict-config-scan")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUNDLE_ROOT = REPO_ROOT / "apps"
 PACKAGE_LOCK_PATH = REPO_ROOT / "airlock.lock"
+MANAGED_PROJECTOR = REPO_ROOT / "bin/airlock-managed-projector"
+MANAGED_STATE = REPO_ROOT / "bin/airlock-managed-state"
+MANAGED_RELEASE = REPO_ROOT / "bin/airlock-managed-release"
+MANAGED_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+_MANAGED_PACKAGE_AUTHORITY: dict[str, dict] = {}
 BUNDLE_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
     "code-server": (),
     "dev-monitor": ("rooted-artifact", "system-unit"),
@@ -655,7 +667,14 @@ def load() -> dict:
             if actual != expected:
                 die("install config snapshot digest changed during this run — "
                     "refusing the projection before reconcile", code=2)
-        return tomllib.loads(data.decode("utf-8"))
+        cfg = tomllib.loads(data.decode("utf-8"))
+        global _MANAGED_PACKAGE_AUTHORITY
+        _MANAGED_PACKAGE_AUTHORITY = _authenticate_managed_receipt(
+            path, read_path, data, cfg,
+        )
+        if not os.environ.get("AIRLOCK_MANAGED_CONFIG_RECEIPT"):
+            _MANAGED_PACKAGE_AUTHORITY = _authenticate_managed_projector_input(cfg)
+        return cfg
     except (OSError, ValueError) as e:
         # ValueError, not just tomllib.TOMLDecodeError (a ValueError
         # subclass): tomllib decodes the bytes as UTF-8 before parsing, so
@@ -664,13 +683,8 @@ def load() -> dict:
         die(f"{path}: invalid TOML: {e}")
 
 
-def cmd_install_snapshot(target: str) -> "None":
-    """Freeze the exact operator-file bytes for one installer invocation.
-
-    This is orchestrator-internal.  The caller supplies an already-created,
-    private regular file (mktemp); refusing links and non-regular targets keeps
-    the snapshot from becoming a general write primitive.
-    """
+def _freeze_config(target: str) -> tuple[Path, bytes, str]:
+    """Copy the operator bytes once into an already-created private file."""
     source = find_config()
     destination = Path(target)
     try:
@@ -688,9 +702,898 @@ def cmd_install_snapshot(target: str) -> "None":
             os.fsync(handle.fileno())
     except (OSError, UnicodeError, ValueError) as exc:
         die(f"cannot freeze install config {source} -> {destination}: {exc}", code=2)
+    return source, data, hashlib.sha256(data).hexdigest()
+
+
+def cmd_install_snapshot(target: str) -> "None":
+    """Freeze the exact operator-file bytes for one installer invocation.
+
+    This is orchestrator-internal.  The caller supplies an already-created,
+    private regular file (mktemp); refusing links and non-regular targets keeps
+    the snapshot from becoming a general write primitive.
+    """
+    source, _data, frozen_digest = _freeze_config(target)
     print(json.dumps({"config_path": str(source),
-                      "sha256": hashlib.sha256(data).hexdigest()},
+                      "sha256": frozen_digest},
                      sort_keys=True, separators=(",", ":")))
+
+
+def _managed_json_pairs(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            die(f"managed projector returned duplicate JSON key {key!r}", code=2)
+        result[key] = value
+    return result
+
+
+def _managed_canonical(value: object) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")) + "\n").encode()
+
+
+def _managed_digest(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _managed_private_bytes(path: Path, label: str, limit: int = 1024 * 1024) -> bytes:
+    """Read one uid-private regular file without following its final component."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        die(f"{label} is not readable as a private regular file: {path} ({exc})", code=2)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) & 0o077):
+            die(f"{label} must be a regular non-symlink file owned by this uid "
+                "with no group/other permissions", code=2)
+        if info.st_size > limit:
+            die(f"{label} exceeds {limit} bytes", code=2)
+        raw = b""
+        while chunk := os.read(fd, min(1024 * 1024, limit + 1 - len(raw))):
+            raw += chunk
+            if len(raw) > limit:
+                die(f"{label} exceeds {limit} bytes", code=2)
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _managed_json_file(path: Path, label: str, *, private: bool = False) -> tuple[dict, bytes]:
+    try:
+        raw = (_managed_private_bytes(path, label) if private else path.read_bytes())
+        value = json.loads(raw, object_pairs_hook=_managed_json_pairs)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        die(f"{label} is not canonical JSON: {exc}", code=2)
+    if not isinstance(value, dict) or raw != _managed_canonical(value):
+        die(f"{label} is not a canonical JSON object", code=2)
+    return value, raw
+
+
+def _managed_absolute_env(name: str) -> Path:
+    value = os.environ.get(name, "")
+    path = Path(value).expanduser()
+    if not value or not path.is_absolute():
+        die(f"{name} must name one absolute producer-authority path", code=2)
+    return path.absolute()
+
+
+def _managed_clean_environment() -> dict[str, str]:
+    env = dict(os.environ)
+    for name in (
+        "AIRLOCK_MANAGED_CONFIG_RECEIPT",
+        "AIRLOCK_MANAGED_CONFIG_RECEIPT_SHA256",
+        "AIRLOCK_MANAGED_STATE",
+        "AIRLOCK_MANAGED_RELEASE",
+        "AIRLOCK_MANAGED_AUTHORITY",
+        "AIRLOCK_MANAGED_PROJECTOR_STATE",
+        "AIRLOCK_MANAGED_PROJECTOR_RELEASE",
+        "AIRLOCK_MANAGED_PROJECTOR_AUTHORITY",
+        "AIRLOCK_MANAGED_PROJECTOR_AT",
+        "AIRLOCK_MANAGED_PROJECTOR_RELEASE_MODE",
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_MODE",
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_STORE",
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_CHANNEL",
+    ):
+        env.pop(name, None)
+    return env
+
+
+def _managed_promoted_coordinates(release_path: Path, channel_id: str) -> tuple[Path, str]:
+    release = release_path.expanduser().absolute()
+    releases = release.parent
+    store = releases.parent
+    if (releases.name != "releases"
+            or re.fullmatch(r"[0-9a-f]{64}", release.name) is None
+            or not isinstance(channel_id, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", channel_id) is None):
+        die("promoted-current release is not one exact store/releases snapshot path", code=2)
+    return store, channel_id
+
+
+def _managed_release_verifier_environment(
+    release_mode: str, release_path: Path, channel_id: str,
+) -> dict[str, str]:
+    env = _managed_clean_environment()
+    if release_mode == "signed-stage":
+        return env
+    if release_mode != "promoted-current":
+        die("managed release verification mode is unsupported", code=2)
+    store, channel = _managed_promoted_coordinates(release_path, channel_id)
+    env.update({
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_MODE": "promoted-current",
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_STORE": str(store),
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_CHANNEL": channel,
+    })
+    return env
+
+
+def _managed_rows_from_state(
+    catalog: dict, lock: dict, state: dict, release_path: Path, label: str,
+) -> list[dict]:
+    """Derive selected managed packages from signed release + private state."""
+    catalog_apps = catalog.get("apps")
+    lock_packages = lock.get("packages")
+    selection = state.get("owner_selection")
+    selections = selection.get("selections") if isinstance(selection, dict) else None
+    ceilings = state.get("capability_ceilings")
+    if (not isinstance(catalog_apps, list) or not isinstance(lock_packages, list)
+            or not isinstance(selections, list) or not isinstance(ceilings, dict)):
+        die(f"{label} has invalid package/selection authority", code=2)
+    catalog_by_id = {row.get("id"): row for row in catalog_apps if isinstance(row, dict)}
+    lock_by_id = {row.get("id"): row for row in lock_packages if isinstance(row, dict)}
+    choices = {row.get("id"): row.get("source") for row in selections if isinstance(row, dict)}
+    if (len(catalog_by_id) != len(catalog_apps)
+            or len(lock_by_id) != len(lock_packages)
+            or len(choices) != len(selections)
+            or any(not isinstance(app_id, str) for app_id in choices)
+            or any(source not in {"local", "managed", "public"} for source in choices.values())):
+        die(f"{label} repeats or corrupts an app selection", code=2)
+    unknown = sorted(set(choices) - set(catalog_by_id))
+    if unknown:
+        die(f"{label} selects app ids absent from the signed catalog: {unknown}", code=2)
+
+    rows = []
+    for app_id, catalog_row in sorted(catalog_by_id.items()):
+        policy = catalog_row.get("policy")
+        choice = choices.get(app_id)
+        if policy == "blocked":
+            if choice is not None:
+                die(f"{label} selects blocked app {app_id!r}", code=2)
+            continue
+        managed = policy == "required" or choice == "managed"
+        if policy == "required" and choice not in {None, "managed"}:
+            die(f"{label} bypasses required managed app {app_id!r}", code=2)
+        if not managed:
+            continue
+        locked = lock_by_id.get(app_id)
+        if not isinstance(locked, dict):
+            die(f"{label} app {app_id!r} is absent from the signed release lock", code=2)
+        capabilities = locked.get("capabilities")
+        ceiling = ceilings.get(app_id, [])
+        if (not isinstance(capabilities, list)
+                or any(not isinstance(item, str) for item in capabilities)
+                or capabilities != sorted(set(capabilities))
+                or not isinstance(ceiling, list)
+                or any(not isinstance(item, str) for item in ceiling)
+                or not set(capabilities) <= set(ceiling)):
+            die(f"{label} capabilities for {app_id!r} exceed the accepted local ceiling", code=2)
+        package_path = release_path / str(locked.get("path", ""))
+        if not package_path.is_dir() or package_path.is_symlink():
+            die(f"{label} package path is not a real directory: {package_path}", code=2)
+        rows.append({
+            "capabilities": capabilities,
+            "id": app_id,
+            "package_digest": locked.get("digest"),
+            "path": str(package_path.resolve()),
+            "policy": policy,
+            "source_class": "managed",
+        })
+    return rows
+
+
+def _authenticate_managed_receipt(
+    config_origin: Path,
+    config_snapshot: Path,
+    config_raw: bytes,
+    cfg: dict,
+) -> dict[str, dict]:
+    """Load a frozen installer receipt and authenticate its producer inputs.
+
+    The receipt digest detects byte drift; it is not authority by itself.  The
+    installer must separately provide the state/release/authority paths from its
+    closed UPDATE_CHANNEL handoff.  Every config process re-verifies the signed
+    producer authority while retaining the receipt's immutable verified-state
+    fact after a later selection transaction advances the mutable state file.
+    """
+    names = {
+        "AIRLOCK_MANAGED_CONFIG_RECEIPT",
+        "AIRLOCK_MANAGED_CONFIG_RECEIPT_SHA256",
+        "AIRLOCK_MANAGED_STATE",
+        "AIRLOCK_MANAGED_RELEASE",
+        "AIRLOCK_MANAGED_AUTHORITY",
+    }
+    present = {name for name in names if os.environ.get(name)}
+    if not present:
+        return {}
+    if present != names:
+        die("managed config authority is incomplete; receipt, receipt digest, "
+            "state, release and authority must be supplied together", code=2)
+    if not os.environ.get("AIRLOCK_CONFIG_SNAPSHOT"):
+        die("managed config receipt requires an authenticated install snapshot", code=2)
+
+    receipt_path = _managed_absolute_env("AIRLOCK_MANAGED_CONFIG_RECEIPT")
+    state_path = _managed_absolute_env("AIRLOCK_MANAGED_STATE")
+    release_path = _managed_absolute_env("AIRLOCK_MANAGED_RELEASE")
+    authority_path = _managed_absolute_env("AIRLOCK_MANAGED_AUTHORITY")
+    receipt, receipt_raw = _managed_json_file(
+        receipt_path, "managed config receipt", private=True,
+    )
+    expected_receipt_sha = os.environ["AIRLOCK_MANAGED_CONFIG_RECEIPT_SHA256"]
+    if (re.fullmatch(r"[0-9a-f]{64}", expected_receipt_sha) is None
+            or hashlib.sha256(receipt_raw).hexdigest() != expected_receipt_sha):
+        die("managed config receipt is missing its exact SHA-256 authority or changed", code=2)
+
+    return _authenticate_managed_receipt_value(
+        receipt, config_origin, config_snapshot, config_raw, cfg,
+        state_path, release_path, authority_path,
+    )
+
+
+def _authenticate_managed_receipt_value(
+    receipt: dict,
+    config_origin: Path,
+    config_snapshot: Path,
+    config_raw: bytes,
+    cfg: dict,
+    state_path: Path,
+    release_path: Path,
+    authority_path: Path,
+) -> dict[str, dict]:
+    """Verify one canonical producer receipt before or after config replacement."""
+
+    expected_keys = {
+        "authority_membership_digest", "authority_path", "authority_sequence",
+        "catalog_digest", "channel_id", "config_digest", "config_origin",
+        "config_path", "config_sha256", "epoch", "local_config_digest",
+        "lock_digest", "managed_packages", "organization_id", "projection_digest",
+        "release_mode", "release_path", "root_key_id", "schema",
+        "selection_digest", "selection_sequence", "sequence", "snapshot_digest",
+        "state_digest", "state_path", "target_profile", "verified_at", "verified_state",
+    }
+    if set(receipt) != expected_keys or receipt.get("schema") != "airlock.managed.config-receipt/v1":
+        die("managed config receipt has an unsupported closed shape", code=2)
+    digest_keys = {
+        "authority_membership_digest", "catalog_digest", "config_digest",
+        "local_config_digest", "lock_digest", "projection_digest", "root_key_id",
+        "selection_digest", "snapshot_digest", "state_digest",
+    }
+    if any(not isinstance(receipt.get(key), str)
+           or MANAGED_DIGEST_RE.fullmatch(receipt[key]) is None
+           for key in digest_keys):
+        die("managed config receipt has an invalid signed-input digest", code=2)
+    if (not isinstance(receipt.get("config_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", receipt["config_sha256"]) is None
+            or receipt["config_sha256"] != receipt["config_digest"].removeprefix("sha256:")):
+        die("managed config receipt has an invalid effective-config SHA-256", code=2)
+    for key in ("authority_sequence", "epoch", "selection_sequence", "sequence"):
+        if isinstance(receipt.get(key), bool) or not isinstance(receipt.get(key), int) or receipt[key] < 1:
+            die(f"managed config receipt {key} must be a positive integer", code=2)
+    for key in ("channel_id", "organization_id", "target_profile", "verified_at"):
+        if not isinstance(receipt.get(key), str) or not receipt[key]:
+            die(f"managed config receipt {key} must be a non-empty string", code=2)
+    if receipt.get("release_mode") not in {"signed-stage", "promoted-current"}:
+        die("managed config receipt release_mode is invalid", code=2)
+
+    expected_paths = {
+        "state_path": str(state_path),
+        "release_path": str(release_path),
+        "authority_path": str(authority_path),
+        "config_origin": str(config_origin),
+        "config_path": str(config_snapshot.absolute()),
+    }
+    if any(receipt.get(key) != value for key, value in expected_paths.items()):
+        die("managed config receipt paths do not match the independently supplied producer authority", code=2)
+    actual_config_digest = _managed_digest(config_raw)
+    if receipt["config_digest"] != actual_config_digest:
+        die("managed config snapshot and receipt do not name the same bytes", code=2)
+
+    verified = subprocess.run([
+        sys.executable, str(MANAGED_RELEASE), "verify", "--stage", str(release_path),
+        "--signed", "--authority", str(authority_path), "--at", receipt["verified_at"],
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+       env=_managed_release_verifier_environment(
+           receipt["release_mode"], release_path, receipt["channel_id"],
+       ))
+    if verified.returncode != 0:
+        reason = verified.stderr.decode(errors="replace").strip()
+        die(f"managed receipt producer release verification failed: "
+            f"{reason or f'exit {verified.returncode}'}", code=2)
+    try:
+        verification = json.loads(verified.stdout, object_pairs_hook=_managed_json_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        die(f"managed release verifier returned invalid JSON: {exc}", code=2)
+    if (verified.stdout != _managed_canonical(verification)
+            or set(verification) != {
+                "bundle_digest", "membership_digest", "publisher_key_id", "snapshot_digest",
+            }
+            or verification["snapshot_digest"] != receipt["snapshot_digest"]
+            or verification["membership_digest"] != receipt["authority_membership_digest"]):
+        die("managed receipt does not match the signed release verification", code=2)
+
+    catalog, catalog_raw = _managed_json_file(release_path / "catalog.json", "managed catalog")
+    lock, lock_raw = _managed_json_file(release_path / "release.lock", "managed release lock")
+    snapshot, _snapshot_raw = _managed_json_file(release_path / "snapshot.json", "managed snapshot")
+    membership, membership_raw = _managed_json_file(
+        authority_path / "current-membership.json", "managed current membership",
+    )
+    try:
+        root_raw = (authority_path / "root-public.der").read_bytes()
+    except OSError as exc:
+        die(f"cannot read managed authority root: {exc}", code=2)
+    if (_managed_digest(catalog_raw) != receipt["catalog_digest"]
+            or _managed_digest(lock_raw) != receipt["lock_digest"]
+            or _managed_digest(membership_raw) != receipt["authority_membership_digest"]
+            or _managed_digest(root_raw) != receipt["root_key_id"]):
+        die("managed receipt input digests differ from the verified producer inputs", code=2)
+    if (membership.get("sequence") != receipt["authority_sequence"]
+            or membership.get("root_key_id") != receipt["root_key_id"]
+            or snapshot.get("organization_id") != receipt["organization_id"]
+            or snapshot.get("channel_id") != receipt["channel_id"]
+            or snapshot.get("epoch") != receipt["epoch"]
+            or snapshot.get("sequence") != receipt["sequence"]
+            or snapshot.get("target_profile") != receipt["target_profile"]):
+        die("managed receipt identity differs from the verified release or authority", code=2)
+
+    state = receipt.get("verified_state")
+    if (not isinstance(state, dict)
+            or _managed_digest(_managed_canonical(state)) != receipt["state_digest"]):
+        die("managed receipt has an invalid frozen verified-state fact", code=2)
+    expected_state_keys = {
+        "authority", "capability_ceilings", "enrollment_digest", "legacy_adoption",
+        "organization_id", "owner_selection", "owner_selection_digest", "root_key_id",
+        "schema", "snapshot",
+    }
+    selection = state.get("owner_selection")
+    state_snapshot = state.get("snapshot")
+    state_authority = state.get("authority")
+    if (set(state) != expected_state_keys
+            or state.get("schema") != "airlock.managed.box-state/v1"
+            or not isinstance(selection, dict)
+            or not isinstance(state_snapshot, dict)
+            or not isinstance(state_authority, dict)
+            or state.get("organization_id") != receipt["organization_id"]
+            or state.get("root_key_id") != receipt["root_key_id"]
+            or state.get("owner_selection_digest") != receipt["selection_digest"]
+            or _managed_digest(_managed_canonical(selection)) != receipt["selection_digest"]
+            or selection.get("sequence") != receipt["selection_sequence"]
+            or selection.get("snapshot_digest") != receipt["snapshot_digest"]
+            or state_snapshot.get("snapshot_digest") != receipt["snapshot_digest"]
+            or state_snapshot.get("channel_id") != receipt["channel_id"]
+            or state_snapshot.get("epoch") != receipt["epoch"]
+            or state_snapshot.get("sequence") != receipt["sequence"]
+            or state_authority.get("membership_digest") != receipt["authority_membership_digest"]
+            or state_authority.get("sequence") != receipt["authority_sequence"]):
+        die("managed receipt is not bound to its frozen accepted selection state", code=2)
+
+    expected_packages = _managed_rows_from_state(
+        catalog, lock, state, release_path, "managed receipt producer inputs",
+    )
+    cfg_apps = cfg.get("apps") or {}
+    cfg_packages = cfg.get("packages") or {}
+    for row in expected_packages:
+        app_id = row["id"]
+        package_table = cfg_packages.get(app_id) if isinstance(cfg_packages, dict) else None
+        if (app_id not in cfg_apps or not isinstance(package_table, dict)
+                or package_table != {"path": row["path"]}):
+            die(f"effective config does not contain the exact managed package {app_id!r}", code=2)
+    if receipt.get("managed_packages") != expected_packages:
+        die("managed config receipt package provenance differs from signed state/release inputs", code=2)
+    return {row["id"]: row for row in expected_packages}
+
+
+def _authenticate_managed_projector_input(cfg: dict) -> dict[str, dict]:
+    """Classify the producer's candidate during projector-internal validation.
+
+    The projector validates both the unchanged operator config and its candidate.
+    Only selected package paths which exactly match the signed release are
+    managed here; the operator input therefore keeps its ordinary explicit
+    semantics while the projected candidate can validate signed capabilities.
+    """
+    names = {
+        "AIRLOCK_MANAGED_PROJECTOR_STATE",
+        "AIRLOCK_MANAGED_PROJECTOR_RELEASE",
+        "AIRLOCK_MANAGED_PROJECTOR_AUTHORITY",
+        "AIRLOCK_MANAGED_PROJECTOR_AT",
+        "AIRLOCK_MANAGED_PROJECTOR_RELEASE_MODE",
+    }
+    present = {name for name in names if os.environ.get(name)}
+    if not present:
+        return {}
+    if present != names:
+        die("managed projector validation authority is incomplete", code=2)
+    state_path = Path(os.environ["AIRLOCK_MANAGED_PROJECTOR_STATE"]).expanduser()
+    release_path = Path(os.environ["AIRLOCK_MANAGED_PROJECTOR_RELEASE"]).expanduser()
+    authority_path = Path(os.environ["AIRLOCK_MANAGED_PROJECTOR_AUTHORITY"]).expanduser()
+    if not all(path.is_absolute() for path in (state_path, release_path, authority_path)):
+        die("managed projector validation authority paths must be absolute", code=2)
+    verified_at = os.environ["AIRLOCK_MANAGED_PROJECTOR_AT"]
+    release_mode = os.environ["AIRLOCK_MANAGED_PROJECTOR_RELEASE_MODE"]
+    state, _state_raw = _managed_json_file(
+        state_path, "managed projector state", private=True,
+    )
+    state_snapshot = state.get("snapshot")
+    if not isinstance(state_snapshot, dict):
+        die("managed projector state has no snapshot identity", code=2)
+    verified = subprocess.run([
+        sys.executable, str(MANAGED_RELEASE), "verify", "--stage", str(release_path),
+        "--signed", "--authority", str(authority_path), "--at", verified_at,
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+       env=_managed_release_verifier_environment(
+           release_mode, release_path, state_snapshot.get("channel_id"),
+       ))
+    if verified.returncode != 0:
+        reason = verified.stderr.decode(errors="replace").strip()
+        die(f"managed projector validation authority failed: "
+            f"{reason or f'exit {verified.returncode}'}", code=2)
+    try:
+        verification = json.loads(verified.stdout, object_pairs_hook=_managed_json_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        die(f"managed projector release verifier returned invalid JSON: {exc}", code=2)
+    if (not isinstance(verification, dict)
+            or verified.stdout != _managed_canonical(verification)
+            or set(verification) != {
+                "bundle_digest", "membership_digest", "publisher_key_id", "snapshot_digest",
+            }):
+        die("managed projector release verifier returned an unsupported shape", code=2)
+    catalog, _catalog_raw = _managed_json_file(release_path / "catalog.json", "managed catalog")
+    lock, _lock_raw = _managed_json_file(release_path / "release.lock", "managed release lock")
+    snapshot, snapshot_raw = _managed_json_file(release_path / "snapshot.json", "managed snapshot")
+    membership, membership_raw = _managed_json_file(
+        authority_path / "current-membership.json", "managed current membership",
+    )
+    try:
+        root_raw = (authority_path / "root-public.der").read_bytes()
+    except OSError as exc:
+        die(f"cannot read managed projector authority root: {exc}", code=2)
+    state_authority = state.get("authority")
+    selection = state.get("owner_selection")
+    if (state.get("schema") != "airlock.managed.box-state/v1"
+            or not isinstance(state_authority, dict)
+            or not isinstance(state_snapshot, dict)
+            or not isinstance(selection, dict)
+            or state.get("root_key_id") != _managed_digest(root_raw)
+            or membership.get("root_key_id") != state.get("root_key_id")
+            or state_authority.get("membership_digest") != _managed_digest(membership_raw)
+            or state_authority.get("sequence") != membership.get("sequence")
+            or verification.get("membership_digest") != _managed_digest(membership_raw)
+            or state.get("organization_id") != snapshot.get("organization_id")
+            or state_snapshot.get("channel_id") != snapshot.get("channel_id")
+            or state_snapshot.get("epoch") != snapshot.get("epoch")
+            or state_snapshot.get("sequence") != snapshot.get("sequence")
+            or state_snapshot.get("snapshot_digest") != _managed_digest(snapshot_raw)
+            or verification.get("snapshot_digest") != _managed_digest(snapshot_raw)
+            or state.get("owner_selection_digest") != _managed_digest(_managed_canonical(selection))
+            or selection.get("snapshot_digest") != verification.get("snapshot_digest")):
+        die("managed projector validation input is not the accepted signed state", code=2)
+    cfg_packages = cfg.get("packages") or {}
+    authority = {}
+    for row in _managed_rows_from_state(
+            catalog, lock, state, release_path, "managed projector authority"):
+        app_id = row["id"]
+        configured = cfg_packages.get(app_id) if isinstance(cfg_packages, dict) else None
+        if not isinstance(configured, dict):
+            continue
+        if configured != {"path": row["path"]}:
+            continue
+        authority[app_id] = row
+    return authority
+
+
+def _managed_output_target(path: Path) -> "None":
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        die(f"managed config output must be a pre-created private regular file: {path} ({exc})", code=2)
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        die(f"managed config output must be a regular non-symlink file: {path}", code=2)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        die("managed config output must be owned by this uid with no group/other permissions", code=2)
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        die(f"managed config output parent must be a real directory: {path.parent}", code=2)
+
+
+def _atomic_managed_output(path: Path, raw: bytes) -> "None":
+    temporary = None
+    directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", dir=path.parent, prefix=".managed-config-", delete=False) as handle:
+            temporary = handle.name
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _managed_output_target(path)
+        os.replace(temporary, path)
+        temporary = None
+        os.fsync(directory_fd)
+    except OSError as exc:
+        die(f"cannot atomically replace managed config output {path}: {exc}", code=2)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        os.close(directory_fd)
+
+
+def _load_managed_projection(
+    raw: bytes,
+    projector_receipt_raw: bytes,
+    projection_path: Path,
+    local_config_digest: str,
+) -> tuple[dict, bytes, dict]:
+    try:
+        projection = json.loads(raw, object_pairs_hook=_managed_json_pairs)
+        projector_receipt = json.loads(
+            projector_receipt_raw, object_pairs_hook=_managed_json_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        die(f"managed projector returned invalid JSON: {exc}", code=2)
+    if not isinstance(projection, dict) or raw != _managed_canonical(projection):
+        die("managed projector returned a non-canonical projection", code=2)
+    expected_projection = {
+        "apps", "channel_id", "config_digest", "config_toml", "epoch", "inputs",
+        "organization_id", "schema", "selection_sequence", "sequence",
+        "snapshot_digest", "target_profile",
+    }
+    if set(projection) != expected_projection or projection.get("schema") != "airlock.managed.desired-projection/v1":
+        die("managed projector returned an unsupported projection shape", code=2)
+    inputs = projection.get("inputs")
+    expected_inputs = {
+        "catalog_digest", "local_config_digest", "lock_digest", "selection_digest",
+        "state_digest",
+    }
+    if not isinstance(inputs, dict) or set(inputs) != expected_inputs:
+        die("managed projector returned an unsupported input-digest shape", code=2)
+    digest_values = [
+        projection.get("config_digest"), projection.get("snapshot_digest"),
+        inputs.get("catalog_digest"), inputs.get("local_config_digest"),
+        inputs.get("lock_digest"), inputs.get("selection_digest"), inputs.get("state_digest"),
+    ]
+    if any(not isinstance(value, str) or MANAGED_DIGEST_RE.fullmatch(value) is None
+           for value in digest_values):
+        die("managed projector returned an invalid digest", code=2)
+    if inputs["local_config_digest"] != local_config_digest:
+        die("managed projector did not consume the frozen operator config", code=2)
+    config_toml = projection.get("config_toml")
+    if not isinstance(config_toml, str):
+        die("managed projector returned non-text config_toml", code=2)
+    config_raw = config_toml.encode()
+    if projection["config_digest"] != _managed_digest(config_raw):
+        die("managed projector config digest differs from config_toml", code=2)
+    if (not isinstance(projector_receipt, dict)
+            or set(projector_receipt) != {"output", "projection_digest"}
+            or projector_receipt["output"] != str(projection_path)
+            or projector_receipt["projection_digest"] != _managed_digest(raw)):
+        die("managed projector receipt does not bind the projection bytes", code=2)
+    return projection, config_raw, projector_receipt
+
+
+@contextlib.contextmanager
+def _managed_state_lease(
+    state: str,
+    release: str,
+    authority: str,
+    verified_at: str,
+    release_mode: str,
+    channel_id: str,
+):
+    """Yield a final verified inspection while its writer lock stays held."""
+    command = [
+        sys.executable, str(MANAGED_STATE), "inspect-verified",
+        "--state", state, "--release", release, "--authority", authority,
+        "--at", verified_at, "--lease",
+    ]
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_managed_release_verifier_environment(
+            release_mode, Path(release), channel_id,
+        ),
+    )
+    acknowledged = False
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        raw = process.stdout.readline()
+        if not raw:
+            reason = process.stderr.read().decode(errors="replace").strip()
+            process.wait()
+            die(f"final managed state verification failed: {reason or f'exit {process.returncode}'}", code=2)
+        try:
+            inspection = json.loads(raw, object_pairs_hook=_managed_json_pairs)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            die(f"final managed state verification returned invalid JSON: {exc}", code=2)
+        expected = {
+            "authority", "legacy_owner_identity_digest", "organization_id", "root_key_id",
+            "selection", "selection_digest", "snapshot", "state_digest",
+        }
+        if (not isinstance(inspection, dict) or set(inspection) != expected
+                or raw != _managed_canonical(inspection)
+                or not isinstance(inspection.get("state_digest"), str)
+                or MANAGED_DIGEST_RE.fullmatch(inspection["state_digest"]) is None
+                or not isinstance(inspection.get("selection_digest"), str)
+                or MANAGED_DIGEST_RE.fullmatch(inspection["selection_digest"]) is None):
+            die("final managed state verification returned an unsupported inspection", code=2)
+        yield inspection
+        assert process.stdin is not None
+        process.stdin.write(b"\0")
+        process.stdin.flush()
+        process.stdin.close()
+        acknowledged = True
+        reason = process.stderr.read().decode(errors="replace").strip()
+        process.wait()
+        if process.returncode != 0:
+            die(f"final managed state lease failed: {reason or f'exit {process.returncode}'}", code=2)
+    finally:
+        if process.poll() is None:
+            if not acknowledged and process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def _require_projection_state_current(projection: dict, inspection: dict) -> None:
+    snapshot = inspection.get("snapshot")
+    selection = inspection.get("selection")
+    if (inspection["state_digest"] != projection["inputs"]["state_digest"]
+            or inspection["selection_digest"] != projection["inputs"]["selection_digest"]
+            or inspection.get("organization_id") != projection["organization_id"]
+            or not isinstance(snapshot, dict)
+            or snapshot.get("channel_id") != projection["channel_id"]
+            or snapshot.get("epoch") != projection["epoch"]
+            or snapshot.get("sequence") != projection["sequence"]
+            or snapshot.get("snapshot_digest") != projection["snapshot_digest"]
+            or not isinstance(selection, dict)
+            or selection.get("sequence") != projection["selection_sequence"]):
+        die("managed state changed before the effective config transaction", code=2)
+
+
+def _managed_receipt_value(
+    projection: dict,
+    projection_raw: bytes,
+    final_state: dict,
+    source: Path,
+    config_path: Path,
+    state: str,
+    release: str,
+    authority: str,
+    verified_at: str,
+    release_mode: str,
+) -> dict:
+    release_path = Path(release).expanduser().absolute()
+    state_path = Path(state).expanduser().absolute()
+    authority_path = Path(authority).expanduser().absolute()
+    frozen_state, frozen_state_raw = _managed_json_file(
+        state_path, "managed selection state", private=True,
+    )
+    if (_managed_digest(frozen_state_raw) != final_state["state_digest"]
+            or final_state["state_digest"] != projection["inputs"]["state_digest"]):
+        die("managed state changed while deriving the final receipt", code=2)
+    lock, lock_raw = _managed_json_file(release_path / "release.lock", "managed release lock")
+    if _managed_digest(lock_raw) != projection["inputs"]["lock_digest"]:
+        die("managed release lock changed after projection", code=2)
+    lock_packages = lock.get("packages")
+    if not isinstance(lock_packages, list):
+        die("managed release lock has no package array", code=2)
+    locked_by_id = {
+        row.get("id"): row for row in lock_packages if isinstance(row, dict)
+    }
+    if len(locked_by_id) != len(lock_packages):
+        die("managed release lock repeats or corrupts a package id", code=2)
+    managed_packages = []
+    for app in sorted(projection["apps"], key=lambda row: row["id"]):
+        if app["source_class"] != "managed":
+            continue
+        locked = locked_by_id.get(app["id"])
+        if (not isinstance(locked, dict)
+                or locked.get("path") != app["package_path"]
+                or locked.get("digest") != app["package_digest"]):
+            die(f"managed projection package {app['id']!r} differs from release.lock", code=2)
+        package_path = release_path / locked["path"]
+        if not package_path.is_dir() or package_path.is_symlink():
+            die(f"managed package path is not a real directory: {package_path}", code=2)
+        managed_packages.append({
+            "capabilities": locked["capabilities"],
+            "id": app["id"],
+            "package_digest": locked["digest"],
+            "path": str(package_path.resolve()),
+            "policy": app["policy"],
+            "source_class": "managed",
+        })
+    authority_state = final_state["authority"]
+    config_digest = projection["config_digest"]
+    return {
+        "authority_membership_digest": authority_state["membership_digest"],
+        "authority_path": str(authority_path),
+        "authority_sequence": authority_state["sequence"],
+        "catalog_digest": projection["inputs"]["catalog_digest"],
+        "channel_id": projection["channel_id"],
+        "config_digest": config_digest,
+        "config_origin": str(source),
+        "config_path": str(config_path.absolute()),
+        "config_sha256": config_digest.removeprefix("sha256:"),
+        "epoch": projection["epoch"],
+        "local_config_digest": projection["inputs"]["local_config_digest"],
+        "lock_digest": projection["inputs"]["lock_digest"],
+        "managed_packages": managed_packages,
+        "organization_id": projection["organization_id"],
+        "projection_digest": _managed_digest(projection_raw),
+        "release_mode": release_mode,
+        "release_path": str(release_path),
+        "root_key_id": final_state["root_key_id"],
+        "schema": "airlock.managed.config-receipt/v1",
+        "selection_digest": projection["inputs"]["selection_digest"],
+        "selection_sequence": projection["selection_sequence"],
+        "sequence": projection["sequence"],
+        "snapshot_digest": projection["snapshot_digest"],
+        "state_digest": projection["inputs"]["state_digest"],
+        "state_path": str(state_path),
+        "target_profile": projection["target_profile"],
+        "verified_at": verified_at,
+        "verified_state": frozen_state,
+    }
+
+
+def _managed_config_args(arguments: list[str]) -> tuple[str, str, str, str, str]:
+    values = {}
+    targets = []
+    release_mode = "signed-stage"
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {"--state", "--release", "--authority"}:
+            if argument in values or index + 1 >= len(arguments):
+                die(f"managed-config-snapshot requires one value for {argument}", code=2)
+            values[argument] = arguments[index + 1]
+            index += 2
+            continue
+        if argument == "--promoted-current":
+            if release_mode != "signed-stage":
+                die("managed-config-snapshot accepts --promoted-current once", code=2)
+            release_mode = "promoted-current"
+            index += 1
+            continue
+        if argument.startswith("-"):
+            die(f"unknown managed-config-snapshot argument: {argument}", code=2)
+        targets.append(argument)
+        index += 1
+    missing = sorted({"--state", "--release", "--authority"} - set(values))
+    if missing or len(targets) != 1:
+        die("managed-config-snapshot requires --state, --release, --authority, "
+            "and one private output path", code=2)
+    return (
+        values["--state"], values["--release"], values["--authority"],
+        targets[0], release_mode,
+    )
+
+
+def cmd_managed_config_snapshot(arguments: list[str]) -> "None":
+    state, release, authority, raw_output, release_mode = _managed_config_args(arguments)
+    output = Path(raw_output).expanduser().absolute()
+    _managed_output_target(output)
+    verified_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with tempfile.TemporaryDirectory(prefix="airlock-managed-config-") as temporary:
+        temporary_dir = Path(temporary)
+        config_snapshot = temporary_dir / "operator-config.toml"
+        projection_path = temporary_dir / "projection.json"
+        config_snapshot.touch(mode=0o600)
+        projection_path.touch(mode=0o600)
+        source, _source_raw, source_digest = _freeze_config(str(config_snapshot))
+        command = [
+            sys.executable, str(MANAGED_PROJECTOR), "--config", str(config_snapshot),
+            "--config-origin", str(source), "--release", release, "--authority", authority,
+            "--state", state, "--at", verified_at, "--out", str(projection_path),
+        ]
+        projector_env = _managed_clean_environment()
+        projector_env["AIRLOCK_MANAGED_PROJECTOR_STATE"] = str(
+            Path(state).expanduser().absolute()
+        )
+        projector_env["AIRLOCK_MANAGED_PROJECTOR_RELEASE"] = str(
+            Path(release).expanduser().absolute()
+        )
+        projector_env["AIRLOCK_MANAGED_PROJECTOR_AUTHORITY"] = str(
+            Path(authority).expanduser().absolute()
+        )
+        projector_env["AIRLOCK_MANAGED_PROJECTOR_AT"] = verified_at
+        projector_env["AIRLOCK_MANAGED_PROJECTOR_RELEASE_MODE"] = release_mode
+        if release_mode == "promoted-current":
+            state_value, _state_raw = _managed_json_file(
+                Path(state).expanduser().absolute(),
+                "managed promoted-current state", private=True,
+            )
+            snapshot = state_value.get("snapshot")
+            if not isinstance(snapshot, dict):
+                die("managed promoted-current state has no snapshot identity", code=2)
+            store, channel = _managed_promoted_coordinates(
+                Path(release), snapshot.get("channel_id"),
+            )
+            command.extend([
+                "--promoted-current", "--current-store", str(store),
+                "--current-channel", channel,
+            ])
+        projected = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            env=projector_env,
+        )
+        if projected.returncode != 0:
+            reason = projected.stderr.decode(errors="replace").strip()
+            die(f"managed config projection failed: {reason or f'exit {projected.returncode}'}", code=2)
+        try:
+            projection_raw = projection_path.read_bytes()
+        except OSError as exc:
+            die(f"cannot read managed projection output: {exc}", code=2)
+        projection, config_raw, _projector_receipt = _load_managed_projection(
+            projection_raw, projected.stdout, projection_path, "sha256:" + source_digest,
+        )
+
+        with _managed_state_lease(
+                state, release, authority, verified_at, release_mode,
+                projection["channel_id"],) as final_state:
+            _require_projection_state_current(projection, final_state)
+
+            candidate = temporary_dir / "effective-config.toml"
+            candidate.write_bytes(config_raw)
+            candidate.chmod(0o600)
+            validation_env = _managed_clean_environment()
+            validation_env["AIRLOCK_CONFIG"] = str(source)
+            validation_env["AIRLOCK_CONFIG_SNAPSHOT"] = str(candidate)
+            validation_env["AIRLOCK_CONFIG_SNAPSHOT_SHA256"] = hashlib.sha256(config_raw).hexdigest()
+            for name in (
+                "AIRLOCK_MANAGED_PROJECTOR_STATE", "AIRLOCK_MANAGED_PROJECTOR_RELEASE",
+                "AIRLOCK_MANAGED_PROJECTOR_AUTHORITY", "AIRLOCK_MANAGED_PROJECTOR_AT",
+                "AIRLOCK_MANAGED_PROJECTOR_RELEASE_MODE",
+            ):
+                validation_env[name] = projector_env[name]
+            validation = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "validate"],
+                env=validation_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            if validation.returncode != 0:
+                reason = validation.stderr.decode(errors="replace").strip()
+                die(f"projected managed config validation failed: {reason or f'exit {validation.returncode}'}", code=2)
+
+            receipt = _managed_receipt_value(
+                projection, projection_raw, final_state, source, output,
+                state, release, authority, verified_at, release_mode,
+            )
+            receipt_raw = _managed_canonical(receipt)
+            # Authenticate the exact final receipt and config bytes before the
+            # sole durable replacement.  The output pathname is an identity
+            # here; its old sentinel bytes are deliberately not read.
+            _authenticate_managed_receipt_value(
+                receipt, source, output, config_raw, tomllib.loads(config_raw.decode("utf-8")),
+                Path(state).expanduser().absolute(),
+                Path(release).expanduser().absolute(),
+                Path(authority).expanduser().absolute(),
+            )
+
+            _atomic_managed_output(output, config_raw)
+            try:
+                sys.stdout.buffer.write(receipt_raw)
+                sys.stdout.buffer.flush()
+            except (BrokenPipeError, OSError) as exc:
+                die("managed config receipt stdout failed after the effective-config "
+                    f"replacement linearized: {exc}", code=2)
 
 
 def _preflight_config_abi(cfg: dict) -> int:
@@ -3508,7 +4411,8 @@ def _render_package_lock(entries: dict[str, str]) -> bytes:
 
 def _bundle_admission(pid: str, pdir: Path, bundle_principal: bool,
                       granted_capabilities=(),
-                      requested_capabilities=()) -> tuple[set[str], list[str]]:
+                      requested_capabilities=(), *,
+                      source_class: str = "explicit") -> tuple[set[str], list[str]]:
     """Return the admitted elevated names and immutable certifications.
 
     A package id is not a principal.  Bundle policy applies only to the
@@ -3525,6 +4429,12 @@ def _bundle_admission(pid: str, pdir: Path, bundle_principal: bool,
     if unknown_grants:
         die(f"package '{pid}': unknown capability grant(s): "
             f"{sorted(unknown_grants)}")
+    if source_class == "managed":
+        if grants != requested:
+            die(f"managed package '{pid}': manifest-requested capabilities "
+                f"{sorted(requested)} differ from signed release capabilities "
+                f"{sorted(grants)}")
+        return grants, []
     non_grantable = grants - GRANTABLE_CAPABILITIES
     if non_grantable:
         die(f"package '{pid}': non-grantable capability grant(s): "
@@ -3581,7 +4491,7 @@ def package_specs(cfg: dict) -> dict:
     if not isinstance(pkgs_cfg, dict):
         die(f"[packages] must be a table; got {pkgs_cfg!r}")
     cfg_dir = find_config().parent
-    sources = {pid: (table, "explicit", False) for pid, table in pkgs_cfg.items()}
+    sources = {pid: (table, "explicit", False, ()) for pid, table in pkgs_cfg.items()}
     shipped_root_real = os.path.realpath(shipped_root)
     for pid in (cfg.get("apps") or {}):
         if pid in sources or pid in RESERVED_PACKAGE_IDS:
@@ -3598,7 +4508,12 @@ def package_specs(cfg: dict) -> dict:
             # excluded, not shipped.
             if (os.path.exists(manifest) and not app_dir.is_symlink()
                     and os.path.realpath(app_dir) == os.path.join(shipped_root_real, pid)):
-                sources[pid] = ({"path": str(manifest.parent)}, "shipped", True)
+                sources[pid] = ({"path": str(manifest.parent)}, "shipped", True, ())
+    for pid, authority in _MANAGED_PACKAGE_AUTHORITY.items():
+        configured = sources.get(pid)
+        if configured is None:
+            die(f"managed receipt package {pid!r} disappeared from effective config", code=2)
+        sources[pid] = (configured[0], "managed", False, authority["capabilities"])
     if _DANGEROUS_ADMIT_UNVERIFIED is not None:
         selected_source = sources.get(_DANGEROUS_ADMIT_UNVERIFIED)
         if selected_source is None or selected_source[1] != "explicit":
@@ -3608,7 +4523,7 @@ def package_specs(cfg: dict) -> dict:
     prepared = {}
     missing_paths = []
     for pid in sorted(sources):
-        table, source_class, bundle_principal = sources[pid]
+        table, source_class, bundle_principal, authority_grants = sources[pid]
         if not isinstance(table, dict):
             die(f"[packages.{pid}] must be a table; got {table!r}")
         if not isinstance(pid, str) or PACKAGE_ID_RE.fullmatch(pid) is None:
@@ -3648,7 +4563,8 @@ def package_specs(cfg: dict) -> dict:
                 missing_paths.append((pid, raw, str(pdir)))
             else:
                 die(f"[packages.{pid}].path does not resolve to a directory: {pdir}")
-        prepared[pid] = (source_class, bundle_principal, granted, pdir)
+        effective_grants = authority_grants if source_class == "managed" else granted
+        prepared[pid] = (source_class, bundle_principal, effective_grants, pdir)
 
     if missing_paths:
         details = "\n".join(
@@ -3664,6 +4580,8 @@ def package_specs(cfg: dict) -> dict:
         spec = _parse_manifest_spec(pid, pdir, source_class,
                                     bundle_principal=bundle_principal,
                                     granted_capabilities=granted)
+        if source_class == "managed":
+            spec["signed_package_digest"] = _MANAGED_PACKAGE_AUTHORITY[pid]["package_digest"]
         if source_class == "explicit" and config_abi == CONFIG_ABI_VERSION:
             _, lock_override = _check_package_lock(pid, pdir, package_lock)
             if lock_override is not None:
@@ -3778,7 +4696,7 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
         # refused and are returned as data so the sheet can disable its button.
         grants |= requested & GRANTABLE_CAPABILITIES
     admitted, certifications = _bundle_admission(
-        pid, pdir, bundle_principal, grants, requested)
+        pid, pdir, bundle_principal, grants, requested, source_class=source_class)
     refused = requested - admitted
     if refused and not preview:
         if "rooted-artifact" in refused:
@@ -5862,7 +6780,7 @@ def main(argv: list[str]) -> int:
     if not argv:
         die("usage: airlock-config "
             "<validate|apps|catalog|init|plaintext|get|env|json|package-preview|"
-            "package-register-validate> [arg]",
+            "package-register-validate|managed-config-snapshot> [arg]",
             code=2)
     cmd, rest = argv[0], argv[1:]
     # `catalog` runs BEFORE load(): it answers "what could I install?", which is
@@ -5914,6 +6832,11 @@ def main(argv: list[str]) -> int:
         if len(rest) != 1:
             die("install-snapshot requires one private target path", code=2)
         cmd_install_snapshot(rest[0])
+        return 0
+    if cmd == "managed-config-snapshot":
+        if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+            die("--dangerously-admit-unverified has no meaning for managed-config-snapshot", code=2)
+        cmd_managed_config_snapshot(rest)
         return 0
     cfg = load()
     _preflight_config_abi(cfg)

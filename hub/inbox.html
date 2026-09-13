@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inbox</title>
+  <link rel="stylesheet" href="/assets/airlock-tokens.css">
+  <link rel="stylesheet" href="/assets/devmon-card-ui.css">
+  <link rel="stylesheet" href="/assets/devmon-inbox.css">
+  <style>body{margin:0;padding:12px;background:var(--airlock-canvas);font:14px var(--airlock-font);}.inbox-footer{margin-top:14px;text-align:right}.inbox-footer a{color:var(--airlock-primary);font-size:13px;text-decoration:none}</style>
+</head>
+<body>
+  <main class="devmon-inbox" id="inbox"></main>
+  <footer class="inbox-footer"><a href="/monitor/" target="_blank" rel="noopener noreferrer">Dev Monitor 에서 보기 ↗</a></footer>
+  <script src="/assets/devmon-card-ui.js"></script>
+  <script src="/assets/devmon-inbox.js"></script>
+  <script>DevmonInbox.mount(document.getElementById('inbox'), {mode:'full', title:false});</script>
+</body>
+</html>

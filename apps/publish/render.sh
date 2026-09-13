@@ -63,6 +63,7 @@ render_publish_unit_cleanup() {
   cat <<UNIT
 [Unit]
 Description=airlock publish — uploads TTL sweep (24h) + public snapshot expiry
+X-Airlock-About=매시간 업로드 TTL과 공개 스냅샷 만료를 정리해 오래된 공유 파일이 남지 않게 합니다. 정리 주기 뒤에도 만료 파일이 남거나 정상 파일이 사라지면 경로·상태 파일·정리 실행의 이상입니다.
 
 [Service]
 Type=oneshot

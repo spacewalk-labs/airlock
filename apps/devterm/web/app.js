@@ -948,14 +948,18 @@ function openTmuxMenu(anchor) {
 acct = (window.initAccounts || function () { const n = function () {}; return { openAcctMenu: n, applyAcctIconCls: n, startAcctIconWatch: n, hideAcctTip: n }; })({ flash: flash, postJson: postJson, mkFocus: mkFocus, closeTabPops: closeTabPops, placePop: placePop });
 
 // ---- secret drop (value -> a file on this box -> the terminal gets only a path token) ----
-// The implementation is secretdrop.js (window.initSecretDrop): the Airlock widget shows
-// the very same UI through panel.html, so only devterm's circumstances are injected here
-// (delivery into the terminal, and reaching the right box for a remote session).
+// The drop is the PLATFORM's (docs/tasks/active/platform-secret-drop.md): secretdrop.js
+// is hub/assets/accounts/secretdrop.js, aliased onto this origin by nginx, and its
+// secret-put/list/del calls are proxied by nginx to the platform surface — this app runs
+// no secret code. The Airlock widget shows the very same UI on the hub. What is injected
+// here is the adapter, and only that: delivery into the terminal, and reaching the right
+// box for a remote session.
 const secretUI = (window.initSecretDrop || function () {
   return { openSecretDrop: function () { flash('Secret drop unavailable — secretdrop.js not loaded', 3000, 'error'); } };
 })({
   flash: flash, postJson: postJson,
   sendInput: sendInput,
+  refocus: function () { uiRefocus(); },
   // A remote (*) session's agent runs on another host, so the token has to say how to
   // read this box's file — the same rule the upload token already follows.
   tokenTarget: function (path) {
@@ -1150,9 +1154,9 @@ function initSession() {
   }).catch(() => connect());
 }
 
-// Shared UI primitives (modal tone + clipboard copy) live in ui.js, which is also
-// loaded by panel.html — a page with no terminal. Only the post-copy focus target
-// differs per page, so app.js supplies it through the uiRefocus hook.
+// Shared UI primitives (modal tone + clipboard copy) live in ui.js. The post-copy focus
+// target is the terminal, supplied through the uiRefocus hook (the platform secret drop
+// gets the same target as its `refocus` dep above).
 window.uiRefocus = function () { if (typeof term !== 'undefined' && term) term.focus(); };
 
 // ---- source-button badge — shows at a glance which source has content. Empty = disabled (grey).

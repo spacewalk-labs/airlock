@@ -1,5 +1,6 @@
 [Unit]
 Description=airlock — check how long the provider credentials on this box have left
+X-Airlock-About=주기적으로 공급자 자격 증명의 남은 유효 시간을 점검해 경고 카드를 만듭니다. 예정된 점검 뒤 결과가 갱신되지 않거나 만료 임박 상태가 보고되지 않으면 검사·스냅샷·메시지 경로의 이상입니다.
 Documentation=file:@APPDIR@/README.md
 # A separate unit rather than a line in this one, for the reason live/systemd's weekly
 # verification records: a run that dies takes this ExecStart with it, and anything that

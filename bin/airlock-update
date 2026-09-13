@@ -42,6 +42,16 @@ set -uo pipefail
 
 airlock_update_program() {
 main() {
+  # Managed authority is never inherited from a caller.  U1 derives it only from
+  # the fixed root-owned anchor; scrub both the established consumer/projector
+  # variables and future update-channel lookalikes before any mode decision.
+  local _managed_name
+  while IFS='=' read -r _managed_name _; do
+    case "$_managed_name" in
+      AIRLOCK_MANAGED_*|AIRLOCK_UPDATE_CHANNEL_*) unset "$_managed_name" ;;
+    esac
+  done < <(env)
+
   local RELEASE_URL="${AIRLOCK_RELEASE_URL:-https://github.com/spacewalk-labs/airlock}"
   local RELEASE_REF="${AIRLOCK_RELEASE_REF:-main}"
   # A remote of our own, so we never touch `origin` — on an installed box that is the
@@ -117,9 +127,23 @@ main() {
   # after, and the update is `git reset --hard` away from being undone. A box that
   # never ran `git init` gets one here rather than a second, hand-rolled backup path
   # to keep correct.
-  local scratch; scratch="$(mktemp -d)"
+  local scratch scratch_created
+  scratch_created="$(mktemp -d)" \
+    || die "업데이트용 비공개 임시 디렉터리를 만들지 못했습니다"
+  scratch="$(canonical_private_scratch "$scratch_created")" || {
+    rmdir -- "$scratch_created" 2>/dev/null || true
+    die "업데이트용 임시 디렉터리를 안전한 절대 경로로 고정하지 못했습니다"
+  }
   # shellcheck disable=SC2064   # $scratch must expand now, not at trap time
   trap "release_update_mutex; rm -rf '$scratch'" EXIT
+  local managed_context=""
+  if [ "$dry" != 1 ] && [ "$do_install" = 1 ] && [ "$(platform)" != Darwin ] \
+     && { [ -e /etc/airlock/managed-channel.json ] \
+          || [ -L /etc/airlock/managed-channel.json ]; }; then
+    managed_context="$scratch/managed-context.json"
+    prepare_managed_update_context "$scratch" "$managed_context" \
+      || die "고정된 managed channel 등록과 trusted measurer 를 검증하지 못했습니다"
+  fi
   if [ ! -d .git ]; then
     if [ "$dry" = 1 ]; then
       # A preview must not create a repository in someone's directory, but every
@@ -172,6 +196,29 @@ main() {
     || die "배포본을 받지 못했습니다 — 인터넷 연결을 확인해 주세요. (레포는 공개라 로그인은 필요 없습니다)"
   local new; new="$(git rev-parse --verify 'FETCH_HEAD^{commit}')" \
     || die "받은 내용을 commit 으로 읽지 못했습니다"
+  if [ -n "$managed_context" ]; then
+    managed_capture "$scratch/core-measurement.json" \
+      python3 "$scratch/frozen-airlock-managed-release" measure-public-core \
+        --repository "$ROOT" --revision "$new" \
+      || die "설치된 trusted measurer 로 받은 public core 를 측정하지 못했습니다"
+    managed_utc_now "$scratch/current-at" \
+      || die "managed current 검증 시각을 고정하지 못했습니다"
+    local managed_at
+    IFS= read -r managed_at <"$scratch/current-at" \
+      || die "managed current 검증 시각을 읽지 못했습니다"
+    managed_capture "$scratch/current-release-before.json" \
+      python3 "$scratch/frozen-airlock-managed-release" resolve-current \
+        --store "$(managed_context_field "$managed_context" store_path)" \
+        --channel "$(managed_context_field "$managed_context" channel_id)" \
+        --authority "$(managed_context_field "$managed_context" authority_path)" \
+        --at "$managed_at" \
+      || die "고정된 managed channel 의 current release 를 검증하지 못했습니다"
+    validate_managed_precheckout \
+      "$managed_context" "$scratch/core-measurement.json" \
+      "$scratch/current-release-before.json" "$new" "$ROOT" \
+      "$scratch/current-release-path" \
+      || die "managed release 와 받은 public core 의 결속이 맞지 않습니다"
+  fi
   local direction direction_rc
   direction="$(release_direction "$new" "$installed_head" "$RELEASE_REF" "$RELEASE_URL")"
   direction_rc=$?
@@ -439,6 +486,9 @@ EOF
     arm_recovery "$recovery_dir" "$scratch" "$before" \
       "$config_path" "$(platform)" "$machine"
   fi
+  if [ -n "$managed_context" ] && [ "$rollback_ready" != 1 ]; then
+    die "managed update 는 검증된 업데이트 전 config/status 기준점 없이는 시작하지 않습니다"
+  fi
 
   # ---------------------------------------------------------------- 6) 덮어쓰기
   #
@@ -468,7 +518,11 @@ EOF
   # user units, the rendered nginx config, the package versions. Undoing the files and
   # re-running the installer is what returns the box, and the message above is worded
   # for the checkout because that is what it actually restores.
-  if [ "$(platform)" != Darwin ]; then
+  if [ "$(platform)" != Darwin ] && [ -n "$managed_context" ]; then
+    say "고정된 managed channel handoff 를 만드는 중…"
+    run_managed_installer "$managed_context" "$scratch" "$ROOT" "$new" "$config_path" \
+      || update_rc=$?
+  elif [ "$(platform)" != Darwin ]; then
     say "설치기를 다시 돌립니다…"
     AIRLOCK_CONFIG="$config_path" bash install/airlock-install.sh || update_rc=$?
   else
@@ -561,6 +615,767 @@ print(json.dumps({"available": available == "1", "changedCount": int(changed),
 PY
 )" || return 1
   printf '%s\n' "$output"
+}
+
+managed_private_target() { # <new-private-file>
+  local target="$1"
+  ( umask 077; set -C; : >"$target" ) || return 1
+  [ -f "$target" ] && [ ! -L "$target" ] \
+    && [ "$(stat -c '%a:%u:%g' "$target" 2>/dev/null)" = "600:$(id -u):$(id -g)" ]
+}
+
+canonical_private_scratch() { # <fresh-mktemp-directory>
+  python3 - "$1" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+try:
+    source_info = source.lstat()
+    resolved = source.resolve(strict=True)
+    resolved_info = resolved.lstat()
+except OSError as exc:
+    print(f"airlock-update scratch: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+if (source.is_symlink() or resolved.is_symlink()
+        or not resolved.is_absolute()
+        or not stat.S_ISDIR(source_info.st_mode)
+        or not stat.S_ISDIR(resolved_info.st_mode)
+        or (source_info.st_dev, source_info.st_ino) != (resolved_info.st_dev, resolved_info.st_ino)
+        or (resolved_info.st_uid, resolved_info.st_gid) != (os.geteuid(), os.getegid())
+        or stat.S_IMODE(resolved_info.st_mode) != 0o700
+        or any(ord(character) < 32 for character in str(resolved))):
+    print("airlock-update scratch: generated directory is not canonical owner-private storage",
+          file=sys.stderr)
+    raise SystemExit(2)
+print(resolved)
+PY
+}
+
+managed_capture() { # <new-private-file> <command...>
+  local target="$1"; shift
+  managed_private_target "$target" || return 1
+  "$@" >"$target"
+}
+
+managed_utc_now() { # <new-private-file>
+  local target="$1"
+  managed_private_target "$target" || return 1
+  python3 - "$target" <<'PY'
+import datetime
+import os
+import sys
+
+path = sys.argv[1]
+value = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+raw = value.isoformat().replace("+00:00", "Z") + "\n"
+fd = os.open(path, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0))
+with os.fdopen(fd, "w", encoding="ascii", newline="") as handle:
+    handle.write(raw)
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+}
+
+managed_file_line() { # <private-one-line-file>
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+if not raw.endswith(b"\n") or raw.count(b"\n") != 1 or b"\r" in raw:
+    raise SystemExit(2)
+value = raw[:-1].decode("utf-8")
+if not value or "\x00" in value:
+    raise SystemExit(2)
+print(value)
+PY
+}
+
+managed_context_field() { # <context> <closed-field>
+  python3 - "$1" "$2" <<'PY'
+import json
+import pathlib
+import sys
+
+path, field = sys.argv[1:]
+allowed = {"authority_path", "channel_id", "state_path", "store_path"}
+if field not in allowed:
+    raise SystemExit(2)
+value = json.loads(pathlib.Path(path).read_bytes())[field]
+if not isinstance(value, str) or not value or any(ord(ch) < 32 for ch in value):
+    raise SystemExit(2)
+print(value)
+PY
+}
+
+prepare_managed_update_context() { # <private-scratch> <new-context-file>
+  python3 - "$1" "$2" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+scratch = pathlib.Path(sys.argv[1])
+context_path = pathlib.Path(sys.argv[2])
+anchor_path = pathlib.Path("/etc/airlock/managed-channel.json")
+measurer_path = pathlib.Path("/opt/airlock/libexec/airlock-managed-release")
+frozen_path = scratch / "frozen-airlock-managed-release"
+uid, gid = os.geteuid(), os.getegid()
+sha = re.compile(r"sha256:[0-9a-f]{64}\Z")
+ident = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+def fail(message):
+    print(f"airlock-update managed preflight: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def canonical(value):
+    return (json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                       sort_keys=True) + "\n").encode()
+
+def object_pairs(rows):
+    value = {}
+    for key, item in rows:
+        if key in value:
+            fail(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+def read_json(path, label):
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                fail(f"{label} is not regular")
+            raw = handle.read()
+    except OSError as exc:
+        fail(f"cannot open {label}: {exc}")
+    try:
+        value = json.loads(raw, object_pairs_hook=object_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"{label} is invalid JSON: {exc}")
+    if canonical(value) != raw:
+        fail(f"{label} is not canonical JSON")
+    return value, raw, info
+
+def directory(path, owner, group, mode, label):
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot stat {label}: {exc}")
+    if (not stat.S_ISDIR(info.st_mode) or path.is_symlink()
+            or info.st_uid != owner or info.st_gid != group
+            or stat.S_IMODE(info.st_mode) != mode):
+        fail(f"{label} owner/mode/type is invalid")
+
+def protected_directory(path, label):
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot stat {label}: {exc}")
+    if (not stat.S_ISDIR(info.st_mode) or path.is_symlink()
+            or info.st_uid != 0 or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) & 0o022):
+        fail(f"{label} is not a protected root directory "
+             f"(uid={info.st_uid} gid={info.st_gid} mode={stat.S_IMODE(info.st_mode):04o})")
+
+def private_file(path, owner, group, label):
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot stat {label}: {exc}")
+    if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+            or info.st_uid != owner or info.st_gid != group
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        fail(f"{label} owner/mode/type is invalid")
+
+directory(scratch, uid, gid, 0o700, "private scratch")
+for path in (pathlib.Path("/"), pathlib.Path("/etc"), pathlib.Path("/etc/airlock")):
+    protected_directory(path, str(path))
+anchor, anchor_raw, anchor_info = read_json(anchor_path, "managed anchor")
+if (anchor_info.st_uid, anchor_info.st_gid, stat.S_IMODE(anchor_info.st_mode)) != (0, 0, 0o644):
+    fail("managed anchor must be root:root 0644")
+expected = {
+    "authority_path", "channel_id", "enrollment_digest", "organization_id",
+    "root_key_id", "schema", "state_path", "store_path", "writer_gid", "writer_uid",
+}
+if set(anchor) != expected or anchor.get("schema") != "airlock.managed.install-anchor/v1":
+    fail("managed anchor has an unsupported closed shape")
+if (type(anchor.get("writer_uid")) is not int
+        or type(anchor.get("writer_gid")) is not int
+        or anchor["writer_uid"] != uid or anchor["writer_gid"] != gid):
+    fail("managed anchor writer does not match updater euid/egid")
+for key in ("organization_id", "channel_id"):
+    if not isinstance(anchor.get(key), str) or ident.fullmatch(anchor[key]) is None:
+        fail(f"managed anchor {key} is invalid")
+for key in ("root_key_id", "enrollment_digest"):
+    if not isinstance(anchor.get(key), str) or sha.fullmatch(anchor[key]) is None:
+        fail(f"managed anchor {key} is invalid")
+
+namespace = pathlib.Path(f"/var/lib/airlock/managed/{uid}")
+expected_paths = {
+    "state_path": namespace / "managed-state.json",
+    "authority_path": namespace / "authority",
+    "store_path": namespace / "store",
+}
+for key, expected_path in expected_paths.items():
+    raw = anchor.get(key)
+    if not isinstance(raw, str) or pathlib.Path(raw) != expected_path or str(expected_path) != raw:
+        fail(f"managed anchor {key} is not its fixed canonical child")
+for path in (
+    pathlib.Path("/var"), pathlib.Path("/var/lib"), pathlib.Path("/var/lib/airlock"),
+    pathlib.Path("/var/lib/airlock/managed"),
+):
+    protected_directory(path, str(path))
+directory(namespace, uid, gid, 0o700, "delegated managed root")
+directory(expected_paths["authority_path"], uid, gid, 0o700, "managed authority")
+directory(expected_paths["store_path"], uid, gid, 0o700, "managed store")
+directory(expected_paths["store_path"] / "releases", uid, gid, 0o700, "managed releases")
+for path, label in (
+    (expected_paths["state_path"], "managed state"),
+    (expected_paths["state_path"].with_name("managed-state.json.lock"), "managed state lock"),
+    (expected_paths["authority_path"] / "root-public.der", "authority root"),
+    (expected_paths["authority_path"] / "current-membership.json", "authority membership"),
+    (expected_paths["store_path"] / ".promotion.lock", "promotion lock"),
+    (expected_paths["store_path"] / "release-state.json", "release state"),
+):
+    private_file(path, uid, gid, label)
+state, _state_raw, _state_info = read_json(expected_paths["state_path"], "managed state")
+snapshot = state.get("snapshot")
+if (state.get("schema") != "airlock.managed.box-state/v1"
+        or state.get("organization_id") != anchor["organization_id"]
+        or state.get("root_key_id") != anchor["root_key_id"]
+        or state.get("enrollment_digest") != anchor["enrollment_digest"]
+        or not isinstance(snapshot, dict)
+        or snapshot.get("channel_id") != anchor["channel_id"]):
+    fail("managed state does not match the root anchor")
+root_raw = (expected_paths["authority_path"] / "root-public.der").read_bytes()
+if "sha256:" + hashlib.sha256(root_raw).hexdigest() != anchor["root_key_id"]:
+    fail("authority root bytes do not match the anchor")
+
+for path in (
+    pathlib.Path("/opt"), pathlib.Path("/opt/airlock"),
+    pathlib.Path("/opt/airlock/libexec"),
+):
+    protected_directory(path, str(path))
+try:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(measurer_path, flags)
+    source_info = os.fstat(source_fd)
+except OSError as exc:
+    fail(f"cannot open installed trusted measurer: {exc}")
+if (not stat.S_ISREG(source_info.st_mode) or source_info.st_uid != 0
+        or source_info.st_gid != 0 or stat.S_IMODE(source_info.st_mode) != 0o555):
+    os.close(source_fd)
+    fail("installed trusted measurer must be root:root regular 0555")
+source_hash = hashlib.sha256()
+try:
+    target_fd = os.open(
+        frozen_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o500,
+    )
+    with os.fdopen(source_fd, "rb") as source, os.fdopen(target_fd, "wb") as target:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            source_hash.update(chunk)
+            target.write(chunk)
+        target.flush()
+        os.fsync(target.fileno())
+except OSError as exc:
+    fail(f"cannot freeze installed trusted measurer: {exc}")
+frozen_raw = frozen_path.read_bytes()
+installed_sha = source_hash.hexdigest()
+if hashlib.sha256(frozen_raw).hexdigest() != installed_sha:
+    fail("frozen trusted measurer digest differs from opened installed bytes")
+frozen_info = frozen_path.lstat()
+if (frozen_info.st_uid, frozen_info.st_gid, stat.S_IMODE(frozen_info.st_mode)) != (uid, gid, 0o500):
+    fail("frozen trusted measurer owner/mode changed")
+
+context = dict(anchor)
+context.update({
+    "anchor_path": str(anchor_path),
+    "anchor_sha256": hashlib.sha256(anchor_raw).hexdigest(),
+    "installed_measurer_sha256": installed_sha,
+    "schema": "airlock.update-channel.internal-context/v1",
+})
+raw = canonical(context)
+try:
+    fd = os.open(
+        context_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+except OSError as exc:
+    fail(f"cannot freeze managed context: {exc}")
+PY
+}
+
+validate_managed_precheckout() { # <context> <measurement> <current> <new> <repo> <new-release-path-file>
+  python3 - "$@" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+
+context_path, measurement_path, current_path, revision, repository, output_path = map(pathlib.Path, sys.argv[1:])
+revision = str(revision)
+sha40 = re.compile(r"[0-9a-f]{40}\Z")
+sha256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+def fail(message):
+    print(f"airlock-update managed binding: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def pairs(rows):
+    value = {}
+    for key, item in rows:
+        if key in value:
+            fail(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+def canonical(value):
+    return (json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode()
+
+def load(path, label):
+    raw = path.read_bytes()
+    value = json.loads(raw, object_pairs_hook=pairs)
+    if canonical(value) != raw:
+        fail(f"{label} is not canonical JSON")
+    return value, raw
+
+def root_anchor_raw(path):
+    for parent in (pathlib.Path("/"), pathlib.Path("/etc"), pathlib.Path("/etc/airlock")):
+        info = parent.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or parent.is_symlink()
+                or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            fail(f"root anchor parent is not protected: {parent}")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o644):
+            fail("root anchor owner/mode/type changed")
+        return handle.read()
+
+context, _ = load(context_path, "managed context")
+measurement, _ = load(measurement_path, "core measurement")
+current, _ = load(current_path, "current release")
+if set(measurement) != {"digest", "public_revision", "public_tree", "schema", "source_revision"}:
+    fail("core measurement shape is not closed")
+if measurement.get("schema") != "airlock.core-public-measurement/v1":
+    fail("core measurement schema is unsupported")
+current_keys = {
+    "authority_membership_digest", "authority_sequence", "bundle_digest",
+    "catalog_digest", "channel_id", "core_digest", "core_revision", "epoch",
+    "lock_digest", "organization_id", "promotion_membership_digest",
+    "promotion_receipt_digest", "promotion_receipt_path", "publisher_id",
+    "publisher_key_id", "receipt_id", "release_path", "requested_capabilities",
+    "root_key_id", "schema", "sequence", "snapshot_digest", "target_profile",
+    "verified_at",
+}
+if set(current) != current_keys or current.get("schema") != "airlock.managed.current-release/v1":
+    fail("current release shape is not closed")
+if sha40.fullmatch(revision) is None or measurement.get("public_revision") != revision:
+    fail("measurement does not name the exact fetched public commit")
+if (measurement.get("source_revision") != current.get("core_revision")
+        or measurement.get("digest") != current.get("core_digest")):
+    fail("private source revision or public core digest is not triple-bound")
+tree = subprocess.run(
+    ["git", "--no-replace-objects", "-C", str(repository), "rev-parse", "--verify", f"{revision}^{{tree}}"],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+)
+if tree.returncode != 0 or tree.stdout != (str(measurement.get("public_tree")) + "\n").encode():
+    fail("public tree differs from the independent Git object identity")
+for key in ("digest",):
+    if not isinstance(measurement.get(key), str) or sha256.fullmatch(measurement[key]) is None:
+        fail(f"core measurement {key} is invalid")
+for key in ("public_revision", "public_tree", "source_revision"):
+    if not isinstance(measurement.get(key), str) or sha40.fullmatch(measurement[key]) is None:
+        fail(f"core measurement {key} is invalid")
+if (current.get("channel_id") != context.get("channel_id")
+        or current.get("organization_id") != context.get("organization_id")
+        or current.get("root_key_id") != context.get("root_key_id")):
+    fail("current release identity differs from the root anchor")
+release = pathlib.Path(str(current.get("release_path")))
+expected_release = pathlib.Path(context["store_path"]) / "releases" / str(current["snapshot_digest"]).removeprefix("sha256:")
+if release != expected_release or not release.is_dir() or release.is_symlink():
+    fail("current release is not the exact fixed-store snapshot path")
+state, _ = load(pathlib.Path(context["state_path"]), "managed state")
+snapshot = state.get("snapshot")
+if (state.get("organization_id") != context.get("organization_id")
+        or state.get("root_key_id") != context.get("root_key_id")
+        or state.get("enrollment_digest") != context.get("enrollment_digest")
+        or not isinstance(snapshot, dict)
+        or snapshot.get("channel_id") != context.get("channel_id")
+        or snapshot.get("snapshot_digest") != current.get("snapshot_digest")):
+    fail("managed state is not bound to anchor and current release")
+anchor_raw = root_anchor_raw(pathlib.Path(context["anchor_path"]))
+if hashlib.sha256(anchor_raw).hexdigest() != context.get("anchor_sha256"):
+    fail("root anchor changed before checkout")
+fd = os.open(
+    output_path,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+with os.fdopen(fd, "wb") as handle:
+    handle.write((str(release) + "\n").encode())
+PY
+}
+
+freeze_managed_next_measurer() { # <repository> <revision> <candidate-source> <new-inert-runfile>
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import os
+import pathlib
+import stat
+import subprocess
+import sys
+
+repository = pathlib.Path(sys.argv[1])
+revision = sys.argv[2]
+source = pathlib.Path(sys.argv[3])
+target = pathlib.Path(sys.argv[4])
+try:
+    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    info = os.fstat(source_fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("candidate measurer is not regular")
+    tree = subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(repository), "ls-tree", revision,
+         "--", "bin/airlock-managed-release"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    fields = tree.stdout.rstrip(b"\n").split(None, 3)
+    if (tree.returncode != 0 or len(fields) != 4 or fields[0] != b"100644"
+            or fields[1] != b"blob" or fields[3] != b"bin/airlock-managed-release"):
+        raise OSError("fetched tree does not carry the expected inert measurer source")
+    expected = subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(repository), "cat-file", "blob",
+         f"{revision}:bin/airlock-managed-release"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if expected.returncode != 0:
+        raise OSError("cannot read candidate measurer from the fetched Git object")
+    incoming_raw = os.read(source_fd, info.st_size + 1)
+    if incoming_raw != expected.stdout:
+        raise OSError("checked-out candidate measurer differs from the fetched Git object")
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    target_fd = os.open(
+        target,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(source_fd, "rb") as incoming, os.fdopen(target_fd, "wb") as outgoing:
+        while True:
+            chunk = incoming.read(1024 * 1024)
+            if not chunk:
+                break
+            outgoing.write(chunk)
+        outgoing.flush()
+        os.fsync(outgoing.fileno())
+except OSError as exc:
+    print(f"airlock-update managed next measurer: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PY
+}
+
+run_managed_installer() { # <context> <scratch> <repository> <revision> <config-path>
+  local managed_context="$1" scratch="$2" repository="$3" revision="$4" config_path="$5"
+  local managed_receipt_at="" managed_handoff_sha="" managed_app=""
+  local -a managed_installer_args=()
+
+  freeze_managed_next_measurer \
+    "$repository" "$revision" "$repository/bin/airlock-managed-release" \
+    "$scratch/next-airlock-managed-release" \
+    || { say "후속 trusted measurer 후보 bytes 를 안전하게 고정하지 못했습니다"; return 2; }
+  managed_private_target "$scratch/effective.toml" \
+    || { say "managed effective config runfile 을 만들지 못했습니다"; return 2; }
+  managed_capture "$scratch/config-receipt.json" \
+    env AIRLOCK_CONFIG="$config_path" python3 "$repository/bin/airlock-config" \
+      managed-config-snapshot \
+      --state "$(managed_context_field "$managed_context" state_path)" \
+      --release "$(managed_file_line "$scratch/current-release-path")" \
+      --authority "$(managed_context_field "$managed_context" authority_path)" \
+      --promoted-current "$scratch/effective.toml" \
+    || { say "managed config producer 가 canonical receipt 를 완성하지 못했습니다"; return 2; }
+  managed_receipt_time "$scratch/config-receipt.json" "$scratch/receipt-at" \
+    || { say "managed config receipt 의 검증 시각이 유효하지 않습니다"; return 2; }
+  IFS= read -r managed_receipt_at <"$scratch/receipt-at" \
+    || { say "managed config receipt 의 검증 시각을 읽지 못했습니다"; return 2; }
+  managed_capture "$scratch/current-release.json" \
+    python3 "$scratch/frozen-airlock-managed-release" resolve-current \
+      --store "$(managed_context_field "$managed_context" store_path)" \
+      --channel "$(managed_context_field "$managed_context" channel_id)" \
+      --authority "$(managed_context_field "$managed_context" authority_path)" \
+      --at "$managed_receipt_at" \
+    || { say "producer 종료 뒤 managed current release 재검증에 실패했습니다"; return 2; }
+  build_managed_handoff \
+    "$managed_context" "$scratch/core-measurement.json" \
+    "$scratch/current-release-before.json" "$scratch/current-release.json" \
+    "$scratch/effective.toml" "$scratch/config-receipt.json" \
+    "$scratch/next-airlock-managed-release" "$revision" \
+    "$scratch/update-channel-handoff.json" "$scratch/selected-apps" \
+    "$scratch/update-channel-handoff.sha256" \
+    || { say "managed UPDATE_CHANNEL handoff 결속을 완성하지 못했습니다"; return 2; }
+  IFS= read -r managed_handoff_sha <"$scratch/update-channel-handoff.sha256" \
+    || { say "managed handoff digest 를 읽지 못했습니다"; return 2; }
+  managed_installer_args=(
+    "--update-channel-handoff=$scratch/update-channel-handoff.json"
+    "--update-channel-handoff-sha256=$managed_handoff_sha"
+  )
+  while IFS= read -r managed_app; do
+    [ -n "$managed_app" ] || continue
+    managed_installer_args+=("--select-app=$managed_app")
+  done <"$scratch/selected-apps"
+  [ "${#managed_installer_args[@]}" -gt 2 ] \
+    || { say "managed handoff 에 설치할 managed app 이 없습니다"; return 2; }
+  say "설치기를 다시 돌립니다 (managed channel)…"
+  AIRLOCK_CONFIG="$config_path" bash "$repository/install/airlock-install.sh" \
+    "${managed_installer_args[@]}"
+}
+
+managed_receipt_time() { # <canonical-receipt> <new-private-time-file>
+  python3 - "$1" "$2" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+source, target = map(pathlib.Path, sys.argv[1:])
+raw = source.read_bytes()
+value = json.loads(raw)
+canonical = (json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode()
+if raw != canonical or not isinstance(value.get("verified_at"), str):
+    raise SystemExit(2)
+parsed = datetime.datetime.fromisoformat(value["verified_at"].replace("Z", "+00:00"))
+if parsed.tzinfo is None:
+    raise SystemExit(2)
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+with os.fdopen(fd, "w", encoding="ascii", newline="") as handle:
+    handle.write(value["verified_at"] + "\n")
+PY
+}
+
+build_managed_handoff() { # context measurement current-before current config receipt next revision handoff apps digest
+  python3 - "$@" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+(context_path, measurement_path, before_path, current_path, config_path,
+ receipt_path, next_path, revision, handoff_path, apps_path,
+ handoff_digest_path) = sys.argv[1:]
+paths = [pathlib.Path(value) for value in (
+    context_path, measurement_path, before_path, current_path, config_path,
+    receipt_path, next_path, handoff_path, apps_path, handoff_digest_path,
+)]
+(context_path, measurement_path, before_path, current_path, config_path,
+ receipt_path, next_path, handoff_path, apps_path,
+ handoff_digest_path) = paths
+sha40 = re.compile(r"[0-9a-f]{40}\Z")
+shahex = re.compile(r"[0-9a-f]{64}\Z")
+appid = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+def fail(message):
+    print(f"airlock-update managed handoff: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def pairs(rows):
+    value = {}
+    for key, item in rows:
+        if key in value:
+            fail(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+def canonical(value):
+    return (json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode()
+
+def load(path, label):
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw, object_pairs_hook=pairs)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"cannot read {label}: {exc}")
+    if canonical(value) != raw:
+        fail(f"{label} is not canonical JSON")
+    return value, raw
+
+def root_anchor_raw(path):
+    for parent in (pathlib.Path("/"), pathlib.Path("/etc"), pathlib.Path("/etc/airlock")):
+        info = parent.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or parent.is_symlink()
+                or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            fail(f"root anchor parent is not protected: {parent}")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o644):
+            fail("root anchor owner/mode/type changed")
+        return handle.read()
+
+def raw_hash(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def private(path, owner, group, mode=0o600):
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+            or info.st_uid != owner or info.st_gid != group
+            or stat.S_IMODE(info.st_mode) != mode):
+        fail(f"private runfile is not regular owner-bound {mode:04o}: {path}")
+
+context, _context_raw = load(context_path, "managed context")
+measurement, measurement_raw = load(measurement_path, "core measurement")
+before, _before_raw = load(before_path, "initial current release")
+current, current_raw = load(current_path, "final current release")
+receipt, receipt_raw = load(receipt_path, "config receipt")
+uid, gid = context.get("writer_uid"), context.get("writer_gid")
+if type(uid) is not int or type(gid) is not int or (uid, gid) != (os.geteuid(), os.getegid()):
+    fail("managed context writer changed")
+scratch = context_path.parent
+info = scratch.lstat()
+if (not stat.S_ISDIR(info.st_mode) or scratch.is_symlink()
+        or (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (uid, gid, 0o700)):
+    fail("managed scratch owner/mode/type changed")
+for path in (measurement_path, before_path, current_path, config_path, receipt_path, next_path):
+    if path.parent != scratch:
+        fail("managed payload escaped the single private run directory")
+    private(path, uid, gid)
+if hashlib.sha256(root_anchor_raw(pathlib.Path(context["anchor_path"]))).hexdigest() != context.get("anchor_sha256"):
+    fail("root anchor changed before installer handoff")
+identity_keys = set(before) - {"verified_at"}
+if set(current) - {"verified_at"} != identity_keys or any(before[key] != current[key] for key in identity_keys):
+    fail("managed current identity changed across the producer")
+if current.get("verified_at") != receipt.get("verified_at"):
+    fail("final current verification did not use the receipt instant")
+if (measurement.get("public_revision") != revision
+        or measurement.get("source_revision") != current.get("core_revision")
+        or measurement.get("digest") != current.get("core_digest")):
+    fail("core measurement lost its public/private/signed triple binding")
+if sha40.fullmatch(revision) is None:
+    fail("fetched public revision is not full lowercase SHA")
+receipt_keys = {
+    "authority_membership_digest", "authority_path", "authority_sequence",
+    "catalog_digest", "channel_id", "config_digest", "config_origin",
+    "config_path", "config_sha256", "epoch", "local_config_digest",
+    "lock_digest", "managed_packages", "organization_id", "projection_digest",
+    "release_mode", "release_path", "root_key_id", "schema", "selection_digest",
+    "selection_sequence", "sequence", "snapshot_digest", "state_digest",
+    "state_path", "target_profile", "verified_at", "verified_state",
+}
+if set(receipt) != receipt_keys or receipt.get("schema") != "airlock.managed.config-receipt/v1":
+    fail("config receipt shape is not closed")
+expected = {
+    "authority_membership_digest": current.get("authority_membership_digest"),
+    "authority_sequence": current.get("authority_sequence"),
+    "catalog_digest": current.get("catalog_digest"),
+    "channel_id": context.get("channel_id"),
+    "epoch": current.get("epoch"),
+    "lock_digest": current.get("lock_digest"),
+    "organization_id": context.get("organization_id"),
+    "release_mode": "promoted-current",
+    "release_path": current.get("release_path"),
+    "root_key_id": context.get("root_key_id"),
+    "sequence": current.get("sequence"),
+    "snapshot_digest": current.get("snapshot_digest"),
+    "state_path": context.get("state_path"),
+    "target_profile": current.get("target_profile"),
+}
+for key, value in expected.items():
+    if receipt.get(key) != value:
+        fail(f"config receipt {key} lost its anchor/current binding")
+if receipt.get("authority_path") != context.get("authority_path"):
+    fail("config receipt authority path is not anchor-derived")
+if receipt.get("config_path") != str(config_path):
+    fail("config receipt does not name the frozen effective config")
+config_sha = raw_hash(config_path)
+if receipt.get("config_sha256") != config_sha or receipt.get("config_digest") != "sha256:" + config_sha:
+    fail("effective config bytes differ from the receipt")
+verified_state = receipt.get("verified_state")
+if (not isinstance(verified_state, dict)
+        or verified_state.get("organization_id") != context.get("organization_id")
+        or verified_state.get("root_key_id") != context.get("root_key_id")
+        or verified_state.get("enrollment_digest") != context.get("enrollment_digest")):
+    fail("receipt frozen state is not enrolled by the root anchor")
+packages = receipt.get("managed_packages")
+if not isinstance(packages, list) or not packages:
+    fail("config receipt contains no managed packages")
+selected = []
+for row in packages:
+    if (not isinstance(row, dict) or set(row) != {
+            "capabilities", "id", "package_digest", "path", "policy", "source_class"
+        } or row.get("source_class") != "managed"
+            or not isinstance(row.get("id"), str) or appid.fullmatch(row["id"]) is None):
+        fail("config receipt managed package row is invalid")
+    selected.append(row["id"])
+if selected != sorted(set(selected)):
+    fail("managed selected app ids are not sorted and unique")
+
+next_sha = raw_hash(next_path)
+handoff = {
+    "actor": "update-channel",
+    "anchor_path": context["anchor_path"],
+    "anchor_sha256": context["anchor_sha256"],
+    "config_path": str(config_path),
+    "config_sha256": config_sha,
+    "core_measurement_path": str(measurement_path),
+    "core_measurement_sha256": hashlib.sha256(measurement_raw).hexdigest(),
+    "current_release_path": str(current_path),
+    "current_release_sha256": hashlib.sha256(current_raw).hexdigest(),
+    "fetched_public_revision": revision,
+    "installed_measurer_sha256": context["installed_measurer_sha256"],
+    "next_measurer_path": str(next_path),
+    "next_measurer_sha256": next_sha,
+    "receipt_path": str(receipt_path),
+    "receipt_sha256": hashlib.sha256(receipt_raw).hexdigest(),
+    "schema": "airlock.update-channel.install-handoff/v1",
+    "selected_apps": selected,
+}
+handoff_raw = canonical(handoff)
+for path, raw in (
+    (handoff_path, handoff_raw),
+    (apps_path, ("\n".join(selected) + "\n").encode()),
+    (handoff_digest_path, (hashlib.sha256(handoff_raw).hexdigest() + "\n").encode()),
+):
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+    private(path, uid, gid)
+PY
 }
 
 release_tree_matches_state() { # <public-release-commit> <local-commit-or-empty-for-worktree>

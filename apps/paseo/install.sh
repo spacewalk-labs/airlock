@@ -52,14 +52,17 @@ AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-paseo}"
 . "$HERE/render.sh"
 
 airlock_load paseo
-# Return-widget menu attributes. With devterm installed the widget's tap opens a small
-# menu (return to Airlock / subscription accounts) instead of navigating straight away —
-# this app owns the whole screen, so the account panel has no other way in. Without
-# devterm there is nothing to open, so the attributes stay empty and a tap navigates.
+# Return-widget menu attributes. Both destinations are platform-owned and live under
+# the hub's owner-gated /airlock-accounts/ prefix: Subscription accounts and Secret
+# drop survive devterm being absent, stopped, or unreachable. They remain separate
+# attributes so each row keeps a single authority; the legacy data-panel input is
+# accepted by the widget as an account-only alias but is no longer emitted here.
+# Without an FQDN the platform URL cannot be addressed, so the widget keeps its plain
+# return-to-Airlock behavior instead of rendering dead rows.
 WIDGET_MENU_ATTRS=""
-PANEL_URL="$(airlock_panel_url || true)"
-if [ -n "$PANEL_URL" ]; then
-  WIDGET_MENU_ATTRS=" data-menu=\"1\" data-panel=\"${PANEL_URL}\""
+PLATFORM_PANEL_URL="$(airlock_secret_panel_url || true)"
+if [ -n "$PLATFORM_PANEL_URL" ]; then
+  WIDGET_MENU_ATTRS=" data-menu=\"1\" data-account-panel=\"${PLATFORM_PANEL_URL}\" data-secret-panel=\"${PLATFORM_PANEL_URL}\""
 fi
 
 GATE_PORT="${AIRLOCK_PASEO_GATE_PORT:?}"
@@ -746,6 +749,103 @@ else
   fi
 fi
 
+# --- 2e-2. schedule busy -> pending delivery (coalesce one tick, do not lose it) ---
+# When an agent-target schedule fires while that seat is running a turn, upstream records the
+# run as FAILED and advances to the next cadence: the tick is gone, the failed run eats maxRuns,
+# and — worst — masters learn "to receive my clock I must be idle at that instant" and end turns
+# with work still in hand. Measured on a pilot box 2026-09-13: 5 of 17 agent-target runs were exactly
+# `already has an active run`; one master wrote, verbatim, "the clock refuses a wake while a turn
+# is running, so I am returning the turn to receive the 08:55 wake".
+# The patch coalesces busy into ONE pending bit (not a queue): no failed run, no maxRuns burn,
+# and the next tick delivers exactly once as soon as the seat is idle — due or not.
+# Two halves, independent on purpose: the protocol schema keeps the bit across restarts (zod
+# strips unknown keys), the server implements it. Schema-only = the field is always false;
+# server-only = pending works until the daemon restarts. Schema goes first so the behaviour
+# check below can prove persistence.
+SCHEDPEND_SCHEMA_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-pending-delivery-schema.mjs"
+SCHEDPEND_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-busy-pending-delivery.mjs"
+SCHEDPEND_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-busy-pending-delivery.test.mjs"
+SCHEDULE_SERVICE_JS="$PASEO_SERVER_DIR/dist/server/server/schedule/service.js"
+SCHEDULE_TYPES_JS="$(cd "$PASEO_SERVER_DIR/../protocol/dist" 2>/dev/null && pwd || true)/schedule/types.js"
+apply_schedpend() {  # <label> <patcher> <target-js> [behaviour-test]
+  local label="$1" patcher="$2" target="$3" test_js="${4:-}" sp_rc=0 sp_out sp_tmp
+  if [ ! -f "$target" ]; then
+    log "warning: schedule $label target not found ($target) — busy-pending patch skipped"
+    return 0
+  fi
+  sp_out="$(node "$patcher" "$target")" || sp_rc=$?
+  case "$sp_rc" in
+    10) log "schedule $label busy-pending patch already applied" ;;
+    20) log "warning: schedule $label anchors missing or ambiguous (paseo version drift) — skipped: $sp_out" ;;
+    0)
+      sp_tmp="${target}.paseo-new.mjs"
+      if ! node --check "$sp_tmp"; then
+        rm -f "$sp_tmp"
+        log "warning: schedule $label patch produced invalid JS — not applied"
+      elif [ -n "$test_js" ] && ! node "$test_js" "$sp_tmp" >/dev/null 2>&1; then
+        # Syntax-valid is not behaving. The check drives the candidate with stub seats:
+        # busy -> pending bit and no failed run, then exactly one delivery once idle.
+        rm -f "$sp_tmp"
+        log "warning: schedule $label patch failed its behaviour check — not applied (busy ticks keep being lost)"
+      else
+        mv "$sp_tmp" "$target" || die "schedule $label patch mv failed"
+        need_restart=1
+        log "schedule $label busy-pending patch applied"
+      fi
+      ;;
+    *) log "warning: schedule $label patcher error (rc=$sp_rc): $sp_out — skipped" ;;
+  esac
+}
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply schedule busy-pending delivery to $SCHEDULE_TYPES_JS and $SCHEDULE_SERVICE_JS"
+elif [ ! -f "$SCHEDPEND_PATCHER" ] || [ ! -f "$SCHEDPEND_SCHEMA_PATCHER" ] || [ ! -f "$SCHEDPEND_TEST" ]; then
+  log "warning: schedule busy-pending patchers or behaviour check missing under $HERE — skipped"
+else
+  apply_schedpend schema "$SCHEDPEND_SCHEMA_PATCHER" "$SCHEDULE_TYPES_JS"
+  apply_schedpend service "$SCHEDPEND_PATCHER" "$SCHEDULE_SERVICE_JS" "$SCHEDPEND_TEST"
+fi
+
+# --- 2e-3. finish notifications queue instead of interrupting a running parent ---
+# notifyOnFinish messages take the unguarded prompt path (replaceRunning -> turn/interrupt): a
+# child finishing cuts its parent's running turn mid-tool and opens a new one. Masters learn that
+# long turns lose work and end turns short. The patch changes ONLY finish notifications: if the
+# parent is running they go to a durable per-parent queue, drained as one message when the parent
+# next goes idle after a turn that COMPLETED (not after a cancel — a human may have stopped it).
+# A queue write failure drops the notification rather than falling back to interrupting; a lease
+# left by a crash is marked uncertain, never re-sent. Direct human/agent prompts are unchanged.
+FINISHQ_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/finish-notification-queue.mjs"
+FINISHQ_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/finish-notification-queue.test.mjs"
+AGENT_PROMPT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/agent-prompt.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply finish-notification queue to $AGENT_PROMPT_JS"
+elif [ ! -f "$AGENT_PROMPT_JS" ]; then
+  log "warning: agent-prompt.js not found ($AGENT_PROMPT_JS) — finish-notification queue skipped"
+elif [ ! -f "$FINISHQ_PATCHER" ] || [ ! -f "$FINISHQ_TEST" ]; then
+  log "warning: finish-notification queue patcher or behaviour check missing under $HERE — skipped"
+else
+  fq_rc=0
+  fq_out="$(node "$FINISHQ_PATCHER" "$AGENT_PROMPT_JS")" || fq_rc=$?
+  case "$fq_rc" in
+    10) log "finish-notification queue already applied" ;;
+    20) log "warning: finish-notification queue anchors missing or ambiguous (paseo version drift) — skipped: $fq_out" ;;
+    0)
+      fq_tmp="${AGENT_PROMPT_JS}.paseo-new.mjs"
+      if ! node --check "$fq_tmp"; then
+        rm -f "$fq_tmp"
+        log "warning: finish-notification queue produced invalid JS — not applied"
+      elif ! node "$FINISHQ_TEST" "$fq_tmp" >/dev/null 2>&1; then
+        rm -f "$fq_tmp"
+        log "warning: finish-notification queue failed its behaviour check — not applied (children keep interrupting parents)"
+      else
+        mv "$fq_tmp" "$AGENT_PROMPT_JS" || die "finish-notification queue mv failed"
+        need_restart=1
+        log "finish-notification queue applied"
+      fi
+      ;;
+    *) log "warning: finish-notification queue patcher error (rc=$fq_rc): $fq_out — skipped" ;;
+  esac
+fi
+
 # --- 2f. process-group sweep (idempotent; layers on 2e — order matters) ---
 # The one leak 2e deliberately left open: when the agent LEADER exits before we
 # terminate it, terminateWithTreeKill returns "already-exited" and stops — and by then
@@ -1086,6 +1186,28 @@ if [ "$BROWSE" = true ]; then
       log "warning: browse-host install failed — agent browsing unavailable (hub + paseo daemon unaffected). Retry: bash $BROWSE_INSTALL"
     fi
   fi
+fi
+
+# --- 4. expose the daemon's agent MCP to the box's own claude CLI ---------------------
+# The daemon serves its agent tools (list/send/create/archive agents+workspaces, browser_*)
+# at /mcp/agents on the loopback backend port. With no daemon password configured that
+# route accepts loopback callers as-is (server/auth.js isAgentMcpRequestAuthorized), and
+# anyone who can open a shell on this box can already drive the daemon — so registering
+# it for the owner's `claude` (devterm, `claude -p`, timers) adds reach, not exposure.
+# This is what lets skills written against mcp__paseo__* (patrol, sweep, reseat) run
+# outside a Paseo-launched seat. Idempotent: `claude mcp add` refuses duplicates.
+if command -v claude >/dev/null 2>&1; then
+  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+    log "[dry] claude mcp add --transport http --scope user paseo http://127.0.0.1:${BACKEND_PORT}/mcp/agents"
+  elif claude mcp get paseo >/dev/null 2>&1; then
+    log "claude mcp: paseo already registered"
+  elif claude mcp add --transport http --scope user paseo "http://127.0.0.1:${BACKEND_PORT}/mcp/agents" >/dev/null 2>&1; then
+    log "claude mcp: paseo registered (http://127.0.0.1:${BACKEND_PORT}/mcp/agents)"
+  else
+    log "warning: claude mcp add paseo failed — mcp__paseo__* unavailable outside Paseo seats (daemon unaffected)"
+  fi
+else
+  log "claude CLI not on PATH — paseo MCP not registered for the CLI (daemon unaffected)"
 fi
 
 # NOTE: smoke runs from the orchestrator AFTER nginx is rendered + reloaded (the

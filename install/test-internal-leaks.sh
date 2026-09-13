@@ -133,6 +133,64 @@ else
   printf '%s\n' "$out" | sed 's/^/    /'
 fi
 
+# ---- --dir takes its audience boundary from the tree it scans ----
+# The pre-push hook expands a candidate ref and asks this mode to scan it. Reading the
+# caller checkout's manifest instead made a newer PRIVATE path look unclassified. Keep
+# the real current tree as the positive control, then mutate one PUBLIC and one
+# unclassified path with the same split probe.
+scoped="$FIX/manifest-scope"; mkdir -p "$scoped"
+git -C "$ROOT" archive HEAD | tar -x -C "$scoped"
+scope_manifest="$scoped/install/public-manifest.sh"
+internal_probe="s""wk-wiki"
+private_hits=$(grep -hF "$internal_probe" \
+  "$scoped/apps/dev-monitor/backend/devmon_weekly_docs.py" \
+  "$scoped/apps/dev-monitor/backend/test_devmon_weekly_docs.py" | awk 'END { print NR }')
+private_paths_ok=true
+for p in \
+  apps/dev-monitor/backend/devmon_weekly_docs.py \
+  apps/dev-monitor/backend/test_devmon_weekly_docs.py; do
+  read -r verdict _rule < <(bash "$scope_manifest" --classify "$p")
+  [ "$verdict" = private ] || private_paths_ok=false
+done
+out="$(bash "$GUARD" --dir "$scoped" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "the current main tree passes through its own manifest boundary"
+else
+  bad "the current main tree was scanned with the caller's stale boundary (rc=$rc)"
+  printf '%s\n' "$out" | sed 's/^/    /'
+fi
+if [ "$private_hits" -eq 4 ] && [ "$private_paths_ok" = true ]; then
+  ok "the four existing private identifier lines are classified private and pass"
+else
+  bad "the private regression fixture drifted (hits=$private_hits classified=$private_paths_ok)"
+fi
+
+public_probe="$scoped/apps/manifest-public-leak-probe.txt"
+printf '%s\n' "$internal_probe" > "$public_probe"
+verdict=""
+read -r verdict _rule < <(bash "$scope_manifest" --classify apps/manifest-public-leak-probe.txt)
+out="$(bash "$GUARD" --dir "$scoped" 2>&1)"; rc=$?
+if [ "$verdict" = public ] && [ "$rc" -eq 1 ] \
+   && printf '%s\n' "$out" | grep -q 'apps/manifest-public-leak-probe.txt'; then
+  ok "a forbidden identifier in a PUBLIC path still fails"
+else
+  bad "a PUBLIC path escaped the identifier scan (verdict=$verdict rc=$rc)"
+fi
+rm -f "$public_probe"
+
+unclassified_probe="$scoped/manifest-unclassified-leak-probe.txt"
+printf '%s\n' "$internal_probe" > "$unclassified_probe"
+verdict=""
+read -r verdict _rule < <(bash "$scope_manifest" --classify manifest-unclassified-leak-probe.txt)
+out="$(bash "$GUARD" --dir "$scoped" 2>&1)"; rc=$?
+if [ "$verdict" = unclassified ] && [ "$rc" -eq 1 ] \
+   && printf '%s\n' "$out" | grep -q 'manifest-unclassified-leak-probe.txt'; then
+  ok "a forbidden identifier in an unclassified path still fails"
+else
+  bad "an unclassified path escaped the identifier scan (verdict=${verdict:-none} rc=$rc)"
+fi
+rm -f "$unclassified_probe"
+
 # ---- the working-tree mode is the one CI runs, and it is green ----
 # This is also what proves the paragraph at the top of this file: if any probe above
 # were stored whole, this case would fail on this file.

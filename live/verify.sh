@@ -55,6 +55,10 @@
 #                           true = start the dev-monitor message console without
 #                           adding either Slack webhook (default false)
 #   AIRLOCK_LIVE_ALLOW_DIRTY 1 = allow a dirty working tree (the SHA then means less)
+#   AIRLOCK_LIVE_RECOVERY_SCENARIO
+#                           empty (default), or one of r1, r2, r3-forward,
+#                           r3-refuse. Recovery runs are disposable-only, never
+#                           publish, and never update the weekly freshness markers.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -76,11 +80,26 @@ DEVMON_MESSAGES="${AIRLOCK_LIVE_DEVMON_MESSAGES:-false}"
 RESULT_DIR="${AIRLOCK_LIVE_RESULT_DIR:-$HOME/.local/state/airlock-live}"
 EVIDENCE_DIR="${AIRLOCK_LIVE_EVIDENCE_DIR:-}"
 PUBLISH="${AIRLOCK_LIVE_PUBLISH:-gh}"
+RECOVERY_SCENARIO="${AIRLOCK_LIVE_RECOVERY_SCENARIO:-}"
 
 case "$DEVMON_MESSAGES" in
   true|false) ;;
   *) die "AIRLOCK_LIVE_DEVMON_MESSAGES must be true or false" ;;
 esac
+case "$RECOVERY_SCENARIO" in
+  ''|r1|r2|r3-forward|r3-refuse) ;;
+  *) die "AIRLOCK_LIVE_RECOVERY_SCENARIO must be empty, r1, r2, r3-forward, or r3-refuse" ;;
+esac
+if [ -n "$RECOVERY_SCENARIO" ]; then
+  [ "$PUBLISH" = none ] \
+    || die "recovery scenarios require AIRLOCK_LIVE_PUBLISH=none"
+  [ -z "$EVIDENCE_DIR" ] \
+    || die "recovery scenarios write a private local evidence bundle; AIRLOCK_LIVE_EVIDENCE_DIR is not accepted"
+  [ "${AIRLOCK_LIVE_UPDATE:-0}" != 1 ] \
+    || die "recovery scenarios require an exact checked-out commit; AIRLOCK_LIVE_UPDATE=1 is not accepted"
+  [ "$DEVMON_MESSAGES" = false ] \
+    || die "recovery scenarios own their dev-monitor message state; AIRLOCK_LIVE_DEVMON_MESSAGES must be false"
+fi
 if [ "$DEVMON_MESSAGES" = true ] && { ! [[ "$SOAK" =~ ^[0-9]+$ ]] || [ "$SOAK" -lt 120 ]; }; then
   die "AIRLOCK_LIVE_DEVMON_MESSAGES=true requires AIRLOCK_LIVE_SOAK of at least 120 seconds"
 fi
@@ -221,10 +240,40 @@ if [ "${AIRLOCK_LIVE_UPDATE:-0}" = 1 ]; then
   SHA="$(git -C "$ROOT" rev-parse HEAD)"
   say "updated $ROOT to origin/$BRANCH ($(git -C "$ROOT" rev-parse --short HEAD))"
 fi
+
+# The old-generation producer is fixed data, not a caller-selectable ref. It is
+# the first parent of the #450 merge and is used to make the receipt/degraded
+# state with the real installer that originally wrote that shape. Validate the
+# exact source slice before creating anything on the LXD host.
+RECOVERY_BASE_SHA=""
+if [ -n "$RECOVERY_SCENARIO" ]; then
+  RECOVERY_BASE_SHA=36cc83dd8ee8b12f456c519eebc0ac64ff78f2eb
+  git -C "$ROOT" cat-file -e "$RECOVERY_BASE_SHA^{commit}" 2>/dev/null \
+    || die "historical recovery producer $RECOVERY_BASE_SHA is not present; refusing to fetch or guess"
+  git -C "$ROOT" merge-base --is-ancestor "$RECOVERY_BASE_SHA" "$SHA" \
+    || die "historical recovery producer is not an ancestor of candidate $SHA"
+  while read -r path expected; do
+    actual="$(git -C "$ROOT" show "$RECOVERY_BASE_SHA:$path" | sha256sum | awk '{print $1}')" \
+      || die "cannot hash historical recovery producer path $path"
+    [ "$actual" = "$expected" ] \
+      || die "historical recovery producer path changed: $path ($actual != $expected)"
+  done <<'RECOVERY_PATH_HASHES'
+install/airlock-install.sh be98fa1d126461562e30f5f4620ce09ddd01ac8832bf64f28d7df1ac5f7902dc
+install/lib.sh 08fe8c0a0c2249db314d951c30626f4d65ea103e96fd867b044b07ee5492cdc9
+apps/dev-monitor/install.sh c396473eb9ff72e5d4e883e29309e1195e2bdcdcf98c00b90a23e25dcb7b1005
+apps/dev-monitor/migration-lifecycle.sh b8f87350672671dc3261fdc838f43702edba3027846770577368e797adb160b9
+apps/dev-monitor/migrate-legacy-state.py 3690d70bb76bb4b2dd2bf10f89f9eb8be103eab4c7dfbbc26a0c8cda140e3e54
+bin/airlock-ledger 335052b70dca191d9969e523b876293cbfb4235ff544bc725bbecf82e11045b7
+RECOVERY_PATH_HASHES
+fi
 # The run id has to be unique per run and legal as a tailnet hostname: lowercase,
 # no underscores. Derived from the clock and the short SHA rather than random, so a
 # result and a container can be matched up by eye afterwards.
-RUN_ID="$(date -u +%Y%m%dt%H%M%S)-$(git -C "$ROOT" rev-parse --short HEAD)"
+if [ -n "$RECOVERY_SCENARIO" ]; then
+  RUN_ID="$(date -u +%Y%m%dt%H%M%S)-$RECOVERY_SCENARIO-$(git -C "$ROOT" rev-parse --short HEAD)"
+else
+  RUN_ID="$(date -u +%Y%m%dt%H%M%S)-$(git -C "$ROOT" rev-parse --short HEAD)"
+fi
 NAME="airlock-live-$RUN_ID"
 RUN_NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(16))')" \
   || die "could not generate the per-run container ownership nonce"
@@ -233,6 +282,12 @@ mkdir -p "$RESULT_DIR"
 RESULT="$RESULT_DIR/$RUN_ID.json"
 INNER_FILE="$RESULT_DIR/$RUN_ID.inner.json"
 LOGFILE="$RESULT_DIR/$RUN_ID.log"
+RECOVERY_BUNDLE="$RESULT_DIR/$RUN_ID.evidence.tar"
+if [ -n "$RECOVERY_SCENARIO" ]; then
+  # Recovery records contain private database/transaction observations. Apply
+  # the private default to result, inner JSON, transcript, and evidence bundle.
+  umask 077
+fi
 
 say "run $RUN_ID"
 say "commit $SHA"
@@ -374,6 +429,19 @@ git -C "$ROOT" archive --format=tar --prefix=airlock-src/ "$SHA" \
 "${SSH[@]}" "lxc exec $NAME -- test -f /opt/airlock-src/install/airlock-install.sh" \
   || die "payload did not land at /opt/airlock-src"
 
+if [ -n "$RECOVERY_SCENARIO" ]; then
+  say "delivering historical recovery producer $RECOVERY_BASE_SHA"
+  git -C "$ROOT" archive --format=tar --prefix=airlock-baseline/ "$RECOVERY_BASE_SHA" \
+    | "${SSH[@]}" "cat > /tmp/$NAME.baseline.tar" \
+    || die "could not stage the historical recovery producer on the host"
+  "${SSH[@]}" "lxc file push /tmp/$NAME.baseline.tar $NAME/tmp/baseline.tar >/dev/null && rm -f /tmp/$NAME.baseline.tar" \
+    || die "could not push the historical recovery producer into the container"
+  "${SSH[@]}" "lxc exec $NAME -- tar -xf /tmp/baseline.tar -C /opt && lxc exec $NAME -- rm -f /tmp/baseline.tar" \
+    || die "could not unpack the historical recovery producer"
+  "${SSH[@]}" "lxc exec $NAME -- test -f /opt/airlock-baseline/install/airlock-install.sh" \
+    || die "historical recovery producer did not land at /opt/airlock-baseline"
+fi
+
 # The auth key goes in over stdin, into a mode-600 file, and is deleted by the
 # in-container script the moment it has been used. It never appears in argv, in
 # this host's process table, or in the container's.
@@ -387,20 +455,67 @@ say "delivering the auth key"
 STAGE=running
 say "installing and smoking inside the container (soak ${SOAK}s) — this takes a while"
 INNER_RC=0
-INNER="$(
-  "${SSH[@]}" "lxc exec $NAME \
-    --env LIVE_USER=airlock \
-    --env LIVE_OWNER='$AIRLOCK_LIVE_OWNER' \
-    --env LIVE_HOSTNAME='$NAME' \
-    --env LIVE_TAG='$TAG' \
-    --env LIVE_SHA='$SHA' \
-    --env LIVE_SOAK='$SOAK' \
-    --env LIVE_DEVMON_MESSAGES='$DEVMON_MESSAGES' \
-    -- bash /opt/airlock-src/live/in-container.sh </dev/null" 2>>"$LOGFILE"
-)" || INNER_RC=$?
+if [ -n "$RECOVERY_SCENARIO" ]; then
+  say "running disposable install-recovery scenario $RECOVERY_SCENARIO"
+  INNER="$(
+    "${SSH[@]}" "lxc exec $NAME \
+      --env LIVE_USER=airlock \
+      --env LIVE_OWNER='$AIRLOCK_LIVE_OWNER' \
+      --env LIVE_HOSTNAME='$NAME' \
+      --env LIVE_TAG='$TAG' \
+      --env LIVE_SHA='$SHA' \
+      --env LIVE_RECOVERY_SCENARIO='$RECOVERY_SCENARIO' \
+      --env LIVE_BASE_SHA='$RECOVERY_BASE_SHA' \
+      -- bash /opt/airlock-src/live/install-recovery-in-container.sh </dev/null" 2>>"$LOGFILE"
+  )" || INNER_RC=$?
+else
+  INNER="$(
+    "${SSH[@]}" "lxc exec $NAME \
+      --env LIVE_USER=airlock \
+      --env LIVE_OWNER='$AIRLOCK_LIVE_OWNER' \
+      --env LIVE_HOSTNAME='$NAME' \
+      --env LIVE_TAG='$TAG' \
+      --env LIVE_SHA='$SHA' \
+      --env LIVE_SOAK='$SOAK' \
+      --env LIVE_DEVMON_MESSAGES='$DEVMON_MESSAGES' \
+      -- bash /opt/airlock-src/live/in-container.sh </dev/null" 2>>"$LOGFILE"
+  )" || INNER_RC=$?
+fi
 [ -n "$INNER" ] || INNER='{}'
 STAGE=ran
 say "inner run exited $INNER_RC (transcript: $LOGFILE)"
+
+# An inner recovery failure may occur before it can assemble a bundle. Preserve
+# the owned guest in that case: cleanup must not delete the only remaining state
+# merely because the result is incomplete. The outer result is still written
+# below before the verdict fails closed.
+if [ -n "$RECOVERY_SCENARIO" ] && [ "$INNER_RC" != 0 ]; then
+  AIRLOCK_LIVE_KEEP=1
+  say "recovery inner failed; keeping $NAME for evidence recovery"
+fi
+
+# Recovery evidence contains private transaction records and database snapshots.
+# Pull it into the host-local result directory before cleanup and verify the hash
+# named by the JSON. A failed pull leaves the owned container running: deleting the
+# only remaining copy would turn an evidence failure into silent loss.
+if [ -n "$RECOVERY_SCENARIO" ] && [ "$INNER_RC" = 0 ]; then
+  STAGE=recovering_evidence
+  if ! "${SSH[@]}" "lxc file pull $NAME/var/lib/airlock-install-recovery/evidence.tar /tmp/$NAME.evidence.tar >/dev/null && cat /tmp/$NAME.evidence.tar && rm -f /tmp/$NAME.evidence.tar" \
+      > "$RECOVERY_BUNDLE" 2>>"$LOGFILE"; then
+    rm -f "$RECOVERY_BUNDLE"
+    AIRLOCK_LIVE_KEEP=1
+    die "could not recover private scenario evidence; $NAME was kept for recovery"
+  fi
+  chmod 0600 "$RECOVERY_BUNDLE"
+  expected_bundle_sha="$(printf '%s' "$INNER" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("evidence_sha256", ""))' 2>/dev/null || true)"
+  actual_bundle_sha="$(sha256sum "$RECOVERY_BUNDLE" | awk '{print $1}')"
+  if [ -z "$expected_bundle_sha" ] || [ "$actual_bundle_sha" != "$expected_bundle_sha" ]; then
+    AIRLOCK_LIVE_KEEP=1
+    die "recovered evidence hash mismatch; $NAME was kept for recovery"
+  fi
+  STAGE=ran
+  say "private recovery evidence written: $RECOVERY_BUNDLE"
+fi
 
 # Result first, then anything that can fail.
 write_result
@@ -411,6 +526,7 @@ say "result written: $RESULT"
 # its own summary (:42-62), so "9/10" and "10/10" mean different things depending
 # on who is counting; the record carries the item list so a reader never has to
 # guess which convention a number used.
+if [ -z "$RECOVERY_SCENARIO" ]; then
 python3 - "$RESULT" <<'PY'
 import json, sys
 r = json.load(open(sys.argv[1]))
@@ -447,10 +563,14 @@ for u in churn:
 for l in lines:
     print(f"  {l}")
 PY
+  VERDICT="$(python3 "$HERE/verdict.py" "$RESULT")" \
+    || die "could not calculate the live verdict"
+else
+  VERDICT="$(python3 "$HERE/install-recovery-verdict.py" "$RESULT" "$RECOVERY_BUNDLE")" \
+    || die "could not calculate the install-recovery verdict"
+fi
 
 INNER_FQDN="$(python3 -c 'import json,sys;print((json.load(open(sys.argv[1])).get("inner") or {}).get("fqdn") or "")' "$RESULT")"
-VERDICT="$(python3 "$HERE/verdict.py" "$RESULT")" \
-  || die "could not calculate the live verdict"
 say "verdict $VERDICT"
 
 # ------------------------------------------------------------------ publish
@@ -510,7 +630,7 @@ write_result
 
 # The heartbeat is written last and only on a clean verdict, so "the job ran" and
 # "the job passed" are not the same file.
-if [ "$VERDICT" = 0 ] || [ "$VERDICT" = 3 ]; then
+if [ -z "$RECOVERY_SCENARIO" ] && { [ "$VERDICT" = 0 ] || [ "$VERDICT" = 3 ]; }; then
   printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "$VERDICT" > "$RESULT_DIR/LAST-GREEN"
   # And retract the alarm. `FAILING` is written by alarm.sh and, until this line, by
   # nothing that could ever remove it: one bad week left a marker that outlived every
@@ -520,6 +640,8 @@ if [ "$VERDICT" = 0 ] || [ "$VERDICT" = 3 ]; then
   # cleared the same way above, on the same principle.
   rm -f "$RESULT_DIR/FAILING" "$RESULT_DIR/LAST-FAILURE"
 fi
-printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "$VERDICT" > "$RESULT_DIR/LAST-RUN"
+if [ -z "$RECOVERY_SCENARIO" ]; then
+  printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "$VERDICT" > "$RESULT_DIR/LAST-RUN"
+fi
 
 exit "$VERDICT"

@@ -74,6 +74,11 @@ if [ -f "$unit" ]; then
   grep -q 'AIRLOCK_HUB_ACCOUNTS_PORT=19904' "$unit" \
     && ok "T2 the port was read from config, not hard-coded in the helper" \
     || bad "T2 unexpected port in the unit: $(grep ACCOUNTS_PORT "$unit" || echo none)"
+  # The secret drop's HTTP boundary lives in this service now, so the unit must carry
+  # the D5 platform CLI path — the lib.sh default, never a devterm-supplied one.
+  grep -qxF "Environment=AIRLOCK_SECRET_BIN=$ROOT/bin/airlock-secret" "$unit" \
+    && ok "T2 the unit hands the platform secret CLI to the secret routes" \
+    || bad "T2 the unit does not name the platform secret CLI: $(grep SECRET_BIN "$unit" || echo none)"
   grep -q '^X-Airlock-Owner=airlock-install$' "$unit" \
     && ok "T2 the rendered unit carries its owner marker (so the sweep can reclaim it)" \
     || bad "T2 the rendered unit has no X-Airlock-Owner — a revert would leave it behind"

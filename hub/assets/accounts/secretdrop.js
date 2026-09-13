@@ -7,10 +7,13 @@
  *   the secret into chat scrollback, terminal history and any log that captures either.
  *   A path is safe to repeat; the file behind it expires on its own.
  *
- * Why a separate file (and not part of app.js): the Airlock return widget opens this UI
- *   inside panel.html, a page with NO terminal. Duplicating the backend contract
- *   (secret-put/list/del), the token strings and the TTL wording into that page is how
- *   two copies drift, so there is one implementation with two framings.
+ * Owner: the PLATFORM (hub/assets/accounts/, served by the platform surface under
+ *   /airlock-accounts/ — docs/tasks/active/platform-secret-drop.md). One implementation,
+ *   two framings: panel.html on the hub origin (the Airlock widget's "Secret drop", no
+ *   terminal) and devterm's terminal, which loads this same file through an nginx alias
+ *   and injects only what a terminal knows — delivery and which box the session is on.
+ *   The API paths below are RELATIVE on purpose: on the hub they resolve under
+ *   /airlock-accounts/, on devterm's origin to its proxy of the same platform routes.
  *
  * DI factory: window.initSecretDrop(deps) -> { openSecretDrop, renderSecretPanel }
  *   deps = {
@@ -21,9 +24,11 @@
  *     tokenTarget, // (path) => what the token should point at. For a remote devterm
  *                  //   session that is `ssh <box> cat <path>`. Default: path.
  *     readCmd,     // (path) => the shell command that reads the file. Default: cat <path>.
+ *     refocus,     // () => where focus returns after a copy / close. Default: nothing.
  *   }
- * Uses ui.js globals (makeModal / uiBtn / uiTitle / mkCloseBtn / UI_FIELD / copyText),
- * so ui.js must load first.
+ * Self-contained: no page globals. It used to lean on devterm's ui.js, which made a
+ * platform asset depend on one app's helper file being loaded first on every page that
+ * shows it. The few primitives it needs are below, copied from that file at the move.
  */
 window.initSecretDrop = function initSecretDrop(deps) {
   const flash = deps.flash, postJson = deps.postJson;
@@ -31,6 +36,66 @@ window.initSecretDrop = function initSecretDrop(deps) {
   const terminalMode = !!sendInput;
   const tokenTarget = deps.tokenTarget || function (path) { return path; };
   const readCmd = deps.readCmd || function (path) { return 'cat ' + path; };
+  const refocus = typeof deps.refocus === 'function' ? deps.refocus : function () {};
+
+  // ---- primitives (private; same tone as devterm's ui.js, owned here) ----
+  const UI_FIELD = 'background:#171a24;color:#f2f5fa;border:1px solid #3a4254;border-radius:8px;';
+  const UI_PANEL = 'background:#202431;border:1px solid #3a4254;border-radius:10px;box-shadow:0 16px 44px rgba(0,0,0,.42);box-sizing:border-box;';
+  function uiTitle(text) { const d = document.createElement('div'); d.textContent = text; d.style.cssText = 'font:600 14.5px system-ui;color:#f2f5fa;'; return d; }
+  function uiBtn(label, kind) {
+    const b = document.createElement('button'); b.textContent = label;
+    const base = 'height:36px;border-radius:8px;font:14px system-ui;border:1px solid ';
+    if (kind === 'primary') b.style.cssText = base + '#5480b8;background:#3d6aa0;color:#fff;padding:0 18px;';
+    else if (kind === 'danger') b.style.cssText = base + '#5a3330;background:#2b303b;color:#e06a5a;padding:0 14px;';
+    else b.style.cssText = base + 'rgba(255,255,255,.12);background:#2b303b;color:#dde1e8;padding:0 14px;';
+    return b;
+  }
+  function mkCloseBtn(onClose) {
+    const x = document.createElement('button');
+    x.type = 'button'; x.textContent = '✕';
+    x.setAttribute('aria-label', 'Close'); x.title = 'Close (Esc)';
+    x.style.cssText = 'flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:40px;height:34px;background:#3a4254;border:none;border-radius:8px;color:#fff;font-size:20px;line-height:1;cursor:pointer;';
+    x.addEventListener('click', onClose);
+    return x;
+  }
+  // The overlay keeps devterm's `copy-overlay` class: devterm's terminal looks for it to
+  // decide not to steal focus or keys while a modal is open (apps/devterm/web/app.js).
+  function makeModal(z, boxCss) {
+    const ov = document.createElement('div');
+    ov.className = 'copy-overlay';
+    ov.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.55);z-index:' + z + ';';
+    const box = document.createElement('div');
+    box.style.cssText = UI_PANEL + boxCss;
+    return { ov: ov, box: box };
+  }
+  // On HTTP (non-secure) navigator.clipboard is blocked -> execCommand fallback. writeText
+  // is called synchronously so the user-gesture context survives. Safari needs the
+  // off-screen, readonly, setSelectionRange shape below — opacity:0 fakes success there.
+  function copyText(text) {
+    if (!text) return Promise.resolve(false);
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text).then(() => true, () => copyFallback(text));
+    }
+    return Promise.resolve(copyFallback(text));
+  }
+  function copyFallback(text) {
+    const t = document.createElement('textarea');
+    t.value = text;
+    t.setAttribute('readonly', '');
+    t.style.cssText = 'position:absolute;left:-9999px;top:0;font-size:12pt;';
+    document.body.appendChild(t);
+    const sel = document.getSelection();
+    const prevSel = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    t.focus();
+    t.select();
+    try { t.setSelectionRange(0, text.length); } catch (e) {}
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(t);
+    if (prevSel) { const g = document.getSelection(); g.removeAllRanges(); g.addRange(prevSel); }
+    refocus();
+    return ok;
+  }
 
   const secretPath = (name) => '~/.devterm-secrets/' + name + '.txt';
   // The agent-facing token is not the value, it is where the value is — same markdown
@@ -279,7 +344,7 @@ window.initSecretDrop = function initSecretDrop(deps) {
       if (ui) ui.markClosed();
       document.removeEventListener('keydown', onKey);
       try { document.body.removeChild(ov); } catch (e) {}
-      uiRefocus();
+      refocus();
     };
     const onKey = (e) => { if (e.key === 'Escape') close(); };
     document.addEventListener('keydown', onKey);

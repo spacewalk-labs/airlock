@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -53,6 +54,13 @@ except ImportError:
     devmon_loop = None
     action_runner = None
     _MESSAGES_AVAILABLE = False
+
+# Company-owned run templates are a private deployment overlay. The public monitor
+# keeps the same receiver and fails closed when that overlay is not present.
+try:
+    import devmon_weekly_docs as WEEKLY_DOCS
+except ImportError:
+    WEEKLY_DOCS = None
 
 # Credential freshness is imported on its own, not with the bundle above: it needs none
 # of those modules and must keep working on an install that has no message console.
@@ -1255,6 +1263,15 @@ class Handler(BaseHTTPRequestHandler):
         is_preview = path == '/api/owner/messages/preview'
         if not self._owner_ready(cors=is_preview):
             return
+        if path == '/api/owner/run/template':
+            try:
+                body = _template_query(qs)
+                card, _ran_input = _compose_template_input(body)
+            except ValueError as error:
+                self._json(400, {'ok': False, 'error': str(error)})
+                return
+            self._json(200, {'ok': True, 'title': card['title'], 'run': card['run']})
+            return
         if is_preview:
             self._json(200, MSG.preview(), cors=True)
             return
@@ -1340,6 +1357,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._owner_ready():
             return
         body = self._read_body()
+        if path == '/api/owner/run/template':
+            self._owner_run_template(body)
+            return
+        if path == '/api/owner/run/template/window':
+            self._owner_run_template_window(body)
+            return
         if path == '/api/owner/run/window':
             self._owner_run_window(body)
             return
@@ -1825,6 +1848,95 @@ class Handler(BaseHTTPRequestHandler):
                          'window': window, 'session': EXEC_CONFIG['session'],
                          'ran_at': ran_at})
 
+    def _owner_run_template(self, body):
+        try:
+            card, ran_input = _compose_template_input(body)
+        except ValueError as error:
+            self._json(400, {'ok': False, 'error': str(error)})
+            return
+        requested_at = MSG.iso(MSG.now_utc())
+        window_name = '%s-%s-%s' % (
+            card['run']['template'], card['run']['action'], os.urandom(4).hex())
+        window_target = EXEC_CONFIG['session'] + ':' + window_name
+        record = {
+            'schema_version': 1,
+            'template': card['run']['template'],
+            'week': card['run']['week'],
+            'action': card['run']['action'],
+            'requested_at': requested_at,
+            'ran_at': None,
+            'ran_input': ran_input,
+            # Persist a server-chosen target before anything runs. If the detail update
+            # below fails, the accepted run is still selectable and a 500 cannot invite
+            # the owner to launch the same agent twice.
+            'ran_window': window_target,
+            'session': EXEC_CONFIG['session'],
+            'state': 'starting',
+        }
+        try:
+            _write_template_run(OWNER_CONFIG, record)
+        except OSError as error:
+            sys.stderr.write('[template-run] record failed: %s\n' % type(error).__name__)
+            self._json(500, {'ok': False, 'error': 'run_record_failed'})
+            return
+        try:
+            target = _launch_message(
+                card, EXEC_CONFIG, card['launch_prompt'], window_name=window_name)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            record.update({'ran_at': None, 'ran_window': None, 'state': 'launch_failed'})
+            try:
+                _write_template_run(OWNER_CONFIG, record)
+            except OSError:
+                pass
+            sys.stderr.write('[template-run] launch failed: %s\n' % type(error).__name__)
+            self._json(502, {'ok': False, 'error': 'launch_failed'})
+            return
+        window = _win_id(target)
+        ran_at = MSG.iso(MSG.now_utc())
+        record.update({'ran_at': ran_at, 'ran_window': window, 'state': 'launched'})
+        recorded = True
+        try:
+            _write_template_run(OWNER_CONFIG, record)
+        except OSError as error:
+            # The pre-launch record still has requested_at/input and the server-chosen
+            # window target. The agent is already running, so returning failure would
+            # make the existing Run sheet enable a duplicate retry.
+            recorded = False
+            sys.stderr.write('[template-run] detail record failed: %s\n' % type(error).__name__)
+        self._json(200, {'ok': True, 'template': card['run']['template'],
+                         'week': card['run']['week'], 'action': card['run']['action'],
+                         'target': target,
+                         'window': window, 'session': EXEC_CONFIG['session'],
+                         'ran_at': ran_at, 'recorded': recorded})
+
+    def _owner_run_template_window(self, body):
+        try:
+            template, week, action = _template_run_key(body)
+        except ValueError as error:
+            self._json(400, {'ok': False, 'error': str(error)})
+            return
+        record = _read_template_run(OWNER_CONFIG, template, week, action)
+        window = record.get('ran_window') if record else None
+        session = EXEC_CONFIG['session'] if EXEC_CONFIG else None
+        named_prefix = (session + ':' + template + '-' + action + '-'
+                        if isinstance(session, str) else None)
+        named_window = (isinstance(window, str) and named_prefix is not None
+                        and window.startswith(named_prefix)
+                        and re.fullmatch(r'[0-9a-f]{8}\Z',
+                                         window[len(named_prefix):]))
+        valid_window = (isinstance(window, str)
+                        and (re.fullmatch(r'@[0-9]+\Z', window) or named_window))
+        if not valid_window:
+            self._json(404, {'ok': False, 'error': 'run window not found'})
+            return
+        with _TMUX_LOCK:
+            active = _tmux('select-window', '-t', window) is not None
+        self._json(200, {'ok': True, 'template': template, 'week': week,
+                         'action': action,
+                         'state': 'active' if active else 'ended',
+                         'window': window,
+                         'session': session})
+
     def _owner_run_window(self, body):
         card_id = body.get('card_id') if isinstance(body, dict) else None
         if not isinstance(card_id, str):
@@ -1984,7 +2096,116 @@ def _compose_message_input(card, supplied, note):
     return prompt, ran_input
 
 
-def _launch_message(card, cfg, prompt=None):
+def _template_query(qs):
+    allowed = {'template', 'week', 'action', 'url'}
+    if set(qs) - allowed:
+        raise ValueError('unexpected template field')
+    body = {}
+    for key, values in qs.items():
+        if not isinstance(values, list) or len(values) != 1:
+            raise ValueError('template fields must occur once')
+        body[key] = values[0]
+    return body
+
+
+def _template_run_key(body):
+    if not isinstance(body, dict) or set(body) != {'template', 'week', 'action'}:
+        raise ValueError('template, week and action required')
+    template = body.get('template')
+    week = body.get('week')
+    action = body.get('action')
+    if WEEKLY_DOCS is None or template != WEEKLY_DOCS.TEMPLATE_ID:
+        raise ValueError('unsupported template')
+    if not isinstance(week, str):
+        raise ValueError('week must be a Friday in YYYY-MM-DD form')
+    try:
+        week_end = datetime.strptime(week, '%Y-%m-%d')
+    except ValueError as error:
+        raise ValueError('week must be a Friday in YYYY-MM-DD form') from error
+    if week_end.strftime('%Y-%m-%d') != week or week_end.weekday() != 4:
+        raise ValueError('week must be a Friday in YYYY-MM-DD form')
+    if not isinstance(action, str) or action not in WEEKLY_DOCS.ACTIONS:
+        raise ValueError('action must be prompt, save or delete')
+    return template, week, action
+
+
+def _compose_template_input(body):
+    if not isinstance(body, dict):
+        raise ValueError('template input must be an object')
+    allowed = {'template', 'week', 'action', 'url', 'note'}
+    if set(body) - allowed:
+        raise ValueError('unexpected template field')
+    template, week, action = _template_run_key({
+        'template': body.get('template'), 'week': body.get('week'),
+        'action': body.get('action')})
+    note = body.get('note', '')
+    if not isinstance(note, str) or len(note) > MAX_OWNER_NOTE:
+        raise ValueError('note must be a string of at most 8000 characters')
+    url = body.get('url')
+    if url is not None:
+        if not isinstance(url, str):
+            raise ValueError('url must be an https URL')
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme != 'https' or not parsed.netloc
+                or any(character.isspace() or ord(character) < 32 for character in url)):
+            raise ValueError('url must be an https URL')
+    if action in ('save', 'delete') and url is None:
+        raise ValueError('url is required for save or delete')
+    definition = WEEKLY_DOCS.build(HOME, week, action, url)
+    fixed_prompt = definition['run']['prompt']
+    launch_prompt = fixed_prompt + ('\n\n' + note if note else '')
+    run = definition['run']
+    ran_input = json.dumps(
+        {'template': template, 'week': week, 'action': action,
+         'url': url, 'note': note},
+        ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    card = {'title': definition['title'], 'run': run, 'launch_prompt': launch_prompt}
+    # The sheet receives the fixed prefix only. The launch path receives the note appended
+    # to that same server-built prefix; the browser never submits either cwd or prompt.
+    return card, ran_input
+
+
+def _template_run_path(config, template, week, action):
+    return (Path(os.path.dirname(config['db'])) / 'template-runs'
+            / ('%s-%s-%s.json' % (template, week, action)))
+
+
+def _write_template_run(config, record):
+    path = _template_run_path(
+        config, record['template'], record['week'], record['action'])
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise OSError('template run directory is not a directory')
+    os.chmod(path.parent, 0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix='.template-run.', dir=str(path.parent))
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(record, handle, ensure_ascii=False, separators=(',', ':'))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_template_run(config, template, week, action):
+    try:
+        with _template_run_path(config, template, week, action).open(encoding='utf-8') as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(record, dict) or record.get('template') != template
+            or record.get('week') != week or record.get('action') != action):
+        return None
+    return record
+
+
+def _launch_message(card, cfg, prompt=None, window_name='message'):
     run = card['run']
     cwd = os.path.realpath(os.path.expanduser(run['cwd']))
     root = os.path.realpath(os.path.expanduser(cfg['cwd_root']))
@@ -2011,7 +2232,7 @@ def _launch_message(card, cfg, prompt=None):
         if _tmux_has_session(tmux_arg(session)) != 0:
             if message_tmux('new-session', '-d', '-s', session) is None:
                 raise OSError('cannot create execution session')
-        target = message_tmux('new-window', '-d', '-t', session + ':', '-n', 'message', '-c', cwd,
+        target = message_tmux('new-window', '-d', '-t', session + ':', '-n', window_name, '-c', cwd,
                               '-P', '-F', '#{pid}:#{window_id}', *command, capture=True)
     if not target:
         raise OSError('cannot create execution window')

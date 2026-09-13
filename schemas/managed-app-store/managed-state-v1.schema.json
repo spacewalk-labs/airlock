@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://airlock.local/schemas/managed-app-store/managed-state-v1.schema.json",
+  "title": "Airlock managed box state contract v1",
+  "description": "Closed local enrollment input and accepted managed selection state. Secret values and site paths are never stored here.",
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "appId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "capabilityList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+      }
+    },
+    "enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_ceilings", "organization_id", "root_key_id", "schema"],
+      "properties": {
+        "schema": {"const": "airlock.managed.enrollment/v1"},
+        "organization_id": {"$ref": "#/$defs/id"},
+        "root_key_id": {"$ref": "#/$defs/digest"},
+        "capability_ceilings": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/appId"},
+          "additionalProperties": {"$ref": "#/$defs/capabilityList"}
+        }
+      }
+    },
+    "authorityFloor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["membership_digest", "sequence"],
+      "properties": {
+        "membership_digest": {"$ref": "#/$defs/digest"},
+        "sequence": {"type": "integer", "minimum": 1}
+      }
+    },
+    "snapshotFloor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel_id", "epoch", "sequence", "snapshot_digest"],
+      "properties": {
+        "channel_id": {"$ref": "#/$defs/id"},
+        "epoch": {"type": "integer", "minimum": 1},
+        "sequence": {"type": "integer", "minimum": 1},
+        "snapshot_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "legacyAdoption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_digest", "owner_identity_digest"],
+      "properties": {
+        "config_digest": {"$ref": "#/$defs/digest"},
+        "owner_identity_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "managedState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "capability_ceilings", "enrollment_digest", "legacy_adoption", "organization_id", "owner_selection", "owner_selection_digest", "root_key_id", "schema", "snapshot"],
+      "properties": {
+        "schema": {"const": "airlock.managed.box-state/v1"},
+        "organization_id": {"$ref": "#/$defs/id"},
+        "root_key_id": {"$ref": "#/$defs/digest"},
+        "enrollment_digest": {"$ref": "#/$defs/digest"},
+        "capability_ceilings": {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/appId"},
+          "additionalProperties": {"$ref": "#/$defs/capabilityList"}
+        },
+        "authority": {"$ref": "#/$defs/authorityFloor"},
+        "snapshot": {"$ref": "#/$defs/snapshotFloor"},
+        "owner_selection": {"$ref": "desired-state-v1.schema.json#/$defs/ownerSelection"},
+        "owner_selection_digest": {"$ref": "#/$defs/digest"},
+        "legacy_adoption": {
+          "oneOf": [
+            {"$ref": "#/$defs/legacyAdoption"},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/enrollment"},
+    {"$ref": "#/$defs/managedState"}
+  ]
+}

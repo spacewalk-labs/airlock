@@ -461,6 +461,34 @@ airlock_panel_url() {
   printf 'https://%s:%s/' "$fqdn" "$port"
 }
 
+# airlock_secret_panel_url — base URL of the PLATFORM secret drop for the return widget,
+# or empty when no FQDN can be measured. Unlike airlock_panel_url this never depends on
+# devterm: the drop's UI and API are the platform account surface under the hub's
+# owner-gated /airlock-accounts/ prefix (bin/airlock-accounts-api), which the platform
+# installs unconditionally. docs/tasks/active/platform-secret-drop.md.
+airlock_secret_panel_url() {
+  local fqdn
+  fqdn="${AIRLOCK_TS_FQDN:-}"
+  # ts_fqdn dies rather than returning empty; offline is a reduced widget, not noise.
+  [ -n "$fqdn" ] || fqdn="$(ts_fqdn 2>/dev/null)" || return 0
+  [ -n "$fqdn" ] || return 0
+  printf 'https://%s/airlock-accounts/\n' "$fqdn"
+}
+
+# airlock_accounts_port — the platform account/secret surface's loopback port. An app
+# that exposes the platform secret routes on its own origin (devterm) proxies to this.
+# The orchestrator exports the value it already validated; only a standalone run reads
+# the config, the same single-read rule install/airlock-accounts-api.sh follows.
+airlock_accounts_port() {
+  local port="${AIRLOCK_HUB_ACCOUNTS_PORT:-}"
+  if [ -z "$port" ]; then
+    port="$(eval "$(airlock_config env hub)" && printf '%s' "${AIRLOCK_HUB_ACCOUNTS_PORT:-}")" \
+      || return 1
+  fi
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$port"
+}
+
 # airlock_publish_doc_url — the link a reader can actually open, or empty.
 #
 # The hub path (/publish/files/) and the dedicated document port serve the SAME

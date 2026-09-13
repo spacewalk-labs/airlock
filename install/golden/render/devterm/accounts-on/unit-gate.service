@@ -21,7 +21,6 @@ Environment=DEVTERM_XAI=false
 Environment=DEVTERM_REMOTE_HOSTS=
 Environment=DEVTERM_ORCA_SHIM=
 Environment=DEVTERM_ACCOUNTS_BIN=ROOT/bin/airlock-accounts
-Environment=DEVTERM_SECRET_BIN=ROOT/bin/airlock-secret
 Environment=DEVTERM_CLAUDE_STATUS=ROOT/bin/airlock-accounts-status
 Environment=DEVTERM_CLAUDE_SWITCH=ROOT/bin/airlock-accounts
 Environment=DEVTERM_FLEET_STORE=

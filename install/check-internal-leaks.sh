@@ -72,14 +72,19 @@ PATTERN='spacewalk|sparrow-spectrum|\b[a-z0-9]+-(dev|mgmt)\b|TeamSPWK|swk[-:_.]|
 # (c) One name of ours the SHAPE pattern cannot tell from a box: `airlock-dev`,
 #     this project's own app name. It is not a host. `airlock-devterm` needs no
 #     entry — `\bdev\b` does not fire inside it.
-# (d) Three public document-component name families. They are CSS/JS API identifiers shipped by
+# (d) Six public document-component name families. They are CSS/JS API identifiers shipped by
 #     the public renderer and consumed by public apps, not infrastructure names.
+#     `swk-fs-scale` (font-scale CSS variable), `swk-fontscale` (the browser-storage key that
+#     holds it) and `swk-theme` (the theme key) are the reader's font-size and theme contract:
+#     an app that wants its own controls to move the shipped document must spell them, so
+#     blocking them would force every app to invent a private mechanism that does not reach
+#     the document — which is exactly the divergence this app just removed.
 #
 # Do not grow either group casually: (a) is closed, and (b) needs an owner
 # decision, because it is the one place a real internal string could hide.
-ALLOW='swk-airlock-return|swk-airlock-slot|swk-panel-close|swk:airlock-btn-pos-v1|swk-doc|swk-quiz|swk-q|spacewalk-labs|cho@spacewalk\.tech|airlock-dev'
+ALLOW='swk-airlock-return|swk-airlock-slot|swk-panel-close|swk:airlock-btn-pos-v1|swk-doc|swk-quiz|swk-q|swk-fs-scale|swk-fontscale|swk-theme|spacewalk-labs|cho@spacewalk\.tech|airlock-dev'
 ALLOW_LIST=(swk-airlock-return swk-airlock-slot swk-panel-close swk:airlock-btn-pos-v1
-            swk-doc swk-quiz swk-q spacewalk-labs cho@spacewalk.tech airlock-dev)
+            swk-doc swk-quiz swk-q swk-fs-scale swk-fontscale swk-theme spacewalk-labs cho@spacewalk.tech airlock-dev)
 
 # This file necessarily names every pattern, so it excludes itself — the same
 # carve-out ci.yml used to need for holding them.
@@ -112,8 +117,6 @@ SELF='install/check-internal-leaks.sh'
 # here is published by the guard that exists to stop exactly that, and a name no shape can
 # express belongs in the publish-sync scan, which is never mirrored. It lives there now.
 # Scoping a scan does not change which side of the mirror the scan is on.
-MANIFEST="$ROOT/install/public-manifest.sh"
-
 # The upstream bundle we do not write. Its minified strings coin tokens like
 # `1.104.0-dev` and `--save-dev`, which no shape can tell from a host name. An
 # ALLOW entry would be worse than an exclusion here: those strings are tied to a
@@ -134,35 +137,6 @@ VENDOR='apps/orca/web-bundle/'
 
 mode=tree
 dir=""
-
-PUBLIC_SPEC=()
-PRIVATE_RE=""
-if [ -f "$MANIFEST" ]; then
-  while IFS= read -r e; do PUBLIC_SPEC+=(":(glob)${e%/}${e:+}"); done < <(bash "$MANIFEST" --print-public)
-  while IFS= read -r e; do
-    PUBLIC_SPEC+=(":(exclude)$e")
-    # The same list again as an anchored regex, because --dir has no pathspecs. Both
-    # modes must mean the same thing by "the tree": the .git/ fix earlier today came
-    # from exactly this pair drifting apart, and the pre-push hook found the second
-    # half of it minutes after the first was shipped.
-    # shellcheck disable=SC2016  # the sed script is literal on purpose
-    PRIVATE_RE="${PRIVATE_RE}${PRIVATE_RE:+|}^$(printf '%s' "$e" | sed 's/[.[\*^$()+?{|]/\\&/g')"
-  done < <(bash "$MANIFEST" --print-private)
-else
-  # No manifest on this ref: scan everything rather than nothing. A missing boundary is
-  # a reason to look harder, not a reason to look at less.
-  PUBLIC_SPEC=(.)
-fi
-
-# Drop hits under a private path. Done on the output rather than with --exclude, which
-# matches basenames and would silently excuse a same-named public file elsewhere.
-drop_private() {
-  if [ -n "$PRIVATE_RE" ] && [ "$mode" = dir ]; then
-    sed "s|^${dir%/}/||" | grep -vE "$PRIVATE_RE"
-  else
-    cat
-  fi
-}
 case "${1:-}" in
   --print-pattern) printf '%s\n' "$PATTERN"; exit 0 ;;
   --print-allow)   printf '%s\n' "$ALLOW";   exit 0 ;;
@@ -171,6 +145,53 @@ case "${1:-}" in
   "") ;;
   *) echo "usage: $0 [--dir DIR | --subset DIR | --print-pattern | --print-allow]" >&2; exit 2 ;;
 esac
+
+# A plain-tree scan must take its audience decision from that tree. Using the caller's
+# checkout here made a current ref fail whenever main added a new PRIVATE exception after
+# the checkout was created. A missing manifest still means scan everything, never nothing.
+MANIFEST="$ROOT/install/public-manifest.sh"
+if [ "$mode" = dir ]; then
+  MANIFEST="${dir%/}/install/public-manifest.sh"
+  [ -f "$MANIFEST" ] || MANIFEST=""
+elif [ "$mode" = subset ]; then
+  MANIFEST=""
+fi
+
+PUBLIC_SPEC=()
+if [ "$mode" = tree ] && [ -f "$MANIFEST" ]; then
+  while IFS= read -r e; do PUBLIC_SPEC+=(":(glob)${e%/}${e:+}"); done < <(bash "$MANIFEST" --print-public)
+  while IFS= read -r e; do
+    PUBLIC_SPEC+=(":(exclude)$e")
+  done < <(bash "$MANIFEST" --print-private)
+elif [ "$mode" = tree ]; then
+  # No manifest on this ref: scan everything rather than nothing. A missing boundary is
+  # a reason to look harder, not a reason to look at less.
+  PUBLIC_SPEC=(.)
+fi
+
+# Drop only paths whose manifest verdict is PRIVATE. Walking the PRIVATE entries as
+# prefixes is not equivalent: docs/ is private but named public documents inside it are
+# deliberate exceptions and must still be scanned. PUBLIC and unclassified hits pass
+# through unchanged.
+drop_private() {
+  if [ -n "$MANIFEST" ] && [ "$mode" = dir ]; then
+    local hit rel path classification verdict classify_rc
+    while IFS= read -r hit; do
+      rel="${hit#"${dir%/}/"}"
+      path="${rel%%:*}"
+      classification="$(bash "$MANIFEST" --classify "$path" 2>&1)"
+      classify_rc=$?
+      verdict="${classification%%$'\t'*}"
+      if [ "$classify_rc" -ne 0 ] && [ "$verdict" != unclassified ]; then
+        echo "::error::could not classify path from target manifest: $path" >&2
+        return 2
+      fi
+      [ "$verdict" = private ] || printf '%s\n' "$hit"
+    done
+  else
+    cat
+  fi
+}
 
 scan() {   # emit matching "path:line:text" for the whole scanned tree
   if [ "$mode" != tree ]; then
@@ -181,7 +202,9 @@ scan() {   # emit matching "path:line:text" for the whole scanned tree
 }
 contains() {   # is this exact string present anywhere in the scanned tree?
   if [ "$mode" != tree ]; then
-    grep -rqF --exclude-dir=.git -- "$1" "$dir" 2>/dev/null
+    local matches
+    matches="$(grep -rnF --exclude-dir=.git -- "$1" "$dir" 2>/dev/null | drop_private)" || return $?
+    [ -n "$matches" ]
   else
     git -C "$ROOT" grep --untracked -qF -- "$1" -- "${PUBLIC_SPEC[@]}" ":(exclude)$SELF"
   fi

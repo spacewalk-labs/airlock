@@ -31,6 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_CLI = ROOT / "bin/airlock-config"
 RELEASE_CLI = ROOT / "bin/airlock-managed-release"
+STATE_CLI = ROOT / "bin/airlock-managed-state"
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
@@ -145,6 +146,70 @@ def validate_selection(value: Any) -> dict[str, Any]:
     return obj
 
 
+def inspect_state(path: Path, stage: Path, authority: Path, at: str) -> dict[str, Any]:
+    raw = run_checked(
+        [
+            sys.executable, str(STATE_CLI), "inspect-verified", "--state", str(path),
+            "--release", str(stage), "--authority", str(authority), "--at", at,
+        ],
+        "verified managed state inspection",
+    )
+    try:
+        value = json.loads(raw, object_pairs_hook=no_duplicate_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"managed state inspector returned invalid JSON: {exc}")
+    obj = exact(
+        value,
+        {
+            "authority", "legacy_owner_identity_digest", "organization_id", "root_key_id",
+            "selection", "selection_digest", "snapshot", "state_digest",
+        },
+        "verified managed state inspection",
+    )
+    if raw != canonical(obj):
+        fail("verified managed state inspector returned non-canonical JSON")
+    selection = validate_selection(obj["selection"])
+    if obj["selection_digest"] != digest(canonical(selection)):
+        fail("managed state selection digest differs from its canonical bytes")
+    for field in ("root_key_id", "selection_digest", "state_digest"):
+        if not isinstance(obj[field], str) or DIGEST_RE.fullmatch(obj[field]) is None:
+            fail(f"managed state {field} is invalid")
+    if not isinstance(obj["organization_id"], str) or ID_RE.fullmatch(obj["organization_id"]) is None:
+        fail("managed state organization_id is invalid")
+    authority_value = exact(obj["authority"], {"membership_digest", "sequence"}, "managed state authority")
+    if (not isinstance(authority_value["membership_digest"], str)
+            or DIGEST_RE.fullmatch(authority_value["membership_digest"]) is None):
+        fail("managed state authority membership_digest is invalid")
+    if (isinstance(authority_value["sequence"], bool)
+            or not isinstance(authority_value["sequence"], int)
+            or authority_value["sequence"] < 1):
+        fail("managed state authority sequence is invalid")
+    snapshot = exact(
+        obj["snapshot"], {"channel_id", "epoch", "sequence", "snapshot_digest"},
+        "managed state snapshot",
+    )
+    if not isinstance(snapshot["channel_id"], str) or ID_RE.fullmatch(snapshot["channel_id"]) is None:
+        fail("managed state snapshot channel_id is invalid")
+    for field in ("epoch", "sequence"):
+        if isinstance(snapshot[field], bool) or not isinstance(snapshot[field], int) or snapshot[field] < 1:
+            fail(f"managed state snapshot {field} is invalid")
+    if (not isinstance(snapshot["snapshot_digest"], str)
+            or DIGEST_RE.fullmatch(snapshot["snapshot_digest"]) is None):
+        fail("managed state snapshot digest is invalid")
+    legacy_digest = obj["legacy_owner_identity_digest"]
+    if legacy_digest is not None and (not isinstance(legacy_digest, str) or DIGEST_RE.fullmatch(legacy_digest) is None):
+        fail("managed state legacy owner identity digest is invalid")
+    return obj
+
+
+def owner_identity_digest(config: dict[str, Any]) -> str:
+    auth = config.get("auth")
+    owner = auth.get("owner") if isinstance(auth, dict) else None
+    if not isinstance(owner, str) or not owner:
+        fail("operator config has no canonical owner identity")
+    return digest(canonical(owner))
+
+
 def toml_string(value: str) -> str:
     escaped = []
     simple = {"\\": "\\\\", '"': '\\"', "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
@@ -208,16 +273,21 @@ def run_checked(argv: list[str], label: str, env: dict[str, str] | None = None) 
     return result.stdout
 
 
-def config_environment(path: Path) -> dict[str, str]:
+def config_environment(path: Path, origin: Path | None = None) -> dict[str, str]:
     env = dict(os.environ)
-    env["AIRLOCK_CONFIG"] = str(path)
-    env.pop("AIRLOCK_CONFIG_SNAPSHOT", None)
-    env.pop("AIRLOCK_CONFIG_SNAPSHOT_SHA256", None)
+    if origin is None:
+        env["AIRLOCK_CONFIG"] = str(path)
+        env.pop("AIRLOCK_CONFIG_SNAPSHOT", None)
+        env.pop("AIRLOCK_CONFIG_SNAPSHOT_SHA256", None)
+    else:
+        env["AIRLOCK_CONFIG"] = str(origin)
+        env["AIRLOCK_CONFIG_SNAPSHOT"] = str(path)
+        env["AIRLOCK_CONFIG_SNAPSHOT_SHA256"] = digest(read_regular(path, "operator config snapshot")).removeprefix("sha256:")
     return env
 
 
-def validate_config(path: Path, label: str) -> None:
-    run_checked([sys.executable, str(CONFIG_CLI), "validate"], label, config_environment(path))
+def validate_config(path: Path, label: str, origin: Path | None = None) -> None:
+    run_checked([sys.executable, str(CONFIG_CLI), "validate"], label, config_environment(path, origin))
 
 
 def normalize_local_package_paths(config: dict[str, Any], config_dir: Path) -> None:
@@ -297,20 +367,40 @@ def atomic_write(path: Path, raw: bytes) -> None:
         os.close(directory_fd)
 
 
-def project(config_path: Path, stage: Path, authority: Path, selection_path: Path, at: str) -> dict[str, Any]:
+def project(
+    config_path: Path,
+    config_origin: Path | None,
+    stage: Path,
+    authority: Path,
+    selection_path: Path | None,
+    state_path: Path | None,
+    at: str,
+) -> dict[str, Any]:
     config_path = config_path.expanduser().resolve()
-    validate_config(config_path, "operator config validation")
+    if config_origin is not None:
+        config_origin = config_origin.expanduser().resolve()
+    validate_config(config_path, "operator config validation", config_origin)
     config_raw = read_regular(config_path, "operator config")
     try:
         operator_config = tomllib.loads(config_raw.decode())
     except (UnicodeError, ValueError) as exc:
         fail(f"operator config is invalid TOML: {exc}")
     candidate = copy.deepcopy(operator_config)
-    normalize_local_package_paths(candidate, config_path.parent)
+    normalize_local_package_paths(candidate, (config_origin or config_path).parent)
 
     verify_result, catalog, lock, snapshot = verified_release(stage, authority, at)
-    selection, selection_raw = load_canonical_json(selection_path, "owner selection")
-    selection = validate_selection(selection)
+    state_inspection = None
+    if state_path is not None:
+        state_inspection = inspect_state(state_path, stage, authority, at)
+        selection = state_inspection["selection"]
+        selection_raw = canonical(selection)
+        legacy_owner = state_inspection["legacy_owner_identity_digest"]
+        if legacy_owner is not None and legacy_owner != owner_identity_digest(operator_config):
+            fail("operator owner identity differs from the explicitly adopted legacy identity")
+    else:
+        assert selection_path is not None
+        selection, selection_raw = load_canonical_json(selection_path, "owner selection")
+        selection = validate_selection(selection)
     if selection["organization_id"] != snapshot["organization_id"]:
         fail("owner selection belongs to another organisation")
     if selection["snapshot_digest"] != verify_result["snapshot_digest"]:
@@ -403,6 +493,9 @@ def project(config_path: Path, stage: Path, authority: Path, selection_path: Pat
     if (verify_after != verify_result or catalog_after != catalog
             or lock_after != lock or snapshot_after != snapshot):
         fail("signed release or current authority changed during projection")
+    if (state_path is not None
+            and inspect_state(state_path, stage, authority, at) != state_inspection):
+        fail("managed state changed during projection")
 
     return {
         "apps": projected_apps,
@@ -415,6 +508,7 @@ def project(config_path: Path, stage: Path, authority: Path, selection_path: Pat
             "local_config_digest": digest(config_raw),
             "lock_digest": snapshot["artifacts"]["release.lock"],
             "selection_digest": digest(selection_raw),
+            "state_digest": state_inspection["state_digest"] if state_inspection is not None else None,
         },
         "organization_id": snapshot["organization_id"],
         "schema": "airlock.managed.desired-projection/v1",
@@ -428,9 +522,15 @@ def project(config_path: Path, stage: Path, authority: Path, selection_path: Pat
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument("--config", required=True)
+    root.add_argument("--config-origin")
     root.add_argument("--release", required=True)
     root.add_argument("--authority", required=True)
-    root.add_argument("--selection", required=True)
+    root.add_argument("--promoted-current", action="store_true")
+    root.add_argument("--current-store")
+    root.add_argument("--current-channel")
+    selection = root.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--selection")
+    selection.add_argument("--state")
     root.add_argument("--at", required=True)
     root.add_argument("--out", required=True)
     return root
@@ -440,10 +540,32 @@ def main() -> int:
     args = parser().parse_args()
     output = Path(args.out).expanduser().absolute()
     try:
+        verification_names = (
+            "AIRLOCK_MANAGED_RELEASE_VERIFY_MODE",
+            "AIRLOCK_MANAGED_RELEASE_VERIFY_STORE",
+            "AIRLOCK_MANAGED_RELEASE_VERIFY_CHANNEL",
+        )
+        for name in verification_names:
+            os.environ.pop(name, None)
+        if args.promoted_current:
+            if not args.state or not args.current_store or not args.current_channel:
+                fail("--promoted-current requires --state, --current-store and --current-channel")
+            os.environ.update({
+                "AIRLOCK_MANAGED_RELEASE_VERIFY_MODE": "promoted-current",
+                "AIRLOCK_MANAGED_RELEASE_VERIFY_STORE": str(
+                    Path(args.current_store).expanduser().absolute()
+                ),
+                "AIRLOCK_MANAGED_RELEASE_VERIFY_CHANNEL": args.current_channel,
+            })
+        elif args.current_store or args.current_channel:
+            fail("current store/channel are valid only with --promoted-current")
         target_info(output)
         projection = project(
-            Path(args.config), Path(args.release).resolve(), Path(args.authority).resolve(),
-            Path(args.selection).expanduser().resolve(), args.at,
+            Path(args.config), Path(args.config_origin) if args.config_origin else None,
+            Path(args.release).resolve(), Path(args.authority).resolve(),
+            Path(args.selection).expanduser().absolute() if args.selection else None,
+            Path(args.state).expanduser().absolute() if args.state else None,
+            args.at,
         )
         raw = canonical(projection)
         atomic_write(output, raw)

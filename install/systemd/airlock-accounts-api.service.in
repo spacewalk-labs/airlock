@@ -14,6 +14,9 @@ Type=simple
 Environment=AIRLOCK_HUB_ACCOUNTS_PORT=@ACCOUNTS_PORT@
 Environment=AIRLOCK_ACCOUNTS_STATUS_BIN=@ACCOUNTS_STATUS_BIN@
 Environment=AIRLOCK_ACCOUNTS_BIN=@ACCOUNTS_BIN@
+# The secret drop's HTTP boundary lives here too (/secret-put|list|del). The store and
+# its TTL are the CLI's and the sweep timer's; this unit deliberately sets no TTL.
+Environment=AIRLOCK_SECRET_BIN=@SECRET_BIN@
 # Read-only pointers at the shared usage store. Empty is a normal box: the account list
 # then reports "no store" rather than "collecting", because promising a collector that
 # does not exist is what left seven rows collecting indefinitely on a real box.

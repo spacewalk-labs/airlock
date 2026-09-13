@@ -204,9 +204,9 @@ Consequences to plan around:
 
 ## The secret drop: what lands on disk, and when it goes away
 
-devterm's **secret drop** exists so that a key never has to be typed into a chat prompt
-or a shell. You paste the value into a modal; the value is written to a file on the box
-and what comes back out is the **path**, not the value:
+The platform's **secret drop** exists so that a key never has to be typed into a chat
+prompt or a shell. You paste the value into a modal; the value is written to a file on the
+box and what comes back out is the **path**, not the value:
 
 ```
 [secret:GH_TOKEN](~/.devterm-secrets/GH_TOKEN.txt)     # for an agent
@@ -215,16 +215,25 @@ export GH_TOKEN=$(cat ~/.devterm-secrets/GH_TOKEN.txt) # for a shell
 
 A path is safe to repeat into scrollback, terminal history and logs. The value is not.
 
-It is **on by default** when devterm is enabled, so here is exactly what that means:
+It is **on by default** — it is part of the platform, not of an app — so here is exactly
+what that means:
 
 | | |
 |---|---|
-| Where | `~/.devterm-secrets/<name>.txt` — the installing user's home |
+| Entrances | the Airlock widget's "Secret drop" (paseo, orca) and devterm's terminal — both open the one platform UI (`hub/assets/accounts/secretdrop.js`) |
+| HTTP | `/secret-put`, `/secret-list`, `/secret-del` on the platform account surface (`bin/airlock-accounts-api`), owner-only under the hub's `/airlock-accounts/` prefix; devterm's origin proxies the same three routes there behind its own owner guard. Writes need `application/json` and the same origin; bodies over 96 KB, other content types and other origins are refused before the store is touched |
+| Where | `~/.devterm-secrets/<name>.txt` — the installing user's home (the name predates the move and is kept because agents already hold these paths) |
 | Modes | directory `0700`, files `0600`, created that way (never widened afterwards) |
 | Lifetime | platform-owned, **1800s (30 min)** from the last write |
 | Who deletes it | the platform `airlock-secret sweep` user timer every minute, plus an opportunistic sweep on every CLI operation — independent of whether devterm is installed or running |
 | Cap | 64 live secrets, 64 KB per value |
 | Who can read the file | the box's own user — same as `~/.ssh` or `~/.aws/credentials` |
+
+The value travels exactly once: browser → nginx owner gate → the platform surface →
+`airlock-secret put` on **stdin**. It is never in argv, environment, a log line or an HTTP
+response; responses are rebuilt from a fixed metadata allowlist. devterm runs no secret
+code: it only tells the UI which box the current terminal session is on, so a remote
+session's token reads `ssh <box> cat <path>` instead of this box's path.
 
 Two boundaries worth stating plainly:
 
@@ -246,13 +255,14 @@ to retain it until the deadline.
 
 dev-monitor's console (`[apps.dev-monitor] messages = true`, **off by default**) does two
 different things, and they have different trust levels. Anything that can write the spool
-can **post a card**. Only the owner, clicking in the console, can **run one**.
+can **post a card**. Only the owner, clicking in the console, can **run a card or a
+server-owned template**.
 
 | | |
 |---|---|
 | Who can post | the installing user and the configured system spool-writer identity. The latter can write only `tmp/`/`new/`, cannot enter collector-only lanes, and has external egress blocked by nftables; there is no network intake |
 | Who can read the console | the owner only. Not collaborators — this is the one dev-monitor surface that is owner-scoped |
-| Who can run an action | the owner, per card, per click. There is no auto-run and no "approve all" |
+| Who can run an action | the owner, per card or server-owned template, per click. There is no auto-run and no "approve all" |
 | Where state lives | `~/.local/state/airlock/dev-monitor/`: execute-only traversal for the writer group, setgid+sticky `spool/tmp` and `spool/new`, and collector-only database/processing/bad state |
 
 Three boundaries hold that up:
@@ -277,6 +287,12 @@ Three boundaries hold that up:
   contain the working directory; the root itself is refused, and so is anything outside it.
   The runner re-checks it after `chdir`, by realpath, so a symlink swapped in after approval
   does not move the run.
+- **A template is server-owned.** A browser request can name only the template, an ISO
+  Friday, one of `prompt|save|delete`, an optional HTTPS URL and an owner note. A URL
+  query cannot carry the note, and the execution body cannot supply the
+  working directory or fixed prompt. The same owner and same-host mutation checks apply,
+  and a successful launch leaves a private per-template/week/action record beside the
+  message DB.
 
 There is no allow-list of skills, and the one that used to be here was removed rather than
 documented better (owner, 2026-08-10). `skill_allow` filtered the `skill` field of an action

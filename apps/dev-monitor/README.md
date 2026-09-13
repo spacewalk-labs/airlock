@@ -135,6 +135,22 @@ message plan, message execution table or message completion state machine exists
 The shared runner's executable-plan/completion-file path remains solely for the
 separate update/harness features.
 
+An installation may provide a card-free run template through
+`/monitor/?run=<template>&week=<Friday>&action=<prompt|save|delete>[&url=<HTTPS URL>]`.
+The page asks the same
+owner API for a server-built preview, then opens the existing Run sheet. Its Run
+button sends only `template`, `week`, the restricted action, optional `url` and the owner note to
+`POST /api/owner/run/template`; `cwd` and the fixed prompt are never accepted from
+the browser; a query-string `note` is rejected. The server requires an ISO Friday,
+one of `prompt|save|delete` and an HTTPS URL, may prefill a server-owned note for the
+action, appends at most
+8,000 note characters, and uses the same owner, same-host mutation, cwd-root and
+tmux launch checks as a card. The latest accepted launch for each template/week/action is
+recorded next to the message database under `template-runs/` with its launch time,
+input and window. When the message console is off, the page shows that the execution
+console is unavailable. A public install with no private template definition rejects
+the template name rather than accepting browser-owned execution data.
+
 The existing owner and proxy-secret checks apply on every request. Writes also
 check origin, content type and body size. Ordinary `/api/run` is not an execution
 route. Publishing a spool message does not authorize execution.

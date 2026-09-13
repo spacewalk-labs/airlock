@@ -1,5 +1,6 @@
 [Unit]
 Description=airlock — collect the daily update snapshot
+X-Airlock-About=매일 설치본과 사용 가능한 Airlock 업데이트 정보를 수집해 변경 여부를 기록합니다. 다음 수집 시각 뒤에도 스냅샷이 오래됐거나 변경이 있는데 카드가 없으면 네트워크·수집기·상태 저장의 이상입니다.
 After=network-online.target
 Wants=network-online.target
 X-Airlock-Owner=airlock-install

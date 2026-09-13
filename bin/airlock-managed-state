@@ -1,0 +1,1468 @@
+#!/usr/bin/env python3
+"""Persist local managed-app enrollment and owner selection under one lock.
+
+The caller chooses the state path and is responsible for invoking this tool as
+the account that owns that path.  The explicit ``bootstrap`` command is the
+separate root action which creates the fixed installed anchor and delegates its
+one mutable namespace.  State never contains site paths, secret references, or
+secret values.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn
+
+
+ROOT = Path(__file__).resolve().parent.parent
+RELEASE_CLI = ROOT / "bin/airlock-managed-release"
+CONFIG_CLI = ROOT / "bin/airlock-config"
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
+APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
+CAPABILITY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}\Z")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}\Z")
+MAX_JSON = 16 * 1024 * 1024
+ANCHOR_SCHEMA = "airlock.managed.install-anchor/v1"
+ANCHOR_PATH = Path("/etc/airlock/managed-channel.json")
+ACCESS_PATH = Path("/etc/airlock/managed-access.json")
+MANAGED_ROOT = Path("/var/lib/airlock/managed")
+ACCESS_SCHEMA = "airlock.managed.access-state/v1"
+BARE_SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
+UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+ANCHOR_KEYS = {
+    "authority_path", "channel_id", "enrollment_digest", "organization_id",
+    "root_key_id", "schema", "state_path", "store_path", "writer_gid",
+    "writer_uid",
+}
+
+
+class StateError(Exception):
+    pass
+
+
+def fail(message: str) -> NoReturn:
+    raise StateError(message)
+
+
+def canonical(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def digest(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def exact(value: Any, keys: set[str], where: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail(f"{where} must be an object")
+    if set(value) != keys:
+        fail(f"{where} fields differ (missing={sorted(keys - set(value))}, extra={sorted(set(value) - keys)})")
+    return value
+
+
+def valid_string(value: Any, pattern: re.Pattern[str], where: str) -> str:
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        fail(f"{where} is invalid")
+    return value
+
+
+def valid_int(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        fail(f"{where} must be an integer >= 1")
+    return value
+
+
+def valid_delegated_id(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        fail(f"{where} must be a non-root integer")
+    return value
+
+
+def sorted_strings(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list):
+        fail(f"{where} must be an array")
+    for item in value:
+        valid_string(item, CAPABILITY_RE, f"{where}[]")
+    if value != sorted(set(value)):
+        fail(f"{where} must be sorted and unique")
+    return value
+
+
+def read_regular(path: Path, label: str, limit: int = MAX_JSON) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot read {label} {path}: {exc}")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{label} must be a regular non-symlink file")
+        if info.st_size > limit:
+            fail(f"{label} exceeds {limit} bytes")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(1024 * 1024, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                fail(f"{label} exceeds {limit} bytes")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            fail(f"JSON object repeats key {key!r}")
+        result[key] = value
+    return result
+
+
+def load_json(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
+    raw = read_regular(path, label)
+    try:
+        value = json.loads(raw, object_pairs_hook=json_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{label} is invalid JSON: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    if raw != canonical(value):
+        fail(f"{label} must use canonical JSON bytes")
+    return value, raw
+
+
+def validate_selection(value: Any) -> dict[str, Any]:
+    obj = exact(value, {"organization_id", "schema", "selections", "sequence", "snapshot_digest"}, "owner selection")
+    if obj["schema"] != "airlock.managed.selection/v1":
+        fail("owner selection schema is unsupported")
+    valid_string(obj["organization_id"], ID_RE, "owner selection organization_id")
+    valid_string(obj["snapshot_digest"], DIGEST_RE, "owner selection snapshot_digest")
+    valid_int(obj["sequence"], "owner selection sequence")
+    if not isinstance(obj["selections"], list):
+        fail("owner selection selections must be an array")
+    ids = []
+    for index, raw in enumerate(obj["selections"]):
+        row = exact(raw, {"id", "source"}, f"owner selection selections[{index}]")
+        valid_string(row["id"], APP_ID_RE, f"owner selection selections[{index}].id")
+        if row["source"] not in {"local", "managed", "public"}:
+            fail(f"owner selection selections[{index}].source is invalid")
+        ids.append(row["id"])
+    if ids != sorted(set(ids)):
+        fail("owner selection selections must be sorted and unique by id")
+    return obj
+
+
+def validate_ceilings(value: Any, where: str) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        fail(f"{where} must be an object")
+    if list(value) != sorted(value):
+        fail(f"{where} keys must be sorted")
+    for app_id, capabilities in value.items():
+        valid_string(app_id, APP_ID_RE, f"{where} app id")
+        sorted_strings(capabilities, f"{where}.{app_id}")
+    return value
+
+
+def validate_enrollment(value: Any) -> dict[str, Any]:
+    obj = exact(value, {"capability_ceilings", "organization_id", "root_key_id", "schema"}, "enrollment")
+    if obj["schema"] != "airlock.managed.enrollment/v1":
+        fail("enrollment schema is unsupported")
+    valid_string(obj["organization_id"], ID_RE, "enrollment organization_id")
+    valid_string(obj["root_key_id"], DIGEST_RE, "enrollment root_key_id")
+    validate_ceilings(obj["capability_ceilings"], "enrollment capability_ceilings")
+    return obj
+
+
+def validate_state(value: Any) -> dict[str, Any]:
+    obj = exact(value, {
+        "authority", "capability_ceilings", "enrollment_digest", "legacy_adoption",
+        "organization_id", "owner_selection", "owner_selection_digest", "root_key_id",
+        "schema", "snapshot",
+    }, "managed state")
+    if obj["schema"] != "airlock.managed.box-state/v1":
+        fail("managed state schema is unsupported")
+    valid_string(obj["organization_id"], ID_RE, "managed state organization_id")
+    valid_string(obj["root_key_id"], DIGEST_RE, "managed state root_key_id")
+    valid_string(obj["enrollment_digest"], DIGEST_RE, "managed state enrollment_digest")
+    validate_ceilings(obj["capability_ceilings"], "managed state capability_ceilings")
+    authority = exact(obj["authority"], {"membership_digest", "sequence"}, "managed state authority")
+    valid_string(authority["membership_digest"], DIGEST_RE, "managed state authority membership_digest")
+    valid_int(authority["sequence"], "managed state authority sequence")
+    snapshot = exact(obj["snapshot"], {"channel_id", "epoch", "sequence", "snapshot_digest"}, "managed state snapshot")
+    valid_string(snapshot["channel_id"], ID_RE, "managed state snapshot channel_id")
+    valid_int(snapshot["epoch"], "managed state snapshot epoch")
+    valid_int(snapshot["sequence"], "managed state snapshot sequence")
+    valid_string(snapshot["snapshot_digest"], DIGEST_RE, "managed state snapshot digest")
+    selection = validate_selection(obj["owner_selection"])
+    valid_string(obj["owner_selection_digest"], DIGEST_RE, "managed state owner_selection_digest")
+    if obj["owner_selection_digest"] != digest(canonical(selection)):
+        fail("managed state owner selection digest differs from its bytes")
+    if selection["organization_id"] != obj["organization_id"]:
+        fail("managed state owner selection belongs to another organisation")
+    if selection["snapshot_digest"] != snapshot["snapshot_digest"]:
+        fail("managed state owner selection names another snapshot")
+    adoption = obj["legacy_adoption"]
+    if adoption is not None:
+        adoption = exact(adoption, {"config_digest", "owner_identity_digest"}, "managed state legacy_adoption")
+        valid_string(adoption["config_digest"], DIGEST_RE, "managed state legacy config_digest")
+        valid_string(adoption["owner_identity_digest"], DIGEST_RE, "managed state legacy owner_identity_digest")
+    return obj
+
+
+def validate_private_state_file(path: Path, *, required: bool) -> bytes | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if required:
+            fail(f"managed state does not exist: {path}")
+        return None
+    except OSError as exc:
+        fail(f"cannot inspect managed state {path}: {exc}")
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        fail("managed state must be a regular non-symlink file")
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        fail("managed state must be owned by this uid with no group/other permissions")
+    return read_regular(path, "managed state")
+
+
+def validate_state_parent(path: Path) -> None:
+    parent = path.parent
+    try:
+        info = parent.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect managed state parent {parent}: {exc}")
+    if not stat.S_ISDIR(info.st_mode) or parent.is_symlink() or info.st_uid != os.geteuid():
+        fail("managed state parent must be a real directory owned by this uid")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        fail("managed state parent must not be writable by group or others")
+
+
+def state_lock(path: Path) -> int:
+    validate_state_parent(path)
+    lock_path = path.with_name(path.name + ".lock")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        fail(f"cannot open managed state lock {lock_path}: {exc}")
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        os.close(fd)
+        fail("managed state lock must be a private regular file owned by this uid")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def atomic_write(path: Path, raw: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=".managed-state-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=False) as target:
+            target.write(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        temporary = ""
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def protected_root_directory(path: Path, label: str) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect {label} {path}: {exc}")
+    if (not stat.S_ISDIR(info.st_mode) or path.is_symlink()
+            or info.st_uid != 0 or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) & 0o022):
+        fail(f"{label} must be a protected root-owned directory")
+    return info
+
+
+def exact_directory(
+    path: Path,
+    owner: int,
+    group: int,
+    mode: int,
+    label: str,
+) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect {label} {path}: {exc}")
+    if (not stat.S_ISDIR(info.st_mode) or path.is_symlink()
+            or info.st_uid != owner or info.st_gid != group
+            or stat.S_IMODE(info.st_mode) != mode):
+        fail(f"{label} owner/mode/type is invalid")
+
+
+def exact_file(
+    path: Path,
+    owner: int,
+    group: int,
+    mode: int,
+    label: str,
+) -> bytes:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect {label} {path}: {exc}")
+    if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+            or info.st_uid != owner or info.st_gid != group
+            or stat.S_IMODE(info.st_mode) != mode):
+        fail(f"{label} owner/mode/type is invalid")
+    return read_regular(path, label)
+
+
+def sync_directory(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        fail(f"cannot sync directory {path}: {exc}")
+
+
+def create_exact_file(path: Path, raw: bytes, mode: int) -> None:
+    temporary_fd = -1
+    temporary = ""
+    try:
+        temporary_fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        os.fchmod(temporary_fd, mode)
+        with os.fdopen(temporary_fd, "wb", closefd=False) as target:
+            target.write(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        os.close(temporary_fd)
+        temporary_fd = -1
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            fail(f"refusing to replace existing bootstrap file {path}")
+        os.unlink(temporary)
+        temporary = ""
+        sync_directory(path.parent)
+    except OSError as exc:
+        fail(f"cannot create bootstrap file {path}: {exc}")
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def bootstrap_root(raw: str) -> Path:
+    if not os.path.isabs(raw) or os.path.normpath(raw) != raw:
+        fail("bootstrap filesystem root must be an absolute canonical path")
+    root = Path(raw)
+    # A relocated root is an explicit source-fixture/chroot boundary.  Requiring
+    # every real ancestor to be protected prevents a writable parent from
+    # swapping that boundary while this root action is in flight.
+    chain = [root, *root.parents]
+    for path in reversed(chain):
+        protected_root_directory(path, "bootstrap filesystem root component")
+    return root
+
+
+def rooted(root: Path, logical: Path) -> Path:
+    if not logical.is_absolute():
+        fail("internal bootstrap path is not absolute")
+    return root / logical.relative_to("/") if root != Path("/") else logical
+
+
+def ensure_root_directory(path: Path, label: str) -> None:
+    try:
+        os.mkdir(path, 0o755)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        fail(f"cannot create {label} {path}: {exc}")
+    protected_root_directory(path, label)
+
+
+def bootstrap_lock(path: Path) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        fail(f"cannot open bootstrap lock {path}: {exc}")
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            fail("bootstrap lock must be root:root regular 0600")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def directory_names(path: Path, expected: set[str], label: str) -> None:
+    try:
+        observed = {entry.name for entry in os.scandir(path)}
+    except OSError as exc:
+        fail(f"cannot enumerate {label} {path}: {exc}")
+    if observed != expected:
+        fail(
+            f"{label} entries differ "
+            f"(missing={sorted(expected - observed)}, extra={sorted(observed - expected)})"
+        )
+
+
+def directory_names_subset(path: Path, allowed: set[str], label: str) -> None:
+    try:
+        observed = {entry.name for entry in os.scandir(path)}
+    except OSError as exc:
+        fail(f"cannot enumerate {label} {path}: {exc}")
+    extra = observed - allowed
+    if extra:
+        fail(f"{label} has unexpected entries: {sorted(extra)}")
+
+
+def partial_directory(
+    path: Path,
+    writer_uid: int,
+    writer_gid: int,
+    mode: int,
+    label: str,
+) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect {label} {path}: {exc}")
+    if (not stat.S_ISDIR(info.st_mode) or path.is_symlink()
+            or (info.st_uid, info.st_gid) not in {(0, 0), (writer_uid, writer_gid)}
+            or stat.S_IMODE(info.st_mode) != mode):
+        fail(f"{label} partial owner/mode/type is invalid")
+
+
+def partial_file(
+    path: Path,
+    raw: bytes,
+    writer_uid: int,
+    writer_gid: int,
+    mode: int,
+    label: str,
+) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        create_exact_file(path, raw, mode)
+        return
+    except OSError as exc:
+        fail(f"cannot inspect {label} {path}: {exc}")
+    if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+            or (info.st_uid, info.st_gid) not in {(0, 0), (writer_uid, writer_gid)}
+            or stat.S_IMODE(info.st_mode) != mode):
+        fail(f"{label} partial owner/mode/type is invalid")
+    if read_regular(path, label) != raw:
+        fail(f"{label} conflicts with requested bootstrap bytes")
+
+
+def parse_command_json(raw: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw, object_pairs_hook=json_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{label} returned invalid JSON: {exc}")
+    if not isinstance(value, dict) or raw != canonical(value):
+        fail(f"{label} returned non-canonical JSON")
+    return value
+
+
+def run_checked(argv: list[str], label: str, env: dict[str, str] | None = None) -> bytes:
+    result = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        reason = result.stderr.decode(errors="replace").strip()
+        fail(f"{label} failed: {reason or f'exit {result.returncode}'}")
+    return result.stdout
+
+
+def release_context(stage: Path, authority: Path, at: str) -> dict[str, Any]:
+    verify_raw = run_checked([
+        sys.executable, str(RELEASE_CLI), "verify", "--stage", str(stage), "--signed",
+        "--authority", str(authority), "--at", at,
+    ], "signed release verification")
+    verification = parse_command_json(verify_raw, "signed release verifier")
+    snapshot, snapshot_raw = load_json(stage / "snapshot.json", "snapshot.json")
+    catalog, _catalog_raw = load_json(stage / "catalog.json", "catalog.json")
+    lock, _lock_raw = load_json(stage / "release.lock", "release.lock")
+    membership, membership_raw = load_json(authority / "current-membership.json", "current membership")
+    root_raw = read_regular(authority / "root-public.der", "authority root", 64 * 1024)
+    if verification.get("snapshot_digest") != digest(snapshot_raw):
+        fail("signed release verifier snapshot digest differs from staged bytes")
+    if verification.get("membership_digest") != digest(membership_raw):
+        fail("signed release verifier membership digest differs from current authority bytes")
+    if membership.get("organization_id") != snapshot.get("organization_id"):
+        fail("current authority and snapshot organisations differ")
+    if membership.get("root_key_id") != digest(root_raw):
+        fail("current authority root key id differs from pinned root bytes")
+    valid_int(membership.get("sequence"), "current membership sequence")
+    return {
+        "catalog": catalog,
+        "lock": lock,
+        "membership_digest": verification["membership_digest"],
+        "membership_sequence": membership["sequence"],
+        "organization_id": snapshot["organization_id"],
+        "root_key_id": membership["root_key_id"],
+        "snapshot": snapshot,
+        "snapshot_digest": verification["snapshot_digest"],
+    }
+
+
+def validate_policy(context: dict[str, Any], selection: dict[str, Any], ceilings: dict[str, list[str]]) -> None:
+    if selection["organization_id"] != context["organization_id"]:
+        fail("owner selection belongs to another organisation")
+    if selection["snapshot_digest"] != context["snapshot_digest"]:
+        fail("owner selection does not name the verified snapshot")
+    catalog_apps = context["catalog"].get("apps")
+    lock_packages = context["lock"].get("packages")
+    if not isinstance(catalog_apps, list) or not isinstance(lock_packages, list):
+        fail("verified release lacks catalog or lock arrays")
+    catalog = {row["id"]: row for row in catalog_apps}
+    packages = {row["id"]: row for row in lock_packages}
+    choices = {row["id"]: row["source"] for row in selection["selections"]}
+    unknown = sorted(set(choices) - set(catalog))
+    if unknown:
+        fail("owner selection names unknown catalog apps: " + ", ".join(unknown))
+    for app_id, source in choices.items():
+        if source == "public":
+            app_dir = ROOT / "apps" / app_id
+            manifest = app_dir / "airlock-app.toml"
+            if not app_dir.is_dir() or app_dir.is_symlink() or not manifest.is_file() or manifest.is_symlink():
+                fail(f"public source for organisation-only app {app_id!r} does not exist")
+    managed = set()
+    for app_id, app in catalog.items():
+        policy = app["policy"]
+        choice = choices.get(app_id)
+        if policy == "blocked" and choice is not None:
+            fail(f"blocked app {app_id!r} cannot be selected")
+        if policy == "required":
+            if choice is not None and choice != "managed":
+                fail(f"required app {app_id!r} must use the managed source")
+            managed.add(app_id)
+        elif choice == "managed":
+            managed.add(app_id)
+    for app_id in sorted(managed):
+        package = packages.get(app_id)
+        if package is None:
+            fail(f"managed app {app_id!r} is absent from release.lock")
+        requested = set(package["capabilities"])
+        admitted = set(ceilings.get(app_id, []))
+        if not requested <= admitted:
+            fail(f"local capability ceiling exceeded for {app_id!r}: {sorted(requested - admitted)}")
+
+
+def config_environment(path: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env["AIRLOCK_CONFIG"] = str(path)
+    env.pop("AIRLOCK_CONFIG_SNAPSHOT", None)
+    env.pop("AIRLOCK_CONFIG_SNAPSHOT_SHA256", None)
+    return env
+
+
+def legacy_adoption(config: Path) -> dict[str, str]:
+    before = read_regular(config, "legacy operator config")
+    run_checked([sys.executable, str(CONFIG_CLI), "validate"], "legacy operator config validation", config_environment(config))
+    after = read_regular(config, "legacy operator config")
+    if after != before:
+        fail("legacy operator config changed while it was validated")
+    try:
+        parsed = tomllib.loads(before.decode())
+    except (UnicodeError, ValueError) as exc:
+        fail(f"legacy operator config is invalid TOML: {exc}")
+    owner = parsed.get("auth", {}).get("owner") if isinstance(parsed.get("auth"), dict) else None
+    if not isinstance(owner, str) or not owner:
+        fail("legacy operator config has no canonical owner identity")
+    return {"config_digest": digest(before), "owner_identity_digest": digest(canonical(owner))}
+
+
+def trusted_legacy_config(raw: str) -> tuple[Path, tuple[tuple[int, int, int, int, int], ...]]:
+    """Resolve one explicit bootstrap input and bind its stable filesystem identity.
+
+    Root choosing this path is the trusted operator action.  The source file may
+    remain owned by that operator rather than root, but neither it nor a path
+    component may be writable by group/other users.  Identity is checked again
+    after validation and again at the bootstrap serialization boundary.
+    """
+    if not os.path.isabs(raw) or os.path.normpath(raw) != raw:
+        fail("bootstrap legacy config path must be absolute and canonical")
+    path = Path(raw)
+    try:
+        if path.resolve(strict=True) != path:
+            fail("bootstrap legacy config path must have no symlink component")
+    except OSError as exc:
+        fail(f"cannot resolve bootstrap legacy config {path}: {exc}")
+
+    identities = []
+    for component in [*reversed(path.parents), path]:
+        try:
+            info = component.lstat()
+        except OSError as exc:
+            fail(f"cannot inspect bootstrap legacy config component {component}: {exc}")
+        is_final = component == path
+        if is_final:
+            if not stat.S_ISREG(info.st_mode) or component.is_symlink():
+                fail("bootstrap legacy config must be a regular non-symlink file")
+        elif not stat.S_ISDIR(info.st_mode) or component.is_symlink():
+            fail("bootstrap legacy config parents must be real directories")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            fail("bootstrap legacy config path must not be writable by group or others")
+        identities.append((info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)))
+    return path, tuple(identities)
+
+
+def bootstrap_legacy_adoption(raw: str) -> tuple[dict[str, str], tuple[tuple[int, int, int, int, int], ...]]:
+    config, identity_before = trusted_legacy_config(raw)
+    adoption = legacy_adoption(config)
+    config_after, identity_after = trusted_legacy_config(raw)
+    if config_after != config or identity_after != identity_before:
+        fail("bootstrap legacy config path or owner identity changed while it was validated")
+    return adoption, identity_before
+
+
+def snapshot_floor(context: dict[str, Any]) -> dict[str, Any]:
+    snapshot = context["snapshot"]
+    return {
+        "channel_id": snapshot["channel_id"],
+        "epoch": snapshot["epoch"],
+        "sequence": snapshot["sequence"],
+        "snapshot_digest": context["snapshot_digest"],
+    }
+
+
+def initial_state(enrollment: dict[str, Any], enrollment_raw: bytes, context: dict[str, Any], selection: dict[str, Any], adoption: dict[str, str] | None) -> dict[str, Any]:
+    return {
+        "authority": {
+            "membership_digest": context["membership_digest"],
+            "sequence": context["membership_sequence"],
+        },
+        "capability_ceilings": copy.deepcopy(enrollment["capability_ceilings"]),
+        "enrollment_digest": digest(enrollment_raw),
+        "legacy_adoption": adoption,
+        "organization_id": enrollment["organization_id"],
+        "owner_selection": copy.deepcopy(selection),
+        "owner_selection_digest": digest(canonical(selection)),
+        "root_key_id": enrollment["root_key_id"],
+        "schema": "airlock.managed.box-state/v1",
+        "snapshot": snapshot_floor(context),
+    }
+
+
+def load_existing_state(path: Path, *, required: bool) -> tuple[dict[str, Any] | None, bytes | None]:
+    raw = validate_private_state_file(path, required=required)
+    if raw is None:
+        return None, None
+    try:
+        value = json.loads(raw, object_pairs_hook=json_pairs)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"managed state is invalid JSON: {exc}")
+    if raw != canonical(value):
+        fail("managed state must use canonical JSON bytes")
+    return validate_state(value), raw
+
+
+def check_existing_floors(state: dict[str, Any], context: dict[str, Any], selection: dict[str, Any]) -> None:
+    if state["organization_id"] != context["organization_id"]:
+        fail("verified release belongs to another enrolled organisation")
+    if state["root_key_id"] != context["root_key_id"]:
+        fail("verified authority root differs from the enrolled root")
+    authority = state["authority"]
+    if context["membership_sequence"] < authority["sequence"]:
+        fail("current membership rollback rejected by local authority floor")
+    if context["membership_sequence"] == authority["sequence"] and context["membership_digest"] != authority["membership_digest"]:
+        fail("current membership sequence reused with different signed bytes")
+    current_snapshot = state["snapshot"]
+    candidate_snapshot = snapshot_floor(context)
+    if candidate_snapshot["channel_id"] != current_snapshot["channel_id"]:
+        fail("snapshot channel differs from the channel fixed at enrollment")
+    current_pair = (current_snapshot["epoch"], current_snapshot["sequence"])
+    candidate_pair = (candidate_snapshot["epoch"], candidate_snapshot["sequence"])
+    if candidate_pair < current_pair:
+        fail("snapshot rollback rejected by local acceptance floor")
+    if candidate_pair == current_pair and candidate_snapshot["snapshot_digest"] != current_snapshot["snapshot_digest"]:
+        fail("snapshot epoch/sequence reused with different signed bytes")
+    current_selection = state["owner_selection"]
+    candidate_digest = digest(canonical(selection))
+    if selection["sequence"] < current_selection["sequence"]:
+        fail("owner selection rollback rejected by local sequence floor")
+    if selection["sequence"] == current_selection["sequence"] and candidate_digest != state["owner_selection_digest"]:
+        fail("owner selection sequence reused with different canonical bytes")
+
+
+def verify_current_state(state: dict[str, Any], context: dict[str, Any]) -> None:
+    """Bind a persisted owner decision to the exact currently verified inputs."""
+    if state["organization_id"] != context["organization_id"]:
+        fail("verified release belongs to another enrolled organisation")
+    if state["root_key_id"] != context["root_key_id"]:
+        fail("verified authority root differs from the enrolled root")
+
+    authority = state["authority"]
+    current_sequence = context["membership_sequence"]
+    if current_sequence < authority["sequence"]:
+        fail("current membership rollback rejected by local authority floor")
+    if current_sequence == authority["sequence"] and context["membership_digest"] != authority["membership_digest"]:
+        fail("current membership sequence reused with different signed bytes")
+    if current_sequence > authority["sequence"]:
+        fail("current membership has not been accepted into managed state")
+
+    current_snapshot = state["snapshot"]
+    candidate_snapshot = snapshot_floor(context)
+    if candidate_snapshot["channel_id"] != current_snapshot["channel_id"]:
+        fail("snapshot channel differs from the channel fixed at enrollment")
+    current_pair = (current_snapshot["epoch"], current_snapshot["sequence"])
+    candidate_pair = (candidate_snapshot["epoch"], candidate_snapshot["sequence"])
+    if candidate_pair < current_pair:
+        fail("snapshot rollback rejected by local acceptance floor")
+    if candidate_pair == current_pair and candidate_snapshot["snapshot_digest"] != current_snapshot["snapshot_digest"]:
+        fail("snapshot epoch/sequence reused with different signed bytes")
+    if candidate_pair > current_pair:
+        fail("verified snapshot has not been selected into managed state")
+
+    validate_policy(context, state["owner_selection"], state["capability_ceilings"])
+
+
+def command_apply(args: argparse.Namespace) -> dict[str, Any]:
+    state_path = Path(args.state).expanduser().absolute()
+    stage = Path(args.release).expanduser().absolute()
+    authority = Path(args.authority).expanduser().absolute()
+    selection, _selection_raw = load_json(Path(args.selection).expanduser().absolute(), "owner selection")
+    selection = validate_selection(selection)
+    enrollment = None
+    enrollment_raw = None
+    if args.command in {"enroll", "adopt"}:
+        enrollment, enrollment_raw = load_json(Path(args.enrollment).expanduser().absolute(), "enrollment")
+        enrollment = validate_enrollment(enrollment)
+    adoption_before = legacy_adoption(Path(args.config).expanduser().absolute()) if args.command == "adopt" else None
+    context_before = release_context(stage, authority, args.at)
+
+    lock_fd = state_lock(state_path)
+    try:
+        context = release_context(stage, authority, args.at)
+        if context != context_before:
+            fail("signed release or current authority changed before state transition")
+        if args.command == "adopt":
+            adoption = legacy_adoption(Path(args.config).expanduser().absolute())
+            if adoption != adoption_before:
+                fail("legacy operator identity changed before state transition")
+        else:
+            adoption = None
+        current, current_raw = load_existing_state(state_path, required=args.command == "select")
+        if args.command in {"enroll", "adopt"}:
+            if current is not None:
+                fail("managed state already exists; enrollment or adoption is one-time")
+            assert enrollment is not None and enrollment_raw is not None
+            if enrollment["organization_id"] != context["organization_id"]:
+                fail("enrollment belongs to another organisation")
+            if enrollment["root_key_id"] != context["root_key_id"]:
+                fail("enrollment root does not match the verified authority")
+            validate_policy(context, selection, enrollment["capability_ceilings"])
+            updated = initial_state(enrollment, enrollment_raw, context, selection, adoption)
+        else:
+            assert current is not None
+            check_existing_floors(current, context, selection)
+            validate_policy(context, selection, current["capability_ceilings"])
+            updated = copy.deepcopy(current)
+            updated["authority"] = {
+                "membership_digest": context["membership_digest"],
+                "sequence": context["membership_sequence"],
+            }
+            updated["snapshot"] = snapshot_floor(context)
+            updated["owner_selection"] = copy.deepcopy(selection)
+            updated["owner_selection_digest"] = digest(canonical(selection))
+        validate_state(updated)
+        raw = canonical(updated)
+        changed = raw != current_raw
+        if changed:
+            atomic_write(state_path, raw)
+        return {
+            "changed": changed,
+            "owner_selection_digest": updated["owner_selection_digest"],
+            "owner_selection_sequence": updated["owner_selection"]["sequence"],
+            "state": str(state_path),
+            "state_digest": digest(raw),
+        }
+    finally:
+        os.close(lock_fd)
+
+
+def command_inspect(args: argparse.Namespace) -> dict[str, Any]:
+    state_path = Path(args.state).expanduser().absolute()
+    lock_fd = state_lock(state_path)
+    try:
+        state, raw = load_existing_state(state_path, required=True)
+        assert state is not None and raw is not None
+        adoption = state["legacy_adoption"]
+        return {
+            "legacy_owner_identity_digest": adoption["owner_identity_digest"] if adoption is not None else None,
+            "selection": state["owner_selection"],
+            "selection_digest": state["owner_selection_digest"],
+            "state_digest": digest(raw),
+        }
+    finally:
+        os.close(lock_fd)
+
+
+def command_inspect_verified(args: argparse.Namespace) -> dict[str, Any] | None:
+    state_path = Path(args.state).expanduser().absolute()
+    stage = Path(args.release).expanduser().absolute()
+    authority_path = Path(args.authority).expanduser().absolute()
+    context_before = release_context(stage, authority_path, args.at)
+    lock_fd = state_lock(state_path)
+    try:
+        context = release_context(stage, authority_path, args.at)
+        if context != context_before:
+            fail("signed release or current authority changed before verified inspection")
+        state, raw = load_existing_state(state_path, required=True)
+        assert state is not None and raw is not None
+        verify_current_state(state, context)
+        adoption = state["legacy_adoption"]
+        result = {
+            "authority": copy.deepcopy(state["authority"]),
+            "legacy_owner_identity_digest": adoption["owner_identity_digest"] if adoption is not None else None,
+            "organization_id": state["organization_id"],
+            "root_key_id": state["root_key_id"],
+            "selection": copy.deepcopy(state["owner_selection"]),
+            "selection_digest": state["owner_selection_digest"],
+            "snapshot": copy.deepcopy(state["snapshot"]),
+            "state_digest": digest(raw),
+        }
+        if release_context(stage, authority_path, args.at) != context:
+            fail("signed release or current authority changed during verified inspection")
+        if args.lease:
+            # The config consumer needs this exact writer lock to span its final
+            # validation and output replacement.  Keep ownership here rather than
+            # teaching nested callers to assert that somebody else holds the lock.
+            # EOF releases the lease on every parent failure/crash path.
+            sys.stdout.buffer.write(canonical(result))
+            sys.stdout.buffer.flush()
+            if sys.stdin.buffer.read(1) != b"\0":
+                fail("verified inspection lease ended without commit acknowledgement")
+            return None
+        return result
+    finally:
+        os.close(lock_fd)
+
+
+def bootstrap_inputs(args: argparse.Namespace) -> tuple[
+    dict[str, Any], bytes, dict[str, Any], dict[str, Any], bytes, bytes,
+    tuple[tuple[int, int, int, int, int], ...] | None,
+]:
+    enrollment, enrollment_raw = load_json(
+        Path(args.enrollment).expanduser().absolute(), "enrollment"
+    )
+    enrollment = validate_enrollment(enrollment)
+    selection, _selection_raw = load_json(
+        Path(args.selection).expanduser().absolute(), "owner selection"
+    )
+    selection = validate_selection(selection)
+    stage = Path(args.release).expanduser().absolute()
+    source_authority = Path(args.authority).expanduser().absolute()
+    context = release_context(stage, source_authority, args.at)
+    if enrollment["organization_id"] != context["organization_id"]:
+        fail("enrollment belongs to another organisation")
+    if enrollment["root_key_id"] != context["root_key_id"]:
+        fail("enrollment root does not match the verified authority")
+    validate_policy(context, selection, enrollment["capability_ceilings"])
+    membership, membership_raw = load_json(
+        source_authority / "current-membership.json", "current membership"
+    )
+    root_raw = read_regular(source_authority / "root-public.der", "authority root", 64 * 1024)
+    if digest(membership_raw) != context["membership_digest"]:
+        fail("current membership bytes changed after release verification")
+    if digest(root_raw) != context["root_key_id"]:
+        fail("authority root bytes changed after release verification")
+    valid_int(membership.get("sequence"), "current membership sequence")
+    if args.legacy_config is None:
+        adoption = None
+        legacy_identity = None
+    else:
+        adoption, legacy_identity = bootstrap_legacy_adoption(args.legacy_config)
+    state = initial_state(enrollment, enrollment_raw, context, selection, adoption)
+    return (
+        enrollment, enrollment_raw, selection, state, membership_raw, root_raw,
+        legacy_identity,
+    )
+
+
+def bootstrap_result(
+    anchor: dict[str, Any], anchor_raw: bytes, state_raw: bytes, changed: bool
+) -> dict[str, Any]:
+    return {
+        "anchor": str(ANCHOR_PATH),
+        "anchor_sha256": hashlib.sha256(anchor_raw).hexdigest(),
+        "changed": changed,
+        "namespace": str(MANAGED_ROOT / str(anchor["writer_uid"])),
+        "state": anchor["state_path"],
+        "state_digest": digest(state_raw),
+    }
+
+
+def valid_utc(value: Any, where: str) -> datetime:
+    valid_string(value, UTC_RE, where)
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        fail(f"{where} is invalid: {exc}")
+    if parsed.tzinfo != timezone.utc:
+        fail(f"{where} must be UTC")
+    return parsed
+
+
+def validate_anchor(value: Any) -> dict[str, Any]:
+    anchor = exact(value, ANCHOR_KEYS, "managed install anchor")
+    if anchor["schema"] != ANCHOR_SCHEMA:
+        fail("managed install anchor schema is unsupported")
+    writer_uid = valid_delegated_id(anchor["writer_uid"], "managed anchor writer_uid")
+    writer_gid = valid_delegated_id(anchor["writer_gid"], "managed anchor writer_gid")
+    valid_string(anchor["organization_id"], ID_RE, "managed anchor organization_id")
+    valid_string(anchor["channel_id"], ID_RE, "managed anchor channel_id")
+    valid_string(anchor["root_key_id"], DIGEST_RE, "managed anchor root_key_id")
+    valid_string(anchor["enrollment_digest"], DIGEST_RE, "managed anchor enrollment_digest")
+    namespace = MANAGED_ROOT / str(writer_uid)
+    expected = {
+        "authority_path": str(namespace / "authority"),
+        "state_path": str(namespace / "managed-state.json"),
+        "store_path": str(namespace / "store"),
+    }
+    if any(anchor[key] != value for key, value in expected.items()):
+        fail("managed install anchor paths differ from its delegated writer namespace")
+    return anchor
+
+
+def installed_anchor_lock(root: Path, *, exclusive: bool) -> tuple[int, dict[str, Any], bytes]:
+    path = rooted(root, ANCHOR_PATH)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open managed install anchor {path}: {exc}")
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o644):
+            fail("managed install anchor must be root:root regular 0644")
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        raw = read_regular(path, "managed install anchor")
+        try:
+            value = json.loads(raw, object_pairs_hook=json_pairs)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            fail(f"managed install anchor is invalid JSON: {exc}")
+        if raw != canonical(value):
+            fail("managed install anchor must use canonical JSON bytes")
+        return fd, validate_anchor(value), raw
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def validate_access(value: Any) -> dict[str, Any]:
+    access = exact(value, {
+        "anchor_sha256", "changed_at", "enrollment_digest", "organization_id",
+        "schema", "status",
+    }, "managed access state")
+    if access["schema"] != ACCESS_SCHEMA:
+        fail("managed access state schema is unsupported")
+    valid_string(access["anchor_sha256"], BARE_SHA256_RE, "managed access anchor_sha256")
+    valid_utc(access["changed_at"], "managed access changed_at")
+    valid_string(access["enrollment_digest"], DIGEST_RE, "managed access enrollment_digest")
+    valid_string(access["organization_id"], ID_RE, "managed access organization_id")
+    if access["status"] not in {"lapsed", "unenrolled"}:
+        fail("managed access status is invalid")
+    return access
+
+
+def load_access(root: Path, anchor: dict[str, Any], anchor_raw: bytes) -> tuple[str, dict[str, Any] | None, bytes | None]:
+    path = rooted(root, ACCESS_PATH)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "active", None, None
+    except OSError as exc:
+        fail(f"cannot inspect managed access state {path}: {exc}")
+    if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+            or info.st_uid != 0 or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) != 0o644):
+        fail("managed access state must be root:root regular 0644")
+    access, raw = load_json(path, "managed access state")
+    access = validate_access(access)
+    if access["anchor_sha256"] != hashlib.sha256(anchor_raw).hexdigest():
+        fail("managed access state belongs to another install anchor")
+    if access["enrollment_digest"] != anchor["enrollment_digest"]:
+        fail("managed access state belongs to another enrollment")
+    if access["organization_id"] != anchor["organization_id"]:
+        fail("managed access state belongs to another organisation")
+    return access["status"], access, raw
+
+
+def atomic_root_write(path: Path, raw: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        os.fchown(fd, 0, 0)
+        with os.fdopen(fd, "wb", closefd=False) as target:
+            target.write(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        temporary = ""
+        sync_directory(path.parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def command_access_transition(args: argparse.Namespace) -> dict[str, Any]:
+    if os.geteuid() != 0 or os.getegid() != 0:
+        fail("managed access transition must run as root:root")
+    root = bootstrap_root(args.root_prefix)
+    changed_at = valid_utc(args.at, "access transition at")
+    fd, anchor, anchor_raw = installed_anchor_lock(root, exclusive=True)
+    try:
+        anchor_sha256 = hashlib.sha256(anchor_raw).hexdigest()
+        if args.expected_anchor_sha256 != anchor_sha256:
+            fail("explicit access transition names another install anchor")
+        status, current, current_raw = load_access(root, anchor, anchor_raw)
+        if status == args.status:
+            assert current is not None and current_raw is not None
+            if current["changed_at"] != args.at:
+                fail("managed access transition already exists with another time")
+            return {"changed": False, "path": str(ACCESS_PATH), "status": status}
+        if status == "unenrolled" or (status == "lapsed" and args.status != "unenrolled"):
+            fail(f"managed access transition {status!r} -> {args.status!r} is not admitted")
+        if current is not None and changed_at <= valid_utc(current["changed_at"], "current access changed_at"):
+            fail("managed access transition time must increase")
+        updated = {
+            "anchor_sha256": anchor_sha256,
+            "changed_at": args.at,
+            "enrollment_digest": anchor["enrollment_digest"],
+            "organization_id": anchor["organization_id"],
+            "schema": ACCESS_SCHEMA,
+            "status": args.status,
+        }
+        path = rooted(root, ACCESS_PATH)
+        atomic_root_write(path, canonical(updated))
+        return {"changed": True, "path": str(ACCESS_PATH), "status": args.status}
+    finally:
+        os.close(fd)
+
+
+def installed_release_command(args: argparse.Namespace, command: str) -> dict[str, Any]:
+    root = bootstrap_root(args.root_prefix)
+    fd, anchor, anchor_raw = installed_anchor_lock(root, exclusive=False)
+    try:
+        if (os.geteuid(), os.getegid()) != (anchor["writer_uid"], anchor["writer_gid"]):
+            fail("installed managed release command must run as the delegated writer")
+        status, _access, _access_raw = load_access(root, anchor, anchor_raw)
+        authority = rooted(root, Path(anchor["authority_path"]))
+        store = rooted(root, Path(anchor["store_path"]))
+        if command == "refresh":
+            if status != "active":
+                fail(f"new organisation snapshots stop while managed access is {status}")
+            argv = [
+                sys.executable, str(RELEASE_CLI), "refresh", "--source", args.source,
+                "--authority", str(authority), "--store", str(store),
+                "--refreshed-at", args.at,
+                "--expected-organization", anchor["organization_id"],
+                "--expected-channel", anchor["channel_id"],
+                "--expected-root-key-id", anchor["root_key_id"],
+            ]
+        else:
+            argv = [
+                sys.executable, str(RELEASE_CLI), "resolve-cached",
+                "--store", str(store), "--authority", str(authority),
+                "--channel", anchor["channel_id"],
+                "--expected-organization", anchor["organization_id"],
+                "--expected-root-key-id", anchor["root_key_id"],
+                "--snapshot-digest", args.snapshot_digest, "--at", args.at,
+            ]
+        result = parse_command_json(
+            run_checked(argv, f"installed managed {command}"),
+            f"installed managed {command}",
+        )
+        result["access_status"] = status
+        return result
+    finally:
+        os.close(fd)
+
+
+def command_refresh_installed(args: argparse.Namespace) -> dict[str, Any]:
+    return installed_release_command(args, "refresh")
+
+
+def command_resolve_installed_cached(args: argparse.Namespace) -> dict[str, Any]:
+    return installed_release_command(args, "resolve-cached")
+
+
+def command_inspect_installed_access(args: argparse.Namespace) -> dict[str, Any]:
+    root = bootstrap_root(args.root_prefix)
+    fd, anchor, anchor_raw = installed_anchor_lock(root, exclusive=False)
+    try:
+        if (os.geteuid(), os.getegid()) != (anchor["writer_uid"], anchor["writer_gid"]):
+            fail("installed managed access inspection must run as the delegated writer")
+        status, _access, _raw = load_access(root, anchor, anchor_raw)
+        admitted = status == "active"
+        return {
+            "fleet_evidence_allowed": admitted,
+            "organization_snapshots_allowed": admitted,
+            "public_local_updates_allowed": True,
+            "recovery_bundles_preserved": True,
+            "running_apps_preserved": True,
+            "status": status,
+        }
+    finally:
+        os.close(fd)
+
+
+def command_bootstrap(args: argparse.Namespace) -> dict[str, Any]:
+    """Create one fixed root anchor and hand one closed namespace to its writer.
+
+    The root-owned namespace directory stays mode 0700 until every child and the
+    anchor have durable exact bytes.  Chowning that top directory is the single
+    visibility/ownership linearization point for the delegated writer.  A crash
+    before it leaves only an inaccessible root-owned partial tree; a same-input
+    retry validates every byte and resumes, while any conflict is left untouched.
+    """
+    if os.geteuid() != 0 or os.getegid() != 0:
+        fail("bootstrap must run as root:root")
+    writer_uid = valid_delegated_id(args.writer_uid, "bootstrap writer_uid")
+    writer_gid = valid_delegated_id(args.writer_gid, "bootstrap writer_gid")
+    root = bootstrap_root(args.root_prefix)
+
+    (
+        enrollment, enrollment_raw, _selection, state, membership_raw, root_raw,
+        legacy_identity,
+    ) = bootstrap_inputs(args)
+    state_raw = canonical(state)
+    logical_namespace = MANAGED_ROOT / str(writer_uid)
+    logical_state = logical_namespace / "managed-state.json"
+    logical_authority = logical_namespace / "authority"
+    logical_store = logical_namespace / "store"
+    anchor = {
+        "authority_path": str(logical_authority),
+        "channel_id": state["snapshot"]["channel_id"],
+        "enrollment_digest": digest(enrollment_raw),
+        "organization_id": enrollment["organization_id"],
+        "root_key_id": enrollment["root_key_id"],
+        "schema": ANCHOR_SCHEMA,
+        "state_path": str(logical_state),
+        "store_path": str(logical_store),
+        "writer_gid": writer_gid,
+        "writer_uid": writer_uid,
+    }
+    exact(anchor, ANCHOR_KEYS, "managed install anchor")
+    anchor_raw = canonical(anchor)
+
+    root_directories = (
+        Path("/etc"), Path("/etc/airlock"), Path("/var"), Path("/var/lib"),
+        Path("/var/lib/airlock"), MANAGED_ROOT,
+    )
+    for logical in root_directories:
+        ensure_root_directory(rooted(root, logical), f"bootstrap {logical}")
+    managed_root = rooted(root, MANAGED_ROOT)
+    lock_fd = bootstrap_lock(managed_root / ".bootstrap.lock")
+    try:
+        # Recheck all mutable cryptographic inputs after serialization.  Only
+        # byte-identical inputs may reach an existing or new protected layout.
+        repeated = bootstrap_inputs(args)
+        if repeated[0] != enrollment or repeated[1] != enrollment_raw:
+            fail("enrollment changed before bootstrap serialization")
+        if canonical(repeated[3]) != state_raw:
+            fail("release, authority, selection, or legacy config changed before bootstrap serialization")
+        if repeated[4] != membership_raw or repeated[5] != root_raw:
+            fail("authority bytes changed before bootstrap serialization")
+        if repeated[6] != legacy_identity:
+            fail("legacy config path or owner identity changed before bootstrap serialization")
+
+        namespace = rooted(root, logical_namespace)
+        authority = rooted(root, logical_authority)
+        store = rooted(root, logical_store)
+        releases = store / "releases"
+        state_path = rooted(root, logical_state)
+        state_lock_path = state_path.with_name("managed-state.json.lock")
+        anchor_path = rooted(root, ANCHOR_PATH)
+
+        try:
+            namespace_info = namespace.lstat()
+        except FileNotFoundError:
+            try:
+                os.mkdir(namespace, 0o700)
+            except OSError as exc:
+                fail(f"cannot create delegated managed namespace {namespace}: {exc}")
+            namespace_info = namespace.lstat()
+        except OSError as exc:
+            fail(f"cannot inspect delegated managed namespace {namespace}: {exc}")
+
+        anchor_exists = False
+        try:
+            anchor_info = anchor_path.lstat()
+            anchor_exists = True
+        except FileNotFoundError:
+            anchor_info = None
+        except OSError as exc:
+            fail(f"cannot inspect managed anchor {anchor_path}: {exc}")
+
+        if anchor_exists:
+            assert anchor_info is not None
+            if (not stat.S_ISREG(anchor_info.st_mode) or anchor_path.is_symlink()
+                    or anchor_info.st_uid != 0 or anchor_info.st_gid != 0
+                    or stat.S_IMODE(anchor_info.st_mode) != 0o644):
+                fail("existing managed anchor owner/mode/type is invalid")
+            if read_regular(anchor_path, "managed anchor") != anchor_raw:
+                fail("existing managed anchor conflicts with requested enrollment")
+
+        if (not stat.S_ISDIR(namespace_info.st_mode) or namespace.is_symlink()
+                or stat.S_IMODE(namespace_info.st_mode) != 0o700):
+            fail("delegated managed namespace owner/mode/type is invalid")
+
+        namespace_owner = (namespace_info.st_uid, namespace_info.st_gid)
+        if namespace_owner == (writer_uid, writer_gid):
+            if not anchor_exists:
+                fail("delegated namespace exists without its root anchor")
+            exact_directory(authority, writer_uid, writer_gid, 0o700, "managed authority")
+            exact_directory(store, writer_uid, writer_gid, 0o700, "managed store")
+            exact_directory(releases, writer_uid, writer_gid, 0o700, "managed releases")
+            if exact_file(state_path, writer_uid, writer_gid, 0o600, "managed state") != state_raw:
+                fail("existing managed state conflicts with requested bootstrap state")
+            if exact_file(state_lock_path, writer_uid, writer_gid, 0o600, "managed state lock") != b"":
+                fail("managed state lock must be empty")
+            if exact_file(authority / "root-public.der", writer_uid, writer_gid, 0o600, "authority root") != root_raw:
+                fail("existing authority root conflicts with requested bootstrap bytes")
+            if exact_file(authority / "current-membership.json", writer_uid, writer_gid, 0o600, "authority membership") != membership_raw:
+                fail("existing authority membership conflicts with requested bootstrap bytes")
+            return bootstrap_result(anchor, anchor_raw, state_raw, False)
+
+        if namespace_owner != (0, 0):
+            fail("delegated managed namespace has unknown ownership")
+
+        for path, label in (
+            (authority, "managed authority"),
+            (store, "managed store"),
+            (releases, "managed releases"),
+        ):
+            try:
+                os.mkdir(path, 0o700)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                fail(f"cannot create {label} {path}: {exc}")
+            partial_directory(path, writer_uid, writer_gid, 0o700, label)
+
+        directory_names_subset(
+            namespace,
+            {"authority", "managed-state.json", "managed-state.json.lock", "store"},
+            "partial managed namespace",
+        )
+        directory_names_subset(
+            authority, {"current-membership.json", "root-public.der"},
+            "partial managed authority",
+        )
+        directory_names_subset(store, {"releases"}, "partial managed store")
+        directory_names(releases, set(), "partial managed releases")
+        # Files are created only after every pre-existing directory has passed
+        # type/owner/mode checks.  Missing files are safe root-only crash residue;
+        # any existing byte disagreement is a conflict, never cleanup input.
+        partial_file(authority / "root-public.der", root_raw, writer_uid, writer_gid, 0o600, "authority root")
+        partial_file(authority / "current-membership.json", membership_raw, writer_uid, writer_gid, 0o600, "authority membership")
+        partial_file(state_path, state_raw, writer_uid, writer_gid, 0o600, "managed state")
+        partial_file(state_lock_path, b"", writer_uid, writer_gid, 0o600, "managed state lock")
+        directory_names(namespace, {"authority", "managed-state.json", "managed-state.json.lock", "store"}, "managed namespace")
+        directory_names(authority, {"current-membership.json", "root-public.der"}, "managed authority")
+        directory_names(store, {"releases"}, "managed store")
+        directory_names(releases, set(), "managed releases")
+
+        if not anchor_exists:
+            create_exact_file(anchor_path, anchor_raw, 0o644)
+        else:
+            exact_file(anchor_path, 0, 0, 0o644, "managed anchor")
+
+        # Descendants change owner first while the root-owned 0700 namespace
+        # remains untraversable by the delegated uid.  The final namespace chown
+        # is the only point at which that uid can observe or mutate the tree.
+        for path in (
+            authority / "root-public.der",
+            authority / "current-membership.json",
+            state_path,
+            state_lock_path,
+            releases,
+            authority,
+            store,
+        ):
+            try:
+                os.chown(path, writer_uid, writer_gid, follow_symlinks=False)
+            except OSError as exc:
+                fail(f"cannot delegate bootstrap path {path}: {exc}")
+        for path in (releases, authority, store):
+            sync_directory(path)
+        sync_directory(namespace)
+        try:
+            os.chown(namespace, writer_uid, writer_gid, follow_symlinks=False)
+        except OSError as exc:
+            fail(f"cannot publish delegated managed namespace {namespace}: {exc}")
+        sync_directory(managed_root)
+
+        exact_directory(namespace, writer_uid, writer_gid, 0o700, "delegated managed root")
+        exact_file(anchor_path, 0, 0, 0o644, "managed anchor")
+        return bootstrap_result(anchor, anchor_raw, state_raw, True)
+    finally:
+        os.close(lock_fd)
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    commands = root.add_subparsers(dest="command", required=True)
+    bootstrap = commands.add_parser(
+        "bootstrap",
+        help="root-create the fixed install anchor and delegate one managed namespace",
+    )
+    bootstrap.add_argument(
+        "--root-prefix", default="/",
+        help="filesystem root; non-default values are for an isolated chroot/source fixture",
+    )
+    bootstrap.add_argument("--writer-uid", required=True, type=int)
+    bootstrap.add_argument("--writer-gid", required=True, type=int)
+    bootstrap.add_argument("--release", required=True)
+    bootstrap.add_argument("--authority", required=True)
+    bootstrap.add_argument("--selection", required=True)
+    bootstrap.add_argument("--enrollment", required=True)
+    bootstrap.add_argument(
+        "--legacy-config",
+        help=("explicit existing operator config to bind into the initial state; "
+              "the installer must match its digests to existing inventory/ledger identity"),
+    )
+    bootstrap.add_argument(
+        "--at", required=True,
+        help="verification instant supplied by the explicit root enrollment action",
+    )
+    bootstrap.set_defaults(handler=command_bootstrap)
+    for name in ("enroll", "adopt", "select"):
+        command = commands.add_parser(name)
+        command.add_argument("--state", required=True)
+        command.add_argument("--release", required=True)
+        command.add_argument("--authority", required=True)
+        command.add_argument("--selection", required=True)
+        command.add_argument(
+            "--at", required=True,
+            help=("verification instant for the source transaction; installed wiring must "
+                  "derive current UTC and must not expose this as owner input"),
+        )
+        if name in {"enroll", "adopt"}:
+            command.add_argument("--enrollment", required=True)
+        if name == "adopt":
+            command.add_argument("--config", required=True)
+        command.set_defaults(handler=command_apply)
+    inspect = commands.add_parser("inspect")
+    inspect.add_argument("--state", required=True)
+    inspect.set_defaults(handler=command_inspect)
+    verified = commands.add_parser("inspect-verified")
+    verified.add_argument("--state", required=True)
+    verified.add_argument("--release", required=True)
+    verified.add_argument("--authority", required=True)
+    verified.add_argument("--at", required=True)
+    verified.add_argument(
+        "--lease", action="store_true",
+        help="hold the state writer lock until a NUL commit acknowledgement on stdin",
+    )
+    verified.set_defaults(handler=command_inspect_verified)
+    access = commands.add_parser(
+        "access-transition",
+        help="root-record an admitted lapse or explicit owner unenrollment",
+    )
+    access.add_argument("--root-prefix", default="/")
+    access.add_argument("--status", required=True, choices=["lapsed", "unenrolled"])
+    access.add_argument("--expected-anchor-sha256", required=True)
+    access.add_argument("--at", required=True)
+    access.set_defaults(handler=command_access_transition)
+    refresh = commands.add_parser(
+        "refresh-installed",
+        help="refresh the fixed enrolled channel from one complete local directory",
+    )
+    refresh.add_argument("--root-prefix", default="/")
+    refresh.add_argument("--source", required=True)
+    refresh.add_argument("--at", required=True)
+    refresh.set_defaults(handler=command_refresh_installed)
+    cached = commands.add_parser(
+        "resolve-installed-cached",
+        help="resolve an exact cached current or recovery release, including offline",
+    )
+    cached.add_argument("--root-prefix", default="/")
+    cached.add_argument("--snapshot-digest", required=True)
+    cached.add_argument("--at", required=True)
+    cached.set_defaults(handler=command_resolve_installed_cached)
+    access_status = commands.add_parser(
+        "inspect-installed-access",
+        help="read the fixed access state for refresh and fleet-evidence consumers",
+    )
+    access_status.add_argument("--root-prefix", default="/")
+    access_status.set_defaults(handler=command_inspect_installed_access)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.command == "access-transition":
+        valid_string(
+            args.expected_anchor_sha256, BARE_SHA256_RE,
+            "expected anchor sha256",
+        )
+        valid_utc(args.at, "access transition at")
+    if args.command in {"refresh-installed", "resolve-installed-cached"}:
+        valid_utc(args.at, "installed managed release at")
+    if args.command == "resolve-installed-cached":
+        valid_string(args.snapshot_digest, DIGEST_RE, "snapshot digest")
+    result = args.handler(args)
+    if result is not None:
+        sys.stdout.buffer.write(canonical(result))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except StateError as exc:
+        print(f"airlock-managed-state: {exc}", file=sys.stderr)
+        raise SystemExit(2)

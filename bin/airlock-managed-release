@@ -37,9 +37,13 @@ SCHEMA_IDS = {
     "membership": "airlock.managed.membership/v1",
     "receipt": "airlock.managed.promotion-receipt/v1",
     "state": "airlock.managed.release-state/v1",
+    "current": "airlock.managed.current-release/v1",
+    "cached": "airlock.managed.cached-release/v1",
+    "core_measurement": "airlock.core-public-measurement/v1",
 }
 SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+PUBLIC_RELEASE_SUBJECT_RE = re.compile(r"release from airlock-work @ ([0-9a-f]{40})\Z")
 ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 APP_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 CAPABILITY_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
@@ -192,6 +196,27 @@ def run(command: list[str], *, input_bytes: bytes | None = None) -> bytes:
     return result.stdout
 
 
+def exact_git_repository(raw: str) -> Path:
+    repository = real_directory_argument(raw, "repository")
+    top_level_raw = run([
+        "git", "--no-replace-objects", "-C", os.fspath(repository),
+        "rev-parse", "--show-toplevel",
+    ])
+    try:
+        top_level_text = top_level_raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"repository: Git top-level path is not UTF-8: {exc}")
+    if not top_level_text.endswith("\n") or top_level_text.count("\n") != 1:
+        fail("repository: Git returned a malformed top-level path")
+    try:
+        top_level = Path(top_level_text[:-1]).resolve(strict=True)
+    except OSError as exc:
+        fail(f"repository: cannot resolve Git top-level path: {exc}")
+    if top_level != repository:
+        fail("repository: must name the exact Git top level")
+    return repository
+
+
 @dataclass(frozen=True)
 class GitEntry:
     relative: str
@@ -200,51 +225,74 @@ class GitEntry:
     symlink: bool
 
 
-def git_entries(repository: Path, revision: str, prefix: str) -> tuple[str, list[GitEntry]]:
+def git_entries(
+    repository: Path, revision: str, prefix: str | None,
+) -> tuple[str, list[GitEntry]]:
     if SHA_RE.fullmatch(revision) is None:
         fail("revision: expected a full lowercase 40-character commit SHA")
-    resolved = run(["git", "-C", os.fspath(repository), "rev-parse", "--verify", f"{revision}^{{commit}}"])
+    resolved = run([
+        "git", "--no-replace-objects", "-C", os.fspath(repository),
+        "rev-parse", "--verify", f"{revision}^{{commit}}",
+    ])
     if resolved.decode().strip() != revision:
         fail("revision does not resolve to the exact reviewed commit")
-    normalized = PurePosixPath(prefix)
-    if normalized.is_absolute() or ".." in normalized.parts or str(normalized) in {"", "."}:
-        fail("input-prefix must be a non-empty relative path")
-    raw_listing = run(["git", "-C", os.fspath(repository), "ls-tree", "-rz", revision, "--", str(normalized)])
+    if prefix is None:
+        prefix_text = ""
+        label = "committed tree"
+        raw_listing = run([
+            "git", "--no-replace-objects", "-C", os.fspath(repository),
+            "ls-tree", "-rz", "--full-tree", revision,
+        ])
+    else:
+        normalized = PurePosixPath(prefix)
+        if normalized.is_absolute() or ".." in normalized.parts or str(normalized) in {"", "."}:
+            fail("input-prefix must be a non-empty relative path")
+        prefix_text = str(normalized).rstrip("/") + "/"
+        label = "reviewed tree"
+        raw_listing = run([
+            "git", "--no-replace-objects", "-C", os.fspath(repository),
+            "ls-tree", "-rz", revision, "--", str(normalized),
+        ])
     entries: list[GitEntry] = []
-    prefix_text = str(normalized).rstrip("/") + "/"
     for row in filter(None, raw_listing.split(b"\0")):
         try:
             header, encoded_path = row.split(b"\t", 1)
             mode_raw, kind_raw, object_raw = header.split(b" ", 2)
             path = encoded_path.decode("utf-8")
         except (ValueError, UnicodeDecodeError) as exc:
-            fail(f"reviewed tree: malformed git entry: {exc}")
+            fail(f"{label}: malformed git entry: {exc}")
         if not path.startswith(prefix_text):
-            fail("reviewed tree: entry escaped input prefix")
+            fail(f"{label}: entry escaped input prefix")
         relative = path[len(prefix_text):]
         pure = PurePosixPath(relative)
-        if pure.is_absolute() or not pure.parts or ".." in pure.parts:
-            fail(f"reviewed tree: unsafe path {relative!r}")
+        if (pure.is_absolute() or not pure.parts or ".." in pure.parts
+                or str(pure) != relative):
+            fail(f"{label}: unsafe or non-normalized path {relative!r}")
         kind = kind_raw.decode()
         mode_text = mode_raw.decode()
         if kind != "blob" or mode_text not in {"100644", "100755", "120000"}:
-            fail(f"reviewed tree: unsupported entry {relative} ({mode_text} {kind})")
-        blob = run(["git", "-C", os.fspath(repository), "cat-file", "blob", object_raw.decode()])
+            fail(f"{label}: unsupported entry {relative} ({mode_text} {kind})")
+        blob = run([
+            "git", "--no-replace-objects", "-C", os.fspath(repository),
+            "cat-file", "blob", object_raw.decode(),
+        ])
         if len(blob) > MAX_BLOB_BYTES:
-            fail(f"reviewed tree: blob too large: {relative}")
+            fail(f"{label}: blob too large: {relative}")
         symlink = mode_text == "120000"
         if symlink:
             try:
                 target = blob.decode("utf-8")
             except UnicodeDecodeError:
-                fail(f"reviewed tree: symlink target is not UTF-8: {relative}")
+                fail(f"{label}: symlink target is not UTF-8: {relative}")
             target_path = PurePosixPath(target)
             if target_path.is_absolute() or ".." in target_path.parts:
-                fail(f"reviewed tree: symlink escapes package tree: {relative}")
+                fail(f"{label}: symlink escapes tree: {relative}")
         entries.append(GitEntry(relative, 0o777 if symlink else int(mode_text[-3:], 8), blob, symlink))
     if not entries:
-        fail("reviewed tree: input prefix has no tracked files")
-    return revision, sorted(entries, key=lambda item: item.relative.encode())
+        fail(f"{label}: has no tracked files")
+    ordered = sorted(entries, key=lambda item: item.relative.encode())
+    entry_map(ordered)
+    return revision, ordered
 
 
 def entry_map(entries: list[GitEntry]) -> dict[str, GitEntry]:
@@ -272,6 +320,50 @@ def tree_manifest(entries: list[GitEntry]) -> list[dict[str, Any]]:
 
 def tree_digest(entries: list[GitEntry]) -> str:
     return digest_bytes(canonical_bytes(tree_manifest(entries)))
+
+
+def command_measure_public_core(args: argparse.Namespace) -> dict[str, Any]:
+    """Measure facts from one exact committed public tree without granting authority."""
+    repository = exact_git_repository(args.repository)
+    if SHA_RE.fullmatch(args.revision) is None:
+        fail("revision: expected a full lowercase 40-character commit SHA")
+
+    revision, entries = git_entries(repository, args.revision, None)
+    subject_raw = run([
+        "git", "--no-replace-objects", "-C", os.fspath(repository),
+        "show", "-s", "--format=%s", revision,
+    ])
+    try:
+        subject_text = subject_raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"public release subject is not UTF-8: {exc}")
+    if not subject_text.endswith("\n") or subject_text.count("\n") != 1:
+        fail("public release subject: malformed Git output")
+    subject_match = PUBLIC_RELEASE_SUBJECT_RE.fullmatch(subject_text[:-1])
+    if subject_match is None:
+        fail("public release subject: expected exact private source revision binding")
+
+    tree_raw = run([
+        "git", "--no-replace-objects", "-C", os.fspath(repository),
+        "rev-parse", "--verify", f"{revision}^{{tree}}",
+    ])
+    try:
+        public_tree_text = tree_raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        fail(f"public tree: Git returned non-ASCII output: {exc}")
+    if not public_tree_text.endswith("\n") or public_tree_text.count("\n") != 1:
+        fail("public tree: Git returned malformed output")
+    public_tree = public_tree_text[:-1]
+    if SHA_RE.fullmatch(public_tree) is None:
+        fail("public tree: expected a full lowercase 40-character tree SHA")
+
+    return {
+        "digest": tree_digest(entries),
+        "public_revision": revision,
+        "public_tree": public_tree,
+        "schema": SCHEMA_IDS["core_measurement"],
+        "source_revision": subject_match.group(1),
+    }
 
 
 def validate_catalog(value: Any) -> dict[str, Any]:
@@ -426,6 +518,36 @@ def validate_membership(value: Any) -> dict[str, Any]:
         fail(f"membership.root_signature.signature: invalid base64: {exc}")
     if len(signature) != 64:
         fail("membership.root_signature.signature: Ed25519 signature must be 64 bytes")
+    return obj
+
+
+def validate_promotion_receipt(value: Any) -> dict[str, Any]:
+    obj = exact_keys(value, {
+        "bundle_digest", "channel_id", "epoch", "membership_digest",
+        "organization_id", "previous_snapshot_digest", "promoted_at",
+        "publisher_id", "publisher_key_id", "receipt_id", "schema",
+        "sequence", "snapshot_digest",
+    }, "promotion receipt")
+    if obj["schema"] != SCHEMA_IDS["receipt"]:
+        fail("promotion receipt: unsupported schema")
+    expect_string(obj["bundle_digest"], "promotion receipt.bundle_digest", SHA256_RE)
+    expect_string(obj["channel_id"], "promotion receipt.channel_id", ID_RE)
+    expect_int(obj["epoch"], "promotion receipt.epoch", 1)
+    expect_string(obj["membership_digest"], "promotion receipt.membership_digest", SHA256_RE)
+    expect_string(obj["organization_id"], "promotion receipt.organization_id", ID_RE)
+    previous = obj["previous_snapshot_digest"]
+    if previous is not None:
+        expect_string(previous, "promotion receipt.previous_snapshot_digest", SHA256_RE)
+    parse_time(obj["promoted_at"], "promotion receipt.promoted_at")
+    expect_string(obj["publisher_id"], "promotion receipt.publisher_id", ID_RE)
+    expect_string(obj["publisher_key_id"], "promotion receipt.publisher_key_id", SHA256_RE)
+    expect_string(obj["receipt_id"], "promotion receipt.receipt_id", SHA256_RE)
+    expect_int(obj["sequence"], "promotion receipt.sequence", 1)
+    expect_string(obj["snapshot_digest"], "promotion receipt.snapshot_digest", SHA256_RE)
+    unsigned = dict(obj)
+    receipt_id = unsigned.pop("receipt_id")
+    if receipt_id != digest_bytes(canonical_bytes(unsigned)):
+        fail("promotion receipt: receipt id does not match canonical fields")
     return obj
 
 
@@ -667,8 +789,14 @@ def bundle_entries(path: Path) -> dict[str, tuple[str, int, bytes | str]]:
     return result
 
 
-def verify_stage(stage: Path, *, signed: bool) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def verify_stage(
+    stage: Path, *, signed: bool, promoted: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if promoted and not signed:
+        fail("stage: promoted verification requires signed bytes")
     expected_names = SIGNED_NAMES if signed else PREPARED_NAMES
+    if promoted:
+        expected_names = expected_names | {"promotion-receipt.json"}
     if not stage.is_dir() or stage.is_symlink() or directory_names(stage) != expected_names:
         fail(f"stage: expected exactly {sorted(expected_names)}")
     catalog_raw = read_regular(stage / "catalog.json", "catalog.json")
@@ -771,10 +899,8 @@ def empty_state() -> dict[str, Any]:
     return {"channels": {}, "membership_floors": {}, "schema": SCHEMA_IDS["state"]}
 
 
-def load_state(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return empty_state()
-    obj = exact_keys(load_json_bytes(read_regular(path, "release state"), "release-state.json"), {"channels", "membership_floors", "schema"}, "release state")
+def validate_release_state(value: Any) -> dict[str, Any]:
+    obj = exact_keys(value, {"channels", "membership_floors", "schema"}, "release state")
     if obj["schema"] != SCHEMA_IDS["state"] or not isinstance(obj["channels"], dict) or not isinstance(obj["membership_floors"], dict):
         fail("release state: unsupported schema, channels or membership floors")
     for channel_id, raw in obj["channels"].items():
@@ -790,6 +916,14 @@ def load_state(path: Path) -> dict[str, Any]:
         expect_int(floor["sequence"], f"release state membership floor {organization_id}.sequence", 1)
         expect_string(floor["membership_digest"], f"release state membership floor {organization_id}.membership_digest", SHA256_RE)
     return obj
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return empty_state()
+    return validate_release_state(
+        load_json_bytes(read_regular(path, "release state"), "release-state.json")
+    )
 
 
 def observe_membership(state: dict[str, Any], membership: dict[str, Any], membership_digest: str) -> tuple[dict[str, Any], bool]:
@@ -849,6 +983,203 @@ def release_matches_stage(destination: Path, stage: Path, receipt_raw: bytes) ->
     return read_regular(destination / "promotion-receipt.json", "existing promotion receipt") == receipt_raw
 
 
+def real_directory_argument(raw: str, label: str) -> Path:
+    path = Path(raw).expanduser().absolute()
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        fail(f"{label}: cannot resolve {path}: {exc}")
+    if resolved != path or not path.is_dir() or path.is_symlink():
+        fail(f"{label}: must be a real directory with no symlink component")
+    return path
+
+
+def resolve_current_value(
+    args: argparse.Namespace, *, supplied_release: Path | None = None,
+) -> dict[str, Any]:
+    store = real_directory_argument(args.store, "store")
+    authority = real_directory_argument(args.authority, "authority")
+    releases = real_directory_argument(os.fspath(store / "releases"), "store/releases")
+    verified_at = parse_time(args.at, "at")
+    lock_path = store / ".promotion.lock"
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        lock_fd = os.open(lock_path, flags)
+    except OSError as exc:
+        fail(f"promotion lock: cannot open existing {lock_path}: {exc}")
+    try:
+        lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode):
+            fail("promotion lock: must be a regular non-symlink file")
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+
+        state_path = store / "release-state.json"
+        state_raw = read_regular(state_path, "release state")
+        state = validate_release_state(
+            load_json_bytes(state_raw, "release-state.json")
+        )
+        current = state["channels"].get(args.channel)
+        if current is None:
+            fail(f"release state: channel {args.channel!r} has no current release")
+
+        release_id = current["snapshot_digest"].removeprefix("sha256:")
+        release = real_directory_argument(
+            os.fspath(releases / release_id), "current release",
+        )
+        if supplied_release is not None and supplied_release != release:
+            fail("supplied release is not the exact current channel release")
+        snapshot, signature = verify_stage(release, signed=True, promoted=True)
+        assert signature is not None
+        snapshot_raw = read_regular(release / "snapshot.json", "snapshot.json")
+        signature_raw = read_regular(release / "signature.json", "signature.json")
+        frozen_signature = validate_signature(
+            load_json_bytes(signature_raw, "signature.json")
+        )
+        if frozen_signature != signature:
+            fail("signature changed after signed release verification")
+        lock_raw = read_regular(release / "release.lock", "release.lock")
+        if digest_bytes(lock_raw) != snapshot["artifacts"]["release.lock"]:
+            fail("release.lock changed after signed release verification")
+        lock = validate_lock(load_json_bytes(lock_raw, "release.lock"))
+        snapshot_digest = digest_bytes(snapshot_raw)
+        if (snapshot_digest != current["snapshot_digest"]
+                or snapshot["channel_id"] != args.channel
+                or snapshot["epoch"] != current["epoch"]
+                or snapshot["sequence"] != current["sequence"]):
+            fail("current release differs from the release-state channel pointer")
+
+        receipt_path = release / "promotion-receipt.json"
+        receipt_raw = read_regular(receipt_path, "promotion receipt")
+        receipt = validate_promotion_receipt(
+            load_json_bytes(receipt_raw, "promotion-receipt.json")
+        )
+        if digest_bytes(receipt_raw) != current["receipt_digest"]:
+            fail("promotion receipt digest differs from the release-state channel pointer")
+        expected_receipt = {
+            "bundle_digest": snapshot["artifacts"]["bundle.tar"],
+            "channel_id": snapshot["channel_id"],
+            "epoch": snapshot["epoch"],
+            "organization_id": snapshot["organization_id"],
+            "publisher_id": snapshot["publisher_id"],
+            "publisher_key_id": signature["key_id"],
+            "sequence": snapshot["sequence"],
+            "snapshot_digest": snapshot_digest,
+        }
+        if any(receipt[key] != value for key, value in expected_receipt.items()):
+            fail("promotion receipt identity differs from the signed current release")
+        if parse_time(receipt["promoted_at"], "promotion receipt.promoted_at") > verified_at:
+            fail("promotion receipt is newer than the verification instant")
+
+        membership, membership_digest = load_authority(authority)
+        publisher = select_publisher(membership, snapshot, signature, args.at)
+        public_der = base64.b64decode(publisher["public_key_der"], validate=True)
+        openssl_verify(
+            public_der, snapshot_raw,
+            base64.b64decode(signature["signature"], validate=True),
+            "snapshot signature",
+        )
+        floor = state["membership_floors"].get(snapshot["organization_id"])
+        if floor is None:
+            fail("release state has no durable authority floor for the current release")
+        if (membership["sequence"] < floor["sequence"]
+                or (membership["sequence"] == floor["sequence"]
+                    and membership_digest != floor["membership_digest"])):
+            fail("current authority is behind or conflicts with the durable authority floor")
+
+        # Authority is not protected by the promotion lock. Re-read it before
+        # returning so a concurrent replacement cannot silently combine two
+        # membership observations. A later revocation is rechecked by the
+        # consuming managed-config boundary.
+        membership_now, membership_digest_now = load_authority(authority)
+        if membership_now != membership or membership_digest_now != membership_digest:
+            fail("current authority changed during release resolution")
+        if read_regular(state_path, "release state") != state_raw:
+            fail("release state changed while the promotion lock was held")
+        if read_regular(receipt_path, "promotion receipt") != receipt_raw:
+            fail("promotion receipt changed while the promotion lock was held")
+        if read_regular(release / "snapshot.json", "snapshot.json") != snapshot_raw:
+            fail("snapshot changed while the promotion lock was held")
+        if read_regular(release / "signature.json", "signature.json") != signature_raw:
+            fail("signature changed while the promotion lock was held")
+        if read_regular(release / "release.lock", "release.lock") != lock_raw:
+            fail("release.lock changed while the promotion lock was held")
+        return {
+            "authority_membership_digest": membership_digest,
+            "authority_sequence": membership["sequence"],
+            "bundle_digest": snapshot["artifacts"]["bundle.tar"],
+            "catalog_digest": snapshot["artifacts"]["catalog.json"],
+            "channel_id": snapshot["channel_id"],
+            "core_digest": lock["core"]["digest"],
+            "core_revision": lock["core"]["revision"],
+            "epoch": snapshot["epoch"],
+            "lock_digest": snapshot["artifacts"]["release.lock"],
+            "organization_id": snapshot["organization_id"],
+            "promotion_membership_digest": receipt["membership_digest"],
+            "promotion_receipt_digest": current["receipt_digest"],
+            "promotion_receipt_path": os.fspath(receipt_path),
+            "publisher_id": snapshot["publisher_id"],
+            "publisher_key_id": signature["key_id"],
+            "receipt_id": receipt["receipt_id"],
+            "release_path": os.fspath(release),
+            "requested_capabilities": snapshot["requested_capabilities"],
+            "root_key_id": membership["root_key_id"],
+            "schema": SCHEMA_IDS["current"],
+            "sequence": snapshot["sequence"],
+            "snapshot_digest": snapshot_digest,
+            "target_profile": snapshot["target_profile"],
+            "verified_at": args.at,
+        }
+    finally:
+        os.close(lock_fd)
+
+
+def command_resolve_current(args: argparse.Namespace) -> dict[str, Any]:
+    return resolve_current_value(args)
+
+
+def command_verify_current(args: argparse.Namespace) -> dict[str, Any]:
+    """Verify one supplied promoted release as the exact current pointer."""
+    supplied = real_directory_argument(args.release, "supplied current release")
+    current = resolve_current_value(args, supplied_release=supplied)
+    return {
+        "bundle_digest": current["bundle_digest"],
+        "membership_digest": current["authority_membership_digest"],
+        "publisher_key_id": current["publisher_key_id"],
+        "snapshot_digest": current["snapshot_digest"],
+    }
+
+
+def internal_promoted_verify_args(args: argparse.Namespace) -> argparse.Namespace | None:
+    """Bridge the explicit mode through the unchanged managed-state subprocess ABI.
+
+    Setting these variables grants no authority: the stricter verifier still derives
+    and authenticates the current pointer, promotion receipt, signed release, and
+    current membership.  Their only purpose is to preserve an explicit mode across a
+    caller which predates the promoted-current CLI.
+    """
+    names = {
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_MODE",
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_STORE",
+        "AIRLOCK_MANAGED_RELEASE_VERIFY_CHANNEL",
+    }
+    present = {name for name in names if os.environ.get(name)}
+    if not present:
+        return None
+    if present != names or os.environ["AIRLOCK_MANAGED_RELEASE_VERIFY_MODE"] != "promoted-current":
+        fail("promoted-current verification environment is incomplete or invalid")
+    if not args.signed or not args.authority or not args.at:
+        fail("promoted-current verification requires signed authority and time")
+    return argparse.Namespace(
+        release=args.stage,
+        store=os.environ["AIRLOCK_MANAGED_RELEASE_VERIFY_STORE"],
+        channel=os.environ["AIRLOCK_MANAGED_RELEASE_VERIFY_CHANNEL"],
+        authority=args.authority,
+        at=args.at,
+    )
+
+
 def command_promote(args: argparse.Namespace) -> dict[str, Any]:
     stage = Path(args.stage).resolve()
     store = Path(args.store).resolve()
@@ -859,6 +1190,15 @@ def command_promote(args: argparse.Namespace) -> dict[str, Any]:
     assert signature is not None
     membership, membership_digest = load_authority(authority)
     snapshot_raw = read_regular(stage / "snapshot.json", "snapshot.json")
+    expected_organization = getattr(args, "expected_organization", None)
+    expected_channel = getattr(args, "expected_channel", None)
+    expected_root_key_id = getattr(args, "expected_root_key_id", None)
+    if expected_organization is not None and snapshot["organization_id"] != expected_organization:
+        fail("refresh snapshot belongs to another enrolled organisation")
+    if expected_channel is not None and snapshot["channel_id"] != expected_channel:
+        fail("refresh snapshot belongs to another enrolled channel")
+    if expected_root_key_id is not None and membership["root_key_id"] != expected_root_key_id:
+        fail("refresh authority root differs from the enrolled root")
 
     if not store.is_dir() or store.is_symlink():
         fail("store must be an existing real directory")
@@ -948,7 +1288,189 @@ def command_promote(args: argparse.Namespace) -> dict[str, Any]:
         os.close(lock_fd)
 
 
+def command_refresh(args: argparse.Namespace) -> dict[str, Any]:
+    """Import one complete local signed directory through the promotion boundary."""
+    source = real_directory_argument(args.source, "refresh source")
+    store = real_directory_argument(args.store, "store")
+    verify_stage(source, signed=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".refresh-", dir=store))
+    try:
+        for name in sorted(SIGNED_NAMES):
+            item = source / name
+            target = temporary / name
+            if item.is_dir():
+                shutil.copytree(item, target, symlinks=True)
+            else:
+                shutil.copy2(item, target, follow_symlinks=False)
+        verify_stage(temporary, signed=True)
+        promoted = argparse.Namespace(
+            stage=os.fspath(temporary),
+            authority=args.authority,
+            store=args.store,
+            promoted_at=args.refreshed_at,
+            expected_organization=args.expected_organization,
+            expected_channel=args.expected_channel,
+            expected_root_key_id=args.expected_root_key_id,
+        )
+        result = command_promote(promoted)
+        return {
+            "receipt": result["receipt"],
+            "receipt_id": result["receipt_id"],
+            "recovered": result["recovered"],
+            "release": result["release"],
+            "snapshot_digest": result["snapshot_digest"],
+        }
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def verify_cached_release(
+    release: Path,
+    expected_snapshot_digest: str,
+    expected_channel: str,
+    expected_organization: str,
+    expected_root_key_id: str,
+    authority: Path,
+    state: dict[str, Any],
+    at: str,
+    expected_receipt_digest: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], bytes, bytes, bytes]:
+    snapshot, signature = verify_stage(release, signed=True, promoted=True)
+    assert signature is not None
+    snapshot_raw = read_regular(release / "snapshot.json", "cached snapshot")
+    signature_raw = read_regular(release / "signature.json", "cached signature")
+    receipt_raw = read_regular(release / "promotion-receipt.json", "cached promotion receipt")
+    snapshot_digest = digest_bytes(snapshot_raw)
+    if snapshot_digest != expected_snapshot_digest:
+        fail("cached release path differs from the requested snapshot digest")
+    if snapshot["channel_id"] != expected_channel:
+        fail("cached release belongs to another enrolled channel")
+    if snapshot["organization_id"] != expected_organization:
+        fail("cached release belongs to another enrolled organisation")
+    receipt = validate_promotion_receipt(
+        load_json_bytes(receipt_raw, "cached promotion-receipt.json")
+    )
+    if expected_receipt_digest is not None and digest_bytes(receipt_raw) != expected_receipt_digest:
+        fail("cached current receipt differs from the release-state pointer")
+    expected_receipt = {
+        "bundle_digest": snapshot["artifacts"]["bundle.tar"],
+        "channel_id": snapshot["channel_id"],
+        "epoch": snapshot["epoch"],
+        "organization_id": snapshot["organization_id"],
+        "publisher_id": snapshot["publisher_id"],
+        "publisher_key_id": signature["key_id"],
+        "sequence": snapshot["sequence"],
+        "snapshot_digest": snapshot_digest,
+    }
+    if any(receipt[key] != value for key, value in expected_receipt.items()):
+        fail("cached promotion receipt identity differs from its signed release")
+    if parse_time(receipt["promoted_at"], "cached promotion receipt.promoted_at") > parse_time(at, "at"):
+        fail("cached promotion receipt is newer than the verification instant")
+
+    membership, membership_digest = load_authority(authority)
+    if membership["root_key_id"] != expected_root_key_id:
+        fail("cached authority root differs from the enrolled root")
+    # This release was already accepted at the receipt time.  A disconnected
+    # box may keep using that exact cached release after the publisher's time
+    # window ends, while a locally learned revocation/removal still rejects it
+    # because select_publisher reads the current membership and status.
+    publisher = select_publisher(membership, snapshot, signature, receipt["promoted_at"])
+    openssl_verify(
+        base64.b64decode(publisher["public_key_der"], validate=True),
+        snapshot_raw,
+        base64.b64decode(signature["signature"], validate=True),
+        "cached snapshot signature",
+    )
+    floor = state["membership_floors"].get(expected_organization)
+    if floor is None:
+        fail("release state has no durable authority floor for the cached release")
+    if (membership["sequence"] < floor["sequence"]
+            or (membership["sequence"] == floor["sequence"]
+                and membership_digest != floor["membership_digest"])):
+        fail("cached authority is behind or conflicts with the durable authority floor")
+    return snapshot, receipt, snapshot_raw, signature_raw, receipt_raw
+
+
+def command_resolve_cached(args: argparse.Namespace) -> dict[str, Any]:
+    store = real_directory_argument(args.store, "store")
+    authority = real_directory_argument(args.authority, "authority")
+    releases = real_directory_argument(os.fspath(store / "releases"), "store/releases")
+    requested = args.snapshot_digest
+    release_id = requested.removeprefix("sha256:")
+    candidate_path = releases / release_id
+    if not candidate_path.exists():
+        fail(f"exact managed bundle is not cached: {requested}")
+    candidate = real_directory_argument(os.fspath(candidate_path), "cached release")
+
+    lock_path = store / ".promotion.lock"
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open(lock_path, flags)
+    except OSError as exc:
+        fail(f"promotion lock: cannot open existing {lock_path}: {exc}")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        state_path = store / "release-state.json"
+        state_raw = read_regular(state_path, "release state")
+        state = validate_release_state(load_json_bytes(state_raw, "release-state.json"))
+        authority_before, authority_digest_before = load_authority(authority)
+        current = state["channels"].get(args.channel)
+        if current is None:
+            fail(f"release state: channel {args.channel!r} has no current release")
+        current_path = real_directory_argument(
+            os.fspath(releases / current["snapshot_digest"].removeprefix("sha256:")),
+            "cached current release",
+        )
+        current_values = verify_cached_release(
+            current_path, current["snapshot_digest"], args.channel,
+            args.expected_organization, args.expected_root_key_id, authority, state,
+            args.at, current["receipt_digest"],
+        )
+        current_receipt = current_values[1]
+        if requested == current["snapshot_digest"]:
+            role = "current"
+            values = current_values
+        elif requested == current_receipt["previous_snapshot_digest"]:
+            role = "recovery-predecessor"
+            values = verify_cached_release(
+                candidate, requested, args.channel, args.expected_organization,
+                args.expected_root_key_id, authority, state, args.at,
+            )
+        else:
+            fail("exact managed bundle is not current or its recovery predecessor")
+        snapshot, receipt, snapshot_raw, signature_raw, receipt_raw = values
+        if read_regular(state_path, "release state") != state_raw:
+            fail("release state changed while cached release was resolved")
+        if read_regular(candidate / "snapshot.json", "cached snapshot") != snapshot_raw:
+            fail("cached snapshot changed while it was resolved")
+        if read_regular(candidate / "signature.json", "cached signature") != signature_raw:
+            fail("cached signature changed while it was resolved")
+        if read_regular(candidate / "promotion-receipt.json", "cached receipt") != receipt_raw:
+            fail("cached receipt changed while it was resolved")
+        authority_after, authority_digest_after = load_authority(authority)
+        if (authority_after != authority_before
+                or authority_digest_after != authority_digest_before):
+            fail("current authority changed while cached release was resolved")
+        return {
+            "bundle_digest": snapshot["artifacts"]["bundle.tar"],
+            "cached": True,
+            "catalog_digest": snapshot["artifacts"]["catalog.json"],
+            "channel_id": snapshot["channel_id"],
+            "promoted_at": receipt["promoted_at"],
+            "release_path": os.fspath(candidate),
+            "role": role,
+            "schema": SCHEMA_IDS["cached"],
+            "snapshot_digest": requested,
+            "verified_at": args.at,
+        }
+    finally:
+        os.close(lock_fd)
+
+
 def command_verify(args: argparse.Namespace) -> dict[str, Any]:
+    promoted_args = internal_promoted_verify_args(args)
+    if promoted_args is not None:
+        return command_verify_current(promoted_args)
     stage = Path(args.stage).resolve()
     snapshot, signature = verify_stage(stage, signed=args.signed)
     result: dict[str, Any] = {"bundle_digest": snapshot["artifacts"]["bundle.tar"], "snapshot_digest": digest_bytes(read_regular(stage / "snapshot.json", "snapshot.json"))}
@@ -993,12 +1515,65 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--at")
     verify.set_defaults(handler=command_verify)
 
+    current = commands.add_parser(
+        "resolve-current",
+        help="resolve and verify one promoted current channel without changing its store",
+    )
+    current.add_argument("--store", required=True)
+    current.add_argument("--channel", required=True)
+    current.add_argument("--authority", required=True)
+    current.add_argument("--at", required=True)
+    current.set_defaults(handler=command_resolve_current)
+
+    verify_current = commands.add_parser(
+        "verify-current",
+        help="verify one supplied promoted release as the exact current channel release",
+    )
+    verify_current.add_argument("--release", required=True)
+    verify_current.add_argument("--store", required=True)
+    verify_current.add_argument("--channel", required=True)
+    verify_current.add_argument("--authority", required=True)
+    verify_current.add_argument("--at", required=True)
+    verify_current.set_defaults(handler=command_verify_current)
+
+    measure = commands.add_parser(
+        "measure-public-core",
+        help="measure one exact committed public core tree without declaring authority",
+    )
+    measure.add_argument("--repository", required=True)
+    measure.add_argument("--revision", required=True)
+    measure.set_defaults(handler=command_measure_public_core)
+
     promote = commands.add_parser("promote", help="atomically promote a signed snapshot under current authority")
     promote.add_argument("--stage", required=True)
     promote.add_argument("--authority", required=True)
     promote.add_argument("--store", required=True)
     promote.add_argument("--promoted-at", required=True)
     promote.set_defaults(handler=command_promote)
+
+    refresh = commands.add_parser(
+        "refresh", help="verify and atomically import one complete local signed release",
+    )
+    refresh.add_argument("--source", required=True)
+    refresh.add_argument("--authority", required=True)
+    refresh.add_argument("--store", required=True)
+    refresh.add_argument("--refreshed-at", required=True)
+    refresh.add_argument("--expected-organization", required=True)
+    refresh.add_argument("--expected-channel", required=True)
+    refresh.add_argument("--expected-root-key-id", required=True)
+    refresh.set_defaults(handler=command_refresh)
+
+    cached = commands.add_parser(
+        "resolve-cached", help="verify one exact cached current or recovery release",
+    )
+    cached.add_argument("--store", required=True)
+    cached.add_argument("--authority", required=True)
+    cached.add_argument("--channel", required=True)
+    cached.add_argument("--expected-organization", required=True)
+    cached.add_argument("--expected-root-key-id", required=True)
+    cached.add_argument("--snapshot-digest", required=True)
+    cached.add_argument("--at", required=True)
+    cached.set_defaults(handler=command_resolve_cached)
     return root
 
 
@@ -1015,6 +1590,18 @@ def main() -> int:
         expect_string(args.source_repository, "source-repository")
     if args.command == "verify" and args.signed and (not args.authority or not args.at):
         fail("verify --signed requires --authority and --at")
+    if args.command in {"resolve-current", "verify-current", "resolve-cached"}:
+        expect_string(args.channel, "channel", ID_RE)
+        parse_time(args.at, "at")
+    if args.command == "refresh":
+        expect_string(args.expected_organization, "expected-organization", ID_RE)
+        expect_string(args.expected_channel, "expected-channel", ID_RE)
+        expect_string(args.expected_root_key_id, "expected-root-key-id", SHA256_RE)
+        parse_time(args.refreshed_at, "refreshed-at")
+    if args.command == "resolve-cached":
+        expect_string(args.expected_organization, "expected-organization", ID_RE)
+        expect_string(args.expected_root_key_id, "expected-root-key-id", SHA256_RE)
+        expect_string(args.snapshot_digest, "snapshot-digest", SHA256_RE)
     result = args.handler(args)
     sys.stdout.buffer.write(canonical_bytes(result))
     return 0

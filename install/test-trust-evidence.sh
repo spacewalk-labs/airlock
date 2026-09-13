@@ -109,8 +109,8 @@ else
   bad "contract-index/runtime parity"
 fi
 
-# v5 remains a historical index; v6 is the current runtime contract and adds
-# container_runtime without weakening or deleting any v5 shape assertion above.
+# v5 and v6 remain historical indexes. V6 added container_runtime; keep every
+# shape assertion here even though the evidence producer now pins current v7.
 if python3 - "$ROOT" <<'PY'
 import importlib.machinery
 import importlib.util
@@ -136,7 +136,7 @@ assert raw == (json.dumps(schema, sort_keys=True, separators=(",", ":")) + "\n")
 ledger = load(root / "bin/airlock-ledger", "airlock_ledger_v6_schema_test")
 evidence = load(root / "bin/airlock-trust-evidence", "airlock_trust_evidence_v6_test")
 assert schema["scope"] == "public-contract-index"
-assert schema["version"] == ledger.LEDGER_VERSION == 6
+assert schema["version"] == 6
 assert schema["supported_versions"] == [1, 2, 3, 4, 5, 6]
 assert schema["artifact_classes"] == list(ledger.ARTIFACT_CLASSES)
 assert schema["capabilities"] == list(ledger.CAPABILITIES)
@@ -148,12 +148,71 @@ assert schema["container_runtime_intent_fields"] == list(ledger.CONTAINER_RUNTIM
 assert schema["container_runtime_committed_fields"] == list(ledger.CONTAINER_RUNTIME_COMMITTED_FIELDS)
 assert schema["container_object_fields"] == list(ledger.CONTAINER_OBJECT_FIELDS)
 assert schema["store_fields"] == list(ledger.STORE_FIELDS_V6)
-assert ("ledger_schema", 6, "schemas/trust/ledger-v6.json") in evidence.SCHEMAS
+assert ("ledger_schema", 6, "schemas/trust/ledger-v6.json") not in evidence.SCHEMAS
 PY
 then
-  ok "v6 contract index adds container runtime fields and is the evidence current pin"
+  ok "historical v6 contract index retains its container runtime shape"
 else
   bad "v6 contract-index/runtime parity"
+fi
+
+# V7 is the current public ledger ABI. It adds the record-level authority field
+# and pins every closed managed-authority name consumed by the runtime; enum-only
+# `managed` is not evidence because these fields and schemas must agree too.
+if python3 - "$ROOT" <<'PY'
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+
+def load(path, name):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+path = root / "schemas/trust/ledger-v7.json"
+raw = path.read_bytes()
+schema = json.loads(raw)
+assert raw == (json.dumps(schema, sort_keys=True, separators=(",", ":")) + "\n").encode()
+capability_schema = json.loads((root / "schemas/trust/capability-v1.json").read_bytes())
+
+ledger = load(root / "bin/airlock-ledger", "airlock_ledger_v7_schema_test")
+config = load(root / "bin/airlock-config", "airlock_config_v7_schema_test")
+evidence = load(root / "bin/airlock-trust-evidence", "airlock_trust_evidence_v7_test")
+assert schema["scope"] == "public-contract-index"
+assert schema["version"] == ledger.LEDGER_VERSION == 7
+assert schema["supported_versions"] == [1, 2, 3, 4, 5, 6, 7]
+assert schema["artifact_classes"] == list(ledger.ARTIFACT_CLASSES)
+assert schema["capabilities"] == list(ledger.CAPABILITIES)
+assert schema["managed_capabilities"] == list(ledger.MANAGED_CAPABILITIES)
+assert schema["managed_capabilities"] == capability_schema["grantable_capabilities"]
+assert schema["managed_capabilities"] == sorted(config.LEDGER_CAPABILITIES)
+assert "plaintext-redirect" not in schema["managed_capabilities"]
+assert capability_schema["surface_classifications"]["plaintext-redirect"] == "shipped-only-restricted"
+assert schema["lifecycle_keys"] == list(ledger.LIFECYCLE_KEYS)
+assert schema["audit_event_fields"] == list(ledger.AUDIT_EVENT_FIELDS)
+assert set(schema["intent_record_fields"]) == set(ledger.INTENT_RECORD_FIELDS_V7)
+assert set(schema["committed_record_fields"]) == set(ledger.COMMITTED_RECORD_FIELDS_V7)
+assert schema["container_runtime_intent_fields"] == list(ledger.CONTAINER_RUNTIME_INTENT_FIELDS)
+assert schema["container_runtime_committed_fields"] == list(ledger.CONTAINER_RUNTIME_COMMITTED_FIELDS)
+assert schema["container_object_fields"] == list(ledger.CONTAINER_OBJECT_FIELDS)
+assert schema["managed_authority_schema"] == ledger.MANAGED_AUTHORITY_SCHEMA
+assert schema["managed_authority_fields"] == list(ledger.MANAGED_AUTHORITY_FIELDS)
+assert schema["managed_run_authority_schema"] == ledger.MANAGED_RUN_AUTHORITY_SCHEMA
+assert schema["managed_run_authority_fields"] == ["authorities", "schema"]
+assert schema["store_fields"] == list(ledger.STORE_FIELDS_V7)
+assert ("ledger_schema", 7, "schemas/trust/ledger-v7.json") in evidence.SCHEMAS
+PY
+then
+  ok "current v7 contract index pins managed authority and runtime closed shapes"
+else
+  bad "v7 contract-index/runtime parity"
 fi
 
 # Exercise candidate binding and suite orchestration in a tiny committed checkout.
@@ -188,16 +247,33 @@ SHA="$(git -C "$REPO" rev-parse HEAD)"
 
 schemas_a="$(python3 "$REPO/bin/airlock-trust-evidence" schemas)"
 schemas_b="$(python3 "$REPO/bin/airlock-trust-evidence" schemas)"
-if [ "$schemas_a" = "$schemas_b" ] && python3 -c '
-import json,sys
+if [ "$schemas_a" = "$schemas_b" ] && REPO="$REPO" SHA="$SHA" python3 -c '
+import hashlib,json,os,subprocess,sys
 d=json.load(sys.stdin)
-assert len(d["candidate_sha"]) == 40
+assert d["candidate_sha"] == os.environ["SHA"]
 assert sorted(d["schemas"]) == ["capability_schema", "config_schema", "ledger_schema"]
 assert all(v["digest"].startswith("sha256:") for v in d["schemas"].values())
 assert sorted(d["runtime_pins"]) == ["config_and_capability_runtime", "ledger_runtime"]
 assert all(v["digest"].startswith("sha256:") for v in d["runtime_pins"].values())
+sha=os.environ["SHA"]
+def committed(path):
+    return subprocess.check_output([
+        "git", "-C", os.environ["REPO"], "cat-file", "blob",
+        f"{sha}:{path}",
+    ])
+def digest(path):
+    return "sha256:" + hashlib.sha256(committed(path)).hexdigest()
+assert d["schemas"]["ledger_schema"] == {
+    "digest": digest("schemas/trust/ledger-v7.json"),
+    "path": "schemas/trust/ledger-v7.json",
+    "version": 7,
+}
+assert d["runtime_pins"]["ledger_runtime"] == {
+    "digest": digest("bin/airlock-ledger"),
+    "path": "bin/airlock-ledger",
+}
 ' <<<"$schemas_a"; then
-  ok "schema bundle deterministically pins three indexes and both runtime implementations"
+  ok "schema bundle binds candidate v7 index and exact runtime digests"
 else
   bad "schema bundle determinism"
 fi

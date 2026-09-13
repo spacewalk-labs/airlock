@@ -9,7 +9,8 @@
        Same-origin subpath app: /assets/ is the hub's, copied there by the installer. -->
   <link rel="icon" type="image/svg+xml" href="/assets/app-icons/dev-monitor.svg">
   <link rel="apple-touch-icon" href="/assets/app-icons/dev-monitor.png">
-  <link rel="stylesheet" href="/assets/devmon-card-ui.css">
+  <link rel="stylesheet" href="/assets/devmon-card-ui.css?v=4">
+  <link rel="stylesheet" href="/assets/devmon-inbox.css?v=3">
   <style>
     :root {
       --bg: #f5f5f7; --surface: #fff; --text: #1d1d1f; --muted: #6e6e73;
@@ -59,6 +60,7 @@
       background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
       box-shadow: var(--shadow);
     }
+    #airlock-slot { flex: none; display: flex; }
     .topbar .title { font-size: 1.25rem; font-weight: 600; color: var(--text); flex: 1; letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px; }
     .topbar .title .ic { width: 1.1em; height: 1.1em; color: var(--accent); }
     .topbar .meta { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
@@ -191,43 +193,10 @@
        off or not ours still drew a filter bar and a row of numbers — a screen that looks like
        it is reporting something. Named per selector rather than as a global !important. */
     .chips[hidden], .strip[hidden] { display: none; }
-    .msg-feed { display: flex; flex-direction: column; gap: 8px; }
-    .mcard { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 16px; display: flex; gap: 12px; align-items: flex-start; box-shadow: var(--shadow); }
-    .mcard.urgent { border-left: 3px solid var(--danger); }
-    .mcard .mdot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); margin-top: 5px; flex: none; }
-    .mcard.unread .mdot { background: var(--accent); }
-    .mcard.urgent .mdot { background: var(--danger); }
-    .mcard .mmain { flex: 1; min-width: 0; }
-    .mcard .mtop { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .mcard .mtop.mtoggle { cursor: pointer; }
-    .mcard .mtitle { font-size: 14px; font-weight: 500; }
-    .mcard.unread .mtitle { font-weight: 600; }
-    .mkind, .murg { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 1px 6px; border-radius: var(--r-sm); border: 1px solid var(--line); color: var(--muted); }
-    .mkind.action { color: var(--accent); border-color: var(--accent); }
-    .murg { color: var(--danger); border-color: var(--danger); }
-    .mowner-fallback { font-size: 10px; padding: 1px 6px; border-radius: var(--r-sm); border: 1px solid var(--warning); color: var(--warning); }
-    .mcard .mbody { font-size: 13px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
-    .mcard .mmeta { font-size: 12px; color: var(--muted); font-family: var(--font-mono); margin-top: 5px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    .mcard.unread .mstatus { color: var(--accent); font-weight: 600; }
-    .mcard.urgent .mstatus { color: var(--danger); }
-    .mcard .mactions { display: flex; gap: 6px; align-items: center; flex: none; }
-    .mcard .mchev { margin-left: auto; font-size: 10px; color: var(--muted); flex: none; }
-    .mcard .mdetail[hidden] { display: none; }
-    .mcard .murl { font-family: var(--font-mono); }
-    .mbtn { padding: 4px 12px; border-radius: var(--r-pill); white-space: nowrap; text-decoration: none; display: inline-block; }
-    .mbtn:disabled, .micon:disabled { opacity: .4; cursor: not-allowed; }
-    .micon { padding: 4px 7px; border-radius: var(--r-sm); line-height: 1; }
-    .mrun { font-size: 12px; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; font-family: inherit; margin-top: 5px; }
-    .mrun:hover { text-decoration: underline; }
-    .msg-empty { text-align: center; color: var(--muted); padding: 24px; font-size: 13px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); }
-    .msg-empty.err { color: var(--danger); }
     #msg-toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: var(--r-pill); padding: 8px 12px 8px 20px; font-size: 13px; box-shadow: var(--shadow); display: none; align-items: center; gap: 12px; z-index: 1050; }
     #msg-toast.show { display: inline-flex; }
     #msg-toast { z-index: 1060; padding: 8px 20px; }
     @media (min-width: 640px) { .sheet-backdrop { align-items: center; } .sheet { border-radius: var(--r); } }
-    /* The task actions made this row longer than a phone. It wraps rather than clipping:
-       a button that is off-screen is a transition the person cannot reach. */
-    @media (max-width: 560px) { .mcard { flex-wrap: wrap; } .mcard .mactions { flex-basis: 100%; flex-wrap: wrap; justify-content: flex-end; margin-top: 6px; } }
 
     /* Tabs. The inbox is a destination rather than the top section of one long page:
        everything else on this box is observation, and observation is not a task. */
@@ -334,6 +303,7 @@
 <div class="shell">
 
   <div class="topbar">
+    <span id="airlock-slot" aria-label="Airlock home"></span>
     <span class="title"><svg class="ic"><use href="#ic-monitor"/></svg> Dev Monitor</span>
     <span class="meta" id="ms-meta">loading…</span>
     <div class="theme-group" role="group" aria-label="Theme">
@@ -358,16 +328,10 @@
       <div class="stat" id="st-urgent"><div class="k">Urgent</div><div class="v">–</div></div>
       <div class="stat" id="st-unread"><div class="k">Unread</div><div class="v">–</div></div>
     </div>
-    <div class="msg-head">
-      <h2>Inbox <span class="msg-unread" id="msg-unread" aria-live="polite" hidden></span></h2>
-      <div class="chips" id="msg-chips" role="group" aria-label="Message filter">
-        <button class="chip" data-key="active" aria-pressed="true">All <span class="n" data-count="active"></span></button>
-        <button class="chip" data-key="unread" aria-pressed="false">Unread <span class="n" data-count="unread"></span></button>
-        <button class="chip" data-key="urgent" aria-pressed="false">Urgent <span class="n" data-count="urgent"></span></button>
-        <button class="chip" data-key="archived" aria-pressed="false">Archived <span class="n" data-count="archived"></span></button>
-      </div>
-    </div>
-    <div class="msg-feed" id="msg-feed"><div class="msg-empty">Loading messages…</div></div>
+    <!-- Stats stay owned by this dashboard; the shared module owns filters and rows. -->
+    <div class="chips" id="msg-chips" hidden></div><span id="msg-unread" hidden></span>
+    <div class="msg-feed" id="msg-feed" hidden></div>
+    <div class="devmon-inbox" id="devmon-inbox"></div>
    </section>
   </section>
 
@@ -486,7 +450,8 @@
 
 <div id="msg-toast" role="status" aria-live="polite"></div>
 
-<script src="/assets/devmon-card-ui.js"></script>
+<script src="/assets/devmon-card-ui.js?v=4"></script>
+<script src="/assets/devmon-inbox.js?v=3"></script>
 <script>
   // ---- theme ----
   var THEME_KEY = 'airlock-monitor-theme';
@@ -929,65 +894,21 @@
   setInterval(function () { loadOverview(); loadTop(); loadServices(); }, 5000);
   setInterval(loadNetwork, 30000);
 
-  // ---- message console ----
-  // Message producers are not trusted dashboard data, so every card is assembled with textContent.
-  // Keeping response status available also lets this optional feature explain access and setup issues.
-  var OWNER_API = API + '/owner';
-  var msgState = { key: 'active', cards: [], counts: {}, enabled: null, nodes: {} };
-  var msgToastTimer = null, msgPoll = null;
-  var devtermConfig = null;
-  var cardUI = DevmonCardUI.create({
-    read: function (card) { return cardAction(card.card_id, 'read'); },
-    archive: function (card) { return cardAction(card.card_id, 'archive'); },
-    run: function (card, params, note) {
-      return ownerFetch('/run', { method: 'POST', body: JSON.stringify({
-        card_id: card.card_id, params: params, note: note
-      }) }).then(ownerResponse).then(function (res) {
-        if (res.status === 403) { disableMessages(403); throw new Error('Owner access required.'); }
-        if (!res.ok || !res.data.ok) throw new Error(res.data.error || 'Could not start the agent.');
-        return res.data;
-      });
-    },
-    selectWindow: function (card) {
-      return ownerFetch('/run/window', { method: 'POST', body: JSON.stringify({card_id: card.card_id}) })
-        .then(ownerResponse).then(function (res) {
-          if (res.status === 403) { disableMessages(403); throw new Error('Owner access required.'); }
-          if (!res.ok || !res.data.ok) throw new Error(res.data.error || 'Could not select the run window.');
-          return res.data;
-        });
-    },
-    devtermUrl: function (session) {
-      var load = devtermConfig ? Promise.resolve(devtermConfig) : j('/__airlock.json').then(function (cfg) {
-        devtermConfig = cfg;
-        return cfg;
-      });
-      return load.then(function (cfg) {
-        var app = cfg && cfg.apps && cfg.apps.devterm;
-        var host = cfg && cfg.fqdn && cfg.fqdn.indexOf('.') > 0 ? cfg.fqdn : location.hostname;
-        return app && app.port && host
-          ? 'https://' + host + ':' + app.port + '/?arg=' + encodeURIComponent(session) : '';
-      });
-    },
-    changed: reflectMessageChange,
-    removed: removeMessage,
-    toast: msgToast
-  });
-
-  function ownerFetch(path, opts) {
-    opts = opts || {};
-    opts.cache = 'no-store';
-    if (opts.method === 'POST') {
-      opts.headers = Object.assign({ 'content-type': 'application/json' }, opts.headers || {});
-      if (opts.body == null) opts.body = '{}';
-    }
-    return fetch(OWNER_API + path, opts);
+  // Inbox rows are now owned by /assets/devmon-inbox.js. These small helpers remain
+  // local because service actions and the routing tab use their toast/text helpers.
+  var msgToastTimer = null;
+  function msgEl(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text != null) node.textContent = text;
+    return node;
   }
-  function ownerResponse(r) {
-    return r.json().catch(function () { return {}; }).then(function (data) {
-      return { status: r.status, ok: r.ok, data: data };
-    });
+  function msgToast(text) {
+    var node = document.getElementById('msg-toast');
+    node.textContent = text; node.classList.add('show');
+    clearTimeout(msgToastTimer);
+    msgToastTimer = setTimeout(function () { node.classList.remove('show'); }, 3000);
   }
-  function isHttpUrl(url) { return typeof url === 'string' && /^https?:\/\//i.test(url); }
   function timeAgo(value) {
     var time = Date.parse(value);
     if (isNaN(time)) return '';
@@ -997,194 +918,27 @@
     if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
     return Math.floor(seconds / 86400) + 'd ago';
   }
-  function msgEl(tag, className, text) {
-    var node = document.createElement(tag);
-    if (className) node.className = className;
-    if (text != null) node.textContent = text;
-    return node;
+  var OWNER_API = API + '/owner';
+  function ownerFetch(path, opts) {
+    opts = opts || {};
+    opts.cache = 'no-store';
+    if (opts.method === 'POST') {
+      opts.headers = Object.assign({ 'content-type': 'application/json' }, opts.headers || {});
+      if (opts.body == null) opts.body = '{}';
+    }
+    return fetch(OWNER_API + path, opts);
   }
-  function msgToast(text) {
-    var node = document.getElementById('msg-toast');
-    node.textContent = text;
-    node.classList.add('show');
-    clearTimeout(msgToastTimer);
-    msgToastTimer = setTimeout(function () { node.classList.remove('show'); }, 3000);
-  }
-  function disableMessages(status) {
-    msgState.enabled = false;
-    if (msgPoll) { clearInterval(msgPoll); msgPoll = null; }
-    var message = status === 403
-      ? 'This message console is available only to the dashboard owner.'
-      : 'Message console is disabled for this installation.';
-    var feed = document.getElementById('msg-feed');
-    feed.textContent = '';
-    feed.appendChild(msgEl('div', 'msg-empty', message));
-    document.getElementById('msg-chips').hidden = true;
-    document.getElementById('msg-unread').hidden = true;
-    document.getElementById('msg-strip').hidden = true;
-    ['nav-unread', 'tb-unread'].forEach(function (id) { document.getElementById(id).hidden = true; });
-  }
-  function scopeForMessageKey(key) { return key === 'archived' ? 'archived' : 'active'; }
-  function filteredMessages() {
-    var key = msgState.key, cards = msgState.cards;
-    if (key === 'active' || key === 'archived') return cards;
-    return cards.filter(function (card) {
-      if (key === 'unread') return !card.read_at;
-      if (key === 'urgent') return card.level === 'urgent';
-      return false;
+  function ownerResponse(response) {
+    return response.json().catch(function () { return {}; }).then(function (data) {
+      return { status: response.status, ok: response.ok, data: data };
     });
   }
-  function loadMessages() {
-    if (msgState.enabled === false) return Promise.resolve();
-    return ownerFetch('/messages?scope=' + scopeForMessageKey(msgState.key)).then(ownerResponse)
-      .then(function (res) {
-        if (res.status === 403 || res.status === 404) { disableMessages(res.status); return; }
-        if (!res.ok) throw new Error('Message feed returned ' + res.status + '.');
-        msgState.enabled = true;
-        msgState.cards = res.data.messages || [];
-        msgState.counts = res.data.counts || {};
-        renderMessages();
-      }).catch(function (error) {
-        if (msgState.enabled === null) {
-          var feed = document.getElementById('msg-feed');
-          feed.textContent = '';
-          feed.appendChild(msgEl('div', 'msg-empty err', 'Message console is unavailable: ' + error.message));
-          return;
-        }
-        // The feed has loaded before, so the cards on screen are real — but they are now
-        // stale and we are still polling. Saying nothing would leave a console that looks
-        // current and is not, which is the failure mode this whole app exists to avoid.
-        msgToast('Message feed did not refresh (' + error.message + '); showing the last known state.');
-      });
-  }
-  var EMPTY_TEXT = {
-    unread: 'Everything has been read.',
-    urgent: 'Nothing urgent.',
-    archived: 'No archived messages.'
-  };
-  function setStat(id, value, sub, tone) {
+
+  function setStat(id, value) {
     var stat = document.getElementById(id);
-    stat.className = 'stat' + (tone ? ' ' + tone : '');
+    stat.className = 'stat';
     stat.querySelector('.v').textContent = value;
-    if (sub) document.getElementById(id + '-sub').textContent = sub;
   }
-  function renderMessages() {
-    var counts = msgState.counts;
-    document.querySelectorAll('#msg-chips .n').forEach(function (node) {
-      var count = counts[node.dataset.count];
-      node.textContent = count > 0 ? count : '';
-    });
-    var unreadCount = counts.unread || 0;
-    setStat('st-total', counts.active || 0);
-    setStat('st-urgent', counts.urgent || 0);
-    setStat('st-unread', unreadCount);
-    ['nav-unread', 'tb-unread'].forEach(function (id) {
-      var badge = document.getElementById(id);
-      badge.textContent = unreadCount > 99 ? '99+' : unreadCount;
-      badge.hidden = !unreadCount;
-    });
-    var unread = document.getElementById('msg-unread');
-    unread.textContent = unreadCount + ' unread';
-    unread.hidden = !unreadCount;
-    var feed = document.getElementById('msg-feed');
-    feed.textContent = '';
-    msgState.nodes = {};
-    var cards = filteredMessages();
-    if (!cards.length) {
-      feed.appendChild(msgEl('div', 'msg-empty', EMPTY_TEXT[msgState.key] || 'No messages.'));
-      return;
-    }
-    cards.forEach(function (card) {
-      var node = buildMessageCard(card);
-      msgState.nodes[card.card_id] = node;
-      feed.appendChild(node);
-    });
-  }
-  function buildMessageCard(message) {
-    var card = msgEl('div', 'mcard' + (message.read_at ? '' : ' unread')
-                     + (message.level === 'urgent' ? ' urgent' : ''));
-    card.dataset.cardId = message.card_id;
-    card.appendChild(msgEl('span', 'mdot'));
-    var main = msgEl('div', 'mmain');
-    var top = msgEl('div', 'mtop mtoggle');
-    top.appendChild(msgEl('span', 'mtitle', message.title));
-    if (message.level === 'urgent') top.appendChild(msgEl('span', 'murg', 'Urgent'));
-    if (message.delivery === 'failed') top.appendChild(msgEl('span', 'murg', 'Delivery failed'));
-    main.appendChild(top);
-    top.addEventListener('click', function () { cardUI.openTitle(message); });
-    var meta = msgEl('div', 'mmeta');
-    meta.appendChild(msgEl('span', null, message.source));
-    meta.appendChild(msgEl('span', null, timeAgo(message.first_at)));
-    if (message.count > 1) meta.appendChild(msgEl('span', null, 'x' + message.count));
-    meta.appendChild(msgEl('span', 'mstatus', message.read_at ? 'Read' : 'Unread'));
-    main.appendChild(meta);
-    if (message.ran_at) main.appendChild(msgEl('div', 'mmeta', 'Last run ' + timeAgo(message.ran_at)));
-    card.appendChild(main);
-    var actions = cardUI.createActions(message, msgState.key !== 'archived');
-    actions.classList.add('mactions');
-    card.appendChild(actions);
-    return card;
-  }
-  function reflectMessageChange(message, kind) {
-    var card = msgState.nodes[message.card_id];
-    if (!card) return;
-    if (kind === 'read' && card.classList.contains('unread')) {
-      card.classList.remove('unread');
-      var status = card.querySelector('.mstatus');
-      if (status) status.textContent = 'Read';
-      if (msgState.counts.unread > 0) msgState.counts.unread--;
-      var unreadCount = msgState.counts.unread || 0;
-      setStat('st-unread', unreadCount);
-      ['nav-unread', 'tb-unread'].forEach(function (id) {
-        var badge = document.getElementById(id);
-        badge.textContent = unreadCount > 99 ? '99+' : unreadCount;
-        badge.hidden = !unreadCount;
-      });
-    }
-    if (kind === 'read-failed' && !card.classList.contains('unread')) {
-      card.classList.add('unread');
-      var failedStatus = card.querySelector('.mstatus');
-      if (failedStatus) failedStatus.textContent = 'Unread';
-      msgState.counts.unread = (msgState.counts.unread || 0) + 1;
-    }
-    if (kind === 'ran') {
-      var prior = card.querySelector('.mrun');
-      if (prior) prior.remove();
-      var main = card.querySelector('.mmain');
-      var ran = msgEl('div', 'mmeta mrun', 'Last run ' + timeAgo(message.ran_at));
-      if (main) main.appendChild(ran);
-      var oldActions = card.querySelector('.mactions');
-      var newActions = cardUI.createActions(message, msgState.key !== 'archived');
-      newActions.classList.add('mactions');
-      if (oldActions) oldActions.replaceWith(newActions);
-    }
-  }
-  function removeMessage(message) {
-    var card = msgState.nodes[message.card_id];
-    if (card) card.remove();
-    delete msgState.nodes[message.card_id];
-    msgState.cards = msgState.cards.filter(function (item) { return item.card_id !== message.card_id; });
-    if (msgState.counts.active > 0) msgState.counts.active--;
-    if (!message.read_at && msgState.counts.unread > 0) msgState.counts.unread--;
-    if (message.level === 'urgent' && msgState.counts.urgent > 0) msgState.counts.urgent--;
-    if (!msgState.cards.length) renderMessages();
-  }
-  function cardAction(cardId, action) {
-    return ownerFetch('/messages/' + encodeURIComponent(cardId) + '/' + action, { method: 'POST' }).then(ownerResponse)
-      .then(function (res) {
-        if (res.status === 403) disableMessages(403);
-        else if (!res.ok || !res.data.ok) throw new Error(res.data.error || ('Action returned ' + res.status + '.'));
-        return res.data;
-      });
-  }
-  document.getElementById('msg-chips').addEventListener('click', function (event) {
-    var chip = event.target.closest('.chip'); if (!chip) return;
-    msgState.key = chip.dataset.key;
-    document.querySelectorAll('#msg-chips .chip').forEach(function (button) {
-      button.setAttribute('aria-pressed', button === chip ? 'true' : 'false');
-    });
-    loadMessages();
-  });
 
   // ---- tabs ----
   // Both bars drive the same function: the phone bar is not a second implementation, it is
@@ -1219,9 +973,33 @@
 
   showTab(location.hash === '#messages' ? 'inbox' : location.hash.replace('#', '') || 'inbox');
 
-  loadMessages();
-  msgPoll = setInterval(function () { if (msgState.enabled !== false) loadMessages(); }, 8000);
+  // The shared module owns fetch/filter/row state.  These three dashboard stats and
+  // the two tab badges deliberately remain here because they belong to this screen.
+  var devmonInbox = DevmonInbox.mount(document.getElementById('devmon-inbox'), {
+    mode: 'full',
+    onCounts: function (counts) {
+      var unreadCount = counts.unread || 0;
+      setStat('st-total', counts.active || 0);
+      setStat('st-urgent', counts.urgent || 0);
+      setStat('st-unread', unreadCount);
+      ['nav-unread', 'tb-unread'].forEach(function (id) {
+        var badge = document.getElementById(id);
+        badge.textContent = unreadCount > 99 ? '99+' : unreadCount;
+        badge.hidden = !unreadCount;
+      });
+    },
+    toast: msgToast
+  });
+  var runQuery = new URLSearchParams(location.search);
+  if (runQuery.has('run')) {
+    devmonInbox.openTemplate({
+      template: runQuery.get('run') || '',
+      week: runQuery.get('week') || '',
+      action: runQuery.get('action') || '',
+      url: runQuery.get('url') || ''
+    });
+  }
 </script>
-<script src="/airlock-return.js" data-mode="corner" defer></script>
+<script src="/airlock-return.js" data-mode="native" defer></script>
 </body>
 </html>

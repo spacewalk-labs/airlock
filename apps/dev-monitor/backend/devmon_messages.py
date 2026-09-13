@@ -255,11 +255,13 @@ def ingest(payload):
             status = 'inserted'
         else:
             conn.execute(
-                'UPDATE cards SET count=count+1,last_at=?,read_at=NULL,send_next_at=CASE '
+                'UPDATE cards SET count=count+1,last_at=?,read_at=CASE '
+                'WHEN title=? AND body=? THEN read_at ELSE NULL END,send_next_at=CASE '
                 "WHEN level='normal' AND ?='urgent' AND sent_at IS NULL AND send_attempts=0 THEN ? ELSE send_next_at END,"
                 'level=?,title=?,body=? '
                 'WHERE card_id=?',
-                (now,p['level'],now,'urgent' if p['level']=='urgent' or card['level']=='urgent' else 'normal',
+                (now,p['title'],p['body'],p['level'],now,
+                 'urgent' if p['level']=='urgent' or card['level']=='urgent' else 'normal',
                  p['title'],p['body'],card['card_id']))
             status = 'coalesced'
         conn.execute('INSERT INTO ledger(id,"group",source,received_at,payload) VALUES(?,?,?,?,?)',

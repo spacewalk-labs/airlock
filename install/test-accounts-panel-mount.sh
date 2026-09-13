@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Phase 1 of DEVTERM_INDEPENDENCE: the account panel is served by the platform surface,
-# under the owner-gated /airlock-accounts/ prefix, without devterm.
+# under the owner-gated /airlock-accounts/ prefix, without devterm. Since 2026-09-13 the
+# same page's secret-drop view is the platform's too (docs/tasks/active/platform-secret-
+# drop.md, AC-PSD-6): the mount serves panel.html verbatim, secret view and secretdrop.js
+# included, and the old "secret is refused here" predicates are inverted on purpose.
 #
 # Everything here is loopback against a scratch instance of bin/airlock-accounts-api with
 # a temporary panel directory. No installed unit, no live account, no credential file,
@@ -21,9 +24,9 @@ bad() { printf 'FAIL %s\n' "$1"; fail=$((fail + 1)); }
 # Counters the AC rows are computed from. A prose "it passed" is not a measurement: each
 # row below prints its predicate, the observed numbers and the exact revision they were
 # taken at, so an acceptance reader re-runs one command and compares values.
-served_panel=0 account_markup=0 secret_dependency=0 assets_served=0 script_type=0 no_store=0 refs_resolvable=0 missing_asset_detected=0
-secret_refused=0 secret_asset_absent=0 symlink_refused=0 escapes_refused=0 json_404=0
-template_mismatch_refused=0 unconfigured_refused=0 negative_control=0
+served_panel=0 account_markup=0 secret_view_linked=0 assets_served=0 script_type=0 no_store=0 refs_resolvable=0 missing_asset_detected=0
+secret_view_served=0 devterm_assets_absent=0 symlink_refused=0 escapes_refused=0 json_404=0
+unconfigured_refused=0 negative_control=0
 rev="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 
 # The layout under test is the SHIPPED one, staged the way the installer stages it:
@@ -34,7 +37,8 @@ rev="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 panel_dir="$TMP/webroot/assets/accounts"
 style_dir="$TMP/checkout/install/accounts-panel"
 mkdir -p "$panel_dir" "$style_dir"
-cp "$ROOT/hub/assets/accounts/panel.html" "$ROOT/hub/assets/accounts/accounts.js" "$panel_dir/" \
+cp "$ROOT/hub/assets/accounts/panel.html" "$ROOT/hub/assets/accounts/accounts.js" \
+   "$ROOT/hub/assets/accounts/secretdrop.js" "$panel_dir/" \
   || { echo "FAIL cannot stage the shipped account assets"; exit 1; }
 cp "$ROOT/install/accounts-panel/popup.css" "$style_dir/" \
   || { echo "FAIL cannot stage the shipped panel stylesheet"; exit 1; }
@@ -78,11 +82,11 @@ case "$panel" in
   *) bad "the served panel lost its account markup" ;;
 esac
 case "$panel" in
-  *secretdrop.js*) secret_dependency=1; bad "the account mount still pulls devterm's secret asset" ;;
-  *) secret_dependency=0; ok "the account mount carries no devterm secret dependency" ;;
+  *'src="secretdrop.js"'*) secret_view_linked=1; ok "the served panel carries the platform secret drop view" ;;
+  *) bad "the served panel lost the secret drop view" ;;
 esac
 
-for asset in accounts.js popup.css; do
+for asset in accounts.js popup.css secretdrop.js; do
   [ "$(code "$B/$asset")" = 200 ] && { assets_served=$((assets_served + 1)); ok "asset served: $asset"; } || bad "asset missing: $asset"
 done
 # Everything the page still asks for must be answerable by this mount. A reference the
@@ -94,20 +98,19 @@ for ref in $(printf '%s' "$panel" | grep -oE '(src|href)="[a-z0-9._-]+"' | sed -
   [ "$got" = 200 ] || { missing_ref=$((missing_ref + 1)); bad "the served panel references $ref which the mount answers $got"; }
 done
 [ "$missing_ref" = 0 ] && { refs_resolvable=1; ok "every asset the served panel references is answerable by the mount"; }
+gone_ok=0
 for gone in ui.js favicon.svg; do
-  [ "$(code "$B/$gone")" = 404 ] && ok "devterm-only asset is not promised here: $gone" || bad "$gone is still whitelisted"
+  [ "$(code "$B/$gone")" = 404 ] && { gone_ok=$((gone_ok + 1)); ok "devterm-only asset is not promised here: $gone"; } || bad "$gone is still whitelisted"
 done
+[ "$gone_ok" = 2 ] && devterm_assets_absent=1
 case "$(header content-type "$B/accounts.js")" in *javascript*) script_type=1; ok "accounts.js keeps a script content type" ;; *) bad "accounts.js content type is wrong" ;; esac
 case "$(header cache-control "$B/panel.html")" in *no-store*) no_store=1; ok "the panel is never a cached answer" ;; *) bad "the panel is missing no-store" ;; esac
 
 # --- what it refuses -------------------------------------------------------------
-[ "$(code "$B/panel.html?p=secret")" = 400 ] \
-  && { secret_refused=1; ok "?p=secret is refused explicitly instead of half-serving a secret view"; } \
-  || bad "?p=secret was not refused (got $(code "$B/panel.html?p=secret"))"
-
-[ "$(code "$B/secretdrop.js")" = 404 ] \
-  && { secret_asset_absent=1; ok "the secret asset is not served here at all"; } \
-  || bad "the secret asset leaked onto the account surface"
+[ "$(code "$B/panel.html?p=secret&embed=1")" = 200 ] \
+  && [ "$(body "$B/panel.html?p=secret&embed=1")" = "$panel" ] \
+  && { secret_view_served=1; ok "?p=secret is served on the hub: the same page, the platform's secret view"; } \
+  || bad "?p=secret is not served on the platform mount (got $(code "$B/panel.html?p=secret&embed=1"))"
 
 [ "$(code "$B/accounts.js.link")" = 404 ] \
   && { symlink_refused=1; ok "a symlinked asset is refused"; } \
@@ -123,18 +126,6 @@ case "$unknown" in
   *"no such route"*) json_404=1; ok "an unknown name answers the surface's JSON 404, never index.html at 200" ;;
   *) bad "an unknown name did not answer the JSON 404 shape: $unknown" ;;
 esac
-stop_server
-
-# --- template mismatch is an explicit failure ------------------------------------
-mism="$TMP/mismatch"; mkdir -p "$mism"; cp "$panel_dir/accounts.js" "$mism/"
-grep -v 'secretdrop.js' "$panel_dir/panel.html" > "$mism/panel.html"
-start_server "$ROOT/bin/airlock-accounts-api" "$mism" || bad "server with mismatched template did not start"
-[ "$(code "$B/panel.html")" = 500 ] 2>/dev/null || true
-PORT_MISMATCH="$PORT"
-got="$(code "http://127.0.0.1:$PORT_MISMATCH/panel.html")"
-[ "$got" = 500 ] \
-  && { template_mismatch_refused=1; ok "a panel that no longer matches the expected contract fails loudly instead of shipping"; } \
-  || bad "a mismatched panel template did not fail (got $got)"
 stop_server
 
 # --- a required asset absent from the staged layout ------------------------------
@@ -187,19 +178,19 @@ verdict() { [ "$1" = 1 ] && printf PASS || printf FAIL; }
 # AC rows: predicate, observed values, verdict, signal and the revision measured. The
 # card's acceptance reads these, not the prose above.
 mount_ok=0
-[ "$served_panel" = 1 ] && [ "$account_markup" = 1 ] && [ "$secret_dependency" = 0 ] \
-  && [ "$assets_served" = 2 ] && [ "$refs_resolvable" = 1 ] && [ "$script_type" = 1 ] \
+[ "$served_panel" = 1 ] && [ "$account_markup" = 1 ] && [ "$secret_view_linked" = 1 ] \
+  && [ "$assets_served" = 3 ] && [ "$refs_resolvable" = 1 ] && [ "$script_type" = 1 ] \
   && [ "$no_store" = 1 ] && mount_ok=1
 refusals_ok=0
-[ "$secret_refused" = 1 ] && [ "$secret_asset_absent" = 1 ] && [ "$symlink_refused" = 1 ] \
-  && [ "$escapes_refused" = 4 ] && [ "$json_404" = 1 ] && [ "$template_mismatch_refused" = 1 ] \
+[ "$secret_view_served" = 1 ] && [ "$devterm_assets_absent" = 1 ] && [ "$symlink_refused" = 1 ] \
+  && [ "$escapes_refused" = 4 ] && [ "$json_404" = 1 ] \
   && [ "$unconfigured_refused" = 1 ] && [ "$missing_asset_detected" = 1 ] && refusals_ok=1
 
 printf '%s\n' "---"
-printf 'AC-DTI-P1A | expected: served_panel==1 && account_markup==1 && secret_dependency==0 && assets_served==2 && refs_resolvable==1 && script_type==1 && no_store==1 | observed: served_panel=%s,account_markup=%s,secret_dependency=%s,assets_served=%s,refs_resolvable=%s,script_type=%s,no_store=%s | verdict: %s | signal: fixture | evidence: install/test-accounts-panel-mount.sh@%s\n' \
-  "$served_panel" "$account_markup" "$secret_dependency" "$assets_served" "$refs_resolvable" "$script_type" "$no_store" "$(verdict "$mount_ok")" "$rev"
-printf 'AC-DTI-P1B | expected: secret_refused==1 && secret_asset_absent==1 && symlink_refused==1 && escapes_refused==4 && json_404==1 && template_mismatch_refused==1 && unconfigured_refused==1 && missing_asset_detected==1 | observed: secret_refused=%s,secret_asset_absent=%s,symlink_refused=%s,escapes_refused=%s,json_404=%s,template_mismatch_refused=%s,unconfigured_refused=%s,missing_asset_detected=%s | verdict: %s | signal: fixture | evidence: install/test-accounts-panel-mount.sh@%s\n' \
-  "$secret_refused" "$secret_asset_absent" "$symlink_refused" "$escapes_refused" "$json_404" "$template_mismatch_refused" "$unconfigured_refused" "$missing_asset_detected" "$(verdict "$refusals_ok")" "$rev"
+printf 'AC-DTI-P1A | expected: served_panel==1 && account_markup==1 && secret_view_linked==1 && assets_served==3 && refs_resolvable==1 && script_type==1 && no_store==1 | observed: served_panel=%s,account_markup=%s,secret_view_linked=%s,assets_served=%s,refs_resolvable=%s,script_type=%s,no_store=%s | verdict: %s | signal: fixture | evidence: install/test-accounts-panel-mount.sh@%s\n' \
+  "$served_panel" "$account_markup" "$secret_view_linked" "$assets_served" "$refs_resolvable" "$script_type" "$no_store" "$(verdict "$mount_ok")" "$rev"
+printf 'AC-DTI-P1B | expected: secret_view_served==1 && devterm_assets_absent==1 && symlink_refused==1 && escapes_refused==4 && json_404==1 && unconfigured_refused==1 && missing_asset_detected==1 | observed: secret_view_served=%s,devterm_assets_absent=%s,symlink_refused=%s,escapes_refused=%s,json_404=%s,unconfigured_refused=%s,missing_asset_detected=%s | verdict: %s | signal: fixture | evidence: install/test-accounts-panel-mount.sh@%s\n' \
+  "$secret_view_served" "$devterm_assets_absent" "$symlink_refused" "$escapes_refused" "$json_404" "$unconfigured_refused" "$missing_asset_detected" "$(verdict "$refusals_ok")" "$rev"
 printf 'AC-DTI-P1C | expected: negative_control==1 | observed: negative_control=%s | verdict: %s | signal: fixture | evidence: install/test-accounts-panel-mount.sh@%s\n' \
   "$negative_control" "$(verdict "$negative_control")" "$rev"
 printf '%s\n' "passed=$pass failed=$fail"

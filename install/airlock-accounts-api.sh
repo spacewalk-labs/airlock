@@ -84,6 +84,7 @@ if ! sed -e "s|@AIRLOCK_ROOT@|$(escape "$ROOT")|g" \
           -e "s|@ACCOUNTS_PORT@|$(escape "$ACCOUNTS_PORT")|g" \
           -e "s|@ACCOUNTS_STATUS_BIN@|$(escape "$AIRLOCK_ACCOUNTS_STATUS_BIN")|g" \
           -e "s|@ACCOUNTS_BIN@|$(escape "$AIRLOCK_ACCOUNTS_BIN")|g" \
+          -e "s|@SECRET_BIN@|$(escape "$AIRLOCK_SECRET_BIN")|g" \
           -e "s|@FLEET_STORE@|$(escape "$FLEET_STORE")|g" \
           -e "s|@PANEL_DIR@|$(escape "$PANEL_DIR")|g" \
           -e "s|@PANEL_STYLE_DIR@|$(escape "$PANEL_STYLE_DIR")|g" \

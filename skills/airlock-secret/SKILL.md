@@ -8,11 +8,13 @@ description: Diagnose and recover Airlock's short-lived secret drop when a secre
 The secret drop stores a value only on the current box at
 `~/.devterm-secrets/<name>.txt`. It returns metadata and a path, never the
 value. Entries expire after 30 minutes by default; expiration is expected, not
-a failure.
+a failure. It is a platform feature: the UI and its `/secret-put|list|del` routes
+belong to the platform account surface (`airlock-accounts-api.service`, hub prefix
+`/airlock-accounts/`), reached from the Airlock widget or from DevTerm.
 
 ## 1. Identify whether it expired, was deleted, or cannot be written
 
-Run as the same box user that runs DevTerm. This output contains only names,
+Run as the same box user that runs Airlock. This output contains only names,
 paths, sizes, and remaining lifetime.
 
 ```bash
@@ -28,11 +30,14 @@ systemctl --user list-timers airlock-secret-sweep.timer --all
   zero. Calling `list`, `put`, or `del` also removes expired entries.
 - The timer should be enabled and scheduled. If it is absent or failed, re-run
   the ordinary Airlock installer; do not hand-create a timer unit.
+- If `list` works here but the UI says it cannot store or list, the HTTP side is
+  down, not the store: check `systemctl --user status airlock-accounts-api`.
 
 ## 2. Put a replacement safely
 
-Use the DevTerm secret form: it keeps the value out of terminal history and
-returns the path to pass to the consuming tool. Do **not** paste or type a real
+Use the Secret drop form (Airlock widget → Secret drop, or DevTerm's key
+button): it keeps the value out of terminal history and returns the path to pass
+to the consuming tool. Do **not** paste or type a real
 secret at a terminal prompt—the command's standard input is normally echoed and
 can remain in terminal scrollback.
 

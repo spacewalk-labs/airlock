@@ -1705,6 +1705,256 @@ pc_fixed="$(run_update_c)"; pc_fixed_rc=$?
   && printf '%s' "$pc_fixed" | grep -q '^installed$' \
   && ok "once the config is fixed the same update runs through the installer" \
   || bad "a valid config still did not update (rc=$pc_fixed_rc): $pc_fixed"
+# ---------------------------------------------------------- U1 managed channel
+# This is a real Linux user+mount namespace with a chroot whose fixed /etc, /opt,
+# and /var/lib paths are owned by namespace root.  No product path override or
+# approval seam exists: the updater sees the production paths verbatim.
+u1_root="$scratch/u1-root"
+u1_public="$u1_root/fixture/public"
+u1_box="$u1_root/fixture/box"
+u1_box_relative="$u1_root/fixture/box-relative"
+mkdir -p "$u1_public" "$u1_box" "$u1_box_relative" \
+  "$u1_root/usr" "$u1_root/dev" "$u1_root/proc" \
+  "$u1_root/work" "$u1_root/root" "$u1_root/tmp" "$u1_root/etc/airlock" \
+  "$u1_root/etc/alternatives" \
+  "$u1_root/opt/airlock/libexec" "$u1_root/var/lib/airlock/managed"
+chmod 0755 "$u1_root" "$u1_root/etc" "$u1_root/etc/airlock" \
+  "$u1_root/opt" "$u1_root/opt/airlock" "$u1_root/opt/airlock/libexec" \
+  "$u1_root/var" "$u1_root/var/lib" "$u1_root/var/lib/airlock" \
+  "$u1_root/var/lib/airlock/managed"
+chmod 1777 "$u1_root/tmp"
+ln -s usr/bin "$u1_root/bin"
+ln -s usr/sbin "$u1_root/sbin"
+ln -s usr/lib "$u1_root/lib"
+ln -s usr/lib64 "$u1_root/lib64"
+ln -s /usr/bin/gawk "$u1_root/etc/alternatives/awk"
+git -C "$ROOT" archive HEAD | tar -x -C "$u1_public"
+cat >"$u1_public/bin/airlock-status" <<'PY'
+#!/usr/bin/env python3
+import json
+print(json.dumps({"checks": [], "exit_code": 0, "schema_version": 1, "verdict": "ok"}))
+PY
+chmod 0755 "$u1_public/bin/airlock-status"
+cat >"$u1_public/install/airlock-install.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if env | grep -Eq '^(AIRLOCK_MANAGED_|AIRLOCK_UPDATE_CHANNEL_)'; then
+  echo "managed authority leaked through ambient environment" >&2
+  exit 71
+fi
+exec 9>>/var/lib/airlock/managed/0/managed-state.json.lock
+flock -n 9 || { echo "producer state lease is still held" >&2; exit 72; }
+python3 - "$@" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+arguments = sys.argv[1:]
+if len(arguments) < 3:
+    raise SystemExit("missing paired handoff/select argv")
+if not arguments[0].startswith("--update-channel-handoff="):
+    raise SystemExit("handoff path is not first")
+if not arguments[1].startswith("--update-channel-handoff-sha256="):
+    raise SystemExit("handoff digest is not second")
+path = pathlib.Path(arguments[0].split("=", 1)[1])
+expected_hash = arguments[1].split("=", 1)[1]
+if not path.is_absolute():
+    raise SystemExit("handoff path is not absolute")
+selected = [item.split("=", 1)[1] for item in arguments[2:]
+            if item.startswith("--select-app=")]
+if len(selected) != len(arguments) - 2 or selected != sorted(set(selected)):
+    raise SystemExit("selected app argv is not exact sorted unique")
+raw = path.read_bytes()
+value = json.loads(raw)
+canonical = (json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode()
+if raw != canonical or hashlib.sha256(raw).hexdigest() != expected_hash:
+    raise SystemExit("handoff bytes/hash are not canonical")
+expected_keys = {
+    "actor", "anchor_path", "anchor_sha256", "config_path", "config_sha256",
+    "core_measurement_path", "core_measurement_sha256", "current_release_path",
+    "current_release_sha256", "fetched_public_revision", "installed_measurer_sha256",
+    "next_measurer_path", "next_measurer_sha256", "receipt_path", "receipt_sha256",
+    "schema", "selected_apps",
+}
+if set(value) != expected_keys or value["schema"] != "airlock.update-channel.install-handoff/v1":
+    raise SystemExit("handoff shape is not closed")
+if value["actor"] != "update-channel" or value["anchor_path"] != "/etc/airlock/managed-channel.json":
+    raise SystemExit("handoff actor/anchor is not fixed")
+if value["selected_apps"] != selected:
+    raise SystemExit("handoff and argv selected ids differ")
+for path_key, hash_key in (
+    ("config_path", "config_sha256"),
+    ("core_measurement_path", "core_measurement_sha256"),
+    ("current_release_path", "current_release_sha256"),
+    ("next_measurer_path", "next_measurer_sha256"),
+    ("receipt_path", "receipt_sha256"),
+):
+    payload = pathlib.Path(value[path_key])
+    if not payload.is_absolute():
+        raise SystemExit(f"handoff payload is not absolute: {path_key}")
+    info = payload.lstat()
+    if (not stat.S_ISREG(info.st_mode) or payload.is_symlink()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or hashlib.sha256(payload.read_bytes()).hexdigest() != value[hash_key]):
+        raise SystemExit(f"handoff payload mismatch: {path_key}")
+PY
+printf '%s\n' "$@" > /fixture/installer-argv.log
+printf 'installer-after-producer\n' > /fixture/install.log
+SH
+chmod 0755 "$u1_public/install/airlock-install.sh"
+git -C "$u1_public" init -q -b main
+git -C "$u1_public" add -A
+u1_source_label="airlock""-work"
+git -C "$u1_public" commit -q -m "release from $u1_source_label @ eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+u1_old="$(git -C "$u1_public" rev-parse HEAD)"
+printf 'managed candidate\n' >>"$u1_public/README.md"
+git -C "$u1_public" add README.md
+git -C "$u1_public" commit -q -m "release from $u1_source_label @ eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+u1_new="$(git -C "$u1_public" rev-parse HEAD)"
+git -C "$u1_public" archive "$u1_old" | tar -x -C "$u1_box"
+git -C "$u1_public" archive "$u1_old" | tar -x -C "$u1_box_relative"
+for u1_initial_box in "$u1_box" "$u1_box_relative"; do
+  git -C "$u1_initial_box" init -q -b main
+  git -C "$u1_initial_box" add -A
+  git -C "$u1_initial_box" commit -q -m "airlock-update: 배포본 ${u1_old:0:12} 으로 갱신"
+done
+
+cat >"$u1_root/fixture/run-u1.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+new=$1
+source_revision=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+git config --global user.name airlock-u1-test
+git config --global user.email airlock-u1-test@example.invalid
+measurement="$(python3 /work/bin/airlock-managed-release measure-public-core \
+  --repository /fixture/public --revision "$new")"
+core_digest="$(printf '%s\n' "$measurement" | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')"
+python3 /work/install/test-managed-config-consumer.py --prepare-u1-fixture \
+  /fixture/material /fixture/box "$source_revision" "$core_digest" \
+  > /fixture/u1-fixture.json
+cp /fixture/box/airlock.toml /fixture/box-relative/airlock.toml
+chmod 0600 /fixture/box-relative/airlock.toml
+
+before="$(git -C /fixture/box rev-parse HEAD)"
+chmod 0600 /etc/airlock/managed-channel.json
+if AIRLOCK_DIR=/fixture/box AIRLOCK_RELEASE_URL=/fixture/public \
+     AIRLOCK_RELEASE_REF="$new" bash /work/bin/airlock-update >/fixture/mode.err 2>&1; then
+  echo "invalid anchor mode passed" >&2; exit 81
+fi
+test "$(git -C /fixture/box rev-parse HEAD)" = "$before"
+test ! -e /fixture/install.log
+chmod 0644 /etc/airlock/managed-channel.json
+
+mv /etc/airlock/managed-channel.json /etc/airlock/managed-channel.real
+ln -s managed-channel.real /etc/airlock/managed-channel.json
+if AIRLOCK_DIR=/fixture/box AIRLOCK_RELEASE_URL=/fixture/public \
+     AIRLOCK_RELEASE_REF="$new" bash /work/bin/airlock-update >/fixture/symlink.err 2>&1; then
+  echo "symlink anchor passed" >&2; exit 82
+fi
+test "$(git -C /fixture/box rev-parse HEAD)" = "$before"
+rm /etc/airlock/managed-channel.json
+mv /etc/airlock/managed-channel.real /etc/airlock/managed-channel.json
+
+chmod 0755 /opt/airlock/libexec/airlock-managed-release
+if AIRLOCK_DIR=/fixture/box AIRLOCK_RELEASE_URL=/fixture/public \
+     AIRLOCK_RELEASE_REF="$new" bash /work/bin/airlock-update >/fixture/measurer-mode.err 2>&1; then
+  echo "invalid installed measurer mode passed" >&2; exit 83
+fi
+test "$(git -C /fixture/box rev-parse HEAD)" = "$before"
+chmod 0555 /opt/airlock/libexec/airlock-managed-release
+
+AIRLOCK_DIR=/fixture/box AIRLOCK_RELEASE_URL=/fixture/public AIRLOCK_RELEASE_REF="$new" \
+AIRLOCK_CONFIG=/fixture/box/airlock.toml AIRLOCK_MANAGED_STATE=/fixture/attacker-state \
+AIRLOCK_MANAGED_RELEASE=/fixture/attacker-release \
+AIRLOCK_MANAGED_AUTHORITY=/fixture/attacker-authority \
+AIRLOCK_MANAGED_PROJECTOR_RELEASE_MODE=promoted-current \
+AIRLOCK_MANAGED_RELEASE_VERIFY_MODE=promoted-current \
+AIRLOCK_MANAGED_RELEASE_VERIFY_STORE=/fixture/copied-store \
+AIRLOCK_MANAGED_RELEASE_VERIFY_CHANNEL=evil \
+AIRLOCK_UPDATE_CHANNEL_HANDOFF=/fixture/attacker-handoff \
+bash /work/bin/airlock-update > /fixture/positive.log 2>&1
+test -f /fixture/install.log
+test "$(git -C /fixture/box rev-parse HEAD)" != "$before"
+grep -qx -- '--select-app=available-app' /fixture/installer-argv.log
+grep -qx -- '--select-app=required-app' /fixture/installer-argv.log
+
+relative_before="$(git -C /fixture/box-relative rev-parse HEAD)"
+mkdir -m 0700 /fixture/box-relative/reltmp
+rm -f /fixture/install.log /fixture/installer-argv.log
+TMPDIR=reltmp AIRLOCK_DIR=/fixture/box-relative AIRLOCK_RELEASE_URL=/fixture/public \
+AIRLOCK_RELEASE_REF="$new" AIRLOCK_CONFIG=/fixture/box-relative/airlock.toml \
+bash /work/bin/airlock-update > /fixture/relative.log 2>&1
+test -f /fixture/install.log
+test "$(git -C /fixture/box-relative rev-parse HEAD)" != "$relative_before"
+python3 - /fixture/installer-argv.log <<'PY'
+import pathlib
+import sys
+
+rows = pathlib.Path(sys.argv[1]).read_text().splitlines()
+handoff = pathlib.Path(rows[0].split("=", 1)[1])
+if not handoff.is_absolute():
+    raise SystemExit("relative TMPDIR produced a relative handoff")
+PY
+grep -qx -- '--select-app=available-app' /fixture/installer-argv.log
+grep -qx -- '--select-app=required-app' /fixture/installer-argv.log
+printf 'root_userns=1\nanchor_rejects=2\nmeasurer_rejects=1\nambient_scrub=1\nrelative_tmpdir=1\n'
+SH
+chmod 0755 "$u1_root/fixture/run-u1.sh"
+
+u1_result="$(unshare -Ur -m bash -s -- "$u1_root" "$ROOT" "$u1_new" <<'SH'
+set -euo pipefail
+root=$1; source=$2; revision=$3
+mount --make-rprivate /
+mount --rbind /usr "$root/usr"
+mount --rbind /dev "$root/dev"
+mount --rbind /proc "$root/proc"
+mount --bind "$source" "$root/work"
+mount -o remount,bind,ro "$root/work"
+/usr/sbin/chroot "$root" /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+  GIT_CONFIG_GLOBAL=/fixture/gitconfig GIT_CONFIG_NOSYSTEM=1 \
+  bash /fixture/run-u1.sh "$revision"
+SH
+)"; u1_rc=$?
+if [ "$u1_rc" = 0 ] \
+   && grep -qx 'root_userns=1' <<<"$u1_result" \
+   && grep -qx 'anchor_rejects=2' <<<"$u1_result" \
+   && grep -qx 'measurer_rejects=1' <<<"$u1_result" \
+   && grep -qx 'ambient_scrub=1' <<<"$u1_result" \
+   && grep -qx 'relative_tmpdir=1' <<<"$u1_result"; then
+  ok "Linux managed U1 uses a real root user namespace and fixed anchor/measurer"
+  u1_root_userns=1; u1_anchor_rejects=2; u1_measurer_rejects=1
+  u1_ambient_scrub=1; u1_relative_tmpdir=1
+else
+  for u1_log in mode.err symlink.err measurer-mode.err positive.log relative.log; do
+    if [ -f "$u1_root/fixture/$u1_log" ]; then
+      printf '%s\n' "--- U1 $u1_log ---" >&2
+      tail -40 "$u1_root/fixture/$u1_log" >&2
+    fi
+  done
+  bad "Linux managed U1 root namespace fixture failed (rc=$u1_rc): $u1_result"
+  u1_root_userns=0; u1_anchor_rejects=0; u1_measurer_rejects=0
+  u1_ambient_scrub=0; u1_relative_tmpdir=0
+fi
+if [ -f "$u1_root/fixture/installer-argv.log" ] \
+   && [ "$(sed -n '1p' "$u1_root/fixture/installer-argv.log")" = \
+        "--update-channel-handoff=$(dirname "$(sed -n '1s/^--update-channel-handoff=//p' "$u1_root/fixture/installer-argv.log")")/update-channel-handoff.json" ] \
+   && sed -n '2p' "$u1_root/fixture/installer-argv.log" | grep -Eq '^--update-channel-handoff-sha256=[0-9a-f]{64}$' \
+   && [ "$(tail -n +3 "$u1_root/fixture/installer-argv.log" | sort)" = \
+        $'--select-app=available-app\n--select-app=required-app' ]; then
+  ok "managed producer exits and releases its lease before exact paired installer argv"
+  u1_paired_argv=1
+else
+  bad "managed installer argv/order was not the closed paired handoff"
+  u1_paired_argv=0
+fi
+printf 'AC-MAU-U1 | expected: root_userns==1 && anchor_rejects==2 && measurer_rejects==1 && ambient_scrub==1 && relative_tmpdir==1 && paired_argv==1 | observed: root_userns=%s,anchor_rejects=%s,measurer_rejects=%s,ambient_scrub=%s,relative_tmpdir=%s,paired_argv=%s | verdict: %s | signal: fixture | evidence: install/test-update.sh@%s\n' \
+  "$u1_root_userns" "$u1_anchor_rejects" "$u1_measurer_rejects" \
+  "$u1_ambient_scrub" "$u1_relative_tmpdir" "$u1_paired_argv" \
+  "$([ "$u1_root_userns$u1_anchor_rejects$u1_measurer_rejects$u1_ambient_scrub$u1_relative_tmpdir$u1_paired_argv" = 121111 ] && printf PASS || printf FAIL)" \
+  "$(git -C "$ROOT" rev-parse HEAD)"
 
 timer_out="$(bash "$ROOT/install/test-update-timer.sh" 2>&1)"; timer_rc=$?
 [ "$timer_rc" = 0 ] \
