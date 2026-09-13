@@ -157,6 +157,7 @@ public_paths_classified=1
 for path in bin/airlock-config hub/index.html \
     apps/dev-monitor/backend/devmon_apps.py \
     apps/dev-monitor/backend/airlock-dev-monitor.py \
+    apps/dev-monitor/backend/action_runner.py \
     apps/dev-monitor/backend/devmon_update_exec.py \
     install/airlock-install.sh install/test-package-reregister.sh; do
   [ "$(bash install/public-manifest.sh --classify "$path" | cut -f1)" = public ] \

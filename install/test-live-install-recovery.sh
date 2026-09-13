@@ -15,6 +15,112 @@ pass=0 fail=0
 ok() { printf 'ok   live-install-recovery: %s\n' "$1"; pass=$((pass+1)); }
 bad() { printf 'FAIL live-install-recovery: %s\n' "$1"; fail=$((fail+1)); }
 
+# Exercise the real config writer without crossing the host boundary. Baseline and
+# current recovery must not accidentally configure the late-failure package; the
+# failure scenario must configure both its app and package tables. The explicit
+# orphan mutation pins the F2 boundary that stopped the first live R1 run.
+CONFIG_MATRIX="$TMP/config-matrix"
+mkdir -p "$CONFIG_MATRIX"
+LIVE_USER="$(id -un)"
+LIVE_OWNER=owner@example.test
+FAIL_PACKAGE="$ROOT/live/install-recovery-packages/late-failure"
+export LIVE_USER LIVE_OWNER FAIL_PACKAGE
+eval "$(sed -n '/^write_config() {/,/^}/p' "$ROOT/live/install-recovery-in-container.sh")"
+write_config "$CONFIG_MATRIX/baseline.toml" false 0
+write_config "$CONFIG_MATRIX/failure.toml" true 1
+write_config "$CONFIG_MATRIX/current.toml" true 0
+config_matrix_rc=0
+python3 - "$ROOT" "$CONFIG_MATRIX" "$FAIL_PACKAGE" <<'PY' \
+  > "$TMP/config-matrix.out" 2>&1 || config_matrix_rc=$?
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+
+root, matrix, fail_package = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+expected = {
+    "baseline.toml": ["hub", "dev-monitor"],
+    "failure.toml": ["hub", "dev-monitor", "zz-install-recovery-fail"],
+    "current.toml": ["hub", "dev-monitor"],
+}
+for name, order in expected.items():
+    path = matrix / name
+    with path.open("rb") as stream:
+        config = tomllib.load(stream)
+    has_app = "zz-install-recovery-fail" in config.get("apps", {})
+    has_package = "zz-install-recovery-fail" in config.get("packages", {})
+    assert (has_app, has_package) == (name == "failure.toml", name == "failure.toml"), name
+    env = dict(os.environ, AIRLOCK_CONFIG=str(path))
+    result = subprocess.run(
+        [sys.executable, str(root / "bin/airlock-config"), "package-info"],
+        cwd=root, env=env, text=True, capture_output=True)
+    assert result.returncode == 0, (name, result.stderr)
+    import json
+    assert json.loads(result.stdout)["order"] == order, name
+
+orphan = matrix / "baseline-orphan.toml"
+orphan.write_text(
+    (matrix / "baseline.toml").read_text()
+    + f'\n[packages.zz-install-recovery-fail]\npath = "{fail_package}"\n')
+env = dict(os.environ, AIRLOCK_CONFIG=str(orphan))
+result = subprocess.run(
+    [sys.executable, str(root / "bin/airlock-config"), "package-info"],
+    cwd=root, env=env, text=True, capture_output=True)
+assert result.returncode != 0
+assert "has no [apps.zz-install-recovery-fail] table" in result.stderr
+print("config matrix and orphan mutation ok")
+PY
+if [ "$config_matrix_rc" = 0 ] \
+   && grep -q 'config matrix and orphan mutation ok' "$TMP/config-matrix.out"; then
+  ok "config writer omits inactive failure package and rejects orphan mutation"
+else
+  bad "config writer matrix/orphan mutation failed"
+  sed 's/^/    /' "$TMP/config-matrix.out"
+fi
+
+# Root runs the inner driver, while the historical installer runs as LIVE_USER.
+# Exercise the real directory-preparation helper and require every XDG parent it
+# creates to be traversable and owned by that installer user.
+DIR_HOME="$TMP/recovery-home"
+HOME_DIR="$DIR_HOME"
+DRIVER_STATE="$HOME_DIR/.local/state/airlock-install-recovery-driver"
+EVIDENCE="$TMP/recovery-evidence"
+mkdir -p "$HOME_DIR"
+dir_setup_rc=0
+dir_setup_function="$(sed -n '/^prepare_recovery_dirs() {/,/^}/p' \
+  "$ROOT/live/install-recovery-in-container.sh")"
+if [ -z "$dir_setup_function" ]; then
+  dir_setup_rc=1
+else
+  eval "$dir_setup_function"
+  prepare_recovery_dirs || dir_setup_rc=$?
+fi
+if [ "$dir_setup_rc" = 0 ] \
+   && python3 - "$HOME_DIR" "$DRIVER_STATE" "$EVIDENCE" "$(id -u)" "$(id -g)" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+home, driver, evidence = map(Path, sys.argv[1:4])
+uid, gid = map(int, sys.argv[4:6])
+for path, mode in (
+    (home / ".local", 0o755),
+    (home / ".local/state", 0o755),
+    (driver, 0o700),
+    (evidence, 0o700),
+):
+    stat = path.stat()
+    assert (stat.st_uid, stat.st_gid) == (uid, gid), path
+    assert stat.st_mode & 0o7777 == mode, path
+os.mkdir(home / ".local/state/airlock", 0o700)
+PY
+then
+  ok "recovery setup gives the installer owned XDG parents before state creation"
+else
+  bad "recovery setup left an unusable XDG parent"
+fi
+
 # Deterministic seed and online-backup observation, without importing a test module.
 mkdir -p "$TMP/db"
 if python3 "$ROOT/live/install-recovery-db.py" seed-legacy "$TMP/db/messages.db" \

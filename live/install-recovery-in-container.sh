@@ -81,7 +81,17 @@ FAIL_PACKAGE="$SRC/live/install-recovery-packages/late-failure"
 EVIDENCE_ROOT=/var/lib/airlock-install-recovery
 EVIDENCE="$EVIDENCE_ROOT/run"
 rm -rf "$EVIDENCE_ROOT"
-install -d -m 0700 -o "$LIVE_USER" -g "$LIVE_USER" "$DRIVER_STATE" "$EVIDENCE"
+
+prepare_recovery_dirs() {
+  local live_group
+  live_group="$(id -gn "$LIVE_USER")" || return 1
+  install -d -m 0755 -o "$LIVE_USER" -g "$live_group" \
+    "$HOME_DIR/.local" "$HOME_DIR/.local/state" || return 1
+  install -d -m 0700 -o "$LIVE_USER" -g "$live_group" \
+    "$DRIVER_STATE" "$EVIDENCE"
+}
+
+prepare_recovery_dirs || die "could not prepare recovery state directories"
 STEPS="$EVIDENCE/steps.tsv"
 : > "$STEPS"
 chown "$LIVE_USER:$LIVE_USER" "$STEPS"
@@ -109,13 +119,13 @@ wiki = ""
 messages = $messages
 TOML
   if [ "$enable_fail" = 1 ]; then
-    printf '\n[apps.zz-install-recovery-fail]\n' >> "$path"
-  fi
-  cat >> "$path" <<TOML
+    cat >> "$path" <<TOML
 
+[apps.zz-install-recovery-fail]
 [packages.zz-install-recovery-fail]
 path = "$FAIL_PACKAGE"
 TOML
+  fi
   chown "$LIVE_USER:$LIVE_USER" "$path"
   chmod 0600 "$path"
 }

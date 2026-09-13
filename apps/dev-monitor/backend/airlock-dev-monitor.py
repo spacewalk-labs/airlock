@@ -1959,18 +1959,35 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---- action execution orchestration ----
-def _tmux(*args, capture=False, timeout=8):
+def _tmux(*args, capture=False, timeout=8, isolate_unit=None):
     """Run tmux, returning output on capture and None when the result is unknown."""
+    command = ['tmux'] + list(args)
+    if isolate_unit is not None:
+        if shutil.which('systemd-run') is None:
+            sys.stderr.write('[exec] systemd-run is unavailable — refusing to start '
+                             'a tmux server inside the dev-monitor service cgroup\n')
+            return None
+        # Only the first tmux server needs the move.  Once it lives in this sibling
+        # scope, every later new-window joins that server and inherits the safe cgroup.
+        # tmux already owns the PTY/process-group boundary, so a scope preserves the
+        # live pane while severing the service cgroup that its own install restarts.
+        command = [
+            'systemd-run', '--user', '--scope', '--collect', '--quiet', '--same-dir',
+            '--unit=' + isolate_unit, '--',
+        ] + command
     try:
         if capture:
             return subprocess.check_output(
-                ['tmux'] + list(args), text=True, timeout=timeout,
+                command, text=True, timeout=timeout,
                 stderr=subprocess.DEVNULL).strip()
         subprocess.check_call(
-            ['tmux'] + list(args), timeout=timeout,
+            command, timeout=timeout,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return ''
-    except Exception:
+    except Exception as exc:
+        if isolate_unit is not None:
+            sys.stderr.write('[exec] isolated tmux launch failed (%s): %s\n'
+                             % (isolate_unit, exc))
         return None
 
 
@@ -1993,6 +2010,29 @@ def _tmux_has_session(name):
                                timeout=8)
     except Exception:  # noqa: BLE001 — missing binary, timeout, permission: all "unknown"
         return None
+
+
+def _managed_user_service_cgroup(cgroup_file='/proc/self/cgroup'):
+    """Return the Airlock user-service leaf that would kill a child tmux server."""
+    try:
+        with open(cgroup_file, encoding='utf-8') as stream:
+            rows = stream.read().splitlines()
+    except OSError:
+        return None
+    path = next((row[3:] for row in rows if row.startswith('0::')), '')
+    parts = [part for part in path.split('/') if part]
+    if not any(re.fullmatch(r'user@[0-9]+\.service', part) for part in parts):
+        return None
+    unit = parts[-1] if parts else ''
+    if re.fullmatch(r'airlock-[A-Za-z0-9_.@-]+\.service', unit) is None:
+        return None
+    return unit
+
+
+def _tmux_scope_unit(run_id):
+    """A bounded systemd unit name; run ids may contain timestamps and colons."""
+    suffix = re.sub(r'[^A-Za-z0-9_.-]', '-', str(run_id))[-64:] or 'run'
+    return 'airlock-devmon-run-%d-%s' % (os.getpid(), suffix)
 
 
 def _launch_run(run_id, plan, cfg=None, window_name=None):
@@ -2035,9 +2075,15 @@ def _launch_run(run_id, plan, cfg=None, window_name=None):
                 'new-window', '-t', session + ':', '-n', window_name, '-c', cwd,
                 '-P', '-F', '#{pid}:#{window_id}', command, capture=True)
         else:
+            host_unit = _managed_user_service_cgroup()
+            isolate_unit = _tmux_scope_unit(run_id) if host_unit else None
+            if host_unit:
+                sys.stderr.write('[exec] launching the tmux server outside %s in %s.scope\n'
+                                 % (host_unit, isolate_unit))
             target = _tmux(
                 'new-session', '-d', '-s', session, '-n', window_name, '-c', cwd,
-                '-P', '-F', '#{pid}:#{window_id}', command, capture=True)
+                '-P', '-F', '#{pid}:#{window_id}', command, capture=True,
+                isolate_unit=isolate_unit)
     if not target:
         return ('ambiguous', None)
     _tmux('setw', '-t', _win_id(target), 'window-size', 'largest')

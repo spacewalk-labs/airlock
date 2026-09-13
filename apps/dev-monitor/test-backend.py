@@ -196,6 +196,56 @@ class TmuxProbeTest(unittest.TestCase):
         finally:
             DM.subprocess.call = saved
 
+    def test_only_airlock_user_service_leaf_is_doomed(self):
+        cases = {
+            '0::/user.slice/user-1001.slice/user@1001.service/app.slice/airlock-dev-monitor.service':
+                'airlock-dev-monitor.service',
+            '0::/user.slice/user-1001.slice/user@1001.service/app.slice/airlock-code-server@1.service':
+                'airlock-code-server@1.service',
+            '0::/user.slice/user-1001.slice/session-4.scope': None,
+            '0::/system.slice/airlock-dev-monitor.service': None,
+            '0::/user.slice/user-1001.slice/user@1001.service/app.slice/not-airlock.service': None,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            probe = os.path.join(directory, 'cgroup')
+            for row, expected in cases.items():
+                Path(probe).write_text(row + '\n')
+                self.assertEqual(DM._managed_user_service_cgroup(probe), expected, row)
+
+    def test_isolated_tmux_uses_scope_without_direct_fallback(self):
+        calls = []
+        saved_check = DM.subprocess.check_output
+        saved_which = DM.shutil.which
+        try:
+            DM.shutil.which = lambda name: '/usr/bin/' + name
+            DM.subprocess.check_output = lambda argv, **kwargs: calls.append(argv) or '7:@3\n'
+            got = DM._tmux('new-session', '-d', capture=True,
+                           isolate_unit='airlock-devmon-run-1-fixture')
+        finally:
+            DM.subprocess.check_output = saved_check
+            DM.shutil.which = saved_which
+        self.assertEqual(got, '7:@3')
+        self.assertEqual(calls, [[
+            'systemd-run', '--user', '--scope', '--collect', '--quiet', '--same-dir',
+            '--unit=airlock-devmon-run-1-fixture', '--', 'tmux', 'new-session', '-d',
+        ]])
+
+    def test_isolated_tmux_refuses_when_systemd_run_is_missing(self):
+        called = []
+        saved_check = DM.subprocess.check_output
+        saved_which = DM.shutil.which
+        try:
+            DM.shutil.which = lambda name: None if name == 'systemd-run' else '/usr/bin/' + name
+            DM.subprocess.check_output = lambda *a, **k: called.append(a) or 'unexpected'
+            with redirect_stderr(io.StringIO()):
+                got = DM._tmux('new-session', '-d', capture=True,
+                               isolate_unit='airlock-devmon-run-1-fixture')
+        finally:
+            DM.subprocess.check_output = saved_check
+            DM.shutil.which = saved_which
+        self.assertIsNone(got)
+        self.assertEqual(called, [])
+
 
 
 
