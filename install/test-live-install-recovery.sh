@@ -480,6 +480,27 @@ for scenario, facts in cases.items():
     value, reason = module.calculate(semantic)
     assert value == 1, (scenario, field, reason)
 
+for scenario, state_name in (("r2", "after_resume"), ("r3-forward", "final")):
+    accepted = outer(scenario, copy.deepcopy(cases[scenario]))
+    accepted["inner"]["facts"][state_name]["ids"] = list(
+        accepted["inner"]["facts"][state_name]["ids"])
+    accepted["inner"]["facts"][state_name]["ids"].append(
+        "cron:" + "0" * 24 + ":fail:unknown")
+    value, reason = module.calculate(accepted)
+    assert value == 0, (scenario, "normal cron", reason)
+    rejected = outer(scenario, copy.deepcopy(cases[scenario]))
+    rejected["inner"]["facts"][state_name]["ids"] = list(
+        rejected["inner"]["facts"][state_name]["ids"])
+    rejected["inner"]["facts"][state_name]["ids"].append("unexpected-message")
+    value, reason = module.calculate(rejected)
+    assert value == 1 and "non-cron" in reason, (scenario, "unexpected addition", reason)
+    missing_seed = outer(scenario, copy.deepcopy(cases[scenario]))
+    missing_seed["inner"]["facts"][state_name]["ids"] = list(
+        missing_seed["inner"]["facts"][state_name]["ids"])
+    missing_seed["inner"]["facts"][state_name]["ids"].remove("recovery-seed-info")
+    value, reason = module.calculate(missing_seed)
+    assert value == 1 and "seed" in reason, (scenario, "seed loss", reason)
+
 timezone_mutations = {
     "name": "Etc/UTC",
     "offset": "+0000",

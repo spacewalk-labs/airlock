@@ -15,6 +15,7 @@ FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 SCENARIOS = {"r1", "r2", "r3-forward", "r3-refuse"}
 SEED_IDS = ["recovery-seed-action", "recovery-seed-info"]
+CRON_ID = re.compile(r"cron:[0-9a-f]{24}:(?:fail|ok):[A-Za-z0-9_.:-]+\Z")
 ACTIVE_UNIT_STATES = {"active"}
 INACTIVE_UNIT_STATES = {"inactive", "failed"}
 
@@ -157,6 +158,17 @@ def verdict_r1(inner: dict[str, Any]) -> None:
             "R1 did not stop at the exact late-package boundary")
 
 
+def require_seeded_window(before: dict[str, Any], after: dict[str, Any], name: str) -> None:
+    """Keep the seeded observation intact while allowing normal cron transitions."""
+    before_ids = set(before["ids"])
+    after_ids = set(after["ids"])
+    require(set(SEED_IDS).issubset(before_ids) and set(SEED_IDS).issubset(after_ids),
+            f"{name} lost seeded message ids")
+    additions = after_ids - before_ids
+    require(all(CRON_ID.fullmatch(item) is not None for item in additions),
+            f"{name} added a non-cron message id")
+
+
 def verdict_r2(inner: dict[str, Any]) -> None:
     facts = mapping(inner.get("facts"), "facts")
     first = snapshot(facts, "after_fault", "canonical")
@@ -180,7 +192,7 @@ def verdict_r2(inner: dict[str, Any]) -> None:
     require(integer(facts.get("health_http"), "health_http") == 200
             and integer(facts.get("overview_http"), "overview_http") == 200,
             "R2 resumed backend is not healthy")
-    require(first["ids"] == resumed["ids"], "R2 changed message ids across resume")
+    require_seeded_window(first, resumed, "R2 resume")
     require(facts.get("protected_hashes_equal") is True, "R2 changed retained backup evidence")
     require(facts.get("spool_modes") == {"new": "3770", "tmp": "3770"},
             "R2 spool modes are not canonical")
@@ -226,7 +238,7 @@ def verdict_r3_forward(inner: dict[str, Any]) -> None:
     require_unit_state(final, "R3 final unit", ACTIVE_UNIT_STATES)
     require(integer(facts.get("overview_http"), "overview_http") == 200,
             "R3 final current backend is not healthy")
-    require(recovered["ids"] == final["ids"], "R3 final install lost message ids")
+    require_seeded_window(recovered, final, "R3 final install")
 
 
 def verdict_r3_refuse(inner: dict[str, Any]) -> None:
