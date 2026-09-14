@@ -87,6 +87,7 @@ HOME_DIR="$DIR_HOME"
 DRIVER_STATE="$HOME_DIR/.local/state/airlock-install-recovery-driver"
 EVIDENCE="$TMP/recovery-evidence"
 mkdir -p "$HOME_DIR"
+chmod 0750 "$HOME_DIR"
 dir_setup_rc=0
 dir_setup_function="$(sed -n '/^prepare_recovery_dirs() {/,/^}/p' \
   "$ROOT/live/install-recovery-in-container.sh")"
@@ -105,6 +106,7 @@ import sys
 home, driver, evidence = map(Path, sys.argv[1:4])
 uid, gid = map(int, sys.argv[4:6])
 for path, mode in (
+    (home, 0o751),
     (home / ".local", 0o755),
     (home / ".local/state", 0o755),
     (driver, 0o700),
@@ -116,9 +118,35 @@ for path, mode in (
 os.mkdir(home / ".local/state/airlock", 0o700)
 PY
 then
-  ok "recovery setup gives the installer owned XDG parents before state creation"
+  ok "recovery setup gives the writer HOME traversal and installer-owned XDG parents"
 else
   bad "recovery setup left an unusable XDG parent"
+fi
+
+# The legacy DB must be seeded while the historical consumer is stopped, then the
+# consumer must be live again before any recovery scenario captures its baseline.
+baseline_sequence_rc=0
+python3 - "$ROOT/live/install-recovery-in-container.sh" <<'PY' \
+  > "$TMP/baseline-sequence.out" 2>&1 || baseline_sequence_rc=$?
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+restart = text.index('systemctl --user start airlock-dev-monitor.service')
+positions = [
+    text.index('systemctl --user stop airlock-dev-monitor.service'),
+    text.index("seed-legacy '$DB'"),
+    restart,
+    text.index('case "$LIVE_RECOVERY_SCENARIO" in', restart),
+]
+assert positions == sorted(positions), positions
+print("baseline stop-seed-start sequence ok")
+PY
+if [ "$baseline_sequence_rc" = 0 ] \
+   && grep -q 'baseline stop-seed-start sequence ok' "$TMP/baseline-sequence.out"; then
+  ok "recovery scenarios begin with a running historical consumer"
+else
+  bad "recovery driver did not restart the historical consumer after seeding"
 fi
 
 # Deterministic seed and online-backup observation, without importing a test module.

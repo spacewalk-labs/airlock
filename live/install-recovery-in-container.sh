@@ -85,6 +85,7 @@ rm -rf "$EVIDENCE_ROOT"
 prepare_recovery_dirs() {
   local live_group
   live_group="$(id -gn "$LIVE_USER")" || return 1
+  chmod o+x "$HOME_DIR" || return 1
   install -d -m 0755 -o "$LIVE_USER" -g "$live_group" \
     "$HOME_DIR/.local" "$HOME_DIR/.local/state" || return 1
   install -d -m 0700 -o "$LIVE_USER" -g "$live_group" \
@@ -286,6 +287,11 @@ install -d -m 0700 -o "$LIVE_USER" -g "$LIVE_USER" "$DEVMON_STATE"
 as_user "python3 '$SRC/live/install-recovery-db.py' seed-legacy '$DB'" \
   > "$EVIDENCE/seed.json" 2> "$EVIDENCE/seed.err" || die "legacy seed failed"
 record_step seed-legacy 0
+as_user "systemctl --user start airlock-dev-monitor.service" \
+  > "$EVIDENCE/baseline-start.log" 2>&1 || die "could not restart baseline dev-monitor"
+as_user "systemctl --user is-active --quiet airlock-dev-monitor.service" \
+  >> "$EVIDENCE/baseline-start.log" 2>&1 || die "baseline dev-monitor is not active"
+record_step baseline-restart 0
 
 case "$LIVE_RECOVERY_SCENARIO" in
   r1)
