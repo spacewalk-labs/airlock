@@ -55,6 +55,25 @@ chmod 440 "/etc/sudoers.d/90-$LIVE_USER"
 # unit. Without this the install "succeeds" and nothing runs.
 loginctl enable-linger "$LIVE_USER" || die "could not enable linger for $LIVE_USER"
 
+# The disposable verifier is a KST Ubuntu acceptance environment.  An image may
+# inherit UTC from its publisher, so assert the guest OS setting rather than
+# letting the host timezone or this process's TZ imply it.
+timedatectl set-timezone Asia/Seoul || die "could not set guest timezone"
+[ ! -e /etc/timezone ] || printf '%s\n' Asia/Seoul > /etc/timezone \
+  || die "could not update guest timezone metadata"
+TZ_NAME="$(timedatectl show -p Timezone --value 2>/dev/null)"
+TZ_OFFSET="$(date +%z)"
+TZ_METADATA=ABSENT
+if [ -e /etc/timezone ]; then
+  IFS= read -r TZ_METADATA < /etc/timezone || TZ_METADATA=""
+fi
+TZ_LOCALTIME="$(readlink /etc/localtime 2>/dev/null || true)"
+if [ "$TZ_NAME" != Asia/Seoul ] || [ "$TZ_OFFSET" != +0900 ] \
+    || { [ "$TZ_METADATA" != Asia/Seoul ] && [ "$TZ_METADATA" != ABSENT ]; } \
+    || [ "$TZ_LOCALTIME" != /usr/share/zoneinfo/Asia/Seoul ]; then
+  die "guest timezone gate failed: name=$TZ_NAME offset=$TZ_OFFSET metadata=$TZ_METADATA localtime=$TZ_LOCALTIME"
+fi
+
 # ---------------------------------------------------------------- 2. tailnet
 say "== joining the tailnet as $LIVE_HOSTNAME =="
 curl -fsSL https://tailscale.com/install.sh | sh >/dev/null 2>&1 || die "tailscale install failed"
@@ -283,10 +302,10 @@ cat /tmp/acceptance.log >&2
 printf '%s' "$FIXES" > /tmp/fixes.txt
 touch /tmp/prereq.log
 printf '%s' "$fix_failed" > /tmp/fixes-failed.txt
-python3 - "$LIVE_SHA" "$TS_FQDN" "$install_rc" "$smoke_rc" "$LIVE_SOAK" "$acceptance_rc" "$package_info_rc" "$LIVE_DEVMON_MESSAGES" "$devmon_no_webhook_rc" <<'PY'
+python3 - "$LIVE_SHA" "$TS_FQDN" "$TZ_NAME" "$TZ_OFFSET" "$TZ_METADATA" "$TZ_LOCALTIME" "$install_rc" "$smoke_rc" "$LIVE_SOAK" "$acceptance_rc" "$package_info_rc" "$LIVE_DEVMON_MESSAGES" "$devmon_no_webhook_rc" <<'PY'
 import json, re, sys, pathlib, subprocess
 
-sha, fqdn, install_rc, smoke_rc, soak, acceptance_rc, package_info_rc, devmon_messages, devmon_no_webhook_rc = sys.argv[1:10]
+sha, fqdn, tz_name, tz_offset, tz_metadata, tz_localtime, install_rc, smoke_rc, soak, acceptance_rc, package_info_rc, devmon_messages, devmon_no_webhook_rc = sys.argv[1:14]
 
 def units(text):
     """Parse `Key=Value|Key=Value|...` lines by NAME, never by position."""
@@ -351,6 +370,8 @@ acceptance_passed, acceptance_failed = (
 print(json.dumps({
     "commit": sha,
     "fqdn": fqdn,
+    "timezone": {"name": tz_name, "offset": tz_offset,
+                 "metadata": tz_metadata, "localtime": tz_localtime},
     "install_rc": int(install_rc),
     "smoke_rc": int(smoke_rc),
     "soak_seconds": int(soak),

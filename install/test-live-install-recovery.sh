@@ -79,6 +79,35 @@ else
   sed 's/^/    /' "$TMP/config-matrix.out"
 fi
 
+# The fresh driver must make the guest OS KST before any repository lifecycle
+# command, and retain the four independent OS observations in its result.
+fresh_timezone_rc=0
+python3 - "$ROOT/live/in-container.sh" <<'PY' > "$TMP/fresh-timezone.out" 2>&1 || fresh_timezone_rc=$?
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+install = text.index("# ---------------------------------------------------------------- 3. install")
+required = (
+    "timedatectl set-timezone Asia/Seoul",
+    "TZ_NAME=",
+    "TZ_OFFSET=",
+    "TZ_METADATA=",
+    "TZ_LOCALTIME=",
+    '"timezone": {"name": tz_name, "offset": tz_offset,',
+)
+assert all(item in text for item in required)
+assert text.index("timedatectl set-timezone Asia/Seoul") < install
+print("fresh KST gate and result evidence are present before install")
+PY
+if [ "$fresh_timezone_rc" = 0 ] \
+   && grep -q 'fresh KST gate and result evidence are present before install' "$TMP/fresh-timezone.out"; then
+  ok "fresh driver sets and records KST before installing Airlock"
+else
+  bad "fresh driver omitted a pre-install KST gate or its evidence"
+  sed 's/^/    /' "$TMP/fresh-timezone.out"
+fi
+
 # The fresh collector must query the same resolved backend port that the
 # installed dev-monitor service receives. A non-default port is the negative
 # control: a stale literal can pass at the default and fail only on this path.
