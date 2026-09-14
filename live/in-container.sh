@@ -272,7 +272,7 @@ if [ "$LIVE_DEVMON_MESSAGES" = true ]; then
   else
     DEVMON_HEALTH_URL="http://127.0.0.1:${DEVMON_BACKEND_PORT}/api/health"
     su - "$LIVE_USER" -c \
-      "python3 '$SRC/live/check-devmon-no-webhook.py' \
+      "AIRLOCK_DEV_MONITOR_MESSAGES=true python3 '$SRC/live/check-devmon-no-webhook.py' \
         '$HOMEDIR/.local/state/airlock/dev-monitor/messages.db' \
         '$SRC/apps/dev-monitor/backend' '$DEVMON_HEALTH_URL' \
         '$LIVE_SOAK' '$SOAK_ELAPSED_MS'" \

@@ -60,11 +60,7 @@ record = {
 }
 
 if case.startswith("devmon-"):
-    zero = {
-        "watchdog_cards": 0,
-        "watchdog_events": 0,
-        "watchdog_notice_deliveries": 0,
-    }
+    pending = {"send_attempts": 0, "pending": True}
     record["dev_monitor_messages_requested"] = True
     record["inner"]["dev_monitor_messages_requested"] = True
     record["inner"]["devmon_no_webhook"] = {
@@ -74,15 +70,16 @@ if case.startswith("devmon-"):
             "observation_requested_seconds": 120,
             "observation_elapsed_milliseconds": 120123,
             "observation_seconds": 120,
-            "worker_states": {
-                "slack-urgent": "off: no webhook configured",
-                "slack-routine": "off: no webhook configured",
+            "slack_effective": "not configured",
+            "no_webhook_control": {
+                "returned": False,
+                "before": dict(pending),
+                "after": dict(pending),
             },
-            "zero_snapshot": zero,
-            "off_branch_control": {"delta": dict(zero)},
-            "positive_control": {
-                "reason_state": "stalled",
-                "delta": {key: 1 for key in zero},
+            "configured_stub_control": {
+                "returned": True,
+                "before": dict(pending),
+                "after": {"send_attempts": 1, "pending": False},
             },
             "unexpected_sensitive_field": "KNOWN_SECRET_SENTINEL",
         },
@@ -141,18 +138,20 @@ elif case == "devmon-effective-off":
     record["inner"]["devmon_no_webhook"]["observation"]["messages_effective"] = "off"
 elif case == "devmon-request-mismatch":
     record["inner"]["dev_monitor_messages_requested"] = False
-elif case == "devmon-zero-nonzero":
-    record["inner"]["devmon_no_webhook"]["observation"]["zero_snapshot"]["watchdog_cards"] = 1
+elif case == "devmon-slack-configured":
+    record["inner"]["devmon_no_webhook"]["observation"]["slack_effective"] = "configured"
 elif case == "devmon-control-dead":
-    record["inner"]["devmon_no_webhook"]["observation"]["positive_control"]["delta"]["watchdog_events"] = 0
+    record["inner"]["devmon_no_webhook"]["observation"]["configured_stub_control"]["after"]["send_attempts"] = 0
 elif case == "devmon-soak-short":
     record["inner"]["devmon_no_webhook"]["observation"]["observation_requested_seconds"] = 119
 elif case == "devmon-elapsed-short":
     record["inner"]["devmon_no_webhook"]["observation"]["observation_elapsed_milliseconds"] = 119999
-elif case == "devmon-off-branch-nonzero":
-    record["inner"]["devmon_no_webhook"]["observation"]["off_branch_control"]["delta"]["watchdog_cards"] = 1
-elif case == "devmon-zero-bool":
-    record["inner"]["devmon_no_webhook"]["observation"]["zero_snapshot"]["watchdog_cards"] = False
+elif case == "devmon-empty-webhook-sent":
+    record["inner"]["devmon_no_webhook"]["observation"]["no_webhook_control"]["after"]["send_attempts"] = 1
+elif case == "devmon-empty-webhook-bool":
+    record["inner"]["devmon_no_webhook"]["observation"]["no_webhook_control"]["returned"] = 0
+elif case == "devmon-empty-webhook-attempt-bool":
+    record["inner"]["devmon_no_webhook"]["observation"]["no_webhook_control"]["after"]["send_attempts"] = False
 elif case == "devmon-collector-failed":
     record["inner"]["devmon_no_webhook"]["rc"] = 1
 elif case == "devmon-green":
@@ -211,12 +210,13 @@ run_case inner-error 1
 run_case devmon-green 0
 run_case devmon-effective-off 1
 run_case devmon-request-mismatch 1
-run_case devmon-zero-nonzero 1
+run_case devmon-slack-configured 1
 run_case devmon-control-dead 1
 run_case devmon-soak-short 1
 run_case devmon-elapsed-short 1
-run_case devmon-off-branch-nonzero 1
-run_case devmon-zero-bool 1
+run_case devmon-empty-webhook-sent 1
+run_case devmon-empty-webhook-bool 1
+run_case devmon-empty-webhook-attempt-bool 1
 run_case devmon-collector-failed 1
 
 public_raw="$TMP/public-raw.json"
@@ -234,9 +234,17 @@ assert 'lxc image info ' + ('a' * 64) in record["reproduction"]
 assert '~/.config/airlock-live/env' in record["reproduction"]
 assert record["result"]["verdict_provenance"].startswith(
     "recomputed from the full local runner record")
-assert gate["positive_control"]["reason_state"] == "stalled"
-assert gate["off_branch_control"]["delta"]["watchdog_cards"] == 0
-assert "same_database_positive_control" not in gate
+assert gate["slack_effective"] == "not configured"
+assert gate["no_webhook_control"] == {
+    "returned": False,
+    "before": {"send_attempts": 0, "pending": True},
+    "after": {"send_attempts": 0, "pending": True},
+}
+assert gate["configured_stub_control"] == {
+    "returned": True,
+    "before": {"send_attempts": 0, "pending": True},
+    "after": {"send_attempts": 1, "pending": False},
+}
 assert "raw_result_sha256" not in record
 blob = json.dumps(record)
 for secret in ("private-host", "private-container", "private-tailnet",
@@ -249,8 +257,8 @@ else
   bad "runner-native public evidence was not an exact safe projection"
 fi
 
-if python3 - "$ROOT/live/check-devmon-no-webhook.py" <<'PY'
-import importlib.util, sys
+if python3 - "$ROOT/live/check-devmon-no-webhook.py" "$ROOT/apps/dev-monitor/backend" <<'PY'
+import http.server, importlib.util, json, os, sys, tempfile, threading
 spec = importlib.util.spec_from_file_location("live_collector", sys.argv[1])
 collector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(collector)
@@ -259,11 +267,35 @@ assert collector.observation_timing("120", "119999") == {
     "observation_elapsed_milliseconds": 119999,
     "observation_seconds": 119,
 }
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"messages": "on", "slack": "not configured"}).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *_args): pass
+with tempfile.TemporaryDirectory() as tmp:
+    os.chmod(tmp, 0o710)
+    old = os.environ.get("AIRLOCK_DEV_MONITOR_MESSAGES")
+    os.environ["AIRLOCK_DEV_MONITOR_MESSAGES"] = "true"
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Health)
+    worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+    try:
+        observed = collector.collect(
+            os.path.join(tmp, "messages.db"), sys.argv[2],
+            "http://127.0.0.1:%d/api/health" % server.server_port, "120", "120000")
+    finally:
+        server.shutdown(); server.server_close(); worker.join()
+        if old is None: os.environ.pop("AIRLOCK_DEV_MONITOR_MESSAGES", None)
+        else: os.environ["AIRLOCK_DEV_MONITOR_MESSAGES"] = old
+assert observed["no_webhook_control"]["returned"] is False
+assert observed["no_webhook_control"]["after"] == {"send_attempts": 0, "pending": True}
+assert observed["configured_stub_control"]["returned"] is True
+assert observed["configured_stub_control"]["after"] == {"send_attempts": 1, "pending": False}
 PY
 then
-  ok "collector timing reports the supplied monotonic measurement, not the requested argv"
+  ok "collector uses the live loop: empty webhook preserves pending and a stub makes one delivery"
 else
-  bad "collector timing echoed the requested soak instead of measured elapsed time"
+  bad "collector did not preserve the empty-webhook card or make one stubbed delivery"
 fi
 run_case inner-commit-absent 1
 run_case inner-commit-mismatch 1

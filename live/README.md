@@ -48,17 +48,16 @@ bash live/verify.sh
 ```
 
 Set `AIRLOCK_LIVE_DEVMON_MESSAGES=true` to exercise the supported configuration
-where the message console is on and neither Slack webhook exists.  The durable
-record then contains the effective health states, a zero watchdog snapshot after
-the measured soak, and two same-database controls through the production watchdog
-entrypoint. A pre-aged open delivery must remain 0/0/0 while both lanes are intentionally
-off, then must become +1/+1/+1 when the same lanes are configured. This makes the
-off-to-ledger fall-through defect observable immediately instead of asking a 120-second
-zero to speak about a 1,800-second threshold. The verdict fails if the request, effective
-state, measured elapsed time, zero observation, off-branch discriminator, or configured
-positive control disagree.
-The natural zero is running-service telemetry, not evidence against the 1,800-second
-fall-through defect; the pre-aged off-branch delta is that discriminator.
+where the message console is on and Slack is effectively `not configured`. The durable
+record names the effective health state after the measured soak, then creates one synthetic
+urgent card in the production messages database. Calling the actual `devmon_loop.deliver_once`
+consumer with an empty webhook must return `false`, keep `send_attempts=0`, and preserve the
+card as pending. The same card then passes through that same consumer with only its HTTP
+transport replaced by a local success stub: it must return `true`, record exactly one attempt,
+and stop being pending. The stub sends no external message; it proves the real selector and
+receipt mutation, not an old watchdog API that the current product no longer owns. The verdict
+fails if the request, effective state, measured elapsed time, empty-webhook negative control,
+or configured-stub positive control disagree.
 This mode requires a soak of at least 120 seconds.
 
 Set `AIRLOCK_LIVE_EVIDENCE_DIR` to have the runner itself write an allowlisted

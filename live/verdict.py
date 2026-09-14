@@ -24,6 +24,15 @@ def is_down(unit):
     return True
 
 
+def delivery_state_is(value, attempts, pending):
+    return (isinstance(value, dict)
+            and isinstance(value.get("send_attempts"), int)
+            and not isinstance(value.get("send_attempts"), bool)
+            and value.get("send_attempts") == attempts
+            and value.get("pending") is pending
+            and set(value) == {"send_attempts", "pending"})
+
+
 def load_record(path):
     try:
         with open(path) as fh:
@@ -60,22 +69,12 @@ def verdict(record):
         if not isinstance(gate, dict) or gate.get("rc") != 0:
             return 1, "verdict 1: messages-on/no-webhook collector failed or is missing"
         observation = gate.get("observation")
-        expected_states = {
-            "slack-urgent": "off: no webhook configured",
-            "slack-routine": "off: no webhook configured",
-        }
-        expected_zero = {
-            "watchdog_cards": 0,
-            "watchdog_events": 0,
-            "watchdog_notice_deliveries": 0,
-        }
-        expected_delta = {key: 1 for key in expected_zero}
         if not isinstance(observation, dict):
             return 1, "verdict 1: messages-on/no-webhook observation is missing"
         if observation.get("messages_effective") != "on":
             return 1, "verdict 1: requested messages were not effectively on"
-        if observation.get("worker_states") != expected_states:
-            return 1, "verdict 1: no-webhook worker states were not named as intentionally off"
+        if observation.get("slack_effective") != "not configured":
+            return 1, "verdict 1: Slack was not effectively unconfigured"
         requested_seconds = observation.get("observation_requested_seconds")
         elapsed_milliseconds = observation.get("observation_elapsed_milliseconds")
         measured_seconds = observation.get("observation_seconds")
@@ -88,28 +87,18 @@ def verdict(record):
                 or isinstance(measured_seconds, bool)
                 or measured_seconds != elapsed_milliseconds // 1000):
             return 1, "verdict 1: messages-on/no-webhook observation was shorter than 120 seconds"
-        # Running-service telemetry. The pre-aged off-branch delta below is the
-        # discriminator for fall-through whose natural threshold is 1,800 seconds.
-        zero = observation.get("zero_snapshot")
-        if (not isinstance(zero, dict)
-                or any(not isinstance(zero.get(key), int)
-                       or isinstance(zero.get(key), bool) for key in expected_zero)
-                or zero != expected_zero):
-            return 1, "verdict 1: no-webhook watchdog created an incident"
-        off_branch = observation.get("off_branch_control") or {}
-        off_delta = off_branch.get("delta")
-        if (not isinstance(off_delta, dict)
-                or any(not isinstance(off_delta.get(key), int)
-                       or isinstance(off_delta.get(key), bool) for key in expected_zero)
-                or off_delta != expected_zero):
-            return 1, "verdict 1: intentionally-off lane fell through to ledger watchdog"
-        positive = observation.get("positive_control") or {}
-        delta = positive.get("delta")
-        if (positive.get("reason_state") != "stalled" or not isinstance(delta, dict)
-                or any(not isinstance(delta.get(key), int)
-                       or isinstance(delta.get(key), bool) for key in expected_delta)
-                or delta != expected_delta):
-            return 1, "verdict 1: watchdog positive control did not activate the measured path"
+        no_webhook = observation.get("no_webhook_control")
+        configured = observation.get("configured_stub_control")
+        if not isinstance(no_webhook, dict) or no_webhook.get("returned") is not False:
+            return 1, "verdict 1: empty webhook did not return false"
+        if (not delivery_state_is(no_webhook.get("before"), 0, True)
+                or not delivery_state_is(no_webhook.get("after"), 0, True)):
+            return 1, "verdict 1: empty webhook did not preserve the pending synthetic card"
+        if not isinstance(configured, dict) or configured.get("returned") is not True:
+            return 1, "verdict 1: configured stub did not return true"
+        if (not delivery_state_is(configured.get("before"), 0, True)
+                or not delivery_state_is(configured.get("after"), 1, False)):
+            return 1, "verdict 1: configured stub did not make exactly one delivery attempt"
 
     acceptance = inner.get("acceptance")
     if not isinstance(acceptance, dict):

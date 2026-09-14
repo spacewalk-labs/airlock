@@ -19,17 +19,14 @@ def main() -> None:
     requested = observation.get("observation_requested_seconds", inner.get("soak_seconds"))
     messages_requested = record.get("dev_monitor_messages_requested") is True
 
-    def counters(value):
+    def control(value):
         value = value if isinstance(value, dict) else {}
         return {
-            "watchdog_cards": value.get("watchdog_cards"),
-            "watchdog_events": value.get("watchdog_events"),
-            "watchdog_notice_deliveries": value.get("watchdog_notice_deliveries"),
+            "returned": value.get("returned"),
+            "before": value.get("before"),
+            "after": value.get("after"),
         }
 
-    worker_states = observation.get("worker_states") or {}
-    off_branch = observation.get("off_branch_control") or {}
-    positive = observation.get("positive_control") or {}
     image_fingerprint = record.get("image_fingerprint")
     commit = record.get("commit")
     reproducible_image = (
@@ -97,18 +94,9 @@ def main() -> None:
             "observation_elapsed_milliseconds": observation.get(
                 "observation_elapsed_milliseconds"),
             "observation_seconds": observation.get("observation_seconds"),
-            "worker_states": {
-                "slack-urgent": worker_states.get("slack-urgent"),
-                "slack-routine": worker_states.get("slack-routine"),
-            },
-            "zero_snapshot": counters(observation.get("zero_snapshot")),
-            "off_branch_control": {
-                "delta": counters(off_branch.get("delta")),
-            },
-            "positive_control": {
-                "reason_state": positive.get("reason_state"),
-                "delta": counters(positive.get("delta")),
-            },
+            "slack_effective": observation.get("slack_effective"),
+            "no_webhook_control": control(observation.get("no_webhook_control")),
+            "configured_stub_control": control(observation.get("configured_stub_control")),
         },
         "redaction": {
             "excluded": [
