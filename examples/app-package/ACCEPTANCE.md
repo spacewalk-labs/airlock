@@ -1,4 +1,49 @@
-# Acceptance run — 2026-08-07
+# Acceptance runs
+
+## 2026-09-14 — 26 checks, 0 failed
+
+The current example was run on a fresh Ubuntu 24.04 LXD guest with real nginx,
+sudo, systemd user units, loopback HTTP, lock and ledger writes. Tailscale was
+the only shimmed boundary, with the same `status --json` and `serve` contract
+described in the earlier run below.
+
+Before the installer ran, the acceptance entrypoint checked the assembled
+six-column prerequisite row for `hello-example/sed`. Its mutation control
+removed exactly that declaration from the copied package:
+
+```bash
+AIRLOCK_ACCEPTANCE_PREREQ_ONLY=1 \
+AIRLOCK_ACCEPTANCE_MUTATE_DROP_SED=1 \
+AIRLOCK_CHECKOUT=$HOME/airlock \
+bash examples/app-package/acceptance.sh
+```
+
+The mutation exited 1 with `0 passed, 1 failed`; the installer validation log
+never appeared, and neither the user unit nor the nginx fragment existed. The
+unmodified control passed the declaration check, then the full command below
+completed install → idempotent rerun → locked upgrade refusal → deliberate
+re-lock → remove:
+
+```text
+PASS  manifest declares sed before lifecycle execution
+PASS  install exits 0 (0)
+PASS  repository lock records the exact package digest
+PASS  changed package is refused without rewriting the old lock
+PASS  successful upgrade records the new exact digest
+PASS  remove-run exits 0 (0)
+PASS  unit removed
+PASS  fragment removed
+PASS  backend stopped
+========== RESULT: 26 passed, 0 failed
+```
+
+The full entrypoint was:
+
+```bash
+AIRLOCK_CHECKOUT=$HOME/airlock bash examples/app-package/acceptance.sh
+```
+
+## Previous run — 2026-08-07
 
 The scratch suite (`install/test-packages.sh`) shims the live boundaries: no real
 units, no `sudo`, no network. It is the right trade for a test that runs on every

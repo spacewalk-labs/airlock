@@ -149,6 +149,39 @@ else
   bad "recovery driver did not restart the historical consumer after seeding"
 fi
 
+# R3 runs a real heartbeat producer from the historical app tree after that tree's
+# digest has been journaled. The producer may write runtime state, never Python cache
+# files back into the candidate tree.
+HEARTBEAT_ROOT="$TMP/heartbeat-root"
+HEARTBEAT_HOME="$TMP/heartbeat-home"
+HEARTBEAT_MARKERS="$HEARTBEAT_HOME/.local/state/airlock-install-recovery-driver"
+HEARTBEAT_STATE="$HEARTBEAT_HOME/.local/state/airlock/dev-monitor"
+mkdir -p "$HEARTBEAT_ROOT/apps" "$HEARTBEAT_MARKERS" \
+  "$HEARTBEAT_STATE/spool/tmp" "$HEARTBEAT_STATE/spool/new"
+cp -a "$ROOT/apps/dev-monitor" "$HEARTBEAT_ROOT/apps/dev-monitor"
+heartbeat_id="heartbeat:$(date -u +%Y-%m-%d)"
+python3 - "$HEARTBEAT_STATE/messages.db" "$heartbeat_id" <<'PY'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.execute("CREATE TABLE ledger(id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO ledger(id) VALUES (?)", (sys.argv[2],))
+PY
+heartbeat_rc=0
+HOME="$HEARTBEAT_HOME" AIRLOCK_ROOT="$HEARTBEAT_ROOT" \
+AIRLOCK_APP_ID=zz-install-recovery-fail AIRLOCK_INSTALL_RECOVERY_SCENARIO=r3-forward \
+AIRLOCK_INSTALL_RECOVERY_MARKER_DIR="$HEARTBEAT_MARKERS" \
+  bash "$ROOT/live/install-recovery-packages/late-failure/install.sh" \
+    > "$TMP/heartbeat-fixture.out" 2> "$TMP/heartbeat-fixture.err" || heartbeat_rc=$?
+if [ "$heartbeat_rc" = 86 ] \
+   && [ -s "$HEARTBEAT_MARKERS/heartbeat-consumed-id.txt" ] \
+   && [ -z "$(find "$HEARTBEAT_ROOT/apps/dev-monitor" -type d -name __pycache__ -print -quit)" ]; then
+  ok "R3 heartbeat leaves the journaled historical candidate tree unchanged"
+else
+  bad "R3 heartbeat mutated or missed the historical candidate tree"
+  find "$HEARTBEAT_ROOT/apps/dev-monitor" -type d -name __pycache__ -print | sed 's/^/    /'
+fi
+
 # Deterministic seed and online-backup observation, without importing a test module.
 mkdir -p "$TMP/db"
 if python3 "$ROOT/live/install-recovery-db.py" seed-legacy "$TMP/db/messages.db" \

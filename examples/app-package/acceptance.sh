@@ -46,9 +46,53 @@ PY
 step "0. copy the example the way the guide says to, change only owner"
 rm -rf "$PKG"
 cp -a "$ROOT/examples/app-package" "$PKG"
-sed -i 's/^owner = .*/owner = "you@example.com"/' "$PKG/airlock.toml"
+sed -i 's/^owner = .*/owner = "owner@fixture.dev"/' "$PKG/airlock.toml"
 grep -n 'owner' "$PKG/airlock.toml"
 export AIRLOCK_CONFIG="$PKG/airlock.toml"
+
+if [ "${AIRLOCK_ACCEPTANCE_MUTATE_DROP_SED:-0}" = 1 ]; then
+  if ! python3 - "$PKG/package/airlock-app.toml" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+block = (
+    '[[prerequisites]]\n'
+    'command = "sed"\n'
+    'predicate = "present"\n'
+    'expected = "-"\n'
+    'fix = "sudo apt-get update && sudo apt-get install -y sed"\n'
+    'note = "Nginx fragment rendering"\n'
+)
+if text.count(block) != 1:
+    raise SystemExit(f"expected one sed prerequisite block, found {text.count(block)}")
+path.write_text(text.replace(block, '', 1))
+PY
+  then
+    bad "could not apply the missing-sed mutation"
+    printf '\n\n========== RESULT: %d passed, %d failed\n' "$pass" "$fail"
+    exit 1
+  fi
+fi
+
+step "0a. PREREQUISITE CONTRACT (before installer execution)"
+prereq_rows=$(python3 "$ROOT/bin/airlock-config" prereqs 2>&1); rc=$?
+expected_prereq=$'hello-example\tsed\tpresent\t-\tsudo apt-get update && sudo apt-get install -y sed\tNginx fragment rendering'
+hello_sed_count=$(awk -F '\t' '$1 == "hello-example" && $2 == "sed" {n++} END {print n+0}' <<<"$prereq_rows")
+exact_prereq_count=$(grep -Fxc "$expected_prereq" <<<"$prereq_rows" || true)
+if [ "$rc" = 0 ] && [ "$hello_sed_count" = 1 ] && [ "$exact_prereq_count" = 1 ]; then
+  ok "manifest declares sed before lifecycle execution"
+else
+  bad "manifest does not declare exactly one canonical sed prerequisite (rc=$rc, sed_rows=$hello_sed_count, exact_rows=$exact_prereq_count)"
+  printf '%s\n' "$prereq_rows"
+  printf '\n\n========== RESULT: %d passed, %d failed\n' "$pass" "$fail"
+  exit 1
+fi
+if [ "${AIRLOCK_ACCEPTANCE_PREREQ_ONLY:-0}" = 1 ]; then
+  printf '\n\n========== RESULT: %d passed, %d failed\n' "$pass" "$fail"
+  exit "$fail"
+fi
 
 step "1. INSTALL (real)"
 bash "$ROOT/install/airlock-install.sh"; rc=$?
@@ -129,7 +173,7 @@ check "nothing answers on the backend port" "$gone" 000
 
 step "5. A WRONG MANIFEST NAMES WHAT IS WRONG"
 rm -rf "$HOME/broken" && cp -a "$ROOT/examples/app-package" "$HOME/broken"
-sed -i 's/^owner = .*/owner = "you@example.com"/' "$HOME/broken"/airlock.toml
+sed -i 's/^owner = .*/owner = "owner@fixture.dev"/' "$HOME/broken"/airlock.toml
 sed -i 's|^units = .*|units = ["../not-a-unit.service"]|' "$HOME/broken"/package/airlock-app.toml
 out=$(AIRLOCK_CONFIG="$HOME/broken"/airlock.toml python3 "$ROOT/bin/airlock-config" validate 2>&1); rc=$?
 echo "$out"

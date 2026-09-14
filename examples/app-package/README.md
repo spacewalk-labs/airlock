@@ -36,8 +36,9 @@ backend. Then open `https://<your-box>/hello-example/` as the owner.
 [`acceptance.sh`](acceptance.sh) drives the full install → rerun → locked
 upgrade → remove cycle against this example and asserts each step, for use on a
 disposable box. [`ACCEPTANCE.md`](ACCEPTANCE.md) is the earlier 21-check
-transcript; current live verification requires 25 checks, adding exact lock
-recording, byte-stable rerun, mismatch refusal, and deliberate re-lock evidence.
+transcript plus the current 26-check run, which adds exact lock recording,
+byte-stable rerun, mismatch refusal, deliberate re-lock evidence, and a
+pre-install prerequisite-declaration check.
 
 ## What the manifest must say
 
