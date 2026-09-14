@@ -96,8 +96,17 @@ def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds
 
 
 def main():
-    print(json.dumps(collect(*sys.argv[1:6]), sort_keys=True))
+    try:
+        observation = collect(*sys.argv[1:6])
+    except Exception as exc:  # preserve a safe diagnosis without recording runtime bytes
+        print(json.dumps({
+            "error": "collector execution failed",
+            "error_type": type(exc).__name__,
+        }, sort_keys=True))
+        return 1
+    print(json.dumps(observation, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
