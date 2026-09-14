@@ -2446,16 +2446,16 @@ def rewrite_asset_refs(body):
 
 READER_SHELL_STYLE = r"""<!-- LEARNING_READER_SHELL_STYLE -->
 <style id="learning-reader-shell-style">
-/* 🔴 글자 크기는 **공용 문서 CSS 의 배율 훅**(`--swk-fs-scale`)을 돌린다 — 이 리더만의
+/* 🔴 글자 크기는 **공용 문서 CSS 의 배율 훅**(`--doc-fs-scale`)을 돌린다 — 이 리더만의
    방식을 따로 두지 않는다. 예전에는 `html` 의 font-size 만 키웠는데, 공용 문서 CSS 는 본문을
-   `body{font-size:calc(17px * var(--swk-fs-scale,1))}` 로 **절대값**으로 잡기 때문에 제목(rem)만
+   `body{font-size:calc(17px * var(--doc-fs-scale,1))}` 로 **절대값**으로 잡기 때문에 제목(rem)만
    커지고 본문은 100%/160% 어디서나 그대로였다(실측 2026-09-13, 배포본 `/read/`).
    아래 규칙은 배율 훅이 **없는 옛 자산**이 깔린 박스용 폴백이고, 그때만 켜진다. */
 html[data-learning-reader-legacy-scale]{font-size:calc(100% * var(--learning-reader-scale,1))}
 html[data-learning-reader-legacy-scale] body{font-size:1rem}
 /* 🔴 테마는 공용 문서 자산이 소유한다 — 여기서 다시 칠하지 않는다. 예전에는 이 셸이
    `data-learning-reader-theme` 에 자기 다크 팔레트를 `!important` 로 덮었고, 그래서 같은
-   페이지에 테마 주인이 둘이었다(공용 `swk-theme` 와 서로 모르는 채로). 공용 CSS 는
+   페이지에 테마 주인이 둘이었다(공용 `doc-theme` 와 서로 모르는 채로). 공용 CSS 는
    `data-theme` 로 다크 토큰을 갈아끼우므로 그 규약만 돌리면 된다.
    남기는 한 줄은 공용 CSS 가 다루지 않는 것: 수동 선택일 때의 `color-scheme`. 이 도구막대는
    `Canvas`/`CanvasText` 로 칠해져서, 이게 없으면 OS 가 다크인데 문서만 라이트로 고른 순간
@@ -2467,8 +2467,8 @@ html[data-theme=light]{color-scheme:light}html[data-theme=dark]{color-scheme:dar
 #learning-reader-share{position:fixed;z-index:2147483647;inset:0;display:none;align-items:flex-end;justify-content:center;padding:18px;background:rgba(0,0,0,.28);font:15px/1.4 -apple-system,BlinkMacSystemFont,sans-serif}#learning-reader-share.is-open{display:flex}.learning-reader-sheet{width:min(520px,100%);padding:18px;border-radius:18px;background:Canvas;color:CanvasText;box-shadow:0 18px 70px rgba(0,0,0,.28)}.learning-reader-sheet-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.learning-reader-sheet-head strong{font-size:18px}.learning-reader-sheet button{border:0;border-radius:9px;padding:9px 12px;background:color-mix(in srgb,CanvasText 9%,Canvas);color:inherit}.learning-reader-segments{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px;border-radius:11px;background:color-mix(in srgb,CanvasText 8%,Canvas)}.learning-reader-segments button[aria-pressed=true]{background:Canvas;box-shadow:0 1px 4px rgba(0,0,0,.18)}#learning-reader-share-description{margin:13px 2px;min-height:42px;color:GrayText;font-size:13px}.learning-reader-address{display:flex;gap:7px}#learning-reader-share-url{min-width:0;flex:1;padding:9px 10px;border:1px solid color-mix(in srgb,CanvasText 15%,Canvas);border-radius:9px;background:Canvas;color:CanvasText;font:12px/1.3 ui-monospace,monospace}#learning-reader-public-options{display:none;margin-top:12px;padding-top:12px;border-top:1px solid color-mix(in srgb,CanvasText 12%,transparent);font-size:13px}#learning-reader-public-options.is-visible{display:grid;gap:9px}#learning-reader-password{display:none;box-sizing:border-box;width:100%;padding:8px;border:1px solid GrayText;border-radius:8px}#learning-reader-password.is-visible{display:block}#learning-reader-revoke-note{display:none;margin:12px 2px 0;color:GrayText;font-size:12px}.learning-reader-transcript-note{margin:32px auto 12px;color:#8e8e93;font:12px/1.5 -apple-system,BlinkMacSystemFont,sans-serif}
 </style>"""
 
-READER_SHARED_CSS = '<link rel="stylesheet" href="../_assets/swk-doc.css">'
-READER_SHARED_JS = '<script type="module" src="../_assets/swk-doc.js"></script>'
+READER_SHARED_CSS = '<link rel="stylesheet" href="../_assets/doc.css">'
+READER_SHARED_JS = '<script type="module" src="../_assets/doc.js"></script>'
 
 READER_SHELL_BODY = r"""<!-- LEARNING_READER_SHELL -->
 <div id="learning-reader-spacer" aria-hidden="true"></div>
@@ -2477,7 +2477,7 @@ READER_SHELL_BODY = r"""<!-- LEARNING_READER_SHELL -->
 </nav><div id="learning-reader-toast" role="status" aria-live="polite"></div>
 <div id="learning-reader-share" role="dialog" aria-modal="true" aria-labelledby="learning-reader-share-title"><section class="learning-reader-sheet"><div class="learning-reader-sheet-head"><strong id="learning-reader-share-title">공유</strong><button type="button" data-share-close title="닫기" aria-label="닫기">×</button></div><div class="learning-reader-segments" role="group" aria-label="공유 범위"><button type="button" data-share-level="private" aria-pressed="true">나만</button><button type="button" data-share-level="company" aria-pressed="false">회사</button><button type="button" data-share-level="internet" aria-pressed="false">인터넷</button></div><p id="learning-reader-share-description"></p><div class="learning-reader-address"><input id="learning-reader-share-url" readonly aria-label="공유 주소"><button type="button" data-share-copy>복사</button></div><div id="learning-reader-public-options"><span>30일 뒤 자동 회수</span><label><input id="learning-reader-password-enabled" type="checkbox"> 비밀번호</label><input id="learning-reader-password" type="password" autocomplete="new-password" placeholder="비밀번호" aria-label="공개 링크 비밀번호"><button type="button" data-share-publish>인터넷 공유 시작</button><button type="button" data-share-renew>30일 연장</button></div><p id="learning-reader-revoke-note">링크를 회수해도 이미 받은 사람의 사본은 남습니다</p></section></div>
 <script id="learning-reader-shell-script">(function(){"use strict";
-var c=window.__LEARNING_READER__||{},F=[1,1.1,1.25,1.4,1.6],T=["auto","light","dark"],FK="swk-fontscale",TK="swk-theme",AK="learning-reader-theme",pk="learning-reader-public:"+(c.path||location.pathname),timer;
+var c=window.__LEARNING_READER__||{},F=[1,1.1,1.25,1.4,1.6],T=["auto","light","dark"],FK="doc-fontscale",TK="doc-theme",AK="learning-reader-theme",pk="learning-reader-public:"+(c.path||location.pathname),timer;
 function get(k,d){try{return localStorage.getItem(k)||d}catch(_){return d}}function put(k,v){try{localStorage.setItem(k,v)}catch(_){}}function toast(m){var n=document.getElementById("learning-reader-toast");n.textContent=m;n.style.display="block";clearTimeout(timer);timer=setTimeout(function(){n.style.display="none"},1800)}
 // TESTABLE:READER_CLIPBOARD_FALLBACK — plain HTTP has no navigator.clipboard.
 async function copyText(t){if(navigator.clipboard&&typeof navigator.clipboard.writeText==="function"){try{await navigator.clipboard.writeText(t);return}catch(_){}}var f=document.createElement("textarea");f.value=t;f.setAttribute("readonly","");f.style.cssText="position:fixed;opacity:0;pointer-events:none";document.body.appendChild(f);f.focus();f.select();f.setSelectionRange(0,f.value.length);var ok=false;try{ok=document.execCommand("copy")}finally{f.remove()}if(!ok)throw new Error("copy failed")}
@@ -2487,9 +2487,9 @@ function root(){var m=location.pathname.indexOf("/read/");return m<0?"../":locat
 var font=near(parseFloat(get(FK,"1")));function near(v){if(!isFinite(v))return 1;var b=F[0];for(var i=1;i<F.length;i++)if(Math.abs(F[i]-v)<Math.abs(b-v))b=F[i];return b}
 // 공용 CSS 가 배율 훅을 모르는 옛 버전이면(설치 시점이 다른 박스) 훅을 돌려도 본문이 안 변한다.
 // 그때만 이 리더의 폴백 규칙을 켠다. TESTABLE:READER_FONT_SCALE_FALLBACK
-function legacy(){var r=document.documentElement,b=document.body;if(!b)return true;var p=r.style.getPropertyValue("--swk-fs-scale"),a=parseFloat(getComputedStyle(b).fontSize);r.style.setProperty("--swk-fs-scale","2");var z=parseFloat(getComputedStyle(b).fontSize);if(p)r.style.setProperty("--swk-fs-scale",p);else r.style.removeProperty("--swk-fs-scale");return !(z>a+0.5)}
+function legacy(){var r=document.documentElement,b=document.body;if(!b)return true;var p=r.style.getPropertyValue("--doc-fs-scale"),a=parseFloat(getComputedStyle(b).fontSize);r.style.setProperty("--doc-fs-scale","2");var z=parseFloat(getComputedStyle(b).fontSize);if(p)r.style.setProperty("--doc-fs-scale",p);else r.style.removeProperty("--doc-fs-scale");return !(z>a+0.5)}
 if(legacy())document.documentElement.setAttribute("data-learning-reader-legacy-scale","");
-function af(){var r=document.documentElement;r.style.setProperty("--swk-fs-scale",String(font));r.style.setProperty("--learning-reader-scale",String(font));document.getElementById("learning-reader-font-value").textContent=Math.round(font*100)+"%";put(FK,String(font))}function mf(d){var i=F.indexOf(font);if(i<0)i=0;font=F[Math.max(0,Math.min(F.length-1,i+d))];af()}
+function af(){var r=document.documentElement;r.style.setProperty("--doc-fs-scale",String(font));r.style.setProperty("--learning-reader-scale",String(font));document.getElementById("learning-reader-font-value").textContent=Math.round(font*100)+"%";put(FK,String(font))}function mf(d){var i=F.indexOf(font);if(i<0)i=0;font=F[Math.max(0,Math.min(F.length-1,i+d))];af()}
 // 테마 어휘·저장 키·적용 속성은 공용 문서 자산의 것이다. 옛 리더 값(`Auto|Light|Dark`)은
 // 한 번 읽어 이관한다 — 안 그러면 쓰던 사람의 선택이 조용히 auto 로 돌아간다.
 var LABEL={auto:"Auto",light:"Light",dark:"Dark"};
@@ -2570,10 +2570,10 @@ def inject_reader_shell(body, context):
     page, _linked = TIMESTAMP_LINKS.link_timestamps(page, context.get("videoUrl"))
     config = "<script>window.__LEARNING_READER__ = " + script_payload(context) + ";</script>"
     shared_assets = ""
-    if not re.search(r"(?:href|src)\s*=\s*([\"'])[^\"']*swk-doc\.css(?:[?#][^\"']*)?\1",
+    if not re.search(r"(?:href|src)\s*=\s*([\"'])(?:[^\"']*/)?doc\.css(?:[?#][^\"']*)?\1",
                      page, re.IGNORECASE):
         shared_assets += READER_SHARED_CSS
-    if not re.search(r"(?:href|src)\s*=\s*([\"'])[^\"']*swk-doc\.js(?:[?#][^\"']*)?\1",
+    if not re.search(r"(?:href|src)\s*=\s*([\"'])(?:[^\"']*/)?doc\.js(?:[?#][^\"']*)?\1",
                      page, re.IGNORECASE):
         shared_assets += READER_SHARED_JS
     if re.search(r"</head\s*>", page, re.IGNORECASE):

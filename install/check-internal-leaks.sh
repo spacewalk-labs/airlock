@@ -54,7 +54,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # not see, so the prefix scan missed a name it existed to catch.
 PATTERN='spacewalk|sparrow-spectrum|\b[a-z0-9]+-(dev|mgmt)\b|TeamSPWK|swk[-:_.]|\bmacmini-[0-9]+\b|@spacewalk\.tech|doc\.spacewalk\.dev'
 
-# The allowlist holds two kinds of string, and they leave for different reasons.
+# The allowlist holds three kinds of string, and they leave for different reasons.
 #
 # (a) Four frontend identifiers that carry the prefix and are already in the
 #     public mirror. The rename landed (owner decision, 2026-08-06): the widget
@@ -72,19 +72,11 @@ PATTERN='spacewalk|sparrow-spectrum|\b[a-z0-9]+-(dev|mgmt)\b|TeamSPWK|swk[-:_.]|
 # (c) One name of ours the SHAPE pattern cannot tell from a box: `airlock-dev`,
 #     this project's own app name. It is not a host. `airlock-devterm` needs no
 #     entry — `\bdev\b` does not fire inside it.
-# (d) Six public document-component name families. They are CSS/JS API identifiers shipped by
-#     the public renderer and consumed by public apps, not infrastructure names.
-#     `swk-fs-scale` (font-scale CSS variable), `swk-fontscale` (the browser-storage key that
-#     holds it) and `swk-theme` (the theme key) are the reader's font-size and theme contract:
-#     an app that wants its own controls to move the shipped document must spell them, so
-#     blocking them would force every app to invent a private mechanism that does not reach
-#     the document — which is exactly the divergence this app just removed.
-#
-# Do not grow either group casually: (a) is closed, and (b) needs an owner
+# Do not grow these groups casually: (a) is closed, and (b) needs an owner
 # decision, because it is the one place a real internal string could hide.
-ALLOW='swk-airlock-return|swk-airlock-slot|swk-panel-close|swk:airlock-btn-pos-v1|swk-doc|swk-quiz|swk-q|swk-fs-scale|swk-fontscale|swk-theme|spacewalk-labs|cho@spacewalk\.tech|airlock-dev'
+ALLOW='swk-airlock-return|swk-airlock-slot|swk-panel-close|swk:airlock-btn-pos-v1|spacewalk-labs|cho@spacewalk\.tech|airlock-dev'
 ALLOW_LIST=(swk-airlock-return swk-airlock-slot swk-panel-close swk:airlock-btn-pos-v1
-            swk-doc swk-quiz swk-q swk-fs-scale swk-fontscale swk-theme spacewalk-labs cho@spacewalk.tech airlock-dev)
+            spacewalk-labs cho@spacewalk.tech airlock-dev)
 
 # This file necessarily names every pattern, so it excludes itself — the same
 # carve-out ci.yml used to need for holding them.

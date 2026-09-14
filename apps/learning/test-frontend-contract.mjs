@@ -36,6 +36,10 @@ const skill = fs.readFileSync(skillPath, 'utf8');
 const installPath = new URL('./install.sh', import.meta.url);
 const installScript = fs.readFileSync(installPath, 'utf8');
 const timestampModulePath = new URL('./backend/timestamp_links.py', import.meta.url);
+const sharedDocCss = fs.readFileSync(
+  new URL('../../docker/student-harness/skills/share-docs/assets/doc.css', import.meta.url), 'utf8');
+const sharedDocJs = fs.readFileSync(
+  new URL('../../docker/student-harness/skills/share-docs/assets/doc.js', import.meta.url), 'utf8');
 
 const newContractNames = [];
 function contract(name, check) {
@@ -292,8 +296,8 @@ contract('reader-markdown-copy', () => {
 // --- 5. 글자 크기와 테마 저장 계약 ---
 contract('reader-preferences-persistence', () => {
   assert.match(backend, /F=\[1,1\.1,1\.25,1\.4,1\.6\]/,
-    '글자 크기는 합의한 다섯 단계여야 한다 — 공용 배율(`--swk-fs-scale`)과 같은 단위(배수)로 센다');
-  assert.match(backend, /setProperty\("--swk-fs-scale"/,
+    '글자 크기는 합의한 다섯 단계여야 한다 — 공용 배율(`--doc-fs-scale`)과 같은 단위(배수)로 센다');
+  assert.match(backend, /setProperty\("--doc-fs-scale"/,
     '글자 크기는 이 리더만의 변수가 아니라 공용 문서 CSS 의 배율 훅을 돌려야 한다');
   assert.match(backend, /T=\["auto","light","dark"\]/,
     '테마 어휘는 공용 문서 자산의 것이어야 한다 — 리더가 자기 어휘를 따로 두지 않는다');
@@ -301,8 +305,8 @@ contract('reader-preferences-persistence', () => {
     '테마 적용은 공용 규약인 `data-theme` 여야 한다');
   assert.doesNotMatch(backend, /data-learning-reader-theme=dark/,
     '리더가 들고 있던 자체 다크 팔레트는 남아 있으면 안 된다 — 테마 주인은 공용 자산 하나다');
-  assert.match(backend, /FK="swk-fontscale"/, '배율 저장 키는 공용 문서 뷰어와 같아야 한다');
-  assert.match(backend, /TK="swk-theme"/, '테마 저장 키는 공용 문서 뷰어와 같아야 한다');
+  assert.match(backend, /FK="doc-fontscale"/, '배율 저장 키는 공용 문서 뷰어와 같아야 한다');
+  assert.match(backend, /TK="doc-theme"/, '테마 저장 키는 공용 문서 뷰어와 같아야 한다');
   assert.match(backend, /localStorage\.getItem\(k\)/);
   assert.match(backend, /localStorage\.setItem\(k,v\)/);
   assert.match(backend, /learning-reader-font-value[^>]+title="글자 크기"[^>]+aria-label="글자 크기">100%/);
@@ -366,7 +370,7 @@ contract('list-theme-shares-reader-key', () => {
   assert.match(backend, /AK="learning-reader-theme"/);
   assert.match(backend, /put\(AK,LABEL\[theme\]\)/);
   // 반대 방향도 같은 짝이어야 한다 — 목록에서 고른 테마가 문서에 가지 않으면 반쪽이다.
-  assert.match(html, /var DOC_THEME_KEY = "swk-theme"/);
+  assert.match(html, /var DOC_THEME_KEY = "doc-theme"/);
   assert.match(html, /localStorage\.setItem\(DOC_THEME_KEY, theme\.toLowerCase\(\)\)/);
   assert.match(html, /var THEMES = \["Auto", "Light", "Dark"\]/);
   for (const theme of ['Auto', 'Light', 'Dark']) {
@@ -469,15 +473,25 @@ contract('reader-quiz-shared-assets', () => {
   assert.match(skill, /## 이해 점검/);
   assert.match(
     skill,
-    /<section class="swk-quiz">[\s\S]*?<ol class="swk-quiz-list">[\s\S]*?<li class="swk-q">[\s\S]*?<p class="swk-q-stem">[\s\S]*?<ul class="swk-q-opts">[\s\S]*?<li data-correct>[\s\S]*?<p class="swk-q-explain">/,
+    /<section class="doc-quiz">[\s\S]*?<ol class="doc-quiz-list">[\s\S]*?<li class="doc-q">[\s\S]*?<p class="doc-q-stem">[\s\S]*?<ul class="doc-q-opts">[\s\S]*?<li data-correct>[\s\S]*?<p class="doc-q-explain">/,
     '새 문서 퀴즈가 공유 컴포넌트 DOM 계약을 따라야 한다',
   );
   assert.match(skill, /오답에도 정답만큼 공을 들인다/);
-  assert.match(backend, /READER_SHARED_CSS = '<link rel="stylesheet" href="\.\.\/_assets\/swk-doc\.css">'/);
-  assert.match(backend, /READER_SHARED_JS = '<script type="module" src="\.\.\/_assets\/swk-doc\.js"><\/script>'/);
+  assert.match(backend, /READER_SHARED_CSS = '<link rel="stylesheet" href="\.\.\/_assets\/doc\.css">'/);
+  assert.match(backend, /READER_SHARED_JS = '<script type="module" src="\.\.\/_assets\/doc\.js"><\/script>'/);
+  assert.match(sharedDocCss, /var\(--doc-fs-scale, 1\)/,
+    'Learning의 배율 훅은 공개 share-docs 자산의 실제 계약이어야 한다');
+  assert.match(sharedDocCss, /\.doc-quiz\{/,
+    'Learning의 퀴즈 마크업은 공개 share-docs CSS에 실제로 있어야 한다');
+  assert.match(sharedDocJs, /const THEME_KEY='doc-theme'/,
+    'Learning의 테마 키는 공개 share-docs JS의 실제 계약이어야 한다');
+  assert.match(sharedDocJs, /const FS_KEY='doc-fontscale'/,
+    'Learning의 배율 키는 공개 share-docs JS의 실제 계약이어야 한다');
+  assert.match(sharedDocJs, /querySelectorAll\('\.doc-quiz'\)/,
+    'Learning의 퀴즈 마크업은 공개 share-docs JS가 실제로 처리해야 한다');
   const inject = pythonFunction(backend, 'def inject_reader_shell(');
-  assert.match(inject, /swk-doc\\\.css/);
-  assert.match(inject, /swk-doc\\\.js/);
+  assert.match(inject, /doc\\\.css/);
+  assert.match(inject, /doc\\\.js/);
   assert.match(inject, /shared_assets \+ READER_SHELL_STYLE/);
   const getRoute = pythonFunction(backend, '    def do_GET(');
   assert.match(getRoute, /re\.fullmatch\(r"\/read\/\(\?:\.\*\/\)\?_assets\/\(\[\^\/\]\+\)"/);
@@ -489,15 +503,15 @@ import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("learning_backend", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-plain = b'<html><head></head><body><section class="swk-quiz"></section></body></html>'
-existing = (b'<html><head><link rel="stylesheet" href="/_assets/swk-doc.css">'
-            b'<script type="module" src="/_assets/swk-doc.js"></script></head><body></body></html>')
+plain = b'<html><head></head><body><section class="doc-quiz"></section></body></html>'
+existing = (b'<html><head><link rel="stylesheet" href="/_assets/doc.css">'
+            b'<script type="module" src="/_assets/doc.js"></script></head><body></body></html>')
 rendered = module.inject_reader_shell(plain, {"videoUrl": None}).decode()
 preserved = module.inject_reader_shell(existing, {"videoUrl": None}).decode()
-print(json.dumps({"plain_css": rendered.count("swk-doc.css"),
-                  "plain_js": rendered.count("swk-doc.js"),
-                  "existing_css": preserved.count("swk-doc.css"),
-                  "existing_js": preserved.count("swk-doc.js")}))
+print(json.dumps({"plain_css": rendered.count("doc.css"),
+                  "plain_js": rendered.count("doc.js"),
+                  "existing_css": preserved.count("doc.css"),
+                  "existing_js": preserved.count("doc.js")}))
 `;
   const result = spawnSync('python3', ['-c', probe, fileURLToPath(backendPath)], {
     encoding: 'utf8',

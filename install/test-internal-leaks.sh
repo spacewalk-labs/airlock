@@ -107,6 +107,20 @@ else
   bad "subset mode skipped a planted internal identifier"
 fi
 
+# Public document components once carried the internal prefix and were excused here.
+# Build each old token at runtime so this public test never becomes the leak it guards.
+# Exact cases matter: a broad allow entry can strip a shorter token out of a longer one.
+old_prefix="s""wk"
+for suffix in doc quiz q fs-scale fontscale theme; do
+  old="$old_prefix-$suffix"
+  printf '%s\n' "$old" > "$subset/leaky.md"
+  if ! bash "$GUARD" --subset "$subset" >/dev/null 2>&1; then
+    ok "the retired public component identifier is rejected: $old"
+  else
+    bad "the retired public component identifier is still allowed: $old"
+  fi
+done
+
 # ---- an allowlisted token excuses itself and nothing else ----
 # The scan strips permitted tokens and re-matches, rather than dropping the whole
 # line. So a line carrying both a permitted string and a real leak must still fail.

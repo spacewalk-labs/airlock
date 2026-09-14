@@ -115,24 +115,24 @@ subs: <auto 또는 manual>
 가리고 보기 네 개만 봤을 때 정답이 드러나면 다시 쓴다.
 
 저장할 HTML의 이해 점검은 공유 컴포넌트의 아래 구조를 그대로 쓴다. 페이지 전용 채점 JS를
-만들거나 공용 자산 태그를 직접 넣지 않는다. `/read/` 셸이 `swk-doc.css`와 `swk-doc.js`를 붙인다.
+만들거나 공용 자산 태그를 직접 넣지 않는다. `/read/` 셸이 `doc.css`와 `doc.js`를 붙인다.
 각 문항의 정답 보기 하나에만 `data-correct`를 붙인다. 퀴즈의 `ol`·`ul`·`li`는 공유 컴포넌트
 구조이므로 「개요」 밖의 본문 불릿 금지 규칙에서 제외한다.
 
 ```html
-<section class="swk-quiz">
-  <h2 class="swk-quiz-title">이해 점검</h2>
-  <p class="swk-quiz-sub">암기가 아니라 핵심을 이해했는지 확인합니다.</p>
-  <ol class="swk-quiz-list">
-    <li class="swk-q">
-      <p class="swk-q-stem">질문</p>
-      <ul class="swk-q-opts">
+<section class="doc-quiz">
+  <h2 class="doc-quiz-title">이해 점검</h2>
+  <p class="doc-quiz-sub">암기가 아니라 핵심을 이해했는지 확인합니다.</p>
+  <ol class="doc-quiz-list">
+    <li class="doc-q">
+      <p class="doc-q-stem">질문</p>
+      <ul class="doc-q-opts">
         <li>그럴듯한 오답</li>
         <li data-correct>정답</li>
         <li>그럴듯한 오답</li>
         <li>그럴듯한 오답</li>
       </ul>
-      <p class="swk-q-explain">0:00:00 — 왜 이 답인지 설명.</p>
+      <p class="doc-q-explain">0:00:00 — 왜 이 답인지 설명.</p>
     </li>
   </ol>
 </section>

@@ -61,6 +61,25 @@ else
 fi
 rm -rf "$d"
 
+# Rehearse the publish boundary in its real order: classify the committed export,
+# prune only PRIVATE files, then scan the delivered tree after the manifest itself
+# has left it. This is the layer the public repository receives.
+d=$(export_tree)
+export_manifest="$d/install/public-manifest.sh"
+if ! bash "$export_manifest" --check --dir "$d" >/dev/null 2>&1; then
+  bad "the committed export is not fully classified before pruning"
+else
+  while IFS= read -r p; do rm -f "${d:?}/$p"; done < <(bash "$export_manifest" --prune-list --dir "$d")
+  find "$d" -type d -empty -delete
+  if [ ! -e "$export_manifest" ] && bash "$SCAN" --dir "$d" >/dev/null 2>&1; then
+    ok "the boundary-pruned public export passes the internal-name scan"
+  else
+    bad "the boundary-pruned public export fails the internal-name scan"
+    bash "$SCAN" --dir "$d" 2>&1 | sed 's/^/    /' | head -8
+  fi
+fi
+rm -rf "$d"
+
 # .git/ is not the tree. A clone carries hooks this box installed; they are not shipped.
 d=$(export_tree); git -C "$d" init -q
 mkdir -p "$d/.git/hooks"; printf '# %s shim\n' "$PROBE" > "$d/.git/hooks/pre-commit"
