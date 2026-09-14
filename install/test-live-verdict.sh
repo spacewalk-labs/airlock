@@ -297,6 +297,37 @@ then
 else
   bad "collector did not preserve the empty-webhook card or make one stubbed delivery"
 fi
+
+if python3 - "$ROOT/live/check-devmon-no-webhook.py" "$ROOT/apps/dev-monitor/backend" <<'PY'
+import http.server, json, os, subprocess, sys, tempfile, threading
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"messages":"off","slack":"not configured"}'
+        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *_args): pass
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Health)
+worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+try:
+    with tempfile.TemporaryDirectory() as tmp:
+        got = subprocess.run([
+            sys.executable, sys.argv[1], os.path.join(tmp, "messages.db"), sys.argv[2],
+            "http://127.0.0.1:%d/api/health" % server.server_port, "120", "120000",
+        ], text=True, capture_output=True)
+finally:
+    server.shutdown(); server.server_close(); worker.join()
+assert got.returncode == 1
+assert json.loads(got.stdout) == {
+    "error": "collector execution failed", "error_type": "RuntimeError", "error_stage": "health",
+}
+PY
+then
+  ok "collector failure records a safe stage and exception class without runtime bytes"
+else
+  bad "collector failure did not preserve the safe stage-only diagnostic"
+fi
 run_case inner-commit-absent 1
 run_case inner-commit-mismatch 1
 

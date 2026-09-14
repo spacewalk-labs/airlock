@@ -7,6 +7,15 @@ import urllib.request
 import threading
 
 
+_COLLECTOR_STAGE = "start"
+
+
+def _at(stage):
+    """Record only the current safe control-flow stage for main's failure record."""
+    global _COLLECTOR_STAGE
+    _COLLECTOR_STAGE = stage
+
+
 def observation_timing(requested_seconds, elapsed_milliseconds):
     """Normalize the requested window separately from the monotonic measurement."""
     requested = int(requested_seconds)
@@ -36,6 +45,7 @@ def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds
     success stub; it therefore proves the loop's selection and receipt mutation
     without sending an external message from the disposable acceptance guest.
     """
+    _at("health")
     timing = observation_timing(soak_seconds, elapsed_milliseconds)
     with urllib.request.urlopen(health_url, timeout=6) as response:
         health = json.load(response)
@@ -46,8 +56,10 @@ def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds
     import devmon_loop as loop
     import devmon_messages as messages
 
+    _at("database")
     messages._local = threading.local()
     messages.init_db(db_path)
+    _at("synthetic-insert")
     card_id = "live-no-webhook-delivery-control"
     if messages.ingest({
         "id": card_id,
@@ -59,12 +71,14 @@ def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds
     }) != "inserted":
         raise RuntimeError("synthetic delivery card was not inserted")
 
+    _at("empty-webhook-control")
     no_webhook_before = _delivery_state(messages, card_id)
     no_webhook_return = loop.deliver_once("")
     no_webhook_after = _delivery_state(messages, card_id)
     if no_webhook_return is not False or no_webhook_before != no_webhook_after:
         raise RuntimeError("empty webhook changed the pending synthetic card")
 
+    _at("configured-stub-control")
     original_send = loop.slack.send
     try:
         loop.slack.send = lambda _webhook, _text: (True, 204, None)
@@ -78,6 +92,7 @@ def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds
     }:
         raise RuntimeError("configured stub did not deliver the synthetic card")
 
+    _at("complete")
     return {
         "messages_effective": health["messages"],
         "slack_effective": health["slack"],
@@ -102,6 +117,7 @@ def main():
         print(json.dumps({
             "error": "collector execution failed",
             "error_type": type(exc).__name__,
+            "error_stage": _COLLECTOR_STAGE,
         }, sort_keys=True))
         return 1
     print(json.dumps(observation, sort_keys=True))
