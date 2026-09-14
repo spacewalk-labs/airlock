@@ -4,9 +4,9 @@ This directory is the reproducible Airlock input for the guarded Paseo 0.2.5
 deployment. The six npm package tarballs are installed together so npm resolves
 the modified `@getpaseo` packages as one version-consistent set.
 
-- Corresponding source: <https://github.com/ChoSungHyeon/paseo/tree/06697f6f6a2495e8040efdb81d4562f0f839e882>
-- Archive-state review: <https://github.com/ChoSungHyeon/paseo/pull/4>
-- Original guarded backport review: <https://github.com/ChoSungHyeon/paseo/pull/1>
+- Corresponding source: <https://github.com/getpaseo/paseo/tree/06697f6f6a2495e8040efdb81d4562f0f839e882>
+- Archive-state reviewed merge: <https://github.com/getpaseo/paseo/commit/06697f6f6a2495e8040efdb81d4562f0f839e882>
+- Original guarded backport reviewed merge: <https://github.com/getpaseo/paseo/commit/6d13dd8e042de1120ff63ac19c0d690d0ad7c32e>
 - Base: upstream Paseo `v0.2.5` (`6fc491e6220fba6543bbbe4bf1b1f58cfe59228b`)
 - License: AGPL-3.0; the full text is in `LICENSE` beside this file.
 

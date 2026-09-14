@@ -11,8 +11,15 @@ pass=0 fail=0
 ok() { printf 'ok   %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf 'FAIL %s\n' "$1"; fail=$((fail + 1)); }
 
-case_name="${2:-${1:-all}}"
-if [ "${1:-}" = --case ]; then case_name="${2:-}"; fi
+case_name=all emit_ac=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --case) case_name="${2:-}"; shift 2 ;;
+    --emit-ac) emit_ac=1; shift ;;
+    *) case_name="$1"; shift ;;
+  esac
+done
+shared_root_restore=0 owner_drift_reject=0
 
 setup_case() {
   local name="$1"
@@ -624,6 +631,137 @@ container_identity_changed() {
   fi
 }
 
+shared_root_container_restore() {
+  setup_case shared-root-container
+  local shared="$FAKEHOME/.local/opt/airlock-notes"
+  local notes_id
+  notes_id="$(printf 'd%.0s' {1..64})"
+  mkdir -p "$shared/perlite-old" "$shared/silverbullet-old" \
+    "$CASE/pkg-notes" "$CASE/pkg-perlite" "$CASE/pkg-silverbullet"
+  printf 'notes-owned\n' > "$shared/notes.conf"
+  printf 'perlite-v1\n' > "$shared/perlite-old/index.php"
+  printf 'silverbullet-v1\n' > "$shared/silverbullet-old/silverbullet"
+  printf 'package\n' > "$CASE/pkg-notes/content"
+  printf 'package\n' > "$CASE/pkg-perlite/content"
+  printf 'package\n' > "$CASE/pkg-silverbullet/content"
+  python3 - "$STATE/app-ledger.json" "$shared" "$CASE" "$UU" "$US" \
+    "$CONFD" "$WEB" "$FAKEHOME" "$notes_id" <<'PY'
+import json, os, sys
+ledger, shared, case, uu, us, confd, web, home, notes_id = sys.argv[1:]
+
+def record(app_id, path, order, runtime=None):
+    artifacts = {name: [] for name in
+                 ("units", "fragments", "webroot", "files", "rooted", "serve_ports")}
+    artifacts["files"] = [path]
+    return {
+        "path": os.path.join(case, f"pkg-{app_id}"), "digest": "c" * 64,
+        "lifecycle": {"install": True, "smoke": True, "deactivate": True},
+        "artifacts": artifacts, "deps": [], "serve_mappings": {},
+        "unit_scopes": {}, "order": order,
+        "roots": {"unit_user": uu, "unit_system": us, "confd": confd,
+                  "webroot": web, "home": home},
+        "source_class": "shipped", "capabilities": [],
+        "container_runtime": runtime,
+    }
+
+runtime = {
+    "runtime": "docker", "daemon_identity": "docker:fixture-daemon",
+    "install_nonce": "notes_nonce_0001", "declarations": ["airlock-notes-*"],
+    "objects": [{"id": notes_id, "name": "airlock-notes-router"}],
+}
+entries = {
+    "notes": {"committed": record("notes", shared, 1, runtime)},
+    "perlite": {"committed": record("perlite", os.path.join(shared, "perlite-old"), 2)},
+    "silverbullet": {"committed": record("silverbullet", os.path.join(shared, "silverbullet-old"), 3)},
+}
+with open(ledger, "w", encoding="utf-8") as fh:
+    json.dump({"version": 6, "entries": entries, "events": []}, fh)
+PY
+  chmod 600 "$STATE/app-ledger.json"
+  cat > "$SHIM/docker" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$AIRLOCK_TEST_CASE/docker.log"
+case "${1:-}" in
+  info)
+    [ "${2:-}" != --format ] || printf '%s\n' fixture-daemon
+    exit 0
+    ;;
+  ps)
+    printf '%s\n' "$AIRLOCK_TEST_NOTES_CONTAINER_ID"
+    exit 0
+    ;;
+  inspect)
+    [ "${2:-}" = "$AIRLOCK_TEST_NOTES_CONTAINER_ID" ] || exit 91
+    printf '[{"Id":"%s","Name":"/airlock-notes-router","Config":{"Labels":{"io.airlock.package":"notes","io.airlock.install-nonce":"notes_nonce_0001"}}}]\n' \
+      "$AIRLOCK_TEST_NOTES_CONTAINER_ID"
+    exit 0
+    ;;
+esac
+exit 91
+STUB
+  chmod +x "$SHIM/docker"
+  AIRLOCK_TEST_NOTES_CONTAINER_ID="$notes_id"; export AIRLOCK_TEST_NOTES_CONTAINER_ID
+
+  "$ROOT/bin/airlock-ledger" transaction-begin \
+    reinstall:notes upgrade-deactivate:perlite upgrade-deactivate:silverbullet \
+    >"$CASE/checkpoint.log" 2>&1 || {
+      bad "shared-root-container: checkpoint creation failed; $(tr '\n' ';' < "$CASE/checkpoint.log")"
+      return
+    }
+  "$ROOT/bin/airlock-ledger" transaction-touch notes
+  "$ROOT/bin/airlock-ledger" transaction-deactivated perlite
+  "$ROOT/bin/airlock-ledger" transaction-deactivated silverbullet
+  printf 'perlite-v2\n' > "$shared/perlite-old/index.php"
+  printf 'silverbullet-v2\n' > "$shared/silverbullet-old/silverbullet"
+  "$ROOT/bin/airlock-ledger" transaction-fail install silverbullet
+  "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/restore.log" 2>&1
+  local rc=$? phase notes_status
+  read -r phase notes_status < <(
+    "$ROOT/bin/airlock-ledger" transaction-show | python3 -c \
+      'import json,sys; tx=json.load(sys.stdin); print(tx["phase"], tx["restore_results"].get("notes",{}).get("status","missing"))')
+  if [ "$rc" = 0 ] && [ "$phase" = rolled_back ] && [ "$notes_status" = restored ] \
+      && grep -qx perlite-v1 "$shared/perlite-old/index.php" \
+      && grep -qx silverbullet-v1 "$shared/silverbullet-old/silverbullet" \
+      && grep -qx notes-owned "$shared/notes.conf" \
+      && ! grep -Eq '^(rm|stop|kill) ' "$CASE/docker.log"; then
+    shared_root_restore=1
+    ok "shared-root-container: sibling restores cannot invalidate the intact shared-root owner"
+  else
+    bad "shared-root-container: sibling restore wedged the shared-root owner (rc=$rc phase=${phase:-none} notes=${notes_status:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
+    return
+  fi
+
+  "$ROOT/bin/airlock-ledger" transaction-begin \
+    reinstall:notes upgrade-deactivate:perlite upgrade-deactivate:silverbullet \
+    >"$CASE/drift-checkpoint.log" 2>&1 || {
+      bad "shared-root-container-drift: checkpoint creation failed; $(tr '\n' ';' < "$CASE/drift-checkpoint.log")"
+      return
+    }
+  "$ROOT/bin/airlock-ledger" transaction-touch notes
+  "$ROOT/bin/airlock-ledger" transaction-deactivated perlite
+  "$ROOT/bin/airlock-ledger" transaction-deactivated silverbullet
+  printf 'notes-owned-v2\n' > "$shared/notes.conf"
+  printf 'perlite-v2\n' > "$shared/perlite-old/index.php"
+  printf 'silverbullet-v2\n' > "$shared/silverbullet-old/silverbullet"
+  "$ROOT/bin/airlock-ledger" transaction-fail install silverbullet
+  "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/drift-restore.log" 2>&1
+  rc=$?
+  read -r phase notes_status < <(
+    "$ROOT/bin/airlock-ledger" transaction-show | python3 -c \
+      'import json,sys; tx=json.load(sys.stdin); print(tx["phase"], tx["restore_results"].get("notes",{}).get("status","missing"))')
+  if [ "$rc" != 0 ] && [ "$phase" = degraded ] && [ "$notes_status" = failed ] \
+      && grep -qx notes-owned-v2 "$shared/notes.conf" \
+      && grep -qx perlite-v1 "$shared/perlite-old/index.php" \
+      && grep -qx silverbullet-v1 "$shared/silverbullet-old/silverbullet" \
+      && grep -q 'existing runtime was preserved for manual recovery' "$CASE/drift-restore.log" \
+      && ! grep -Eq '^(rm|stop|kill) ' "$CASE/docker.log"; then
+    owner_drift_reject=1
+    ok "shared-root-container-drift: parent-owned drift still fails closed"
+  else
+    bad "shared-root-container-drift: nested exclusion hid owner drift (rc=$rc phase=${phase:-none} notes=${notes_status:-none}); $(tr '\n' ';' < "$CASE/drift-restore.log")"
+  fi
+}
+
 checkpoint_parent_redirect() {
   setup_case checkpoint-parent-redirect
   local outside="$TMP/checkpoint-outside"
@@ -699,6 +837,7 @@ case "$case_name" in
   container-intact) container_intact_after_intent ;;
   container-changed) container_regular_changed ;;
   container-identity-changed) container_identity_changed ;;
+  shared-root-container) shared_root_container_restore ;;
   crash-reenter) crash_reenter ;;
   all)
     roundtrip
@@ -719,10 +858,18 @@ case "$case_name" in
     container_intact_after_intent
     container_regular_changed
     container_identity_changed
+    shared_root_container_restore
     crash_reenter
     ;;
   *) bad "unknown case: $case_name" ;;
 esac
 
 printf '%s\n' '---' "passed=$pass failed=$fail"
+if [ "$emit_ac" = 1 ] && { [ "$case_name" = all ] || [ "$case_name" = shared-root-container ]; }; then
+  revision="$(git -C "$ROOT" rev-parse HEAD)"
+  verdict=FAIL
+  [ "$shared_root_restore" = 1 ] && [ "$owner_drift_reject" = 1 ] && verdict=PASS
+  printf 'AC-MAU-A5-G | expected: shared_root_restore == 1 && owner_drift_reject == 1 | observed: shared_root_restore=%s,owner_drift_reject=%s | verdict: %s | signal: fixture | evidence: install/test-install-transaction-primitive.sh@%s\n' \
+    "$shared_root_restore" "$owner_drift_reject" "$verdict" "$revision"
+fi
 [ "$fail" -eq 0 ]

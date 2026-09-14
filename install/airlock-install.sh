@@ -375,6 +375,31 @@ raise SystemExit(0 if (store.get("entries", {}).get(sys.argv[2]) or {}).get("com
   log "$app activated"
 }
 
+# Restoring package bytes is not enough after a removed nginx fragment was loaded into
+# the live process. The ledger keeps that publication debt non-terminal across crashes;
+# only a successful config test + reload may close it as rolled_back.
+_airlock_restore_transaction() {
+  local restore_output="" restore_rc=0 nginx_owed=0
+  restore_output="$("$ROOT/bin/airlock-ledger" transaction-restore 2>&1)" \
+    || restore_rc=$?
+  [ -z "$restore_output" ] || printf '%s\n' "$restore_output" >&2
+  [ "$restore_rc" = 0 ] || return "$restore_rc"
+  nginx_owed="$("$ROOT/bin/airlock-ledger" transaction-show \
+    | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("nginx_restore_owed") else 0)')" \
+    || return 1
+  if [ "$nginx_owed" = 1 ]; then
+    log "republishing restored nginx fragments before declaring rollback complete"
+    airlock_run sudo nginx -t || return 1
+    airlock_run sudo systemctl reload nginx || return 1
+    "$ROOT/bin/airlock-ledger" transaction-nginx-restore-published || return 1
+  fi
+}
+
+_airlock_mark_nginx_restore_owed() {
+  [ "${_airlock_transaction_active:-0}" = 1 ] || return 0
+  "$ROOT/bin/airlock-ledger" transaction-nginx-restore-owed
+}
+
 # Before anything is stopped: if this run is hosted by one of the units it is about
 # to restart, move it out of that cgroup so it survives its own teardown. Informs
 # and continues rather than refusing — see install/lib.sh.
@@ -457,7 +482,7 @@ print("\t".join((d["id"], d["phase"], *values)))
           || true
         die "database compensation remains degraded; incompatible old writers were not restarted"
       fi
-      "$ROOT/bin/airlock-ledger" transaction-restore \
+      _airlock_restore_transaction \
         || die "transaction recovery remains degraded; inspect bin/airlock-status before retrying"
       ;;
     committed)
@@ -511,6 +536,7 @@ _airlock_transaction_active=0
 _airlock_transaction_id=""
 _airlock_failure_phase="pre-mutation"
 _airlock_failure_app="-"
+_airlock_removed_after_first_reload=0
 for _airlock_install_arg in "$@"; do
   case "$_airlock_install_arg" in
     --dangerously-admit-unverified=*)
@@ -563,7 +589,7 @@ fi
 
 _airlock_cleanup_config_wrapper() {
   local _exit_rc=$? _db_restore_rc=0 _trusted_restore_rc=0 _fail_rc=0 _restore_rc=0
-  local _restore_output="" _result="degraded" _trusted_state="none"
+  local _result="degraded" _trusted_state="none"
   trap - EXIT INT TERM HUP
   if [ "${_airlock_transaction_active:-0}" = 1 ]; then
     [ "$_exit_rc" != 0 ] || _exit_rc=1
@@ -602,9 +628,7 @@ _airlock_cleanup_config_wrapper() {
         >/dev/null 2>&1 || _fail_rc=$?
     if [ "$_db_restore_rc" = 0 ] && [ "$_trusted_restore_rc" = 0 ] \
         && [ "$_fail_rc" = 0 ]; then
-      _restore_output="$("$ROOT/bin/airlock-ledger" transaction-restore 2>&1)" \
-        || _restore_rc=$?
-      [ -z "$_restore_output" ] || printf '%s\n' "$_restore_output" >&2
+      _airlock_restore_transaction || _restore_rc=$?
       [ "$_restore_rc" != 0 ] || _result="rolled_back"
     elif [ "$_fail_rc" != 0 ]; then
       log "WARN: failed to persist the install transaction failure"
@@ -1818,6 +1842,7 @@ fi
 
 # 4) validate + reload
 airlock_run sudo nginx -t
+_airlock_mark_nginx_restore_owed
 airlock_run sudo systemctl reload nginx
 
 # 4b) reboot survival. Each app installer already `systemctl --user enable`s its
@@ -1956,7 +1981,22 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
     printf '%s' "$AIRLOCK_PKG_INFO" \
       | "$ROOT/bin/airlock-ledger" remove "$_id" --active-ports "$_active_ports" \
       || die "could not remove '$_id'; compensating the touched transaction"
+    _airlock_removed_after_first_reload=1
   done <<<"$_remove_plan"
+
+  # The first reload happens while retiring packages still own their fragments: removal
+  # is deliberately last so every desired app has committed before old state disappears.
+  # Publish that last mutation too. Without this reload nginx keeps the deleted proxy
+  # location in memory and answers 502 against its now-stopped upstream until another
+  # install happens to reload it.
+  if [ "$_airlock_removed_after_first_reload" = 1 ]; then
+    _airlock_failure_phase="remove-publish"
+    _airlock_failure_app="-"
+    log "reloading nginx after retired package fragments were removed"
+    airlock_run sudo nginx -t
+    _airlock_mark_nginx_restore_owed
+    airlock_run sudo systemctl reload nginx
+  fi
 fi
 _airlock_failure_app="-"
 _airlock_failure_phase="frontend-check"

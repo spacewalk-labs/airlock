@@ -1718,12 +1718,14 @@ if (("standalone" in navigator) && navigator.standalone) {
     if (!response.ok) {
       progressNote.textContent = "실행 상태를 읽지 못했습니다 (HTTP " + response.status +
         ") — 끝났는지 아직 알 수 없습니다.";
+      runTimer = setTimeout(pollRun, 4000);
       return;
     }
     let value;
     try { value = await response.json(); }
     catch (_) {
       progressNote.textContent = "실행 상태 응답을 해석하지 못했습니다 — 끝났는지 아직 알 수 없습니다.";
+      runTimer = setTimeout(pollRun, 4000);
       return;
     }
     const run = value && value.run;

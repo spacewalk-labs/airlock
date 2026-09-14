@@ -62,6 +62,22 @@ STUB
 cat > "$SHIM/systemctl" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TMP/systemctl.log"
+if [ -n "\${AIRLOCK_FIXTURE_RETIRED_FRAGMENT:-}" ] \
+    && [ "\$*" = "reload nginx" ]; then
+  if [ -e "\$AIRLOCK_FIXTURE_RETIRED_FRAGMENT" ]; then
+    printf '%s\n' 'reload-retired-fragment=present' >> "$TMP/systemctl.log"
+    if [ -n "\${AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE:-}" ] \
+        && [ -e "\$AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE.seen" ] \
+        && [ -e "\$AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE" ]; then
+      rm -f "\$AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE"
+      exit 78
+    fi
+  else
+    printf '%s\n' 'reload-retired-fragment=absent' >> "$TMP/systemctl.log"
+    [ -z "\${AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE:-}" ] \
+      || : >"\$AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE.seen"
+  fi
+fi
 # A real backend start is a DB write even when no message arrives: init_db() in
 # apps/dev-monitor/backend/devmon_messages.py switches a canonical DB to WAL,
 # which rewrites the header bytes a conversion marker hashed. The 2026-09-11
@@ -178,7 +194,7 @@ cat > "$SHIM/curl" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
   *http_code*127.0.0.1:*/api/overview*) printf '%s' "${AIRLOCK_FIXTURE_BACKEND_HTTP_CODE:-200}" ;;
-  *http_code*) printf 200 ;;
+  *http_code*) printf '%s' "${AIRLOCK_FIXTURE_FRONTEND_HTTP_CODE:-200}" ;;
 esac
 exit 0
 STUB
@@ -1464,6 +1480,210 @@ current_blast() {
   fail_after_deactivate
 }
 
+removed_fragment_reload() {
+  reset_fixture
+  local cfg="$TMP/removed-fragment.toml" pkg="$TMP/retired-v1"
+  local fragment="$CONFD/hub-locations.d/retired.conf" rc=0
+  local -a reload_states=()
+  mkpkg "$pkg" retired 0
+  printf '%s\n' 'fragments = ["hub-locations.d/retired.conf"]' >>"$pkg/airlock-app.toml"
+  cat >>"$pkg/install.sh" <<'EOF'
+install -d "$AIRLOCK_CONFD/hub-locations.d"
+printf 'location /retired/ { proxy_pass http://127.0.0.1:9; }\n' \
+  >"$AIRLOCK_CONFD/hub-locations.d/retired.conf"
+EOF
+  cat >"$cfg" <<EOF
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+[apps.retired]
+[packages.retired]
+path = "$pkg"
+EOF
+  orch "$cfg" >"$TMP/removed-fragment-first.log" 2>&1 \
+    || { bad "removed-fragment-reload: setup failed"; return; }
+  cat >"$cfg" <<'EOF'
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+EOF
+  : >"$TMP/systemctl.log"
+  AIRLOCK_FIXTURE_RETIRED_FRAGMENT="$fragment" \
+    orch "$cfg" >"$TMP/removed-fragment-second.log" 2>&1 || rc=$?
+  mapfile -t reload_states < <(sed -n 's/^reload-retired-fragment=//p' "$TMP/systemctl.log")
+  if [ "$rc" = 0 ] && [ ! -e "$fragment" ] \
+      && [ "${reload_states[*]}" = "present absent" ]; then
+    ok "removed-fragment-reload: nginx reloads once more after the retired route disappears"
+  else
+    bad "removed-fragment-reload: rc=$rc fragment=$([ -e "$fragment" ] && echo present || echo absent) reloads=${reload_states[*]:-none}"
+  fi
+}
+
+devmon_proxy_secret_rotation() {
+  reset_fixture
+  local cfg="$TMP/devmon-secret-rotation.toml" rc=0 second_rc=0
+  local env_file="$FAKEHOME/.config/airlock/dev-monitor.env"
+  local fragment="$CONFD/hub-locations.d/dev-monitor.conf"
+  local first_secret second_secret
+  prepare_devmon_migration "$cfg" \
+    || { bad "devmon-proxy-secret-rotation: setup failed"; return; }
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$TMP/devmon-v2/smoke.sh"
+  chmod +x "$TMP/devmon-v2/smoke.sh"
+  devmon_orch "$cfg" >"$TMP/devmon-secret-first.log" 2>&1 || rc=$?
+  first_secret="$(sed -n 's/^DEV_MONITOR_PROXY_SECRET=//p' "$env_file" 2>/dev/null | head -1)"
+  devmon_orch "$cfg" >"$TMP/devmon-secret-second.log" 2>&1 || second_rc=$?
+  second_secret="$(sed -n 's/^DEV_MONITOR_PROXY_SECRET=//p' "$env_file" 2>/dev/null | head -1)"
+  if [ "$rc" = 0 ] && [ "$second_rc" = 0 ] && [ -n "$first_secret" ] \
+      && [ -n "$second_secret" ] && [ "$first_secret" != "$second_secret" ] \
+      && grep -Fq "X-Devmon-Proxy-Secret \"$second_secret\"" "$fragment"; then
+    ok "devmon-proxy-secret-rotation: every real install rotates the secret and publishes one matching pair"
+  else
+    bad "devmon-proxy-secret-rotation: first_rc=$rc second_rc=$second_rc rotated=$([ -n "$first_secret" ] && [ -n "$second_secret" ] && [ "$first_secret" != "$second_secret" ] && echo yes || echo no)"
+    tail -20 "$TMP/devmon-secret-second.log" | sed 's/^/    /'
+  fi
+}
+
+removed_fragment_rollback_reloads() {
+  reset_fixture
+  local cfg="$TMP/removed-fragment-rollback.toml" pkg="$TMP/retired-rollback-v1"
+  local fragment="$CONFD/hub-locations.d/retired.conf" rc=0
+  local -a reload_states=()
+  mkpkg "$pkg" retired 0
+  printf '%s\n' 'fragments = ["hub-locations.d/retired.conf"]' >>"$pkg/airlock-app.toml"
+  cat >>"$pkg/install.sh" <<'EOF'
+install -d "$AIRLOCK_CONFD/hub-locations.d"
+printf 'location /retired/ { proxy_pass http://127.0.0.1:9; }\n' \
+  >"$AIRLOCK_CONFD/hub-locations.d/retired.conf"
+EOF
+  cat >"$cfg" <<EOF
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+[apps.retired]
+[packages.retired]
+path = "$pkg"
+EOF
+  orch "$cfg" >"$TMP/removed-fragment-rollback-first.log" 2>&1 \
+    || { bad "removed-fragment-rollback: setup failed"; return; }
+  cat >"$cfg" <<'EOF'
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+EOF
+  : >"$TMP/systemctl.log"
+  AIRLOCK_FIXTURE_RETIRED_FRAGMENT="$fragment" AIRLOCK_FIXTURE_FRONTEND_HTTP_CODE=502 \
+    orch "$cfg" >"$TMP/removed-fragment-rollback-second.log" 2>&1 || rc=$?
+  mapfile -t reload_states < <(sed -n 's/^reload-retired-fragment=//p' "$TMP/systemctl.log")
+  if [ "$rc" != 0 ] && [ -e "$fragment" ] && [ "$(tx_phase)" = rolled_back ] \
+      && [ "${reload_states[*]}" = "present absent present" ]; then
+    ok "removed-fragment-rollback: a later failure restores and republishes the retired route before rolled_back"
+  else
+    bad "removed-fragment-rollback: rc=$rc phase=$(tx_phase 2>/dev/null || echo none) fragment=$([ -e "$fragment" ] && echo present || echo absent) reloads=${reload_states[*]:-none}"
+    tail -30 "$TMP/removed-fragment-rollback-second.log" | sed 's/^/    /'
+  fi
+}
+
+fresh_fragment_rollback_reloads() {
+  reset_fixture
+  local cfg="$TMP/fresh-fragment-rollback.toml" pkg="$TMP/fresh-fragment-v1"
+  local fragment="$CONFD/hub-locations.d/fresh.conf" rc=0
+  local -a reload_states=()
+  cat >"$cfg" <<'EOF'
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+EOF
+  orch "$cfg" >"$TMP/fresh-fragment-rollback-first.log" 2>&1 \
+    || { bad "fresh-fragment-rollback: setup failed"; return; }
+  mkpkg "$pkg" fresh 0
+  printf '%s\n' 'fragments = ["hub-locations.d/fresh.conf"]' >>"$pkg/airlock-app.toml"
+  cat >>"$pkg/install.sh" <<'EOF'
+install -d "$AIRLOCK_CONFD/hub-locations.d"
+printf 'location /fresh/ { proxy_pass http://127.0.0.1:9; }\n' \
+  >"$AIRLOCK_CONFD/hub-locations.d/fresh.conf"
+EOF
+  cat >>"$cfg" <<EOF
+[apps.fresh]
+[packages.fresh]
+path = "$pkg"
+EOF
+  : >"$TMP/systemctl.log"
+  AIRLOCK_FIXTURE_RETIRED_FRAGMENT="$fragment" AIRLOCK_FIXTURE_FRONTEND_HTTP_CODE=502 \
+    orch "$cfg" >"$TMP/fresh-fragment-rollback-second.log" 2>&1 || rc=$?
+  mapfile -t reload_states < <(sed -n 's/^reload-retired-fragment=//p' "$TMP/systemctl.log")
+  if [ "$rc" != 0 ] && [ ! -e "$fragment" ] && [ "$(tx_phase)" = rolled_back ] \
+      && [ "${reload_states[*]}" = "present absent" ]; then
+    ok "fresh-fragment-rollback: a newly published route is removed from live nginx before rolled_back"
+  else
+    bad "fresh-fragment-rollback: rc=$rc phase=$(tx_phase 2>/dev/null || echo none) fragment=$([ -e "$fragment" ] && echo present || echo absent) reloads=${reload_states[*]:-none}"
+    tail -30 "$TMP/fresh-fragment-rollback-second.log" | sed 's/^/    /'
+  fi
+}
+
+removed_fragment_rollback_reentry() {
+  reset_fixture
+  local cfg="$TMP/removed-fragment-reentry.toml" pkg="$TMP/retired-reentry-v1"
+  local fragment="$CONFD/hub-locations.d/retired.conf" fail_once="$TMP/reload-fail-once"
+  local rc=0 retry_rc=0 owed=0 retry_owed=1
+  local -a first_states=() retry_states=()
+  mkpkg "$pkg" retired 0
+  printf '%s\n' 'fragments = ["hub-locations.d/retired.conf"]' >>"$pkg/airlock-app.toml"
+  cat >>"$pkg/install.sh" <<'EOF'
+install -d "$AIRLOCK_CONFD/hub-locations.d"
+printf 'location /retired/ { proxy_pass http://127.0.0.1:9; }\n' \
+  >"$AIRLOCK_CONFD/hub-locations.d/retired.conf"
+EOF
+  cat >"$cfg" <<EOF
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+[apps.retired]
+[packages.retired]
+path = "$pkg"
+EOF
+  orch "$cfg" >"$TMP/removed-fragment-reentry-first.log" 2>&1 \
+    || { bad "removed-fragment-reentry: setup failed"; return; }
+  cat >"$cfg" <<'EOF'
+[auth]
+provider = "tailscale"
+owner = "owner@fixture.dev"
+[apps.hub]
+EOF
+  : >"$TMP/systemctl.log"
+  : >"$fail_once"
+  AIRLOCK_FIXTURE_RETIRED_FRAGMENT="$fragment" \
+  AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE="$fail_once" \
+  AIRLOCK_FIXTURE_FRONTEND_HTTP_CODE=502 \
+    orch "$cfg" >"$TMP/removed-fragment-reentry-second.log" 2>&1 || rc=$?
+  mapfile -t first_states < <(sed -n 's/^reload-retired-fragment=//p' "$TMP/systemctl.log")
+  owed="$("$ROOT/bin/airlock-ledger" transaction-show \
+    | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("nginx_restore_owed") else 0)')"
+
+  printf '%s\n' '[auth' >"$cfg"
+  : >"$TMP/systemctl.log"
+  AIRLOCK_FIXTURE_RETIRED_FRAGMENT="$fragment" \
+  AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE="$fail_once" \
+    orch "$cfg" >"$TMP/removed-fragment-reentry-retry.log" 2>&1 || retry_rc=$?
+  mapfile -t retry_states < <(sed -n 's/^reload-retired-fragment=//p' "$TMP/systemctl.log")
+  retry_owed="$("$ROOT/bin/airlock-ledger" transaction-show \
+    | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("nginx_restore_owed") else 0)')"
+  if [ "$rc" != 0 ] && [ "$retry_rc" != 0 ] && [ -e "$fragment" ] \
+      && [ "$owed" = 1 ] && [ "$retry_owed" = 0 ] && [ "$(tx_phase)" = rolled_back ] \
+      && [ "${first_states[*]}" = "present absent present" ] \
+      && [ "${retry_states[*]}" = "present" ]; then
+    ok "removed-fragment-reentry: failed rollback publication stays owed until a later run republishes it"
+  else
+    bad "removed-fragment-reentry: rc=$rc retry_rc=$retry_rc phase=$(tx_phase 2>/dev/null || echo none) owed=$owed retry_owed=$retry_owed fragment=$([ -e "$fragment" ] && echo present || echo absent) first=${first_states[*]:-none} retry=${retry_states[*]:-none}"
+    tail -30 "$TMP/removed-fragment-reentry-retry.log" 2>/dev/null | sed 's/^/    /'
+  fi
+}
+
 case "$case_name" in
   unchanged) unchanged ;;
   upgrade-success) upgrade_success ;;
@@ -1495,6 +1715,11 @@ case "$case_name" in
   devmon-default-state-dir) devmon_default_state_dir ;;
   devmon-crash-reentry) devmon_crash_reentry ;;
   current-blast) current_blast ;;
+  devmon-proxy-secret-rotation) devmon_proxy_secret_rotation ;;
+  removed-fragment-reload) removed_fragment_reload ;;
+  removed-fragment-rollback) removed_fragment_rollback_reloads ;;
+  fresh-fragment-rollback) fresh_fragment_rollback_reloads ;;
+  removed-fragment-reentry) removed_fragment_rollback_reentry ;;
   all)
     unchanged
     upgrade_success
@@ -1524,6 +1749,11 @@ case "$case_name" in
     devmon_standalone_after_writer
     devmon_default_state_dir
     devmon_crash_reentry
+    devmon_proxy_secret_rotation
+    removed_fragment_reload
+    removed_fragment_rollback_reloads
+    fresh_fragment_rollback_reloads
+    removed_fragment_rollback_reentry
     ;;
   *) bad "unknown case: $case_name" ;;
 esac

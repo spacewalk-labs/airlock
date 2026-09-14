@@ -149,38 +149,84 @@ else
   bad "recovery driver did not restart the historical consumer after seeding"
 fi
 
-# R3 runs a real heartbeat producer from the historical app tree after that tree's
-# digest has been journaled. The producer may write runtime state, never Python cache
-# files back into the candidate tree.
+# R3 runs the historical installer after its package digest has been journaled. Both
+# its DB migration and its heartbeat producer import modules from that package tree;
+# runtime state may change, but the journaled input tree must not.
 HEARTBEAT_ROOT="$TMP/heartbeat-root"
 HEARTBEAT_HOME="$TMP/heartbeat-home"
 HEARTBEAT_MARKERS="$HEARTBEAT_HOME/.local/state/airlock-install-recovery-driver"
 HEARTBEAT_STATE="$HEARTBEAT_HOME/.local/state/airlock/dev-monitor"
-mkdir -p "$HEARTBEAT_ROOT/apps" "$HEARTBEAT_MARKERS" \
+mkdir -p "$HEARTBEAT_ROOT/apps" "$HEARTBEAT_ROOT/install" "$HEARTBEAT_MARKERS" \
   "$HEARTBEAT_STATE/spool/tmp" "$HEARTBEAT_STATE/spool/new"
 cp -a "$ROOT/apps/dev-monitor" "$HEARTBEAT_ROOT/apps/dev-monitor"
-heartbeat_id="heartbeat:$(date -u +%Y-%m-%d)"
-python3 - "$HEARTBEAT_STATE/messages.db" "$heartbeat_id" <<'PY'
+find "$HEARTBEAT_ROOT/apps/dev-monitor" -type d -name __pycache__ -prune \
+  -exec rm -rf -- {} +
+# Match the live sequence: the baseline backend has already populated the cache,
+# while the migration-only module has not run yet.
+PYTHONPATH="$HEARTBEAT_ROOT/apps/dev-monitor/backend" \
+  python3 -c 'import devmon_messages'
+python3 "$ROOT/live/install-recovery-db.py" seed-legacy \
+  "$HEARTBEAT_STATE/messages.db" >/dev/null
+package_digest() {
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/bin/airlock-ledger" "$1" <<'PY'
+import importlib.machinery
+import importlib.util
+import sys
+
+module_path, package_path = sys.argv[1:]
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader("airlock_ledger_live_probe", module_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+print(module.digest_tree(package_path))
+PY
+}
+heartbeat_digest_before="$(package_digest "$HEARTBEAT_ROOT/apps/dev-monitor")"
+FAIL_INSTALL="$ROOT/live/install-recovery-packages/late-failure/install.sh"
+PROBE_APP="$HEARTBEAT_ROOT/apps/dev-monitor"
+PROBE_DB="$HEARTBEAT_STATE/messages.db"
+export FAIL_INSTALL PROBE_APP PROBE_DB
+cat > "$HEARTBEAT_ROOT/install/airlock-install.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+python3 "$PROBE_APP/migrate-legacy-state.py" --endstate "$PROBE_DB" --offline >/dev/null
+python3 - "$PROBE_DB" <<'PY'
+from datetime import datetime, timezone
 import sqlite3
 import sys
+heartbeat_id = "heartbeat:" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
 with sqlite3.connect(sys.argv[1]) as connection:
-    connection.execute("CREATE TABLE ledger(id TEXT PRIMARY KEY)")
-    connection.execute("INSERT INTO ledger(id) VALUES (?)", (sys.argv[2],))
+    connection.execute(
+        'INSERT INTO ledger(id, "group", source, received_at, payload) VALUES(?,?,?,?,?)',
+        (heartbeat_id, "fixture", "fixture", heartbeat_id, "{}"),
+    )
 PY
+AIRLOCK_ROOT="$(cd "$(dirname "$0")/.." && pwd)" \
+AIRLOCK_APP_ID=zz-install-recovery-fail exec bash "$FAIL_INSTALL"
+SH
+chmod 0700 "$HEARTBEAT_ROOT/install/airlock-install.sh"
+run_installer_function="$(sed -n '/^run_installer() {/,/^}/p' \
+  "$ROOT/live/install-recovery-in-container.sh")"
+eval "$run_installer_function"
+as_user() { HOME="$HEARTBEAT_HOME" bash -c "$1"; }
+DRIVER_STATE="$HEARTBEAT_MARKERS"
+export AIRLOCK_STATE="$HEARTBEAT_HOME/.local/state/airlock"
 heartbeat_rc=0
-HOME="$HEARTBEAT_HOME" AIRLOCK_ROOT="$HEARTBEAT_ROOT" \
-AIRLOCK_APP_ID=zz-install-recovery-fail AIRLOCK_INSTALL_RECOVERY_SCENARIO=r3-forward \
-AIRLOCK_INSTALL_RECOVERY_MARKER_DIR="$HEARTBEAT_MARKERS" \
-  bash "$ROOT/live/install-recovery-packages/late-failure/install.sh" \
-    > "$TMP/heartbeat-fixture.out" 2> "$TMP/heartbeat-fixture.err" || heartbeat_rc=$?
+heartbeat_rc="$(run_installer "$HEARTBEAT_ROOT" /dev/null r3-forward \
+  /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  "$TMP/heartbeat-fixture.out")"
+heartbeat_digest_after="$(package_digest "$HEARTBEAT_ROOT/apps/dev-monitor")"
 if [ "$heartbeat_rc" = 86 ] \
    && [ -s "$HEARTBEAT_MARKERS/heartbeat-consumed-id.txt" ] \
-   && [ -z "$(find "$HEARTBEAT_ROOT/apps/dev-monitor" -type d -name __pycache__ -print -quit)" ]; then
-  ok "R3 heartbeat leaves the journaled historical candidate tree unchanged"
+   && [ "$heartbeat_digest_before" = "$heartbeat_digest_after" ]; then
+  ok "R3 historical migration and heartbeat leave the journaled candidate tree unchanged"
 else
-  bad "R3 heartbeat mutated or missed the historical candidate tree"
-  find "$HEARTBEAT_ROOT/apps/dev-monitor" -type d -name __pycache__ -print | sed 's/^/    /'
+  bad "R3 historical lifecycle mutated or missed the journaled candidate tree"
+  printf '    before=%s after=%s rc=%s\n' \
+    "$heartbeat_digest_before" "$heartbeat_digest_after" "$heartbeat_rc"
 fi
+unset FAIL_INSTALL PROBE_APP PROBE_DB AIRLOCK_STATE
 
 # Deterministic seed and online-backup observation, without importing a test module.
 mkdir -p "$TMP/db"

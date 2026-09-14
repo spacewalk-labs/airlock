@@ -3528,7 +3528,7 @@ def _validate_transaction(value: Any, path: Path) -> dict[str, Any]:
               "ledger_snapshot", "error", "restore_results"}
     optional_fields = {"forward_keep", "app_scoped_plan", "resource_results",
                        "managed_authorities", "managed_authority_sha256",
-                       "trusted_measurer_activation"}
+                       "trusted_measurer_activation", "nginx_restore_owed"}
     if not isinstance(value, dict) or not (fields <= set(value) <= fields | optional_fields):
         fail(f"{path}: invalid transaction shape")
     if "forward_keep" in value:
@@ -3589,6 +3589,8 @@ def _validate_transaction(value: Any, path: Path) -> dict[str, Any]:
         _validate_trusted_measurer_activation(
             value["trusted_measurer_activation"], value, path,
         )
+    if "nginx_restore_owed" in value and value["nginx_restore_owed"] is not True:
+        fail(f"{path}: nginx_restore_owed must be true when present")
     if value["phase"] not in TRANSACTION_PHASES:
         fail(f"{path}: invalid transaction phase {value['phase']!r}")
     activation = value.get("trusted_measurer_activation")
@@ -4609,6 +4611,59 @@ def command_transaction_fail(phase: str, app_id: str) -> int:
     return 0
 
 
+def command_transaction_nginx_restore_owed() -> int:
+    """Bind rollback completion to republishing restored nginx fragments.
+
+    Package fragment changes can be published into the live nginx process before the
+    rest of the install commits.  A later rollback is therefore not complete when the
+    bytes alone are restored: nginx must load those bytes again.  This bit is durable
+    so a crash between publication and commit cannot turn that obligation into a
+    false rolled_back verdict.
+    """
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] in TRANSACTION_TERMINAL_PHASES:
+        fail(f"transaction {tx['id']} is already {tx['phase']}")
+    store = load_store()
+    touched_fragments = False
+    for app_id in tx["touched"]:
+        checkpoint = tx["checkpoints"].get(app_id) or {}
+        if any(item.get("class") == "fragments"
+               for item in checkpoint.get("artifacts", [])):
+            touched_fragments = True
+            break
+        entry = store["entries"].get(app_id) or {}
+        for kind in ("intent", "committed"):
+            record = entry.get(kind)
+            if record is None:
+                continue
+            artifacts = (record.get("artifacts_declared") if kind == "intent"
+                         else record.get("artifacts")) or {}
+            if artifacts.get("fragments"):
+                touched_fragments = True
+                break
+        if touched_fragments:
+            break
+    if not touched_fragments:
+        return 0
+    if not tx.get("nginx_restore_owed"):
+        tx["nginx_restore_owed"] = True
+        write_transaction(tx)
+    return 0
+
+
+def command_transaction_nginx_restore_published() -> int:
+    tx = load_transaction()
+    assert tx is not None
+    if tx["phase"] != "rolling_back" or tx.get("nginx_restore_owed") is not True:
+        fail("nginx restore publication is not owed after artifact restoration")
+    del tx["nginx_restore_owed"]
+    tx["phase"] = "rolled_back"
+    write_transaction(tx)
+    log(f"transaction {tx['id']} rolled_back")
+    return 0
+
+
 def _safe_extract_archive(archive: Path, destination: Path) -> tuple[Path, list[tarfile.TarInfo]]:
     try:
         with tarfile.open(archive, "r") as bundle:
@@ -4740,6 +4795,93 @@ def _container_runtime_is_intact(app_id: str, runtime: dict[str, Any]) -> bool:
     return actual == expected
 
 
+def _nested_restore_owners(tx: dict[str, Any], app_id: str,
+                           path: str) -> list[tuple[str, ...]]:
+    """Return touched sibling artifacts strictly below ``path``.
+
+    Current commits reject overlapping ownership, but an installed ledger can
+    predate that boundary.  Those legacy child roots are restored by their own
+    checkpoint and must not make the container-backed parent look externally
+    modified after the child restore has changed ancestor directory metadata.
+    """
+    kept_app = (tx.get("forward_keep") or {}).get("app")
+    nested: list[tuple[str, ...]] = []
+    for sibling in tx["touched"]:
+        if sibling in (app_id, kept_app):
+            continue
+        checkpoint = tx["checkpoints"].get(sibling) or {}
+        for sibling_item in checkpoint.get("artifacts", []):
+            sibling_path = sibling_item["path"]
+            if sibling_path == path or not _is_under(sibling_path, path):
+                continue
+            relative = Path(os.path.relpath(sibling_path, path)).parts
+            if not any(relative[:len(parent)] == parent for parent in nested):
+                nested = [parent for parent in nested
+                          if parent[:len(relative)] != relative]
+                nested.append(relative)
+    return sorted(nested, key=lambda parts: os.fsencode("/".join(parts)))
+
+
+def _checkpoint_archives_match_outside(
+        expected_path: Path, actual_path: Path,
+        excluded: list[tuple[str, ...]]) -> bool:
+    """Compare two checkpoint archives outside independently owned subtrees.
+
+    Directory mtimes above an excluded child are omitted: replacing that child
+    necessarily changes those ancestor mtimes.  Every other archived metadata
+    field and every regular-file byte remains part of the comparison.
+    """
+    def relative(member: tarfile.TarInfo) -> tuple[str, ...]:
+        parts = Path(member.name).parts
+        return tuple(parts[1:])
+
+    def is_excluded(parts: tuple[str, ...]) -> bool:
+        return any(parts[:len(root)] == root for root in excluded)
+
+    def is_excluded_ancestor(parts: tuple[str, ...]) -> bool:
+        return any(len(parts) < len(root) and root[:len(parts)] == parts
+                   for root in excluded)
+
+    def metadata(member: tarfile.TarInfo) -> tuple[Any, ...]:
+        ancestor = member.isdir() and is_excluded_ancestor(relative(member))
+        pax = tuple(sorted((key, value) for key, value in member.pax_headers.items()
+                           if not (ancestor and key == "mtime")))
+        return (member.name, member.type, member.mode, member.uid, member.gid,
+                member.size, None if ancestor else member.mtime, member.linkname,
+                member.uname, member.gname, member.devmajor, member.devminor, pax)
+
+    def contents(bundle: tarfile.TarFile, member: tarfile.TarInfo) -> str | None:
+        if not member.isreg():
+            return None
+        source = bundle.extractfile(member)
+        if source is None:
+            return None
+        digest = hashlib.sha256()
+        with source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    try:
+        with tarfile.open(expected_path, "r") as expected_bundle, \
+                tarfile.open(actual_path, "r") as actual_bundle:
+            expected_members = [member for member in expected_bundle.getmembers()
+                                if not is_excluded(relative(member))]
+            actual_members = [member for member in actual_bundle.getmembers()
+                              if not is_excluded(relative(member))]
+            if ([member.name for member in expected_members]
+                    != [member.name for member in actual_members]):
+                return False
+            for expected, actual in zip(expected_members, actual_members):
+                if metadata(expected) != metadata(actual):
+                    return False
+                if contents(expected_bundle, expected) != contents(actual_bundle, actual):
+                    return False
+    except (OSError, tarfile.TarError):
+        return False
+    return True
+
+
 def _checkpoint_item_matches_live(tx: dict[str, Any], app_id: str,
                                   item: dict[str, Any]) -> bool:
     """Re-capture through the same primitive and compare its two receipts."""
@@ -4752,8 +4894,21 @@ def _checkpoint_item_matches_live(tx: dict[str, Any], app_id: str,
         current = temporary / "current.tar"
         digest, ephemeral = _write_checkpoint_archive(
             app_id, item["class"], item["scope"], path, current)
-        return (digest == item["sha256"]
-                and ephemeral == item.get("ephemeral_sockets", []))
+        recorded_ephemeral = item.get("ephemeral_sockets", [])
+        if digest == item["sha256"] and ephemeral == recorded_ephemeral:
+            return True
+        excluded = _nested_restore_owners(tx, app_id, path)
+        if not excluded:
+            return False
+
+        def outside(paths: list[str]) -> list[str]:
+            return [candidate for candidate in paths
+                    if not any(Path(candidate).parts[:len(root)] == root
+                               for root in excluded)]
+
+        return (outside(ephemeral) == outside(recorded_ephemeral)
+                and _checkpoint_archives_match_outside(
+                    archive, current, excluded))
     except LedgerError:
         return False
     finally:
@@ -5055,9 +5210,13 @@ def command_transaction_restore() -> int:
             )
             _write_resource_result(tx, resource_result)
         write_transaction(tx)
-    tx["phase"] = "rolled_back" if all_ok else "degraded"
+    tx["phase"] = ("rolling_back" if all_ok and tx.get("nginx_restore_owed")
+                   else "rolled_back" if all_ok else "degraded")
     write_transaction(tx)
-    log(f"transaction {tx['id']} {tx['phase']}")
+    if tx["phase"] == "rolling_back":
+        log(f"transaction {tx['id']} restored artifacts; nginx publication remains owed")
+    else:
+        log(f"transaction {tx['id']} {tx['phase']}")
     return 0 if all_ok else 1
 
 
@@ -5081,6 +5240,7 @@ def command_transaction_finish(phase: str) -> int:
         activation = tx.get("trusted_measurer_activation")
         if not isinstance(activation, dict) or activation.get("state") != "owed":
             fail("managed transaction requires an owed trusted measurer activation before commit")
+    tx.pop("nginx_restore_owed", None)
     tx["phase"] = "committed"
     write_transaction(tx)
     try:
@@ -5110,6 +5270,10 @@ def transaction_cli(argv: list[str]) -> int:
         return _transaction_update_list("touched" if command.endswith("touch") else "deactivated", argv[1])
     if command == "transaction-fail" and len(argv) == 3:
         return command_transaction_fail(argv[1], argv[2])
+    if command == "transaction-nginx-restore-owed" and len(argv) == 1:
+        return command_transaction_nginx_restore_owed()
+    if command == "transaction-nginx-restore-published" and len(argv) == 1:
+        return command_transaction_nginx_restore_published()
     if command == "transaction-resource-result" and len(argv) == 4:
         return command_transaction_resource_result(argv[1], argv[2], argv[3])
     if command == "transaction-restore" and len(argv) == 1:

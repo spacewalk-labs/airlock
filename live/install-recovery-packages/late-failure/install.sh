@@ -23,8 +23,7 @@ case "$AIRLOCK_INSTALL_RECOVERY_SCENARIO" in
     spool="$HOME/.local/state/airlock/dev-monitor/spool"
     database="$HOME/.local/state/airlock/dev-monitor/messages.db"
     heartbeat_id="heartbeat:$(date -u +%Y-%m-%d)"
-    (cd "$AIRLOCK_ROOT/apps/dev-monitor" \
-      && PYTHONDONTWRITEBYTECODE=1 python3 heartbeat.py --spool "$spool") \
+    (cd "$AIRLOCK_ROOT/apps/dev-monitor" && python3 heartbeat.py --spool "$spool") \
       > "$expected/heartbeat-producer.txt"
     chmod 0600 "$expected/heartbeat-producer.txt"
     consumed=0

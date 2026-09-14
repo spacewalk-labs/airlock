@@ -178,6 +178,7 @@ run_prerequisites() {
 run_installer() {
   local root="$1" config="$2" scenario="$3" path_prefix="$4" log="$5" rc=0
   as_user "cd '$root' && env AIRLOCK_CONFIG='$config' \
+    PYTHONDONTWRITEBYTECODE=1 \
     AIRLOCK_INSTALL_RECOVERY_SCENARIO='$scenario' \
     AIRLOCK_INSTALL_RECOVERY_MARKER_DIR='$DRIVER_STATE' \
     AIRLOCK_INSTALL_RECOVERY_STATE_DIR='$AIRLOCK_STATE' \

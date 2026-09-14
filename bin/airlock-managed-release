@@ -43,7 +43,17 @@ SCHEMA_IDS = {
 }
 SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
-PUBLIC_RELEASE_SUBJECT_RE = re.compile(r"release from airlock-work @ ([0-9a-f]{40})\Z")
+# Writers use ``release from source @ <full SHA>``.  Historical public releases
+# used a restricted repository label and sometimes an abbreviated SHA, so the
+# reader keeps that shape without naming a particular private repository.  The
+# negative lookahead prevents the compatibility branch from weakening the new
+# canonical spelling's full-SHA requirement.
+PUBLIC_RELEASE_SUBJECT_RE = re.compile(
+    r"release from (?:"
+    r"source @ (?P<canonical>[0-9a-f]{40})|"
+    r"(?!source @)[a-z0-9][a-z0-9._-]{0,63} @ (?P<legacy>[0-9a-f]{7,40})"
+    r")\Z"
+)
 ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 APP_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 CAPABILITY_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
@@ -341,7 +351,7 @@ def command_measure_public_core(args: argparse.Namespace) -> dict[str, Any]:
         fail("public release subject: malformed Git output")
     subject_match = PUBLIC_RELEASE_SUBJECT_RE.fullmatch(subject_text[:-1])
     if subject_match is None:
-        fail("public release subject: expected exact private source revision binding")
+        fail("public release subject: expected exact source revision binding")
 
     tree_raw = run([
         "git", "--no-replace-objects", "-C", os.fspath(repository),
@@ -362,7 +372,9 @@ def command_measure_public_core(args: argparse.Namespace) -> dict[str, Any]:
         "public_revision": revision,
         "public_tree": public_tree,
         "schema": SCHEMA_IDS["core_measurement"],
-        "source_revision": subject_match.group(1),
+        "source_revision": (
+            subject_match.group("canonical") or subject_match.group("legacy")
+        ),
     }
 
 

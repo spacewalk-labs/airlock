@@ -689,9 +689,13 @@ function runCase(kind) {
   const http = await runCase("http");
   check("run poll: an error status says the state is unknown, with the status",
         http.text.includes("HTTP 503") && http.text.includes("알 수 없습니다"), true);
+  check("run poll: a transient HTTP error is polled again instead of freezing the run",
+        JSON.stringify(http.timers), "[4000]");
   const json = await runCase("json");
   check("run poll: an unparseable answer says the state is unknown",
         json.text.includes("알 수 없습니다"), true);
+  check("run poll: an unparseable transient answer is polled again",
+        JSON.stringify(json.timers), "[4000]");
   // The two paths that DO have a reading must be exactly as before: this fix is about
   // the absence of a reading, and turning a real "running" into "unknown" would be the
   // same defect pointing the other way.

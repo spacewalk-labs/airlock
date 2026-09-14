@@ -26,7 +26,11 @@ from pathlib import Path, PurePosixPath
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}\Z")
 FULL_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-RELEASE_SOURCE = re.compile(r"(?:airlock-work\s*@\s*|source(?:-ref)?[=: ]+)([0-9a-f]{7,40})", re.I)
+RELEASE_SOURCE = re.compile(
+    r"(?:release from [a-z0-9][a-z0-9._-]{0,63}\s*@\s*|"
+    r"source(?:-ref)?[=: ]+)([0-9a-f]{7,40})",
+    re.I,
+)
 STALE_ENV = re.compile(r"(?:AIRLOCK_)?DEVTERM_(?:ACCOUNTS|XAI)(?:=|_)")
 
 ASSETS = (

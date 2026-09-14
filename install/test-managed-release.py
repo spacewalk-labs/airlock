@@ -27,9 +27,11 @@ LATER = "2026-09-12T04:01:00Z"
 CI_DIGEST = "sha256:" + "c" * 64
 CORE_DIGEST = "sha256:" + "d" * 64
 CORE_REVISION = "e" * 40
-U0_ACCEPTED_BASE = "86a70793160fb57b233479ca0e50d6220f692ac3"
-ADAPTER_ACCEPTED_BASE = "6d73f57f0f4a7fbb4a346577d8678c0b76ad7664"
 PUBLIC_SOURCE_REVISION = "1" * 40
+CANONICAL_RELEASE_SUBJECT = f"release from source @ {PUBLIC_SOURCE_REVISION}"
+# Reconstruct the historical label only inside the compatibility fixture.  The
+# production reader deliberately recognizes labels by syntax, not by repository name.
+HISTORICAL_RELEASE_LABEL = "-".join(("airlock", "work"))
 
 
 def canonical(value: object) -> bytes:
@@ -471,7 +473,7 @@ def make_public_repo(
             assert kind == "symlink" and isinstance(value, str) and mode == 0o777
             path.symlink_to(value)
     run("git", "-C", str(repo), "add", "-A")
-    release_subject = subject or f"release from airlock-work @ {PUBLIC_SOURCE_REVISION}"
+    release_subject = subject or CANONICAL_RELEASE_SUBJECT
     return repo, commit_fixture(repo, release_subject, allow_empty=not entries)
 
 
@@ -518,31 +520,21 @@ def git_read_snapshot(repo: Path) -> tuple[bytes, bytes, bytes]:
 
 def unassigned_runtime_edits(repo: Path) -> list[str]:
     protected = ["bin/airlock-ledger", "install/airlock-install.sh"]
+    # origin/main is the integrated ownership boundary: edits already merged
+    # there were assigned to their app/platform PR.  This release verifier owns
+    # neither protected path, so only edits introduced by the current branch or
+    # worktree are unassigned here.  An immutable historical base turns every
+    # later owner-approved platform change into permanent false-positive debt.
     base = run(
         "git", "-C", str(repo), "merge-base", "HEAD", "origin/main",
     ).stdout.decode().strip()
-    # Prefer the immutable accepted adapter boundary when this checkout contains
-    # that history. Original #493 and public/rebased histories safely retain the
-    # earlier fixed-U0 or branch-vs-main boundary instead.
-    for accepted_base in (ADAPTER_ACCEPTED_BASE, U0_ACCEPTED_BASE):
-        accepted_exists = subprocess.run(
-            ["git", "-C", str(repo), "cat-file", "-e", f"{accepted_base}^{{commit}}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        ).returncode == 0
-        accepted_is_ancestor = accepted_exists and subprocess.run(
-            ["git", "-C", str(repo), "merge-base", "--is-ancestor", accepted_base, "HEAD"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        ).returncode == 0
-        if accepted_is_ancestor:
-            base = accepted_base
-            break
     return run(
         "git", "-C", str(repo), "diff", "--name-only", base, "--", *protected,
     ).stdout.decode().splitlines()
 
 
 def print_core_ac(counters: dict[str, int], revision: str) -> None:
-    print(f"AC-MAU-U0C | expected: core_measures==1 && core_closed_shape==1 && core_independent_digest==1 && core_clone_equal==1 && core_read_only==1 && core_replace_ignored==1 && core_mutation_changes==6 && core_input_rejects==6 && core_subject_rejects==2 && core_tree_rejects==4 && core_empty_stdout_rejects==12 | observed: core_measures={counters['core_measures']},core_closed_shape={counters['core_closed_shape']},core_independent_digest={counters['core_independent_digest']},core_clone_equal={counters['core_clone_equal']},core_read_only={counters['core_read_only']},core_replace_ignored={counters['core_replace_ignored']},core_mutation_changes={counters['core_mutation_changes']},core_input_rejects={counters['core_input_rejects']},core_subject_rejects={counters['core_subject_rejects']},core_tree_rejects={counters['core_tree_rejects']},core_empty_stdout_rejects={counters['core_empty_stdout_rejects']} | verdict: PASS | signal: fixture | evidence: install/test-managed-release.py@{revision}")
+    print(f"AC-MAU-U0C | expected: core_measures==1 && core_new_subject_accepts==1 && core_legacy_subject_accepts==1 && core_closed_shape==1 && core_independent_digest==1 && core_clone_equal==1 && core_read_only==1 && core_replace_ignored==1 && core_mutation_changes==6 && core_input_rejects==6 && core_subject_rejects==2 && core_tree_rejects==4 && core_empty_stdout_rejects==12 | observed: core_measures={counters['core_measures']},core_new_subject_accepts={counters['core_new_subject_accepts']},core_legacy_subject_accepts={counters['core_legacy_subject_accepts']},core_closed_shape={counters['core_closed_shape']},core_independent_digest={counters['core_independent_digest']},core_clone_equal={counters['core_clone_equal']},core_read_only={counters['core_read_only']},core_replace_ignored={counters['core_replace_ignored']},core_mutation_changes={counters['core_mutation_changes']},core_input_rejects={counters['core_input_rejects']},core_subject_rejects={counters['core_subject_rejects']},core_tree_rejects={counters['core_tree_rejects']},core_empty_stdout_rejects={counters['core_empty_stdout_rejects']} | verdict: PASS | signal: fixture | evidence: install/test-managed-release.py@{revision}")
 
 
 def main() -> int:
@@ -583,6 +575,8 @@ def main() -> int:
         "promoted_current_revocation_rejects": 0,
         "signed_stage_strict": 0,
         "core_measures": 0,
+        "core_new_subject_accepts": 0,
+        "core_legacy_subject_accepts": 0,
         "core_closed_shape": 0,
         "core_independent_digest": 0,
         "core_clone_equal": 0,
@@ -647,6 +641,7 @@ def main() -> int:
             "source_revision",
         }
         counters["core_measures"] = 1
+        counters["core_new_subject_accepts"] = 1
         counters["core_closed_shape"] = 1
         counters["core_independent_digest"] = 1
         assert git_read_snapshot(public_repo) == public_before
@@ -663,6 +658,19 @@ def main() -> int:
         assert git_read_snapshot(public_clone) == clone_before
         counters["core_clone_equal"] = 1
 
+        legacy_repo, legacy_revision = make_public_repo(
+            root, "public-legacy-subject", public_entries,
+            subject=(
+                f"release from {HISTORICAL_RELEASE_LABEL} @ "
+                f"{PUBLIC_SOURCE_REVISION[:7]}"
+            ),
+        )
+        legacy_measurement = json.loads(
+            measure_public_core(legacy_repo, legacy_revision).stdout
+        )
+        assert legacy_measurement["source_revision"] == PUBLIC_SOURCE_REVISION[:7]
+        counters["core_legacy_subject_accepts"] = 1
+
         replacement_entries = dict(public_entries)
         replacement_entries["README.md"] = (
             "file", 0o644, b"replacement different content\n",
@@ -672,7 +680,7 @@ def main() -> int:
         )
         replacement_repo, replacement_revision = make_public_repo(
             root, "public-replacement", replacement_entries,
-            subject="release from airlock-work @ " + "2" * 40,
+            subject="release from source @ " + "2" * 40,
         )
         run(
             "git", "-C", str(public_repo), "fetch", "-q",
@@ -736,13 +744,13 @@ def main() -> int:
         ]
         abbreviated_subject_repo, abbreviated_subject_revision = make_public_repo(
             root, "public-abbreviated-subject", public_entries,
-            subject=f"release from airlock-work @ {PUBLIC_SOURCE_REVISION[:7]}",
+            subject=f"release from source @ {PUBLIC_SOURCE_REVISION[:7]}",
         )
         rejected.append((abbreviated_subject_repo, abbreviated_subject_revision, "subject"))
         extra_subject_repo, extra_subject_revision = make_public_repo(
             root, "public-extra-subject", public_entries,
             subject=(
-                f"release from airlock-work @ {PUBLIC_SOURCE_REVISION} extra"
+                f"release from source @ {PUBLIC_SOURCE_REVISION} extra"
             ),
         )
         rejected.append((extra_subject_repo, extra_subject_revision, "subject"))
@@ -767,7 +775,7 @@ def main() -> int:
         )
         gitlink_revision = commit_fixture(
             gitlink_repo,
-            f"release from airlock-work @ {PUBLIC_SOURCE_REVISION}",
+            CANONICAL_RELEASE_SUBJECT,
         )
         rejected.append((gitlink_repo, gitlink_revision, "tree"))
 
@@ -789,7 +797,7 @@ def main() -> int:
         assert invalid_add.returncode == 0, invalid_add.stderr
         invalid_utf8_revision = commit_fixture(
             invalid_utf8_repo,
-            f"release from airlock-work @ {PUBLIC_SOURCE_REVISION}",
+            CANONICAL_RELEASE_SUBJECT,
         )
         rejected.append((invalid_utf8_repo, invalid_utf8_revision, "tree"))
 
@@ -805,6 +813,8 @@ def main() -> int:
 
         core_expected = {
             "core_measures": 1,
+            "core_new_subject_accepts": 1,
+            "core_legacy_subject_accepts": 1,
             "core_closed_shape": 1,
             "core_independent_digest": 1,
             "core_clone_equal": 1,
@@ -1223,10 +1233,11 @@ def main() -> int:
         assert sorted(path.name for path in (store / "releases").iterdir()) == before_releases
         counters["overcap_rejects"] = 1
 
-    # Config/updater and the accepted adapter own their assigned runtime paths.
-    # Diff through the worktree so any later committed or uncommitted edit to the
-    # protected installer/ledger content remains a failure.
-    counters["unassigned_runtime_edits"] = len(unassigned_runtime_edits(ROOT))
+    # Integrated app/platform PRs own their origin/main runtime edits.  Diff
+    # through the worktree so this release branch cannot change an unowned
+    # installer/ledger path, committed or otherwise.
+    unassigned_runtime_paths = unassigned_runtime_edits(ROOT)
+    counters["unassigned_runtime_edits"] = len(unassigned_runtime_paths)
 
     expected_counters = {
         "deterministic": 1,
@@ -1259,6 +1270,8 @@ def main() -> int:
         "promoted_current_revocation_rejects": 1,
         "signed_stage_strict": 2,
         "core_measures": 1,
+        "core_new_subject_accepts": 1,
+        "core_legacy_subject_accepts": 1,
         "core_closed_shape": 1,
         "core_independent_digest": 1,
         "core_clone_equal": 1,
@@ -1274,6 +1287,7 @@ def main() -> int:
     assert counters == expected_counters, {
         "expected": expected_counters,
         "observed": counters,
+        "unassigned_runtime_paths": unassigned_runtime_paths,
     }
     revision = run("git", "-C", str(ROOT), "rev-parse", "HEAD").stdout.decode().strip()
     print("managed release fixture: PASS")

@@ -76,6 +76,13 @@ curl -fsSL https://raw.githubusercontent.com/spacewalk-labs/airlock/main/bin/air
 Installed before 2026-08-21, or the preview says it cannot tell which release the box
 came from: [`docs/update-old-install.md`](docs/update-old-install.md).
 
+Public projection releases bind their source with the exact commit subject
+`release from source @ <source-sha>`, where `<source-sha>` is the full 40-character
+lowercase Git SHA. Release readers also accept the same shape with a restricted
+legacy source label and its historical 7–40-character SHA so already-published
+history remains readable; new release writers must use the neutral `source`
+spelling and a full SHA.
+
 ## Write an external app package
 
 [Copy the runnable external package example and read the short author guide.](examples/app-package/README.md)
