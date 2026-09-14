@@ -185,11 +185,11 @@ if [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
   DEVMON_ENV_OUTPUT="$AIRLOCK_RENDER_DIR/files/dev-monitor.env"
 fi
 # The spool is written by a SECOND UID, which therefore has to traverse every directory
-# above it. The one in the way is Airlock's own state directory: install/airlock-install.sh
-# creates it 0700, which is right for a directory holding the ledger and wrong for a
-# parent this app needs a foreign uid to walk through. So widen exactly that one bit,
-# here, where it is the OPERATOR doing it to their own directory — no sudo, and nothing
-# root-owned is involved.
+# above it. Airlock's own state directory is created 0700, and Ubuntu can create the
+# account home 0700 too. Both are right for private contents and wrong when they are
+# ancestors of a path this app deliberately shares with a foreign uid. Widen exactly
+# the traverse bit on the user-owned ancestor chain here, where it is the OPERATOR doing
+# it — no sudo, and nothing root-owned is involved.
 #
 # `o+x` and not `o+rx`: traverse, never list. The ledger beside us stays 0600 and the
 # directory stays unlistable, so what this grants is the ability to reach a path you
@@ -201,10 +201,17 @@ fi
 # Measured 2026-08-22: without this the install dies in install-spool-hardening.sh's
 # cross-UID check, which is the check written to catch precisely this.
 _devmon_state_parent="$(dirname "$DEVMON_STATE")"
-if [ -d "$_devmon_state_parent" ]; then
-  chmod o+x "$_devmon_state_parent" \
-    || die "cannot make $_devmon_state_parent traversable for the spool writer"
+_devmon_traverse_dirs=("$_devmon_state_parent")
+if [ "$MESSAGES" = true ] && [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+  _devmon_traverse_dirs=(
+    "$HOME" "$HOME/.local" "$HOME/.local/state" "$_devmon_state_parent"
+  )
 fi
+for _devmon_traverse_dir in "${_devmon_traverse_dirs[@]}"; do
+  [ ! -d "$_devmon_traverse_dir" ] \
+    || chmod o+x "$_devmon_traverse_dir" \
+    || die "cannot make $_devmon_traverse_dir traversable for the spool writer"
+done
 
 # A legacy messages DB cannot be opened by the current backend.  Run on its own, this
 # script converts it here, before it renders or starts the replacement.  Under the

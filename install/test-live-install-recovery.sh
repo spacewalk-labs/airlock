@@ -79,6 +79,48 @@ else
   sed 's/^/    /' "$TMP/config-matrix.out"
 fi
 
+# The fresh collector must query the same resolved backend port that the
+# installed dev-monitor service receives. A non-default port is the negative
+# control: a stale literal can pass at the default and fail only on this path.
+collector_port_rc=0
+python3 - "$ROOT" "$CONFIG_MATRIX" <<'PY' > "$TMP/collector-port.out" 2>&1 || collector_port_rc=$?
+from pathlib import Path
+import os
+import subprocess
+import sys
+
+root, matrix = map(Path, sys.argv[1:])
+driver = (root / "live/in-container.sh").read_text(encoding="utf-8")
+assert "18804" not in driver
+assert "bin/airlock-config get apps.dev-monitor.backend_port" in driver
+assert 'DEVMON_HEALTH_URL="http://127.0.0.1:${DEVMON_BACKEND_PORT}/api/health"' in driver
+
+changed = matrix / "collector-port-change.toml"
+changed.write_text(
+    (matrix / "baseline.toml").read_text(encoding="utf-8").replace(
+        "[apps.dev-monitor]\nmessages = false",
+        "[apps.dev-monitor]\nbackend_port = 19924\nmessages = false",
+    ),
+    encoding="utf-8",
+)
+result = subprocess.run(
+    [sys.executable, str(root / "bin/airlock-config"), "get",
+     "apps.dev-monitor.backend_port"],
+    cwd=root, env=dict(os.environ, AIRLOCK_CONFIG=str(changed)),
+    text=True, capture_output=True,
+)
+assert result.returncode == 0, result.stderr
+assert result.stdout.strip() == "19924", result.stdout
+print("collector resolves the changed effective backend port")
+PY
+if [ "$collector_port_rc" = 0 ] \
+   && grep -q 'collector resolves the changed effective backend port' "$TMP/collector-port.out"; then
+  ok "collector resolves the configured backend port instead of a stale literal"
+else
+  bad "collector health URL ignored a changed configured backend port"
+  sed 's/^/    /' "$TMP/collector-port.out"
+fi
+
 # Root runs the inner driver, while the historical installer runs as LIVE_USER.
 # Exercise the real directory-preparation helper and require every XDG parent it
 # creates to be traversable and owned by that installer user.

@@ -239,13 +239,27 @@ cat /tmp/smoke.log >&2
 devmon_no_webhook_rc=0
 if [ "$LIVE_DEVMON_MESSAGES" = true ]; then
   say "== dev-monitor messages-on/no-webhook watchdog gate =="
-  su - "$LIVE_USER" -c \
-    "python3 '$SRC/live/check-devmon-no-webhook.py' \
-      '$HOMEDIR/.local/state/airlock/dev-monitor/messages.db' \
-      '$SRC/apps/dev-monitor/backend' 'http://127.0.0.1:18804/api/health' \
-      '$LIVE_SOAK' '$SOAK_ELAPSED_MS'" \
-    >/tmp/devmon-no-webhook.json 2>/tmp/devmon-no-webhook.err || devmon_no_webhook_rc=$?
-  cat /tmp/devmon-no-webhook.err >&2
+  devmon_port_rc=0
+  DEVMON_BACKEND_PORT="$(su - "$LIVE_USER" -c \
+    "cd '$SRC' && AIRLOCK_CONFIG='$HOMEDIR/airlock.toml' \
+      python3 bin/airlock-config get apps.dev-monitor.backend_port")" \
+    || devmon_port_rc=$?
+  if [ "$devmon_port_rc" != 0 ] || [[ ! "$DEVMON_BACKEND_PORT" =~ ^[0-9]+$ ]] \
+      || [ "$DEVMON_BACKEND_PORT" -lt 1 ] || [ "$DEVMON_BACKEND_PORT" -gt 65535 ]; then
+    say "could not resolve a valid dev-monitor backend port for the watchdog collector"
+    printf '%s\n' '{"error":"invalid effective dev-monitor backend port"}' \
+      > /tmp/devmon-no-webhook.json
+    devmon_no_webhook_rc=1
+  else
+    DEVMON_HEALTH_URL="http://127.0.0.1:${DEVMON_BACKEND_PORT}/api/health"
+    su - "$LIVE_USER" -c \
+      "python3 '$SRC/live/check-devmon-no-webhook.py' \
+        '$HOMEDIR/.local/state/airlock/dev-monitor/messages.db' \
+        '$SRC/apps/dev-monitor/backend' '$DEVMON_HEALTH_URL' \
+        '$LIVE_SOAK' '$SOAK_ELAPSED_MS'" \
+      >/tmp/devmon-no-webhook.json 2>/tmp/devmon-no-webhook.err || devmon_no_webhook_rc=$?
+    cat /tmp/devmon-no-webhook.err >&2
+  fi
 else
   printf '%s\n' '{"skipped":true}' > /tmp/devmon-no-webhook.json
 fi

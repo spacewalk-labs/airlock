@@ -1016,6 +1016,27 @@ devmon_standalone_fallback() {
   fi
 }
 
+devmon_home_traversal() {
+  reset_fixture
+  local cfg="$TMP/devmon-home-traversal.toml" rc=0
+  prepare_devmon_migration "$cfg" \
+    || { bad "devmon-home-traversal: setup failed"; tail -30 "$TMP/devmon-first.log"; return; }
+
+  # Ubuntu 24.04 creates a private account home. The messages writer is a separate
+  # system uid, so a correct install must grant traverse-only access before the
+  # spool hardening probe walks through HOME to the user-owned state directory.
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$TMP/devmon-v2/smoke.sh"
+  chmod +x "$TMP/devmon-v2/smoke.sh"
+  chmod 0700 "$FAKEHOME"
+  devmon_orch "$cfg" >"$TMP/devmon-home-traversal.log" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && [ "$(stat -c %a "$FAKEHOME")" = 701 ]; then
+    ok "devmon-home-traversal: a private account home becomes traverse-only for the dedicated spool writer"
+  else
+    bad "devmon-home-traversal: rc=$rc home_mode=$(stat -c %a "$FAKEHOME")"
+    tail -25 "$TMP/devmon-home-traversal.log" | sed 's/^/    /'
+  fi
+}
+
 devmon_owed_activation_does_not_block_others() {
   # An activation still owed means dev-monitor is stopped. A later run that does not
   # reinstall it must not fail its smoke and roll back unrelated apps.
@@ -1711,6 +1732,7 @@ case "$case_name" in
   devmon-keep-forward-bound) devmon_keep_forward_is_bound ;;
   devmon-keep-forward-evidence) devmon_keep_forward_evidence_rechecked ;;
   devmon-standalone-fallback) devmon_standalone_fallback ;;
+  devmon-home-traversal) devmon_home_traversal ;;
   devmon-standalone-after-writer) devmon_standalone_after_writer ;;
   devmon-default-state-dir) devmon_default_state_dir ;;
   devmon-crash-reentry) devmon_crash_reentry ;;
@@ -1746,6 +1768,7 @@ case "$case_name" in
     devmon_keep_forward_is_bound
     devmon_keep_forward_evidence_rechecked
     devmon_standalone_fallback
+    devmon_home_traversal
     devmon_standalone_after_writer
     devmon_default_state_dir
     devmon_crash_reentry
