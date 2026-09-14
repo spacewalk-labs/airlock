@@ -28,6 +28,40 @@ CI_DIGEST = "sha256:" + "c" * 64
 CORE_DIGEST = "sha256:" + "d" * 64
 CORE_REVISION = "e" * 40
 PUBLIC_SOURCE_REVISION = "1" * 40
+RUNTIME_PATH_ACCEPTANCES = {
+    "install/airlock-install.sh": (
+        {
+            "owner": "platform",
+            "pr": 518,
+            "commit": "d805ffe82eb0f2a859deebe798b1cd8cc2757a82",
+            "blob": "a4a6056a1becfd7d8ba1362980eda610d4dc1d55",
+            "mode": "100755",
+        },
+        {
+            "owner": "platform",
+            "pr": 563,
+            "commit": "53d5649710d04f6baa7183ef3ac25bcf22cebd9b",
+            "blob": "b06735f65bb5c4fff4618bb0a100abcfb754b4da",
+            "mode": "100755",
+        },
+    ),
+    "bin/airlock-ledger": (
+        {
+            "owner": "platform",
+            "pr": 561,
+            "commit": "4dc8856d655fd6c20782ea7e36c8a3065842c0c6",
+            "blob": "377f1a68429e2d5db0a13e8b477f500d0b50c867",
+            "mode": "100755",
+        },
+        {
+            "owner": "platform",
+            "pr": 563,
+            "commit": "53d5649710d04f6baa7183ef3ac25bcf22cebd9b",
+            "blob": "82dd7be8b180f294edec5a50480212369effedeb",
+            "mode": "100755",
+        },
+    ),
+}
 CANONICAL_RELEASE_SUBJECT = f"release from source @ {PUBLIC_SOURCE_REVISION}"
 # Reconstruct the historical label only inside the compatibility fixture.  The
 # production reader deliberately recognizes labels by syntax, not by repository name.
@@ -518,19 +552,151 @@ def git_read_snapshot(repo: Path) -> tuple[bytes, bytes, bytes]:
     )
 
 
-def unassigned_runtime_edits(repo: Path) -> list[str]:
-    protected = ["bin/airlock-ledger", "install/airlock-install.sh"]
-    # origin/main is the integrated ownership boundary: edits already merged
-    # there were assigned to their app/platform PR.  This release verifier owns
-    # neither protected path, so only edits introduced by the current branch or
-    # worktree are unassigned here.  An immutable historical base turns every
-    # later owner-approved platform change into permanent false-positive debt.
-    base = run(
-        "git", "-C", str(repo), "merge-base", "HEAD", "origin/main",
-    ).stdout.decode().strip()
-    return run(
-        "git", "-C", str(repo), "diff", "--name-only", base, "--", *protected,
-    ).stdout.decode().splitlines()
+def unassigned_runtime_edits(
+    repo: Path,
+    acceptances: dict[str, tuple[dict[str, object], ...]] = RUNTIME_PATH_ACCEPTANCES,
+) -> list[str]:
+    # The remote integration ref is required even though it is not the baseline:
+    # losing it must fail closed rather than silently making every HEAD trusted.
+    run("git", "-C", str(repo), "rev-parse", "--verify", "origin/main^{commit}")
+    changed: list[str] = []
+    for path, history in acceptances.items():
+        assert history, f"runtime ownership acceptance missing for {path}"
+        previous_commit: str | None = None
+        for acceptance in history:
+            owner = acceptance.get("owner")
+            pr = acceptance.get("pr")
+            commit = acceptance.get("commit")
+            blob = acceptance.get("blob")
+            mode = acceptance.get("mode")
+            assert isinstance(owner, str) and owner, f"runtime owner missing for {path}"
+            assert isinstance(pr, int) and pr > 0, f"runtime approval PR missing for {path}"
+            assert isinstance(commit, str) and len(commit) == 40 \
+                and all(character in "0123456789abcdef" for character in commit), \
+                f"runtime approval commit invalid for {path}"
+            assert isinstance(blob, str) and len(blob) == 40 \
+                and all(character in "0123456789abcdef" for character in blob), \
+                f"runtime approval blob invalid for {path}"
+            assert mode in ("100644", "100755"), f"runtime approval mode invalid for {path}"
+
+            commit_exists = subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", f"{commit}^{{commit}}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            ).returncode == 0
+            if commit_exists:
+                accepted_entry = run(
+                    "git", "-C", str(repo), "ls-tree", commit, "--", path,
+                ).stdout.decode().strip()
+                assert accepted_entry == f"{mode} blob {blob}\t{path}", (
+                    f"runtime approval #{pr} does not bind its declared {path} blob"
+                )
+                if previous_commit is not None:
+                    run(
+                        "git", "-C", str(repo), "merge-base", "--is-ancestor",
+                        previous_commit, commit,
+                    )
+                previous_commit = commit
+
+        latest = history[-1]
+        latest_commit = latest["commit"]
+        latest_exists = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", f"{latest_commit}^{{commit}}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        ).returncode == 0
+        if latest_exists:
+            run(
+                "git", "-C", str(repo), "merge-base", "--is-ancestor",
+                str(latest_commit), "origin/main",
+            )
+        accepted_entry = (
+            f"{latest['mode']} blob {latest['blob']}\t{path}"
+        )
+        head_entry = run(
+            "git", "-C", str(repo), "ls-tree", "HEAD", "--", path,
+        ).stdout.decode().strip()
+        worktree_changed = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--", path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        ).returncode != 0
+        if head_entry != accepted_entry or worktree_changed:
+            changed.append(path)
+    return sorted(changed)
+
+
+def runtime_ownership_mutation_fixture() -> dict[str, int]:
+    counters = {
+        "runtime_committed_mutation_rejects": 0,
+        "runtime_worktree_mutation_rejects": 0,
+        "runtime_unapproved_advance_rejects": 0,
+    }
+    contents = {
+        "install/airlock-install.sh": b"#!/bin/sh\nexit 0\n",
+        "bin/airlock-ledger": b"#!/usr/bin/env python3\n",
+    }
+    with tempfile.TemporaryDirectory(prefix="airlock-runtime-ownership-") as temporary:
+        repo = Path(temporary) / "repo"
+        repo.mkdir()
+        run("git", "init", "-q", "-b", "main", str(repo))
+        run("git", "-C", str(repo), "config", "user.name", "Runtime ownership fixture")
+        run("git", "-C", str(repo), "config", "user.email", "fixture@example.invalid")
+        for path, raw in contents.items():
+            target = repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+            target.chmod(0o755)
+        run("git", "-C", str(repo), "add", "--", *contents)
+        run("git", "-C", str(repo), "commit", "-q", "-m", "accepted runtime owners")
+        accepted_commit = run(
+            "git", "-C", str(repo), "rev-parse", "HEAD",
+        ).stdout.decode().strip()
+        run(
+            "git", "-C", str(repo), "update-ref",
+            "refs/remotes/origin/main", accepted_commit,
+        )
+        fixture_acceptances: dict[str, tuple[dict[str, object], ...]] = {}
+        for path in contents:
+            entry = run(
+                "git", "-C", str(repo), "ls-tree", accepted_commit, "--", path,
+            ).stdout.decode().strip()
+            metadata, recorded_path = entry.split("\t", 1)
+            mode, kind, blob = metadata.split()
+            assert kind == "blob" and recorded_path == path
+            fixture_acceptances[path] = ({
+                "owner": "fixture-platform",
+                "pr": 1,
+                "commit": accepted_commit,
+                "blob": blob,
+                "mode": mode,
+            },)
+        assert unassigned_runtime_edits(repo, fixture_acceptances) == []
+
+        run("git", "-C", str(repo), "switch", "-q", "-c", "committed-mutation")
+        (repo / "bin/airlock-ledger").write_bytes(b"#!/usr/bin/env python3\n# changed\n")
+        run("git", "-C", str(repo), "add", "--", "bin/airlock-ledger")
+        run("git", "-C", str(repo), "commit", "-q", "-m", "unapproved ledger edit")
+        assert unassigned_runtime_edits(repo, fixture_acceptances) == ["bin/airlock-ledger"]
+        counters["runtime_committed_mutation_rejects"] = 1
+
+        run("git", "-C", str(repo), "switch", "-q", "main")
+        (repo / "install/airlock-install.sh").write_bytes(b"#!/bin/sh\n# changed\nexit 0\n")
+        assert unassigned_runtime_edits(repo, fixture_acceptances) == ["install/airlock-install.sh"]
+        counters["runtime_worktree_mutation_rejects"] = 1
+        (repo / "install/airlock-install.sh").write_bytes(contents["install/airlock-install.sh"])
+        assert unassigned_runtime_edits(repo, fixture_acceptances) == []
+
+        (repo / "bin/airlock-ledger").write_bytes(b"#!/usr/bin/env python3\n# unapproved main\n")
+        run("git", "-C", str(repo), "add", "--", "bin/airlock-ledger")
+        run("git", "-C", str(repo), "commit", "-q", "-m", "unapproved main advance")
+        advanced_main = run(
+            "git", "-C", str(repo), "rev-parse", "HEAD",
+        ).stdout.decode().strip()
+        run(
+            "git", "-C", str(repo), "update-ref",
+            "refs/remotes/origin/main", advanced_main,
+        )
+        assert unassigned_runtime_edits(repo, fixture_acceptances) == ["bin/airlock-ledger"]
+        counters["runtime_unapproved_advance_rejects"] = 1
+    return counters
 
 
 def print_core_ac(counters: dict[str, int], revision: str) -> None:
@@ -587,6 +753,9 @@ def main() -> int:
         "core_subject_rejects": 0,
         "core_tree_rejects": 0,
         "core_empty_stdout_rejects": 0,
+        "runtime_committed_mutation_rejects": 0,
+        "runtime_worktree_mutation_rejects": 0,
+        "runtime_unapproved_advance_rejects": 0,
         "unassigned_runtime_edits": -1,
     }
     schema = json.loads(SCHEMA.read_text())
@@ -1233,9 +1402,10 @@ def main() -> int:
         assert sorted(path.name for path in (store / "releases").iterdir()) == before_releases
         counters["overcap_rejects"] = 1
 
-    # Integrated app/platform PRs own their origin/main runtime edits.  Diff
-    # through the worktree so this release branch cannot change an unowned
-    # installer/ledger path, committed or otherwise.
+    # Only the per-path owner approval ledger advances these protected bytes.
+    # A branch commit, worktree edit, or unapproved origin/main advance must all
+    # remain visible instead of inheriting trust from the moving integration ref.
+    counters.update(runtime_ownership_mutation_fixture())
     unassigned_runtime_paths = unassigned_runtime_edits(ROOT)
     counters["unassigned_runtime_edits"] = len(unassigned_runtime_paths)
 
@@ -1282,6 +1452,9 @@ def main() -> int:
         "core_subject_rejects": 2,
         "core_tree_rejects": 4,
         "core_empty_stdout_rejects": 12,
+        "runtime_committed_mutation_rejects": 1,
+        "runtime_worktree_mutation_rejects": 1,
+        "runtime_unapproved_advance_rejects": 1,
         "unassigned_runtime_edits": 0,
     }
     assert counters == expected_counters, {
@@ -1292,7 +1465,7 @@ def main() -> int:
     revision = run("git", "-C", str(ROOT), "rev-parse", "HEAD").stdout.decode().strip()
     print("managed release fixture: PASS")
     print(f"AC-MAU-R1 | expected: deterministic==1 && receipt==1 && forward_recovery==1 | observed: deterministic={counters['deterministic']},receipt={counters['receipt']},forward_recovery={counters['forward_recovery']} | verdict: PASS | signal: fixture | evidence: install/test-managed-release.py@{revision}")
-    print(f"AC-MAU-R2 | expected: tamper_rejects==5 && replay_rejects==1 && revoked_rejects==1 && membership_rollback_rejects==1 && membership_equivocation_rejects==1 && invalid_authority_rejects==1 && overcap_rejects==1 && nonmember_rejects==1 && partial_rejects==1 && unassigned_runtime_edits==0 | observed: tamper_rejects={counters['tamper_rejects']},replay_rejects={counters['replay_rejects']},revoked_rejects={counters['revoked_rejects']},membership_rollback_rejects={counters['membership_rollback_rejects']},membership_equivocation_rejects={counters['membership_equivocation_rejects']},invalid_authority_rejects={counters['invalid_authority_rejects']},overcap_rejects={counters['overcap_rejects']},nonmember_rejects={counters['nonmember_rejects']},partial_rejects={counters['partial_rejects']},unassigned_runtime_edits={counters['unassigned_runtime_edits']} | verdict: PASS | signal: fixture | evidence: install/test-managed-release.py@{revision}")
+    print(f"AC-MAU-R2 | expected: tamper_rejects==5 && replay_rejects==1 && revoked_rejects==1 && membership_rollback_rejects==1 && membership_equivocation_rejects==1 && invalid_authority_rejects==1 && overcap_rejects==1 && nonmember_rejects==1 && partial_rejects==1 && runtime_committed_mutation_rejects==1 && runtime_worktree_mutation_rejects==1 && runtime_unapproved_advance_rejects==1 && unassigned_runtime_edits==0 | observed: tamper_rejects={counters['tamper_rejects']},replay_rejects={counters['replay_rejects']},revoked_rejects={counters['revoked_rejects']},membership_rollback_rejects={counters['membership_rollback_rejects']},membership_equivocation_rejects={counters['membership_equivocation_rejects']},invalid_authority_rejects={counters['invalid_authority_rejects']},overcap_rejects={counters['overcap_rejects']},nonmember_rejects={counters['nonmember_rejects']},partial_rejects={counters['partial_rejects']},runtime_committed_mutation_rejects={counters['runtime_committed_mutation_rejects']},runtime_worktree_mutation_rejects={counters['runtime_worktree_mutation_rejects']},runtime_unapproved_advance_rejects={counters['runtime_unapproved_advance_rejects']},unassigned_runtime_edits={counters['unassigned_runtime_edits']} | verdict: PASS | signal: fixture | evidence: install/test-managed-release.py@{revision}")
     print(f"AC-MAU-U0 | expected: current_resolves==1 && current_closed_shape==1 && current_read_only==1 && current_symlink_rejects==2 && current_receipt_rejects==1 && current_pointer_rejects==1 && current_race_rejects==1 && current_signed_race_rejects==3 && current_revocation_rejects==1 | observed: current_resolves={counters['current_resolves']},current_closed_shape={counters['current_closed_shape']},current_read_only={counters['current_read_only']},current_symlink_rejects={counters['current_symlink_rejects']},current_receipt_rejects={counters['current_receipt_rejects']},current_pointer_rejects={counters['current_pointer_rejects']},current_race_rejects={counters['current_race_rejects']},current_signed_race_rejects={counters['current_signed_race_rejects']},current_revocation_rejects={counters['current_revocation_rejects']} | verdict: PASS | signal: fixture | evidence: install/test-managed-release.py@{revision}")
     print(f"AC-MAU-U0P | expected: promoted_current_verifies==1 && promoted_current_closed_shape==1 && promoted_current_missing_rejects==1 && promoted_current_modified_rejects==1 && promoted_current_foreign_rejects==1 && promoted_current_stale_rejects==1 && promoted_current_revocation_rejects==1 && signed_stage_strict==2 | observed: promoted_current_verifies={counters['promoted_current_verifies']},promoted_current_closed_shape={counters['promoted_current_closed_shape']},promoted_current_missing_rejects={counters['promoted_current_missing_rejects']},promoted_current_modified_rejects={counters['promoted_current_modified_rejects']},promoted_current_foreign_rejects={counters['promoted_current_foreign_rejects']},promoted_current_stale_rejects={counters['promoted_current_stale_rejects']},promoted_current_revocation_rejects={counters['promoted_current_revocation_rejects']},signed_stage_strict={counters['signed_stage_strict']} | verdict: PASS | signal: fixture | evidence: install/test-managed-release.py@{revision}")
     print_core_ac(counters, revision)
