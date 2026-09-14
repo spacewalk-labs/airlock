@@ -70,6 +70,12 @@ def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds
         "body": "synthetic card; the empty webhook must preserve it",
     }) != "inserted":
         raise RuntimeError("synthetic delivery card was not inserted")
+    # deliver_once orders due cards by cards.first_at, which ingest deliberately
+    # assigns at receipt time rather than from payload.created_at.  Reorder only
+    # this disposable sentinel so the stub cannot consume a real pending card.
+    with messages._conn():
+        messages._conn().execute(
+            "UPDATE cards SET first_at=? WHERE card_id=?", ("1970-01-01T00:00:00.000000Z", card_id))
 
     _at("empty-webhook-control")
     no_webhook_before = _delivery_state(messages, card_id)

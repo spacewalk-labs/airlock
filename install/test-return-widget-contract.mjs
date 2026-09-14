@@ -220,8 +220,8 @@ let acctOnlyRows = "", acctOnlySrc = "", acctOnlyFetch = "";
   acctOnlySrc = w.clickRow(m, "Subscription accounts");
   check("account-only: it opens the hub prefix", acctOnlySrc === ACCOUNT_PAGE, acctOnlySrc);
   acctOnlyFetch = JSON.stringify(w.fetched);
-  check("account-only: a panel authority does not imply a cross-origin alert poll",
-    !w.fetched.some((u) => u.includes("acct-alert")), acctOnlyFetch);
+  check("account-only: a panel authority does not redirect the alert poll",
+    w.fetched.filter((u) => u.includes("acct-alert")).every((u) => u === ACCOUNT_ALERT), acctOnlyFetch);
 }
 
 // ------------------------------------- 3. legacy data-panel alias = ACCOUNT only
@@ -255,17 +255,32 @@ let legacyRows = "", legacySrc = "";
 
 // --------------------------------------------- 5. only the legacy account alias is a ring source
 let panelImpliedAlert = 0, secretImpliedAlert = 0, explicitAlertFetch = 0;
+let bareDefaultFetch = 0, badgeOffAlert = 0;
 {
+  // A panel destination never redirects the ring elsewhere: the fetch is the hub default.
   const w = run({ menu: "1", accountPanel: HUB, secretPanel: HUB });
-  panelImpliedAlert = w.fetched.filter((u) => u.includes("acct-alert")).length;
-  check("ring: platform panel destinations do not silently grant alert-fetch authority",
+  panelImpliedAlert = w.fetched.filter((u) => u.includes("acct-alert") && u !== ACCOUNT_ALERT).length;
+  check("ring: platform panel destinations do not redirect the alert fetch",
     panelImpliedAlert === 0, JSON.stringify(w.fetched));
 }
 {
-  const w = run({ menu: "1", secretPanel: HUB });
-  secretImpliedAlert = w.fetched.filter((u) => u.includes("acct-alert")).length;
+  const w = run({ menu: "1", secretPanel: DEVTERM });
+  secretImpliedAlert = w.fetched.filter((u) => u.startsWith(DEVTERM)).length;
   check("ring: a secret destination grants no account alert authority",
     secretImpliedAlert === 0, JSON.stringify(w.fetched));
+}
+{
+  // code-server and publish inject no attributes at all; they must still get the ring.
+  const w = run({ mode: "corner" });
+  bareDefaultFetch = w.fetched.filter((u) => u === ACCOUNT_ALERT).length;
+  check("ring: a bare injection polls the hub's platform alert route",
+    bareDefaultFetch === 1, JSON.stringify(w.fetched));
+}
+{
+  const w = run({ mode: "corner", badge: "0" });
+  badgeOffAlert = w.fetched.filter((u) => u.includes("acct-alert")).length;
+  check("ring: data-badge=0 (wider audience) makes no alert fetch",
+    badgeOffAlert === 0, JSON.stringify(w.fetched));
 }
 {
   const w = run({ menu: "1", accountAlert: ACCOUNT_ALERT });
@@ -324,8 +339,8 @@ const ac = [
     "the legacy data-panel alias grants account authority only",
     `rows=${legacyRows} src=${legacySrc}`],
   ["AC-DTI-P2G",
-    "only data-account-alert grants the platform alert fetch; panel destinations grant none",
-    `explicit_alert_fetch=${explicitAlertFetch},panel_implied_alert=${panelImpliedAlert},secret_implied_alert=${secretImpliedAlert},injectors_authorize=${Object.values(injectors).filter((text) => text.includes("data-account-alert=")).length}`],
+    "the ring polls the hub alert route by default, data-account-alert overrides it, panels redirect nothing, data-badge=0 disables it",
+    `bare_default_fetch=${bareDefaultFetch},badge_off_alert=${badgeOffAlert},explicit_alert_fetch=${explicitAlertFetch},panel_implied_alert=${panelImpliedAlert},secret_implied_alert=${secretImpliedAlert},injectors_authorize=${Object.values(injectors).filter((text) => text.includes("data-account-alert=")).length}`],
 ];
 console.log("");
 for (const [id, expected, observed] of ac) {

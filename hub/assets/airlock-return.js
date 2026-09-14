@@ -29,10 +29,10 @@
  * navigates as before (never a dead menu entry). If a panel does not load within 6s the
  * modal says so and prints the address it tried, instead of showing a blank box.
  *
- * Subscription ring (all modes): data-account-alert is a separate, explicit read
- * authority for the exact /acct-alert URL. A panel destination only permits an iframe
- * navigation and never implies cross-origin fetch permission. The one-release legacy
- * data-panel alias remains both its account destination and its measured alert base.
+ * Subscription ring (all modes): polls <hub>/airlock-accounts/acct-alert by default, so
+ * every host that loads the widget gets the ring without its injector knowing about it.
+ * data-account-alert overrides the URL, the one-release legacy data-panel alias keeps its
+ * measured alert base, and data-badge="0" turns the poll off with the badge.
  * A failed poll clears the ring: no reading is not a warning.
  *
  * The platform backend emits Access-Control-Allow-Origin only for /acct-alert and only
@@ -144,9 +144,17 @@
   // any tool origin). 404s (and the badge stays hidden) unless dev-monitor's
   // message console is enabled.
   var UNREAD_URL = AIRLOCK + "monitor/api/owner/messages/preview";
-  // The legacy alias carries its old measured behavior for one release, but neither
-  // panel destination grants a fetch. New renders authorize the exact endpoint.
-  var ALERT_URL = accountAlert || (legacyBase ? legacyBase + "acct-alert" : "");
+  // The ring source is the platform's own alert route on this box's hub, derived here
+  // rather than handed in by each injector. When the injector owned it, a widget change
+  // needed every host app (paseo, orca, code-server, publish, ...) re-rendered, and any
+  // host that never emitted the attribute stayed dark: code-server and publish had no
+  // ring at all. The route is owner-gated and CORS-scoped to this hostname by the
+  // backend, so asking grants nothing; a non-owner simply gets no reading.
+  // An explicit data-account-alert still wins, the legacy alias keeps its old base, and
+  // data-badge="0" (a page whose audience is wider than the owner) skips it for the
+  // same reason it skips the badge poll: most visitors would only log a blocked fetch.
+  var ALERT_URL = accountAlert || (legacyBase ? legacyBase + "acct-alert" : "")
+    || (wantBadge ? AIRLOCK + "airlock-accounts/acct-alert" : "");
   var POLL_MS = 30000;
 
   var POS_KEY = "airlock:btn-pos-v1";               // per-device position (floating)

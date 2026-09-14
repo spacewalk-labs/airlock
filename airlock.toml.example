@@ -126,6 +126,11 @@ redirect_port = 19903   # loopback server that emits that 301
 accounts_port = 19904   # loopback backend for the platform account surface. Unlike the
                         # three above it is not an nginx listener but a service: the hub
                         # proxies /airlock-accounts/ to it behind an owner-only guard.
+# fleet_store     = ""  # path to the shared usage-store file the account panel reads
+#                       # (optional; written by an out-of-tree collector, e.g. claude-fleet:
+#                       # "~/.claude-accounts/.fleet-usage.json"). Unset = only the active
+#                       # account shows usage. Falls back to apps.devterm.fleet_store.
+# fleet_store_url = ""  # URL of a shared usage store (optional; no host is hardcoded)
 
 [apps.devterm]
 # No plaintext pair here: D-DEVTERM-9900 retired devterm's public_port/

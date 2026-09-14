@@ -277,6 +277,14 @@ with tempfile.TemporaryDirectory() as tmp:
     os.chmod(tmp, 0o710)
     old = os.environ.get("AIRLOCK_DEV_MONITOR_MESSAGES")
     os.environ["AIRLOCK_DEV_MONITOR_MESSAGES"] = "true"
+    sys.path.insert(0, sys.argv[2])
+    import devmon_messages as messages
+    messages.init_db(os.path.join(tmp, "messages.db"))
+    assert messages.ingest({
+        "id": "preexisting-pending-control", "group": "preexisting-pending-control",
+        "source": "live-collector", "level": "urgent", "title": "preexisting pending",
+        "body": "must not be consumed by the synthetic stub",
+    }) == "inserted"
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Health)
     worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
     try:
@@ -291,11 +299,13 @@ assert observed["no_webhook_control"]["returned"] is False
 assert observed["no_webhook_control"]["after"] == {"send_attempts": 0, "pending": True}
 assert observed["configured_stub_control"]["returned"] is True
 assert observed["configured_stub_control"]["after"] == {"send_attempts": 1, "pending": False}
+assert messages.get_card("preexisting-pending-control")["delivery"] == "pending"
+assert messages.get_card("preexisting-pending-control")["send_attempts"] == 0
 PY
 then
-  ok "collector uses the live loop: empty webhook preserves pending and a stub makes one delivery"
+  ok "collector uses the live loop without consuming a preexisting pending delivery"
 else
-  bad "collector did not preserve the empty-webhook card or make one stubbed delivery"
+  bad "collector mutated a preexisting delivery or failed its synthetic controls"
 fi
 
 if python3 - "$ROOT/live/check-devmon-no-webhook.py" "$ROOT/apps/dev-monitor/backend" <<'PY'

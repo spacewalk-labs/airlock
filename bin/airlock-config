@@ -1653,6 +1653,17 @@ def resolved(cfg: dict) -> dict:
         merged = dict(APP_DEFAULTS.get(name, {}))
         merged.update(table or {})
         apps[name] = merged
+    # The account surface reads hub.fleet_store, but the key was documented under
+    # [apps.devterm] for the months it lived there (#348/#349 moved the reader, not the
+    # operator's config). A box that set it for devterm and never copied it lost every
+    # non-active account's usage with no error (measured 2026-09-14). Inherit it:
+    # one file, one collector, one opinion. An explicit hub value still wins.
+    hub = apps.get("hub")
+    devterm = apps.get("devterm")
+    if isinstance(hub, dict) and isinstance(devterm, dict):
+        for key in ("fleet_store", "fleet_store_url"):
+            if not hub.get(key) and devterm.get(key):
+                hub[key] = devterm[key]
     paths = out.setdefault("paths", {})
     for k in ("wiki",):
         if paths.get(k):
