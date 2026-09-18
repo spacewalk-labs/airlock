@@ -168,6 +168,23 @@ that ONE store, and `sidebar-order-rehydrate-on-visibility` refreshes it on devi
 return or immediately after a stale write is rejected. No other persisted state
 changes hands.
 
+Sidebar ordering also follows an exact daemon placement (`serverId`, `projectId`)
+when upstream switches its `viewKey` between equivalence and placement keys. The
+outgoing project slot and workspace order carry over before missing-key ordering
+runs, including a return to a key that already has an older order. Placement history
+is stored as JSON string triples in the reserved, non-project
+`workspaceOrderByProject["@airlock:sidebar-placement-keys:v1"]` record. This uses the
+existing string-array schema, survives reload and shared-state rehydration, and stays
+intact in older clients. `sidebar-order-atomic-reconcile` commits that history and
+the reconciled orders in one store update; the existing revision adapter handles it
+as one snapshot.
+
+Only one-to-one placement transitions inherit order. A multi-host split or merge
+into a still-visible group keeps each group's own order. On the first load without
+history, existing records are retained rather than guessing which historical order
+was user-authored; an already-diverged order can be corrected once by dragging in
+the UI. This patch does not delete projects or archived workspaces.
+
 ## Files
 
 | File | Role |

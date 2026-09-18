@@ -9,12 +9,13 @@
 //   node bin/patch-web-ui.js <web-ui-dir> <companion-js-path>  # legacy --browse
 //
 // The always-on general group (CLI flag `--subagent-stream`, kept for callers that
-// predate it carrying more than one edit) applies SEVEN edits every box wants: a
+// predate it carrying more than one edit) applies NINE edits every box wants: a
 // visible provider-subagent panel subscribes to its parent agent's timeline; the
 // fresh-install font-size defaults move to 18 (ui) / 14 (code); the sidebar order
 // store points at the airlock ui-state backend so the order follows the owner across
 // devices instead of living in one browser; an already-open tab rehydrates that order
-// when it becomes visible and polls its revision while it stays visible; a device
+// when it becomes visible and polls its revision while it stays visible; sidebar
+// ordering follows exact daemon placements when their view keys change; a device
 // that cannot hover is treated as
 // compact for the tooltip gate; a coarse pointer gets the project row's trailing
 // actions without having to manufacture a hover first; and a sidebar tap stops being
@@ -43,13 +44,13 @@ const PINNED_SHA = "a182df940822df553fd648885dbfe2e31da3cc2f771b56a51f935d364f55
 //
 // 0.8.0 note: this table restarts fresh at the version bump — the 0.2.5-era shape
 // history (many partial-adoption rows as edits grew/moved groups over time) does not
-// carry forward, since no box has ever run a partially-patched 0.8.0 bundle. Only two
-// shapes exist so far: pristine (nothing applied) and fully patched (both groups).
+// carry forward. Keep the pre-identity 0.8.0 shapes as upgrade inputs and name
+// both upgraded shapes explicitly so interrupted/unknown bundle states still fail.
 // Rows will accumulate again here exactly as they did for 0.2.5 if an edit grows an
 // anchor or moves groups after this pin ships.
 //
 // Each sha256 covers the whole bundle and was re-derived from the pristine bundle by
-// applying exactly the listed edits — order-independent, the nine sites are disjoint:
+// applying exactly the listed edits — order-independent, the twelve sites are disjoint:
 //   npm pack @getpaseo/server@0.8.0 && tar xzf getpaseo-server-0.8.0.tgz
 //   # apply the subset to package/dist/server/web-ui/_expo/static/js/web/index-*.js
 const KNOWN_BUNDLE_SHAPES = [
@@ -67,6 +68,11 @@ const KNOWN_BUNDLE_SHAPES = [
             "tooltip-hover-none-is-compact", "project-actions-coarse-pointer",
             "sidebar-tap-not-swallowed-on-web",
             "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+  // Identity-preserving always-on group, with and without optional browse.
+  { sha: "9f95e589fc36170d8de126645a5e93262a55f83670fdb481e5179d0440448dc6",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web"] },
+  { sha: "d040a555b98bcc8f54888fe80afea6662a4dc93725be42b9fbdea58eae6f98b5",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
 ];
 const PINNED_VERSION = "@getpaseo/cli@0.8.0 (index-1be98d8895969110732458bbaeac57b2)";
 
@@ -292,6 +298,79 @@ const SIDEBAR_REHYDRATE_REVISIONED_080 = SIDEBAR_REHYDRATE_REVISIONED.replace(
 );
 const SIDEBAR_REHYDRATE_LEGACY = 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));"undefined"!=typeof document&&document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&f.persist.rehydrate()})},3544,[3368,3273,3276]);';
 const SUBAGENT_STREAM_PATCHES = [
+  {
+    // Persist placement history and migrated orders in one Zustand update. A
+    // reload, failed PUT, or CAS rehydrate must never observe half a transition.
+    name: "sidebar-order-atomic-reconcile",
+    find: 'o.projectOrder&&t.setProjectOrder(o.projectOrder);for(const{projectViewKey:s,order:n}of o.workspaceOrders)t.setWorkspaceOrder(s,n)',
+    repl: 'if(o.projectOrder||o.workspaceOrders.length)f.useSidebarOrderStore.setState({...(o.projectOrder?{projectOrder:o.projectOrder}:{}),workspaceOrderByProject:Object.assign({},t.workspaceOrderByProject,Object.fromEntries(o.workspaceOrders.map(({projectViewKey:e,order:t})=>[e,t])))})',
+  },
+
+  {
+    // viewKey changes when another clone appears/disappears. Reconcile by the
+    // daemon's stable serverId/projectId before missing-key append/prepend runs.
+    // Existing records are left alone on first load; no historical guessing or
+    // bulk migration. After a real transition, the outgoing user's order wins.
+    name: "sidebar-order-stable-identity",
+    find: 'e.computeSidebarOrderUpdates=function(t){if(0===t.projects.length)return{projectOrder:null,workspaceOrders:[]};const s=K({currentOrder:t.persistedProjectOrder,visibleKeys:t.projects.map(t=>t.viewKey)}),o=s===t.persistedProjectOrder?null:s,c=[];for(const s of t.projects){const o=t.getWorkspaceOrder(s.viewKey),n=I({currentOrder:o,visibleKeys:s.workspaces.map(t=>t.workspaceKey)});n!==o&&c.push({projectViewKey:s.viewKey,order:n})}return{projectOrder:o,workspaceOrders:c}}',
+    repl: `e.computeSidebarOrderUpdates=(()=>{
+  // A reserved, non-project record keeps placement history inside the existing
+  // string-array order schema. Older tabs preserve this record without needing
+  // a new strict-schema field. History and order commit atomically in the effect.
+  const historyKey="@airlock:sidebar-placement-keys:v1";
+  return function(t){
+    if(0===t.projects.length)return{projectOrder:null,workspaceOrders:[]};
+    const history=t.getWorkspaceOrder(historyKey),previous=new Map();
+    for(const record of history){
+      try{const row=JSON.parse(record);if(Array.isArray(row)&&3===row.length&&row.every(value=>"string"===typeof value))previous.set(JSON.stringify(row.slice(0,2)),row[2])}catch(error){}
+    }
+    const visible=new Set(t.projects.map(project=>project.viewKey));
+    const current=new Map(),targets=new Map(),sources=new Map();
+    const add=(map,key,value)=>{if(!map.has(key))map.set(key,new Set());map.get(key).add(value)};
+    for(const project of t.projects)for(const host of project.hosts){
+      const identity=JSON.stringify([host.serverId,host.projectId]);
+      current.set(identity,project.viewKey);
+      const old=previous.get(identity);
+      if(void 0!==old&&old!==project.viewKey){add(targets,old,project.viewKey);add(sources,project.viewKey,old)}
+    }
+    const inherited=new Map();
+    for(const [old,next] of targets){
+      if(visible.has(old)||1!==next.size)continue;
+      const key=next.values().next().value;
+      if(1!==sources.get(key).size)continue;
+      // An incoming group that another placement kept visible owns its own drag
+      // order. Merging into it must not replace that order with a detached row.
+      if([...previous].some(([identity,value])=>value===key&&current.get(identity)===key))continue;
+      // A shared multi-host equivalence key may split into several placements.
+      // Transfer only a one-to-one transition; never assign one clone's slot to
+      // another or move a still-visible equivalence group.
+      if([...previous].some(([identity,value])=>value===old&&current.get(identity)!==key))continue;
+      inherited.set(key,old);
+    }
+    let projectOrder=t.persistedProjectOrder;
+    for(const [key,old] of inherited){
+      if(!projectOrder.includes(old))continue;
+      projectOrder=projectOrder.filter(value=>value!==key).map(value=>value===old?key:value);
+    }
+    projectOrder=K({currentOrder:projectOrder,visibleKeys:t.projects.map(project=>project.viewKey)});
+    const workspaceOrders=[];
+    for(const project of t.projects){
+      const own=t.getWorkspaceOrder(project.viewKey),old=inherited.get(project.viewKey);
+      const prior=void 0===old?[]:t.getWorkspaceOrder(old);
+      // A previously used target key can contain an older drag order. The
+      // outgoing key wins on a measured transition, even when both keys exist.
+      const base=prior.length?[...new Set([...prior,...own])]:own;
+      const order=I({currentOrder:base,visibleKeys:project.workspaces.map(workspace=>workspace.workspaceKey)});
+      if(order.length!==own.length||order.some((value,index)=>value!==own[index]))workspaceOrders.push({projectViewKey:project.viewKey,order});
+    }
+    for(const [identity,key] of current)previous.set(identity,key);
+    const nextHistory=[...previous].sort(([a],[b])=>a<b?-1:a>b?1:0).map(([identity,key])=>JSON.stringify([...JSON.parse(identity),key]));
+    if(nextHistory.length!==history.length||nextHistory.some((value,index)=>value!==history[index]))workspaceOrders.push({projectViewKey:historyKey,order:nextHistory});
+    return{projectOrder:projectOrder===t.persistedProjectOrder?null:projectOrder,workspaceOrders};
+  }
+})()`,
+  },
+
   {
     name: "provider-subagent-visible-parent",
     find: 'return"agent"===s?.kind?[s.agentId]:[]',
