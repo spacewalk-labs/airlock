@@ -27,6 +27,8 @@ assert.deepEqual(BROWSE_PATCHES.map((patch) => patch.name), [
 ]);
 const byName = (name) => SUBAGENT_STREAM_PATCHES.find((patch) => patch.name === name);
 assert.deepEqual(SUBAGENT_STREAM_PATCHES.map((patch) => patch.name), [
+  "sidebar-order-atomic-reconcile",
+  "sidebar-order-stable-identity",
   "provider-subagent-visible-parent",
   "appearance-default-font-sizes",
   "sidebar-order-shared-storage",
@@ -184,13 +186,14 @@ assert.equal(
   new Set(KNOWN_BUNDLE_SHAPES.flatMap((shape) => [shape.sha, ...(shape.legacyShas ?? [])])).size,
   KNOWN_BUNDLE_SHAPES.reduce((count, shape) => count + 1 + (shape.legacyShas?.length ?? 0), 0),
 );
-// 0.8.0 restarts the shape table fresh: pristine, always-on-only (browse=false, the
-// default), and both groups combined. No legacy/partial shapes exist yet — nothing
-// has ever installed a partially-patched 0.8.0 bundle.
-assert.equal(KNOWN_BUNDLE_SHAPES.length, 3);
+// Pre-identity fleet bytes remain accepted alongside the two upgraded shapes.
+assert.equal(KNOWN_BUNDLE_SHAPES.length, 5);
 assert.deepEqual(KNOWN_BUNDLE_SHAPES[0].edits, []);
-assert.deepEqual(key(KNOWN_BUNDLE_SHAPES[1].edits), key(GENERAL_EDITS));
-assert.deepEqual(key(KNOWN_BUNDLE_SHAPES[2].edits), key(ALL_EDITS));
+const PRE_IDENTITY = name => !name.startsWith("sidebar-order-stable-") && name !== "sidebar-order-atomic-reconcile";
+assert.equal(key(KNOWN_BUNDLE_SHAPES[1].edits), key(GENERAL_EDITS.filter(PRE_IDENTITY)));
+assert.equal(key(KNOWN_BUNDLE_SHAPES[2].edits), key(ALL_EDITS.filter(PRE_IDENTITY)));
+assert.equal(key(KNOWN_BUNDLE_SHAPES[3].edits), key(GENERAL_EDITS));
+assert.equal(key(KNOWN_BUNDLE_SHAPES[4].edits), key(ALL_EDITS));
 
 assert.deepEqual(productionShasForEdits([]), [PINNED_SHA]);
 assert.equal(productionShasForEdits(ALL_EDITS).length, 1);
@@ -282,4 +285,158 @@ const legacySeam = patchBundleContent(pristine, sha(pristine));
 assert.equal(legacySeam.alreadyPatched, false);
 for (const patch of BROWSE_PATCHES) assert.ok(legacySeam.source.includes(patch.repl));
 
-console.log("patch-web-ui: shape table, state transitions, preservation, idempotence, and refusal controls passed");
+// Exercise the shipped replacement, with upstream append/prepend helpers. Each
+// invocation below represents a committed sidebar effect, followed by a drag or
+// daemon directory update. No storage schema or remote alias is involved.
+{
+  const vm = require("node:vm");
+  function loadOrder(source) {
+    const e = {};
+    vm.runInNewContext(source, {
+      e,
+      K: ({currentOrder, visibleKeys}) => {
+        const missing = visibleKeys.filter(key => !currentOrder.includes(key));
+        return missing.length ? [...currentOrder, ...missing] : currentOrder;
+      },
+      I: ({currentOrder, visibleKeys}) => {
+        const missing = visibleKeys.filter(key => !currentOrder.includes(key));
+        return missing.length ? [...missing, ...currentOrder] : currentOrder;
+      },
+    });
+    return e.computeSidebarOrderUpdates;
+  }
+  const patch = byName("sidebar-order-stable-identity");
+  const host = (serverId, projectId) => ({serverId, projectId});
+  const project = (viewKey, hosts, keys = []) => ({
+    viewKey, hosts, workspaces: keys.map(workspaceKey => ({workspaceKey})),
+  });
+  const eq = "remote:github.com/team/repo";
+  const placed = JSON.stringify(["s", "repo"]);
+  const clone = JSON.stringify(["s", "clone"]);
+  const primary = key => project(key, [host("s", "repo")], ["s:a", "s:b"]);
+  const other = project("other", [host("s", "other")]);
+  const duplicate = project(clone, [host("s", "clone")], ["s:clone"]);
+  const run = compute => {
+    const state = {projectOrder: [eq, "other", placed], workspaceOrders: {
+      [eq]: ["s:b", "s:a"], [placed]: ["s:a", "s:b"],
+    }};
+    const effect = projects => {
+      const update = compute({projects, persistedProjectOrder: state.projectOrder,
+        getWorkspaceOrder: key => state.workspaceOrders[key] ?? []});
+      if (update.projectOrder) state.projectOrder = Array.from(update.projectOrder);
+      for (const {projectViewKey, order} of update.workspaceOrders)
+        state.workspaceOrders[projectViewKey] = Array.from(order);
+      return update;
+    };
+    effect([primary(eq), other]);
+    effect([primary(placed), other, duplicate]);
+    return {state, effect};
+  };
+  // Negative control: the unpatched function loses both orders even though the
+  // incoming key already exists. A missing-key fallback would miss this case.
+  const broken = run(loadOrder(patch.find));
+  assert.equal(broken.state.projectOrder.indexOf(placed), 2);
+  assert.deepEqual(broken.state.workspaceOrders[placed], ["s:a", "s:b"]);
+  const {state, effect} = run(loadOrder(patch.repl));
+  assert.deepEqual(state.projectOrder, [placed, "other", clone]);
+  assert.deepEqual(state.workspaceOrders[placed], ["s:b", "s:a"]);
+  assert.deepEqual(state.workspaceOrders[clone], ["s:clone"]);
+  // Drag while duplicated; returning to a previously used key must carry the
+  // latest outgoing order instead of reviving that key's old record.
+  state.projectOrder = ["other", placed, clone];
+  state.workspaceOrders[placed] = ["s:a", "s:b"];
+  effect([primary(eq), other]);
+  assert.deepEqual(state.projectOrder, ["other", eq, clone]);
+  assert.deepEqual(state.workspaceOrders[eq], ["s:a", "s:b"]);
+  // Repeat after both keys have records, then reconnect through an empty snapshot.
+  state.workspaceOrders[eq] = ["s:b", "s:a"];
+  effect([]);
+  effect([primary(placed), other, duplicate]);
+  assert.deepEqual(state.workspaceOrders[placed], ["s:b", "s:a"]);
+  assert.deepEqual(state.projectOrder, ["other", placed, clone]);
+  const unchanged = effect([primary(placed), other, duplicate]);
+  assert.equal(unchanged.projectOrder, null);
+  assert.equal(unchanged.workspaceOrders.length, 0);
+  // New workspaces still prepend; genuinely new projects still append.
+  effect([project(placed, [host("s", "repo")], ["s:a", "s:b", "s:new"]),
+    other, duplicate, project("brand-new", [host("s", "new")])]);
+  assert.deepEqual(state.workspaceOrders[placed], ["s:new", "s:b", "s:a"]);
+  assert.equal(state.projectOrder.at(-1), "brand-new");
+  // The same remote is not placement identity: replacement with a different clone
+  // on first load or during a session gets no inherited slot or workspace order.
+  const fresh = loadOrder(patch.repl);
+  const historyKey = "@airlock:sidebar-placement-keys:v1";
+  let history = [];
+  fresh({projects: [primary(eq)], persistedProjectOrder: [eq],
+    getWorkspaceOrder: key => key === historyKey ? [] : ["s:b", "s:a"]}).workspaceOrders
+    .forEach(item => { if (item.projectViewKey === historyKey) history = Array.from(item.order); });
+  const replaced = fresh({projects: [duplicate], persistedProjectOrder: [eq],
+    getWorkspaceOrder: key => key === historyKey ? history : key === eq ? ["s:b", "s:a"] : []});
+  assert.deepEqual(Array.from(replaced.projectOrder), [eq, clone]);
+  assert.deepEqual(Array.from(replaced.workspaceOrders[0].order), ["s:clone"]);
+  // Multi-host equivalence splits are ambiguous; never hand one shared slot to
+  // an arbitrary clone. A still-visible source must also keep its slot.
+  const multi = loadOrder(patch.repl);
+  const multiOrders = {};
+  const base = {persistedProjectOrder: [eq], getWorkspaceOrder: key => multiOrders[key] ?? []};
+  const commit = update => update.workspaceOrders.forEach(item => {
+    multiOrders[item.projectViewKey] = Array.from(item.order);
+  });
+  commit(multi({...base, projects: [project(eq, [host("s", "repo"), host("t", "repo")])]}));
+  const split = multi({...base, projects: [primary(placed),
+    project('t-placement', [host("t", "repo")])]});
+  assert.deepEqual(Array.from(split.projectOrder), [eq, placed, "t-placement"]);
+  const surviving = loadOrder(patch.repl);
+  multiOrders[historyKey] = [];
+  commit(surviving({...base, projects: [primary(eq)]}));
+  const shared = surviving({...base, projects: [primary(placed),
+    project(eq, [host("t", "repo")])]});
+  assert.deepEqual(Array.from(shared.projectOrder), [eq, placed]);
+  // Reviewer counterexample: a group that stayed visible throughout a split
+  // must keep its project slot and interleaved multi-host workspace order on merge.
+  commit(shared);
+  multiOrders[eq] = ["t:x", "s:a"];
+  multiOrders[placed] = ["s:a"];
+  const merged = surviving({persistedProjectOrder: [placed, eq, clone],
+    getWorkspaceOrder: key => multiOrders[key] ?? [],
+    projects: [project(eq, [host("s", "repo"), host("t", "repo")], ["s:a", "t:x"])]});
+  assert.equal(merged.projectOrder, null);
+  assert.ok(!merged.workspaceOrders.some(item => item.projectViewKey === eq));
+  // Reload using the saved state: no module-local history is needed. An unused
+  // computation must also leave the next real reconciliation able to migrate.
+  state.workspaceOrders[placed] = ["s:a", "s:b", "s:new"];
+  const afterReload = loadOrder(patch.repl);
+  const input = {projects: [primary(eq), other], persistedProjectOrder: state.projectOrder,
+    getWorkspaceOrder: key => state.workspaceOrders[key] ?? []};
+  const discarded = afterReload(input);
+  const replayed = afterReload(input);
+  assert.deepEqual(JSON.parse(JSON.stringify(replayed)), JSON.parse(JSON.stringify(discarded)));
+  const inherited = replayed.workspaceOrders.find(item => item.projectViewKey === eq);
+  assert.deepEqual(Array.from(inherited.order).slice(0, 2), ["s:a", "s:b"]);
+  // One store write contains both order updates and the identity history; pinned
+  // order and unrelated records remain in the merged Zustand state.
+  const reconcile = byName("sidebar-order-atomic-reconcile");
+  const writes = [];
+  vm.runInNewContext(reconcile.repl, {
+    o: replayed,
+    t: {workspaceOrderByProject: {...state.workspaceOrders, unrelated: ["keep"]}},
+    f: {useSidebarOrderStore: {setState: value => writes.push(value)}},
+  });
+  assert.equal(writes.length, 1);
+  assert.deepEqual(Array.from(writes[0].workspaceOrderByProject.unrelated), ["keep"]);
+  assert.ok(writes[0].workspaceOrderByProject[historyKey].length);
+  assert.deepEqual(Array.from(writes[0].workspaceOrderByProject[eq]).slice(0, 2), ["s:a", "s:b"]);
+  // A CAS-rejected transition does not consume module-local history. Rehydrate
+  // another tab's successful transition and drag, then compute from that snapshot.
+  const convergedOrders = {...state.workspaceOrders,
+    ...Object.fromEntries(replayed.workspaceOrders.map(item => [item.projectViewKey, Array.from(item.order)])),
+    [eq]: ["s:b", "s:a"],
+  };
+  const converged = loadOrder(patch.repl)({projects: [primary(eq), other],
+    persistedProjectOrder: Array.from(replayed.projectOrder),
+    getWorkspaceOrder: key => convergedOrders[key] ?? []});
+  assert.equal(converged.projectOrder, null);
+  assert.equal(converged.workspaceOrders.length, 0);
+}
+
+console.log("patch-web-ui: shape transitions, sidebar identity/drag preservation, idempotence, and refusal controls passed");

@@ -34,6 +34,37 @@
           "new-browser-gate-Wo",
           "browserpane-marker"
         ]
+      },
+      {
+        "sha256": "9f95e589fc36170d8de126645a5e93262a55f83670fdb481e5179d0440448dc6",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web"
+        ]
+      },
+      {
+        "sha256": "d040a555b98bcc8f54888fe80afea6662a4dc93725be42b9fbdea58eae6f98b5",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web",
+          "new-browser-gate-vo",
+          "new-browser-gate-Wo",
+          "browserpane-marker"
+        ]
       }
     ]
   },
@@ -142,7 +173,9 @@
         "{name:\"sidebar-project-workspace-order\",storage:(0,p.createValidatedPersistStorage)(o.default,j),partialize:",
         "partialize:e=>({projectOrder:e.projectOrder,pinnedWorkspaceOrder:e.pinnedWorkspaceOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:y}))},3813,[1587,3401,3404,3313,3553]);",
         "const[E,S]=j(C),P=(0,y.useIsCompactFormFactor)(),z=P?w:v;",
-        "c[14]===Symbol.for(\"react.memo_cache_sentinel\")?(H=e=>{const t=M.current;if(!t||x.current||P.current)return;"
+        "c[14]===Symbol.for(\"react.memo_cache_sentinel\")?(H=e=>{const t=M.current;if(!t||x.current||P.current)return;",
+        "e.computeSidebarOrderUpdates=function(t){if(0===t.projects.length)return{projectOrder:null,workspaceOrders:[]};const s=K({currentOrder:t.persistedProjectOrder,visibleKeys:t.projects.map(t=>t.viewKey)}),o=s===t.persistedProjectOrder?null:s,c=[];for(const s of t.projects){const o=t.getWorkspaceOrder(s.viewKey),n=I({currentOrder:o,visibleKeys:s.workspaces.map(t=>t.workspaceKey)});n!==o&&c.push({projectViewKey:s.viewKey,order:n})}return{projectOrder:o,workspaceOrders:c}}",
+        "o.projectOrder&&t.setProjectOrder(o.projectOrder);for(const{projectViewKey:s,order:n}of o.workspaceOrders)t.setWorkspaceOrder(s,n)"
       ]
     }
   ]
