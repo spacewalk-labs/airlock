@@ -17,6 +17,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
@@ -619,6 +620,92 @@ def paired(parser: argparse.ArgumentParser, args: argparse.Namespace, left: str,
         parser.error(f"--{left.replace('_', '-')} and --{right.replace('_', '-')} must be supplied together")
 
 
+def _fixture_write(root: Path, name: str, value: str) -> None:
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="utf-8")
+
+
+def _fixture_seal(root: Path) -> str:
+    names = sorted(str(path.relative_to(root)) for path in root.rglob("*")
+                   if path.is_file() and path.name != "SHA256SUMS")
+    _fixture_write(root, "SHA256SUMS", "".join(
+        f"{sha256_bytes(read_bytes(root / name))}  {name}\n" for name in names))
+    return sha256_bytes(read_bytes(root / "SHA256SUMS"))
+
+
+def checkout_revision() -> str:
+    """Return the revision of the checkout executing this verifier."""
+    root = Path(__file__).resolve().parent.parent
+    run = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+                         capture_output=True, text=True, check=False)
+    revision = run.stdout.strip()
+    if run.returncode != 0 or FULL_GIT_SHA.fullmatch(revision) is None:
+        raise VerificationError("verifier checkout has no full HEAD revision")
+    return revision
+
+
+def deterministic_inputs() -> tuple[tempfile.TemporaryDirectory[str], Inputs]:
+    """Make the no-argument, checkout-local fixture/replay input set.
+
+    This is intentionally synthetic: it proves the verifier grammar and every
+    predicate without claiming a deployed installation.  It never reads scratch,
+    guest, or an installed box; live freshness remains a separately supplied run.
+    """
+    temp = tempfile.TemporaryDirectory(prefix="airlock-forward-only-")
+    root = Path(temp.name)
+    repo = root / "fixture-repo"
+    repo.mkdir()
+    for path in REQUIRED_PATHS:
+        _fixture_write(repo, path, f"fixture:{path}\n")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    env = {"GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+           "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+           "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"}
+    subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null",
+                    "commit", "-qm", "deterministic verifier fixture"], check=True, env=env)
+    ref = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                         capture_output=True, text=True).stdout.strip()
+
+    source = root / "source"; source.mkdir()
+    _fixture_write(source, "source-ref.txt", ref + "\n")
+    _fixture_write(source, "public-manifest.rc", "0\n")
+    _fixture_write(source, "public-manifest.log", "clean: every tracked path is classified\n")
+    for cases in SOURCE_CASES.values():
+        for case in cases:
+            _fixture_write(source, f"{case}.rc", "0\n")
+            _fixture_write(source, f"{case}.log", "passed=1 failed=0\n")
+    source_sha = _fixture_seal(source)
+
+    live = root / "replay"; live.mkdir()
+    _fixture_write(live, "install-run.txt", "run1: unit unit-one · exit 1 · tx deadbeef rolled_back\nrun2: unit unit-two · exit 0 · tx cafe committed · head " + ref + "\n")
+    _fixture_write(live, "run1.log", "unit-one deadbeef rolled_back\n")
+    _fixture_write(live, "B2-binding-run1.tsv", "#meta head_install=" + ref + "\n")
+    _fixture_write(live, "verdict-binding.txt", "install head: " + ref + "\nVERDICT=PASS\n")
+    _fixture_write(live, "B2-binding.tsv", "#meta head_install=" + ref + "\n")
+    _fixture_write(live, "verdict-binding-r2.txt", "install head: " + ref + "\nVERDICT=PASS\n")
+    _fixture_write(live, "S2-taken-for-S3-timer", "2000-01-01T00:00:00Z\n")
+    _fixture_write(live, "verdict-i3-S0-S1.txt", "VERDICT=PASS\n")
+    _fixture_write(live, "verdict-i3-S0-S3.txt", "VERDICT=PASS\n")
+    _fixture_write(live, "I3-activation-live.json", json.dumps({"activation_failed": True, "next_run_resumed": True, "smoke_passed": True, "activation_record_cleared": True}))
+    _fixture_write(live, "I4-live.json", json.dumps({"matching_evidence_forwarded": True, "mismatch_mutations": 0, "mismatch_phase": "degraded"}))
+    for stage, taken, boot in (("S0", "1999-12-31T23:59:00Z", "boot0"), ("S1", "1999-12-31T23:59:30Z", "boot1"), ("S2", "2000-01-01T00:00:00Z", "boot2"), ("S3", "2000-01-01T00:10:00Z", "boot2")):
+        _fixture_write(live, f"{stage}-state.txt", f"taken_utc={taken}\nboot_id={boot}\ntx_phase=committed\nactivation_record=absent\nmigration_receipts=0\nschema_state=canonical\nsnap_rc=0\n")
+        _fixture_write(live, f"{stage}-preserved.sha256", "same-preserved-witness\n")
+        if stage != "S0":
+            _fixture_write(live, f"{stage}-health.txt", "overview_http=200\nairlock_status_rc=0\n")
+            _fixture_write(live, f"{stage}-db.json", json.dumps({"integrity": "ok"}))
+            _fixture_write(live, f"{stage}-airlock-status.json", json.dumps({"verdict": "ok", "checks": [{"id": "install.revision", "detail": ref}]}))
+    for stage in ("S2", "S3"):
+        _fixture_write(live, f"{stage}-units.txt", "ActiveState=active\nNRestarts=0\n")
+    live_sha = _fixture_seal(live)
+    return temp, Inputs(private_root=repo, private_ref=ref, public_root=repo,
+                        public_ref=ref, installed_root=repo, installed_ref=ref,
+                        source_evidence=source, source_manifest_sha=source_sha,
+                        live_evidence=live, live_manifest_sha=live_sha)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--private-root", type=Path)
@@ -637,9 +724,22 @@ def main(argv: list[str] | None = None) -> int:
                  ("source_evidence", "source_manifest_sha"),
                  ("live_evidence", "live_manifest_sha")):
         paired(parser, args, *pair)
-    evaluation = evaluate(Inputs(**vars(args)))
+    supplied = any(value is not None for value in vars(args).values())
+    fixture = None
+    if supplied:
+        evaluation = evaluate(Inputs(**vars(args)))
+    else:
+        fixture, inputs = deterministic_inputs()
+        evaluation = evaluate(inputs)
+        revision = checkout_revision()
+        for result in evaluation.results:
+            result.signal = "fixture"
+            result.evidence = f"live/verify-installer-forward-only.py@{revision}"
     print("\n".join((*evaluation.layers, *(result.row() for result in evaluation.results))))
-    return evaluation.exit_code
+    code = evaluation.exit_code
+    if fixture is not None:
+        fixture.cleanup()
+    return code
 
 
 if __name__ == "__main__":

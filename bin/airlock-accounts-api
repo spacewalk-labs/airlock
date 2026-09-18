@@ -73,6 +73,10 @@ LOGIN_CODE_BODY_MAX = 400
 STATUS_BIN = os.environ.get("AIRLOCK_ACCOUNTS_STATUS_BIN", "").strip()
 ACCOUNTS_BIN = os.environ.get("AIRLOCK_ACCOUNTS_BIN", "").strip()
 OPENCODE_BIN = os.environ.get("AIRLOCK_OPENCODE_BIN", "").strip()
+# Antigravity (agy) quota. Empty = this box has no agy and /agy-usage says so.
+AGY_BIN = os.environ.get("AIRLOCK_AGY_BIN", "").strip()
+# The probe's path is handed in like every other CLI this service calls.
+AGY_USAGE_PROBE = os.environ.get("AIRLOCK_AGY_USAGE_BIN", "").strip()
 # The platform secret-drop CLI. Handed in like the account CLIs; unset means every secret
 # route answers the fixed failure below rather than guessing a path.
 SECRET_BIN = os.environ.get("AIRLOCK_SECRET_BIN", "").strip()
@@ -848,6 +852,11 @@ def _codex_login_cancel():
 # artifact would be wrong besides. The data is disposable display state — an empty start
 # self-heals on the next probe, so nothing migrates.
 CODEX_USAGE_STATE = os.path.join(ACCOUNTS_STATE_DIR, "codex-usage.json")
+AGY_USAGE_STATE = os.path.join(ACCOUNTS_STATE_DIR, "agy-usage.json")
+# Reading agy quota means opening its interactive CLI for a few seconds, so it is done
+# only when someone opens the panel and the last reading is older than this.
+AGY_USAGE_FRESH = 20 * 60
+AGY_USAGE_TIMEOUT = 90
 CLAUDE_USAGE_STATE = os.path.join(ACCOUNTS_STATE_DIR, "claude-usage.json")
 CODEX_AUTH = os.path.expanduser(os.environ.get("AIRLOCK_CODEX_AUTH", "~/.codex/auth.json"))
 _CODEX_AUTH_GENERATION_UNAVAILABLE = object()
@@ -1285,6 +1294,64 @@ def _codex_usage_cached(wait=False):
         return out
 
 
+_agy_usage = {"refreshing": False, "lastErr": None}
+
+
+def _agy_usage_read():
+    try:
+        with open(AGY_USAGE_STATE, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("ok") is not True \
+            or _finite_number(record.get("observedAt")) is None:
+        return None
+    return record
+
+
+def _agy_usage_refresh():
+    """One probe in a worker thread. A failed reading keeps the last good one on disk."""
+    err = None
+    try:
+        proc = subprocess.run(
+            [sys.executable, AGY_USAGE_PROBE],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=AGY_USAGE_TIMEOUT,
+            env=dict(os.environ, AIRLOCK_AGY_BIN=AGY_BIN), check=False)
+        record = json.loads(proc.stdout or b"{}")
+        if isinstance(record, dict) and record.get("ok") is True:
+            os.makedirs(ACCOUNTS_STATE_DIR, exist_ok=True)
+            tmp = AGY_USAGE_STATE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f)
+            os.replace(tmp, AGY_USAGE_STATE)
+        else:
+            err = str((record or {}).get("error") or "probe failed")[:200]
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        err = type(exc).__name__
+    with _cache_lock:
+        _agy_usage.update(refreshing=False, lastErr=err)
+
+
+def _agy_usage_payload():
+    """The last agy reading at once; a background re-read when it is older than 20 min."""
+    if not AGY_BIN or not AGY_USAGE_PROBE:
+        return {"enabled": False}
+    record = _agy_usage_read()
+    now = time.time()
+    with _cache_lock:
+        if not _agy_usage["refreshing"] and (
+                record is None or now - record["observedAt"] > AGY_USAGE_FRESH):
+            _agy_usage["refreshing"] = True
+            threading.Thread(target=_agy_usage_refresh, daemon=True,
+                             name="agy-usage-refresh").start()
+        state = dict(_agy_usage)
+    out = {"enabled": True, "refreshing": state["refreshing"], "lastErr": state["lastErr"]}
+    if record is not None:
+        out.update(account=record.get("account"), groups=record.get("groups") or [],
+                   observedAt=record["observedAt"], age=int(now - record["observedAt"]))
+    return out
+
+
 def _live_usage_cached():
     """The active account's own 5h/7d reading, cached for LIVE_USAGE_TTL."""
     with _cache_lock:
@@ -1614,6 +1681,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/codex-usage":
             self._send(200, _codex_usage_cached(wait=True))
+            return
+        if self.path == "/agy-usage":
+            self._send(200, _agy_usage_payload())
             return
         if self.path == "/claude-usage-store":
             self._send(200, _fetch_fleet_store() if FLEET_STORE else {})

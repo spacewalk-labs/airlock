@@ -122,28 +122,34 @@
 -            // Tree-kill the old process tree now that the SDK has cleaned up.
 -            // If we skip this, MCP children of the previous claude process can
 -            // survive as orphans when the session spawns a replacement query.
--            if (this.childProcess) {
--                await terminateWithTreeKill(this.childProcess, {
+-            if (retiredChild) {
+-                await terminateWithTreeKill(retiredChild, {
 -                    gracefulTimeoutMs: 2000,
 -                    forceTimeoutMs: 2000,
 -                }).catch(() => {
 -                    /* process may already be dead */
 -                });
--                this.childProcess = null;
 -            }
 +            // [paseo-orphan-guard] Same termination path as close(): every live handle,
-+            // not just the newest one. MCP children of a previous claude process used to
-+            // survive here whenever the handle had been overwritten.
++            // not just the one retired here. MCP children of a previous claude process
++            // used to survive whenever the handle had been overwritten before restart.
 +            await this.terminateLiveChildren("query_restart");
          }
          // Preserve claudeSessionId across query recreation so buildOptions() passes
          // resume: sessionId and the new query continues the existing conversation.
-@@ -2371,7 +2430,7 @@
+@@ -2371,8 +2430,13 @@
              launchEnv: this.launchEnv,
              queryFactory: this.queryFactory,
              onChildProcess: (child) => {
 -                this.childProcess = child;
-+                this.adoptSpawnedChild(child); // [paseo-orphan-guard]
+-                child.once("exit", (code, signal) => this.handleRuntimeExit(child, code, signal));
++                // [paseo-orphan-guard] Register upstream's own exit-triggered turn-failure
++                // handler FIRST -- adoptSpawnedChild's own exit listener also nulls
++                // this.childProcess, and handleRuntimeExit's guard
++                // (`this.childProcess !== child`) would otherwise see that null and skip
++                // reporting the crash.
++                child.once("exit", (code, signal) => this.handleRuntimeExit(child, code, signal));
++                this.adoptSpawnedChild(child);
              },
          });
          const fastMode = this.resolveFastModeSetting();

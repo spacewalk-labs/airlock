@@ -202,5 +202,33 @@ grep -q 'AIRLOCK_HUB_ACCOUNTS_PORT="\$AIRLOCK_HUB_ACCOUNTS_PORT"' "$ROOT/install
 # ---- T8: a bad mode is refused ----
 run bogus >/dev/null 2>&1 && bad "T8 an unknown mode was accepted" || ok "T8 an unknown mode is refused"
 
+# ---- T11: hub.xai decides whether the xAI routes get a CLI path ----
+# The service answers {"enabled": false} whenever AIRLOCK_OPENCODE_BIN is empty, so an
+# unwired flag is a login row that silently never appears (measured on a live box,
+# 2026-09-15). Off: empty. On with the CLI on PATH: its absolute path. On without it:
+# the install fails instead of shipping that silent panel.
+# Orchestrator form: the port and flag arrive in the environment (the helper reads
+# config itself only when run standalone, and the fixture config sets no xai).
+orch() { AIRLOCK_HUB_ACCOUNTS_PORT=19904 run install; }
+orch >"$TMP/out9" 2>&1 || bad "T11 baseline install failed: $(tail -2 "$TMP/out9")"
+grep -qxF 'Environment=AIRLOCK_OPENCODE_BIN=' "$unit" \
+  && ok "T11 xai off (the default) leaves the xAI routes disabled" \
+  || bad "T11 xai off rendered: $(grep OPENCODE "$unit" || echo none)"
+printf '#!/bin/sh\n' > "$BIN_DIR/opencode"; chmod 0755 "$BIN_DIR/opencode"
+if AIRLOCK_HUB_XAI=true orch >"$TMP/out8" 2>&1 \
+   && grep -qxF "Environment=AIRLOCK_OPENCODE_BIN=$BIN_DIR/opencode" "$unit"; then
+  ok "T11 xai on hands the resolved opencode path to the service"
+else
+  bad "T11 xai on: $(grep OPENCODE "$unit" || tail -2 "$TMP/out8")"
+fi
+rm -f "$BIN_DIR/opencode"
+if AIRLOCK_HUB_XAI=true PATH="$BIN_DIR:/usr/bin:/bin" orch >"$TMP/out8b" 2>&1; then
+  bad "T11 xai on without an opencode CLI installed anyway"
+else
+  grep -q "opencode CLI was not found" "$TMP/out8b" \
+    && ok "T11 xai on without an opencode CLI fails the install and says why" \
+    || bad "T11 wrong failure: $(tail -2 "$TMP/out8b")"
+fi
+
 printf '\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

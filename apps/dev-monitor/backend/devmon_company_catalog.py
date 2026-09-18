@@ -27,6 +27,7 @@ from typing import Any
 APP_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
 SHA = re.compile(r"^[0-9a-f]{40}\Z")
 DIGEST = re.compile(r"^[0-9a-f]{64}\Z")
+PINNED_STAGE = re.compile(r"^[0-9a-f]{40}-[0-9a-f]{64}\Z")
 REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SCP_REPOSITORY = re.compile(
     r"^[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+:[A-Za-z0-9_./-]+(?:\.git)?\Z")
@@ -174,6 +175,45 @@ def list_catalog(config: Path) -> list[dict[str, Any]]:
             # boxes. Do not leak transport diagnostics or turn the tab into an error page.
             return []
     return _decode_catalog(raw)
+
+
+def installed_company_ids(config: Path) -> set[str]:
+    """Return the persisted company origin of already-approved package registrations.
+
+    A catalog fetch is deliberately absent here: this only recognises the immutable
+    stage path written by ``stage_entry`` during the prior owner-approved install.
+    Therefore a lost Git credential can preserve a tile's tier mark without making
+    any catalog row or install authority available again.
+    """
+    config = Path(config).resolve()
+    settings = _settings(config)
+    try:
+        document = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CatalogError("config_unavailable", str(exc)) from exc
+    apps = document.get("apps") if isinstance(document, dict) else None
+    packages = document.get("packages") if isinstance(document, dict) else None
+    if not isinstance(apps, dict) or not isinstance(packages, dict):
+        return set()
+    stage_packages = (Path(settings["stage"]).resolve() / "packages")
+    result = set()
+    for app_id in apps:
+        if not isinstance(app_id, str) or APP_ID.fullmatch(app_id) is None:
+            continue
+        package = packages.get(app_id)
+        path = package.get("path") if isinstance(package, dict) else None
+        if not isinstance(path, str) or not path.strip():
+            continue
+        package_path = Path(path).expanduser()
+        if not package_path.is_absolute():
+            package_path = config.parent / package_path
+        try:
+            relative = package_path.resolve().relative_to(stage_packages / app_id)
+        except ValueError:
+            continue
+        if len(relative.parts) == 1 and PINNED_STAGE.fullmatch(relative.name):
+            result.add(app_id)
+    return result
 
 
 def _repository_url(value: str, *, code: str = "catalog_invalid") -> str:

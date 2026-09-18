@@ -119,6 +119,13 @@ _DANGEROUS_ADMIT_UNVERIFIED: str | None = None
 # trust state; keeping the two authorities separate prevents candidate validation from
 # accidentally acquiring the installer's broader audit/finalize meaning.
 _REGISTER_APPROVAL: tuple[str, str] | None = None
+# Lock digest is a lifecycle admission check, not a read-only config
+# precondition. validate/webjson/env/render skip it; package-info and
+# lock-finalize confirm only the explicit packages they will mutate.
+_LIFECYCLE_LOCK = False
+_LIFECYCLE_PIDS: frozenset[str] | None = None
+_APPROVAL: dict | None = None
+_LIFECYCLE_CONFIRMED: set[str] = set()
 _HTTPS_REGISTRY_CACHE: dict[str, bytes | None] = {}
 
 # App names cross a line-oriented shell boundary (`airlock-config apps`). Keep
@@ -145,7 +152,10 @@ APP_DEFAULTS: dict[str, dict] = {
                     # and nothing in this tree ever opens either for writing. That is why
                     # moving them off devterm needed no coordination with it (parent
                     # decision OQ2; devterm keeps both keys as overrides).
-                    "fleet_store": "", "fleet_store_url": ""},
+                    "fleet_store": "", "fleet_store_url": "",
+                    # OpenCode xAI login on the account surface. Off by default: it needs
+                    # the `opencode` CLI, which the installer resolves when this is true.
+                    "xai": False},
 }
 
 # Accepted in ANY app table (not a default: they carry no value when absent).
@@ -1653,16 +1663,18 @@ def resolved(cfg: dict) -> dict:
         merged = dict(APP_DEFAULTS.get(name, {}))
         merged.update(table or {})
         apps[name] = merged
-    # The account surface reads hub.fleet_store, but the key was documented under
-    # [apps.devterm] for the months it lived there (#348/#349 moved the reader, not the
-    # operator's config). A box that set it for devterm and never copied it lost every
-    # non-active account's usage with no error (measured 2026-09-14). Inherit it:
-    # one file, one collector, one opinion. An explicit hub value still wins.
+    # The account surface reads hub.fleet_store / hub.xai, but both keys were documented
+    # under [apps.devterm] for the months the surface lived there (#347-#349 moved the
+    # reader, not the operator's config). A box that set them for devterm and never
+    # copied them lost every non-active account's usage and the xAI login with no error
+    # (measured 2026-09-14/15). Inherit them: one opinion per box. An explicit hub value
+    # still wins.
     hub = apps.get("hub")
     devterm = apps.get("devterm")
     if isinstance(hub, dict) and isinstance(devterm, dict):
-        for key in ("fleet_store", "fleet_store_url"):
-            if not hub.get(key) and devterm.get(key):
+        explicit = (cfg.get("apps") or {}).get("hub") or {}
+        for key in ("fleet_store", "fleet_store_url", "xai"):
+            if key not in explicit and devterm.get(key):
                 hub[key] = devterm[key]
     paths = out.setdefault("paths", {})
     for k in ("wiki",):
@@ -4386,10 +4398,65 @@ def _package_tree_digest(pid: str, pdir: Path) -> str:
         die(f"package '{pid}': cannot compute package lock digest: {exc}")
 
 
-def _check_package_lock(pid: str, pdir: Path, lock: dict[str, str]) -> tuple[str, dict | None]:
+class _LifecycleLockScope:
+    def __init__(self, pids: frozenset[str] | None = None):
+        self.pids = pids
+        self.prev_lock = False
+        self.prev_pids: frozenset[str] | None = None
+
+    def __enter__(self):
+        global _LIFECYCLE_LOCK, _LIFECYCLE_PIDS
+        self.prev_lock = _LIFECYCLE_LOCK
+        self.prev_pids = _LIFECYCLE_PIDS
+        _LIFECYCLE_LOCK = True
+        if self.pids is not None:
+            _LIFECYCLE_PIDS = self.pids
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        global _LIFECYCLE_LOCK, _LIFECYCLE_PIDS
+        _LIFECYCLE_LOCK = self.prev_lock
+        _LIFECYCLE_PIDS = self.prev_pids
+
+
+def _lifecycle_lock_scope(pids=None) -> _LifecycleLockScope:
+    return _LifecycleLockScope(None if pids is None else frozenset(pids))
+
+
+def _spec_cache_key(cfg: dict):
+    return (id(cfg), _LIFECYCLE_LOCK, _LIFECYCLE_PIDS)
+
+
+def _approval_allows(pid: str, pdir: Path, computed: str, grants: list[str]) -> bool:
+    if _APPROVAL is None:
+        return False
+    approved_id = _APPROVAL.get("id")
+    approved_digest = _APPROVAL.get("digest")
+    approved_path = _APPROVAL.get("path")
+    approved_grants = _APPROVAL.get("grants")
+    if approved_id != pid or approved_digest != computed:
+        return False
+    if not isinstance(approved_path, str) or not approved_path.strip():
+        return False
+    if os.path.realpath(approved_path) != os.path.realpath(pdir):
+        return False
+    if not isinstance(approved_grants, list):
+        return False
+    return list(approved_grants) == list(grants)
+
+
+def _check_package_lock(pid: str, pdir: Path, lock: dict[str, str],
+                        grants: list[str] | None = None) -> tuple[str, dict | None]:
     computed = _package_tree_digest(pid, pdir)
     recorded = lock.get(pid)
+    _LIFECYCLE_CONFIRMED.add(pid)
     if recorded is not None and recorded != computed:
+        if grants is not None and _approval_allows(pid, pdir, computed, grants):
+            return computed, {
+                "argument": "approve",
+                "recorded_digest": recorded,
+                "admitted_digest": computed,
+            }
         if _DANGEROUS_ADMIT_UNVERIFIED == pid:
             return computed, {
                 "argument": f"--dangerously-admit-unverified={pid}",
@@ -4487,7 +4554,7 @@ def package_specs(cfg: dict) -> dict:
     violation (F10: unknown fields anywhere are fatal); {} when no packages
     are configured. Config cross-checks (serve values, spans, disjointness)
     live in packages_resolved."""
-    cached = _SPEC_CACHE.get(id(cfg))
+    cached = _SPEC_CACHE.get(_spec_cache_key(cfg))
     if cached is not None:
         return cached[1]
     config_abi = _preflight_config_abi(cfg)
@@ -4495,7 +4562,9 @@ def package_specs(cfg: dict) -> dict:
             and config_abi != CONFIG_ABI_VERSION):
         die("--dangerously-admit-unverified requires [airlock] "
             f"config_version = {CONFIG_ABI_VERSION}", code=2)
-    package_lock = _read_package_lock() if config_abi == CONFIG_ABI_VERSION else {}
+    package_lock = (_read_package_lock()
+                    if config_abi == CONFIG_ABI_VERSION and _LIFECYCLE_LOCK
+                    else {})
     shipped_root = _shipped_root()
     _assert_bundle_policy_parity()
     pkgs_cfg = cfg.get("packages") or {}
@@ -4593,12 +4662,15 @@ def package_specs(cfg: dict) -> dict:
                                     granted_capabilities=granted)
         if source_class == "managed":
             spec["signed_package_digest"] = _MANAGED_PACKAGE_AUTHORITY[pid]["package_digest"]
-        if source_class == "explicit" and config_abi == CONFIG_ABI_VERSION:
-            _, lock_override = _check_package_lock(pid, pdir, package_lock)
+        if (source_class == "explicit" and config_abi == CONFIG_ABI_VERSION
+                and _LIFECYCLE_LOCK
+                and (_LIFECYCLE_PIDS is None or pid in _LIFECYCLE_PIDS)):
+            _, lock_override = _check_package_lock(
+                pid, pdir, package_lock, list(granted))
             if lock_override is not None:
                 spec["lock_override"] = lock_override
         out[pid] = spec
-    if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+    if _DANGEROUS_ADMIT_UNVERIFIED is not None and _LIFECYCLE_LOCK:
         selected = out.get(_DANGEROUS_ADMIT_UNVERIFIED)
         if selected is None or selected.get("source_class") != "explicit":
             raise AssertionError("selected explicit package disappeared during parsing")
@@ -4608,7 +4680,7 @@ def package_specs(cfg: dict) -> dict:
             die(f"--dangerously-admit-unverified target "
                 f"'{_DANGEROUS_ADMIT_UNVERIFIED}' {state}; the escape hatch is "
                 "accepted only for a real digest mismatch", code=2)
-    _SPEC_CACHE[id(cfg)] = (cfg, out)
+    _SPEC_CACHE[_spec_cache_key(cfg)] = (cfg, out)
     return out
 
 
@@ -4848,7 +4920,7 @@ def cmd_package_preview(cfg: dict, raw_path: str) -> "None":
     packages[pid] = {"path": str(pdir)}
     if grants:
         packages[pid]["grant"] = grants
-    _SPEC_CACHE[id(candidate)] = (candidate, specs)
+    _SPEC_CACHE[_spec_cache_key(candidate)] = (candidate, specs)
 
     # Full candidate validation is still useful for a refused capability: the UI can
     # show all other manifest/config problems before the owner edits that capability
@@ -4929,7 +5001,8 @@ def cmd_package_register_validate(cfg: dict, package_id: str,
 
     _REGISTER_APPROVAL = (package_id, approved_digest)
     cmd_validate(cfg)
-    spec = package_specs(cfg).get(package_id)
+    with _lifecycle_lock_scope({package_id}):
+        spec = package_specs(cfg).get(package_id)
     override = spec.get("lock_override") if isinstance(spec, dict) else None
     admitted = override.get("admitted_digest") if isinstance(override, dict) else None
     if admitted != approved_digest:
@@ -6046,6 +6119,11 @@ def cmd_prereqs(cfg: dict) -> "None":
 def cmd_package_info(cfg: dict) -> "None":
     """Everything bash needs about [packages.*], as one JSON object. Consumed
     by the orchestrator and bin/airlock-ledger (which parses no TOML)."""
+    with _lifecycle_lock_scope(_LIFECYCLE_PIDS):
+        _cmd_package_info_locked(cfg)
+
+
+def _cmd_package_info_locked(cfg: dict) -> "None":
     rendered = json.dumps({
         "config_path": str(find_config()),
         "order": app_order(cfg),
@@ -6130,16 +6208,34 @@ def cmd_lock_finalize(cfg: dict, override_receipt: str | None = None) -> "None":
         fcntl.flock(directory_fd, fcntl.LOCK_EX)
         specs = package_specs(cfg)
         current = _read_package_lock()
-        checked = {
-            pid: _check_package_lock(pid, Path(spec["dir"]), current)
-            for pid, spec in sorted(specs.items())
-            if spec["source_class"] == "explicit"
-        }
+        pkgs_cfg = cfg.get("packages") or {}
+        checked = {}
+        for pid, spec in sorted(specs.items()):
+            if spec["source_class"] != "explicit":
+                continue
+            table = pkgs_cfg.get(pid) if isinstance(pkgs_cfg, dict) else None
+            grants = (table or {}).get("grant") or []
+            if not isinstance(grants, list):
+                grants = []
+            checked[pid] = _check_package_lock(
+                pid, Path(spec["dir"]), current, [str(g) for g in grants])
         computed = {pid: result[0] for pid, result in checked.items()}
         missing = {pid: digest for pid, digest in computed.items()
                    if pid not in current}
         replacement = None
-        if _DANGEROUS_ADMIT_UNVERIFIED is not None:
+        if _APPROVAL is not None and _DANGEROUS_ADMIT_UNVERIFIED is None:
+            pid = _APPROVAL.get("id")
+            if pid not in computed:
+                die(f"package '{pid}': approval does not name a configured "
+                    "explicit package", code=2)
+            override = checked[pid][1]
+            if override is None or override.get("argument") != "approve":
+                die(f"package '{pid}': --approve-json is accepted only for a "
+                    "real digest mismatch", code=2)
+            log(f"package-lock-approve id={pid} digest={computed[pid]} "
+                f"grants={_APPROVAL.get('grants')!r}")
+            replacement = (pid, computed[pid])
+        elif _DANGEROUS_ADMIT_UNVERIFIED is not None:
             pid = _DANGEROUS_ADMIT_UNVERIFIED
             if (override_receipt is None
                     or re.fullmatch(r"[0-9a-f]{64}", override_receipt) is None):
@@ -6760,15 +6856,45 @@ def cmd_webjson(cfg: dict) -> "None":
     print(json.dumps(out, indent=2, sort_keys=True))
 
 
+def _parse_approve_json(raw: str) -> dict:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        die(f"--approve-json is not valid JSON: {exc}", code=2)
+    if not isinstance(value, dict):
+        die("--approve-json must be a JSON object", code=2)
+    pid = value.get("id")
+    path = value.get("path")
+    digest = value.get("digest")
+    grants = value.get("grants")
+    if not isinstance(pid, str) or PACKAGE_ID_RE.fullmatch(pid) is None:
+        die("--approve-json.id must be a valid package id", code=2)
+    if not isinstance(path, str) or not path.strip():
+        die("--approve-json.path must be a non-empty path", code=2)
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        die("--approve-json.digest must be a lowercase 64-hex digest", code=2)
+    if not isinstance(grants, list) or any(not isinstance(item, str) for item in grants):
+        die("--approve-json.grants must be a list of strings", code=2)
+    if len(grants) != len(set(grants)):
+        die("--approve-json.grants must be unique", code=2)
+    return {"id": pid, "path": path, "digest": digest, "grants": list(grants)}
+
+
 def _parse_global_args(argv: list[str]) -> list[str]:
     global _DANGEROUS_ADMIT_UNVERIFIED, _REGISTER_APPROVAL
+    global _LIFECYCLE_LOCK, _LIFECYCLE_PIDS, _APPROVAL
+    _LIFECYCLE_CONFIRMED.clear()
     # main() is normally one process per call, but keep the parser honest for
     # embedded/test callers too: an earlier exceptional invocation must never
     # become ambient state for a later normal invocation in the same process.
     _DANGEROUS_ADMIT_UNVERIFIED = None
     _REGISTER_APPROVAL = None
+    _LIFECYCLE_LOCK = False
+    _LIFECYCLE_PIDS = None
+    _APPROVAL = None
     rest = []
     seen = False
+    seen_approve = False
     for argument in argv:
         if argument == "--dangerously-admit-unverified":
             die("--dangerously-admit-unverified requires =<package-id>", code=2)
@@ -6781,6 +6907,14 @@ def _parse_global_args(argv: list[str]) -> list[str]:
                 die("--dangerously-admit-unverified requires a valid package id "
                     "after '='", code=2)
             _DANGEROUS_ADMIT_UNVERIFIED = value
+            continue
+        if argument == "--approve-json":
+            die("--approve-json requires =<json>", code=2)
+        if argument.startswith("--approve-json="):
+            if seen_approve:
+                die("--approve-json is accepted only once", code=2)
+            seen_approve = True
+            _APPROVAL = _parse_approve_json(argument.split("=", 1)[1])
             continue
         rest.append(argument)
     return rest
@@ -6905,6 +7039,19 @@ def main(argv: list[str]) -> int:
             die("package-register-validate requires <id> <approved-digest>", code=2)
         cmd_package_register_validate(cfg, rest[0], rest[1])
     elif cmd == "package-info":
+        targets = None
+        for argument in rest:
+            if argument.startswith("--lifecycle-targets="):
+                raw = argument.split("=", 1)[1]
+                names = [item for item in raw.split(",") if item]
+                if not names or any(PACKAGE_ID_RE.fullmatch(item) is None for item in names):
+                    die("package-info --lifecycle-targets requires package ids", code=2)
+                targets = frozenset(names)
+            elif argument:
+                die("package-info takes only --lifecycle-targets=<id,id>", code=2)
+        if targets is not None:
+            global _LIFECYCLE_PIDS
+            _LIFECYCLE_PIDS = targets
         cmd_package_info(cfg)
     elif cmd == "install-preflight":
         if not rest:

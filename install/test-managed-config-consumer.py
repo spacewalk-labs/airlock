@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -406,8 +407,24 @@ def prepare_u1_fixture(
             files["airlock-app.toml"] = (0o644, manifest)
         return files
 
+    # The updater judges host compatibility on every managed run, so a delivered
+    # enrollment fixture must carry this host's measured profile rather than the
+    # abstract label the source-only state fixture uses.
+    host_profile = "linux-" + {"amd64": "x86_64", "arm64": "aarch64"}.get(
+        platform.machine().lower(), platform.machine().lower())
+    original_write_json = SF.RF.write_json
+
+    def host_profiled_write_json(path: Path, value: dict) -> None:
+        if path.name == "catalog.json":
+            for app in value["apps"]:
+                app["compatibility"] = {"platforms": ["linux"], "profiles": [host_profile]}
+        elif path.name == "release.lock":
+            value["target_profile"] = host_profile
+        original_write_json(path, value)
+
     SF.CORE_REVISION, SF.CORE_DIGEST = core_revision, core_digest
     SF.materialize_package = materialize_capability_package
+    SF.RF.write_json = host_profiled_write_json
     try:
         stage = SF.make_stage(
             material_root, publisher_key, sequence=50,
@@ -416,6 +433,7 @@ def prepare_u1_fixture(
     finally:
         SF.CORE_REVISION, SF.CORE_DIGEST = previous_revision, previous_digest
         SF.materialize_package = original_materialize_package
+        SF.RF.write_json = original_write_json
     snapshot_digest = SF.snapshot_digest(stage)
     store.mkdir(parents=True, exist_ok=True)
     (store / "releases").mkdir()

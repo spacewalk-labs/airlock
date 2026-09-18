@@ -24,11 +24,12 @@ marked            github.com/markedjs/marked        MIT           vendored in ap
 DOMPurify         github.com/cure53/DOMPurify       Apache-2.0 OR MPL-2.0  vendored in apps/fileview/static/vendor/purify.min.js (v3.4.8)
 orca (ADE)        github.com/stablyai/orca          MIT           AppImage downloaded at install (sha-pinned)
 orca web client   github.com/stablyai/orca          MIT           vendored BUILT dist in apps/orca/web-bundle/dist/ (patched; redistributed)
-paseo (CLI)       github.com/getpaseo/paseo         AGPL-3.0      guarded 0.2.5 package set vendored under apps/paseo/vendor/
+paseo (CLI)       github.com/getpaseo/paseo         Apache-2.0    guarded 0.8.0 package set vendored under apps/paseo/vendor/
 paseo patches     apps/paseo/patches/               AGPL-3.0      our patches — derivative of paseo, see that dir
 paseo web-ui patcher apps/paseo/browse-host/bin/patch-web-ui.js  AGPL-3.0  encodes derivative edits of paseo's web-ui
 paseo browse-host apps/paseo/browse-host/ (ours)    AGPL-3.0      loopback-WS sidecar; needs Playwright (follow-up, not wired in v1)
 Playwright/Chromium (only if browse-host used)      Apache-2.0 / (Chromium BSD)  downloaded at install
+google-antigravity-acp (agy-acp) github.com/sibbl/google-antigravity-acp  MIT  forked source vendored+patched in apps/paseo/agy-acp/ (redistributed; config-gated, off by default)
 
 Everything else under apps/ (hub, publish, notepad, dev-monitor backends/UIs, the
 gate, config layer, installers) is Airlock's own code under AGPL-3.0 (repo root LICENSE).
@@ -38,6 +39,15 @@ Copyright (c) 2026 Lovecast Inc.; local patches under this repo's AGPL-3.0 licen
 the other upstream tools, this is a BUILT derivative we REDISTRIBUTE (it ships in the
 repo and is served at /orca-web/), which the upstream MIT license permits with this
 attribution. Provenance + patch summary: apps/orca/web-bundle/README.md.
+
+agy-acp (apps/paseo/agy-acp/) — forked from sibbl/google-antigravity-acp, MIT,
+Copyright (c) 2026 Antigravity ACP Contributors; local patches under this repo's
+AGPL-3.0 license. Unlike the Paseo patches above (derivative of AGPL Paseo, so
+necessarily AGPL-3.0 themselves), the upstream base here is MIT, which permits
+redistributing patched SOURCE directly rather than only an install-time text
+patch against an opaque dist — so unlike orca's BUILT-dist vendoring, this is a
+full source fork with its own tests and build step. Provenance + patch
+summary: apps/paseo/agy-acp/README.md.
 
 Deferred to a follow-up (NOT shipped in v1, so not a distribution concern yet):
 the paseo browse-host live panels, and the orca local-render / grab sidecars (the
@@ -51,17 +61,21 @@ Notes
   verifies sha256 where applicable. Operators accept the upstream terms of those
   binaries.
 - The modified Paseo npm packages are redistributed with checksum, review, source,
-  and license provenance in `apps/paseo/vendor/guarded-0.2.5/`. The corresponding
+  and license provenance in `apps/paseo/vendor/guarded-0.8.0/`. The corresponding
   source is the public commit named there.
 - Core license: the Airlock core is AGPL-3.0 (changed from Apache-2.0 on
-  2026-09-08 by the copyright holder). Paseo (@getpaseo/cli) is also AGPL-3.0 and
-  runs as a SEPARATE PROCESS — the core talks to it over loopback IPC/WS, so the
-  core is not a derivative of paseo (mere aggregation). That separation still
-  matters for attribution even though both are now AGPL-3.0: the paseo *patches*
-  and the *web-ui patcher* ARE derivatives of paseo and are marked AGPL-3.0-only
-  for that reason, while the rest of this repository is AGPL-3.0 by the copyright
-  holder's own choice. The full AGPL-3.0 text is the repo root LICENSE (also
-  vendored at apps/paseo/patches/LICENSE). This is NOT legal advice.
+  2026-09-08 by the copyright holder). Paseo (@getpaseo/cli) is licensed
+  Apache-2.0 by upstream (changed from AGPL-3.0 as of upstream v0.7) and runs as
+  a SEPARATE PROCESS — the core talks to it over loopback IPC/WS, so the core is
+  not a derivative of paseo (mere aggregation) regardless of either side's
+  license. The paseo *patches* and the *web-ui patcher* ARE derivatives of
+  paseo's own source; see `apps/paseo/patches/README.md` for why they are
+  licensed AGPL-3.0-only (our own choice under Apache-2.0 §4(b), not an
+  inherited requirement) while the rest of this repository is AGPL-3.0 by the
+  copyright holder's own choice. The repo root LICENSE carries the AGPL-3.0
+  text (also vendored at apps/paseo/patches/LICENSE); the upstream Apache-2.0
+  text is vendored at apps/paseo/patches/UPSTREAM-LICENSE for the portions of
+  the patched files that remain upstream's own work. This is NOT legal advice.
 - Network use (AGPL-3.0 section 13): Airlock is network-interactive. An operator
   who modifies Airlock and lets others use it over a network must offer those
   users the Corresponding Source of the modified version. The hub footer carries

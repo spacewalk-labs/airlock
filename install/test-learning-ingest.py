@@ -1604,6 +1604,25 @@ def main(argv):
         check("영수증이 짝을 밝힌다",
               pair.get("html") == "2026-08-22--paired--iiiiiiiiii1.html",
               str(pair.get("html")))
+        layout_path = "2026-08-22--layout-root--iiiiiiiii10.md"
+        SAVE.save(
+            library, layout_path, document("iiiiiiiii10"),
+            video_id="iiiiiiiii10", state_dir=state,
+            html=(b"<!doctype html><html><head></head><body>"
+                  b"<style>body{max-width:44rem;margin:3rem auto;padding:0 1.25rem}</style>"
+                  b"<h1>Title</h1><p>Body</p></body></html>"))
+        layout_html = open(os.path.join(
+            library, "2026-08-22--layout-root--iiiiiiiii10.html"), encoding="utf-8").read()
+        check("저장 HTML 에 main.doc 루트가 생긴다",
+              layout_html.count('<main class="doc">') == 1
+              and "<h1>Title</h1>" in layout_html.split('<main class="doc">', 1)[-1],
+              layout_html[:240])
+        check("이미 있는 루트는 다시 감싸지 않는다",
+              SAVE.ensure_doc_root(layout_html) == layout_html)
+        check("doc-quiz 는 문서 루트가 아니다",
+              SAVE.ensure_doc_root(
+                  '<html><body><section class="doc-quiz"></section></body></html>'
+              ).count('<main class="doc">') == 1)
         # 🔴 짝이 없으면 `mutable` 이 거짓이 되어 공유도 보관도 안 된다. 그 연결을 잰다.
         snap_env = (os.environ["AIRLOCK_LEARNING_LIBRARY"],
                     os.environ["AIRLOCK_LEARNING_STATE_DIR"])

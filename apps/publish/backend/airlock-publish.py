@@ -46,6 +46,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -976,8 +977,25 @@ def _ingest(method, ep, body=None, timeout=20):
     req = urllib.request.Request(
         INGEST_URL + ep, data=data, method=method,
         headers={'Content-Type': 'application/json', TOKEN_HEADER: TOKEN})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode('utf-8'))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        # HTTPError is also a response.  Throwing its body away reduced every
+        # receiver failure to e.g. "HTTP Error 500", which made a storage
+        # failure indistinguishable from an auth failure and led operators to
+        # rotate a healthy token.  Keep only the receiver's bounded structured
+        # error; arbitrary HTML and credentials never enter the UI or journal.
+        raw = exc.read(8192)
+        detail = ''
+        try:
+            payload = json.loads(raw.decode('utf-8'))
+            if isinstance(payload, dict):
+                detail = _ingest_error(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        status = f'HTTP {exc.code}'
+        raise RuntimeError(f'{status}: {detail}' if detail else status) from None
 
 
 # ---- local target: snapshots on disk, served by this box's nginx ----------

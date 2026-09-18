@@ -1172,7 +1172,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
             updates = UPDATES.read_snapshot() if UPDATES is not None else None
             try:
-                projection = APPS.list_apps(cfg['root'], updates)
                 try:
                     config = APPS.config_path(cfg['root'])
                 except APPS.AppsError as exc:
@@ -1180,12 +1179,17 @@ class Handler(BaseHTTPRequestHandler):
                     # exact failure.  A source-tree launch without AIRLOCK_CONFIG asks
                     # package-info for the config path next, which is lock-strict too;
                     # do not let the optional company lookup erase that projection.
-                    if (projection.get('degraded') != 'lock-mismatch'
-                            or exc.code != 'config_invalid'
+                    if (exc.code != 'config_invalid'
                             or 'package lock digest mismatch' not in exc.detail):
+                        raise
+                    projection = APPS.list_apps(cfg['root'], updates, set())
+                    if projection.get('degraded') != 'lock-mismatch':
                         raise
                     projection['company'] = []
                 else:
+                    company_ids = (COMPANY_CATALOG.installed_company_ids(config)
+                                   if COMPANY_CATALOG is not None else set())
+                    projection = APPS.list_apps(cfg['root'], updates, company_ids)
                     projection['company'] = (
                         COMPANY_CATALOG.list_catalog(config)
                         if COMPANY_CATALOG is not None else [])

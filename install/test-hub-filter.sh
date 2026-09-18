@@ -8,6 +8,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+CHECKOUT_SHA="$(git -C "$ROOT" rev-parse --verify HEAD^{commit} 2>/dev/null)" \
+  || { echo "FAIL hub-filter: execution checkout revision is unavailable"; exit 1; }
+[[ "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]] \
+  || { echo "FAIL hub-filter: execution checkout revision is not a full SHA"; exit 1; }
+AC_DTI_EVIDENCE="install/test-hub-filter.sh@$CHECKOUT_SHA"
 
 command -v node >/dev/null 2>&1 \
   || { echo "FAIL hub-filter: node is required (the hub filter is JS)"; exit 1; }
@@ -182,7 +187,7 @@ grep -qF 'want = new URL(base, location.href).origin;' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the close-message origin is not resolved against this page"; exit 1; }
 echo "ok   hub-filter: the identity pill entrance, its owner gate and its close message are wired"
 
-node - "$ROOT/hub/index.html" <<'JS'
+AIRLOCK_HUB_FILTER_EVIDENCE="$AC_DTI_EVIDENCE" node - "$ROOT/hub/index.html" <<'JS'
 const fs = require("fs");
 const html = fs.readFileSync(process.argv[2], "utf8");
 let failed = 0;
@@ -190,6 +195,8 @@ function sourceCheck(name, condition) {
   if (condition) { console.log("ok   hub-filter: " + name); }
   else { console.log("FAIL hub-filter: " + name); failed = 1; }
 }
+sourceCheck("acceptance evidence binds this execution checkout's full SHA",
+  /^install\/test-hub-filter\.sh@[0-9a-f]{40}$/.test(process.env.AIRLOCK_HUB_FILTER_EVIDENCE || ""));
 
 // The owner explicitly removed recents, rather than merely hiding its section:
 // no duplicate tile DOM, click tracking, or local-storage state remains. These
@@ -706,21 +713,42 @@ function runCase(kind) {
   check("run poll: a finished run still reads as finished",
         done.text, "전체 설치기 재실행 — 완료되었습니다.");
 
-  // The card's machine verdict for this slice, with the values it was read from.
+  // The card's machine verdict for this slice. Keep the predicate in the exact
+  // observed-field vocabulary so accept-card can recompute it, and prove that one
+  // false condition is a FAIL rather than an implicit pass.
+  const dtiExpected = 'base == "/airlock-accounts/" && relative == true && ' +
+    'no_devterm == "/airlock-accounts/" && no_port == "/airlock-accounts/" && ' +
+    'no_config == "/airlock-accounts/"';
+  const dtiFields = {
+    base: panelBase(),
+    relative: /^\/[^/]/.test(panelBase()),
+    no_devterm: panelBase({ paseo: { port: 8444 } }, "box.tail.ts.net", "box.tail.ts.net"),
+    no_port: panelBase({ devterm: {} }, "box.tail.ts.net", "box.tail.ts.net"),
+    no_config: panelBase(null, "", ""),
+  };
+  function dtiVerdict(fields) {
+    return fields.base === "/airlock-accounts/" && fields.relative === true &&
+      fields.no_devterm === "/airlock-accounts/" && fields.no_port === "/airlock-accounts/" &&
+      fields.no_config === "/airlock-accounts/" ? "PASS" : "FAIL";
+  }
+  check("AC-DTI-P2E: all observed conditions satisfy the machine predicate",
+        dtiVerdict(dtiFields), "PASS");
+  check("AC-DTI-P2E: one false condition is a FAIL",
+        dtiVerdict(Object.assign({}, dtiFields, { relative: false })), "FAIL");
   const observed = [
-    "base=" + JSON.stringify(panelBase()),
-    "relative=" + /^\/[^/]/.test(panelBase()),
-    "no_devterm=" + JSON.stringify(panelBase({ paseo: { port: 8444 } }, "box.tail.ts.net", "box.tail.ts.net")),
-    "no_port=" + JSON.stringify(panelBase({ devterm: {} }, "box.tail.ts.net", "box.tail.ts.net")),
-    "no_config=" + JSON.stringify(panelBase(null, "", "")),
+    "base=" + JSON.stringify(dtiFields.base),
+    "relative=" + dtiFields.relative,
+    "no_devterm=" + JSON.stringify(dtiFields.no_devterm),
+    "no_port=" + JSON.stringify(dtiFields.no_port),
+    "no_config=" + JSON.stringify(dtiFields.no_config),
   ].join(",");
   console.log("");
-  console.log('AC-DTI-P2E | expected: the hub identity pill\'s account base is the literal ' +
-    'owner-gated hub prefix and does not vary with devterm being absent, portless or unconfigured' +
+  console.log('AC-DTI-P2E | expected: ' + dtiExpected +
     ' | observed: ' + observed + ' | verdict: ' + (failed ? "FAIL" : "PASS") +
-    ' | signal: fixture | evidence: install/test-hub-filter.sh');
+    ' | signal: fixture | evidence: ' + process.env.AIRLOCK_HUB_FILTER_EVIDENCE);
   process.exit(failed);
 })();
 JS
 echo "---"
+node "$ROOT/install/test-hub-home-edit.cjs"
 echo "hub-filter: all assertions passed"

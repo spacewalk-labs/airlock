@@ -2117,7 +2117,8 @@ class PackageReregistrationTest(unittest.TestCase):
         self.assertEqual(backup.read_bytes(), disabled)
         self.assertEqual(lock.read_bytes(), lock_before)
         self.assertEqual(self.data.read_text(), 'operator data\n')
-        self.assertNotEqual(self._config('validate').returncode, 0)
+        self.assertEqual(self._config('validate').returncode, 0)
+        self.assertNotEqual(self._config('package-info').returncode, 0)
         approved = self._config(
             'package-register-validate', 'retained-app', preview['digest'])
         self.assertEqual(approved.returncode, 0, approved.stderr)
@@ -2471,13 +2472,15 @@ class UpdateExecRouteTest(unittest.TestCase):
         }
         saved = (DM.APPS.list_apps, DM.APPS.config_path,
                  DM.APPS.register, DM.APPS.mutate_enabled)
-        saved_company = DM.COMPANY_CATALOG.list_catalog
+        saved_company = (DM.COMPANY_CATALOG.installed_company_ids,
+                         DM.COMPANY_CATALOG.list_catalog)
         calls = []
-        DM.APPS.list_apps = lambda root, updates: projection
+        DM.APPS.list_apps = lambda root, updates, company_ids=None: projection
         DM.APPS.config_path = lambda root: Path('/tmp/airlock.toml')
         DM.APPS.register = lambda config, app_id: calls.append(('register', app_id))
         DM.APPS.mutate_enabled = lambda config, app_id, enabled: (
             calls.append(('enabled', app_id, enabled)))
+        DM.COMPANY_CATALOG.installed_company_ids = lambda config: set()
         DM.COMPANY_CATALOG.list_catalog = lambda config: []
         try:
             status, payload = self._req('GET', '/api/owner/apps')
@@ -2506,7 +2509,42 @@ class UpdateExecRouteTest(unittest.TestCase):
         finally:
             (DM.APPS.list_apps, DM.APPS.config_path,
              DM.APPS.register, DM.APPS.mutate_enabled) = saved
-            DM.COMPANY_CATALOG.list_catalog = saved_company
+            (DM.COMPANY_CATALOG.installed_company_ids,
+             DM.COMPANY_CATALOG.list_catalog) = saved_company
+
+    def test_unreadable_company_catalog_keeps_only_the_installed_company_marker(self):
+        """A lost Git credential is not permission to relabel or install an app."""
+        projection = {
+            'apps': {'widget': {}},
+            'installed': [{'id': 'widget', 'source': 'explicit', 'tier': 'company', 'canRemove': True}],
+            'public': [], 'updates': {'apps': []},
+        }
+        saved = (DM.APPS.list_apps, DM.APPS.config_path,
+                 DM.COMPANY_CATALOG.installed_company_ids,
+                 DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry)
+        calls = []
+        DM.APPS.list_apps = lambda root, updates, company_ids=None: (
+            calls.append(('list_apps', company_ids)) or projection)
+        DM.APPS.config_path = lambda root: Path('/tmp/catalog-fixture.toml')
+        DM.COMPANY_CATALOG.installed_company_ids = lambda config: {'widget'}
+        DM.COMPANY_CATALOG.list_catalog = lambda config: []
+        DM.COMPANY_CATALOG.stage_entry = lambda *args: calls.append(('stage', args))
+        try:
+            status, payload = self._req('GET', '/api/owner/apps')
+            self.assertEqual((status, payload['company']), (200, []), payload)
+            self.assertEqual(payload['installed'][0]['tier'], 'company')
+            self.assertEqual(calls, [('list_apps', {'widget'})])
+            self.assertEqual(self._req('GET', '/api/owner/apps', owner=False)[0], 403)
+
+            status, payload = self._req(
+                'POST', '/api/owner/apps/widget/install-company', b'{}')
+            self.assertEqual((status, payload['error']), (404, 'app_not_found'))
+            self.assertEqual(calls, [('list_apps', {'widget'})])
+            self.assertEqual(self.launched, [])
+        finally:
+            (DM.APPS.list_apps, DM.APPS.config_path,
+             DM.COMPANY_CATALOG.installed_company_ids,
+             DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
 
     def test_lock_mismatch_without_detector_snapshot_keeps_reapproval_visible(self):
         """D3(a): the CLI refusal itself supplies the review row before the timer runs."""
@@ -2557,6 +2595,21 @@ class UpdateExecRouteTest(unittest.TestCase):
         self.assertEqual((status, payload['action'], payload['execution']),
                          (200, 'reapprove', 'install'), payload)
         self.assertIn('--reapprove', self.launched[-1][1]['exec'])
+
+    def test_config_path_lock_mismatch_rebuilds_the_degraded_apps_projection(self):
+        """The optional catalog lookup cannot dereference an unbuilt projection."""
+        saved = DM.APPS.config_path
+        DM.UPDATES = self._missing_snapshot()
+        try:
+            with self._actual_lock_mismatch(installed_env=True):
+                DM.APPS.config_path = lambda root: (_ for _ in ()).throw(
+                    DM.APPS.AppsError('config_invalid', 'package lock digest mismatch'))
+                status, payload = self._req('GET', '/api/owner/apps')
+        finally:
+            DM.APPS.config_path = saved
+        self.assertEqual((status, payload['degraded'], payload['company']),
+                         (200, 'lock-mismatch', []), payload)
+        self.assertEqual([row['id'] for row in payload['installed']], ['moved-app'])
 
     def test_company_install_stages_then_uses_the_existing_register_and_install_path(self):
         saved = (DM.APPS.config_path, DM.APPS.package_preview, DM.APPS.register,
@@ -2644,6 +2697,7 @@ class UpdateExecRouteTest(unittest.TestCase):
 
     def test_company_install_exposes_machine_reason_without_staging(self):
         saved = (DM.APPS.config_path, DM.APPS.list_apps, DM.APPS.register,
+                 DM.COMPANY_CATALOG.installed_company_ids,
                  DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry)
         touched = []
         row = {
@@ -2652,10 +2706,11 @@ class UpdateExecRouteTest(unittest.TestCase):
             "installable": False, "reason": "build_artifact",
         }
         DM.APPS.config_path = lambda root: Path('/tmp/catalog-fixture.toml')
-        DM.APPS.list_apps = lambda root, updates: {
+        DM.APPS.list_apps = lambda root, updates, company_ids=None: {
             'installed': [], 'public': [], 'apps': {},
         }
         DM.APPS.register = lambda *args, **kwargs: touched.append(('register', args, kwargs))
+        DM.COMPANY_CATALOG.installed_company_ids = lambda config: set()
         DM.COMPANY_CATALOG.list_catalog = lambda path: [row]
         DM.COMPANY_CATALOG.stage_entry = lambda *args: touched.append(('stage', args))
         try:
@@ -2669,6 +2724,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertEqual(self.launched, [])
         finally:
             (DM.APPS.config_path, DM.APPS.list_apps, DM.APPS.register,
+             DM.COMPANY_CATALOG.installed_company_ids,
              DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
 
     def test_personal_preview_and_registration_bind_path_digest_and_grants(self):

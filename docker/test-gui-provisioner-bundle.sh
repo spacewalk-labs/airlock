@@ -38,6 +38,7 @@ cp -a "$HERE/project-starter" "$repo/docker/project-starter"
 install -m 0644 "$HERE/student-harness-provenance.json" "$repo/docker/student-harness-provenance.json"
 install -m 0644 "$ROOT/install/install-student-harness.py" "$repo/install/install-student-harness.py"
 install -m 0644 "$ROOT/install/install-agent-tools.sh" "$repo/install/install-agent-tools.sh"
+install -m 0644 "$ROOT/install/configure-opencode.py" "$repo/install/configure-opencode.py"
 install -m 0644 "$ROOT/install/check-internal-leaks.sh" "$repo/install/check-internal-leaks.sh"
 # Development runs happen before these files have a repository revision. Make that
 # exact candidate a temporary commit so the builder still consumes committed bytes;
@@ -49,7 +50,7 @@ git -C "$repo" add docker/gui_selection.py
 git -C "$repo" add docker/org.airlock.Installer.desktop docker/org.airlock.Installer.policy
 git -C "$repo" add docker/student-harness docker/project-starter \
   docker/student-harness-provenance.json install/install-student-harness.py \
-  install/install-agent-tools.sh install/check-internal-leaks.sh
+  install/install-agent-tools.sh install/configure-opencode.py install/check-internal-leaks.sh
 if ! git -C "$repo" diff --cached --quiet; then
   git -C "$repo" -c user.name=gui-bundle-test -c user.email=gui-bundle-test@example.invalid \
     commit -q -m 'gui bundle test candidate'
@@ -77,6 +78,7 @@ if [ -f "$one" ] && tar -xzf "$one" -C "$extract" \
     && [ -f "$extract/airlock/docker/gui-version-relation.py" ] \
     && [ -f "$extract/airlock/docker/student-harness-provenance.json" ] \
     && [ -f "$extract/airlock/install/install-student-harness.py" ] \
+    && [ -f "$extract/airlock/install/configure-opencode.py" ] \
     && bash -n "$extract/airlock/docker/gui-provisioner.sh"; then
   ok "archive contains the manifest and runnable provisioner/version gate"
 else

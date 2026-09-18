@@ -553,6 +553,22 @@ class _StubIngest(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class _FailingIngest(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        payload = json.dumps({
+            'ok': False,
+            'error': {'code': 'commit_failed', 'message': 'no space left on device'},
+        }).encode()
+        self.send_response(500)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_a):
+        pass
+
+
 def t_remote_regression(tmp):
     print('\n[13,14] remote protocol, size behavior, and local-only guards')
     share, _p, state, _env = make_dirs(tmp)
@@ -601,6 +617,32 @@ def t_remote_regression(tmp):
     ok_bad, bad_res = m.publish_public('r.html', 24, OWNER)
     m._ingest = real_ingest
     check('malformed remote ingest result fails closed', not ok_bad and 'invalid result' in str(bad_res), str(bad_res))
+
+    # A receiver's structured failure is the diagnosis.  Dropping this body
+    # previously turned a real commit failure into a bare status and invited a
+    # second, faulty auth probe that created an unrelated 403.
+    srv = http.server.HTTPServer(('127.0.0.1', 0), _FailingIngest)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        m3 = load({'AIRLOCK_PUBLISH_SHARE_DIR': share,
+                   'AIRLOCK_PUBLISH_STATE_DIR': state,
+                   'AIRLOCK_PUBLISH_INGEST_URL': f'http://127.0.0.1:{srv.server_port}',
+                   'AIRLOCK_PUBLISH_BASE_URL': 'https://docs.example',
+                   'AIRLOCK_PUBLISH_TOKEN': 'sekret'})
+        try:
+            m3._ingest('POST', '/ingest', {'slug': 'failure-a1b2c3'})
+            rendered = ''
+        except RuntimeError as exc:
+            rendered = str(exc)
+        check('remote HTTP errors preserve the receiver code and message',
+              rendered == 'HTTP 500: no space left on device [commit_failed]', rendered)
+        check('remote HTTP errors do not expose the configured token',
+              'sekret' not in rendered, rendered)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=2)
 
     m2 = load({'AIRLOCK_PUBLISH_SHARE_DIR': share, 'AIRLOCK_PUBLISH_STATE_DIR': state,
                'AIRLOCK_PUBLISH_PUBLIC_MODE': 'local', 'AIRLOCK_PUBLISH_BASE_URL': 'https://x',
@@ -1158,6 +1200,19 @@ def t_remote_contract_v1(tmp):
         return m, sent
 
     V1 = {'supported_versions': ['0', '1'], 'modes': ['open', 'gated']}
+
+    # Health readiness and protocol capability are independent.  A receiver
+    # with low storage keeps HTTP 200 for compatibility and says ok=false, but
+    # its v1 contract is still authoritative; caching it as v0 would keep
+    # gated/bundle publishing disabled after storage recovers.
+    storage_unhealthy, _ = load_with(V1)
+    storage_unhealthy._ingest = lambda *a, **k: {
+        'ok': False,
+        'error': {'code': 'storage_unavailable', 'message': 'insufficient storage'},
+        'public_contract': V1,
+    }
+    check('an unhealthy receiver still advertises its stable v1 capability',
+          storage_unhealthy.remote_supports('1', 'gated'))
 
     # --- a receiver that speaks v1 -------------------------------------------
     m, sent = load_with(V1)

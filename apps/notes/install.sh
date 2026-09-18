@@ -192,8 +192,8 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
     if can_reuse_containers; then
       [ -f "$run_final/airlock-notes-editor.service" ] \
         && [ -f "$run_final/notes.conf" ] || die "reusable container set has no runtime render"
-      install -m 644 "$run_final/airlock-notes-editor.service" "$UNIT_DIR/airlock-notes-editor.service"
-      install -m 644 "$run_final/notes.conf" "$CONFD/hub-locations.d/notes.conf"
+      install_if_changed 644 "$run_final/airlock-notes-editor.service" "$UNIT_DIR/airlock-notes-editor.service"
+      install_if_changed 644 "$run_final/notes.conf" "$CONFD/hub-locations.d/notes.conf"
       systemctl --user daemon-reload
       systemctl --user enable --now airlock-notes-editor.service
       log "notes unchanged; retained committed container ids (nonce=$NONCE)"
@@ -261,8 +261,8 @@ ln_tmp="$RUNTIME/.current.$$"
 ln -s "runs/$NONCE" "$ln_tmp"
 mv -Tf "$ln_tmp" "$RUNTIME/current"
 
-install -m 644 "$run_final/airlock-notes-editor.service" "$UNIT_DIR/airlock-notes-editor.service"
-install -m 644 "$run_final/notes.conf" "$CONFD/hub-locations.d/notes.conf"
+install_if_changed 644 "$run_final/airlock-notes-editor.service" "$UNIT_DIR/airlock-notes-editor.service"
+install_if_changed 644 "$run_final/notes.conf" "$CONFD/hub-locations.d/notes.conf"
 
 if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   install_failed=1

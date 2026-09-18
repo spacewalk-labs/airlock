@@ -1,0 +1,47 @@
+--- a/opencode-agent.js
++++ b/opencode-agent.js
+@@ -556,10 +556,20 @@
+ function buildOpenCodeModelDefinition(provider, modelId, model) {
+     const rawVariants = model.variants ? Object.keys(model.variants) : [];
+     // OpenCode lists only overrides; its base model behavior is selected by omitting `variant`.
+     const thinkingOptions = rawVariants.length
+         ? [
+             { id: OPENCODE_DEFAULT_VARIANT_ID, label: "Default", isDefault: true },
+             ...rawVariants.map((id) => ({ id, label: id })),
+         ]
+         : [];
++    // grok-4.6 thinking default starts at high (0.8.0: defaultThinkingOptionId reads
++    // thinkingOptions[0].id, which the synthetic Default entry above would otherwise own).
++    if (provider.id === "xai" && modelId === "grok-4.6" && rawVariants.includes("high")) {
++        const high = thinkingOptions.find((option) => option.id === "high");
++        if (high) thinkingOptions.unshift(high);
++    }
++    // muse-spark-1.3-contributor thinking default starts at xhigh (same mechanism as
++    // grok-4.6 above; models.dev's catalog stops at xhigh — the earlier box-local
++    // "max" variant was rejected by the provider, so xhigh is the default).
++    if (provider.id === "opencode-go" && modelId === "muse-spark-1.3-contributor" && rawVariants.includes("xhigh")) {
++        const xhigh = thinkingOptions.find((option) => option.id === "xhigh");
++        if (xhigh) thinkingOptions.unshift(xhigh);
++    }
+@@ -1301,12 +1306,20 @@
+                 }
+                 models.push(definition);
+             }
+         }
+         context?.signal.throwIfAborted();
+         this.modelContextWindows.clear();
+         for (const [key, value] of contextWindows)
+             this.modelContextWindows.set(key, value);
++        // picker order: muse-spark-1.3-contributor, grok-4.6, grok-build, then the rest.
++        const preferred = ["opencode-go/muse-spark-1.3-contributor", "xai/grok-4.6", "xai/grok-build-0.1"];
++        models.sort((left, right) => {
++            const li = preferred.indexOf(left.id);
++            const ri = preferred.indexOf(right.id);
++            if (li === -1 && ri === -1) return 0;
++            if (li === -1) return 1;
++            if (ri === -1) return -1;
++            return li - ri;
++        });
+         return models;
+     }
+     async fetchModesFromClient(client, directory, context) {

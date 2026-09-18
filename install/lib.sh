@@ -399,6 +399,29 @@ airlock_pin_state_dir() {
   export AIRLOCK_STATE_DIR
 }
 
+# Every process that can change an installed box enters through one expiring,
+# metadata-bearing lease.  The ledger command owns the kernel flock and runs the
+# mutator as its child. A nested updater -> installer joins only when it inherited
+# the actual flock fd; an ambient id without that fd is refused.
+airlock_require_live_box_lease() {
+  "$AIRLOCK_ROOT/bin/airlock-ledger" live-box-lease-require
+}
+
+airlock_enter_live_box_lease() { # <reason> <command> [arguments]
+  local reason="${1:?live-box lease reason required}"; shift
+  if [ -n "${AIRLOCK_LIVE_BOX_LEASE_ID:-}" ]; then
+    airlock_require_live_box_lease \
+      || die "live-box lease identity is stale, forged, or no longer held"
+    return 0
+  fi
+  local agent_id="${PASEO_AGENT_ID:-operator:$(id -u)}"
+  local card="${AIRLOCK_LIVE_BOX_CARD:-manual/live-box}"
+  local ttl="${AIRLOCK_LIVE_BOX_TTL_SECONDS:-3600}"
+  exec "$AIRLOCK_ROOT/bin/airlock-ledger" live-box-lease-run \
+    --agent-id="$agent_id" --card="$card" --reason="$reason" --ttl-seconds="$ttl" \
+    -- "$@"
+}
+
 # airlock_pkg_dir <app> — canonical package dir for a [packages.*] app, or
 # nothing for a built-in. Callers set AIRLOCK_PKG_INFO once (the output of
 # `airlock_config package-info`) so N apps cost one config run, not N.
@@ -509,6 +532,242 @@ airlock_publish_doc_url() {
   [ -n "$fqdn" ] || fqdn="$(ts_fqdn)" || return 0
   [ -n "$fqdn" ] || return 0
   if [ "$port" = 443 ]; then printf 'https://%s' "$fqdn"; else printf 'https://%s:%s' "$fqdn" "$port"; fi
+}
+
+# airlock_require_nginx_publish_continuity <current-site> <candidate-site>
+#                                           <publish-enabled> <gate-port> <selector>
+#
+# Last gate before the installer replaces the live Airlock nginx site. nginx
+# syntax validation cannot detect a valid render that silently dropped a whole
+# listener or its identity gate. Preserve every listener owned by the current
+# site and, when publish is desired or already live, require one marked dedicated
+# block whose loopback port and fail-closed selector match the frozen candidate.
+airlock_require_nginx_publish_continuity() {
+  local current="$1" candidate="$2" publish_enabled="$3" gate_port="$4" selector="$5"
+  python3 - "$current" "$candidate" "$publish_enabled" "$gate_port" "$selector" <<'PY'
+import pathlib
+import re
+import stat
+import sys
+
+current_raw, candidate_raw, publish_enabled, gate_port, selector = sys.argv[1:]
+start_marker = "# ==== Publish dedicated document-view gate ===="
+end_marker = "# ==== End publish dedicated document-view gate ===="
+listen_re = re.compile(r"^\s*listen\s+([^;]+?)\s*;\s*$", re.MULTILINE)
+
+def read_regular(raw, *, required):
+    path = pathlib.Path(raw)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise SystemExit(f"nginx continuity: missing candidate site: {path}")
+        return ""
+    except OSError as exc:
+        raise SystemExit(f"nginx continuity: cannot inspect {path}: {exc}")
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        raise SystemExit(f"nginx continuity: site must be a regular non-symlink file: {path}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(f"nginx continuity: cannot read {path}: {exc}")
+
+def listens(value):
+    return {" ".join(match.split()) for match in listen_re.findall(value)}
+
+def publish_block(value):
+    if value.count(start_marker) != 1 or value.count(end_marker) != 1:
+        return None
+    start = value.index(start_marker)
+    end = value.index(end_marker, start)
+    return value[start:end + len(end_marker)]
+
+current = read_regular(current_raw, required=False)
+candidate = read_regular(candidate_raw, required=True)
+current_listens = listens(current)
+candidate_listens = listens(candidate)
+missing = sorted(current_listens - candidate_listens)
+if missing:
+    raise SystemExit(
+        "nginx continuity: candidate dropped live listen directives; "
+        f"current={sorted(current_listens)} candidate={sorted(candidate_listens)} "
+        f"missing={missing}"
+    )
+
+current_block = publish_block(current)
+candidate_block = publish_block(candidate)
+current_requires_publish = current_block is not None or "127.0.0.1:19925" in current_listens
+candidate_mentions_publish = candidate_block is not None or "127.0.0.1:19925" in candidate_listens
+if publish_enabled not in {"0", "1"}:
+    raise SystemExit("nginx continuity: invalid publish-enabled input")
+if publish_enabled == "1":
+    if not gate_port.isdigit() or not 1 <= int(gate_port) <= 65535:
+        raise SystemExit("nginx continuity: invalid candidate publish gate port")
+    if selector not in {"hub_ok", "tailnet_ok"}:
+        raise SystemExit("nginx continuity: invalid candidate publish selector")
+if current_requires_publish or publish_enabled == "1" or candidate_mentions_publish:
+    if candidate_block is None:
+        raise SystemExit("nginx continuity: candidate dropped the dedicated publish gate")
+    if publish_enabled != "1":
+        raise SystemExit("nginx continuity: candidate publish gate lacks frozen config authority")
+    expected_listen = f"listen 127.0.0.1:{gate_port};"
+    expected_gate = f"if (${selector} = 0) {{ return 403; }}"
+    if candidate_block.count(expected_listen) != 1:
+        raise SystemExit(
+            f"nginx continuity: dedicated publish gate must contain exactly one {expected_listen}"
+        )
+    # At least one, not exactly one: render-nginx.sh repeats the selector gate in every
+    # /publish/api location since #441, so a real candidate carries it more than once.
+    # A candidate with none still fails closed (F3, 2026-09-16).
+    if candidate_block.count(expected_gate) < 1:
+        raise SystemExit(
+            f"nginx continuity: dedicated publish gate must contain at least one {expected_gate}"
+        )
+PY
+}
+
+airlock_emit_owner_v1_map() { # <owner>
+  local owner="${1:?owner-v1 map requires an owner}"
+  # shellcheck disable=SC2016 # nginx runtime variables are emitted literally
+  printf 'map $http_tailscale_user_login $owner_ok {\n'
+  printf '    default 0;\n'
+  printf '    "%s" 1;\n' "$owner"
+  printf '}\n'
+}
+
+airlock_emit_owner_v1_unit() { # <owner>
+  local owner="${1:?owner-v1 unit requires an owner}"
+  printf '# airlock-owner-v1 owner=%s\n' "$owner"
+  airlock_emit_owner_v1_map "$owner"
+}
+
+# airlock_require_nginx_owner_continuity <current-site-snapshot> <current-present>
+#                                         <snapshot-owner> <transfer-from>
+#                                         [candidate-site]
+#
+# Pure decision boundary for the owner gate. The caller snapshots the current
+# site (with privilege when needed) so this helper neither reads mutable live
+# state nor writes anything. A v1 site binds its owner sentinel to one adjacent,
+# byte-exact canonical owner_ok map. A sentinel-free legacy site gets one
+# upgrade admission only for the previous renderer's exact map bytes. An owner
+# change is admitted only when argv named the exact previous owner; the
+# destination is always the validated config snapshot. Supplying candidate-site
+# requires the just-rendered replacement to be v1 and snapshot-owner exact.
+airlock_require_nginx_owner_continuity() {
+  local current="$1" current_present="$2" snapshot_owner="$3" transfer_from="$4"
+  local candidate="${5:-}"
+  python3 - "$current" "$current_present" "$snapshot_owner" "$transfer_from" \
+    "$candidate" <<'PY'
+import pathlib
+import stat
+import sys
+
+current_raw, current_present, snapshot_owner, transfer_from, candidate_raw = sys.argv[1:]
+
+SENTINEL_PREFIX = "# airlock-owner-v1 owner="
+SENTINEL_TOKEN = "# airlock-owner-v1"
+OWNER_MAP_HEADER = "map $http_tailscale_user_login $owner_ok {"
+
+def safe_owner(value):
+    local, separator, domain = value.partition("@")
+    return (
+        bool(local and separator and domain)
+        and '"' not in value
+        and "\\" not in value
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+def require_owner_value(value, label, *, empty_ok=False):
+    if empty_ok and not value:
+        return
+    if not safe_owner(value):
+        raise SystemExit(f"nginx owner continuity: invalid {label}")
+
+def read_regular(raw, label):
+    path = pathlib.Path(raw)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise SystemExit(f"nginx owner continuity: cannot inspect {label}: {exc}")
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        raise SystemExit(f"nginx owner continuity: {label} must be a regular non-symlink file")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(f"nginx owner continuity: cannot read {label}: {exc}")
+
+def exact_count(value, expected):
+    return value.count(expected + "\n")
+
+def require_unique_owner_header(value, label):
+    if value.count(OWNER_MAP_HEADER) != 1:
+        raise SystemExit(
+            f"nginx owner continuity: {label} requires exactly one canonical owner-map header"
+        )
+
+def canonical_map(owner):
+    return (
+        "map $http_tailscale_user_login $owner_ok {\n"
+        "    default 0;\n"
+        f'    "{owner}" 1;\n'
+        "}"
+    )
+
+def canonical_unit(owner):
+    return f"{SENTINEL_PREFIX}{owner}\n{canonical_map(owner)}"
+
+def require_v1(value, label):
+    require_unique_owner_header(value, label)
+    if value.count(SENTINEL_TOKEN) != 1:
+        raise SystemExit(f"nginx owner continuity: {label} requires exactly one owner-v1 sentinel")
+    sentinel_lines = [
+        line for line in value.splitlines() if line.startswith(SENTINEL_PREFIX)
+    ]
+    if len(sentinel_lines) != 1:
+        raise SystemExit(f"nginx owner continuity: {label} owner-v1 sentinel is malformed")
+    owner = sentinel_lines[0][len(SENTINEL_PREFIX):]
+    require_owner_value(owner, f"{label} sentinel owner")
+    if exact_count(value, canonical_unit(owner)) != 1 \
+            or exact_count(value, canonical_map(owner)) != 1:
+        raise SystemExit(
+            f"nginx owner continuity: {label} owner-v1 unit is not byte-exact and unique"
+        )
+    return owner
+
+require_owner_value(snapshot_owner, "snapshot owner")
+require_owner_value(transfer_from, "transfer previous owner", empty_ok=True)
+if current_present not in {"0", "1"}:
+    raise SystemExit("nginx owner continuity: invalid current-site presence input")
+
+if current_present == "0":
+    if transfer_from:
+        raise SystemExit("nginx owner continuity: owner transfer cannot target a first install")
+else:
+    current_value = read_regular(current_raw, "current site snapshot")
+    if SENTINEL_TOKEN in current_value:
+        current_owner = require_v1(current_value, "current site")
+    else:
+        current_owner = transfer_from or snapshot_owner
+        require_unique_owner_header(current_value, "legacy current site")
+        if exact_count(current_value, canonical_map(current_owner)) != 1:
+            raise SystemExit(
+                "nginx owner continuity: legacy current site lacks one byte-exact canonical owner map"
+            )
+    if current_owner == snapshot_owner:
+        if transfer_from:
+            raise SystemExit("nginx owner continuity: stale owner-transfer authority on same-owner install")
+    elif transfer_from != current_owner:
+        raise SystemExit(
+            "nginx owner continuity: snapshot owner differs from current owner; "
+            "use --transfer-owner-from=<exact-current-owner> for the intended transition"
+        )
+
+if candidate_raw:
+    candidate_value = read_regular(candidate_raw, "candidate site")
+    candidate_owner = require_v1(candidate_value, "candidate site")
+    if candidate_owner != snapshot_owner:
+        raise SystemExit("nginx owner continuity: rendered candidate owner differs from snapshot owner")
+PY
 }
 
 # airlock_escape_selfkill_cgroup SCRIPT [ARGS...] — survive stopping our own host.
@@ -1062,6 +1321,22 @@ write_if_changed() {
   install -D -m 0644 "$tmp" "$path"
   rm -f "$tmp"
   return 0
+}
+
+# install_if_changed MODE SRC DEST — install SRC over DEST only when the bytes or the
+# mode differ. An identical re-install must leave DEST untouched, mtime included: the
+# ledger checkpoints artifacts with their metadata, so rewriting an unchanged file makes
+# a later rollback in the same transaction judge that app "changed with no lossless
+# checkpoint" and leave the whole transaction degraded (notes, 2026-09-14 and 09-15).
+install_if_changed() {
+  local mode="${1:?install_if_changed: mode required}"
+  local src="${2:?install_if_changed: source required}"
+  local dest="${3:?install_if_changed: destination required}"
+  if [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$src" "$dest" \
+     && [ "$(stat -c %a "$dest")" = "$mode" ]; then
+    return 0
+  fi
+  install -m "$mode" "$src" "$dest"
 }
 
 # airlock_sweep_platform_units <owner> <declared-unit>...

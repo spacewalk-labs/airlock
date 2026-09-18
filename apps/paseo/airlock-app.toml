@@ -27,6 +27,9 @@ gate_port = 19951
 backend_port = 19952
 browse = false
 browse_ws_port = 19953
+# agy-acp: registers Google Antigravity's `agy` CLI as the Paseo provider
+# `agy` (config-only — see apps/paseo/agy-acp/README.md). Off by default.
+agy = false
 # Loopback home for the web-UI state paseo otherwise keeps per browser (the
 # sidebar's project/workspace order). Proxied by this app's own gate under
 # /airlock-ui-state/, never tailscale-served, so it is not a serve_ports entry.
@@ -106,19 +109,26 @@ note = "Privileged ingress setup"
 # the icon location's own fragments-class dir claim (paseo/ —
 # favicon-ring.svg + icons/, [branding] icon_ring), the pinned npm-global
 # tree (prefix hardcoded $HOME/.npm-global, apps/paseo/install.sh — the
-# guarded bundle installs all six @getpaseo packages as siblings under
+# guarded bundle installs all seven @getpaseo packages as siblings under
 # @getpaseo/, the install-id marker sits there too, and every patch lands
 # inside this tree) + its bin symlink, and the browse-host sidecar's own
-# install dir (browse=true). The six packages and the marker are ENUMERATED,
+# install dir (browse=true). The seven packages and the marker are ENUMERATED,
 # not claimed as the @getpaseo/ directory: the npm scope is a namespace, and
-# a package someone else puts there is not Airlock's to remove.
+# a package someone else puts there is not Airlock's to remove. Same shape,
+# same reasoning, for the agy-acp fork's own install dir (agy=true) —
+# apps/paseo/agy-acp/install.sh stages and builds it under
+# ~/.local/share/agy-acp/, entirely separate from the npm-global tree above.
 # Deliberately NOT declared (retained data, per the Appendix): ~/.paseo/
 # (config.json, patched in place, never removed) and
 # ~/.cache/ms-playwright/ (a SHARED Playwright cache other tools may use —
 # never Airlock's alone to remove). ~/.nvm/ is never touched or claimed
 # either — install/preflight.sh's airlock_load_nvm only SOURCES nvm.sh
 # (if present) to put an nvm-managed node/npm on PATH; it is not something
-# this app installs or owns.
+# this app installs or owns. The agy Paseo-provider entry inside config.json
+# (agents.providers.agy) and the ~/.gemini/config/skills.json entry follow
+# ~/.paseo/'s own precedent exactly — both live inside a file this app
+# already treats as retained data, so they stay retained too rather than
+# gaining a second, key-level rollback mechanism nothing else here has.
 [artifacts]
 units = ["airlock-paseo.service", "airlock-paseo-browse-host.service",
          "airlock-paseo-uistate.service"]
@@ -126,12 +136,14 @@ fragments = ["servers.d/paseo.conf", "paseo/"]
 files = ["~/.npm-global/lib/node_modules/@getpaseo/cli/",
          "~/.npm-global/lib/node_modules/@getpaseo/client/",
          "~/.npm-global/lib/node_modules/@getpaseo/highlight/",
+         "~/.npm-global/lib/node_modules/@getpaseo/plugin/",
          "~/.npm-global/lib/node_modules/@getpaseo/protocol/",
          "~/.npm-global/lib/node_modules/@getpaseo/relay/",
          "~/.npm-global/lib/node_modules/@getpaseo/server/",
          "~/.npm-global/lib/node_modules/@getpaseo/.airlock-install-id",
          "~/.npm-global/bin/paseo",
-         "~/.local/share/paseo-browse-host/"]
+         "~/.local/share/paseo-browse-host/",
+         "~/.local/share/agy-acp/"]
 serve_ports = ["https_port"]
 
 [serve.https]

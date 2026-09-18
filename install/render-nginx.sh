@@ -27,6 +27,16 @@ WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
 CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
 IDENT="$(ident_var "$AIRLOCK_IDENTITY_HEADER")"
 
+emit_canonical_fragment_includes() {
+  local sub="$1" app
+  airlock_config apps | while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    printf '%s' "$app" | grep -qE '^[a-z0-9][a-z0-9-]{0,31}$' || continue
+    [ -f "$CONFD/$sub/$app.conf" ] || continue
+    printf 'include %s/%s/%s.conf;\n' "$CONFD" "$sub" "$app"
+  done
+}
+
 # publish's dedicated document-view port is always present when the app is
 # enabled. Its broader tailnet-member tier is not: the shipped default is false,
 # which selects the exact same owner+collaborators map as the hub. A box opts in
@@ -82,7 +92,7 @@ fi
 
 emit_connection_upgrade_map
 emit_identity_map hub_ok "${hub_logins[@]}"
-emit_identity_map owner_ok "$AIRLOCK_OWNER"
+airlock_emit_owner_v1_unit "$AIRLOCK_OWNER"
 if [ "$PUBLISH_ENABLED" = true ]; then
   printf 'map $%s $tailnet_ok {\n    "" 0;\n    default 1;\n}\n' "$IDENT"
 fi
@@ -328,15 +338,17 @@ sed -e "s|@@CONFD@@|${CONFD}|g" <<'NGINX'
     # the entrance itself
     location / {
         try_files $uri $uri/ /index.html;
+        # Launcher code and assets use stable URLs; revalidate after each install.
+        add_header Cache-Control "no-cache" always;
     }
 
     # same-origin subpath apps (fileview, publish, dev-monitor, notepad) drop
     # location fragments here as they are installed. They inherit the server-level
     # gate above — fragments are plain proxies, no per-location guard needed.
-    include @@CONFD@@/hub-locations.d/*.conf;
-}
-
+    # Only enabled-app ids are included; manual files outside that set stay inert.
 NGINX
+emit_canonical_fragment_includes hub-locations.d
+printf '}\n\n'
 
 if [ "$PUBLISH_ENABLED" = true ]; then
   PUBLISH_SHARE_SED="$(printf '%s' "$PUBLISH_SHARE_DIR" | sed 's/[\\&|]/\\&/g')"
@@ -457,9 +469,10 @@ server {
 NGINX
 fi
 
-sed -e "s|@@CONFD@@|${CONFD}|g" <<'NGINX'
+cat <<'NGINX'
 
 # separate-port owner gates (devterm, code-server, orca, paseo) drop server
-# fragments here as they are installed.
-include @@CONFD@@/servers.d/*.conf;
+# fragments here as they are installed. Only enabled-app ids are included;
+# a manual listener such as publish-doc-gate.conf is not preserved.
 NGINX
+emit_canonical_fragment_includes servers.d

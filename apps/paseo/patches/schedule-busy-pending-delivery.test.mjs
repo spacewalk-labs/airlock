@@ -56,10 +56,27 @@ try {
     const logger = { child: () => logger, info: noop, warn: noop, error: noop, debug: noop, trace: noop };
     let busy = true;
     const delivered = [];
+    // 0.8.0's agent-target executeSchedule() no longer calls agentManager.runAgent()
+    // directly (that path now only serves the new-agent target). It goes through the
+    // shared startAgentRun() helper (agent/agent-prompt.js, imported live by the
+    // patched service.js -- not stubbed here, so this drives the REAL helper):
+    // ensureAgentLoaded() -> getAgent() (present, so it returns immediately) ->
+    // tryRunOutOfBand() (false, so it proceeds) -> steerOrReplaceActiveRun() (status
+    // is neither "steered" nor "replaced", so it falls through) -> startOrReplaceRun(),
+    // which is where busy actually forks the call: replaceAgentRun() when
+    // hasInFlightRun() is true, streamAgent() otherwise. executeSchedule() does not
+    // await the iterator draining (that runs in a fire-and-forget background
+    // promise) -- it awaits waitForAgentEvent() right after the call returns, so
+    // that call is the real "delivered" signal, not drain completion.
+    const emptyIterator = async function* () {};
     const agentManager = {
         getAgent: () => ({ id: AGENT, lifecycle: busy ? "running" : "idle" }),
         hasInFlightRun: () => busy,
-        runAgent: async (id) => { delivered.push(id); return { timeline: [], finalText: "ok" }; },
+        tryRunOutOfBand: () => false,
+        steerOrReplaceActiveTurn: async () => ({ status: "no_active_turn" }),
+        replaceAgentRun: async (id) => { delivered.push(id); return emptyIterator(); },
+        streamAgent: (id) => { delivered.push(id); return emptyIterator(); },
+        waitForAgentEvent: async () => ({ status: "idle", permission: null, lastMessage: "ok" }),
     };
     const service = new ScheduleService({
         paseoHome: home, logger, agentManager,

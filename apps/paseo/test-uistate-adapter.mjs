@@ -7,8 +7,11 @@ const require = createRequire(import.meta.url);
 const patcher = require("./browse-host/bin/patch-web-ui.js");
 const patch = patcher.SUBAGENT_STREAM_PATCHES.find((p) => p.name === "sidebar-order-shared-storage");
 assert.ok(patch, "the sidebar-order anchor is gone — nothing to evaluate");
-const head = "storage:(0,n.createJSONStorage)(()=>";
-const tail = "),partialize:";
+// 0.8.0: the backing storage is createValidatedPersistStorage's first argument
+// directly (no createJSONStorage(() => ...) factory wrapper) — the adapter
+// expression itself (the IIFE body between these markers) is unchanged.
+const head = "storage:(0,p.createValidatedPersistStorage)(";
+const tail = ",j),partialize:";
 const start = patch.repl.indexOf(head) + head.length;
 const end = patch.repl.lastIndexOf(tail);
 assert.ok(start > head.length - 1 && end > start, "could not locate the adapter expression");

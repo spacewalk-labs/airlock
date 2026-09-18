@@ -1,12 +1,13 @@
 --- a/dist/server/server/agent/providers/codex/app-server-transport.js
 +++ b/dist/server/server/agent/providers/codex/app-server-transport.js
 @@ -181,6 +181,38 @@
-         if (result === "kill-timeout") {
-             this.logger.warn({ timeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS }, "Codex app-server did not report exit after SIGKILL");
-         }
 +        // [paseo-process-group] The app-server is already spawned detached upstream, but
 +        // nothing ever killed its group — so when it exited first, its children survived.
++        // Sweep unconditionally, before the kill-timeout throw below would otherwise skip it.
 +        this.sweepProcessGroup(this.child ? this.child.pid : undefined, "dispose");
+         if (result === "kill-timeout") {
+             throw new Error("Codex app-server did not report exit after SIGKILL");
+         }
 +    }
 +    // [paseo-process-group] Kill the leader's PROCESS GROUP, not just its tree.
 +    // A tree-kill walks ppid links, which are already gone once the leader exits —

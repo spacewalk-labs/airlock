@@ -6,6 +6,7 @@ map $http_tailscale_user_login $hub_ok {
     default 0;
     "owner@fixture.dev" 1;
 }
+# airlock-owner-v1 owner=owner@fixture.dev
 map $http_tailscale_user_login $owner_ok {
     default 0;
     "owner@fixture.dev" 1;
@@ -126,12 +127,15 @@ server {
     # the entrance itself
     location / {
         try_files $uri $uri/ /index.html;
+        # Launcher code and assets use stable URLs; revalidate after each install.
+        add_header Cache-Control "no-cache" always;
     }
 
     # same-origin subpath apps (fileview, publish, dev-monitor, notepad) drop
     # location fragments here as they are installed. They inherit the server-level
     # gate above — fragments are plain proxies, no per-location guard needed.
-    include TMP/confd/hub-locations.d/*.conf;
+    # Only enabled-app ids are included; manual files outside that set stay inert.
+include TMP/confd/hub-locations.d/publish.conf;
 }
 
 # ==== Publish dedicated document-view gate ====
@@ -241,5 +245,6 @@ server {
 # ==== End publish dedicated document-view gate ====
 
 # separate-port owner gates (devterm, code-server, orca, paseo) drop server
-# fragments here as they are installed.
-include TMP/confd/servers.d/*.conf;
+# fragments here as they are installed. Only enabled-app ids are included;
+# a manual listener such as publish-doc-gate.conf is not preserved.
+include TMP/confd/servers.d/devterm.conf;

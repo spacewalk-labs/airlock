@@ -58,6 +58,8 @@ only-work	apps/paseo/patches/finish-notification-queue.mjs
 only-work	apps/paseo/patches/finish-notification-queue.patch
 only-work	apps/paseo/patches/finish-notification-queue.test.mjs
 only-work	apps/paseo/patches/claude-model-fable51.mjs
+only-work	apps/paseo/patches/opencode-grok-defaults.mjs
+only-work	apps/paseo/patches/opencode-grok-defaults.patch
 only-work	apps/paseo/patches/provider-subagent-stream-filter.mjs
 only-work	apps/paseo/patches/provider-subagent-stream-filter.patch
 only-work	apps/paseo/patches/provider-subagent-stream-filter.test.mjs
@@ -205,7 +207,17 @@ content	apps/publish/install.sh
 # the platform CLI through the HTTP relay, and paseo's installer comment names the
 # platform pool-record schema it is preserving. These are content changes awaiting the
 # next public mirror sync; neither is an intentional long-term implementation fork.
-content	apps/paseo/patches/credential-key-preservation.test.mjs
+# 13) 2026-09-15 paseo 0.2.5->0.8.0 (card C2): credential-key-preservation is removed
+# from work — 0.8.0's quota fetchers no longer do the destructive zod write-back this
+# patch guarded against (confirmed against real 0.8.0 dist bytes), so the patch and its
+# behaviour test are gone. The public mirror has not picked up the removal yet, so all
+# four files (previously byte-identical .mjs/.test.mjs or unlisted-because-identical
+# .patch pair) now read only-apps; they clear at the next publish sync, same as any
+# other work-ahead deletion.
+only-apps	apps/paseo/patches/credential-key-preservation.test.mjs
+only-apps	apps/paseo/patches/credential-key-preservation.mjs
+only-apps	apps/paseo/patches/credential-key-preservation-claude.patch
+only-apps	apps/paseo/patches/credential-key-preservation-codex.patch
 # 11) 2026-08-24 platform-owned credentials P3: the transport boundary is a new
 # work-ahead backend module. It invokes the handed-in platform CLI while
 # devmon_tokens.py stays a pure (raw JSON, clock) verdict engine. The public mirror
@@ -481,21 +493,29 @@ only-work	apps/dev-monitor/verify-cron-handoff-live.py
 only-work	apps/dev-monitor/backend/devmon_company_catalog.py
 only-work	apps/dev-monitor/backend/test_devmon_company_catalog.py
 
-# 2026-09-11 guarded Paseo 0.2.5: Airlock now carries the reviewed six-package
-# set as its reproducible default install input. The public platform bundle and the
-# three live dev boxes consume this work tree directly; airlock-apps remains a
-# separately pinned projection and receives the same immutable directory at its next
-# app release rather than a partial sync onto its older Paseo installer.
-only-work	apps/paseo/vendor/guarded-0.2.5/INSTALLED_SHA256SUMS
-only-work	apps/paseo/vendor/guarded-0.2.5/LICENSE
-only-work	apps/paseo/vendor/guarded-0.2.5/README.md
-only-work	apps/paseo/vendor/guarded-0.2.5/SHA256SUMS
-only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-cli-0.2.5.tgz
-only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-client-0.2.5.tgz
-only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-highlight-0.2.5.tgz
-only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-protocol-0.2.5.tgz
-only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-relay-0.2.5.tgz
-only-work	apps/paseo/vendor/guarded-0.2.5/getpaseo-server-0.2.5.tgz
+# 2026-09-15 guarded Paseo 0.8.0 (card C2, supersedes the 0.2.5 entry below): Airlock
+# now carries the reviewed seven-package set (adds @getpaseo/plugin) as its
+# reproducible default install input, re-derived against upstream v0.8.0 with a
+# re-implemented agentMessageSendGuard/scheduleStateRestore overlay (the old fork
+# PR never merged upstream). The public platform bundle and the three live dev boxes
+# consume this work tree directly; airlock-apps remains a separately pinned
+# projection and receives the same immutable directory at its next app release
+# rather than a partial sync onto its older Paseo installer. patches/UPSTREAM-LICENSE
+# (Apache-2.0 text, vendored alongside the AGPL-3.0 LICENSE per the same license
+# wording revisit) is new for the same reason.
+only-work	apps/paseo/patches/UPSTREAM-LICENSE
+only-work	apps/paseo/vendor/guarded-0.8.0/INSTALLED_SHA256SUMS
+only-work	apps/paseo/vendor/guarded-0.8.0/LICENSE
+only-work	apps/paseo/vendor/guarded-0.8.0/README.md
+only-work	apps/paseo/vendor/guarded-0.8.0/SHA256SUMS
+only-work	apps/paseo/vendor/guarded-0.8.0/UPSTREAM-LICENSE
+only-work	apps/paseo/vendor/guarded-0.8.0/getpaseo-cli-0.8.0.tgz
+only-work	apps/paseo/vendor/guarded-0.8.0/getpaseo-client-0.8.0.tgz
+only-work	apps/paseo/vendor/guarded-0.8.0/getpaseo-highlight-0.8.0.tgz
+only-work	apps/paseo/vendor/guarded-0.8.0/getpaseo-plugin-0.8.0.tgz
+only-work	apps/paseo/vendor/guarded-0.8.0/getpaseo-protocol-0.8.0.tgz
+only-work	apps/paseo/vendor/guarded-0.8.0/getpaseo-relay-0.8.0.tgz
+only-work	apps/paseo/vendor/guarded-0.8.0/getpaseo-server-0.8.0.tgz
 
 # 2026-09-12 적재 스킬 문체 규칙: 요약 프롬프트를 원칙 중심으로 다시 쓰면서 문체 규칙을
 # 신설했고(개요만 불릿, 그 밖의 절은 문단), 자막 경고를 본문에서 빼 프론트매터로 옮겼다.
@@ -540,3 +560,64 @@ content	apps/devterm/web/ui.js
 # `install/public-manifest.sh` independently excludes both exact paths from export.
 only-work	apps/dev-monitor/backend/devmon_weekly_docs.py
 only-work	apps/dev-monitor/backend/test_devmon_weekly_docs.py
+
+# 2026-09-15 agy-facing ACP gaps (card C2): two new paseo patches (context gauge,
+# cross-provider mode default) landed on work only -- the public mirror picks these
+# up at the next publish sync, same shape as every other paseo-patch batch above.
+only-work	apps/paseo/patches/acp-context-gauge.mjs
+only-work	apps/paseo/patches/acp-context-gauge.test.mjs
+only-work	apps/paseo/patches/acp-cross-provider-mode-default.mjs
+only-work	apps/paseo/patches/acp-cross-provider-mode-default.test.mjs
+# 2026-09-15 orphan-process-guard/-group re-derived for 0.8.0 (card C2, supersedes the
+# drift these carried since the paseo 0.2.5->0.8.0 vendor bump): the public mirror still
+# carries the pre-re-derivation bytes (and the now-deleted codex half of
+# orphan-process-guard) until the next publish sync -- work is the live consumer.
+# orphan-process-guard-codex.patch was removed outright: re-checked against 0.8.0,
+# upstream independently rewrote CodexAppServerSession's connect()/close() lifecycle,
+# fixing the same leak this patch targeted for claude (see the patcher's own header).
+content	apps/paseo/patches/orphan-process-group-codex-transport.patch
+content	apps/paseo/patches/orphan-process-group.mjs
+content	apps/paseo/patches/orphan-process-guard-claude.patch
+content	apps/paseo/patches/orphan-process-guard.mjs
+only-apps	apps/paseo/patches/orphan-process-guard-codex.patch
+# 2026-09-15 agy-acp fork (card C1, docs/tasks/active/paseo-080-agy-20260915.md):
+# a new Paseo provider under apps/paseo/agy-acp/, not yet published. Card C6
+# ("public airlock release") runs `/airlock-publish-sync` only after C1+C2 are
+# merged and a human approves the diff — until then this whole subtree is
+# work-only by design, the same shape as the dev-monitor weekly-docs overlay
+# above. install/public-manifest.sh already classifies apps/ (the whole tree)
+# PUBLIC for when that sync happens; this baseline entry is the interim
+# "not yet" the divergence gate needs to stay green in the meantime.
+only-work	apps/paseo/agy-acp/.gitignore
+only-work	apps/paseo/agy-acp/configure-agy-acp.py
+only-work	apps/paseo/agy-acp/LICENSE
+only-work	apps/paseo/agy-acp/README.md
+only-work	apps/paseo/agy-acp/install.sh
+only-work	apps/paseo/agy-acp/package.json
+only-work	apps/paseo/agy-acp/package-lock.json
+only-work	apps/paseo/agy-acp/src/acp-agent.ts
+only-work	apps/paseo/agy-acp/src/agy-session.ts
+only-work	apps/paseo/agy-acp/src/binary.ts
+only-work	apps/paseo/agy-acp/src/cli.ts
+only-work	apps/paseo/agy-acp/src/index.ts
+only-work	apps/paseo/agy-acp/src/one-shot-cli.ts
+only-work	apps/paseo/agy-acp/src/types.ts
+only-work	apps/paseo/agy-acp/tests/acp-agent.test.mjs
+only-work	apps/paseo/agy-acp/tests/agy-session-tree-kill.test.mjs
+only-work	apps/paseo/agy-acp/tests/agy-session.test.mjs
+only-work	apps/paseo/agy-acp/tests/binary.test.mjs
+only-work	apps/paseo/agy-acp/tests/fake-agy-matrix.test.mjs
+only-work	apps/paseo/agy-acp/tests/fixtures/fake-agy.mjs
+only-work	apps/paseo/agy-acp/tests/fixtures/mock-agy.mjs
+only-work	apps/paseo/agy-acp/tests/materialize-fixture.mjs
+only-work	apps/paseo/agy-acp/tsconfig.json
+
+# 2026-09-18 rollback checkpoint repair: npm's closed esbuild native/shim
+# hardlink pair is materialized by this public installer helper. The public
+# manifest includes it with apps/paseo/install.sh; the mirror receives both
+# at the next approved publish sync, as with the patch batches above.
+only-work	apps/paseo/normalize-native-links.py
+
+# ACP invalid model rejection is a public install-time overlay; export picks it up.
+only-work	apps/paseo/patches/acp-model-rejection.mjs
+only-work	apps/paseo/patches/acp-model-rejection.test.mjs

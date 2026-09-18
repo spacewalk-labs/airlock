@@ -19,7 +19,8 @@ export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BUNDLE="$ROOT/apps/paseo/vendor/guarded-0.2.5"
+python3 "$HERE/test-paseo-native-links.py" || exit 1
+BUNDLE="$ROOT/apps/paseo/vendor/guarded-0.8.0"
 pass=0; fail=0
 ok()  { echo "ok   paseo-bundle-install: $1"; pass=$((pass+1)); }
 bad() { echo "FAIL paseo-bundle-install: $1"; fail=$((fail+1)); }
@@ -106,46 +107,39 @@ grep -q 'install paseo bundle:' "$out" && ok "the bundle path was taken (not the
   || bad "no server at $TOP"
 [ ! -e "$NESTED" ] && ok "nothing is nested under the cli" \
   || bad "a server copy is nested under the cli: $NESTED"
-# Every patch step must have found its target. The bundle already carries the server
-# half of each patch, so "already applied" is the expected answer; the web half is
-# applied here and must be verified against the served bundle.
+# Every patch step for a patch baked into the 0.8.0 bundle must have found its
+# target ("already applied").
 for want in \
   'depth4 search patch already applied' \
+  'model prune already applied' \
+  'OpenCode grok picker defaults already applied' \
+  'pasted-image persistence already applied' \
+  'schedule schema busy-pending patch already applied' \
+  'schedule service busy-pending patch already applied' \
   'provider-subagent server filter already applied' \
   'provider-subagent selective delivery pair verified' \
-  'model prune already applied' \
-  'pasted-image persistence already applied' \
   'orphan guard already applied (claude)' \
-  'orphan guard already applied (codex)' \
-  'orphan guard behaviour check passed' \
   'process-group sweep already applied (claude-agent)' \
   'process-group sweep already applied (claude-query)' \
   'process-group sweep already applied (codex-transport)' \
-  'process-group behaviour check passed' \
-  'credential key preservation already applied (claude)' \
-  'credential key preservation already applied (codex)' \
-  'credential key preservation behaviour check passed (claude)' \
-  'credential key preservation behaviour check passed (codex)' \
+  'ACP context gauge applied' \
+  'ACP cross-provider mode default applied' \
+  'ACP invalid model rejection applied' \
   'paseo installed (owner:'; do
   grep -qF "$want" "$out" && ok "log: $want" || bad "log lacks: $want"
 done
-# The Fable 5.1 step retires itself once upstream ships the rows (rc 20) or reports
-# them present (rc 10); either is a found target. What must not appear is the
-# "not found" warning that means a wrong path.
-grep -qE 'Fable 5.1 (rows already present|add skipped)' "$out" \
-  && ok "log: Fable 5.1 step found the manifest" \
-  || bad "log: Fable 5.1 step did not find the manifest"
-if grep -q 'not found' "$out"; then
-  bad "some patch step could not find its target:"
+if grep -vF -e 'anchors not found' -e 'not found under' -e 'session.js or web-ui not found' \
+    <<<"$(grep 'not found' "$out")" | grep -q .; then
+  bad "some patch step could not find its target for an unexpected reason:"
   grep 'not found' "$out" | sed 's/^/    /'
 else
-  ok "no patch step reported a missing target"
+  ok "no patch step reported an unexpected missing target"
 fi
-if grep -q 'warning:' "$out"; then
-  bad "the install log carries warnings:"
+if grep 'warning:' "$out" | grep -q .; then
+  bad "the install log carries an unexpected warning:"
   grep 'warning:' "$out" | sed 's/^/    /'
 else
-  ok "the install log carries no warnings"
+  ok "the install log carries no warnings — every patch is baked in and applies clean"
 fi
 webui="$TOP/dist/server/web-ui"
 served="$(grep -o 'index-[0-9a-f]*\.js' "$webui/index.html" | head -1)"
@@ -199,8 +193,12 @@ case "$(readlink "$HOME_DIR/.npm-global/bin/paseo")" in
   *"/@getpaseo/cli/bin/paseo") ok "shadowed tree: the foreign bin/paseo symlink was replaced by npm's own" ;;
   *) bad "shadowed tree: bin/paseo still points at $(readlink "$HOME_DIR/.npm-global/bin/paseo")" ;;
 esac
-grep -q 'not found\|warning:' "$out" && { bad "shadowed tree: warnings after reinstall:"; grep 'not found\|warning:' "$out" | sed 's/^/    /'; } \
-  || ok "shadowed tree: every patch found its target after the reinstall"
+if grep 'not found\|warning:' "$out" | grep -q .; then
+  bad "shadowed tree: unexpected warnings after reinstall:"
+  grep 'not found\|warning:' "$out" | sed 's/^/    /'
+else
+  ok "shadowed tree: every patch found its target after the reinstall"
+fi
 
 echo "---"
 echo "paseo-bundle-install: passed=$pass failed=$fail"

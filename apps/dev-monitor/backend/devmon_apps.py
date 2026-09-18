@@ -124,12 +124,13 @@ def _update_map(updates: Any) -> dict[str, dict[str, Any]]:
             if isinstance(row, dict) and isinstance(row.get("id"), str)}
 
 
-def _lock_mismatch_projection(error: AppsError, updates: Any) -> dict[str, Any] | None:
+def _lock_mismatch_projection(error: AppsError, updates: Any,
+                              company_ids: set[str]) -> dict[str, Any] | None:
     """Keep the review surface reachable when the strict config reader refuses a lock.
 
-    ``airlock-config json`` intentionally fails closed after an explicit package's
-    bytes move. Its own diagnostic is the authority for the degraded row, so the app
-    sheet stays reachable before the daily update collector has produced a snapshot.
+    ``airlock-config package-info`` intentionally fails closed after an explicit
+    package's bytes move. Its own diagnostic is the authority for the degraded row, so
+    the app sheet stays reachable before the daily update collector has produced a snapshot.
     Never calculate another digest or turn a different config error into a partial
     inventory.
     """
@@ -159,6 +160,7 @@ def _lock_mismatch_projection(error: AppsError, updates: Any) -> dict[str, Any] 
         "config": {},
         "tile": None,
         "source": "explicit",
+        "tier": "company" if row["id"] in company_ids else "",
         "digest": None,
         "capabilities": [],
         "canRemove": False,
@@ -169,7 +171,7 @@ def _lock_mismatch_projection(error: AppsError, updates: Any) -> dict[str, Any] 
             "degraded": "lock-mismatch"}
 
 
-def list_apps(root: Path, updates: Any) -> dict[str, Any]:
+def list_apps(root: Path, updates: Any, company_ids: set[str] | None = None) -> dict[str, Any]:
     """Return installed apps, uninstalled shipped apps, and the update snapshot.
 
     Installed values come from ``airlock-config json`` rather than a second TOML
@@ -177,17 +179,18 @@ def list_apps(root: Path, updates: Any) -> dict[str, Any]:
     contributes presentation metadata only; it cannot add an id to that set.
     """
     root = Path(root).resolve()
+    company_ids = set(company_ids or ())
     try:
         resolved = _command(root, ["json"], json_output=True)
+        package_info = _command(root, ["package-info"], json_output=True)
     except AppsError as exc:
-        degraded = _lock_mismatch_projection(exc, updates)
+        degraded = _lock_mismatch_projection(exc, updates, company_ids)
         if degraded is not None:
             return degraded
         raise
     apps = resolved.get("apps")
     if not isinstance(apps, dict):
         raise AppsError("config_unavailable", "airlock-config json omitted apps")
-    package_info = _command(root, ["package-info"], json_output=True)
     packages = package_info.get("packages")
     packages = packages if isinstance(packages, dict) else {}
     known = {line.strip() for line in _command(root, ["known-builtins"]).splitlines()
@@ -211,6 +214,8 @@ def list_apps(root: Path, updates: Any) -> dict[str, Any]:
             "config": config,
             "tile": package.get("tile"),
             "source": package.get("source_class", "platform"),
+            "tier": ("company" if app_id in company_ids
+                     and package.get("source_class") == "explicit" else ""),
             "digest": package.get("digest"),
             "capabilities": package.get("effective_capabilities") or [],
             "canRemove": bool((package.get("lifecycle") or {}).get("deactivate")),
@@ -336,7 +341,8 @@ def _write_candidate(config: Path, candidate_text: str) -> Path:
 
 
 def _replace_validated(config: Path, candidate_text: str, expected: bytes,
-                       approved_package: tuple[str, str] | None = None) -> None:
+                       approved_package: tuple[str, str] | None = None,
+                       lifecycle_pids: list[str] | None = None) -> None:
     root = default_root()
     candidate = _write_candidate(config, candidate_text)
     backup_tmp: Path | None = None
@@ -344,6 +350,10 @@ def _replace_validated(config: Path, candidate_text: str, expected: bytes,
         validation = (["validate"] if approved_package is None else
                       ["package-register-validate", *approved_package])
         _command(root, validation, config=candidate)
+        if approved_package is None and lifecycle_pids:
+            _command(root, ["package-info",
+                            "--lifecycle-targets=" + ",".join(lifecycle_pids)],
+                     config=candidate)
         try:
             current = config.read_bytes()
         except OSError as exc:
@@ -430,5 +440,6 @@ def register(config: Path, app_id: str,
         text = _append_tables(original.decode("utf-8"), app_id, package)
         approval = ((app_id, approved_digest)
                     if approved_digest is not None else None)
-        _replace_validated(config, text, original, approval)
+        targets = [app_id] if package is not None and approved_digest is None else None
+        _replace_validated(config, text, original, approval, lifecycle_pids=targets)
     return {"id": app_id, "enabled": True, "changed": True}

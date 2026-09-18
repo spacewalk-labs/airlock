@@ -34,6 +34,10 @@ mkdir -p "$STATE" "$WEB/assets" "$CONFD/hub-locations.d" "$CONFD/servers.d" \
 printf '0::/user.slice/user-1000.slice/session-1.scope\n' > "$TMP/cgroup"
 
 export AIRLOCK_STATE_DIR="$STATE" AIRLOCK_WEBROOT="$WEB" AIRLOCK_CONFD="$CONFD"
+chmod 700 "$TMP"
+printf '%s\n' 'airlock.live-box-fixture/v1' > "$TMP/.airlock-live-box-fixture-v1"
+chmod 600 "$TMP/.airlock-live-box-fixture-v1"
+export AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR="$TMP/airlock-live-box"
 export AIRLOCK_UNIT_DIR_USER="$UU" AIRLOCK_UNIT_DIR_SYSTEM="$US"
 export AIRLOCK_TS_FQDN="box.example.ts.net" AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
 
@@ -199,6 +203,11 @@ esac
 exit 0
 STUB
 chmod +x "$SHIM"/*
+cat > "$SHIM/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$SHIM/systemd-run"
 PATH="$SHIM:$PATH"; export PATH
 
 mkpkg() {
@@ -295,6 +304,30 @@ PY
 tx_phase() {
   "$ROOT/bin/airlock-ledger" transaction-show \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])' 2>/dev/null
+}
+
+tx_id() {
+  "$ROOT/bin/airlock-ledger" transaction-show \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null
+}
+
+recover_tx() {
+  local id
+  id="$(tx_id)" || return 1
+  (
+    [ "${AIRLOCK_FIXTURE_UNSET_STATE_DIR:-0}" != 1 ] || unset AIRLOCK_STATE_DIR
+    HOME="$FAKEHOME" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" \
+      AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup" \
+      bash "$ROOT/install/airlock-install.sh" --recover-transaction="$id"
+  )
+}
+
+devmon_recover_tx() {
+  AIRLOCK_FIXTURE_SYSTEMCTL_STATE="$TMP/devmon-systemctl-state" \
+  AIRLOCK_FIXTURE_DB="$FAKEHOME/.local/state/airlock/dev-monitor/messages.db" \
+  AIRLOCK_FIXTURE_CROSS_UID=1 \
+  AIRLOCK_FIXTURE_NGINX_FAIL="${AIRLOCK_FIXTURE_NGINX_FAIL:-}" \
+    recover_tx
 }
 
 install_v1_pair() {
@@ -543,7 +576,7 @@ PY
 
 crash_and_reenter() {
   reset_fixture
-  local cfg="$TMP/crash.toml" pidfile="$TMP/orch.pid" rc=0
+  local cfg="$TMP/crash.toml" pidfile="$TMP/orch.pid" rc=0 recovery_rc=0
   install_v1_pair "$cfg" || { bad "crash-and-reenter: setup failed"; return; }
   mkpkg "$TMP/failer-v2" failer 0 0 0 1
   mkpkg "$TMP/victim-v2" victim 0
@@ -552,16 +585,17 @@ crash_and_reenter() {
     AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup" AIRLOCK_FIXTURE_CRASH_PID_FILE="$pidfile" \
     bash -c 'printf "%s\n" "$$" > "$AIRLOCK_FIXTURE_CRASH_PID_FILE"; exec bash "$1"' \
       -- "$ROOT/install/airlock-install.sh" > "$TMP/crash-first.log" 2>&1 || rc=$?
-  # Change the fixture script so the recovery run can proceed after restoring v1.
+  # Recovery is one exact-id invocation and cannot continue into a candidate.
   mkpkg "$TMP/failer-v2" failer 0
+  recover_tx > "$TMP/crash-recovery.log" 2>&1 || recovery_rc=$?
   orch "$cfg" > "$TMP/crash-second.log" 2>&1
   local retry_rc=$?
-  if [ "$rc" != 0 ] && [ "$retry_rc" = 0 ] \
-      && grep -q 'recovering unfinished install transaction' "$TMP/crash-second.log" \
+  if [ "$rc" != 0 ] && [ "$recovery_rc" = 0 ] && [ "$retry_rc" = 0 ] \
+      && grep -q 'explicitly recovering install transaction' "$TMP/crash-recovery.log" \
       && [ "$(tx_phase)" = committed ]; then
-    ok "crash-and-reenter: a fresh installer recovers first, then performs the new candidate"
+    ok "crash-and-reenter: exact-id recovery exits before a separate new candidate commits"
   else
-    bad "crash-and-reenter: crash_rc=$rc retry_rc=$retry_rc phase=$(tx_phase 2>/dev/null || echo none)"
+    bad "crash-and-reenter: crash_rc=$rc recovery_rc=$recovery_rc retry_rc=$retry_rc phase=$(tx_phase 2>/dev/null || echo none)"
   fi
 }
 
@@ -856,10 +890,14 @@ personal_path_r4_transaction() {
 
   if [ "$positive" = 1 ] && [ "$noop_installer_rejected" = 1 ] \
       && [ "$recovery_rejected" = 1 ] && [ "$receipt_tamper_rejected" = 1 ]; then
+    local evidence_revision
+    evidence_revision="$(git -C "$ROOT" rev-parse --verify HEAD)" || {
+      bad "personal-path-r4-transaction: cannot bind evidence to checkout revision"; return
+    }
     ok "personal-path-r4-transaction: approved digest reaches real installer; rollback preserves the approved config, prior lock/ledger revision, and the failure-time data write"
-    printf 'AC-AST-R4-TRANSACTION | expected: positive=1 && noop_installer_rejected=1 && recovery_rejected=1 && receipt_tamper_rejected=1 | observed: positive=%s,noop_installer_rejected=%s,noop_phase=%s,noop_data_after=%s,recovery_rejected=%s,corrupt_phase=%s,receipt_tamper_rejected=%s,%s | verdict: PASS | signal: hermetic actual-installer | evidence: install/test-installer-transaction.sh\n' \
+    printf 'AC-AST-R4-TRANSACTION | expected: positive == 1 && noop_installer_rejected == 1 && recovery_rejected == 1 && receipt_tamper_rejected == 1 | observed: positive=%s,noop_installer_rejected=%s,noop_phase=%s,noop_data_after=%s,recovery_rejected=%s,corrupt_phase=%s,receipt_tamper_rejected=%s,%s | verdict: PASS | signal: fixture | evidence: install/test-installer-transaction.sh@%s\n' \
       "$positive" "$noop_installer_rejected" "$noop_phase" "$noop_data_after" \
-      "$recovery_rejected" "$corrupt_phase" "$receipt_tamper_rejected" "$observed"
+      "$recovery_rejected" "$corrupt_phase" "$receipt_tamper_rejected" "$observed" "$evidence_revision"
   else
     bad "personal-path-r4-transaction: positive=$positive noop_installer_rejected=$noop_installer_rejected recovery_rejected=$recovery_rejected receipt_tamper_rejected=$receipt_tamper_rejected $observed"
   fi
@@ -1263,10 +1301,10 @@ devmon_receipt_forward_keep() {
 
 devmon_receipt_degraded_reentry() {
   # The box #448 left behind: an old-generation transaction already marked degraded,
-  # its receipt still beside the checkpoint, the converted DB written to. The next
-  # installer must get past the refusal on its own and go on to commit.
+  # its receipt still beside the checkpoint, the converted DB written to. Exact-id
+  # recovery must close that debt before a separate installer can commit.
   reset_fixture
-  local cfg="$TMP/devmon-reentry.toml" rc=0 second_rc=0 pidfile="$TMP/devmon-reentry.pid"
+  local cfg="$TMP/devmon-reentry.toml" rc=0 recovery_rc=0 second_rc=0 pidfile="$TMP/devmon-reentry.pid"
   local db="$FAKEHOME/.local/state/airlock/dev-monitor/messages.db"
   prepare_devmon_receipt_flow "$cfg" \
     || { bad "devmon-receipt-degraded-reentry: setup failed"; return; }
@@ -1286,17 +1324,18 @@ devmon_receipt_degraded_reentry() {
     "$ROOT/bin/airlock-ledger" transaction-fail final-render dev-monitor >/dev/null 2>&1 \
     || { bad "devmon-receipt-degraded-reentry: could not mark the transaction degraded"; return; }
   rm -f "$TMP/devmon-nginx-fail"
+  devmon_recover_tx >"$TMP/devmon-reentry-recovery.log" 2>&1 || recovery_rc=$?
   devmon_orch "$cfg" >"$TMP/devmon-reentry-second.log" 2>&1 || second_rc=$?
-  if [ "$rc" != 0 ] && [ "$second_rc" = 0 ] && [ "$(tx_phase)" = committed ] \
-      && grep -q 'recovering unfinished install transaction' "$TMP/devmon-reentry-second.log" \
-      && grep -q 'keeping it' "$TMP/devmon-reentry-second.log" \
+  if [ "$rc" != 0 ] && [ "$recovery_rc" = 0 ] && [ "$second_rc" = 0 ] && [ "$(tx_phase)" = committed ] \
+      && grep -q 'explicitly recovering install transaction' "$TMP/devmon-reentry-recovery.log" \
+      && grep -q 'keeping it' "$TMP/devmon-reentry-recovery.log" \
       && ledger_has_committed dev-monitor \
       && ! find "$STATE/install-checkpoints" -name dev-monitor-migration.json -print -quit | grep -q . \
       && [ "$(python3 "$ROOT/apps/dev-monitor/migrate-legacy-state.py" --schema-state "$db")" = canonical ]; then
     ok "devmon-receipt-degraded-reentry: a box left degraded by an old receipt recovers forward and the retry commits"
   else
-    bad "devmon-receipt-degraded-reentry: crash_rc=$rc second_rc=$second_rc phase=$(tx_phase 2>/dev/null || echo none)"
-    grep -nE 'recovering|keeping|kept|schema|compensat|WARN' "$TMP/devmon-reentry-second.log" | head -12 | sed 's/^/    /'
+    bad "devmon-receipt-degraded-reentry: crash_rc=$rc recovery_rc=$recovery_rc second_rc=$second_rc phase=$(tx_phase 2>/dev/null || echo none)"
+    grep -nE 'recovering|keeping|kept|schema|compensat|WARN' "$TMP/devmon-reentry-recovery.log" | head -12 | sed 's/^/    /'
   fi
 }
 
@@ -1372,7 +1411,7 @@ devmon_keep_forward_evidence_rechecked() {
   python3 -c 'import sqlite3, sys
 c = sqlite3.connect(sys.argv[1]); c.execute("UPDATE cards SET title=\"changed-after-decision\""); c.commit(); c.close()' "$db"
   rm -f "$TMP/devmon-nginx-fail"
-  devmon_orch "$cfg" >"$TMP/devmon-recheck-second.log" 2>&1 || second_rc=$?
+  devmon_recover_tx >"$TMP/devmon-recheck-second.log" 2>&1 || second_rc=$?
   if [ "$second_rc" != 0 ] && [ "$(tx_phase)" = degraded ] \
       && grep -q 'forward-keep evidence changed' "$TMP/devmon-recheck-second.log" \
       && ! grep -q '^start-schema=legacy ' "$TMP/systemctl.log"; then
@@ -1458,7 +1497,7 @@ devmon_default_state_dir() {
 
 devmon_crash_reentry() {
   reset_fixture
-  local cfg="$TMP/devmon-crash.toml" rc=0 retry_rc=0 before
+  local cfg="$TMP/devmon-crash.toml" rc=0 recovery_rc=0 retry_rc=0 before
   local db="$FAKEHOME/.local/state/airlock/dev-monitor/messages.db" pidfile="$TMP/devmon.pid"
   prepare_devmon_migration "$cfg" \
     || { bad "devmon-crash-reentry: setup failed"; tail -30 "$TMP/devmon-first.log"; return; }
@@ -1480,9 +1519,10 @@ devmon_crash_reentry() {
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$TMP/devmon-v2/smoke.sh"
   chmod +x "$TMP/devmon-v2/smoke.sh"
   : >"$TMP/systemctl.log"
+  devmon_recover_tx >"$TMP/devmon-crash-recovery.log" 2>&1 || recovery_rc=$?
   devmon_orch "$cfg" >"$TMP/devmon-crash-second.log" 2>&1 || retry_rc=$?
-  if [ "$rc" != 0 ] && [ "$retry_rc" = 0 ] && [ "$(tx_phase)" = committed ] \
-      && grep -q 'recovering unfinished install transaction' "$TMP/devmon-crash-second.log" \
+  if [ "$rc" != 0 ] && [ "$recovery_rc" = 0 ] && [ "$retry_rc" = 0 ] && [ "$(tx_phase)" = committed ] \
+      && grep -q 'explicitly recovering install transaction' "$TMP/devmon-crash-recovery.log" \
       && grep -q '^start-schema=legacy airlock-dev-monitor.service' "$TMP/systemctl.log" \
       && grep -q 'dev-monitor activated' "$TMP/devmon-crash-second.log" \
       && [ ! -e "$(activation_record)" ] \
@@ -1490,7 +1530,7 @@ devmon_crash_reentry() {
       && ! find "$STATE/install-checkpoints" -name dev-monitor-migration.json -print -quit | grep -q .; then
     ok "devmon-crash-reentry: recovery takes back the deferral and restores the old package, then the retry commits and activates"
   else
-    bad "devmon-crash-reentry: crash_rc=$rc retry_rc=$retry_rc phase=$(tx_phase 2>/dev/null || echo none)"
+    bad "devmon-crash-reentry: crash_rc=$rc recovery_rc=$recovery_rc retry_rc=$retry_rc phase=$(tx_phase 2>/dev/null || echo none)"
     tail -35 "$TMP/devmon-crash-second.log" | sed 's/^/    /'
   fi
 }
@@ -1650,7 +1690,7 @@ removed_fragment_rollback_reentry() {
   reset_fixture
   local cfg="$TMP/removed-fragment-reentry.toml" pkg="$TMP/retired-reentry-v1"
   local fragment="$CONFD/hub-locations.d/retired.conf" fail_once="$TMP/reload-fail-once"
-  local rc=0 retry_rc=0 owed=0 retry_owed=1
+  local rc=0 recovery_rc=0 retry_rc=0 owed=0 retry_owed=1
   local -a first_states=() retry_states=()
   mkpkg "$pkg" retired 0
   printf '%s\n' 'fragments = ["hub-locations.d/retired.conf"]' >>"$pkg/airlock-app.toml"
@@ -1690,17 +1730,18 @@ EOF
   : >"$TMP/systemctl.log"
   AIRLOCK_FIXTURE_RETIRED_FRAGMENT="$fragment" \
   AIRLOCK_FIXTURE_RELOAD_FAIL_AFTER_ABSENT_ONCE="$fail_once" \
-    orch "$cfg" >"$TMP/removed-fragment-reentry-retry.log" 2>&1 || retry_rc=$?
+    recover_tx >"$TMP/removed-fragment-reentry-recovery.log" 2>&1 || recovery_rc=$?
   mapfile -t retry_states < <(sed -n 's/^reload-retired-fragment=//p' "$TMP/systemctl.log")
+  orch "$cfg" >"$TMP/removed-fragment-reentry-retry.log" 2>&1 || retry_rc=$?
   retry_owed="$("$ROOT/bin/airlock-ledger" transaction-show \
     | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("nginx_restore_owed") else 0)')"
-  if [ "$rc" != 0 ] && [ "$retry_rc" != 0 ] && [ -e "$fragment" ] \
+  if [ "$rc" != 0 ] && [ "$recovery_rc" = 0 ] && [ "$retry_rc" != 0 ] && [ -e "$fragment" ] \
       && [ "$owed" = 1 ] && [ "$retry_owed" = 0 ] && [ "$(tx_phase)" = rolled_back ] \
       && [ "${first_states[*]}" = "present absent present" ] \
       && [ "${retry_states[*]}" = "present" ]; then
     ok "removed-fragment-reentry: failed rollback publication stays owed until a later run republishes it"
   else
-    bad "removed-fragment-reentry: rc=$rc retry_rc=$retry_rc phase=$(tx_phase 2>/dev/null || echo none) owed=$owed retry_owed=$retry_owed fragment=$([ -e "$fragment" ] && echo present || echo absent) first=${first_states[*]:-none} retry=${retry_states[*]:-none}"
+    bad "removed-fragment-reentry: rc=$rc recovery_rc=$recovery_rc retry_rc=$retry_rc phase=$(tx_phase 2>/dev/null || echo none) owed=$owed retry_owed=$retry_owed fragment=$([ -e "$fragment" ] && echo present || echo absent) first=${first_states[*]:-none} retry=${retry_states[*]:-none}"
     tail -30 "$TMP/removed-fragment-reentry-retry.log" 2>/dev/null | sed 's/^/    /'
   fi
 }
@@ -1743,40 +1784,50 @@ case "$case_name" in
   fresh-fragment-rollback) fresh_fragment_rollback_reloads ;;
   removed-fragment-reentry) removed_fragment_rollback_reentry ;;
   all)
-    unchanged
-    upgrade_success
-    fail_before_mutation
-    fail_after_deactivate
-    fail_before_commit
-    restore_denied
-    deactivate_fails
-    crash_and_reenter
-    signal_term
-    resource_handoff
-    personal_path_r4_transaction
-    devmon_nginx_failure
-    devmon_write_survives_rollback
-    devmon_later_app_fails
-    devmon_activation_resume
-    devmon_owed_activation_does_not_block_others
-    devmon_activation_record_contract
-    devmon_fence_recovery
-    devmon_spool_mode_restore
-    devmon_receipt_forward_keep
-    devmon_receipt_refuses_unsound
-    devmon_receipt_degraded_reentry
-    devmon_keep_forward_is_bound
-    devmon_keep_forward_evidence_rechecked
-    devmon_standalone_fallback
-    devmon_home_traversal
-    devmon_standalone_after_writer
-    devmon_default_state_dir
-    devmon_crash_reentry
-    devmon_proxy_secret_rotation
-    removed_fragment_reload
-    removed_fragment_rollback_reloads
-    fresh_fragment_rollback_reloads
-    removed_fragment_rollback_reentry
+    # Each named case creates its own mktemp fixture and only reads the checkout.
+    # The serial suite regularly exceeded the taskboard's fixed 600-second
+    # acceptance window even though no individual assertion was slow.  Keep every
+    # case and its own process boundary, but run a bounded number concurrently.
+    all_cases=(
+      unchanged upgrade-success fail-before-mutation fail-after-deactivate
+      fail-before-commit restore-denied deactivate-fails crash-and-reenter
+      signal-term resource-handoff personal-path-r4-transaction devmon-nginx-failure
+      devmon-write-survives-rollback devmon-later-app-fails devmon-activation-resume
+      devmon-owed-activation devmon-activation-record devmon-fence-recovery
+      devmon-spool-mode-restore devmon-receipt-forward-keep devmon-receipt-refuses-unsound
+      devmon-receipt-degraded-reentry devmon-keep-forward-bound devmon-keep-forward-evidence
+      devmon-standalone-fallback devmon-home-traversal devmon-standalone-after-writer
+      devmon-default-state-dir devmon-crash-reentry devmon-proxy-secret-rotation
+      removed-fragment-reload removed-fragment-rollback fresh-fragment-rollback
+      removed-fragment-reentry
+    )
+    jobs="${AIRLOCK_TRANSACTION_JOBS:-8}"
+    [[ "$jobs" =~ ^[1-9][0-9]*$ ]] && [ "$jobs" -le 8 ] || {
+      bad "all: AIRLOCK_TRANSACTION_JOBS must be 1..8"; jobs=1;
+    }
+    all_out="$TMP/all-cases"
+    mkdir -p "$all_out"
+    pids=()
+    names=()
+    reap_one() {
+      local child="${pids[0]}" name="${names[0]}" rc=0
+      wait "$child" || rc=$?
+      cat "$all_out/$name.log"
+      if [ "$rc" = 0 ] && grep -q '^passed=1 failed=0$' "$all_out/$name.log"; then
+        pass=$((pass + 1))
+      else
+        fail=$((fail + 1))
+      fi
+      pids=("${pids[@]:1}")
+      names=("${names[@]:1}")
+    }
+    for named_case in "${all_cases[@]}"; do
+      bash "$0" --case "$named_case" >"$all_out/$named_case.log" 2>&1 &
+      pids+=("$!")
+      names+=("$named_case")
+      [ "${#pids[@]}" -lt "$jobs" ] || reap_one
+    done
+    while [ "${#pids[@]}" -gt 0 ]; do reap_one; done
     ;;
   *) bad "unknown case: $case_name" ;;
 esac

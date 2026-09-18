@@ -31,6 +31,26 @@ bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
 
 scratch="$(mktemp -d)"
 trap 'chmod -R u+rwX "$scratch" 2>/dev/null; rm -rf "$scratch"' EXIT
+chmod 700 "$scratch"
+printf '%s\n' 'airlock.live-box-fixture/v1' > "$scratch/.airlock-live-box-fixture-v1"
+chmod 600 "$scratch/.airlock-live-box-fixture-v1"
+
+# This test reaches the early state-directory branch but never has authority
+# to run a box installer.  The installer fixture boundary requires all four
+# mutation shims and paths to stay below this marked scratch root.
+shim="$scratch/shim"
+mkdir -p "$shim" "$scratch/unit-user" "$scratch/unit-system"
+for command in sudo systemctl systemd-run tailscale; do
+  cat > "$shim/$command" <<'SHIM'
+#!/usr/bin/env bash
+exit 0
+SHIM
+  chmod +x "$shim/$command"
+done
+printf '0::/fixture.scope\n' > "$scratch/cgroup"
+export AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR="$scratch/airlock-live-box"
+export AIRLOCK_SELFKILL_CGROUP_FILE="$scratch/cgroup"
+PATH="$shim:$PATH"; export PATH
 
 cfg="$scratch/airlock.toml"
 cat > "$cfg" <<'TOML'
@@ -45,17 +65,24 @@ owner = "owner@fixture.dev"
 [apps.hub]
 TOML
 
-run_orchestrator() {   # run_orchestrator <state-dir>
+run_orchestrator() {   # run_orchestrator <state-dir> <log>
   AIRLOCK_CONFIG="$cfg" \
   AIRLOCK_TS_FQDN=test.example.ts.net \
   AIRLOCK_STATE_DIR="$1" \
   AIRLOCK_CONFD="$scratch/confd" \
   AIRLOCK_WEBROOT="$scratch/webroot" \
+  AIRLOCK_NGINX_SITE="$scratch/nginx-site" \
+  AIRLOCK_UNIT_DIR_USER="$scratch/unit-user" \
+  AIRLOCK_UNIT_DIR_SYSTEM="$scratch/unit-system" \
   HOME="$scratch/home" \
-  timeout 120 bash "$ROOT/install/airlock-install.sh" >"$scratch/run.log" 2>&1
+  timeout 120 bash "$ROOT/install/airlock-install.sh" >"$2" 2>&1
   return 0
 }
-mkdir -p "$scratch/home" "$scratch/confd" "$scratch/webroot"
+show_orchestrator_log() { # <log>
+  printf '%s\n' '--- orchestrator log (fixture retained in CI output) ---' >&2
+  sed -n '1,200p' "$1" >&2
+}
+mkdir -p "$scratch/home" "$scratch/confd" "$scratch/webroot" "$scratch/nginx-site"
 
 # ---- 1) an existing directory keeps its mode
 state="$scratch/state-existing"
@@ -63,9 +90,11 @@ install -d -m 0701 "$state"
 # A ledger file is what makes the orchestrator reach the line at all (see the guard
 # above it): without one, and with no packages, it never touches the state directory.
 printf '{"version": 5, "entries": {}, "events": []}\n' > "$state/app-ledger.json"
-run_orchestrator "$state"
+existing_log="$scratch/run-existing.log"
+run_orchestrator "$state" "$existing_log"
 if [ ! -e "$state/app-ledger.lock" ]; then
   bad "the orchestrator never reached the state-directory step — this case proves nothing"
+  show_orchestrator_log "$existing_log"
 else
   ok "positive control: the run really did reach the state-directory step"
   got="$(stat -c %a "$state")"
@@ -79,9 +108,11 @@ printf '' > /dev/null
 mkdir -p "$(dirname "$fresh")"
 # No directory, but a package set is what makes the guard fire on a fresh box; hub is
 # enabled in the config above, so the run creates it.
-run_orchestrator "$fresh"
+fresh_log="$scratch/run-fresh.log"
+run_orchestrator "$fresh" "$fresh_log"
 if [ ! -d "$fresh" ]; then
   bad "the orchestrator did not create the state directory — case 2 proves nothing"
+  show_orchestrator_log "$fresh_log"
 else
   got2="$(stat -c %a "$fresh")"
   [ "$got2" = 700 ] && ok "a state directory the run creates is 0700" \

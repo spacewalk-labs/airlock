@@ -91,17 +91,20 @@ else
 fi
 
 tools="$HERE/install-agent-tools.sh"
+opencode_defaults="$HERE/configure-opencode.py"
 tool_contract=1
 bash -n "$tools" || tool_contract=0
+python3 -m py_compile "$opencode_defaults" || tool_contract=0
 for token in git jq gitleaks unzip '@anthropic-ai/claude-code' '@openai/codex' pnpm opencode; do
   grep -Fq "$token" "$tools" || tool_contract=0
 done
+grep -Fq 'configure-opencode.py' "$tools" || tool_contract=0
 for caller in "$ROOT/docker/gui-provisioner.sh" "$ROOT/docker/orbstack-machine-setup.sh"; do
   grep -Fq 'install-agent-tools.sh' "$caller" || tool_contract=0
   grep -Fq 'install-student-harness.py' "$caller" || tool_contract=0
 done
 if [ "$tool_contract" = 1 ]; then
-  ok "both platform paths statically wire install and execute-checks for every harness prerequisite"
+  ok "both platform paths statically wire install, OpenCode defaults and execute-checks for every harness prerequisite"
 else
   bad "an agent CLI, prerequisite tool or platform integration call is absent"
 fi

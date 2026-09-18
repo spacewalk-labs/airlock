@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""airlock-agy-usage — read Antigravity (agy) model quota by asking the CLI itself.
+
+agy has no non-interactive usage command and keeps its quota summary in memory only,
+so this opens the interactive CLI in a pseudo-terminal, runs `/usage`, reads the screen
+and exits. Prints one JSON object:
+
+  {"ok": true, "account": "...", "groups": [{"name": "GEMINI MODELS",
+    "weeklyRemaining": 99.91, "weeklyResetAt": 1789..., "fiveHourRemaining": 98.7,
+    "fiveHourResetAt": 1789...}], "observedAt": 1789...}
+  {"ok": false, "error": "..."}
+
+Screen text is the contract here, and screens change. Anything that does not parse is
+an error, never a guessed number. Tokens are never read: agy authenticates itself.
+"""
+import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
+
+AGY = os.environ.get("AIRLOCK_AGY_BIN") or "agy"
+# A private, empty working directory: agy asks once whether to trust it, and scans it.
+WORKDIR = os.path.join(os.environ.get("AIRLOCK_STATE_DIR")
+                       or os.path.expanduser("~/.local/state/airlock"), "accounts", "agy-probe")
+TIMEOUT = float(os.environ.get("AIRLOCK_AGY_USAGE_TIMEOUT", "60"))
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(\x07|\x1b\\)|\x1b[@-Z\\-_]")
+
+
+def screen_text(raw):
+    return ANSI.sub("", raw.decode("utf-8", "replace")).replace("\r", "\n")
+
+
+def parse(text, now):
+    """Return the parsed usage, or None when the screen is not a complete /usage view."""
+    if "Models & Quota" not in text:
+        return None
+    text = text[text.rindex("Models & Quota"):]
+    account = re.search(r"Account:\s*(\S+@\S+)", text)
+    groups = []
+    for block in re.split(r"\n\s*(?=[A-Z][A-Z &]+MODELS\s*\n)", text)[1:]:
+        name = block.strip().splitlines()[0].strip()
+        group = {"name": name}
+        weekly = re.search(r"Weekly Limit Remaining[\s\S]*?([0-9.]+)%[\s\S]*?"
+                           r"Refreshes in\s*(?:([0-9]+)h)?\s*(?:([0-9]+)m)?", block)
+        five = re.search(r"Five Hour Limit Remaining[\s\S]*?([0-9.]+)%[\s\S]*?"
+                         r"Refreshes in\s*(?:([0-9]+)h)?\s*(?:([0-9]+)m)?", block)
+        for key, m in (("weekly", weekly), ("fiveHour", five)):
+            if not m:
+                return None
+            group[key + "Remaining"] = float(m.group(1))
+            group[key + "ResetAt"] = int(now + int(m.group(2) or 0) * 3600
+                                         + int(m.group(3) or 0) * 60)
+        groups.append(group)
+    if not account or not groups:
+        return None
+    return {"ok": True, "account": account.group(1), "groups": groups, "observedAt": int(now)}
+
+
+def trusted_or_known(text, trusted):
+    return trusted or "Do you trust the contents of this project?" not in text
+
+
+def main():
+    os.makedirs(WORKDIR, mode=0o700, exist_ok=True)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(WORKDIR)
+        try:
+            os.execvp(AGY, [AGY])
+        except OSError as exc:
+            sys.stderr.write(f"cannot start {AGY}: {exc}\n")
+            os._exit(127)
+    # Without a window size the TUI renders for a 0x0 terminal and never shows its header.
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 160, 0, 0))
+    buf, sent, trusted, result = b"", False, False, None
+    deadline = time.monotonic() + TIMEOUT
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+            text = screen_text(buf)
+            if not trusted and "Do you trust the contents of this project?" in text:
+                os.write(fd, b"\r"); trusted = True; continue
+            # "currently not signed in" is also printed for a moment while agy loads its
+            # stored token, so it only counts once the prompt it leads to is on screen.
+            if "Sign in with Google" in text or "not logged into Antigravity" in text:
+                result = {"ok": False, "error": "not logged in"}; break
+            # Ready = the input prompt's footer. The account header is drawn with cursor
+            # moves, so its spacing is not stable text to match on.
+            if not sent and trusted_or_known(text, trusted) and "? for shortcuts" in text:
+                time.sleep(1.5)
+                os.write(fd, b"/usage"); time.sleep(1.0); os.write(fd, b"\r"); sent = True
+                continue
+            if sent:
+                result = parse(text, time.time())
+                if result and len(result["groups"]) >= 1 and text.count("Refreshes in") >= 2 * len(result["groups"]):
+                    break
+                result = None
+        if result is None and os.environ.get("AIRLOCK_AGY_USAGE_DEBUG"):
+            sys.stderr.write(screen_text(buf)[-3000:])
+        if result is None:
+            result = {"ok": False, "error": "usage screen did not appear" if not sent
+                      else "usage screen did not parse"}
+    finally:
+        try:
+            os.write(fd, b"\x1b"); time.sleep(0.3); os.write(fd, b"\x03\x03")
+        except OSError:
+            pass
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                break
+            for _ in range(10):
+                if os.waitpid(pid, os.WNOHANG) != (0, 0):
+                    break
+                time.sleep(0.2)
+            else:
+                continue
+            break
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

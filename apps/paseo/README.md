@@ -50,10 +50,10 @@ fragment is **written directly** by `install.sh` — but it replicates
 
 - **node >= 20.** The daemon and its `node-pty` fail on node 18; the installer
   hard-checks and aborts with a clear message on older boxes.
-- **Pinned guarded Paseo 0.2.5 package set** installed into a fixed,
-  user-writable npm prefix (`~/.npm-global`). Airlock ships the six modified
+- **Pinned guarded Paseo 0.8.0 package set** installed into a fixed,
+  user-writable npm prefix (`~/.npm-global`). Airlock ships the seven modified
   `@getpaseo` tarballs together and verifies their checksums before install; see
-  [`vendor/guarded-0.2.5/README.md`](vendor/guarded-0.2.5/README.md) for source and
+  [`vendor/guarded-0.8.0/README.md`](vendor/guarded-0.8.0/README.md) for source and
   review provenance. The set is pinned deliberately — Paseo is pre-1.0 and a
   floating install would drift the web-ui bundle and patch anchors. Setting
   `version` under `[apps.paseo]` explicitly selects that ordinary npm registry
@@ -84,17 +84,18 @@ reference / re-derivation copy of that edit.
 
 | Component | License | Why |
 |---|---|---|
-| paseo daemon (`@getpaseo/cli`) | **AGPL-3.0** (upstream) | fetched via npm at install; not redistributed by Airlock |
-| `patches/` (our edits to paseo) | **AGPL-3.0** | derivative of paseo |
+| paseo daemon (`@getpaseo/cli`) | **Apache-2.0** (upstream, since `v0.7`) | fetched via npm at install; not redistributed by Airlock |
+| `patches/` (our edits to paseo) | **AGPL-3.0-only** (our choice) | derivative of paseo; Apache-2.0 §4(b) permits different terms on our own modifications |
 | `install.sh`, `smoke.sh`, this README | AGPL-3.0 (Airlock core) | our glue; runs paseo as a separate process (mere aggregation) |
 | `browse-host/` sidecar | **AGPL-3.0** | independent loopback-WS sidecar; does not import paseo, but the core is AGPL by our own choice |
-| `browse-host/bin/patch-web-ui.js` | **AGPL-3.0** | encodes derivative edits to paseo's web-ui bundle |
+| `browse-host/bin/patch-web-ui.js` | **AGPL-3.0-only** (our choice) | encodes derivative edits to paseo's web-ui bundle |
 
 See the repo `NOTICE` and `patches/README.md`. Airlock talks to paseo over a
 separate process boundary, so the core is not a derivative of paseo (mere
-aggregation). Since 2026-09-08 the core is AGPL-3.0 anyway, by the copyright
-holder's own choice — the aggregation argument now matters for attribution, not
-for which licence the core carries. *This is not legal advice.*
+aggregation) regardless of either side's licence. Since 2026-09-08 the core is
+AGPL-3.0 anyway, by the copyright holder's own choice, and the patches are
+AGPL-3.0-only by that same choice (Apache-2.0 upstream leaves that choice to
+us — see `patches/README.md`). *This is not legal advice.*
 
 ## browse-host live panels (config-gated)
 

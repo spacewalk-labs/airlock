@@ -37,128 +37,38 @@ const crypto = require("node:crypto");
 const childProcess = require("node:child_process");
 
 // SHA-256 of the ORIGINAL (unpatched) bundle we derived anchors against.
-const PINNED_SHA = "435dff4ee752a352ee81ff1eae02338163455b2f7e9b605f1ef30967007ce28c";
+const PINNED_SHA = "a182df940822df553fd648885dbfe2e31da3cc2f771b56a51f935d364f555645";
 // Every bundle shape the fleet is known to carry: the pinned upstream bundle plus a
 // SUBSET of this file's edits, keyed by exactly which edits it holds.
 //
-// Two things put a box on an older subset. A group GROWS an anchor (this happened
-// three times to the general group and once to browse), and an edit MOVES between
-// groups — `project-actions-coarse-pointer` did, when it stopped riding on the
-// optional browse group and joined the always-on one. Either way the box must be
-// RECOGNISED and completed on the next install rather than refused, and a subset
-// nobody ever shipped must still be refused. That is why this is a table of shapes
-// and not "any subset goes": the SHA pin still names what upstream's bytes are.
+// 0.8.0 note: this table restarts fresh at the version bump — the 0.2.5-era shape
+// history (many partial-adoption rows as edits grew/moved groups over time) does not
+// carry forward, since no box has ever run a partially-patched 0.8.0 bundle. Only two
+// shapes exist so far: pristine (nothing applied) and fully patched (both groups).
+// Rows will accumulate again here exactly as they did for 0.2.5 if an edit grows an
+// anchor or moves groups after this pin ships.
 //
 // Each sha256 covers the whole bundle and was re-derived from the pristine bundle by
 // applying exactly the listed edits — order-independent, the nine sites are disjoint:
-//   npm pack @getpaseo/server@0.2.5 && tar xzf getpaseo-server-0.2.5.tgz
+//   npm pack @getpaseo/server@0.8.0 && tar xzf getpaseo-server-0.8.0.tgz
 //   # apply the subset to package/dist/server/web-ui/_expo/static/js/web/index-*.js
 const KNOWN_BUNDLE_SHAPES = [
   { sha: PINNED_SHA, edits: [] },
-
-  // --- the always-on general group, one era per row (browse never applied) ---
-  { sha: "6cc40f4d39f1bd9a65234c360b134ee6342afd2ac877586e3f61ee35d81a6eff",
-    edits: ["provider-subagent-visible-parent"] },
-  { sha: "c0e1972ed7be9fff2df9d4c1fb9c90ba4dc39fd412a522d98ae3776fb0741de6",
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes"] },
-  { sha: "b79d8ce072ae84d36d92a4a0ea9c970b5430202da28a567036fafa72c2c82363",
-    legacyShas: ["d28bbda4c1fc9337b094b48ceb6f23c53672474d3ef7044a9cacebf29bfb546f", "670b7048aaac21d29a04e4a7e44fcee049c65d81b98ded03fad71b79e8afadba"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage"] },
-  // The shape every browse-less box carried before the coarse-pointer edit moved in.
-  { sha: "f1ad068d7abcbe4639009a34affcfb6a274961a8454a6b4f44e8de28b455e925",
-    legacyShas: ["3bc72e9f6bc0f3b440e2a1353d0d2f0f2fcde25d0b988895871be53414e0ba92", "702134b78675e2323e094db041086c53f70020f19aa0b1bc32492d2cb2cebaea"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage", "tooltip-hover-none-is-compact"] },
-  // ...and the shape this revision installs there instead: the tablet "+" fix no
-  // longer costs a 150MB chromium download to receive.
-  { sha: "0aa422349b2c4103e80d5d88ae7117f1e6a40429e16ef278cf56bb334e945856",
-    legacyShas: ["15c2daf833748d97a1b7aef28a2c855597e32ebacb4c372256d85f47c1a09c95", "6a6acb81ced1dfd6982f19e0c5f0c7fa80fea7738ef4f4def28dbe6eb1ca064e"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
-            "project-actions-coarse-pointer"] },
-  // A device that was already open now rehydrates the shared order when its tab
-  // becomes visible.
-  { sha: "fc9815e243b3cfe2ed416f358cc16eb55fbef40455d75ac4797aaac573beb485",
-    legacyShas: ["2a363947ca567d3da1aefbdbdbe706994fa173fd03691862b440dc9dc60e0528", "b9aa1eac972a2030f03e8c786830a07d40f13839c658664c20c628dcb47c0cea"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
-            "tooltip-hover-none-is-compact", "project-actions-coarse-pointer"] },
-  // ...and the current browse-less shape: a sidebar tap is no longer swallowed by the
-  // long-press/drag machinery web never arms. A browse box passes through here too —
-  // the always-on group runs first, so this is also its mid-install state.
-  { sha: "f440860c5f10abda72f6e8eab0053143d08cfb5d7f9510e78a3771fbabbc4f8d",
-    legacyShas: ["2eb226a06326740fe56f54be59e55c06493f715f216909c6ee7be202131a91bb", "e77864d635f9699e555e83d5a456425694b78745b98cc8249a010ac0c10223d3"],
+  // always-on group only (browse = false, the default)
+  { sha: "fcb035158faafcc910f05442605c7205eeffab66f1a13a0f803ed2e879da1b39",
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
             "tooltip-hover-none-is-compact", "project-actions-coarse-pointer",
             "sidebar-tap-not-swallowed-on-web"] },
-
-  // --- the same eras again on a box that also runs the browse group ---
-  // `project-actions-coarse-pointer` shipped FROM the browse group until this
-  // revision, so every pre-move browse box already holds it: that is why it appears
-  // beside a general group that is otherwise one, two, three or four edits old.
-  { sha: "8a31b87021fc2e0b70b8b2009fd7bf19bd9da89f4ae0c86af2353ae5e1bcb6b9",
-    edits: ["new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
-  { sha: "769e57f5fbdc31a9a8bbcf32ee8de6602c61f1705102f7e7ff5d9ebbd733117a",
-    edits: ["new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
-            "project-actions-coarse-pointer"] },
-  { sha: "fa7c2470a1040b886125c5a58ed53b87e0c222b3b6a73f3a81588d502f75540f",
-    edits: ["provider-subagent-visible-parent",
-            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
-  { sha: "c74929516273d623698ab4646a5ffa826af35edfc714e0997e1ef4581eb5dfe2",
-    edits: ["provider-subagent-visible-parent",
-            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
-            "project-actions-coarse-pointer"] },
-  { sha: "7702c7e018ebadbaef91d40440c3e898ac419bb417b2bf9494924c6be6ee0164",
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
-  { sha: "67646ec71d1e64db703b1b0d5277dc1898501b73ab67b048884c6b578e704549",
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
-            "project-actions-coarse-pointer"] },
-  { sha: "ed4bd10aef38e6836591061c5cf4716cd55f78fc8358df9e8079a352ebeeefd7",
-    legacyShas: ["420849d03e093988fdfa395c6a511020fe583868bf287bdb33960aa25d0c8b82", "9f5c599500b78a69b8771ff3df7cb05dc58982354d4b22df24d9072182cf65bb"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage",
-            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
-  { sha: "81bf658d877f9267c13f367355fe1e01ebaaf5499613c12dfc8f36123dd473d7",
-    legacyShas: ["5dc74b4dce187e7e55cb471707b8ff2e9ec50dffb8c6064292d0037fde836254", "f89ae3ae99905c0c1e1c8e6090e0e44dcd10fd8043c80338aa1792704fcb0e67"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage",
-            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
-            "project-actions-coarse-pointer"] },
-  { sha: "09c3fb6f8b2e67693e85a295991ab8d99030e0c9f8e624bd600d5c8c3cf764a0",
-    legacyShas: ["ae8c2e29eb783360f08a1fb154016cb6b62758e0d8b8f683b71f517297665c77", "0d175c93d202803e17ea539ab4ce17fd109004fb062141ffa72d2e0e6bbbd82a"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
-            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
-  // Fully patched: identical bytes before and after the move, because the move
-  // changed which group owns an edit and not which edits the bundle carries.
-  { sha: "6dbfe0de05bcd682c6162f41dd3f3b1584251974940befd034fceaaad398f5b7",
-    legacyShas: ["f3ce77bd649c1409bbbbd28385f2e33af8b282d9bcf2be336e51a06c8a1156d4", "32719926ca9df3ce3600cd11aef9c4d7ceb1d5ee9a36e9b8e64310eca301aabd"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage", "tooltip-hover-none-is-compact",
-            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker",
-            "project-actions-coarse-pointer"] },
-  // Fully patched, including visibility-triggered shared-order rehydration.
-  { sha: "78dabb290ae651dae8b8cacdb19dd4cad1b5bb9254ce88ad1af21b321196a8c8",
-    legacyShas: ["cff2de26a81bf08f4bf5c4c0d6ef0a8bf7ca5514286fa45e3be099376c3a4d57", "9f0ef2a3fd13ec714d4d9b95324d6b21136ef85bcb1ecf3e1e1baee81339a8b6"],
+  // both groups (browse = true)
+  { sha: "d4c12a9ef7725d6f356f065d1156b49b5b27cc6b3cc4c11c58527b031e86549f",
     edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
             "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
-            "tooltip-hover-none-is-compact", "new-browser-gate-vo",
-            "new-browser-gate-Wo", "browserpane-marker",
-            "project-actions-coarse-pointer"] },
-  // Fully patched, this revision: the same browse box after the sidebar-tap fix.
-  { sha: "84acd94533ac1bfb7c062f5ddcad20c5e992213ce438cedebc3fbb78cfe77f98",
-    legacyShas: ["75abafed0f4c766829067bf3f5322e0efd0da49ee128c0255a06874cf4164990", "9dc8c8fbd96032688977bc3b219587884930a3e53c94309d04a297fd76cb9d3c"],
-    edits: ["provider-subagent-visible-parent", "appearance-default-font-sizes",
-            "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility",
-            "tooltip-hover-none-is-compact", "new-browser-gate-vo",
-            "new-browser-gate-Wo", "browserpane-marker",
-            "project-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web"] },
+            "tooltip-hover-none-is-compact", "project-actions-coarse-pointer",
+            "sidebar-tap-not-swallowed-on-web",
+            "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
 ];
-const PINNED_VERSION = "@getpaseo/cli@0.2.5 (index-55db56b9)";
+const PINNED_VERSION = "@getpaseo/cli@0.8.0 (index-1be98d8895969110732458bbaeac57b2)";
 
 // Each anchor MUST occur exactly once in the pinned bundle (verified).
 // The two gate anchors carry minifier-local names, which are NOT stable across
@@ -166,19 +76,23 @@ const PINNED_VERSION = "@getpaseo/cli@0.2.5 (index-55db56b9)";
 // Re->Be, qe->at, ie->le and changed nothing else about these two callbacks.
 const BROWSE_PATCHES = [
   {
+    // 0.8.0 note: handleCreateBrowserTab dropped the separate `paneId && at(...)`
+    // side-effect statement 0.2.5 had — paneId now flows entirely through the
+    // third argument of the openWorkspaceTabFocused/gt(...) call below, per
+    // packages/app/src/screens/workspace/workspace-screen.tsx handleCreateBrowserTab.
     name: "new-browser-gate-vo",
-    find: 'if(!Ye||!(0,Be.getIsElectron)())return;e?.paneId&&at(Ye,e.paneId);const{browserId:t}=(0,le.createWorkspaceBrowser)()',
-    repl: 'if(!Ye)return;e?.paneId&&at(Ye,e.paneId);const{browserId:t}=(0,le.createWorkspaceBrowser)()',
+    find: 'if(!pt||!(0,ze.getIsElectron)())return;const{browserId:t}=(0,ue.createWorkspaceBrowser)();gt(pt,{kind:"browser",browserId:t},Ht(e?.paneId))',
+    repl: 'if(!pt)return;const{browserId:t}=(0,ue.createWorkspaceBrowser)();gt(pt,{kind:"browser",browserId:t},Ht(e?.paneId))',
   },
   {
     name: "new-browser-gate-Wo",
-    find: 'if(!Ye||!(0,Be.getIsElectron)())return;const{browserId:t}=(0,le.createWorkspaceBrowser)({initialUrl:e})',
-    repl: 'if(!Ye)return;const{browserId:t}=(0,le.createWorkspaceBrowser)({initialUrl:e})',
+    find: 'if(!pt||!(0,ze.getIsElectron)())return;const{browserId:t}=(0,ue.createWorkspaceBrowser)({initialUrl:e});gt(pt,{kind:"browser",browserId:t},Q.FOCUSED_PANE_PLACEMENT)',
+    repl: 'if(!pt)return;const{browserId:t}=(0,ue.createWorkspaceBrowser)({initialUrl:e});gt(pt,{kind:"browser",browserId:t},Q.FOCUSED_PANE_PLACEMENT)',
   },
   {
     name: "browserpane-marker",
-    find: '{style:u.container,children:[S,_,I]})',
-    repl: '{style:u.container,dataSet:{paseoBrowserId:w,paseoWorkspaceId:f.workspaceId,paseoServerId:f.serverId},children:[S,_,I]})',
+    find: '{style:u.container,children:[v,M,k]}',
+    repl: '{style:u.container,dataSet:{paseoBrowserId:w,paseoWorkspaceId:f.workspaceId,paseoServerId:f.serverId},children:[v,M,k]}',
   },
 ];
 const SIDEBAR_STORAGE_LEGACY = '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e);return{getItem:async e=>{try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok)return await t.text()}catch(t){}return l.getItem(e)},setItem:async(e,t)=>{await l.setItem(e,t);try{await fetch(u(e),{method:"PUT",headers:{"content-type":"application/json"},body:t})}catch(n){}},removeItem:async e=>{await l.removeItem(e);try{await fetch(u(e),{method:"DELETE"})}catch(t){}}}})(o.default))),partialize:';
@@ -347,28 +261,58 @@ const SIDEBAR_STORAGE_REVISIONED = `{name:"sidebar-project-workspace-order",stor
     removeItem:key=>mutate(key,null)
   }
 })(o.default))),partialize:`;
+// 0.8.0's persistence layer moved from createJSONStorage(() => storage) to
+// createValidatedPersistStorage(storage, schema) — same StateStorage shape
+// (getItem/setItem/removeItem), passed directly rather than behind a factory
+// function (see packages/app/src/storage/validated-persist-storage.ts
+// upstream). Reuse the identical custom-storage body, just unwrapped from the
+// old factory call and re-wrapped for the new one, second-arg schema (`j`)
+// left untouched — the pristine 0.8.0 anchor grows a new `pinnedWorkspaceOrder`
+// field, but nothing here reaches into individual field names.
+const SIDEBAR_STORAGE_REVISIONED_080 = (() => {
+  const prefix = '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>';
+  const suffix = "),partialize:";
+  if (!SIDEBAR_STORAGE_REVISIONED.startsWith(prefix) || !SIDEBAR_STORAGE_REVISIONED.endsWith(suffix)) {
+    throw new Error("SIDEBAR_STORAGE_REVISIONED shape changed — update SIDEBAR_STORAGE_REVISIONED_080 by hand");
+  }
+  const iife = SIDEBAR_STORAGE_REVISIONED.slice(prefix.length, SIDEBAR_STORAGE_REVISIONED.length - suffix.length);
+  return `{name:"sidebar-project-workspace-order",storage:(0,p.createValidatedPersistStorage)(${iife},j),partialize:`;
+})();
 // Interval for the revision-checked poll while the tab stays visible. One tiny GET;
 // the store is only touched when the server revision moved (or was never observed).
 const SIDEBAR_POLL_MS = 60000;
 const SIDEBAR_REHYDRATE_REVISIONED_V1 = '"undefined"!=typeof document&&(()=>{const e=()=>f.persist.rehydrate();document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&e()}),document.addEventListener("airlock-ui-state-stale",e)})()';
 const SIDEBAR_REHYDRATE_REVISIONED = '"undefined"!=typeof document&&(()=>{const e=()=>f.persist.rehydrate(),s=()=>g.__airlockUiState?.sync?.("sidebar-project-workspace-order");document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&e()}),document.addEventListener("airlock-ui-state-stale",e),"undefined"!=typeof window&&(window.addEventListener("focus",s),window.addEventListener("online",s),window.setInterval(()=>{"visible"===document.visibilityState&&s()},' + SIDEBAR_POLL_MS + '))})()';
+// 0.8.0's store-handle local is named P, not f (module compiled with more
+// preceding local bindings) — only the receiver of `.persist.rehydrate()` and
+// `f.__airlockUiState?.sync` (unrelated to the store handle) actually changes.
+const SIDEBAR_REHYDRATE_REVISIONED_080 = SIDEBAR_REHYDRATE_REVISIONED.replace(
+  /const e=\(\)=>f\.persist\.rehydrate\(\)/,
+  "const e=()=>P.persist.rehydrate()",
+);
 const SIDEBAR_REHYDRATE_LEGACY = 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));"undefined"!=typeof document&&document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&f.persist.rehydrate()})},3544,[3368,3273,3276]);';
 const SUBAGENT_STREAM_PATCHES = [
   {
     name: "provider-subagent-visible-parent",
-    find: 'return"agent"===l?.kind?[l.agentId]:[]',
-    repl: 'return"agent"===l?.kind?[l.agentId]:"provider_subagent"===l?.kind?[l.parentAgentId]:[]',
+    find: 'return"agent"===s?.kind?[s.agentId]:[]',
+    repl: 'return"agent"===s?.kind?[s.agentId]:"provider_subagent"===s?.kind?[s.parentAgentId]:[]',
   },
   {
-    // Fresh-install appearance defaults: DEFAULT_UI_FONT_SIZE 16 -> 18 and
-    // DEFAULT_CODE_FONT_SIZE 12 -> 14, inside the clamps the settings UI already
-    // enforces (ui 11..24, code 9..22 — left untouched here). Both are per-device
-    // settings persisted under `@paseo:app-settings`, so this moves what a device
-    // gets when it has NEVER saved settings; a device that already stored a value
-    // keeps it and must change it in Settings -> Appearance.
+    // Fresh-install appearance defaults: ui font size -> 18 and code font size
+    // 12 -> 14, inside the clamps the settings UI already enforces (ui 10..21,
+    // code 9..22 — left untouched here). Both are per-device settings persisted
+    // under `@paseo:app-settings`, so this moves what a device gets when it has
+    // NEVER saved settings; a device that already stored a value keeps it and
+    // must change it in Settings -> Appearance.
+    // 0.8.0 note: upstream's own web default (FONT_SIZE.base) moved to 14 (from
+    // whatever it was at 0.2.5) and is now computed via a small function call
+    // (`N(E.isNative)`) rather than a bare numeric literal — this patch replaces
+    // the call with our literal default outright rather than editing the shared
+    // function (which content-font-size also calls). codeFontSize's default
+    // (`B=12`) is still a bare literal, unaffected by that change.
     name: "appearance-default-font-sizes",
-    find: "b=1e4,S=0,h=1e6,_=16,O=11,T=24,F=12,I=9,E=22,N=200",
-    repl: "b=1e4,S=0,h=1e6,_=18,O=11,T=24,F=14,I=9,E=22,N=200",
+    find: "const R=N(E.isNative),P=10,L=21;function D(e){return e?16:_.FONT_SIZE.content}const C=D(E.isNative),v=10,j=21,B=12,w=9,M=22,k=200,U=",
+    repl: "const R=18,P=10,L=21;function D(e){return e?16:_.FONT_SIZE.content}const C=D(E.isNative),v=10,j=21,B=14,w=9,M=22,k=200,U=",
   },
   {
     // Cross-device sidebar order. Upstream persists the project/workspace order in
@@ -382,13 +326,13 @@ const SUBAGENT_STREAM_PATCHES = [
     // Another device advancing the revision makes this tab rehydrate shared truth;
     // an unreachable or pre-v2 backend remains local-only and is never written to
     // unconditionally.
+    // 0.8.0 note: find text updated for createValidatedPersistStorage (see
+    // SIDEBAR_STORAGE_REVISIONED_080 above) — no legacyRepls yet, this is the
+    // first 0.8.0-shaped derivation of this patch, so there is no older
+    // 0.8.0-era fleet shape to migrate from.
     name: "sidebar-order-shared-storage",
-    find: '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>o.default),partialize:',
-    repl: SIDEBAR_STORAGE_REVISIONED,
-    // PR #256 shipped the first adapter without an outbox or write queue. Treat its
-    // exact bytes as a named migration source: the SHA still has to match a known
-    // fleet shape, then this patch upgrades it in place.
-    legacyRepls: [SIDEBAR_STORAGE_LEGACY, SIDEBAR_STORAGE_DURABLE, SIDEBAR_STORAGE_REVISIONED_V1],
+    find: '{name:"sidebar-project-workspace-order",storage:(0,p.createValidatedPersistStorage)(o.default,j),partialize:',
+    repl: SIDEBAR_STORAGE_REVISIONED_080,
   },
   {
     // A second device commonly already has Paseo open. Persist hydrates only once,
@@ -397,13 +341,14 @@ const SUBAGENT_STREAM_PATCHES = [
     // until a full refresh. Rehydrate when a hidden tab becomes visible. Zustand's
     // persist rehydrate updates the existing store (and therefore the rendered
     // sidebar) without restarting Paseo or reloading the page.
+    // 0.8.0 note: gained a pinnedWorkspaceOrder field in the partialize picker
+    // (packages/app adds pinned-workspace ordering), migrate's local renamed
+    // j->y, and the module tail's id/deps changed (3544->3813, more deps) — the
+    // bundle grew, module ids are not stable across versions. No legacyRepls
+    // yet, same reasoning as sidebar-order-shared-storage above.
     name: "sidebar-order-rehydrate-on-visibility",
-    find: 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}))},3544,[3368,3273,3276]);',
-    repl: 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));' + SIDEBAR_REHYDRATE_REVISIONED + '},3544,[3368,3273,3276]);',
-    // The previous revision's listener, with the anchor bytes around it: the patcher
-    // swaps a legacy replacement for the current one verbatim, so a bare expression
-    // here would duplicate the surrounding `partialize:…}));` on an installed bundle.
-    legacyRepls: [SIDEBAR_REHYDRATE_LEGACY, 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));' + SIDEBAR_REHYDRATE_REVISIONED_V1 + '},3544,[3368,3273,3276]);'],
+    find: 'partialize:e=>({projectOrder:e.projectOrder,pinnedWorkspaceOrder:e.pinnedWorkspaceOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:y}))},3813,[1587,3401,3404,3313,3553]);',
+    repl: 'partialize:e=>({projectOrder:e.projectOrder,pinnedWorkspaceOrder:e.pinnedWorkspaceOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:y}));' + SIDEBAR_REHYDRATE_REVISIONED_080 + '},3813,[1587,3401,3404,3313,3553]);',
   },
   {
     // Tooltips are gated on useIsCompactFormFactor() — the xs/sm breakpoint — and a
@@ -440,9 +385,12 @@ const SUBAGENT_STREAM_PATCHES = [
     // pointer:coarse=true, any-pointer:fine=false, hover:none=true — iPadOS does not
     // report the trackpad as a pointing device at all, so `any-pointer` would widen the
     // gate without fixing anything here (2026-09-01).
+    // 0.8.0 note: field order in the destructure changed (isMobileBreakpoint now comes
+    // before isProjectActive) and the combining locals renamed (k=c||we.isNative||l ->
+    // y=p||ke.isNative||u); same three-source OR, different letters.
     name: "project-actions-coarse-pointer",
-    find: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l,',
-    repl: ',isProjectActive:d,onBeginWorkspaceSetup:h,onRemoveProject:b,removeProjectStatus:w}=e,k=c||we.isNative||l||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches,',
+    find: 'overed:p,isMobileBreakpoint:u,isProjectActive:k,onBeginWorkspaceSetup:b,onRemoveProject:v,removeProjectStatus:j}=e,y=p||ke.isNative||u;',
+    repl: 'overed:p,isMobileBreakpoint:u,isProjectActive:k,onBeginWorkspaceSetup:b,onRemoveProject:v,removeProjectStatus:j}=e,y=p||ke.isNative||u||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches;',
   },
   {
     // A tap on a sidebar row does nothing; the SECOND tap navigates. Reported from an
@@ -474,8 +422,8 @@ const SUBAGENT_STREAM_PATCHES = [
     // overscroll are what to watch on a real tablet. Desktop is unaffected outright — a
     // mouse emits no touchmove at all.
     name: "sidebar-tap-not-swallowed-on-web",
-    find: 'c[13]===Symbol.for("react.memo_cache_sentinel")?(B=e=>{const t=R.current;if(!t||p.current||x.current)return;',
-    repl: 'c[13]===Symbol.for("react.memo_cache_sentinel")?(B=o.isWeb?()=>{}:e=>{const t=R.current;if(!t||p.current||x.current)return;',
+    find: 'c[14]===Symbol.for("react.memo_cache_sentinel")?(H=e=>{const t=M.current;if(!t||x.current||P.current)return;',
+    repl: 'c[14]===Symbol.for("react.memo_cache_sentinel")?(H=o.isWeb?()=>{}:e=>{const t=M.current;if(!t||x.current||P.current)return;',
   },
 ];
 const GROUPS = {

@@ -44,6 +44,7 @@ export AIRLOCK_WEBROOT="$TMP/web"
 export AIRLOCK_CONFD="$TMP/confd"
 export AIRLOCK_TS_FQDN="box.example.ts.net"
 export AIRLOCK_DRY_RUN=1
+export AIRLOCK_DRY_RUN_OUTPUT_DIR="$TMP"
 # The remaining host reads, pinned like everything above (measured 2026-08-25:
 # on a box with airlock actually installed, the transcript grew dev-monitor's
 # `pre-ledger artifact(s) found` line and lost `chmod o+x /opt/airlock` —

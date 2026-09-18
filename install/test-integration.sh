@@ -78,7 +78,8 @@ export AIRLOCK_TS_FQDN="box.example.ts.net"
 
 # real orchestrator (dry) — runs each enabled app installer, which writes its fragment
 mkdir -p "$TMP/fullhome"
-if HOME="$TMP/fullhome" bash "$ROOT/install/airlock-install.sh" >"$TMP/orch.log" 2>&1; then ok "orchestrator (dry) ran"; else bad "orchestrator (dry)"; sed 's/^/    /' "$TMP/orch.log"; fi
+if HOME="$TMP/fullhome" AIRLOCK_DRY_RUN_OUTPUT_DIR="$TMP" \
+  bash "$ROOT/install/airlock-install.sh" >"$TMP/orch.log" 2>&1; then ok "orchestrator (dry) ran"; else bad "orchestrator (dry)"; sed 's/^/    /' "$TMP/orch.log"; fi
 
 # Local publishing is validated before any dry-run mutation. These probes keep the
 # paths under a world-traversable temporary root so each failure names the condition

@@ -54,8 +54,8 @@ ok: config valid
 [airlock] wrote nginx fragment: TMP/confd/servers.d/devterm.conf
 [airlock] devterm installed (owner: owner@fixture.dev; fileview=false, orca=false)
 [dry] sudo tailscale serve --bg --https=19910 http://127.0.0.1:19911
-[airlock] rendering nginx site -> /etc/nginx/conf.d/airlock.conf
-[airlock] [dry] render-nginx.sh > /etc/nginx/conf.d/airlock.conf
+[airlock] rendering nginx site -> TMP/airlock.conf
+[airlock] [dry] render-nginx.sh > TMP/airlock.conf
 [dry] sudo nginx -t
 [dry] sudo systemctl reload nginx
 [dry] loginctl enable-linger USER

@@ -514,6 +514,52 @@ def read_receipt(path):
     return data if isinstance(data, dict) else None
 
 
+DOC_ROOT_TAG = re.compile(
+    r"<(?:main|div|article)\b[^>]*\bclass\s*=\s*(?P<q>['\"])(?P<val>[^'\"]*)(?P=q)",
+    re.IGNORECASE)
+BODY_OPEN = re.compile(r"<body(?:\s[^>]*)?>", re.IGNORECASE)
+BODY_CLOSE = re.compile(r"</body\s*>", re.IGNORECASE)
+
+
+def has_doc_root(page):
+    """공용 문서 CSS 가 여백을 거는 루트(class 토큰 `doc`)가 있는가.
+
+    ``doc-quiz`` · ``doc-meta`` 는 다른 토큰이다. ``\\bdoc\\b`` 로 보면 하이픈 앞에서
+    끊겨 그것들까지 루트로 오인한다.
+    """
+    for match in DOC_ROOT_TAG.finditer(page):
+        if "doc" in match.group("val").lower().split():
+            return True
+    return False
+
+
+def ensure_doc_root(page):
+    """공용 문서 CSS 의 본문 루트(``main.doc``)가 없으면 만든다.
+
+    여백은 ``.doc`` 에만 있다. 적재 모델이 body 에 ``max-width`` · ``margin:auto`` 를
+    직접 쓰고 루트를 빼먹으면, ``/read/`` 가 붙인 공용 CSS 의 ``body{margin:0}`` 이
+    그 가운데 정렬을 지워 글이 화면 끝에 붙는다. 저장 시점과 읽기 시점이 같은 함수를
+    쓴다 — 이미 디스크에 있는 파일은 읽기 응답에서, 새로 쓰는 짝은 여기서 고친다.
+    """
+    if not isinstance(page, str) or has_doc_root(page):
+        return page
+    opened = BODY_OPEN.search(page)
+    if not opened:
+        return page
+    start = opened.end()
+    closed = BODY_CLOSE.search(page, start)
+    end = closed.start() if closed else len(page)
+    return page[:start] + '<main class="doc">' + page[start:end] + "</main>" + page[end:]
+
+
+def normalize_rendered_html(html):
+    if html is None:
+        return None
+    if isinstance(html, (bytes, bytearray)):
+        return ensure_doc_root(html.decode("utf-8", "replace")).encode("utf-8")
+    return ensure_doc_root(html)
+
+
 def save(library, relative, blob, video_id=None, state_dir=None, receipt_path=None,
          html=None):
     """검사 → 락 → 원자적 쓰기 → **다시 읽어** 영수증. (영수증|None, 경고 목록)을 돌려준다.
@@ -560,6 +606,7 @@ def save(library, relative, blob, video_id=None, state_dir=None, receipt_path=No
         #    `mutable` 판정도 이 짝의 존재를 본다. 문서만 저장하고 짝을 잊으면, 목록에는
         #    보이는데 공유 버튼만 안 먹는 자료가 조용히 쌓인다.
         if html is not None:
+            html = normalize_rendered_html(html)
             # 🔴 `.md` 는 이미 갈아끼워졌다. 여기서 예외를 올리면 "실패하면 대상 파일은
             #    손대지 않는다" 가 두 번째로 깨진다 — 문서는 저장됐는데 exit 2 다.
             #    짝이 없으면 그 문서는 공유·보관이 안 되므로 그것을 **경고로 말한다.**

@@ -181,6 +181,8 @@
                     border-radius: 999px; background: var(--airlock-primary); color: #fff;
                     font: inherit; font-size: .82rem; font-weight: 650; cursor: pointer; }
   .home-edit-done[hidden] { display: none; }
+  :root[data-home-order-owner="1"] .app { -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none; -webkit-user-drag: none; }
   :root[data-home-edit="1"] .app { animation: home-icon-wiggle .16s ease-in-out infinite alternate;
                                     cursor: grab; touch-action: none; -webkit-user-drag: none; }
   :root[data-home-edit="1"] .app:hover .ic { transform: none; }
@@ -579,6 +581,7 @@
           aria-expanded="false" aria-controls="launcher-find" hidden>
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.3"></circle><path d="m16 16 4.2 4.2"></path></svg>
   </button>
+  <button type="button" class="home-edit-done" id="home-edit-open" aria-controls="secs" hidden>편집</button>
   <button type="button" class="home-edit-done" id="home-edit-done" hidden>완료</button>
   <!-- Settings sheet. The two section shells are static so their order is
        readable here rather than assembled in script; harness rows are drawn from
@@ -785,6 +788,7 @@ function airlockPersonalTier(entry) {
 }
 
 const AIRLOCK_COMPANY_IDS = new Set();
+const AIRLOCK_INSTALLED_COMPANY_IDS = new Set();
 
 function airlockTierMark(kind) {
   const mark = document.createElement("span");
@@ -795,14 +799,24 @@ function airlockTierMark(kind) {
 }
 
 // Company packages use the same explicit package table as personal packages.
-// The owner-only catalog response is therefore the only source that can refine
-// an explicit package's square into the company dot. Keep the catalog names in
-// memory so a later launcher redraw preserves that distinction.
+// Keep the installed, locally-persisted origin apart from readable catalog rows:
+// it restores an approved tile's dot after Git credentials disappear but cannot
+// create a company tab row or an install action.
+function airlockSetInstalledCompanyIds(installed) {
+  AIRLOCK_INSTALLED_COMPANY_IDS.clear();
+  for (const row of Array.isArray(installed) ? installed : []) {
+    if (row && row.tier === "company" && typeof row.id === "string") {
+      AIRLOCK_INSTALLED_COMPANY_IDS.add(row.id);
+    }
+  }
+}
+
 function airlockApplyCompanyCatalog(rows) {
   AIRLOCK_COMPANY_IDS.clear();
   for (const row of Array.isArray(rows) ? rows : []) {
     if (row && typeof row.id === "string") AIRLOCK_COMPANY_IDS.add(row.id);
   }
+  for (const id of AIRLOCK_INSTALLED_COMPANY_IDS) AIRLOCK_COMPANY_IDS.add(id);
   for (const tile of document.querySelectorAll(".app[data-app-name]")) {
     const label = tile.querySelector(".lb");
     if (!label) continue;
@@ -1193,28 +1207,33 @@ function airlockHarnessRunLine(state) {
     else filterApps();
   });
 
-  // Long press is the only entrance to edit mode. Pointer events give mouse and
+  // Long press and the owner edit button enter edit mode. Pointer events give mouse and
   // touch one implementation, while FLIP keeps the non-dragged icons moving into
   // their new slots instead of jumping. The × badge calls the app-store disable
   // API; it never turns a configuration change into an in-page DOM-only deletion.
   if (me && me.role === "owner") {
     const done = document.getElementById("home-edit-done");
+    const edit = document.getElementById("home-edit-open");
     const root = document.documentElement;
+    root.dataset.homeOrderOwner = "1";
+    edit.hidden = false;
     let editing = false;
     let drag = null, ghost = null, pressTimer = null, pointerId = null;
-    let pressPointerId = null, pressX = 0, pressY = 0;
+    let pressPointerId = null, pressX = 0, pressY = 0, pressSlop = 6;
 
     function setEditing(on) {
       editing = on;
       root.dataset.homeEdit = on ? "1" : "0";
       done.hidden = !on;
+      edit.hidden = on;
     }
     function appsIn(grid) { return Array.from(grid.querySelectorAll(":scope > .app")); }
     function moveTo(target) {
       if (!drag || !target || target === drag || target.parentElement !== drag.parentElement) return;
       const grid = drag.parentElement;
-      const before = new Map(appsIn(grid).map(node => [node, node.getBoundingClientRect()]));
-      grid.insertBefore(drag, target);
+      const nodes = appsIn(grid);
+      const before = new Map(nodes.map(node => [node, node.getBoundingClientRect()]));
+      grid.insertBefore(drag, nodes.indexOf(drag) < nodes.indexOf(target) ? target.nextSibling : target);
       for (const node of appsIn(grid)) {
         if (node === drag) continue;
         const from = before.get(node), to = node.getBoundingClientRect();
@@ -1240,12 +1259,14 @@ function airlockHarnessRunLine(state) {
         if (value && Array.isArray(value.order)) homeOrder = value.order;
       } catch (_) {}
     }
-    function stop() {
+    function stop(event) {
+      if (event && event.pointerId !== (drag ? pointerId : pressPointerId)) return;
       if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
       pressPointerId = null;
       if (!drag) return;
       if (ghost) ghost.remove();
       drag.classList.remove("home-dragging");
+      if (drag.hasPointerCapture(pointerId)) drag.releasePointerCapture(pointerId);
       drag = ghost = null;
       pointerId = null;
       persist();
@@ -1262,22 +1283,25 @@ function airlockHarnessRunLine(state) {
       node.setPointerCapture(event.pointerId);
     }
     secs.addEventListener("pointerdown", event => {
+      if (!event.isPrimary || event.button !== 0 || drag || pressTimer) return;
       if (event.target.closest(".app-disable")) return;
       const node = event.target.closest(".app");
       if (!node || !secs.contains(node)) return;
-      event.preventDefault();
-      if (editing) { start(node, event); return; }
+      if (editing) { event.preventDefault(); start(node, event); return; }
       pressPointerId = event.pointerId;
       pressX = event.clientX; pressY = event.clientY;
+      pressSlop = event.pointerType === "mouse" ? 6 : 16;
       pressTimer = setTimeout(() => {
         pressTimer = null;
-        setEditing(true); start(node, event);
+        // touch-action is fixed at pointerdown. Lift before dragging so the next
+        // gesture starts with edit-mode touch-action:none and cannot become a scroll.
+        setEditing(true);
       }, 500);
     });
-    secs.addEventListener("pointermove", event => {
+    document.addEventListener("pointermove", event => {
       if (!drag) {
         if (pressTimer && event.pointerId === pressPointerId
-            && Math.hypot(event.clientX - pressX, event.clientY - pressY) > 6) {
+            && Math.hypot(event.clientX - pressX, event.clientY - pressY) > pressSlop) {
           clearTimeout(pressTimer); pressTimer = null; pressPointerId = null;
         }
         return;
@@ -1288,10 +1312,13 @@ function airlockHarnessRunLine(state) {
       const target = document.elementFromPoint(event.clientX, event.clientY);
       moveTo(target && target.closest(".app"));
     });
-    secs.addEventListener("pointerup", stop);
-    secs.addEventListener("pointercancel", stop);
+    document.addEventListener("pointerup", stop);
+    document.addEventListener("pointercancel", stop);
+    secs.addEventListener("lostpointercapture", stop);
+    window.addEventListener("blur", () => stop());
+    document.addEventListener("visibilitychange", () => { if (document.hidden) stop(); });
     secs.addEventListener("pointerleave", event => {
-      if (!drag && pressTimer && event.buttons) {
+      if (!drag && pressTimer && event.pointerId === pressPointerId && event.buttons) {
         clearTimeout(pressTimer); pressTimer = null; pressPointerId = null;
       }
     });
@@ -1315,8 +1342,15 @@ function airlockHarnessRunLine(state) {
       }
       if (editing && event.target.closest(".app")) event.preventDefault();
     }, true);
-    secs.addEventListener("dragstart", event => { if (editing) event.preventDefault(); });
-    done.addEventListener("click", () => setEditing(false));
+    secs.addEventListener("contextmenu", event => {
+      if (event.target.closest(".app")) { event.preventDefault(); stop(); }
+    });
+    secs.addEventListener("dragstart", event => { if (event.target.closest(".app")) event.preventDefault(); });
+    edit.addEventListener("click", () => { stop(); setEditing(true); done.focus(); });
+    done.addEventListener("click", () => { stop(); setEditing(false); edit.focus(); });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && editing) { stop(); setEditing(false); edit.focus(); }
+    });
   }
 })();
 
@@ -1325,6 +1359,7 @@ function airlockHarnessRunLine(state) {
 // Cross-origin links (separate-port tools, external=true) are left alone.
 if (("standalone" in navigator) && navigator.standalone) {
   document.addEventListener("click", function (e) {
+    if (e.defaultPrevented) return;
     const a = e.target.closest && e.target.closest("a[href]");
     if (!a || a.target === "_blank") return;
     let u; try { u = new URL(a.href, location.href); } catch (_) { return; }
@@ -1553,6 +1588,7 @@ if (("standalone" in navigator) && navigator.standalone) {
     const installed = Array.isArray(data.installed) ? data.installed : [];
     const available = Array.isArray(data.public) ? data.public : [];
     const company = Array.isArray(data.company) ? data.company : [];
+    airlockSetInstalledCompanyIds(installed);
     airlockApplyCompanyCatalog(company);
     installedEl.textContent = "";
     publicEl.textContent = "";

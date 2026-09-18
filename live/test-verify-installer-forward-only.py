@@ -169,6 +169,21 @@ class VerifyInstallerForwardOnlyTest(unittest.TestCase):
         self.assertEqual(result(evaluation, "AC-AST-I4").verdict, "UNMEASURED")
         self.assertIn("source=PASS live=UNMEASURED", "\n".join(evaluation.layers))
 
+    def test_no_argument_mode_binds_fixture_rows_to_verifier_checkout(self):
+        run = subprocess.run([sys.executable, str(SCRIPT)], check=False,
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        rows = [line for line in run.stdout.splitlines() if line.startswith("AC-AST-")]
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all("verdict: PASS" in line for line in rows))
+        root_ref = subprocess.run(
+            ["git", "-C", str(SCRIPT.parent.parent), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        expected_evidence = f"evidence: live/verify-installer-forward-only.py@{root_ref}"
+        self.assertTrue(all("signal: fixture" in line for line in rows))
+        self.assertTrue(all(expected_evidence in line for line in rows))
+
     def test_first_200_without_observation_source_is_unmeasured(self):
         live, live_sha = live_bundle(self.root / "live", health=False)
         evaluation = verify.evaluate(self.inputs(

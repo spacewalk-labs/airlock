@@ -84,6 +84,25 @@ class CompanyCatalogTest(unittest.TestCase):
             + json.dumps(str(self.base / "missing")) + "\n")
         self.assertEqual(CATALOG.list_catalog(self.config), [])
 
+    def test_pinned_stage_marks_only_already_approved_company_packages(self) -> None:
+        """This local provenance check never fetches or exposes a catalog row."""
+        pinned = (self.base / "stage" / "packages" / "widget" /
+                  f"{self.commit}-{self.expected}")
+        personal = self.base / "personal" / "widget"
+        self.config.write_text(self.config.read_text() + (
+            "[apps.widget]\n[packages.widget]\npath = " + json.dumps(str(pinned)) + "\n"
+            "[apps.personal]\n[packages.personal]\npath = " + json.dumps(str(personal)) + "\n"
+            "[apps.wrong-id]\n[packages.wrong-id]\npath = "
+            + json.dumps(str(self.base / "stage" / "packages" / "widget" /
+                             f"{self.commit}-{self.expected}")) + "\n"))
+        original_git = CATALOG._git
+        CATALOG._git = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("provenance must not fetch the catalog"))
+        try:
+            self.assertEqual(CATALOG.installed_company_ids(self.config), {"widget"})
+        finally:
+            CATALOG._git = original_git
+
     def test_digest_mismatch_leaves_no_package_stage(self) -> None:
         row = dict(self.row, tree_digest="0" * 64)
         with self.assertRaisesRegex(CATALOG.CatalogError, "digest differs") as raised:

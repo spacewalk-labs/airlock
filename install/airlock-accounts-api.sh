@@ -67,6 +67,19 @@ PANEL_STYLE_DIR="$ROOT/install/accounts-panel"
 # absence with 404/500 rather than a page. The fixture measures that layout end to end.
 FLEET_STORE="${AIRLOCK_HUB_FLEET_STORE-}"
 FLEET_STORE_URL="${AIRLOCK_HUB_FLEET_STORE_URL-}"
+# hub.xai turns on the OpenCode xAI login. The service reads a binary path, not a flag,
+# so the path is resolved here, once, where a missing CLI can still fail the install
+# loudly instead of leaving a panel that silently never shows the row.
+OPENCODE_BIN=""
+if [ "${AIRLOCK_HUB_XAI:-false}" = true ]; then
+  OPENCODE_BIN="$(PATH="$HOME/.local/bin:$PATH" command -v opencode || true)"
+  [ -n "$OPENCODE_BIN" ] \
+    || die "hub.xai = true but the opencode CLI was not found (PATH or ~/.local/bin)"
+fi
+# agy is optional and per box: found = the panel shows its quota, absent = the row says
+# so. The unit gets an absolute path because a user unit's PATH does not include
+# ~/.local/bin, where the agy installer puts it.
+AGY_BIN="$(PATH="$HOME/.local/bin:$PATH" command -v agy || true)"
 
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] render platform account surface unit into $UNIT_DIR (port $ACCOUNTS_PORT)"
@@ -89,6 +102,9 @@ if ! sed -e "s|@AIRLOCK_ROOT@|$(escape "$ROOT")|g" \
           -e "s|@PANEL_DIR@|$(escape "$PANEL_DIR")|g" \
           -e "s|@PANEL_STYLE_DIR@|$(escape "$PANEL_STYLE_DIR")|g" \
           -e "s|@FLEET_STORE_URL@|$(escape "$FLEET_STORE_URL")|g" \
+          -e "s|@OPENCODE_BIN@|$(escape "$OPENCODE_BIN")|g" \
+          -e "s|@AGY_BIN@|$(escape "$AGY_BIN")|g" \
+          -e "s|@AGY_USAGE_BIN@|$(escape "$ROOT/bin/airlock-agy-usage")|g" \
           "$HERE/systemd/$SERVICE.in" > "$tmp"; then
   rm -f "$tmp"
   die "could not render $SERVICE"

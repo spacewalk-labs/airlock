@@ -1,11 +1,16 @@
-// [paseo-process-group] idempotent, all-or-nothing patcher. Layers on top of
-// orphan-process-guard.mjs — apply that one FIRST (this patch anchors on text it
-// introduces; if it is absent this exits 20 and skips, which is the correct
-// degradation rather than a half-fix).
+// [paseo-process-group] idempotent, all-or-nothing patcher.
 //
 //   node orphan-process-group.mjs claude-agent    <.../providers/claude/agent.js>
 //   node orphan-process-group.mjs claude-query    <.../providers/claude/query.js>
 //   node orphan-process-group.mjs codex-transport <.../providers/codex/app-server-transport.js>
+//
+// claude-agent layers on top of orphan-process-guard.mjs — apply that one FIRST
+// (its anchor is text that patch introduces; if absent this exits 20 and skips,
+// the correct degradation rather than a half-fix). claude-query and codex-transport
+// anchor on unrelated, unpatched upstream text and do not need it first — codex has
+// no orphan-process-guard counterpart any more (0.8.0 fixed that leak upstream; see
+// the header of orphan-process-guard.mjs), and this mode closes a different gap
+// (reaching an already-exited leader's MCP children) that fix does not touch.
 //
 // Problem this closes (the one orphan-process-guard deliberately left open):
 // when the agent LEADER exits before we terminate it, `terminateWithTreeKill`
@@ -136,19 +141,23 @@ const CQ_NEW_SPAWN = L(
 
 // -------------------------------------------- codex / app-server-transport ---
 
+// 0.8.0 changed this from "warn and return" to "warn on the SIGKILL escalation
+// itself (onForceSignal) and throw if the process still hasn't died" -- the sweep
+// has to run BEFORE that throw, or the group is never reached on the failure path.
 const KT_OLD_DISPOSE = L(
     '        if (result === "kill-timeout") {',
-    '            this.logger.warn({ timeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS }, "Codex app-server did not report exit after SIGKILL");',
+    '            throw new Error("Codex app-server did not report exit after SIGKILL");',
     '        }',
     '    }',
 );
 const KT_NEW_DISPOSE = L(
-    '        if (result === "kill-timeout") {',
-    '            this.logger.warn({ timeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS }, "Codex app-server did not report exit after SIGKILL");',
-    '        }',
     '        // [paseo-process-group] The app-server is already spawned detached upstream, but',
     '        // nothing ever killed its group — so when it exited first, its children survived.',
+    '        // Sweep unconditionally, before the kill-timeout throw below would otherwise skip it.',
     '        this.sweepProcessGroup(this.child ? this.child.pid : undefined, "dispose");',
+    '        if (result === "kill-timeout") {',
+    '            throw new Error("Codex app-server did not report exit after SIGKILL");',
+    '        }',
     '    }',
     SWEEP_FN("    ", "sweepProcessGroup", '"codex"'),
 );

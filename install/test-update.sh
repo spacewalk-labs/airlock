@@ -35,12 +35,33 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 UPDATE="$ROOT/bin/airlock-update"
 
+bootstrap_pins_current=1
+for bootstrap_tool in bin/airlock-ledger install/lib.sh install/preflight.sh; do
+  bootstrap_digest="$(sha256sum "$ROOT/$bootstrap_tool" | awk '{print $1}')"
+  grep -q "$bootstrap_digest" "$UPDATE" || bootstrap_pins_current=0
+done
+
 pass=0 fail=0
 ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
 bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
 
+[ "$bootstrap_pins_current" = 1 ] \
+  && ok "stream bootstrap pins the exact lease and escape tools shipped with this updater" \
+  || bad "stream bootstrap tool digests drifted from this updater"
+
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
+chmod 700 "$scratch"
+printf '%s\n' 'airlock.live-box-fixture/v1' > "$scratch/.airlock-live-box-fixture-v1"
+chmod 600 "$scratch/.airlock-live-box-fixture-v1"
+export AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR="$scratch/airlock-live-box"
+mkdir -p "$scratch/home" "$scratch/state"
+export HOME="$scratch/home" AIRLOCK_STATE_DIR="$scratch/state"
+# This suite exercises update semantics, not the cgroup transport (that has its own
+# focused fixture).  Pin a neutral cgroup so the host running the test cannot make
+# every case escape through the suite's unrelated systemd-run shims.
+printf '0::/fixture.scope\n' >"$scratch/cgroup"
+export AIRLOCK_SELFKILL_CGROUP_FILE="$scratch/cgroup"
 export GIT_CONFIG_GLOBAL="$scratch/gitconfig"   # never read the runner's identity
 export GIT_CONFIG_NOSYSTEM=1
 git config -f "$GIT_CONFIG_GLOBAL" user.name  airlock-test
@@ -1473,6 +1494,19 @@ fixture_status; no_rollback_status=$?
   || bad "negative control: a rollback that never ran looked green (status rc=$no_rollback_status)"
 [ "$(cat "$INSTALL_LOG")" = new ] && ok "negative control: the old installer has not run yet" \
   || bad "negative control: rollback ran before it was requested"
+recovery_tools_error=""
+for recovery_tool in bin/airlock-ledger install/lib.sh install/preflight.sh; do
+  recovery_file="$BOX/.git/airlock-update-rollback/lease-tools/$recovery_tool"
+  if [ ! -f "$recovery_file" ] || [ -L "$recovery_file" ] \
+     || [ "$(sha256sum "$recovery_file" 2>/dev/null | awk '{print $1}')" != \
+          "$(cat "$recovery_file.sha256" 2>/dev/null)" ]; then
+    recovery_tools_error="$recovery_tool"
+    break
+  fi
+done
+[ -z "$recovery_tools_error" ] \
+  && ok "rollback capsule preserves exact lease, escape, and preflight tools" \
+  || bad "rollback capsule tool is missing or changed: $recovery_tools_error"
 rollback_out="$(run_rollback)"; rollback_rc=$?
 [ "$rollback_rc" = 0 ] && ok "one rollback command restores and verifies the failed update" \
   || bad "rollback exited $rollback_rc: $rollback_out"

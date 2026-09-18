@@ -1,21 +1,18 @@
 // [paseo-orphan-guard] idempotent, all-or-nothing patcher (install.sh runs it right
-// after the pinned npm install). Two independent targets, one per invocation:
+// after the pinned npm install).
 //
 //   node orphan-process-guard.mjs claude <.../providers/claude/agent.js>
-//   node orphan-process-guard.mjs codex  <.../providers/codex-app-server-agent.js>
 //
-// Problem: paseo leaks the agent processes it spawns. Upstream tracks exactly one
-// live child per session (`this.childProcess` / `this.client`) and kills it in
-// close() behind an `if (handle)` guard. Three ways a running process escapes:
+// Problem: the claude provider tracks exactly one live child per session
+// (`this.childProcess`) and kills it in close() behind an `if (handle)` guard.
+// Three ways a running process escapes:
 //
-//   (1) close() sets `closed = true` and nulls the handle -- but neither
-//       ensureQuery() (claude) nor connect() (codex) checks that flag. Any
+//   (1) close() sets `closed = true` -- but ensureQuery() does not check that flag
+//       (only startTurn()/startQueryPump() do, confirmed against 0.8.0 source). Any
 //       control-plane call that lands during or after close (setMode, setModel,
-//       listCommands, revertFiles, ensureFreshQuery / a codex reconnect) spawns a
-//       REPLACEMENT process onto the already-closed session. Nothing will ever
-//       close that session again, so the process runs until the box is rebooted.
-//       The same race exists for the in-flight spawn: onChildProcess can fire
-//       after close() has already walked past the kill block.
+//       listCommands, revertFiles, ensureFreshQuery) spawns a REPLACEMENT process
+//       onto the already-closed session. Nothing will ever close that session
+//       again, so the process runs until the box is rebooted.
 //   (2) a second spawn overwrites the single handle; the first process is dropped
 //       on the floor while the handle still looks healthy (so a null-check fix
 //       does not catch this one).
@@ -24,23 +21,39 @@
 //       which the daemon's info-level logger never emits. close() reports success
 //       having killed nothing.
 //
-// Fix (both providers, same shape):
+// Fix:
 //   - ownership becomes a Set of live handles, not one slot; every handle in it is
-//     terminated at close and at query restart / reconnect,
-//   - a closed-session gate on the spawn entry point (ensureQuery / connect) so a
-//     dead session cannot give birth,
+//     terminated at close and at query restart,
+//   - a closed-session gate on the spawn entry point (ensureQuery) so a dead
+//     session cannot give birth,
 //   - a late-arrival path: a child that shows up after close is terminated on the
 //     spot instead of being stored,
 //   - logger.warn (level 40, actually emitted) on every one of those branches,
 //     including "there was nothing to kill" -- so the next occurrence is visible
 //     instead of inferred.
 //
+// codex is intentionally NOT covered here anymore. Re-checked against 0.8.0
+// (`codex-app-server-agent.js`): upstream rewrote CodexAppServerSession's
+// connect()/close() lifecycle since the 0.2.5 fork this patch was ported from --
+// connect() now gates on `this.closed` at three points (entry, post-spawn-before-
+// adopting the client, post-setup-before-marking-connected), de-duplicates
+// concurrent connect() calls through a single shared `connectionPromise` (so two
+// overlapping callers cannot each spawn their own app-server), and every failure
+// branch disposes the client it identity-checks against `this.client` before
+// deciding whether it is still the live one. That is the same fix this patch
+// makes for claude, already done upstream. Re-adding it would be dead code
+// shadowing a fix that already shipped -- same triage call as Fable 5.1 /
+// credential-preservation / finish-notification-queue in the 0.2.5 -> 0.8.0 bundle
+// bump. orphan-process-group.mjs's `codex-transport` mode is unaffected: it closes
+// a different gap (MCP grandchildren of an already-exited leader) that upstream's
+// session-lifecycle rewrite does not touch.
+//
 // Out of scope on purpose: `detached: true` + process-group kill. It would also
 // cover MCP children orphaned when the leader exits first (terminateWithTreeKill
 // returns "already-exited" and by then the descendants are reparented to PID 1),
 // but it changes the signal/session semantics of the provider spawn and belongs in
 // its own change with its own observation window. This patch logs that case loudly
-// instead of silently accepting it.
+// instead of silently accepting it. (orphan-process-group.mjs is that change.)
 //
 // Contract: argv[2] = mode, argv[3] = target file. One stdout line + an exit code.
 //   exit 10 = already patched (sentinel) -> skip
@@ -52,8 +65,8 @@ import fs from "node:fs";
 
 const MODE = process.argv[2];
 const F = process.argv[3];
-if (!MODE || !F || (MODE !== "claude" && MODE !== "codex")) {
-    console.error("usage: orphan-process-guard.mjs <claude|codex> <agent.js>");
+if (!MODE || !F || MODE !== "claude") {
+    console.error("usage: orphan-process-guard.mjs claude <agent.js>");
     process.exit(1);
 }
 
@@ -198,192 +211,49 @@ const C_OLD_RESTART_KILL = L(
     '            // Tree-kill the old process tree now that the SDK has cleaned up.',
     '            // If we skip this, MCP children of the previous claude process can',
     '            // survive as orphans when the session spawns a replacement query.',
-    '            if (this.childProcess) {',
-    '                await terminateWithTreeKill(this.childProcess, {',
+    '            if (retiredChild) {',
+    '                await terminateWithTreeKill(retiredChild, {',
     '                    gracefulTimeoutMs: 2000,',
     '                    forceTimeoutMs: 2000,',
     '                }).catch(() => {',
     '                    /* process may already be dead */',
     '                });',
-    '                this.childProcess = null;',
     '            }',
 );
 const C_NEW_RESTART_KILL = L(
     '            // [paseo-orphan-guard] Same termination path as close(): every live handle,',
-    '            // not just the newest one. MCP children of a previous claude process used to',
-    '            // survive here whenever the handle had been overwritten.',
+    '            // not just the one retired here. MCP children of a previous claude process',
+    '            // used to survive whenever the handle had been overwritten before restart.',
     '            await this.terminateLiveChildren("query_restart");',
 );
 
 const C_OLD_ONCHILD = L(
     '            onChildProcess: (child) => {',
     '                this.childProcess = child;',
+    '                child.once("exit", (code, signal) => this.handleRuntimeExit(child, code, signal));',
     '            },',
 );
 const C_NEW_ONCHILD = L(
     '            onChildProcess: (child) => {',
-    '                this.adoptSpawnedChild(child); // [paseo-orphan-guard]',
+    '                // [paseo-orphan-guard] Register upstream\'s own exit-triggered turn-failure',
+    '                // handler FIRST -- adoptSpawnedChild\'s own exit listener also nulls',
+    '                // this.childProcess, and handleRuntimeExit\'s guard',
+    '                // (`this.childProcess !== child`) would otherwise see that null and skip',
+    '                // reporting the crash.',
+    '                child.once("exit", (code, signal) => this.handleRuntimeExit(child, code, signal));',
+    '                this.adoptSpawnedChild(child);',
     '            },',
-);
-
-// ----------------------------------------------------------------- codex ----
-
-const K_OLD_FIELDS = L(
-    '        this.currentThreadId = null;',
-    '        this.currentTurnId = null;',
-    '        this.client = null;',
-    '        this.subscribers = new Set();',
-);
-const K_NEW_FIELDS = L(
-    '        this.currentThreadId = null;',
-    '        this.currentTurnId = null;',
-    '        this.client = null;',
-    '        this.sessionClosed = false; // [paseo-orphan-guard]',
-    '        this.liveAppServerClients = new Set(); // [paseo-orphan-guard]',
-    '        this.subscribers = new Set();',
-);
-
-const K_HELPERS = L(
-    '    // [paseo-orphan-guard] Same defect as the claude provider: one `this.client` slot,',
-    '    // an `if (this.client)` guard in close() with no else branch, and no closed-session',
-    '    // gate on connect() — so an app-server spawned during or after close outlives the',
-    '    // session with nobody holding its handle.',
-    '    trackAppServerClient(client) {',
-    '        if (!this.liveAppServerClients) {',
-    '            this.liveAppServerClients = new Set();',
-    '        }',
-    '        this.liveAppServerClients.add(client);',
-    '    }',
-    '    async disposeLiveAppServerClients(reason) {',
-    '        const targets = new Set(this.liveAppServerClients || []);',
-    '        if (this.client) {',
-    '            targets.add(this.client);',
-    '        }',
-    '        this.liveAppServerClients = new Set();',
-    '        if (targets.size === 0) {',
-    '            // Not a warning: a session that was created but never connected has nothing',
-    '            // to dispose, and that is the common case (close() is idempotent too).',
-    '            return;',
-    '        }',
-    '        if (targets.size > 1) {',
-    '            this.logger.warn({ agentId: this.agentId, provider: "codex", reason, count: targets.size }, "[paseo-orphan-guard] more than one live app-server client at disposal");',
-    '        }',
-    '        for (const client of targets) {',
-    '            try {',
-    '                await client.dispose();',
-    '            }',
-    '            catch (err) {',
-    '                this.logger.warn({ err, agentId: this.agentId, provider: "codex", reason }, "[paseo-orphan-guard] app-server dispose failed — the process tree may survive");',
-    '            }',
-    '        }',
-    '    }',
-);
-
-const K_OLD_CONNECT = L(
-    '    async connect() {',
-    '        if (this.connected)',
-    '            return;',
-    '        const child = await this.spawnAppServer();',
-    '        this.client = new CodexAppServerClient(child, this.logger, () => this.traceContext());',
-    '        this.client.setNotificationHandler((method, params) => this.handleNotification(method, params));',
-);
-const K_NEW_CONNECT = L(
-    K_HELPERS,
-    '    async connect() {',
-    '        if (this.connected)',
-    '            return;',
-    '        // [paseo-orphan-guard] A closed session must not spawn an app-server.',
-    '        if (this.sessionClosed) {',
-    '            this.logger.warn({ agentId: this.agentId, provider: "codex" }, "[paseo-orphan-guard] connect() on a closed session — refusing to spawn an app-server");',
-    '            throw new Error("Codex session is closed");',
-    '        }',
-    '        // A stale client here means a previous connect left a live app-server behind',
-    '        // (connected === false but the handle is set). Dispose it before replacing it.',
-    '        if (this.client || (this.liveAppServerClients && this.liveAppServerClients.size > 0)) {',
-    '            this.logger.warn({ agentId: this.agentId, provider: "codex" }, "[paseo-orphan-guard] reconnecting over a live app-server client — disposing the previous one");',
-    '            await this.disposeLiveAppServerClients("reconnect");',
-    '            this.client = null;',
-    '        }',
-    '        const child = await this.spawnAppServer();',
-    '        this.client = new CodexAppServerClient(child, this.logger, () => this.traceContext());',
-    '        this.trackAppServerClient(this.client);',
-    '        // The spawn above is awaited, so close() can have run in the meantime.',
-    '        if (this.sessionClosed) {',
-    '            this.logger.warn({ agentId: this.agentId, provider: "codex", pid: child ? child.pid : undefined }, "[paseo-orphan-guard] app-server arrived after close — disposing it immediately");',
-    '            await this.disposeLiveAppServerClients("late_arrival");',
-    '            this.client = null;',
-    '            throw new Error("Codex session is closed");',
-    '        }',
-    '        this.client.setNotificationHandler((method, params) => this.handleNotification(method, params));',
-);
-
-// connect() cleans up after a failed spawn by calling its own close(), which now
-// raises the closed flag. Without this edit a single transient spawn failure would
-// brick the session: every later connect() would refuse. Restore the flag there —
-// that path is internal cleanup, not a session close. (The late-arrival throw added
-// above is raised before this try block, so it does not pass through here.)
-const K_OLD_CONNECT_FAIL = L(
-    '        catch (error) {',
-    '            try {',
-    '                await this.close();',
-    '            }',
-    '            catch (closeError) {',
-    '                this.logger.warn({ err: closeError, connectError: error }, "Failed to close Codex app-server after connection failure");',
-    '            }',
-    '            throw error;',
-    '        }',
-);
-const K_NEW_CONNECT_FAIL = L(
-    '        catch (error) {',
-    '            try {',
-    '                await this.close();',
-    '            }',
-    '            catch (closeError) {',
-    '                this.logger.warn({ err: closeError, connectError: error }, "Failed to close Codex app-server after connection failure");',
-    '            }',
-    '            // [paseo-orphan-guard] The close() above is cleanup after a failed spawn, not',
-    '            // a session close. Leaving the flag raised would refuse every later retry.',
-    '            this.sessionClosed = false;',
-    '            throw error;',
-    '        }',
-);
-
-const K_OLD_CLOSE = L(
-    '        if (this.client) {',
-    '            await this.client.dispose();',
-    '        }',
-    '        this.client = null;',
-    '        this.connected = false;',
-    '        this.currentThreadId = null;',
-    '        this.currentTurnId = null;',
-);
-const K_NEW_CLOSE = L(
-    '        // [paseo-orphan-guard] Flag first (connect() may be mid-spawn), then dispose every',
-    '        // live app-server client — not just the one currently in this.client.',
-    '        this.sessionClosed = true;',
-    '        await this.disposeLiveAppServerClients("session_close");',
-    '        this.client = null;',
-    '        this.connected = false;',
-    '        this.currentThreadId = null;',
-    '        this.currentTurnId = null;',
 );
 
 // ------------------------------------------------------------------ apply ---
 
-const EDITS = MODE === "claude"
-    ? [
-        ["fields", C_OLD_FIELDS, C_NEW_FIELDS],
-        ["close-kill", C_OLD_CLOSE_KILL, C_NEW_CLOSE_KILL],
-        ["ensure-query", C_OLD_ENSURE, C_NEW_ENSURE],
-        ["restart-kill", C_OLD_RESTART_KILL, C_NEW_RESTART_KILL],
-        ["on-child", C_OLD_ONCHILD, C_NEW_ONCHILD],
-    ]
-    : [
-        ["fields", K_OLD_FIELDS, K_NEW_FIELDS],
-        ["connect", K_OLD_CONNECT, K_NEW_CONNECT],
-        ["connect-failure", K_OLD_CONNECT_FAIL, K_NEW_CONNECT_FAIL],
-        ["close", K_OLD_CLOSE, K_NEW_CLOSE],
-    ];
+const EDITS = [
+    ["fields", C_OLD_FIELDS, C_NEW_FIELDS],
+    ["close-kill", C_OLD_CLOSE_KILL, C_NEW_CLOSE_KILL],
+    ["ensure-query", C_OLD_ENSURE, C_NEW_ENSURE],
+    ["restart-kill", C_OLD_RESTART_KILL, C_NEW_RESTART_KILL],
+    ["on-child", C_OLD_ONCHILD, C_NEW_ONCHILD],
+];
 
 // all-or-nothing: every anchor must be present AND unique. A duplicated anchor
 // means String.replace would silently pick the first one — that is a drift signal,

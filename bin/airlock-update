@@ -42,6 +42,11 @@ set -uo pipefail
 
 airlock_update_program() {
 main() {
+  # Internal state never comes from an ambient caller.  The capsule wrapper writes
+  # its fixed root after the function definition; an ordinary file invocation
+  # scrubs AIRLOCK_UPDATE_CAPSULE_ROOT immediately before calling this function.
+  unset AIRLOCK_UPDATE_KEEPER_PID
+  trap cleanup_update_capsule EXIT
   # Managed authority is never inherited from a caller.  U1 derives it only from
   # the fixed root-owned anchor; scrub both the established consumer/projector
   # variables and future update-channel lookalikes before any mode decision.
@@ -65,7 +70,10 @@ main() {
   # this has to recognise were installed by code that no longer exists here.
   local MACHINE_MARKER=/opt/airlock/hub
 
+  local -a original_argv=("$@")
   local dry=0 do_install=1 rollback=0 machine="" from_unknown=0 unknown_hint=0
+  local managed_release_source="" managed_snapshot_digest=""
+  local managed_refresh_source="" managed_status=0
   while [ $# -gt 0 ]; do
     case "$1" in
     --dry-run)    dry=1 ;;
@@ -75,6 +83,27 @@ main() {
       --rollback)   rollback=1 ;;
       --machine)    shift; [ $# -gt 0 ] || die "--machine 뒤에 머신 이름이 필요합니다"; machine="$1" ;;
       --machine=*)  machine="${1#--machine=}" ;;
+      --managed-release-source=*)
+        [ -z "$managed_release_source" ] \
+          || die "--managed-release-source 는 한 번만 지정할 수 있습니다"
+        managed_release_source="${1#--managed-release-source=}"
+        [ -n "$managed_release_source" ] \
+          || die "--managed-release-source 에 완성된 local release 디렉터리가 필요합니다" ;;
+      --managed-snapshot-digest=*)
+        [ -z "$managed_snapshot_digest" ] \
+          || die "--managed-snapshot-digest 는 한 번만 지정할 수 있습니다"
+        managed_snapshot_digest="${1#--managed-snapshot-digest=}"
+        [[ "$managed_snapshot_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+          || die "--managed-snapshot-digest 는 sha256:<64 lowercase hex> 여야 합니다" ;;
+      --managed-refresh=*)
+        [ -z "$managed_refresh_source" ] \
+          || die "--managed-refresh 는 한 번만 지정할 수 있습니다"
+        managed_refresh_source="${1#--managed-refresh=}"
+        [ -n "$managed_refresh_source" ] \
+          || die "--managed-refresh 에 완성된 서명 release 디렉터리가 필요합니다" ;;
+      --managed-status) managed_status=1 ;;
+      --managed-release-source|--managed-snapshot-digest|--managed-refresh)
+        die "$1 는 =<값> 형식으로 지정해야 합니다" ;;
       -h|--help)    usage; return 0 ;;
       *)            die "모르는 옵션: $1" ;;
     esac
@@ -85,6 +114,24 @@ main() {
   fi
   if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && [ "$dry" != 1 ]; then
     die "--json 은 --dry-run 과 함께만 쓸 수 있습니다"
+  fi
+  if { [ -n "$managed_refresh_source" ] || [ "$managed_status" = 1 ]; } \
+     && { [ "$dry" = 1 ] || [ "$do_install" != 1 ] || [ "$rollback" = 1 ] \
+          || [ "$from_unknown" = 1 ] || [ -n "$managed_snapshot_digest" ] \
+          || [ -n "$managed_release_source" ] || [ -n "$machine" ] \
+          || [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; }; then
+    die "--managed-refresh·--managed-status 는 다른 옵션과 함께 쓸 수 없습니다"
+  fi
+  # The store modes answer in JSON on stdout; every sentence from here on is stderr.
+  if [ -n "$managed_refresh_source" ] || [ "$managed_status" = 1 ]; then
+    AIRLOCK_UPDATE_JSON=1
+  fi
+  if [ -n "$managed_release_source" ] && [ -z "$managed_snapshot_digest" ]; then
+    die "--managed-release-source 는 exact --managed-snapshot-digest 와 함께 지정해야 합니다"
+  fi
+  if [ -n "$managed_snapshot_digest" ] \
+     && { [ "$dry" = 1 ] || [ "$do_install" != 1 ] || [ "$rollback" = 1 ]; }; then
+    die "managed release 입력은 실제 install update 에서만 사용할 수 있습니다"
   fi
 
   local ROOT=""
@@ -107,11 +154,24 @@ main() {
        다른 곳에 있으면 그 경로를 알려 주세요:  AIRLOCK_DIR=/경로 bash bin/airlock-update"
   fi
 
+  # AIRLOCK_FIXTURE_BOUNDARY_CALL — the regression fixture mutates this exact call.
+  fixture_boundary "$ROOT" "$dry" "$machine" \
+    || die "unsafe fixture execution refused before live effects"
+
   command -v git >/dev/null 2>&1 \
     || die "git 이 없습니다. 맥이면 터미널에서 'xcode-select --install' 을 한 번 실행하세요."
 
+  if [ "$dry" != 1 ] && [ "$managed_status" != 1 ]; then
+    local lease_reason=update
+    [ "$rollback" != 1 ] || lease_reason=rollback
+    [ -z "$managed_refresh_source" ] || lease_reason=managed-refresh
+    # AIRLOCK_UPDATE_LIVE_BOX_LEASE_CALL — the regression fixture mutates this boundary.
+    enter_update_live_box_lease \
+      "$ROOT" "$lease_reason" "$RELEASE_URL" "$RELEASE_REF" "${original_argv[@]}"
+  fi
+
   cd "$ROOT" || die "$ROOT 로 들어가지 못했습니다"
-  trap release_update_mutex EXIT
+  trap 'release_update_mutex; cleanup_update_capsule' EXIT
   say "대상: $ROOT"
 
   if [ "$rollback" = 1 ]; then
@@ -135,7 +195,60 @@ main() {
     die "업데이트용 임시 디렉터리를 안전한 절대 경로로 고정하지 못했습니다"
   }
   # shellcheck disable=SC2064   # $scratch must expand now, not at trap time
-  trap "release_update_mutex; rm -rf '$scratch'" EXIT
+  trap "release_update_mutex; rm -rf '$scratch'; cleanup_update_capsule" EXIT
+  if [ "$dry" = 1 ] && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    local source_git_dir="" source_common_dir="" preview_git_dir="$scratch/preview.git"
+    source_git_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-dir 2>/dev/null)" \
+      || die "미리보기에서 원본 Git 메타데이터 경로를 읽지 못했습니다"
+    source_common_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+      || die "미리보기에서 공통 Git 메타데이터 경로를 읽지 못했습니다"
+    acquire_update_mutex "$source_common_dir"
+    mkdir -p "$preview_git_dir" \
+      || die "미리보기용 임시 Git 메타데이터 디렉터리를 만들지 못했습니다"
+    if ! tar -C "$source_common_dir" --exclude=objects -cf - . \
+      | tar -C "$preview_git_dir" -xf -; then
+      die "미리보기용 임시 Git 메타데이터를 복제하지 못했습니다"
+    fi
+    if [ "$source_git_dir" != "$source_common_dir" ]; then
+      cp -- "$source_git_dir/HEAD" "$preview_git_dir/HEAD" \
+        || die "미리보기용 worktree HEAD 를 고정하지 못했습니다"
+      if [ -f "$source_git_dir/index" ]; then
+        cp -- "$source_git_dir/index" "$preview_git_dir/index" \
+          || die "미리보기용 worktree index 를 고정하지 못했습니다"
+      else
+        rm -f -- "$preview_git_dir/index"
+      fi
+      if [ -f "$source_git_dir/config.worktree" ]; then
+        cp -- "$source_git_dir/config.worktree" "$preview_git_dir/config.worktree" \
+          || die "미리보기용 worktree config 를 고정하지 못했습니다"
+      fi
+      rm -f -- "$preview_git_dir/commondir"
+    fi
+    mkdir -p "$preview_git_dir/objects" \
+      || die "미리보기용 임시 Git 메타데이터를 복제하지 못했습니다"
+    export GIT_ALTERNATE_OBJECT_DIRECTORIES="$source_common_dir/objects"
+    export GIT_DIR="$preview_git_dir" GIT_WORK_TREE="$ROOT"
+  fi
+  if [ -n "$managed_refresh_source" ] || [ "$managed_status" = 1 ]; then
+    # A catalog refresh is not an install.  These two modes read or replace only the
+    # verified local managed snapshot and print the store view; they never fetch the
+    # public core, touch the checkout, arm a recovery or start the installer.
+    [ "$(platform)" != Darwin ] || die "managed store 는 Linux 설치본에만 연결되어 있습니다"
+    { [ -e /etc/airlock/managed-channel.json ] || [ -L /etc/airlock/managed-channel.json ]; } \
+      || die "managed store 에는 고정된 /etc/airlock/managed-channel.json 등록이 필요합니다"
+    prepare_managed_update_context "$scratch" "$scratch/managed-context.json" \
+      || die "고정된 managed channel 등록과 trusted measurer 를 검증하지 못했습니다"
+    if [ -n "$managed_refresh_source" ]; then
+      [ -d .git ] || die "managed refresh 는 Git 설치본에서만 실행합니다"
+      managed_refresh_admitted_or_die "$scratch" "$ROOT"
+      acquire_update_mutex "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+      managed_refresh_installed "$scratch" "$managed_refresh_source" \
+        || die "reason=refresh-refused 서명 release 를 managed cache 에 반영하지 못했습니다 — 이전 snapshot 을 그대로 둡니다"
+    fi
+    managed_store_status "$scratch" "$ROOT" \
+      || die "managed store 상태를 검증된 cache 에서 만들지 못했습니다"
+    return 0
+  fi
   local managed_context=""
   if [ "$dry" != 1 ] && [ "$do_install" = 1 ] && [ "$(platform)" != Darwin ] \
      && { [ -e /etc/airlock/managed-channel.json ] \
@@ -167,17 +280,75 @@ main() {
     fi
   fi
 
-  local git_dir recovery_dir
+  local git_dir git_common_dir recovery_dir
   git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" \
     || die "git 메타데이터 경로를 읽지 못했습니다"
+  git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || die "공통 git 메타데이터 경로를 읽지 못했습니다"
   local installed_head=""
   git rev-parse --verify -q HEAD >/dev/null 2>&1 \
     && installed_head="$(git rev-parse HEAD)"
-  acquire_update_mutex "$git_dir"
+  if [ -z "${AIRLOCK_UPDATE_KEEPER_PID:-}" ]; then
+    acquire_update_mutex "$git_common_dir"
+  fi
   recovery_dir="$git_dir/airlock-update-rollback"
   if [ "$dry" != 1 ] && [ -e "$recovery_dir" ]; then
     die "끝나지 않은 업데이트 복구 기록이 있습니다.
        먼저 되돌리십시오:  AIRLOCK_DIR=\"$ROOT\" bash \"$recovery_dir/airlock-update\" --rollback"
+  fi
+  if [ "$dry" != 1 ] && git show-ref --verify -q refs/airlock-update/rollback; then
+    die "다른 linked worktree의 끝나지 않은 업데이트 복구 ref가 있습니다.
+       해당 worktree의 airlock-update --rollback 을 먼저 완료하십시오"
+  fi
+
+  # A transport supplies bytes, never authority.  Before touching the public
+  # checkout or invoking the installer, bind those bytes to the fixed enrollment,
+  # verify host/policy/lifecycle compatibility, let the accepted state primitive
+  # promote them, and resolve the exact digest back out of the installed cache.
+  if [ -n "$managed_snapshot_digest" ]; then
+    managed_utc_now "$scratch/managed-request-at" \
+      || die "managed release 검증 시각을 고정하지 못했습니다"
+    local managed_request_at
+    IFS= read -r managed_request_at <"$scratch/managed-request-at" \
+      || die "managed release 검증 시각을 읽지 못했습니다"
+    if [ -n "$managed_release_source" ]; then
+      # Importing a new organisation snapshot is exactly what a subscription lapse or
+      # an unenrollment stops.  Say so with the measured status before anything runs;
+      # already-accepted cached releases below stay available either way.
+      managed_refresh_admitted_or_die "$scratch" "$ROOT"
+      managed_capture "$scratch/managed-candidate-verify.json" \
+        python3 "$scratch/frozen-airlock-managed-release" verify \
+          --stage "$managed_release_source" --signed \
+          --authority "$(managed_context_field "$managed_context" authority_path)" \
+          --at "$managed_request_at" \
+        || die "managed local candidate 서명 검증에 실패했습니다"
+      managed_release_preflight \
+        "$managed_context" "$managed_release_source" "$managed_snapshot_digest" \
+        "$(platform)" "$(uname -m)" \
+        || die "managed local candidate host/policy preflight 에 실패했습니다"
+      managed_capture "$scratch/managed-refresh.json" \
+        python3 "$ROOT/bin/airlock-managed-state" refresh-installed \
+          --source "$managed_release_source" --at "$managed_request_at" \
+        || die "managed local candidate 를 고정된 installed channel 에 반영하지 못했습니다"
+      managed_refresh_matches_request \
+        "$scratch/managed-refresh.json" "$managed_snapshot_digest" \
+        || die "managed refresh 결과가 요청한 exact snapshot 과 다릅니다"
+    fi
+    managed_cached_release_present \
+      "$managed_context" "$managed_snapshot_digest" \
+      || die "reason=bundle-not-cached 요청한 managed bundle 이 이 박스에 캐시되어 있지 않습니다 — 먼저 --managed-refresh 로 받아야 합니다"
+    managed_capture "$scratch/managed-cached.json" \
+      python3 "$ROOT/bin/airlock-managed-state" resolve-installed-cached \
+        --snapshot-digest "$managed_snapshot_digest" --at "$managed_request_at" \
+      || die "요청한 managed snapshot 을 installed cache 에서 해석하지 못했습니다"
+    managed_cached_release_path \
+      "$managed_context" "$scratch/managed-cached.json" \
+      "$managed_snapshot_digest" "$scratch/managed-requested-release-path" \
+      || die "managed cached release 결과의 identity/path/role 이 올바르지 않습니다"
+    managed_release_preflight \
+      "$managed_context" "$(managed_file_line "$scratch/managed-requested-release-path")" \
+      "$managed_snapshot_digest" "$(platform)" "$(uname -m)" \
+      || die "managed cached release host/policy preflight 에 실패했습니다"
   fi
 
   # ---------------------------------------------------------------- 2) 배포본 받기
@@ -218,6 +389,26 @@ main() {
       "$scratch/current-release-before.json" "$new" "$ROOT" \
       "$scratch/current-release-path" \
       || die "managed release 와 받은 public core 의 결속이 맞지 않습니다"
+    if [ -n "$managed_snapshot_digest" ]; then
+      managed_requested_current_matches \
+        "$scratch/managed-cached.json" "$scratch/current-release-before.json" \
+        "$scratch/managed-requested-release-path" "$managed_snapshot_digest" \
+        || die "요청한 managed cached release 가 fetched core 의 current release 와 다릅니다"
+    fi
+    # The authoritative policy decision is the one against the release the installer
+    # will really consume: the channel's current release, bound to the fetched core and
+    # BEFORE the checkout.  A managed run with no digest input used to reach the
+    # installer handoff with no policy decision at all, and failed only after the
+    # checkout commit had already armed a recovery.
+    local managed_current_digest
+    managed_current_digest="$(managed_current_snapshot_digest \
+      "$scratch/current-release-before.json")" \
+      || die "managed current release 의 snapshot digest 를 읽지 못했습니다"
+    managed_release_preflight \
+      "$managed_context" "$(managed_file_line "$scratch/current-release-path")" \
+      "$managed_current_digest" "$(platform)" "$(uname -m)" \
+      "$scratch/preflight-selected" \
+      || die "managed current release 의 host/policy/lifecycle preflight 에 실패했습니다 — 파일을 바꾸지 않았습니다"
   fi
   local direction direction_rc
   direction="$(release_direction "$new" "$installed_head" "$RELEASE_REF" "$RELEASE_URL")"
@@ -528,7 +719,13 @@ EOF
   else
     say "설치기를 다시 돌립니다 (머신: $machine)…"
     say "설치 중 경고가 여러 줄 나올 수 있습니다 — 마지막의 Entrance 주소가 나오면 성공입니다."
-    AIRLOCK_MACHINE="$machine" bash docker/orbstack-machine-setup.sh || update_rc=$?
+    # The host checkout and Orb VM are distinct live boxes: an open host flock fd
+    # cannot cross the VM boundary.  Prevent Orb from mistaking the host identity for
+    # an inherited VM lease; the VM installer acquires its own canonical lease.
+    env -u AIRLOCK_LIVE_BOX_LEASE_ID -u AIRLOCK_LIVE_BOX_LEASE_FD \
+      -u AIRLOCK_LIVE_BOX_LEASE_GUARD_FD -u AIRLOCK_LIVE_BOX_LEASE_RECORD \
+      -u AIRLOCK_SELFKILL_ESCAPED \
+      AIRLOCK_MACHINE="$machine" bash docker/orbstack-machine-setup.sh || update_rc=$?
   fi
 
   if [ "$rollback_ready" != 1 ]; then
@@ -545,6 +742,39 @@ EOF
       >"$recovery_dir/status-after-failure.json" 2>/dev/null || true
     record_update_event "$git_dir" update-failed "$before" "$after" "$update_rc"
     say "설치가 실패했습니다 (rc=$update_rc). 이전 상태는 보존돼 있습니다."
+    # A managed failure is not left for a human to finish.  The app-scoped executor
+    # has already compensated its own resources when it reports `rolled_back`, so the
+    # remaining work — the checkout, the pre-update ledger/config baseline and the
+    # status verification — is run here and verified before anything is called
+    # recovered.  Any other transaction phase is NOT auto-resumed: the ledger owns
+    # that judgment, and a degraded or still-rolling transaction needs its record.
+    local managed_phase="" recovery_rc=0
+    if [ -n "$managed_context" ]; then
+      managed_phase="$(managed_transaction_phase "$rollback_state_dir")" || managed_phase=""
+    fi
+    if [ "$managed_phase" = rolled_back ]; then
+      say "managed 실행기가 앱 자원을 되돌렸습니다 (transaction=rolled_back) — 이전 상태로 복구하고 검증합니다…"
+      release_update_mutex
+      rollback_update "$ROOT" "$machine" "$MACHINE_MARKER" || recovery_rc=$?
+      if [ "$recovery_rc" = 0 ]; then
+        write_update_channel_receipt "$rollback_state_dir" recovered "$managed_context" \
+          "$scratch" "$before" "$after" "$update_rc" "$managed_phase" \
+          || say "복구는 끝났지만 managed update 영수증을 남기지 못했습니다"
+        say "이전 관리판으로 복구하고 상태 검증까지 통과했습니다 (설치 실패 rc=$update_rc)."
+        return "$update_rc"
+      fi
+      write_update_channel_receipt "$rollback_state_dir" recovery-failed "$managed_context" \
+        "$scratch" "$before" "$after" "$update_rc" "$managed_phase" \
+        || say "복구 실패 영수증을 남기지 못했습니다"
+      say "자동 복구가 끝나지 못했습니다 (rc=$recovery_rc) — 기록을 보존했습니다."
+      say "다시 시도:  AIRLOCK_DIR=\"$ROOT\" bash \"$recovery_dir/airlock-update\" --rollback"
+      return "$recovery_rc"
+    fi
+    if [ -n "$managed_context" ]; then
+      write_update_channel_receipt "$rollback_state_dir" recovery-required "$managed_context" \
+        "$scratch" "$before" "$after" "$update_rc" "$managed_phase" \
+        || say "복구 필요 영수증을 남기지 못했습니다"
+    fi
     say "되돌리기:  AIRLOCK_DIR=\"$ROOT\" bash \"$recovery_dir/airlock-update\" --rollback"
     return "$update_rc"
   fi
@@ -564,6 +794,12 @@ EOF
     return "$status_rc"
   fi
 
+  if [ -n "$managed_context" ]; then
+    write_update_channel_receipt "$rollback_state_dir" installed "$managed_context" \
+      "$scratch" "$before" "$after" 0 \
+      "$(managed_transaction_phase "$rollback_state_dir" || printf unknown)" \
+      || die "managed update 영수증을 남기지 못해 성공으로 보고하지 않습니다"
+  fi
   record_update_event "$git_dir" update-ok "$before" "$after" 0
   git update-ref -d refs/airlock-update/rollback "$before" \
     || die "성공한 업데이트의 복구용 Git ref 를 정리하지 못했습니다"
@@ -581,6 +817,237 @@ say()  {
 }
 die()  { printf '\033[1;31m[airlock-update] 중단:\033[0m %s\n' "$*" >&2; exit 1; }
 
+fixture_boundary() { # <checkout-root> <dry> <machine>
+  local checkout="$1" dry="$2" machine="$3" fixture_signal=0 name orb_path=""
+  while IFS= read -r name; do
+    case "$name" in AIRLOCK_FIXTURE_*) fixture_signal=1; break ;; esac
+  done < <(compgen -A variable)
+  [ "$fixture_signal" = 1 ] || return 0
+  [ -z "$machine" ] || orb_path="$(command -v orb 2>/dev/null || true)"
+  python3 - "$checkout" "$dry" "$machine" \
+    "${AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR:-}" "${HOME:-}" \
+    "${AIRLOCK_STATE_DIR:-}" "$orb_path" \
+    "${AIRLOCK_FIXTURE_UPDATE_TOOLS_ROOT:-}" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+checkout_raw, dry, machine, lease_raw, home, state, orb_path, update_tools = sys.argv[1:]
+lease = pathlib.Path(lease_raw)
+if not lease.is_absolute() or lease.name != "airlock-live-box":
+    raise SystemExit("fixture boundary: lease path must be absolute and end in /airlock-live-box")
+try:
+    root = lease.parent.resolve(strict=True)
+    root_info = root.lstat()
+    marker = root / ".airlock-live-box-fixture-v1"
+    marker_info = marker.lstat()
+    marker_value = marker.read_text(encoding="ascii")
+except (OSError, UnicodeError) as exc:
+    raise SystemExit(f"fixture boundary: missing fixture root or marker: {exc}")
+if (lease.parent != root or root.is_symlink() or not root.is_dir()
+        or root_info.st_uid != os.getuid() or stat.S_IMODE(root_info.st_mode) != 0o700
+        or marker.is_symlink() or not marker.is_file()
+        or marker_info.st_uid != os.getuid() or stat.S_IMODE(marker_info.st_mode) != 0o600
+        or marker_value != "airlock.live-box-fixture/v1\n"):
+    raise SystemExit("fixture boundary: root must be canonical, owner-private, and explicitly marked")
+def below(label, raw, required):
+    if not raw:
+        if required:
+            raise SystemExit(f"fixture boundary: {label} must be explicit")
+        return
+    path = pathlib.Path(raw)
+    if not path.is_absolute():
+        raise SystemExit(f"fixture boundary: {label} must be absolute")
+    resolved = path.resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise SystemExit(f"fixture boundary: {label} escapes fixture root: {resolved}")
+
+below("checkout", checkout_raw, True)
+below("HOME", home, True)
+below("AIRLOCK_STATE_DIR", state, dry != "1")
+if machine:
+    below("orb mutation command", orb_path, True)
+below("update tools", update_tools, False)
+PY
+}
+
+update_lease_tools_valid() { # <tools-root>
+  local tools="$1"
+  [ ! -L "$tools" ] && [ -d "$tools" ] \
+    && [ ! -L "$tools/bin" ] && [ -d "$tools/bin" ] \
+    && [ ! -L "$tools/install" ] && [ -d "$tools/install" ] \
+    && [ ! -L "$tools/bin/airlock-ledger" ] && [ -x "$tools/bin/airlock-ledger" ] \
+    && [ ! -L "$tools/install/lib.sh" ] && [ -f "$tools/install/lib.sh" ] \
+    && [ ! -L "$tools/install/preflight.sh" ] && [ -f "$tools/install/preflight.sh" ] \
+    && grep -q 'live-box-lease-require' "$tools/bin/airlock-ledger"
+}
+
+bootstrap_update_lease_tools() { # <release-url> <release-ref> <private-parent>
+  local release_url="$1" release_ref="$2" parent="$3" bootstrap=""
+  case "$release_url:$release_ref" in
+    https://github.com/spacewalk-labs/airlock:main|https://github.com/spacewalk-labs/airlock.git:main) ;;
+    *) return 1 ;;
+  esac
+  bootstrap="$(mktemp -d "$parent/airlock-update-tools.XXXXXX")" || return 1
+  chmod 0700 "$bootstrap" || { rm -rf -- "$bootstrap"; return 1; }
+  if ! git init -q --bare "$bootstrap/repository" \
+     || ! git -C "$bootstrap/repository" fetch -q --depth=1 "$release_url" "$release_ref" \
+     || ! mkdir -p "$bootstrap/tools"; then
+    rm -rf -- "$bootstrap"
+    return 1
+  fi
+  if ! git -C "$bootstrap/repository" archive FETCH_HEAD -- \
+         bin/airlock-ledger install/lib.sh install/preflight.sh \
+       | tar -C "$bootstrap/tools" -xf - \
+     || [ "$(sha256_file "$bootstrap/tools/bin/airlock-ledger")" != \
+            2d8abccd6074c4c4c0d9dacd9820ca56efc17b88e603227ff8e661616c22bd7c ] \
+     || [ "$(sha256_file "$bootstrap/tools/install/lib.sh")" != \
+            70493cdfd6a2411155d8021d7038a9f5a648e2855320b19ad72e9f13776cda7b ] \
+     || [ "$(sha256_file "$bootstrap/tools/install/preflight.sh")" != \
+            dcff752abe254921e6a788f8b27fd0151071c359185864dc6c19779625abdb35 ] \
+     || ! chmod 0500 "$bootstrap/tools/bin/airlock-ledger"; then
+    rm -rf -- "$bootstrap"
+    return 1
+  fi
+  rm -rf -- "$bootstrap/repository"
+  printf '%s\n' "$bootstrap"
+}
+
+preserved_update_lease_tools_valid() { # <lease-tools-root>
+  local tools="$1" relative="" expected="" actual=""
+  update_lease_tools_valid "$tools" || return 1
+  for relative in bin/airlock-ledger install/lib.sh install/preflight.sh; do
+    [ ! -L "$tools/$relative.sha256" ] && [ -f "$tools/$relative.sha256" ] \
+      || return 1
+    IFS= read -r expected <"$tools/$relative.sha256" || return 1
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+    actual="$(sha256_file "$tools/$relative")" || return 1
+    [ "$actual" = "$expected" ] || return 1
+  done
+}
+
+build_update_capsule() { # <tools-root> <private-parent>
+  local tools="$1" parent="$2" capsule=""
+  capsule="$(mktemp -d "$parent/airlock-update-capsule.XXXXXX")" || return 1
+  chmod 0700 "$capsule" || { rm -rf -- "$capsule"; return 1; }
+  if ! mkdir -p "$capsule/bin" "$capsule/install" \
+     || ! cp -- "$tools/bin/airlock-ledger" "$capsule/bin/airlock-ledger" \
+     || ! cp -- "$tools/install/lib.sh" "$capsule/install/lib.sh" \
+     || ! cp -- "$tools/install/preflight.sh" "$capsule/install/preflight.sh" \
+     || ! declare -f airlock_update_program >"$capsule/bin/airlock-update"; then
+    rm -rf -- "$capsule"
+    return 1
+  fi
+  {
+    printf '%s\n' 'set -uo pipefail'
+    printf 'AIRLOCK_UPDATE_CAPSULE_ROOT=%q\n' "$capsule"
+    printf '%s\n' 'airlock_update_program "$@"'
+  } >>"$capsule/bin/airlock-update" || { rm -rf -- "$capsule"; return 1; }
+  printf 'airlock.update-capsule/v1\n' >"$capsule/.airlock-update-capsule-v1" \
+    || { rm -rf -- "$capsule"; return 1; }
+  chmod 0500 "$capsule/bin/airlock-update" "$capsule/bin/airlock-ledger" \
+    || { rm -rf -- "$capsule"; return 1; }
+  printf '%s\n' "$capsule"
+}
+
+cleanup_update_capsule() {
+  local capsule="${AIRLOCK_UPDATE_CAPSULE_ROOT:-}"
+  [ -n "$capsule" ] && [ ! -L "$capsule" ] && [ -d "$capsule" ] \
+    && [ -f "$capsule/.airlock-update-capsule-v1" ] \
+    && [ "$(cat "$capsule/.airlock-update-capsule-v1" 2>/dev/null)" = \
+           airlock.update-capsule/v1 ] \
+    || return 0
+  case "$capsule" in
+    /tmp/airlock-update-capsule.*|*/airlock-update-capsule.*) rm -rf -- "$capsule" ;;
+  esac
+}
+
+escape_update_selfkill_cgroup() { # <tools-root> <reexec-path> [argv]
+  local tools="$1" reexec="$2" saved_die saved_root_set saved_root
+  shift 2
+  saved_die="$(declare -f die)"
+  saved_root_set="${AIRLOCK_ROOT+x}"
+  saved_root="${AIRLOCK_ROOT:-}"
+  # shellcheck source=/dev/null
+  . "$tools/install/lib.sh"
+  airlock_escape_selfkill_cgroup "$reexec" "$@"
+  eval "$saved_die"
+  unset -f log
+  if [ -n "$saved_root_set" ]; then AIRLOCK_ROOT="$saved_root"; else unset AIRLOCK_ROOT; fi
+}
+
+update_selfkill_escape_needed() {
+  [ -z "${AIRLOCK_SELFKILL_ESCAPED:-}" ] || return 1
+  local cgroup_file="${AIRLOCK_SELFKILL_CGROUP_FILE:-/proc/self/cgroup}" cgroup path unit
+  [ -r "$cgroup_file" ] || return 1
+  cgroup="$(cat "$cgroup_file" 2>/dev/null || true)"
+  path="$(printf '%s\n' "$cgroup" | sed -n 's|^0::||p' | head -n1)"
+  [ -n "$path" ] || return 1
+  unit="${path##*/}"
+  case "$path" in */user@*.service/*) ;; *) return 1 ;; esac
+  case "$unit" in airlock-*.service) ;; *) return 1 ;; esac
+  systemctl --user show-environment >/dev/null 2>&1 || return 1
+  return 0
+}
+
+enter_update_live_box_lease() { # <checkout-root> <reason> <release-url> <release-ref> [argv]
+  local checkout="$1" reason="$2" release_url="$3" release_ref="$4"
+  local source="${BASH_SOURCE[0]:-}" source_dir="" source_path="" tools="" bootstrap=""
+  local capsule="" private_parent=/tmp rc=0
+  shift 4
+  if [ -n "$source" ] && [ -f "$source" ]; then
+    source_dir="$(cd "$(dirname "$source")" && pwd -P)"
+    source_path="$source_dir/$(basename "$source")"
+    if preserved_update_lease_tools_valid "$source_dir/lease-tools"; then
+      tools="$source_dir/lease-tools"
+    elif update_lease_tools_valid "$source_dir/.."; then
+      tools="$(cd "$source_dir/.." && pwd -P)"
+    fi
+  fi
+  if [ -z "$tools" ] && [ -n "${AIRLOCK_FIXTURE_UPDATE_TOOLS_ROOT:-}" ] \
+     && update_lease_tools_valid "$AIRLOCK_FIXTURE_UPDATE_TOOLS_ROOT"; then
+    tools="$(cd "$AIRLOCK_FIXTURE_UPDATE_TOOLS_ROOT" && pwd -P)"
+  fi
+  [ -z "${AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR:-}" ] \
+    || private_parent="$(dirname "$AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR")"
+  if [ -z "$tools" ]; then
+    bootstrap="$(bootstrap_update_lease_tools "$release_url" "$release_ref" "$private_parent")" \
+      || die "공통 live-box lease 도구를 찾지 못해 변경을 시작하지 않습니다"
+    tools="$bootstrap/tools"
+  fi
+  if [ -z "$source_path" ] || [ -n "$bootstrap" ]; then
+    capsule="$(build_update_capsule "$tools" "$private_parent")" \
+      || { [ -z "$bootstrap" ] || rm -rf -- "$bootstrap"; \
+           die "updater 실행 캡슐을 만들지 못해 변경을 시작하지 않습니다"; }
+    source_path="$capsule/bin/airlock-update"
+    tools="$capsule"
+    [ -z "$bootstrap" ] || rm -rf -- "$bootstrap"
+  fi
+  export AIRLOCK_UPDATE_ACTIVE_LEASE_TOOLS_ROOT="$tools"
+
+  local inherited_lease=0
+  if [ -n "${AIRLOCK_LIVE_BOX_LEASE_ID:-}${AIRLOCK_LIVE_BOX_LEASE_FD:-}${AIRLOCK_LIVE_BOX_LEASE_RECORD:-}${AIRLOCK_LIVE_BOX_LEASE_GUARD_FD:-}" ]; then
+    "$tools/bin/airlock-ledger" live-box-lease-require \
+      || die "live-box lease identity is stale, forged, or no longer held"
+    inherited_lease=1
+    update_selfkill_escape_needed \
+      && die "an inherited live-box lease cannot cross the self-kill escape boundary"
+  fi
+  # Escaping after admission loses the inherited flock at the systemd manager
+  # boundary.  The persistent updater path enters a safe transient service first;
+  # that same process then acquires and carries the lease into the installer.
+  [ "$inherited_lease" = 1 ] || escape_update_selfkill_cgroup "$tools" "$source_path" "$@"
+  [ "$inherited_lease" != 1 ] || return 0
+  "$tools/bin/airlock-ledger" live-box-lease-run \
+    --agent-id="${PASEO_AGENT_ID:-operator:$(id -u)}" \
+    --card="${AIRLOCK_LIVE_BOX_CARD:-manual/live-box}" \
+    --reason="$reason" --ttl-seconds="${AIRLOCK_LIVE_BOX_TTL_SECONDS:-3600}" \
+    -- bash "$source_path" "$@" || rc=$?
+  [ -z "$capsule" ] || { AIRLOCK_UPDATE_CAPSULE_ROOT="$capsule"; cleanup_update_capsule; }
+  exit "$rc"
+}
+
 usage() { printf '%s\n' \
   "airlock-update — 이미 깔린 Airlock 을 최신 배포본으로 갱신합니다." \
   "  bash bin/airlock-update              # 갱신하고 설치기까지 다시 돌립니다" \
@@ -589,6 +1056,9 @@ usage() { printf '%s\n' \
   "  bash bin/airlock-update --no-install # 파일만 갱신하고 설치기는 건너뜁니다" \
   "  bash bin/airlock-update --rollback   # 마지막으로 실패한 갱신을 되돌립니다" \
   "  bash bin/airlock-update --machine m  # 리눅스 머신 이름을 직접 지정합니다" \
+  "  bash bin/airlock-update --managed-snapshot-digest=sha256:... [--managed-release-source=/완성된/서명본]" \
+  "  bash bin/airlock-update --managed-refresh=/완성된/서명본 # 설치 없이 검증된 managed cache 만 갱신" \
+  "  bash bin/airlock-update --managed-status   # managed store 상태 JSON (cache 나이·후보판·버튼)" \
   "  bash bin/airlock-update --from-unknown # 어느 배포본인지 모르는 옛 설치본(2026-08-21 이전)을 확인 후 갱신" \
   "  AIRLOCK_DIR=/경로 를 앞에 붙이면 그 폴더를 갱신합니다."; }
 
@@ -689,6 +1159,721 @@ if not raw.endswith(b"\n") or raw.count(b"\n") != 1 or b"\r" in raw:
     raise SystemExit(2)
 value = raw[:-1].decode("utf-8")
 if not value or "\x00" in value:
+    raise SystemExit(2)
+print(value)
+PY
+}
+
+managed_refresh_matches_request() { # <refresh-json> <expected-snapshot-digest>
+  python3 - "$1" "$2" <<'PY'
+import json
+import pathlib
+import sys
+
+path, expected = pathlib.Path(sys.argv[1]), sys.argv[2]
+raw = path.read_bytes()
+value = json.loads(raw)
+canonical = (json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                        sort_keys=True) + "\n").encode()
+if raw != canonical or value.get("snapshot_digest") != expected:
+    raise SystemExit(2)
+if value.get("access_status") != "active":
+    raise SystemExit(2)
+PY
+}
+
+managed_cached_release_path() { # <context> <cached-json> <expected-digest> <new-path-file>
+  python3 - "$@" <<'PY'
+import json
+import os
+import pathlib
+import re
+import sys
+
+context_path, cached_path, expected, output_path = sys.argv[1:]
+context_path, cached_path, output_path = map(
+    pathlib.Path, (context_path, cached_path, output_path),
+)
+sha256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+def load(path):
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    canonical = (json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                            sort_keys=True) + "\n").encode()
+    if raw != canonical:
+        raise SystemExit(2)
+    return value
+
+context = load(context_path)
+cached = load(cached_path)
+required = {
+    "access_status", "bundle_digest", "cached", "catalog_digest", "channel_id",
+    "promoted_at", "release_path", "role", "schema", "snapshot_digest",
+    "verified_at",
+}
+if (set(cached) != required
+        or cached.get("schema") != "airlock.managed.cached-release/v1"
+        or cached.get("cached") is not True
+        or cached.get("role") != "current"
+        or cached.get("snapshot_digest") != expected
+        or cached.get("channel_id") != context.get("channel_id")
+        or sha256.fullmatch(expected) is None):
+    raise SystemExit(2)
+release = pathlib.Path(str(cached.get("release_path")))
+wanted = pathlib.Path(context["store_path"]) / "releases" / expected.removeprefix("sha256:")
+if release != wanted or not release.is_dir() or release.is_symlink():
+    raise SystemExit(2)
+fd = os.open(
+    output_path,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+with os.fdopen(fd, "wb") as handle:
+    handle.write((str(release) + "\n").encode())
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+}
+
+managed_requested_current_matches() { # <cached> <current> <release-path-file> <digest>
+  python3 - "$@" <<'PY'
+import json
+import pathlib
+import sys
+
+cached_path, current_path, release_path_file, digest = map(pathlib.Path, sys.argv[1:])
+digest = str(digest)
+cached = json.loads(cached_path.read_bytes())
+current = json.loads(current_path.read_bytes())
+release_raw = release_path_file.read_bytes()
+if (not release_raw.endswith(b"\n") or release_raw.count(b"\n") != 1
+        or cached.get("snapshot_digest") != digest
+        or current.get("snapshot_digest") != digest
+        or cached.get("release_path") != current.get("release_path")
+        or release_raw[:-1].decode() != current.get("release_path")):
+    raise SystemExit(2)
+PY
+}
+
+managed_release_preflight() { # <context> <signed-release> <snapshot-digest> <os> <arch> [selected-apps-out]
+  python3 - "$@" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+context_path, release_path, expected_digest, host_os, host_arch = sys.argv[1:6]
+selected_output = pathlib.Path(sys.argv[6]) if len(sys.argv) > 6 else None
+context_path, release_path = pathlib.Path(context_path), pathlib.Path(release_path)
+digest_re = re.compile(r"sha256:[0-9a-f]{64}\Z")
+app_re = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
+grantable = {"rooted-artifact", "system-unit"}
+
+# A refusal is also a product answer another surface has to render, so every one of
+# them carries a stable machine-readable reason next to its sentence.
+def fail(message, reason="release-input-invalid"):
+    print(f"airlock-update managed package preflight: reason={reason} {message}",
+          file=sys.stderr)
+    raise SystemExit(2)
+
+def pairs(rows):
+    result = {}
+    for key, value in rows:
+        if key in result:
+            fail(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+def load(path, label, canonical=True):
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw, object_pairs_hook=pairs)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"cannot read {label}: {exc}")
+    encoded = (json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                          sort_keys=True) + "\n").encode()
+    if canonical and raw != encoded:
+        fail(f"{label} is not canonical JSON")
+    return value, raw
+
+def exact(value, keys, label):
+    if not isinstance(value, dict) or set(value) != set(keys):
+        fail(f"{label} has an unsupported closed shape")
+    return value
+
+def executable(relative, label):
+    raw = pathlib.PurePosixPath(relative)
+    if raw.is_absolute() or ".." in raw.parts or str(raw) in {"", "."}:
+        fail(f"{label} is not a confined relative path")
+    path = release_path / package["path"] / raw
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"{label} is unavailable: {exc}", "lifecycle-incomplete")
+    if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+            or stat.S_IMODE(info.st_mode) & 0o111 == 0):
+        fail(f"{label} must be a regular executable", "lifecycle-incomplete")
+
+context, _ = load(context_path, "managed context")
+snapshot, snapshot_raw = load(release_path / "snapshot.json", "snapshot")
+catalog, _ = load(release_path / "catalog.json", "catalog")
+lock, _ = load(release_path / "release.lock", "release lock")
+state, _ = load(pathlib.Path(context["state_path"]), "managed state")
+if "sha256:" + hashlib.sha256(snapshot_raw).hexdigest() != expected_digest:
+    fail("snapshot bytes differ from the requested digest")
+if not release_path.is_dir() or release_path.is_symlink():
+    fail("release path must be a real directory")
+if (snapshot.get("organization_id") != context.get("organization_id")
+        or snapshot.get("channel_id") != context.get("channel_id")
+        or lock.get("organization_id") != context.get("organization_id")
+        or lock.get("channel_id") != context.get("channel_id")):
+    fail("release identity differs from the fixed enrollment")
+host_os = host_os.lower()
+host_arch = host_arch.lower()
+arch_aliases = {"amd64": "x86_64", "arm64": "aarch64"}
+host_arch = arch_aliases.get(host_arch, host_arch)
+if (not re.fullmatch(r"[a-z0-9_]+", host_os)
+        or not re.fullmatch(r"[a-z0-9_]+", host_arch)):
+    fail("host platform facts are unknown or ambiguous", "host-facts-unknown")
+host_profile = f"{host_os}-{host_arch}"
+if snapshot.get("target_profile") != host_profile or lock.get("target_profile") != host_profile:
+    fail(f"release target profile does not match measured host {host_profile}",
+         "host-profile-mismatch")
+
+catalog_rows = catalog.get("apps")
+lock_rows = lock.get("packages")
+if not isinstance(catalog_rows, list) or not isinstance(lock_rows, list):
+    fail("catalog/lock app arrays are unavailable")
+catalog_by_id = {row.get("id"): row for row in catalog_rows if isinstance(row, dict)}
+lock_by_id = {row.get("id"): row for row in lock_rows if isinstance(row, dict)}
+if (len(catalog_by_id) != len(catalog_rows)
+        or len(lock_by_id) != len(lock_rows)
+        or any(app_re.fullmatch(str(app_id)) is None for app_id in catalog_by_id | lock_by_id)):
+    fail("catalog/lock app ids are not exact sorted identities")
+selection = state.get("owner_selection")
+if (not isinstance(selection, dict)
+        or selection.get("snapshot_digest") != expected_digest
+        or state.get("snapshot", {}).get("snapshot_digest") != expected_digest):
+    fail("owner-selected state does not name the requested snapshot")
+choices = {
+    row.get("id"): row.get("source") for row in selection.get("selections", [])
+    if isinstance(row, dict)
+}
+selected = set()
+for app_id, row in catalog_by_id.items():
+    policy = row.get("policy")
+    choice = choices.get(app_id)
+    if policy == "blocked":
+        if choice is not None:
+            fail(f"blocked app {app_id!r} is selected", "policy-blocked-selected")
+        continue
+    if policy == "required":
+        if choice not in {None, "managed"}:
+            fail(f"required app {app_id!r} bypasses managed source",
+                 "policy-required-bypassed")
+        selected.add(app_id)
+    elif policy == "available":
+        if choice == "managed":
+            selected.add(app_id)
+    else:
+        fail(f"catalog app {app_id!r} has unknown policy")
+
+ceilings = state.get("capability_ceilings")
+if not isinstance(ceilings, dict):
+    fail("managed state capability ceilings are unavailable")
+for app_id in sorted(selected):
+    row = catalog_by_id[app_id]
+    compatibility = exact(row.get("compatibility"), {"platforms", "profiles"},
+                          f"catalog app {app_id} compatibility")
+    if host_os not in compatibility["platforms"] or host_profile not in compatibility["profiles"]:
+        fail(f"managed app {app_id!r} is incompatible with measured host facts",
+             "app-host-incompatible")
+    package = lock_by_id.get(app_id)
+    if not isinstance(package, dict):
+        fail(f"selected managed app {app_id!r} is absent from release.lock")
+    capabilities = package.get("capabilities")
+    ceiling = ceilings.get(app_id)
+    if (not isinstance(capabilities, list) or capabilities != sorted(set(capabilities))
+            or not set(capabilities) <= grantable):
+        fail(f"managed app {app_id!r} requests an ungrantable capability",
+             "capability-ungrantable")
+    # An absent ceiling is the empty set, exactly as the accepted selection state
+    # reads it: an app that requests no capability needs no enrollment entry, while
+    # one that requests any is refused until the owner admits it.
+    if ceiling is None:
+        ceiling = []
+    if not isinstance(ceiling, list) or not set(capabilities) <= set(ceiling):
+        fail(f"managed app {app_id!r} exceeds its enrolled capability ceiling",
+             "capability-over-ceiling")
+    classification = package.get("data_compatibility")
+    if classification not in {
+        "backward-compatible-data", "maintenance-required", "stateless",
+    }:
+        fail(f"managed app {app_id!r} has unknown data compatibility",
+             "data-class-unknown")
+    for lifecycle in ("install.sh", "smoke.sh", package.get("deactivator")):
+        if not isinstance(lifecycle, str):
+            fail(f"managed app {app_id!r} lifecycle is incomplete",
+                 "lifecycle-incomplete")
+        executable(lifecycle, f"managed app {app_id!r} lifecycle {lifecycle}")
+
+ledger_root = pathlib.Path(os.environ.get(
+    "AIRLOCK_STATE_DIR", pathlib.Path.home() / ".local/state/airlock",
+))
+ledger_path = ledger_root / "app-ledger.json"
+if ledger_path.exists() or ledger_path.is_symlink():
+    ledger, _ = load(ledger_path, "installed ledger", canonical=False)
+    if ledger.get("version") != 7 or not isinstance(ledger.get("entries"), dict):
+        fail("installed ledger is not the current closed store")
+    for app_id, entry in ledger["entries"].items():
+        committed = entry.get("committed") if isinstance(entry, dict) else None
+        if not isinstance(committed, dict) or committed.get("source_class") != "managed":
+            continue
+        if app_id not in selected:
+            # An installed managed app the current desired state no longer selects is a
+            # removal request.  Two refusals, in this order, because they are different
+            # facts: a package with no recorded deactivator can never be removed safely
+            # (design: report non-compliance, never escalate to explicit teardown), and
+            # even a compliant one is not removed by this updater — per-app teardown
+            # belongs to the app-scoped executor, so the honest answer is to refuse
+            # before the checkout rather than to leave the app silently behind.
+            lifecycle = committed.get("lifecycle")
+            if not isinstance(lifecycle, dict) or not lifecycle.get("deactivate"):
+                fail(f"managed removal for {app_id!r} has no recorded deactivator",
+                     "removal-no-deactivator")
+            policy = (catalog_by_id.get(app_id) or {}).get("policy")
+            reason = {
+                "blocked": "removal-blocked-policy",
+                "available": "removal-deselected",
+            }.get(policy, "removal-app-absent")
+            fail(f"managed removal for {app_id!r} is not executed by the updater "
+                 f"(catalog policy {policy!r})", reason)
+        old_authority = committed.get("managed_authority")
+        package = lock_by_id[app_id]
+        if (not isinstance(old_authority, dict)
+                or not digest_re.fullmatch(str(old_authority.get("package_digest")))):
+            fail(f"installed managed identity for {app_id!r} is ambiguous",
+                 "installed-identity-ambiguous")
+        if (old_authority["package_digest"] != package.get("digest")
+                and package.get("data_compatibility") == "maintenance-required"):
+            fail(f"managed app {app_id!r} requires an operator-owned maintenance procedure",
+                 "upgrade-maintenance-required")
+
+if selected_output is not None:
+    fd = os.open(
+        selected_output,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(("".join(app_id + "\n" for app_id in sorted(selected))).encode())
+        handle.flush()
+        os.fsync(handle.fileno())
+PY
+}
+
+# Importing a new organisation snapshot is exactly what a subscription lapse or an
+# unenrollment stops, on every path that imports one.  Already-accepted cached releases
+# are never gated here.
+managed_refresh_admitted_or_die() { # <scratch> <checkout>
+  managed_access_status "$1" "$2" "$1/access-before-refresh.json" \
+    || die "reason=organization-access-unknown 고정된 managed access 상태를 읽지 못했습니다"
+  managed_access_admits_refresh "$1/access-before-refresh.json" \
+    || die "reason=organization-access-$(managed_access_field "$1/access-before-refresh.json" status) 조직 snapshot 갱신이 허용되지 않는 상태입니다 — 파일을 바꾸지 않았습니다"
+}
+
+managed_access_status() { # <scratch> <checkout> <new-private-file>
+  managed_capture "$3" python3 "$2/bin/airlock-managed-state" inspect-installed-access
+}
+
+managed_access_field() { # <access-json> <status|organization_snapshots_allowed>
+  python3 - "$1" "$2" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_bytes())[sys.argv[2]]
+if isinstance(value, bool):
+    print("true" if value else "false")
+    raise SystemExit(0)
+if not isinstance(value, str) or re.fullmatch(r"[a-z-]{1,32}", value) is None:
+    raise SystemExit(2)
+print(value)
+PY
+}
+
+managed_access_admits_refresh() { # <access-json>
+  python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+if (value.get("status") != "active"
+        or value.get("organization_snapshots_allowed") is not True):
+    raise SystemExit(2)
+PY
+}
+
+# A digest this box never accepted has no directory in the fixed store.  Saying that
+# plainly is what a locked Install button needs; the verified resolve still decides
+# whether a present directory is usable.
+managed_cached_release_present() { # <context> <snapshot-digest>
+  python3 - "$1" "$2" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+context = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+digest = sys.argv[2]
+if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit(2)
+release = pathlib.Path(context["store_path"]) / "releases" / digest.removeprefix("sha256:")
+if not release.is_dir() or release.is_symlink():
+    raise SystemExit(2)
+PY
+}
+
+managed_refresh_installed() { # <scratch> <complete-signed-release-dir>
+  local scratch="$1" source="$2" at
+  managed_utc_now "$scratch/refresh-at" || return 2
+  IFS= read -r at <"$scratch/refresh-at" || return 2
+  managed_capture "$scratch/refresh-verify.json" \
+    python3 "$scratch/frozen-airlock-managed-release" verify --stage "$source" --signed \
+      --authority "$(managed_context_field "$scratch/managed-context.json" authority_path)" \
+      --at "$at" || return 2
+  managed_capture "$scratch/refresh-installed.json" \
+    python3 bin/airlock-managed-state refresh-installed --source "$source" --at "$at" \
+    || return 2
+  python3 - "$scratch/refresh-verify.json" "$scratch/refresh-installed.json" <<'PY'
+import json
+import pathlib
+import sys
+
+verified = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+refreshed = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
+if (refreshed.get("snapshot_digest") != verified.get("snapshot_digest")
+        or refreshed.get("access_status") != "active"):
+    raise SystemExit(2)
+PY
+}
+
+# The store view the Apps & updates surface renders.  Every row is derived from the
+# verified cache and the ledger, never from a catalog read alone: the candidate is the
+# channel's current release, the installed identity is what the ledger committed, and
+# the action is what the updater would actually run for it.  An app on the release it
+# already runs offers nothing.
+managed_store_status() { # <scratch> <checkout>
+  local scratch="$1" root="$2" context="$1/managed-context.json" at predecessor=""
+  managed_utc_now "$scratch/status-at" || return 2
+  IFS= read -r at <"$scratch/status-at" || return 2
+  managed_capture "$scratch/status-current.json" \
+    python3 "$scratch/frozen-airlock-managed-release" resolve-current \
+      --store "$(managed_context_field "$context" store_path)" \
+      --channel "$(managed_context_field "$context" channel_id)" \
+      --authority "$(managed_context_field "$context" authority_path)" --at "$at" || return 2
+  managed_capture "$scratch/status-current-cached.json" \
+    python3 "$root/bin/airlock-managed-state" resolve-installed-cached \
+      --snapshot-digest "$(managed_current_snapshot_digest "$scratch/status-current.json")" \
+      --at "$at" || return 2
+  managed_capture "$scratch/status-access.json" \
+    python3 "$root/bin/airlock-managed-state" inspect-installed-access || return 2
+  predecessor="$(python3 - "$scratch/status-current.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+current = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+raw = pathlib.Path(current["promotion_receipt_path"]).read_bytes()
+if "sha256:" + hashlib.sha256(raw).hexdigest() != current["promotion_receipt_digest"]:
+    raise SystemExit(2)
+print(json.loads(raw).get("previous_snapshot_digest") or "")
+PY
+)" || return 2
+  : >"$scratch/status-predecessor.json"
+  if [ -n "$predecessor" ]; then
+    python3 "$root/bin/airlock-managed-state" resolve-installed-cached \
+      --snapshot-digest "$predecessor" --at "$at" >"$scratch/status-predecessor.json" \
+      2>/dev/null || : >"$scratch/status-predecessor.json"
+  fi
+  python3 - "$context" "$scratch/status-current.json" "$scratch/status-current-cached.json" \
+    "$scratch/status-predecessor.json" "$scratch/status-access.json" "$at" \
+    "$(platform)" "$(uname -m)" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+(context_path, current_path, cached_path, predecessor_path, access_path, at,
+ host_os, host_arch) = sys.argv[1:]
+
+def load(path):
+    return json.loads(pathlib.Path(path).read_bytes())
+
+def moment(value):
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+context, current, cached, access = (load(context_path), load(current_path),
+                                    load(cached_path), load(access_path))
+predecessor_raw = pathlib.Path(predecessor_path).read_bytes()
+predecessor = json.loads(predecessor_raw) if predecessor_raw.strip() else None
+release = pathlib.Path(current["release_path"])
+catalog = json.loads((release / "catalog.json").read_bytes())
+lock = json.loads((release / "release.lock").read_bytes())
+state = load(context["state_path"])
+host_os = host_os.lower()
+host_arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(host_arch.lower(), host_arch.lower())
+host_profile = f"{host_os}-{host_arch}"
+
+ledger_path = pathlib.Path(os.environ.get(
+    "AIRLOCK_STATE_DIR", pathlib.Path.home() / ".local/state/airlock")) / "app-ledger.json"
+entries = json.loads(ledger_path.read_bytes()).get("entries", {}) if ledger_path.is_file() else {}
+ceilings = state.get("capability_ceilings") or {}
+packages = {row["id"]: row for row in lock.get("packages", [])}
+
+apps = []
+for row in catalog.get("apps", []):
+    app_id, policy = row["id"], row["policy"]
+    package = packages.get(app_id)
+    committed = ((entries.get(app_id) or {}).get("committed") or {})
+    authority = committed.get("managed_authority") or {} if committed.get("source_class") == "managed" else {}
+    installed_digest = authority.get("package_digest")
+    candidate_digest = package["digest"] if package else None
+    bundle_cached = bool(package) and (release / package["path"]).is_dir()
+    action, locked = "none", None
+    if policy == "blocked":
+        locked = "removal-blocked-policy" if installed_digest else "policy-blocked"
+    elif host_os not in row["compatibility"]["platforms"] or host_profile not in row["compatibility"]["profiles"]:
+        locked = "app-host-incompatible"
+    elif not bundle_cached:
+        locked = "bundle-not-cached"
+    elif not set(package["capabilities"]) <= set(ceilings.get(app_id) or []):
+        locked = "capability-over-ceiling"
+    elif installed_digest is None:
+        action = "install"
+    elif installed_digest != candidate_digest:
+        if package["data_compatibility"] == "maintenance-required":
+            locked = "upgrade-maintenance-required"
+        else:
+            action = "update"
+    apps.append({
+        "action": action if locked is None else "none",
+        "bundle_cached": bundle_cached,
+        "candidate_digest": candidate_digest,
+        "id": app_id,
+        "installed_digest": installed_digest,
+        "installed_snapshot_digest": authority.get("snapshot_digest"),
+        "locked_reason": locked,
+        "name": (row.get("metadata") or {}).get("name"),
+        "policy": policy,
+        "source_label": row.get("source_label"),
+        "version": (row.get("metadata") or {}).get("version"),
+    })
+
+refreshed_at = cached["promoted_at"]
+view = {
+    "access": access,
+    "apps": apps,
+    "channel_id": current["channel_id"],
+    "current": {
+        "cache_age_seconds": int((moment(at) - moment(refreshed_at)).total_seconds()),
+        "epoch": current["epoch"],
+        "publisher_id": current["publisher_id"],
+        "refreshed_at": refreshed_at,
+        "sequence": current["sequence"],
+        "snapshot_digest": current["snapshot_digest"],
+    },
+    "measured_at": at,
+    "organization_id": current["organization_id"],
+    "recovery_predecessor": None if predecessor is None else {
+        "cached": bool(predecessor.get("cached")),
+        "refreshed_at": predecessor.get("promoted_at"),
+        "snapshot_digest": predecessor.get("snapshot_digest"),
+    },
+    "schema": "airlock.update-channel.status/v1",
+}
+sys.stdout.write(json.dumps(view, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n")
+PY
+}
+
+managed_transaction_phase() { # <installed-state-dir>
+  python3 - "$1" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1]) / "install-transaction.json"
+if path.is_symlink() or not path.is_file():
+    raise SystemExit(2)
+value = json.loads(path.read_bytes())
+phase = value.get("phase")
+if not isinstance(phase, str) or re.fullmatch(r"[a-z_]{1,32}", phase) is None:
+    raise SystemExit(2)
+print(phase)
+PY
+}
+
+# The ledger's transaction record is the app-scoped executor's own receipt, and it is
+# overwritten by the next install.  A managed run therefore freezes its outcome next to
+# the installed state: which release was requested, which publisher authorized it, what
+# was installed before and after, and the executor's per-app receipts exactly as the
+# ledger wrote them.  This is the record a fleet or store surface reads; it is not a
+# second source of truth and it never re-derives what the ledger already decided.
+write_update_channel_receipt() { # <state-dir> <outcome> <context> <scratch> <before> <after> <update-rc> <phase>
+  python3 - "$@" <<'PY'
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+
+(state_dir, outcome, context_path, scratch, before, after, update_rc, phase) = sys.argv[1:]
+state_dir, scratch = pathlib.Path(state_dir), pathlib.Path(scratch)
+context_path = pathlib.Path(context_path)
+
+def fail(message):
+    print(f"airlock-update managed receipt: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def canonical(value):
+    return (json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                       sort_keys=True) + "\n").encode()
+
+def load(path, label):
+    try:
+        return json.loads(path.read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"cannot read {label}: {exc}")
+
+def managed_identities(ledger):
+    """Every managed app the ledger has committed, and the release it came from."""
+    rows = {}
+    for app_id, entry in sorted((ledger.get("entries") or {}).items()):
+        committed = (entry or {}).get("committed") or {}
+        if committed.get("source_class") != "managed":
+            continue
+        authority = committed.get("managed_authority") or {}
+        rows[app_id] = {
+            "package_digest": authority.get("package_digest"),
+            "snapshot_digest": authority.get("snapshot_digest"),
+        }
+    return rows
+
+if outcome not in {"installed", "recovered", "recovery-failed", "recovery-required"}:
+    fail(f"unsupported outcome {outcome!r}")
+if re.fullmatch(r"[0-9a-f]{0,40}", before) is None or re.fullmatch(r"[0-9a-f]{0,40}", after) is None:
+    fail("checkout revisions are not lowercase Git object names")
+context = load(context_path, "managed context")
+current = load(scratch / "current-release-before.json", "requested current release")
+requested = {key: current.get(key) for key in (
+    "epoch", "promotion_receipt_digest", "publisher_id", "publisher_key_id",
+    "sequence", "snapshot_digest", "target_profile",
+)}
+if not isinstance(requested["snapshot_digest"], str):
+    fail("requested release has no snapshot digest")
+
+previous_state = (scratch / "app-ledger.json.state").read_text().strip()
+previous = (managed_identities(load(scratch / "app-ledger.json", "pre-update ledger"))
+            if previous_state == "present" else {})
+installed_path = state_dir / "app-ledger.json"
+installed = (managed_identities(load(installed_path, "installed ledger"))
+             if installed_path.is_file() and not installed_path.is_symlink() else {})
+
+transaction_path = state_dir / "install-transaction.json"
+transaction = {"phase": phase, "present": False}
+if transaction_path.is_file() and not transaction_path.is_symlink():
+    raw = transaction_path.read_bytes()
+    value = json.loads(raw)
+    transaction = {
+        "app_receipts": value.get("app_receipts"),
+        "managed_authorities": value.get("managed_authorities"),
+        "managed_authority_sha256": value.get("managed_authority_sha256"),
+        "phase": value.get("phase"),
+        "present": True,
+        "record_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    if transaction["phase"] != phase:
+        fail(f"transaction phase changed under the receipt: {transaction['phase']} != {phase}")
+
+receipt = {
+    "actor": {
+        "channel_actor": "update-channel",
+        "gid": os.getegid(),
+        "role": "box-owner",
+        "uid": os.geteuid(),
+    },
+    "at": datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z"),
+    "channel_id": context.get("channel_id"),
+    "checkout": {"after": after, "before": before},
+    "enrollment_digest": context.get("enrollment_digest"),
+    "installed_managed": installed,
+    "organization_id": context.get("organization_id"),
+    "outcome": outcome,
+    "previous_managed": previous,
+    "requested_release": requested,
+    "root_key_id": context.get("root_key_id"),
+    "schema": "airlock.update-channel.receipt/v1",
+    "transaction": transaction,
+    "update_rc": int(update_rc),
+}
+receipt["receipt_digest"] = hashlib.sha256(canonical(receipt)).hexdigest()
+raw = canonical(receipt)
+
+directory = state_dir / "update-channel-receipts"
+try:
+    # The installer normally created the state directory already; a first managed
+    # run on a box whose installer never wrote state still owns a private record.
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.mkdir(mode=0o700, exist_ok=True)
+except OSError as exc:
+    fail(f"cannot create the receipt directory: {exc}")
+stamp = receipt["at"].replace(":", "").replace("-", "")
+name = f"{stamp}-{requested['snapshot_digest'].removeprefix('sha256:')[:12]}-{outcome}.json"
+target = directory / name
+for attempt in range(1, 100):
+    candidate = target if attempt == 1 else target.with_name(f"{target.stem}.{attempt}.json")
+    try:
+        fd = os.open(
+            candidate,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except FileExistsError:
+        continue
+    except OSError as exc:
+        fail(f"cannot create the receipt: {exc}")
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+    print(str(candidate))
+    raise SystemExit(0)
+fail("cannot find a free receipt name")
+PY
+}
+
+managed_current_snapshot_digest() { # <current-release-json>
+  python3 - "$1" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_bytes()).get("snapshot_digest")
+if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
     raise SystemExit(2)
 print(value)
 PY
@@ -1136,7 +2321,7 @@ run_managed_installer() { # <context> <scratch> <repository> <revision> <config-
     "$scratch/effective.toml" "$scratch/config-receipt.json" \
     "$scratch/next-airlock-managed-release" "$revision" \
     "$scratch/update-channel-handoff.json" "$scratch/selected-apps" \
-    "$scratch/update-channel-handoff.sha256" \
+    "$scratch/update-channel-handoff.sha256" "$scratch/preflight-selected" \
     || { say "managed UPDATE_CHANNEL handoff 결속을 완성하지 못했습니다"; return 2; }
   IFS= read -r managed_handoff_sha <"$scratch/update-channel-handoff.sha256" \
     || { say "managed handoff digest 를 읽지 못했습니다"; return 2; }
@@ -1178,7 +2363,7 @@ with os.fdopen(fd, "w", encoding="ascii", newline="") as handle:
 PY
 }
 
-build_managed_handoff() { # context measurement current-before current config receipt next revision handoff apps digest
+build_managed_handoff() { # context measurement current-before current config receipt next revision handoff apps digest preflight
   python3 - "$@" <<'PY'
 import hashlib
 import json
@@ -1190,7 +2375,7 @@ import sys
 
 (context_path, measurement_path, before_path, current_path, config_path,
  receipt_path, next_path, revision, handoff_path, apps_path,
- handoff_digest_path) = sys.argv[1:]
+ handoff_digest_path, preflight_selected_path) = sys.argv[1:]
 paths = [pathlib.Path(value) for value in (
     context_path, measurement_path, before_path, current_path, config_path,
     receipt_path, next_path, handoff_path, apps_path, handoff_digest_path,
@@ -1338,6 +2523,10 @@ for row in packages:
     selected.append(row["id"])
 if selected != sorted(set(selected)):
     fail("managed selected app ids are not sorted and unique")
+# The policy decision and the installer input are two derivations of one desired state.
+# Bind them: a config receipt naming apps the preflight never judged is a refusal.
+if pathlib.Path(preflight_selected_path).read_text().split() != selected:
+    fail("config receipt apps differ from the preflight decision")
 
 next_sha = raw_hash(next_path)
 handoff = {
@@ -1907,6 +3096,20 @@ snapshot_box_state() { # snapshot_box_state <root> <machine> <out> [state-dir]
 
 snapshot_hash() { git hash-object --stdin <"$1"; }
 
+sha256_file() {
+  python3 - "$1" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+digest = hashlib.sha256()
+with pathlib.Path(sys.argv[1]).open("rb") as handle:
+    for block in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(block)
+print(digest.hexdigest())
+PY
+}
+
 capture_failed_state() { # <root> <machine> <recovery-dir>
   local root="$1" machine="$2" dir="$3" state_dir name
   local failed="$dir/failed"
@@ -1958,6 +3161,17 @@ arm_recovery() { # <dir> <scratch> <before> <config-path> <platform> <machine>
               airlock-update; do
     cp -- "$scratch/$name" "$staged/$name" || die "복구 기록을 보존하지 못했습니다: $name"
   done
+  mkdir -p "$staged/lease-tools/bin" "$staged/lease-tools/install" \
+    || die "복구용 live-box lease 도구 디렉터리를 만들지 못했습니다"
+  local relative
+  for relative in bin/airlock-ledger install/lib.sh install/preflight.sh; do
+    cp -- "$AIRLOCK_UPDATE_ACTIVE_LEASE_TOOLS_ROOT/$relative" \
+      "$staged/lease-tools/$relative" \
+      || die "복구용 live-box lease 도구를 보존하지 못했습니다: $relative"
+    sha256_file "$staged/lease-tools/$relative" \
+      >"$staged/lease-tools/$relative.sha256" \
+      || die "복구용 live-box lease 도구 해시를 보존하지 못했습니다: $relative"
+  done
   for name in app-ledger.json plaintext-retirement.json airlock.lock; do
     if [ "$(cat "$scratch/$name.state")" = present ]; then
       cp -- "$scratch/$name" "$staged/$name" || die "복구 기준을 보존하지 못했습니다: $name"
@@ -1976,6 +3190,14 @@ arm_recovery() { # <dir> <scratch> <before> <config-path> <platform> <machine>
   done
   printf '%s\n' checkout-pending >"$staged/phase"
   chmod 0600 "$staged"/* || die "복구 기록 권한을 좁히지 못했습니다"
+  chmod 0700 "$staged/lease-tools" "$staged/lease-tools/bin" "$staged/lease-tools/install" \
+    || die "복구용 live-box lease 디렉터리 권한을 좁히지 못했습니다"
+  chmod 0500 "$staged/lease-tools/bin/airlock-ledger" \
+    || die "복구용 live-box lease ledger 권한을 좁히지 못했습니다"
+  chmod 0400 "$staged/lease-tools/bin/airlock-ledger.sha256" \
+    "$staged/lease-tools/install/lib.sh.sha256" \
+    "$staged/lease-tools/install/preflight.sh.sha256" \
+    || die "복구용 live-box lease 도구 해시 권한을 좁히지 못했습니다"
   git update-ref refs/airlock-update/rollback "$before" \
     || die "업데이트 전 Git 객체를 복구용으로 고정하지 못했습니다"
   if ! mv -- "$staged" "$dir"; then
@@ -2145,11 +3367,13 @@ ROLLBACK_TEARDOWN
 }
 
 rollback_update() { # <root> <machine-option> <machine-marker>
-  local root="$1" requested_machine="$2" marker="$3" git_dir dir phase before after
+  local root="$1" requested_machine="$2" marker="$3" git_dir git_common_dir dir phase before after
   local saved_platform saved_machine machine head parent dirty config_path state_dir rc=0
   git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" \
     || die "git 메타데이터 경로를 읽지 못했습니다"
-  acquire_update_mutex "$git_dir"
+  git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || die "공통 git 메타데이터 경로를 읽지 못했습니다"
+  acquire_update_mutex "$git_common_dir"
   dir="$git_dir/airlock-update-rollback"
   if [ ! -d "$dir" ] || [ -L "$dir" ]; then
     die "되돌릴 실패 업데이트 기록이 없습니다"
@@ -2402,4 +3626,5 @@ $(printf '%s' "$found" | grep . | sed 's/^/         /')
 
 main "$@"
 }
+unset AIRLOCK_UPDATE_CAPSULE_ROOT
 airlock_update_program "$@"

@@ -219,8 +219,19 @@ grep -q 'return 301 https://\$host'                <<<"$SITE" && bad "redirect a
 # the redirect server must carry no content and no gate — only the 301
 awk '/listen 127.0.0.1:19903;/{f=1} f&&/proxy_pass|root |try_files/{print "leak"} f&&/^}/{f=0}' <<<"$SITE" \
   | grep -q leak && bad "redirect server serves content" || ok "redirect server serves only the 301"
-grep -q 'include .*/servers.d/\*.conf;'            <<<"$SITE" && ok "servers.d include" || bad "servers.d include"
-grep -q 'include .*/hub-locations.d/\*.conf;'      <<<"$SITE" && ok "hub-locations.d include" || bad "hub-locations include"
+if grep -q 'include .*/servers.d/\*.conf;' <<<"$SITE" \
+   || grep -q 'include .*/hub-locations.d/\*.conf;' <<<"$SITE"; then
+  bad "fragment globs were not removed"
+else
+  ok "canonical render does not glob servers.d or hub-locations.d"
+fi
+printf 'server { listen 127.0.0.1:19925; }\n' >"$AIRLOCK_CONFD/servers.d/publish-doc-gate.conf"
+SITE_EXTRA="$(bash "$HERE/render-nginx.sh" 2>"$TMP/err-extra")" || { bad "render with manual fragment exited"; cat "$TMP/err-extra"; }
+if grep -q 'servers.d/publish-doc-gate.conf;' <<<"$SITE_EXTRA"; then
+  bad "manual listener outside canonical app ids is still included"
+else
+  ok "manual listener outside canonical app ids is not included"
+fi
 grep -q '@@' <<<"$SITE" && bad "no unresolved placeholder" || ok "no unresolved placeholder"
 
 # Generate the actual local-mode fragment. This guards the installer template,

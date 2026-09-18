@@ -27,6 +27,11 @@ Environment=AIRLOCK_ACCOUNTS_PANEL_DIR=@PANEL_DIR@
 Environment=AIRLOCK_ACCOUNTS_PANEL_STYLE_DIR=@PANEL_STYLE_DIR@
 Environment=AIRLOCK_HUB_FLEET_STORE=@FLEET_STORE@
 Environment=AIRLOCK_HUB_FLEET_STORE_URL=@FLEET_STORE_URL@
+# Empty = the xAI routes answer {"enabled": false}. Set only when hub.xai is true.
+Environment=AIRLOCK_OPENCODE_BIN=@OPENCODE_BIN@
+# Antigravity CLI for the quota row. Empty = no agy on this box; the row says so.
+Environment=AIRLOCK_AGY_BIN=@AGY_BIN@
+Environment=AIRLOCK_AGY_USAGE_BIN=@AGY_USAGE_BIN@
 ExecStart=@PYTHON@ "@AIRLOCK_ROOT@/bin/airlock-accounts-api"
 Restart=on-failure
 RestartSec=2

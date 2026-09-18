@@ -1,14 +1,25 @@
-# paseo patches — AGPL-3.0-only
+# paseo patches — AGPL-3.0-only (our own choice, on an Apache-2.0 base)
 
 **License: `AGPL-3.0-only`** — marked separately from the repo's own AGPL-3.0,
 because the basis is different (see below).
 
 Paseo (`@getpaseo/cli`, upstream https://github.com/getpaseo/paseo) is licensed
-**AGPL-3.0**. The files in this directory modify Paseo's own bundle, so they are
-**derivative works of Paseo** and are licensed **AGPL-3.0-only** on that basis —
-independently of the licence the rest of Airlock happens to carry. Since
-2026-09-08 the rest of Airlock is also AGPL-3.0, but by the copyright holder's own
-choice; if that ever changed, these files would still be AGPL-3.0-only.
+**Apache License, Version 2.0** (changed from AGPL-3.0 as of upstream `v0.7`;
+confirmed against the upstream `LICENSE` file at the pinned `v0.8.0` tag). The
+files in this directory modify Paseo's own bundle, so they are **derivative
+works of Paseo**. Apache-2.0 §4(b) lets a licensee "provide additional or
+different license terms and conditions for use, reproduction, or distribution
+of Your modifications" — we exercise that permission and license our own
+modifications **AGPL-3.0-only**, independently of the licence the rest of
+Airlock happens to carry, for the same reason the core itself is AGPL-3.0:
+the copyright holder's own choice, not an inherited requirement from Paseo.
+The portions of each patched file that remain upstream's own unmodified work
+are still covered by upstream's Apache-2.0 grant — its full text is vendored
+at `UPSTREAM-LICENSE` beside this file, per Apache-2.0 §4(a)'s requirement to
+give recipients a copy of the License. Before upstream `v0.7` these files were
+derivatives of an AGPL-3.0 work and had no choice in the matter; the AGPL-3.0
+election here is now made *by us*, and would remain AGPL-3.0-only even if
+upstream changed licence again.
 
 ## What is here
 
@@ -22,16 +33,6 @@ choice; if that ever changed, these files would still be AGPL-3.0-only.
   across restarts (zod strips unknown keys); the two halves are safe in either order and alone.
   Same discipline as the others: sentinel, all-or-nothing anchors, `node --check`, plus a behaviour
   check that drives the candidate with stub seats before it is installed.
-
-- **`finish-notification-queue.mjs`** (+ `.patch`, `.test.mjs`) — a child's finish notification takes
-  Paseo's unguarded prompt path and interrupts its parent's running turn mid-tool. The patch queues
-  finish notifications (only those) durably per parent while the parent is running, and delivers
-  them as one message once the parent's turn ends normally — not after a cancel. Delivery uses the
-  non-replacing path only: if another send opens a turn between the idle check and the send, the
-  notification goes back to the queue instead of interrupting that turn (v1 interrupted it; the patcher
-  upgrades a v1-applied file in place). Queue failure
-  drops rather than interrupts; a crash-left lease is marked uncertain and never re-sent. Residual:
-  after a daemon restart the queue is resumed when that parent next sets up a child notification.
 
 - **`depth4-search.patch`** — caps the add-project name search to `maxDepth: 4`
   (paseo's default full-scans `$HOME` and times out on a large home). This is the
@@ -57,6 +58,17 @@ choice; if that ever changed, these files would still be AGPL-3.0-only.
   Decomposes the array into entry blocks and refuses to write unless they
   reassemble byte-for-byte, so an upstream format change skips instead of
   mangling the file. Edit `PRUNE_IDS` to change which models are hidden.
+
+- **`opencode-grok-defaults.mjs`** (+ `opencode-grok-defaults.patch`, the reference copy)
+  — OpenCode's catalog order treats the first variant key as the thinking default
+  (`low`) and lists models in provider-catalog order, not Airlock's preference. The
+  patch sorts the picker so `opencode-go/muse-spark-1.3-contributor` is first,
+  `xai/grok-4.6` second, and `xai/grok-build-0.1` third, and moves each of their
+  thinking defaults (`xhigh` for muse-spark, `high` for grok-4.6) to the front so new
+  sessions start there. muse-spark's `xhigh` is the top of the models.dev catalog
+  (which stops at `xhigh`); the earlier box-local `max` variant was rejected by the
+  provider, so no box-local variant is needed. Picker/create-form only: an already-running
+  agent's model and thinking stay on the session record. Both anchors or none.
 
 - **`provider-subagent-stream-filter.mjs`** (+ reference patch and behavior test)
   — Paseo 0.2.5 forwards `agent.provider_subagents.update` through connection-wide
@@ -120,29 +132,42 @@ choice; if that ever changed, these files would still be AGPL-3.0-only.
   half-fix). The behaviour check spawns real detached processes and asserts the shipped
   sweep reaps a survivor, because this is the half that signals other processes.
 
-- **`credential-key-preservation.mjs`** (+ `credential-key-preservation-{claude,codex}.patch`,
-  the reference copies) — paseo's quota fetchers refresh the OAuth token when the usage
-  API answers 401/403, and they write it back through a zod `z.object`, which **strips
-  unknown keys at every level**. So the write-back does not update the credential file,
-  it replaces it with the four fields the schema happens to name.
-  `~/.claude/.credentials.json` loses `claudeAiOauth.expiresAt`, `refreshTokenExpiresAt`
-  and `scopes` — and the whole top-level `_meta` block (email/org/kind) our account
-  switcher reads. `~/.codex/auth.json` loses `tokens.id_token` and the top-level
-  `auth_mode` / `OPENAI_API_KEY` / `last_refresh` (the field that says whether a green
-  Codex panel is backed by a token that is actually alive). Both write paths sit inside
-  a bare `catch {}`, so the loss is silent. The patch merges the refreshed token fields
-  into the object **parsed from disk** instead of into zod's output, and gives the claude
-  side's swallowed catch a `logger.warn` (the codex provider is constructed without a
-  logger). Data preservation only: refresh timing and the 401/403 trigger are untouched,
-  and the stale `expiresAt` is preserved rather than recomputed — a past expiry makes
-  Claude Code refresh on its own next call, an absent one leaves its state ambiguous.
-  Two independent targets, one invocation each (`claude` / `codex`); anchors must be
-  present **and** unique or it exits 20. `credential-key-preservation.test.mjs` is the
-  behaviour check — it slices each save method back out of the installed bundle and drives
-  it against an in-memory fs and invented fixtures, because "what survives a write-back"
-  is precisely what a text anchor cannot assert. It never reads a real credential file.
-  Verify after install:
-  `node credential-key-preservation.test.mjs claude <installed>/quota-fetcher/providers/claude.js`.
+- **`acp-context-gauge.mjs`** (+ `.test.mjs`) — agy runs over Paseo's generic ACP
+  provider. `usage_update` is parsed and dropped (`handleUsageUpdate` was `void
+  update;`) — no context-window gauge for any ACP provider. `handlePromptResponse`
+  then OVERWRITES `currentTurnUsage` at turn end instead of merging, so even a turn
+  that did see a mid-turn `usage_update` loses those fields the moment it ends. A
+  `config_option_update` that only touches model or thinking reassigns
+  `availableModes` from a mode-state-less `deriveModesFromACP` call, blanking any
+  mode list that came from `session/new` rather than a config option. And an ACP
+  agent's own advertised unattended mode (`_meta.paseo.isUnattended`) never reaches
+  the mode list or the catalog probe's `defaultModeId`. Five edit sites, one file,
+  same discipline as the others: sentinel, all-or-nothing anchors, `node --check`,
+  plus a behaviour test that drives the extracted methods directly (merge-not-
+  overwrite, mode-list survival, event shape).
+
+- **`acp-cross-provider-mode-default.mjs`** (+ `.test.mjs`) — once a generic ACP
+  agent (agy) advertises modes, `paseo run --provider agy` with no `--mode` from an
+  **attended** agent of a *different* provider is refused ("cannot inherit mode").
+  The base `ACPAgentClient` already bypasses this, but only for an unattended create
+  or an unattended parent (`resolveACPCreateConfig`, `acp-agent.js`) — attended
+  cross-provider callers still hit the throw. A plain method override on
+  `GenericACPAgentClient` would be dead code against 0.8.0: the base constructor
+  assigns `this.resolveCreateConfig` as an *own instance property*, which always
+  shadows a subclass's same-named prototype method. The patch instead captures that
+  already-assigned function in the subclass constructor and wraps it — bypass for
+  the attended-cross-provider-no-mode case, fall through to the captured base
+  function (preserving its auto-accept feature-value injection) otherwise. Same
+  codebase pattern the base class itself already uses for provider dispatch.
+
+- **`acp-model-rejection.mjs`** (+ `.test.mjs`) — rejects unavailable legacy
+  models and model config choices with an error after the existing warning.
+  This prevents AgentManager from recording a requested model that the ACP
+  consumer did not select. Tests drive the real bundled selection helpers,
+  session methods, and manager method; invalid choices preserve previous state,
+  while valid choices reach the ACP connection. The ACP module is not pinned in
+  `INSTALLED_SHA256SUMS`, so this follows the existing install-time ACP overlays
+  without rebaking the vendor bundle.
 
 - **`anchor-manifest.json`** — records the pinned Paseo/web-ui version, the pristine
   web-ui SHA, the **shape table** (every bundle state the fleet is known to carry: the
@@ -150,6 +175,13 @@ choice; if that ever changed, these files would still be AGPL-3.0-only.
   bundle anchors, and the guard-before-group dependency. The offline drift test compares
   the shape table against `patch-web-ui.js` as data and checks that the manifest still
   agrees with the installer and patcher sources; it does not vendor any upstream bundle.
+  `paseo_version` tracks `install.sh`'s pin (checked independently); `web_ui.*` tracks
+  `patch-web-ui.js`'s own `PINNED_SHA`/`PINNED_VERSION`/`KNOWN_BUNDLE_SHAPES` (checked
+  independently too) — the two can legitimately lag each other, as they do right now:
+  `paseo_version` is `0.8.0` but `web_ui.*` still describes the 0.2.5 web-ui bundle,
+  because the web-ui patcher's 10 anchors have not been re-derived yet (tracked
+  follow-up — see `../vendor/guarded-0.8.0/README.md`). Once that lands, `web_ui.*`
+  and `patch-web-ui.js`'s constants move together.
 
 The browse-host sidecar carries one more AGPL derivative outside this directory:
 **`../browse-host/bin/patch-web-ui.js`** (`SPDX-License-Identifier:
@@ -172,21 +204,30 @@ aggregation*: Paseo's licence does not reach them. Only the modifications **to
 Paseo itself** (here) are derivatives.
 
 Since 2026-09-08 the core is AGPL-3.0 too, chosen by the copyright holder rather
-than inherited. Keeping the two reasons apart still matters — it is what lets the
-holder relicense their own code later, which they could not do for these files.
+than inherited. Keeping the two reasons apart still matters — the core's licence
+was always the holder's to choose; for these files, Apache-2.0 §4(b) is *why*
+there is a choice to make at all (a pre-`v0.7` AGPL-3.0 upstream would have left
+none).
 
-> This is not legal advice. Confirm against the AGPL-3.0 terms — and consider
-> asking the Paseo maintainers for explicit interop guidance — before publishing.
+> This is not legal advice. Confirm against the Apache-2.0 and AGPL-3.0 terms —
+> and consider asking the Paseo maintainers for explicit interop guidance —
+> before publishing.
 
 ## AGPL §13 (network use)
 
-If you offer a modified Paseo to users over a network, AGPL-3.0 requires you to
-offer them the corresponding source. Operators of an Airlock deployment that
-exposes Paseo are responsible for this.
+Because we license these patches (and the web-ui patcher) AGPL-3.0-only by our
+own choice, AGPL-3.0 §13 attaches to them regardless of Paseo's own upstream
+licence: if you offer a modified Paseo carrying these patches to users over a
+network, AGPL-3.0 requires you to offer them the corresponding source. Airlock's
+own core is independently AGPL-3.0 too (the copyright holder's own choice), so
+this obligation also holds at the whole-product level. Operators of an Airlock
+deployment that exposes Paseo are responsible for this.
 
 ## TODO before public release
 
-- [ ] Vendor the full AGPL-3.0 license text into this directory (`LICENSE`).
+- [x] Vendor the full AGPL-3.0 license text into this directory (`LICENSE`) and
+      the upstream Apache-2.0 text (`UPSTREAM-LICENSE`, required by Apache-2.0
+      §4(a) for the unmodified portions of each patched file).
 - [ ] Audit each patch/anchor to confirm only minimal, interoperability-necessary
       excerpts of Paseo source are reproduced (prefer install-time anchor derivation
       over shipping verbatim upstream lines where feasible).

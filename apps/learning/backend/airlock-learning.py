@@ -2461,6 +2461,10 @@ html[data-learning-reader-legacy-scale] body{font-size:1rem}
    `Canvas`/`CanvasText` 로 칠해져서, 이게 없으면 OS 가 다크인데 문서만 라이트로 고른 순간
    막대만 검은 채로 남는다. */
 html[data-theme=light]{color-scheme:light}html[data-theme=dark]{color-scheme:dark}
+/* 🔴 적재 HTML 이 body 에 둔 읽기 열(`max-width:44rem;margin:auto;padding:0 1.25rem`)은
+   공용 CSS 의 `body{margin:0}` 보다 앞에 있어 가운데 정렬만 죽고 폭 제한은 남는다.
+   본문 폭·옆여백의 주인은 `.doc` 다. `html body` 가 문서 `body` 규칙보다 구체적이다. */
+html body{max-width:none;margin:0;padding-left:0;padding-right:0;padding-bottom:0}
 #learning-reader-toolbar{position:fixed;z-index:2147483646;top:0;left:0;right:0;height:48px;padding:env(safe-area-inset-top) 8px 0;box-sizing:content-box;display:flex;align-items:center;justify-content:flex-start;gap:3px;overflow-x:auto;background:color-mix(in srgb,Canvas 92%,transparent);color:CanvasText;border-bottom:1px solid color-mix(in srgb,CanvasText 16%,transparent);backdrop-filter:blur(18px);font:16px/1 -apple-system,BlinkMacSystemFont,sans-serif}
 #learning-reader-toolbar button{appearance:none;border:0;border-radius:9px;min-width:38px;height:38px;padding:0 7px;background:transparent;color:inherit;font:inherit;cursor:pointer}#learning-reader-toolbar button:hover{background:color-mix(in srgb,CanvasText 9%,transparent)}#learning-reader-toolbar button:disabled{opacity:.35;cursor:default}#learning-reader-font-value{min-width:46px;text-align:center;font-size:12px;font-variant-numeric:tabular-nums}#learning-reader-spacer{height:calc(49px + env(safe-area-inset-top))}
 #learning-reader-toast{position:fixed;z-index:2147483647;left:50%;bottom:28px;transform:translateX(-50%);display:none;max-width:min(86vw,420px);padding:9px 13px;border-radius:999px;color:#fff;background:rgba(28,28,30,.94);font:13px/1.35 -apple-system,BlinkMacSystemFont,sans-serif}
@@ -2567,6 +2571,7 @@ def reader_context(relative):
 def inject_reader_shell(body, context):
     """라이브러리 `/read/` 응답에만 런타임 셸을 씌운다."""
     page = body.decode("utf-8", "replace")
+    page = SAVE.ensure_doc_root(page)
     page, _linked = TIMESTAMP_LINKS.link_timestamps(page, context.get("videoUrl"))
     config = "<script>window.__LEARNING_READER__ = " + script_payload(context) + ";</script>"
     shared_assets = ""

@@ -22,7 +22,10 @@ function extractPatchedMethod(source) {
         throw new Error("target is not patched: sentinel missing");
     }
     const start = source.indexOf("    forwardProviderSubagentUpdate(update) {");
-    const end = source.indexOf("\n    emitProjectUpdate(update) {", start);
+    // 0.8.0: the method already existed upstream and sits before subscribeToAgentEvents,
+    // not before emitProjectUpdate (that was the insertion point the 0.2.5-era patch
+    // added it at, when the method did not exist yet).
+    const end = source.indexOf("\n    subscribeToAgentEvents(", start);
     if (start < 0 || end < 0) {
         throw new Error("target is not patched: forwarding method extraction failed");
     }
@@ -58,6 +61,12 @@ function buildHarness(source, options = {}) {
                 for (const capabilities of this.clientCapabilitiesBySource.values()) {
                     if (!capabilities.has(CLIENT_CAPS.selectiveAgentTimeline)) return false;
                 }
+                return true;
+            }
+            // Item-TYPE capability gating only (notifications/plugin items) — the fixture
+            // rows below are plain assistant_message items, which always return true here,
+            // same as the real method for any item type it does not special-case.
+            supportsTimelineItem(_item, _source) {
                 return true;
             }
             emit(message) {
@@ -223,54 +232,63 @@ function runBehaviorChecks(source) {
     );
 }
 
+// 0.8.0's actual pre-patch shape: upstream already built the per-capability,
+// per-source forwarding method (unlike 0.2.5, which broadcast via a plain
+// this.emit() inside a switch and needed the whole method added). What is
+// still missing, and what this patch adds, is the viewed-parent filter.
 const SYNTHETIC_PRISTINE = `
 const CLIENT_CAPS = { providerSubagents: "provider_subagents", selectiveAgentTimeline: "selective_agent_timeline" };
 export class Session {
-    supportsForSource(capability, source) {
-        return (this.clientCapabilitiesBySource.get(source)?.has(capability) ?? this.supports(capability));
-    }
-    emitProjectUpdate(update) {
-        return update;
-    }
-    handleEvent(event) {
-            if (event.type === "provider_subagent") {
-                if (!this.supports(CLIENT_CAPS.providerSubagents)) {
-                    return;
-                }
-                const update = event.event;
-                if (update.type === "upsert") {
-                    this.emit({
-                        type: "agent.provider_subagents.update",
-                        payload: { kind: "upsert", subagent: update.subagent },
-                    });
-                }
-                else if (update.type === "timeline") {
-                    this.emit({
-                        type: "agent.provider_subagents.update",
-                        payload: {
-                            kind: "timeline",
-                            parentAgentId: update.parentAgentId,
-                            subagentId: update.subagentId,
-                            provider: update.provider,
-                            item: update.row.item,
-                            timestamp: update.row.timestamp,
-                            seq: update.row.seq,
-                            epoch: update.epoch,
-                        },
-                    });
-                }
-                else {
-                    this.emit({
-                        type: "agent.provider_subagents.update",
-                        payload: {
-                            kind: "remove",
-                            parentAgentId: update.parentAgentId,
-                            subagentId: update.subagentId,
-                        },
-                    });
-                }
-                return;
+    forwardProviderSubagentUpdate(update) {
+        let message;
+        if (update.type === "upsert") {
+            message = {
+                type: "agent.provider_subagents.update",
+                payload: { kind: "upsert", subagent: update.subagent },
+            };
+        }
+        else if (update.type === "timeline") {
+            message = {
+                type: "agent.provider_subagents.update",
+                payload: {
+                    kind: "timeline",
+                    parentAgentId: update.parentAgentId,
+                    subagentId: update.subagentId,
+                    provider: update.provider,
+                    item: update.row.item,
+                    timestamp: update.row.timestamp,
+                    seq: update.row.seq,
+                    epoch: update.epoch,
+                },
+            };
+        }
+        else {
+            message = {
+                type: "agent.provider_subagents.update",
+                payload: {
+                    kind: "remove",
+                    parentAgentId: update.parentAgentId,
+                    subagentId: update.subagentId,
+                },
+            };
+        }
+        if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
+            if (this.supports(CLIENT_CAPS.providerSubagents) &&
+                (update.type !== "timeline" || this.supportsTimelineItem(update.row.item))) {
+                this.emit(message);
             }
+            return;
+        }
+        for (const [source, capabilities] of this.clientCapabilitiesBySource) {
+            if (!capabilities.has(CLIENT_CAPS.providerSubagents))
+                continue;
+            if (update.type === "timeline" && !this.supportsTimelineItem(update.row.item, source))
+                continue;
+            this.onMessageToSource(source, message);
+        }
+    }
+    subscribeToAgentEvents() {
+        return null;
     }
 }
 `;

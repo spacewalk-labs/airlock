@@ -637,7 +637,7 @@ def main() -> int:
         if route not in ALLOWED_DEVTERM_ROUTES for method in methods
     }
     p4a_expected = (
-        "retired_404==15 && platform_200==19 && platform_routes==19 && registered_routes==24 "
+        "retired_404==16 && platform_200==20 && platform_routes==20 && registered_routes==24 "
         "&& registered_runtime_200==25 && account_domain_routes==0 && account_domain_200==0"
     )
     p4a_observed = {

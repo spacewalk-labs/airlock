@@ -295,7 +295,7 @@ failure_detail() { printf '%s\n' "$1" | sed 's/^/    /' | tail -n 8; }
 assert_lock_schema_rejected() {
   # assert_lock_schema_rejected <label> <config> <required diagnostic fragment>
   local label="$1" cfg="$2" fragment="$3" out rc
-  out="$(run "$cfg" validate 2>&1)" && rc=0 || rc=$?
+  out="$(run "$cfg" package-info 2>&1)" && rc=0 || rc=$?
   if [ "$rc" -ne 0 ] && grep -Eq 'airlock\.lock|package lock' <<<"$out" \
      && grep -Eq "$fragment" <<<"$out"; then
     ok "lock schema: $label is fatal"
@@ -530,7 +530,14 @@ recorded="$expected"
 printf 'changed\n' >>"$LOCK_CASE/pkg/payload.txt"
 computed="$(tree_digest "$LOCK_CASE/pkg" 2>/dev/null || true)"
 : >"$MARKERS/lockpkg"
-out="$(run "$LOCK_CASE/config/airlock.toml" validate 2>&1)" && mismatch_rc=0 || mismatch_rc=$?
+out="$(run "$LOCK_CASE/config/airlock.toml" validate 2>&1)" && validate_mismatch_rc=0 || validate_mismatch_rc=$?
+if [ "$validate_mismatch_rc" -eq 0 ] && [ ! -s "$MARKERS/lockpkg" ]; then
+  ok "lock: read-only validate does not require a matching package lock"
+else
+  bad "lock: validate stayed a global lock precondition (rc=$validate_mismatch_rc)"
+  failure_detail "$out"
+fi
+out="$(run "$LOCK_CASE/config/airlock.toml" package-info 2>&1)" && mismatch_rc=0 || mismatch_rc=$?
 if [ "$mismatch_rc" -ne 0 ] && [ "$recorded" != "$computed" ] \
    && [[ "$recorded" =~ ^[0-9a-f]{64}$ ]] && [[ "$computed" =~ ^[0-9a-f]{64}$ ]] \
    && grep -Fq "package 'lockpkg'" <<<"$out" \
@@ -738,7 +745,7 @@ fi
 
 printf 'ref: refs/heads/other\n' >"$SEM/pkg/.git/HEAD"
 git_computed="$(tree_digest "$SEM/pkg" 2>/dev/null || true)"
-out="$(run "$SEM/airlock.toml" validate 2>&1)" && git_rc=0 || git_rc=$?
+out="$(run "$SEM/airlock.toml" package-info 2>&1)" && git_rc=0 || git_rc=$?
 printf 'ref: refs/heads/main\n' >"$SEM/pkg/.git/HEAD"
 if [ "$git_rc" -ne 0 ] && [ "$git_computed" != "$semantic_locked" ] \
    && grep -Fq "computed digest: $git_computed" <<<"$out" \
@@ -751,7 +758,7 @@ fi
 
 chmod 0644 "$SEM/pkg/payload.txt"
 mode_computed="$(tree_digest "$SEM/pkg" 2>/dev/null || true)"
-out="$(run "$SEM/airlock.toml" validate 2>&1)" && mode_rc=0 || mode_rc=$?
+out="$(run "$SEM/airlock.toml" package-info 2>&1)" && mode_rc=0 || mode_rc=$?
 chmod 0600 "$SEM/pkg/payload.txt"
 if [ "$mode_rc" -ne 0 ] && [ "$mode_computed" != "$semantic_locked" ] \
    && grep -Fq "computed digest: $mode_computed" <<<"$out" \
@@ -764,7 +771,7 @@ fi
 
 rm "$SEM/pkg/link"; ln -s target-b "$SEM/pkg/link"
 link_computed="$(tree_digest "$SEM/pkg" 2>/dev/null || true)"
-out="$(run "$SEM/airlock.toml" validate 2>&1)" && link_rc=0 || link_rc=$?
+out="$(run "$SEM/airlock.toml" package-info 2>&1)" && link_rc=0 || link_rc=$?
 rm "$SEM/pkg/link"; ln -s target-a "$SEM/pkg/link"
 if [ "$link_rc" -ne 0 ] && [ "$link_computed" != "$semantic_locked" ] \
    && grep -Fq "computed digest: $link_computed" <<<"$out" \
@@ -778,7 +785,7 @@ fi
 cp "$LOCK" "$TMP/special-before"
 mkfifo "$SEM/pkg/forbidden.fifo"
 out_digest="$(tree_digest "$SEM/pkg" 2>&1)" && special_digest_rc=0 || special_digest_rc=$?
-out="$(run "$SEM/airlock.toml" validate 2>&1)" && special_admit_rc=0 || special_admit_rc=$?
+out="$(run "$SEM/airlock.toml" package-info 2>&1)" && special_admit_rc=0 || special_admit_rc=$?
 rm "$SEM/pkg/forbidden.fifo"
 if [ "$special_digest_rc" -ne 0 ] && [ "$special_admit_rc" -ne 0 ] \
    && grep -Fq 'special file is not allowed in package tree' <<<"$out_digest" \
@@ -798,7 +805,7 @@ make_plain_package "$ROOT" rootpkg
 write_config "$SELF/airlock.toml" rootpkg "$ROOT" 2
 write_sentinel_lock
 cp "$LOCK" "$TMP/self-before"
-out="$(run "$SELF/airlock.toml" validate 2>&1)" && self_rc=0 || self_rc=$?
+out="$(run "$SELF/airlock.toml" package-info 2>&1)" && self_rc=0 || self_rc=$?
 if [ "$self_rc" -ne 0 ] && grep -Fq "package 'rootpkg'" <<<"$out" \
    && grep -Fq 'airlock.lock' <<<"$out" \
    && grep -Eq 'stag|self|repository lock' <<<"$out" \

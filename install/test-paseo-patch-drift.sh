@@ -147,13 +147,15 @@ if (!patcher.SUBAGENT_STREAM_PATCHES.some((patch) => patch.name === "project-act
 
 const expected = new Set([
   "depth4-search",
-  "claude-model-fable51",
   "claude-model-prune",
+  "opencode-grok-defaults",
   "provider-subagent-stream-filter",
   "image-attachments-persist",
   "orphan-process-guard",
   "orphan-process-group",
-  "credential-key-preservation",
+  "acp-context-gauge",
+  "acp-cross-provider-mode-default",
+  "acp-model-rejection",
   "patch-web-ui",
 ]);
 const seen = new Set();
@@ -167,7 +169,7 @@ for (const patch of manifest.patches) {
   }
 }
 if (seen.size !== expected.size || [...expected].some((id) => !seen.has(id))) {
-  throw new Error("anchor manifest does not cover exactly the nine paseo patchers");
+  throw new Error("anchor manifest does not cover exactly the eleven paseo patchers");
 }
 const group = manifest.patches.find((patch) => patch.id === "orphan-process-group");
 if (!group.requires || !group.requires.includes("orphan-process-guard")) {
@@ -180,7 +182,7 @@ if (subagent.paired_with !== "patch-web-ui:subagent-stream") {
 console.log("manifest agrees with the pinned version, SHA, anchors, and ordering");
 NODE
 if [ "$manifest_rc" -eq 0 ]; then
-  ok "anchor manifest: version, shape table, nine patchers, and pair/order contracts"
+  ok "anchor manifest: version, shape table, eleven patchers, and pair/order contracts"
 else
   bad "anchor manifest: version/SHA/coverage/order contract"
   sed 's/^/    /' "$manifest_out"
@@ -284,68 +286,6 @@ else
   bad "provider-subagent install wiring: server candidate rename is not gated on UI success (ui_ok=$ui_ok_line mv=$mv_line ui_fail=$ui_fail_line)"
 fi
 
-# ------------------------------------------------------------------ model fable 5.1
-# The pin (paseo 0.2.5) predates Fable 5.1, so the picker cannot offer a model the
-# installed CLI already runs. Additive sibling of the prune patch; it must retire
-# itself (rc 20) the moment upstream ships the rows.
-FB51="$TMP/model-manifest-fable51.js"
-# The prune preimage carries no Fable rows, so this fixture is built here: the
-# minimum shape the patcher anchors on (array head, the Fable 5 sibling it inserts
-# above, and the CLAUDE_EFFORT_LEVELS symbol the new entries reference).
-cat > "$FB51" <<'FB51EOF'
-export const CLAUDE_EFFORT_LEVELS = { xhigh: ["low", "medium", "high", "xhigh", "max"] };
-export const CLAUDE_MODEL_MANIFEST = [
-    {
-        id: "claude-opus-5",
-        label: "Opus 5",
-        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
-    },
-    {
-        id: "claude-fable-5[1m]",
-        label: "Fable 5 1M",
-        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
-    },
-    {
-        id: "claude-fable-5",
-        label: "Fable 5",
-        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
-    },
-];
-FB51EOF
-if [ "${PASEO_PATCH_DRIFT_BREAK:-}" = "model-fable51" ]; then
-  sed -i '/id: "claude-fable-5\[1m\]"/d' "$FB51"
-fi
-if positive_js "$PATCH_DIR/claude-model-fable51.mjs" "$FB51"; then
-  if grep -qF '[airlock-model-fable51]' "$FB51.paseo-new.mjs" \
-    && grep -qF 'id: "claude-fable-5-1",' "$FB51.paseo-new.mjs" \
-    && grep -qF 'id: "claude-fable-5-1[1m]",' "$FB51.paseo-new.mjs" \
-    && grep -qF 'id: "claude-fable-5",' "$FB51.paseo-new.mjs"; then
-    ok "model fable51: adds both 5.1 rows and keeps the Fable 5 family"
-  else
-    bad "model fable51: patched result did not match the intended manifest"
-  fi
-else
-  bad "model fable51: representative fixture was not patched"
-fi
-FB51_DONE="$TMP/model-manifest-fable51-done.js"
-cp "$FB51.paseo-new.mjs" "$FB51_DONE" 2>/dev/null || cp "$FB51" "$FB51_DONE"
-sed -i 's/\[airlock-model-fable51\]/[gone]/' "$FB51_DONE"
-cp "$FB51_DONE" "$TMP/model-manifest-fable51-done.before"
-if negative_js "$PATCH_DIR/claude-model-fable51.mjs" "$FB51_DONE" 20 "$TMP/model-manifest-fable51-done.before"; then
-  ok "model fable51 negative control: upstream already shipping 5.1 is an untouched rc 20 skip"
-else
-  bad "model fable51 negative control: patch ran on a manifest that already lists 5.1"
-fi
-FB51_BAD="$TMP/model-manifest-fable51-bad.js"
-cp "$FB51" "$FB51_BAD"
-sed -i '/id: "claude-fable-5\[1m\]"/d' "$FB51_BAD"
-cp "$FB51_BAD" "$TMP/model-manifest-fable51-bad.before"
-if negative_js "$PATCH_DIR/claude-model-fable51.mjs" "$FB51_BAD" 20 "$TMP/model-manifest-fable51-bad.before"; then
-  ok "model fable51 negative control: missing Fable anchor is an untouched rc 20 skip"
-else
-  bad "model fable51 negative control: skipped patch did not fail the positive assertion"
-fi
-
 # ---------------------------------------------------------------------- model prune
 PRUNE="$TMP/model-manifest.js"
 reference_preimage "$PATCH_DIR/claude-model-prune.patch" "$PRUNE"
@@ -378,6 +318,34 @@ else
   bad "model prune negative control: skipped patch did not fail the positive assertion"
 fi
 
+# ---------------------------------------------------------- OpenCode grok defaults
+OPENCODE_GROK="$TMP/opencode-agent.js"
+reference_preimage "$PATCH_DIR/opencode-grok-defaults.patch" "$OPENCODE_GROK"
+if [ "${PASEO_PATCH_DRIFT_BREAK:-}" = "opencode-grok-defaults" ]; then
+  sed -i '/const rawVariants = model.variants/d' "$OPENCODE_GROK"
+fi
+if positive_js "$PATCH_DIR/opencode-grok-defaults.mjs" "$OPENCODE_GROK"; then
+  if grep -qF '[airlock-opencode-grok-defaults]' "$OPENCODE_GROK.paseo-new.mjs" \
+    && grep -qF 'const preferred = ["opencode-go/muse-spark-1.3-contributor", "xai/grok-4.6", "xai/grok-build-0.1"];' "$OPENCODE_GROK.paseo-new.mjs" \
+    && grep -qF 'rawVariants.includes("high")' "$OPENCODE_GROK.paseo-new.mjs" \
+    && grep -qF 'rawVariants.includes("xhigh")' "$OPENCODE_GROK.paseo-new.mjs"; then
+    ok "opencode grok defaults: muse-first picker order, xhigh default, high default"
+  else
+    bad "opencode grok defaults: patched result did not contain muse/grok order or xhigh/high defaults"
+  fi
+else
+  bad "opencode grok defaults: representative fixture was not patched"
+fi
+OPENCODE_GROK_BAD="$TMP/opencode-agent-bad.js"
+cp "$OPENCODE_GROK" "$OPENCODE_GROK_BAD"
+sed -i '/const rawVariants = model.variants/d' "$OPENCODE_GROK_BAD"
+cp "$OPENCODE_GROK_BAD" "$TMP/opencode-agent-bad.before"
+if negative_js "$PATCH_DIR/opencode-grok-defaults.mjs" "$OPENCODE_GROK_BAD" 20 "$TMP/opencode-agent-bad.before"; then
+  ok "opencode grok defaults negative control: missing thinking anchor is an untouched rc 20 skip"
+else
+  bad "opencode grok defaults negative control: skipped patch did not fail the positive assertion"
+fi
+
 # --------------------------------------------------------------- image persistence
 IMAGE="$TMP/agent-image.js"
 image_preimage "$PATCH_DIR/image-attachments-persist.patch" "$IMAGE"
@@ -404,32 +372,12 @@ else
 fi
 
 # ---------------------------------------------------------------- orphan process guard
+# codex has no fixture here any more: 0.8.0 independently rewrote CodexAppServerSession's
+# connect()/close() lifecycle (closed-flag gate at three points, connectionPromise
+# de-duplication, identity-checked dispose in every failure branch) -- the patcher only
+# accepts "claude" now. See orphan-process-guard.mjs's header for the full comparison.
 GUARD_CLAUDE="$TMP/claude-agent.js"
-GUARD_CODEX="$TMP/codex-agent.js"
 reference_preimage "$PATCH_DIR/orphan-process-guard-claude.patch" "$GUARD_CLAUDE"
-reference_preimage "$PATCH_DIR/orphan-process-guard-codex.patch" "$GUARD_CODEX"
-# The codex reference hunk has only three unchanged context lines around each of these
-# edits, while the patcher's all-or-nothing anchors intentionally cover the whole cleanup
-# blocks. Complete the synthetic excerpt with those stable old blocks independently of the
-# patcher source, just as a tiny hand-written bundle fixture would.
-cat >> "$GUARD_CODEX" <<'FIXTURE'
-        catch (error) {
-            try {
-                await this.close();
-            }
-            catch (closeError) {
-                this.logger.warn({ err: closeError, connectError: error }, "Failed to close Codex app-server after connection failure");
-            }
-            throw error;
-        }
-        if (this.client) {
-            await this.client.dispose();
-        }
-        this.client = null;
-        this.connected = false;
-        this.currentThreadId = null;
-        this.currentTurnId = null;
-FIXTURE
 if positive_js "$PATCH_DIR/orphan-process-guard.mjs" "$GUARD_CLAUDE" claude \
   && grep -qF '[paseo-orphan-guard]' "$GUARD_CLAUDE.paseo-new.mjs" \
   && grep -qF 'liveChildProcesses' "$GUARD_CLAUDE.paseo-new.mjs" \
@@ -437,14 +385,6 @@ if positive_js "$PATCH_DIR/orphan-process-guard.mjs" "$GUARD_CLAUDE" claude \
   ok "orphan guard claude: tracks replacements, gates closed spawns, and handles late children"
 else
   bad "orphan guard claude: representative fixture was not patched as intended"
-fi
-if positive_js "$PATCH_DIR/orphan-process-guard.mjs" "$GUARD_CODEX" codex \
-  && grep -qF '[paseo-orphan-guard]' "$GUARD_CODEX.paseo-new.mjs" \
-  && grep -qF 'liveAppServerClients' "$GUARD_CODEX.paseo-new.mjs" \
-  && grep -qF 'connect() on a closed session' "$GUARD_CODEX.paseo-new.mjs"; then
-  ok "orphan guard codex: tracks app-server replacements and gates closed reconnects"
-else
-  bad "orphan guard codex: representative fixture was not patched as intended"
 fi
 
 GUARD_CLAUDE_BAD="$TMP/claude-agent-bad.js"
@@ -456,14 +396,13 @@ if negative_js "$PATCH_DIR/orphan-process-guard.mjs" "$GUARD_CLAUDE_BAD" 20 "$TM
 else
   bad "orphan guard claude negative control: skipped patch did not fail the positive assertion"
 fi
-GUARD_CODEX_BAD="$TMP/codex-agent-bad.js"
-cp "$GUARD_CODEX" "$GUARD_CODEX_BAD"
-sed -i '/this.client = null;/d' "$GUARD_CODEX_BAD"
-cp "$GUARD_CODEX_BAD" "$TMP/codex-agent-bad.before"
-if negative_js "$PATCH_DIR/orphan-process-guard.mjs" "$GUARD_CODEX_BAD" 20 "$TMP/codex-agent-bad.before" codex; then
-  ok "orphan guard codex negative control: missing client anchor is an untouched rc 20 skip"
+GUARD_MODE_BAD_OUT="$TMP/orphan-guard-codex-mode.out"
+guard_mode_bad_rc=0
+node "$PATCH_DIR/orphan-process-guard.mjs" codex "$GUARD_CLAUDE" >"$GUARD_MODE_BAD_OUT" 2>&1 || guard_mode_bad_rc=$?
+if [ "$guard_mode_bad_rc" -eq 1 ] && grep -qF 'usage:' "$GUARD_MODE_BAD_OUT"; then
+  ok "orphan guard: codex mode was removed on purpose (usage error, not a silent no-op)"
 else
-  bad "orphan guard codex negative control: skipped patch did not fail the positive assertion"
+  bad "orphan guard: codex mode should refuse with a usage error (rc=$guard_mode_bad_rc)"
 fi
 
 # ------------------------------------------------------------- process-group sweep
@@ -534,6 +473,126 @@ if negative_js "$PATCH_DIR/orphan-process-group.mjs" "$GROUP_CODEX_BAD" 20 "$TMP
   ok "process group codex negative control: dispose-anchor drift skips rc 20"
 else
   bad "process group codex negative control: skipped patch did not fail the positive assertion"
+fi
+
+# ACP invalid model rejection: real offline vendored module and manager methods,
+# plus missing/duplicate/partial anchor and complete idempotence controls.
+ACP_MODEL_OUT="$TMP/acp-model-rejection.out"
+if node "$PATCH_DIR/acp-model-rejection.test.mjs" --self-test "$PATCH_DIR/acp-model-rejection.mjs" >"$ACP_MODEL_OUT" 2>&1; then
+  ok "ACP model rejection: invalid selection preserves manager state; valid selection and drift controls"
+else
+  bad "ACP model rejection: behaviour/drift contract"
+  sed 's/^/    /' "$ACP_MODEL_OUT"
+fi
+if grep -qF 'apply_acp_gap "ACP invalid model rejection" "$ACPMODEL_PATCHER" "$ACP_AGENT_JS" "$ACPMODEL_TEST"' "$ROOT/apps/paseo/install.sh"; then
+  ok "ACP model rejection: official installer applies and verifies the candidate"
+else
+  bad "ACP model rejection: official installer wiring is absent"
+fi
+
+# ----------------------------------------------------- agy ACP gap: context gauge
+# Synthetic excerpts of the five anchor blocks acp-context-gauge.mjs edits, each on
+# its own class so a fixture change to one cannot accidentally satisfy another.
+ACPGAUGE="$TMP/acp-agent.js"
+cat > "$ACPGAUGE" <<'FIXTURE'
+class A {
+    build() {
+        return {
+            modes: modeState.availableModes.map((mode) => ({
+                id: mode.id,
+                label: mode.name,
+                description: mode.description ?? undefined,
+            })),
+            currentModeId: modeState.currentModeId ?? null,
+        };
+    }
+}
+class B {
+    probe() {
+            return {
+                models: this.modelTransformer ? this.modelTransformer(models) : models,
+                modes: modeInfo.modes,
+            };
+    }
+}
+class C {
+    route(update) {
+        switch (update.sessionUpdate) {
+            case "usage_update":
+                this.handleUsageUpdate(update);
+                return pendingUserEvents;
+        }
+    }
+}
+class D {
+    handleConfigOptionUpdate(update) {
+        const nextMode = modeInfo.currentModeId;
+        const nextModel = deriveCurrentConfigValue(this.configOptions, "model");
+        const nextThinkingOptionId = deriveCurrentConfigValue(this.configOptions, "thought_level");
+        this.availableModes = modeInfo.modes;
+    }
+}
+class E {
+    handleUsageUpdate(update) {
+        void update;
+    }
+    handlePromptResponse(response, turnId) {
+        this.currentTurnUsage = mapACPUsage(response.usage) ?? this.currentTurnUsage;
+    }
+}
+FIXTURE
+if positive_js "$PATCH_DIR/acp-context-gauge.mjs" "$ACPGAUGE" \
+  && grep -qF '[paseo-acp-context-gauge]' "$ACPGAUGE.paseo-new.mjs" \
+  && grep -qF 'isUnattended: true' "$ACPGAUGE.paseo-new.mjs" \
+  && grep -qF 'defaultModeId: modeInfo.currentModeId' "$ACPGAUGE.paseo-new.mjs" \
+  && grep -qF 'return [...pendingUserEvents, ...this.handleUsageUpdate(update)];' "$ACPGAUGE.paseo-new.mjs" \
+  && grep -qF 'if (nextMode !== null) {' "$ACPGAUGE.paseo-new.mjs" \
+  && grep -qF 'type: "usage_updated",' "$ACPGAUGE.paseo-new.mjs"; then
+  ok "agy ACP context gauge: all five edit sites land"
+else
+  bad "agy ACP context gauge: representative fixture was not patched as intended"
+fi
+ACPGAUGE_BAD="$TMP/acp-agent-bad.js"
+cp "$ACPGAUGE" "$ACPGAUGE_BAD"
+sed -i '/void update;/d' "$ACPGAUGE_BAD"
+cp "$ACPGAUGE_BAD" "$TMP/acp-agent-bad.before"
+if negative_js "$PATCH_DIR/acp-context-gauge.mjs" "$ACPGAUGE_BAD" 20 "$TMP/acp-agent-bad.before"; then
+  ok "agy ACP context gauge negative control: missing usage-handler anchor is an untouched rc 20 skip"
+else
+  bad "agy ACP context gauge negative control: skipped patch did not fail the positive assertion"
+fi
+
+# ------------------------------------- agy ACP gap: cross-provider mode default
+ACPMODE="$TMP/generic-acp-agent.js"
+cat > "$ACPMODE" <<'FIXTURE'
+class GenericACPAgentClient extends ACPAgentClient {
+    constructor(options) {
+        const providerParams = parseGenericACPProviderParams(options.providerParams);
+        super({
+            provider: "acp",
+            logger: options.logger,
+        });
+        this.command = options.command;
+        this.providerId = options.providerId;
+    }
+}
+FIXTURE
+if positive_js "$PATCH_DIR/acp-cross-provider-mode-default.mjs" "$ACPMODE" \
+  && grep -qF '[paseo-acp-cross-provider-mode-default]' "$ACPMODE.paseo-new.mjs" \
+  && grep -qF 'const baseResolveCreateConfig = this.resolveCreateConfig;' "$ACPMODE.paseo-new.mjs" \
+  && grep -qF 'return { modeId: undefined, featureValues: input.featureValues };' "$ACPMODE.paseo-new.mjs"; then
+  ok "agy ACP cross-provider mode default: wraps the base resolver"
+else
+  bad "agy ACP cross-provider mode default: representative fixture was not patched as intended"
+fi
+ACPMODE_BAD="$TMP/generic-acp-agent-bad.js"
+cp "$ACPMODE" "$ACPMODE_BAD"
+sed -i '/this.command = options.command;/d' "$ACPMODE_BAD"
+cp "$ACPMODE_BAD" "$TMP/generic-acp-agent-bad.before"
+if negative_js "$PATCH_DIR/acp-cross-provider-mode-default.mjs" "$ACPMODE_BAD" 20 "$TMP/generic-acp-agent-bad.before"; then
+  ok "agy ACP cross-provider mode default negative control: missing constructor-tail anchor is an untouched rc 20 skip"
+else
+  bad "agy ACP cross-provider mode default negative control: skipped patch did not fail the positive assertion"
 fi
 
 # ------------------------------------------ platform Claude pool-record contract
@@ -677,75 +736,6 @@ else
   sed 's/^/    /' "$POOL_SCHEMA_OUT"
 fi
 
-# ------------------------------------------------- credential key preservation
-# The point of this patch is what SURVIVES the write-back, so the fixture assertions
-# check that the refreshed-token merge is applied to the object read from disk (the
-# raw JSON / onDisk spread) and not to zod's stripped output.
-CRED_CLAUDE="$TMP/quota-claude.js"
-reference_preimage "$PATCH_DIR/credential-key-preservation-claude.patch" "$CRED_CLAUDE"
-if positive_js "$PATCH_DIR/credential-key-preservation.mjs" "$CRED_CLAUDE" claude \
-  && grep -qF '[paseo-cred-preserve]' "$CRED_CLAUDE.paseo-new.mjs" \
-  && grep -qF 'const existing = JSON.parse(await fs.readFile(credPath, "utf8"));' "$CRED_CLAUDE.paseo-new.mjs" \
-  && grep -qF 'existing.claudeAiOauth = { ...(existing.claudeAiOauth ?? {}), ...oauth };' "$CRED_CLAUDE.paseo-new.mjs" \
-  && ! grep -qF 'existing.claudeAiOauth = oauth;' "$CRED_CLAUDE.paseo-new.mjs"; then
-  ok "credential preservation claude: merges the refreshed tokens into the on-disk JSON"
-else
-  bad "credential preservation claude: representative fixture was not patched as intended"
-fi
-CRED_CLAUDE_BAD="$TMP/quota-claude-bad.js"
-cp "$CRED_CLAUDE" "$CRED_CLAUDE_BAD"
-sed -i '/existing.claudeAiOauth = oauth;/d' "$CRED_CLAUDE_BAD"
-cp "$CRED_CLAUDE_BAD" "$TMP/quota-claude-bad.before"
-if negative_js "$PATCH_DIR/credential-key-preservation.mjs" "$CRED_CLAUDE_BAD" 20 "$TMP/quota-claude-bad.before" claude; then
-  ok "credential preservation claude negative control: save-body drift is an untouched rc 20 skip"
-else
-  bad "credential preservation claude negative control: skipped patch did not fail the positive assertion"
-fi
-
-CRED_CODEX="$TMP/quota-codex.js"
-reference_preimage "$PATCH_DIR/credential-key-preservation-codex.patch" "$CRED_CODEX"
-if positive_js "$PATCH_DIR/credential-key-preservation.mjs" "$CRED_CODEX" codex \
-  && grep -qF '[paseo-cred-preserve]' "$CRED_CODEX.paseo-new.mjs" \
-  && grep -qF 'onDisk = JSON.parse(await fs.readFile(authPath, "utf8"));' "$CRED_CODEX.paseo-new.mjs" \
-  && grep -qF 'onDisk = { ...original };' "$CRED_CODEX.paseo-new.mjs" \
-  && grep -qF '...(onDisk.tokens ?? {}),' "$CRED_CODEX.paseo-new.mjs" \
-  && ! grep -qF '                ...original,' "$CRED_CODEX.paseo-new.mjs"; then
-  ok "credential preservation codex: merges the refreshed tokens into the on-disk auth.json"
-else
-  bad "credential preservation codex: representative fixture was not patched as intended"
-fi
-CRED_CODEX_BAD="$TMP/quota-codex-bad.js"
-cp "$CRED_CODEX" "$CRED_CODEX_BAD"
-sed -i '/^                    \.\.\.original\.tokens,$/d' "$CRED_CODEX_BAD"
-cp "$CRED_CODEX_BAD" "$TMP/quota-codex-bad.before"
-if negative_js "$PATCH_DIR/credential-key-preservation.mjs" "$CRED_CODEX_BAD" 20 "$TMP/quota-codex-bad.before" codex; then
-  ok "credential preservation codex negative control: save-body drift is an untouched rc 20 skip"
-else
-  bad "credential preservation codex negative control: skipped patch did not fail the positive assertion"
-fi
-
-# The behaviour check install.sh runs after applying, exercised here offline against the
-# same fixtures — with the unpatched preimage as its control, because a check that passes
-# on the pristine bundle would be asserting nothing.
-for cred_mode in claude codex; do
-  case "$cred_mode" in
-    claude) cred_pre="$CRED_CLAUDE" ;;
-    *) cred_pre="$CRED_CODEX" ;;
-  esac
-  cred_rc=0
-  node "$PATCH_DIR/credential-key-preservation.test.mjs" "$cred_mode" "$cred_pre.paseo-new.mjs" \
-    >"$TMP/cred-$cred_mode.out" 2>&1 || cred_rc=$?
-  cred_pristine_rc=0
-  node "$PATCH_DIR/credential-key-preservation.test.mjs" "$cred_mode" "$cred_pre" \
-    >/dev/null 2>&1 || cred_pristine_rc=$?
-  if [ "$cred_rc" -eq 0 ] && [ "$cred_pristine_rc" -ne 0 ]; then
-    ok "credential preservation $cred_mode behaviour: patched save keeps every field the pristine one drops"
-  else
-    bad "credential preservation $cred_mode behaviour: patched rc=$cred_rc, pristine control rc=$cred_pristine_rc"
-    sed 's/^/    /' "$TMP/cred-$cred_mode.out"
-  fi
-done
-
 # ------------------------------------------------------------------------ web-ui core
 # patch-web-ui.js is deliberately SHA-pinned and its CLI refuses drift with exit 1 (the
 # browse-host installer downgrades that to a warning). Its pure matching core accepts the
@@ -760,16 +750,16 @@ const { patchBundleContent } = require(path.join(process.argv[2], "apps/paseo/br
 
 const patches = [
   {
-    find: 'if(!Ye||!(0,Be.getIsElectron)())return;e?.paneId&&at(Ye,e.paneId);const{browserId:t}=(0,le.createWorkspaceBrowser)()',
-    repl: 'if(!Ye)return;e?.paneId&&at(Ye,e.paneId);const{browserId:t}=(0,le.createWorkspaceBrowser)()',
+    find: 'if(!pt||!(0,ze.getIsElectron)())return;const{browserId:t}=(0,ue.createWorkspaceBrowser)();gt(pt,{kind:"browser",browserId:t},Ht(e?.paneId))',
+    repl: 'if(!pt)return;const{browserId:t}=(0,ue.createWorkspaceBrowser)();gt(pt,{kind:"browser",browserId:t},Ht(e?.paneId))',
   },
   {
-    find: 'if(!Ye||!(0,Be.getIsElectron)())return;const{browserId:t}=(0,le.createWorkspaceBrowser)({initialUrl:e})',
-    repl: 'if(!Ye)return;const{browserId:t}=(0,le.createWorkspaceBrowser)({initialUrl:e})',
+    find: 'if(!pt||!(0,ze.getIsElectron)())return;const{browserId:t}=(0,ue.createWorkspaceBrowser)({initialUrl:e});gt(pt,{kind:"browser",browserId:t},Q.FOCUSED_PANE_PLACEMENT)',
+    repl: 'if(!pt)return;const{browserId:t}=(0,ue.createWorkspaceBrowser)({initialUrl:e});gt(pt,{kind:"browser",browserId:t},Q.FOCUSED_PANE_PLACEMENT)',
   },
   {
-    find: '{style:u.container,children:[S,_,I]})',
-    repl: '{style:u.container,dataSet:{paseoBrowserId:w,paseoWorkspaceId:f.workspaceId,paseoServerId:f.serverId},children:[S,_,I]})',
+    find: '{style:u.container,children:[v,M,k]}',
+    repl: '{style:u.container,dataSet:{paseoBrowserId:w,paseoWorkspaceId:f.workspaceId,paseoServerId:f.serverId},children:[v,M,k]}',
   },
 ];
 // The coarse-pointer edit is deliberately absent: it moved to the always-on group on

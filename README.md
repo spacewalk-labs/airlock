@@ -29,7 +29,7 @@ left.
 | **dev-monitor** | System / service / network / storage monitor (+ optional owner-only message & action console) | (ours) |
 | **code-server** | Browser IDE | code-server (MIT) |
 | **orca** | Agent Development Environment (parallel coding agents) | stablyai/orca (MIT) |
-| **paseo** | Coding-agent orchestration daemon | @getpaseo/cli (AGPL-3.0) |
+| **paseo** | Coding-agent orchestration daemon | @getpaseo/cli (Apache-2.0) |
 
 Shipped since v1: dev-monitor's message/action console (`messages = true`),
 code-server multi-tab slots, orca's patched web-bundle client, and paseo's

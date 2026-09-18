@@ -195,8 +195,8 @@ fi
 PASEO_PKG="@getpaseo/cli"
 # Version PIN — do NOT track latest. paseo is pre-1.0; a floating install would
 # drift the web-ui bundle and the depth4 anchor out from under us.
-PASEO_VER="${AIRLOCK_PASEO_VERSION:-0.2.5}"
-PASEO_BUNDLE_DIR="$HERE/vendor/guarded-0.2.5"
+PASEO_VER="${AIRLOCK_PASEO_VERSION:-0.8.0}"
+PASEO_BUNDLE_DIR="$HERE/vendor/guarded-0.8.0"
 PASEO_BUNDLE_SUMS="$PASEO_BUNDLE_DIR/SHA256SUMS"
 PASEO_BUNDLE_INSTALLED_SUMS="$PASEO_BUNDLE_DIR/INSTALLED_SHA256SUMS"
 
@@ -301,7 +301,7 @@ PASEO_INSTALL_ID_FILE="$NPM_ROOT/@getpaseo/.airlock-install-id"
 # Where the cli loads @getpaseo/server from — the one directory every patch below
 # edits. Node resolves upward from the cli, so a copy nested under the cli shadows
 # the prefix-level one; the two candidates are exactly node's lookup order.
-#   bundle:   the six tarballs are installed as siblings, so server lands at the
+#   bundle:   the seven tarballs are installed as siblings, so server lands at the
 #             prefix level and NOTHING is nested under the cli (measured 2026-09-12,
 #             npm 10.9.8; INSTALLED_SHA256SUMS is written against this layout).
 #   registry: `npm i -g @getpaseo/cli` nests its dependencies under the cli.
@@ -325,7 +325,7 @@ else
   (cd "$PASEO_BUNDLE_DIR" && sha256sum -c SHA256SUMS >/dev/null) \
     || die "paseo bundle checksum mismatch: $PASEO_BUNDLE_SUMS"
   mapfile -t paseo_packages < <(awk '{print dir "/" $2}' dir="$PASEO_BUNDLE_DIR" "$PASEO_BUNDLE_SUMS")
-  [ "${#paseo_packages[@]}" -eq 6 ] || die "paseo bundle must contain exactly 6 packages"
+  [ "${#paseo_packages[@]}" -eq 7 ] || die "paseo bundle must contain exactly 7 packages"
   PASEO_SOURCE=bundle
   PASEO_INSTALL_ID="bundle:$(sha256sum "$PASEO_BUNDLE_SUMS" | cut -d' ' -f1)"
 fi
@@ -441,8 +441,8 @@ else
   else
     if [ -f "$PASEO_INSTALL_ID_FILE" ]; then
       airlock_quiet env npm_config_prefix="$PASEO_PREFIX" npm uninstall -g \
-        @getpaseo/cli @getpaseo/client @getpaseo/highlight @getpaseo/protocol \
-        @getpaseo/relay @getpaseo/server --no-audit --no-fund \
+        @getpaseo/cli @getpaseo/client @getpaseo/highlight @getpaseo/plugin \
+        @getpaseo/protocol @getpaseo/relay @getpaseo/server --no-audit --no-fund \
         || die "failed to clear bundled paseo packages before registry install"
     fi
     airlock_quiet env npm_config_prefix="$PASEO_PREFIX" npm i -g "${PASEO_PKG}@${PASEO_VER}" \
@@ -468,6 +468,10 @@ fi
 # Resolved once, after step 1 has settled the tree; every patch target below hangs
 # off it. (Dry run: whatever is on disk, or the bundle layout if nothing is.)
 PASEO_SERVER_DIR="$(paseo_server_dir)"
+if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+  "$PY" "$HERE/normalize-native-links.py" "$PASEO_SERVER_DIR" \
+    || die "Paseo native files cannot be materialized for rollback checkpoints"
+fi
 SESSION_JS="$PASEO_SERVER_DIR/dist/server/server/session.js"
 PATCH_LINE='                maxDepth: searchesWorkspace ? undefined : 4,'
 PATCH_ANCHOR='confidentResultScanThreshold: searchesWorkspace ? undefined : 5000,'
@@ -583,42 +587,6 @@ fi
 # Opus 5, and under `set -u` removing that step would have taken the prune with it.
 CLAUDE_MANIFEST_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/claude/model-manifest.js"
 
-# --- 2b2. add Fable 5.1 to the picker (idempotent) ---
-# The pinned manifest predates Fable 5.1, so the picker cannot offer a model the
-# installed CLI already runs. Same shape as the Opus 5 backport step that lived
-# here until the pin caught up — the patch removes itself (exit 20) once upstream
-# ships the rows. Runs BEFORE the prune so each patch sees the array in the shape
-# its own anchors were written against.
-# Picker-only: the manifest is not on the execution path, so adding a row cannot
-# change how an existing session runs.
-FABLE51_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/claude-model-fable51.mjs"
-if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "[dry] add Fable 5.1 rows to $CLAUDE_MANIFEST_JS"
-elif [ ! -f "$CLAUDE_MANIFEST_JS" ]; then
-  log "warning: model-manifest.js not found ($CLAUDE_MANIFEST_JS) — Fable 5.1 add skipped (paseo dist layout changed?)"
-elif [ ! -f "$FABLE51_PATCHER" ]; then
-  log "warning: Fable 5.1 patcher not found ($FABLE51_PATCHER) — skipped"
-else
-  fb_rc=0
-  fb_out="$(node "$FABLE51_PATCHER" "$CLAUDE_MANIFEST_JS")" || fb_rc=$?
-  case "$fb_rc" in
-    10) log "Fable 5.1 rows already present" ;;
-    20) log "Fable 5.1 add skipped — $fb_out" ;;
-    0)
-      FB_TMP="${CLAUDE_MANIFEST_JS}.paseo-new.mjs"
-      if node --check "$FB_TMP"; then
-        mv "$FB_TMP" "$CLAUDE_MANIFEST_JS" || die "Fable 5.1 add mv failed"
-        need_restart=1   # bundle changed -> restart so the daemon serves the new list
-        log "Fable 5.1 rows added ($fb_out)"
-      else
-        rm -f "$FB_TMP"
-        log "warning: Fable 5.1 add produced invalid JS — not applied"
-      fi
-      ;;
-    *) log "warning: Fable 5.1 patcher error (rc=$fb_rc): $fb_out — skipped" ;;
-  esac
-fi
-
 # --- 2c. prune superseded models (idempotent) ---
 # The pinned manifest still lists Opus 4.7/4.6 and Sonnet 4.6; drop them so the
 # picker is the handful people actually choose. Picker-only: the manifest is not
@@ -651,7 +619,39 @@ else
         log "warning: model prune produced invalid JS — not applied"
       fi
       ;;
-    *) log "warning: model prune patcher error (rc=$pr_rc): $pr_out — skipped" ;;
+     *) log "warning: model prune patcher error (rc=$pr_rc): $pr_out — skipped" ;;
+   esac
+fi
+
+# --- 2c2. OpenCode picker: grok-4.6 first, grok-build next, thinking default high ---
+# OpenCode's catalog order and first-variant default put grok-4.6 last at low.
+# Picker/create-form only: an already-running agent's model string is untouched.
+OPENCODE_AGENT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/opencode-agent.js"
+OPENCODE_GROK_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/opencode-grok-defaults.mjs"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply OpenCode grok picker defaults to $OPENCODE_AGENT_JS"
+elif [ ! -f "$OPENCODE_AGENT_JS" ]; then
+  log "warning: opencode-agent.js not found ($OPENCODE_AGENT_JS) — OpenCode grok defaults skipped (paseo dist layout changed?)"
+elif [ ! -f "$OPENCODE_GROK_PATCHER" ]; then
+  log "warning: OpenCode grok defaults patcher not found ($OPENCODE_GROK_PATCHER) — skipped"
+else
+  og_rc=0
+  og_out="$(node "$OPENCODE_GROK_PATCHER" "$OPENCODE_AGENT_JS")" || og_rc=$?
+  case "$og_rc" in
+    10) log "OpenCode grok picker defaults already applied" ;;
+    20) log "OpenCode grok picker defaults skipped — $og_out" ;;
+    0)
+      OG_TMP="${OPENCODE_AGENT_JS}.paseo-new.mjs"
+      if node --check "$OG_TMP"; then
+        mv "$OG_TMP" "$OPENCODE_AGENT_JS" || die "OpenCode grok defaults mv failed"
+        need_restart=1
+        log "OpenCode grok picker defaults applied ($og_out)"
+      else
+        rm -f "$OG_TMP"
+        log "warning: OpenCode grok defaults produced invalid JS — not applied"
+      fi
+      ;;
+    *) log "warning: OpenCode grok defaults patcher error (rc=$og_rc): $og_out — skipped" ;;
   esac
 fi
 
@@ -691,23 +691,27 @@ else
   esac
 fi
 
-# --- 2e. orphan process guard (idempotent; claude + codex providers) ---
-# paseo leaks the agent processes it spawns. Both providers track exactly one live
-# child (`this.childProcess` / `this.client`) and kill it behind an `if (handle)`
-# with no else branch, and neither honours the closed flag on its spawn entry point
-# (ensureQuery / connect). So a control-plane call landing during or after close —
-# setMode, setModel, listCommands, revertFiles, a codex reconnect, or just the
-# in-flight spawn finishing late — starts a REPLACEMENT process on a session nothing
-# will ever close again. It then runs until the box is rebooted, and close() reports
-# success because at that instant there genuinely was nothing to kill. Measured on
-# Pilot box 2026-08-05: 18 orphans, 2.9G RSS + 1.9G swap.
+# --- 2e. orphan process guard (idempotent; claude provider only) ---
+# paseo leaks the agent processes it spawns. The claude provider tracks exactly one
+# live child (`this.childProcess`) and kills it behind an `if (handle)` with no else
+# branch, and does not honour the closed flag on its spawn entry point (ensureQuery
+# -- only startTurn()/startQueryPump() do, confirmed against 0.8.0 source). So a
+# control-plane call landing during or after close — setMode, setModel, listCommands,
+# revertFiles, or just the in-flight spawn finishing late — starts a REPLACEMENT
+# process on a session nothing will ever close again. It then runs until the box is
+# rebooted, and close() reports success because at that instant there genuinely was
+# nothing to kill. Measured on Pilot box 2026-08-05: 18 orphans, 2.9G RSS + 1.9G swap.
 # The patch makes ownership a Set (so a replaced handle is still terminated), gates
-# both spawn entry points on the closed flag, terminates late arrivals on the spot,
+# the spawn entry point on the closed flag, terminates late arrivals on the spot,
 # and warns at level 40 — the surrounding session_close lines are logger.trace, which
 # the daemon's info-level logger never emits, so this class of leak was unobservable.
+# codex is not covered here: re-checked against 0.8.0, upstream independently
+# rewrote CodexAppServerSession's connect()/close() lifecycle (closed-flag gate at
+# three points, connectionPromise de-duplication, identity-checked dispose in every
+# failure branch) — the same fix this patch makes for claude, already shipped
+# upstream. See the patcher's own header for the full comparison.
 ORPHANGUARD_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/orphan-process-guard.mjs"
 ORPHANGUARD_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/orphan-process-guard.test.mjs"
-CODEX_AGENT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/codex-app-server-agent.js"
 apply_orphan_guard() {  # <mode> <target-js>
   local mode="$1" target="$2" og_rc=0 og_out og_tmp
   if [ ! -f "$target" ]; then
@@ -733,13 +737,12 @@ apply_orphan_guard() {  # <mode> <target-js>
   esac
 }
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "[dry] apply orphan process guard to $CLAUDE_AGENT_JS and $CODEX_AGENT_JS"
+  log "[dry] apply orphan process guard to $CLAUDE_AGENT_JS"
 elif [ ! -f "$ORPHANGUARD_PATCHER" ]; then
   log "warning: orphan guard patcher not found ($ORPHANGUARD_PATCHER) — skipped"
 else
   apply_orphan_guard claude "$CLAUDE_AGENT_JS"
-  apply_orphan_guard codex  "$CODEX_AGENT_JS"
-  # Syntax-valid is not the same as behaving. This check slices the two guard methods
+  # Syntax-valid is not the same as behaving. This check slices the guard methods
   # back out of the installed bundle and drives them against fake children, so a patch
   # that applied but reassembled wrongly fails the install instead of shipping quietly.
   if [ -f "$ORPHANGUARD_TEST" ] && grep -q 'paseo-orphan-guard' "$CLAUDE_AGENT_JS" 2>/dev/null; then
@@ -805,47 +808,6 @@ else
   apply_schedpend service "$SCHEDPEND_PATCHER" "$SCHEDULE_SERVICE_JS" "$SCHEDPEND_TEST"
 fi
 
-# --- 2e-3. finish notifications queue instead of interrupting a running parent ---
-# notifyOnFinish messages take the unguarded prompt path (replaceRunning -> turn/interrupt): a
-# child finishing cuts its parent's running turn mid-tool and opens a new one. Masters learn that
-# long turns lose work and end turns short. The patch changes ONLY finish notifications: if the
-# parent is running they go to a durable per-parent queue, drained as one message when the parent
-# next goes idle after a turn that COMPLETED (not after a cancel — a human may have stopped it).
-# A queue write failure drops the notification rather than falling back to interrupting; a lease
-# left by a crash is marked uncertain, never re-sent. Direct human/agent prompts are unchanged.
-FINISHQ_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/finish-notification-queue.mjs"
-FINISHQ_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/finish-notification-queue.test.mjs"
-AGENT_PROMPT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/agent-prompt.js"
-if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "[dry] apply finish-notification queue to $AGENT_PROMPT_JS"
-elif [ ! -f "$AGENT_PROMPT_JS" ]; then
-  log "warning: agent-prompt.js not found ($AGENT_PROMPT_JS) — finish-notification queue skipped"
-elif [ ! -f "$FINISHQ_PATCHER" ] || [ ! -f "$FINISHQ_TEST" ]; then
-  log "warning: finish-notification queue patcher or behaviour check missing under $HERE — skipped"
-else
-  fq_rc=0
-  fq_out="$(node "$FINISHQ_PATCHER" "$AGENT_PROMPT_JS")" || fq_rc=$?
-  case "$fq_rc" in
-    10) log "finish-notification queue already applied" ;;
-    20) log "warning: finish-notification queue anchors missing or ambiguous (paseo version drift) — skipped: $fq_out" ;;
-    0)
-      fq_tmp="${AGENT_PROMPT_JS}.paseo-new.mjs"
-      if ! node --check "$fq_tmp"; then
-        rm -f "$fq_tmp"
-        log "warning: finish-notification queue produced invalid JS — not applied"
-      elif ! node "$FINISHQ_TEST" "$fq_tmp" >/dev/null 2>&1; then
-        rm -f "$fq_tmp"
-        log "warning: finish-notification queue failed its behaviour check — not applied (children keep interrupting parents)"
-      else
-        mv "$fq_tmp" "$AGENT_PROMPT_JS" || die "finish-notification queue mv failed"
-        need_restart=1
-        log "finish-notification queue applied"
-      fi
-      ;;
-    *) log "warning: finish-notification queue patcher error (rc=$fq_rc): $fq_out — skipped" ;;
-  esac
-fi
-
 # --- 2f. process-group sweep (idempotent; layers on 2e — order matters) ---
 # The one leak 2e deliberately left open: when the agent LEADER exits before we
 # terminate it, terminateWithTreeKill returns "already-exited" and stops — and by then
@@ -906,68 +868,57 @@ else
   fi
 fi
 
-# --- 2g. credential key preservation (idempotent) ---
-# The quota fetchers refresh the OAuth token when the usage API answers 401/403 and
-# write it back through a zod z.object — which STRIPS unknown keys at every level. The
-# Claude half now has a named counterparty: schemas/credentials/pool-record-v1.json is
-# the platform contract for ~/.claude-accounts records, and
-# install/test-paseo-patch-drift.sh pins every known field plus the open-object rule with
-# deletion controls. A projected write would violate that contract by silently dropping
-# claudeAiOauth expiry/scopes fields, _meta identity, or a future provider field. Codex's
-# live auth file is not a platform-owned pool record, but the same upstream write path
-# would still erase tokens.id_token and top-level auth_mode / OPENAI_API_KEY /
-# last_refresh, including the liveness signal consumed by platform status. Both writes
-# sit inside a bare `catch {}`, so the next reader merely finds a record with holes.
-# The patch merges the refreshed token fields into the object parsed from disk instead
-# of into zod's output. Data preservation only: refresh timing is untouched.
-CREDPRESERVE_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/credential-key-preservation.mjs"
-CREDPRESERVE_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/credential-key-preservation.test.mjs"
-QUOTA_PROVIDERS="$PASEO_SERVER_DIR/dist/server/services/quota-fetcher/providers"
-apply_cred_preserve() {  # <mode> <target-js>
-  local mode="$1" target="$2" cp_rc=0 cp_out cp_tmp
+# --- 2g. agy (generic ACP) gaps: context gauge + cross-provider mode default ---
+# agy runs over Paseo's generic ACP provider. Against 0.8.0, usage_update is parsed
+# and dropped (no context gauge for any ACP provider), a config-only update (model
+# or thinking only) blanks a mode list that came from session/new rather than a
+# config option, an ACP agent's own advertised unattended mode never reaches
+# anything downstream, and — once a generic ACP agent advertises modes — an
+# ATTENDED agent of a different provider running `paseo run --provider agy` with
+# no --mode is refused ("cannot inherit mode"). Two independent files, two patches.
+ACPGAUGE_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-context-gauge.mjs"
+ACPGAUGE_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-context-gauge.test.mjs"
+ACP_AGENT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/acp-agent.js"
+ACPMODE_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-cross-provider-mode-default.mjs"
+ACPMODE_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-cross-provider-mode-default.test.mjs"
+GENERIC_ACP_AGENT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/generic-acp-agent.js"
+ACPMODEL_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-model-rejection.mjs"
+ACPMODEL_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-model-rejection.test.mjs"
+apply_acp_gap() {  # <label> <patcher> <target-js> <behaviour-test>
+  local label="$1" patcher="$2" target="$3" test_js="$4" ag_rc=0 ag_out ag_tmp
   if [ ! -f "$target" ]; then
-    log "warning: $mode quota provider not found ($target) — credential key preservation skipped"
+    log "warning: $label target not found ($target) — skipped"
     return 0
   fi
-  cp_out="$(node "$CREDPRESERVE_PATCHER" "$mode" "$target")" || cp_rc=$?
-  case "$cp_rc" in
-    10) log "credential key preservation already applied ($mode)" ;;
-    20) log "credential key preservation anchors missing or ambiguous for $mode (paseo version drift) — skipped" ;;
+  ag_out="$(node "$patcher" "$target")" || ag_rc=$?
+  case "$ag_rc" in
+    10) log "$label already applied" ;;
+    20) log "warning: $label anchors missing or ambiguous (paseo version drift) — skipped" ;;
     0)
-      cp_tmp="${target}.paseo-new.mjs"
-      if node --check "$cp_tmp"; then
-        mv "$cp_tmp" "$target" || die "credential key preservation mv failed ($mode)"
-        need_restart=1   # bundle changed -> restart so the daemon runs the patched fetcher
-        log "credential key preservation applied ($mode)"
+      ag_tmp="${target}.paseo-new.mjs"
+      if ! node --check "$ag_tmp"; then
+        rm -f "$ag_tmp"
+        log "warning: $label produced invalid JS — not applied"
+      elif [ -n "$test_js" ] && ! node "$test_js" "$ag_tmp" >/dev/null 2>&1; then
+        rm -f "$ag_tmp"
+        log "warning: $label failed its behaviour check — not applied"
       else
-        rm -f "$cp_tmp"
-        log "warning: credential key preservation produced invalid JS ($mode) — not applied"
+        mv "$ag_tmp" "$target" || die "$label mv failed"
+        need_restart=1
+        log "$label applied"
       fi
       ;;
-    *) log "warning: credential key preservation patcher error ($mode rc=$cp_rc): $cp_out — skipped" ;;
+    *) log "warning: $label patcher error (rc=$ag_rc): $ag_out — skipped" ;;
   esac
 }
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "[dry] apply credential key preservation to $QUOTA_PROVIDERS/{claude,codex}.js"
-elif [ ! -f "$CREDPRESERVE_PATCHER" ]; then
-  log "warning: credential key preservation patcher not found ($CREDPRESERVE_PATCHER) — skipped"
+  log "[dry] apply agy ACP gaps to $ACP_AGENT_JS and $GENERIC_ACP_AGENT_JS"
+elif [ ! -f "$ACPGAUGE_PATCHER" ] || [ ! -f "$ACPMODE_PATCHER" ] || [ ! -f "$ACPMODEL_PATCHER" ]; then
+  log "warning: agy ACP gap patchers not found — skipped"
 else
-  apply_cred_preserve claude "$QUOTA_PROVIDERS/claude.js"
-  apply_cred_preserve codex  "$QUOTA_PROVIDERS/codex.js"
-  # Syntax-valid is not the same as key-preserving. This check slices each save method
-  # back out of the installed bundle and drives it against an in-memory fs and invented
-  # credential fixtures, so a patch that applied but reassembled wrongly fails the install
-  # instead of quietly shipping a writer that still eats fields. It never reads a real
-  # credential file.
-  if [ -f "$CREDPRESERVE_TEST" ]; then
-    for cp_mode in claude codex; do
-      if grep -q 'paseo-cred-preserve' "$QUOTA_PROVIDERS/${cp_mode}.js" 2>/dev/null; then
-        node "$CREDPRESERVE_TEST" "$cp_mode" "$QUOTA_PROVIDERS/${cp_mode}.js" >/dev/null 2>&1 \
-          || die "credential key preservation behaviour check failed ($cp_mode) — the installed fetcher carries the sentinel and still drops fields"
-        log "credential key preservation behaviour check passed ($cp_mode)"
-      fi
-    done
-  fi
+  apply_acp_gap "ACP context gauge" "$ACPGAUGE_PATCHER" "$ACP_AGENT_JS" "$ACPGAUGE_TEST"
+  apply_acp_gap "ACP cross-provider mode default" "$ACPMODE_PATCHER" "$GENERIC_ACP_AGENT_JS" "$ACPMODE_TEST"
+  apply_acp_gap "ACP invalid model rejection" "$ACPMODEL_PATCHER" "$ACP_AGENT_JS" "$ACPMODEL_TEST"
 fi
 
 # --- 3. tailnet FQDN (for the gate Host header + the daemon hostname allowlist) ---
@@ -991,6 +942,32 @@ elif [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
 else
   FQDN="$(ts_fqdn)"
 fi
+
+# --- 3b. agy-acp translator (config-gated; warn-only; see agy-acp/README.md) ---
+# Must run BEFORE the restart decision below, not after: registering a provider
+# means writing agents.providers.agy into config.json, and that only takes
+# effect the next time the daemon reads it at startup. Placed after this
+# script's own restart (as section 7, next to browse-host — a same-process
+# sidecar with no such generation coupling) a freshly written provider would
+# silently sit unread until some unrelated later restart. rc 2 from
+# agy-acp/install.sh means "wrote a change" and folds into the one restart
+# below; any other nonzero is warn-only, same discipline as browse-host.
+# `|| rc=$?`, not `; rc=$?`: this script runs under `set -e`, which would abort on
+# the child's intended rc 2 before the fold below ever sees it (C2.5 F1, 2026-09-15).
+agy_acp_rc=0
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  # A dry run must not mutate the box (LIVE_BOX_ISOLATION). The child writes config.json
+  # and skills.json directly, so it is not called at all (C2.5 F2, 2026-09-15).
+  log "[dry] agy-acp: would configure the agy provider in ${PASEO_HOME:-$HOME/.paseo}/config.json (agy=$AIRLOCK_PASEO_AGY)"
+else
+  AIRLOCK_PASEO_AGY="$AIRLOCK_PASEO_AGY" PASEO_HOME="${PASEO_HOME:-$HOME/.paseo}" \
+    bash "$HERE/agy-acp/install.sh" || agy_acp_rc=$?
+fi
+case "$agy_acp_rc" in
+  0) ;;
+  2) need_restart=1 ;;
+  *) log "warning: agy-acp install skipped (rc=$agy_acp_rc) — agy provider unavailable (daemon unaffected). Retry: bash $HERE/agy-acp/install.sh" ;;
+esac
 
 # --- 4. systemd --user unit (loopback daemon; explicit PATH, HOME, XDG env) ---
 # AIRLOCK_RENDER_DIR forces this write branch even under AIRLOCK_DRY_RUN=1 — see

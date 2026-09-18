@@ -1,0 +1,38 @@
+{
+  "name": "google-antigravity-acp",
+  "version": "1.1.1",
+  "private": true,
+  "description": "ACP adapter for Google Antigravity (agy) — Airlock fork of sibbl/google-antigravity-acp, patched for Paseo. See README.md.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "bin": {
+    "google-antigravity-acp": "dist/cli.js",
+    "google-antigravity-cli": "dist/one-shot-cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test tests/"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sibbl/google-antigravity-acp.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.4.0",
+    "commander": "^13.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

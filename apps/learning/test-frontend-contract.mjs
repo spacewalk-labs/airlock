@@ -492,7 +492,9 @@ contract('reader-quiz-shared-assets', () => {
   const inject = pythonFunction(backend, 'def inject_reader_shell(');
   assert.match(inject, /doc\\\.css/);
   assert.match(inject, /doc\\\.js/);
+  assert.match(inject, /SAVE\.ensure_doc_root\(page\)/);
   assert.match(inject, /shared_assets \+ READER_SHELL_STYLE/);
+  assert.match(backend, /html body\{max-width:none;margin:0;padding-left:0;padding-right:0;padding-bottom:0\}/);
   const getRoute = pythonFunction(backend, '    def do_GET(');
   assert.match(getRoute, /re\.fullmatch\(r"\/read\/\(\?:\.\*\/\)\?_assets\/\(\[\^\/\]\+\)"/);
   assert.match(getRoute, /return self\._published_asset\(unquote\(read_asset\.group\(1\)\)\)/);
@@ -520,6 +522,41 @@ print(json.dumps({"plain_css": rendered.count("doc.css"),
   assert.deepEqual(JSON.parse(result.stdout), {
     plain_css: 1, plain_js: 1, existing_css: 1, existing_js: 1,
   }, '누락 자산은 한 번 붙고 기존 자산은 중복되지 않아야 한다');
+});
+
+// --- 13b. 읽기 응답은 공용 CSS 가 여백을 거는 main.doc 루트를 보장한다 ---
+contract('reader-doc-root-layout', () => {
+  assert.match(skill, /<main class="doc">/);
+  const probe = String.raw`
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("learning_backend", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+bare = b'<html><head></head><body><style>body{max-width:44rem;margin:3rem auto;padding:0 1.25rem}</style><h1>Title</h1><p>Body</p></body></html>'
+quiz = b'<html><head></head><body><section class="doc-quiz"></section></body></html>'
+owned = b'<html><head></head><body><main class="doc"><h1>x</h1></main></body></html>'
+bare_out = module.inject_reader_shell(bare, {"videoUrl": None}).decode()
+quiz_out = module.inject_reader_shell(quiz, {"videoUrl": None}).decode()
+owned_out = module.inject_reader_shell(owned, {"videoUrl": None}).decode()
+print(json.dumps({
+  "bare_root": bare_out.count('<main class="doc">'),
+  "quiz_root": quiz_out.count('<main class="doc">'),
+  "owned_root": owned_out.count('<main class="doc">'),
+  "chrome_before_doc": bare_out.find("LEARNING_READER_SHELL") < bare_out.find('<main class="doc">'),
+  "title_inside": "<h1>Title</h1>" in bare_out.split('<main class="doc">', 1)[-1],
+}))
+`;
+  const result = spawnSync('python3', ['-c', probe, fileURLToPath(backendPath)], {
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    bare_root: 1,
+    quiz_root: 1,
+    owned_root: 1,
+    chrome_before_doc: true,
+    title_inside: true,
+  }, '루트는 한 겹이고 도구막대는 .doc 밖에 있어야 한다');
 });
 
 // --- 14. 타임스탬프 링크는 저장 원문이 아니라 읽기 응답에서 결정적으로 만든다 ---
@@ -589,6 +626,7 @@ assert.deepEqual(newContractNames, [
   'retry-replaces-card-without-deleting-history',
   'reader-transcript-note-single',
   'reader-quiz-shared-assets',
+  'reader-doc-root-layout',
   'reader-timestamp-links',
   'search-toggle-single-input',
 ]);

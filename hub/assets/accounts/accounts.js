@@ -263,6 +263,58 @@ function fetchCodexUsage(box, cx, identity, reflow, alive, reaskState, revalidat
   });
 }
 
+// Antigravity quota. The server answers with its last reading at once and re-reads in
+// the background when that reading is older than 20 minutes (it has to open the agy CLI
+// to do so), so this paints the remembered numbers first and asks again until the
+// re-read is done. agy reports "remaining"; rows show "used" like every other section.
+const AGY_REASK_MS = 4000, AGY_REASK_MAX = 25;
+function renderAgySection(list, reflow, parentAlive) {
+  const box = document.createElement('div'); box.className = 'agy-box codex-box';
+  const sep = document.createElement('div'); sep.className = 'sep';
+  const hd = document.createElement('div'); hd.className = 'hd'; hd.textContent = 'Antigravity · this box';
+  const alive = function () { return (!parentAlive || parentAlive()) && document.body.contains(box); };
+  let tries = 0, shown = false;
+  const ask = function () {
+    fetch(API + 'agy-usage', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (u) {
+      if (!alive() && shown) return;
+      if (!u || u.enabled !== true) return;        // no agy on this box: no section at all
+      if (!shown) { list.appendChild(sep); list.appendChild(hd); list.appendChild(box); shown = true; }
+      renderAgyBody(box, u); if (reflow) reflow();
+      if (u.refreshing && ++tries <= AGY_REASK_MAX) setTimeout(function () { if (alive()) ask(); }, AGY_REASK_MS);
+    }).catch(function () {
+      if (shown && alive()) { box.textContent = 'Antigravity quota query failed'; if (reflow) reflow(); }
+    });
+  };
+  ask();
+}
+function renderAgyBody(box, u) {
+  box.textContent = '';
+  const head = document.createElement('div'); head.className = 'codex-row';
+  const nm = document.createElement('span'); nm.className = 'nm';
+  const pl = document.createElement('span'); pl.className = 'pl';
+  nm.textContent = u.account || (u.refreshing ? 'reading…' : 'no reading yet');
+  if (!u.account) nm.style.color = C_GRAY;
+  const bits = [];
+  if (u.age != null) bits.push(u.age < 60 ? 'just now' : Math.round(u.age / 60) + ' min ago');
+  if (u.refreshing) bits.push('refreshing…');
+  else if (u.lastErr) bits.push('last read failed: ' + u.lastErr);
+  pl.textContent = bits.join(' · ');
+  head.appendChild(nm); head.appendChild(pl); box.appendChild(head);
+  (u.groups || []).forEach(function (g) {
+    const row = document.createElement('div'); row.className = 'codex-row';
+    const gn = document.createElement('span'); gn.className = 'nm';
+    const gp = document.createElement('span'); gp.className = 'pl';
+    const used5 = Math.max(0, Math.round(100 - g.fiveHourRemaining));
+    const used7 = Math.max(0, Math.round(100 - g.weeklyRemaining));
+    const name = String(g.name || '').replace(/ MODELS$/, '').toLowerCase().replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+    gn.textContent = name + ' · 5h ' + used5 + '% · 7d ' + used7 + '%';
+    gn.style.color = levelColor(Math.max(usageLevel('5h', used5), usageLevel('7d', used7)));
+    gp.textContent = 'resets ' + fmtReset(new Date(g.fiveHourResetAt * 1000).toISOString()) +
+      ' / ' + fmtReset(new Date(g.weeklyResetAt * 1000).toISOString(), true);
+    row.appendChild(gn); row.appendChild(gp); box.appendChild(row);
+  });
+}
+
 function renderCodexSection(list, reflow, parentAlive) {
   _codexOperationPending = false;        // a newly opened/redrawn section owns new work
   const sep = document.createElement('div'); sep.className = 'sep'; list.appendChild(sep);
@@ -662,6 +714,7 @@ function fillAcctList(list, opts) {
   // drawn whether or not account switching is enabled here.
   renderCodexSection(list, reflow, alive);
   renderXaiSection(list, reflow, alive);
+  renderAgySection(list, reflow, alive);
   const render = function (j) {
     claudeBox.textContent = '';
     if (j && j.enabled === false) {

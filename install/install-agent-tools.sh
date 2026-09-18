@@ -40,6 +40,9 @@ if [ -x "$home/.opencode/bin/opencode" ]; then
   chown -h "$user:$user" "$home/.local/bin/opencode"
 fi
 
+runuser -u "$user" -- env HOME="$home" \
+  python3 "$(dirname "$0")/configure-opencode.py" --home "$home"
+
 runuser -u "$user" -- env HOME="$home" PATH="$tool_path" bash -c '
 set -e
 [ "$(node -p '\''process.versions.node.split(".")[0]'\'')" -ge 20 ]

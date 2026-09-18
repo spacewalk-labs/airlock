@@ -131,6 +131,8 @@ accounts_port = 19904   # loopback backend for the platform account surface. Unl
 #                       # "~/.claude-accounts/.fleet-usage.json"). Unset = only the active
 #                       # account shows usage. Falls back to apps.devterm.fleet_store.
 # fleet_store_url = ""  # URL of a shared usage store (optional; no host is hardcoded)
+# xai = false           # OpenCode xAI login on the account panel (needs the `opencode`
+#                       # CLI). Falls back to apps.devterm.xai.
 
 [apps.devterm]
 # No plaintext pair here: D-DEVTERM-9900 retired devterm's public_port/
@@ -287,3 +289,9 @@ backend_port   = 19952
 # browse-host/install.sh (warn-only). See apps/paseo/browse-host/README.md.
 browse         = false
 browse_ws_port = 19953
+# agy-acp: registers Google Antigravity's `agy` CLI as the Paseo provider
+# `agy` (config-only — no Paseo source patch, no static model list). Off by
+# default. When true, the installer builds the fork under
+# ~/.local/share/agy-acp and writes ~/.paseo/config.json + ~/.gemini/config/
+# skills.json (warn-only). See apps/paseo/agy-acp/README.md.
+agy            = false

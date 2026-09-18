@@ -8,6 +8,228 @@
 # May require sudo for nginx/tailscale steps depending on your box.
 set -euo pipefail
 
+_airlock_install_usage() {
+  cat <<'EOF'
+airlock-install — validate and install the configured Airlock box.
+  bash install/airlock-install.sh
+  bash install/airlock-install.sh --select-app=<package-id> [...]
+  bash install/airlock-install.sh --dangerously-admit-unverified=<package-id>
+  bash install/airlock-install.sh --update-channel-handoff=<path> \
+    --update-channel-handoff-sha256=<sha256> --select-app=<package-id> [...]
+  AIRLOCK_DRY_RUN=1 bash install/airlock-install.sh
+  bash install/airlock-install.sh --transfer-owner-from=<current-owner-login>
+  bash install/airlock-install.sh --recover-transaction=<transaction-id>
+  bash install/airlock-install.sh --help
+EOF
+}
+
+_airlock_arg_die() {
+  printf '[airlock] FATAL: %s\n' "$*" >&2
+  exit 1
+}
+
+# Classify the complete argv before sourcing helpers or looking at live state.  A
+# question or an invalid invocation must not enter self-kill escape, recovery,
+# config, render, or lock code merely to learn that it should have exited.
+_airlock_lifecycle_args=()
+_airlock_selected_apps=()
+_airlock_update_channel_handoff=""
+_airlock_update_channel_handoff_sha256=""
+_airlock_recover_transaction=""
+_airlock_transfer_owner_from=""
+_airlock_help=0
+for _airlock_install_arg in "$@"; do
+  case "$_airlock_install_arg" in
+    -h|--help)
+      _airlock_help=$((_airlock_help + 1))
+      ;;
+    --dangerously-admit-unverified=*)
+      [ "${#_airlock_lifecycle_args[@]}" -eq 0 ] \
+        || _airlock_arg_die "--dangerously-admit-unverified is accepted only once"
+      _airlock_lifecycle_args+=("$_airlock_install_arg")
+      ;;
+    --dangerously-admit-unverified)
+      _airlock_arg_die "--dangerously-admit-unverified requires =<package-id>"
+      ;;
+    --select-app=*)
+      _airlock_selected_app="${_airlock_install_arg#*=}"
+      [ -n "$_airlock_selected_app" ] || _airlock_arg_die "--select-app requires =<package-id>"
+      _airlock_selected_apps+=("$_airlock_selected_app")
+      ;;
+    --select-app)
+      _airlock_arg_die "--select-app requires =<package-id>"
+      ;;
+    --update-channel-handoff=*)
+      [ -z "$_airlock_update_channel_handoff" ] \
+        || _airlock_arg_die "--update-channel-handoff is accepted only once"
+      _airlock_update_channel_handoff="${_airlock_install_arg#*=}"
+      [ -n "$_airlock_update_channel_handoff" ] \
+        || _airlock_arg_die "--update-channel-handoff requires =<absolute-private-path>"
+      ;;
+    --update-channel-handoff-sha256=*)
+      [ -z "$_airlock_update_channel_handoff_sha256" ] \
+        || _airlock_arg_die "--update-channel-handoff-sha256 is accepted only once"
+      _airlock_update_channel_handoff_sha256="${_airlock_install_arg#*=}"
+      ;;
+    --update-channel-handoff|--update-channel-handoff-sha256)
+      _airlock_arg_die "$_airlock_install_arg requires =<value>"
+      ;;
+    --recover-transaction=*)
+      [ -z "$_airlock_recover_transaction" ] \
+        || _airlock_arg_die "--recover-transaction is accepted only once"
+      _airlock_recover_transaction="${_airlock_install_arg#*=}"
+      [[ "$_airlock_recover_transaction" =~ ^[0-9a-f]{32}$ ]] \
+        || _airlock_arg_die "--recover-transaction requires one full 32-hex transaction id"
+      ;;
+    --recover-transaction)
+      _airlock_arg_die "--recover-transaction requires =<transaction-id>"
+      ;;
+    --transfer-owner-from=*)
+      [ -z "$_airlock_transfer_owner_from" ] \
+        || _airlock_arg_die "--transfer-owner-from is accepted only once"
+      _airlock_transfer_owner_from="${_airlock_install_arg#*=}"
+      [ -n "$_airlock_transfer_owner_from" ] \
+        || _airlock_arg_die "--transfer-owner-from requires =<current-owner-login>"
+      [[ "$_airlock_transfer_owner_from" =~ ^[^[:cntrl:]\"\\]+@[^[:cntrl:]\"\\]+$ ]] \
+        || _airlock_arg_die "--transfer-owner-from must be one safe email-like login"
+      ;;
+    --transfer-owner-from)
+      _airlock_arg_die "--transfer-owner-from requires =<current-owner-login>"
+      ;;
+    *)
+      _airlock_arg_die "unknown installer argument: $_airlock_install_arg"
+      ;;
+  esac
+done
+if [ "$_airlock_help" -gt 0 ]; then
+  [ "$#" -eq 1 ] && [ "$_airlock_help" -eq 1 ] \
+    || _airlock_arg_die "--help cannot be combined with installer arguments"
+  _airlock_install_usage
+  exit 0
+fi
+if [ -n "$_airlock_update_channel_handoff" ] \
+    || [ -n "$_airlock_update_channel_handoff_sha256" ]; then
+  [ -n "$_airlock_update_channel_handoff" ] \
+    && [ -n "$_airlock_update_channel_handoff_sha256" ] \
+    || _airlock_arg_die "managed update requires the handoff path and SHA-256 together"
+  [ "${#_airlock_selected_apps[@]}" -gt 0 ] \
+    || _airlock_arg_die "managed update requires one or more --select-app arguments"
+  [ "${#_airlock_lifecycle_args[@]}" -eq 0 ] \
+    || _airlock_arg_die "managed update cannot use the unverified package escape hatch"
+fi
+if [ -n "$_airlock_recover_transaction" ]; then
+  [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] \
+    || _airlock_arg_die "--recover-transaction cannot be combined with AIRLOCK_DRY_RUN=1"
+  [ "${#_airlock_lifecycle_args[@]}" -eq 0 ] \
+    && [ "${#_airlock_selected_apps[@]}" -eq 0 ] \
+    && [ -z "$_airlock_update_channel_handoff" ] \
+    && [ -z "$_airlock_update_channel_handoff_sha256" ] \
+    || _airlock_arg_die "--recover-transaction cannot be combined with install arguments"
+fi
+if [ -n "$_airlock_transfer_owner_from" ]; then
+  [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] \
+    || _airlock_arg_die "--transfer-owner-from is an explicit live transition, not a dry-run option"
+  [ "${#_airlock_lifecycle_args[@]}" -eq 0 ] \
+    && [ "${#_airlock_selected_apps[@]}" -eq 0 ] \
+    && [ -z "$_airlock_update_channel_handoff" ] \
+    && [ -z "$_airlock_update_channel_handoff_sha256" ] \
+    && [ -z "$_airlock_recover_transaction" ] \
+    || _airlock_arg_die "--transfer-owner-from is accepted only by a full ordinary install"
+fi
+
+# AIRLOCK_FIXTURE_* is executable test authority, not a harmless destination
+# hint. Before sourcing helpers or reading live state, bind it to one marked,
+# owner-private root and prove every path a fixture run may write stays below
+# that root. A normal mutating fixture also has to replace the commands that can
+# cross into systemd, nginx, Tailscale, or root-owned paths. This is deliberately
+# fail-closed: an incomplete fixture is never allowed to become a live install.
+_airlock_fixture_boundary() { # <dry|recover|mutate>
+  local _mode="$1" _fixture_signal=0 _name _resolved _tool_paths=()
+  while IFS= read -r _name; do
+    case "$_name" in AIRLOCK_FIXTURE_*) _fixture_signal=1; break ;; esac
+  done < <(compgen -A variable)
+  [ "$_fixture_signal" = 1 ] || return 0
+  if [ "$_mode" != dry ]; then
+    for _name in sudo systemctl systemd-run tailscale; do
+      _resolved="$(command -v "$_name" 2>/dev/null || true)"
+      _tool_paths+=("$_resolved")
+    done
+  fi
+  python3 - "$_mode" "${AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR:-}" \
+    "${HOME:-}" "${AIRLOCK_STATE_DIR:-}" "${AIRLOCK_WEBROOT:-}" \
+    "${AIRLOCK_CONFD:-}" "${AIRLOCK_NGINX_SITE:-}" \
+    "${AIRLOCK_UNIT_DIR_USER:-}" "${AIRLOCK_UNIT_DIR_SYSTEM:-}" \
+    "${AIRLOCK_RENDER_DIR:-}" "${_tool_paths[@]}" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+mode, lease_raw, home, state, webroot, confd, nginx_site, unit_user, unit_system, render, *tools = sys.argv[1:]
+lease = pathlib.Path(lease_raw)
+if not lease.is_absolute() or lease.name != "airlock-live-box":
+    raise SystemExit("fixture boundary: lease path must be absolute and end in /airlock-live-box")
+try:
+    root = lease.parent.resolve(strict=True)
+    root_info = root.lstat()
+    marker = root / ".airlock-live-box-fixture-v1"
+    marker_info = marker.lstat()
+    marker_value = marker.read_text(encoding="ascii")
+except (OSError, UnicodeError) as exc:
+    raise SystemExit(f"fixture boundary: missing fixture root or marker: {exc}")
+if (lease.parent != root or root.is_symlink() or not root.is_dir()
+        or root_info.st_uid != os.getuid() or stat.S_IMODE(root_info.st_mode) != 0o700
+        or marker.is_symlink() or not marker.is_file()
+        or marker_info.st_uid != os.getuid() or stat.S_IMODE(marker_info.st_mode) != 0o600
+        or marker_value != "airlock.live-box-fixture/v1\n"):
+    raise SystemExit("fixture boundary: root must be canonical, owner-private, and explicitly marked")
+
+def below(label, raw, required):
+    if not raw:
+        if required:
+            raise SystemExit(f"fixture boundary: {label} must be explicit")
+        return
+    path = pathlib.Path(raw)
+    if not path.is_absolute():
+        raise SystemExit(f"fixture boundary: {label} must be absolute")
+    resolved = path.resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise SystemExit(f"fixture boundary: {label} escapes fixture root: {resolved}")
+
+below("HOME", home, True)
+state = state or os.fspath(pathlib.Path(home) / ".local" / "state" / "airlock")
+unit_user = unit_user or os.fspath(pathlib.Path(home) / ".config" / "systemd" / "user")
+below("AIRLOCK_STATE_DIR", state, True)
+for label, raw in (
+    ("AIRLOCK_WEBROOT", webroot),
+    ("AIRLOCK_CONFD", confd),
+    ("AIRLOCK_NGINX_SITE", nginx_site),
+    ("AIRLOCK_UNIT_DIR_USER", unit_user),
+    ("AIRLOCK_UNIT_DIR_SYSTEM", unit_system),
+    ("AIRLOCK_RENDER_DIR", render),
+):
+    below(label, raw, mode == "mutate" and label != "AIRLOCK_RENDER_DIR")
+if mode != "dry":
+    if len(tools) != 4 or any(not raw for raw in tools):
+        raise SystemExit("fixture boundary: mutation command shims are incomplete")
+    for raw in tools:
+        below("mutation command", raw, True)
+PY
+}
+
+_airlock_fixture_mode=mutate
+[ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || _airlock_fixture_mode=dry
+[ -z "$_airlock_recover_transaction" ] || _airlock_fixture_mode=recover
+# AIRLOCK_FIXTURE_BOUNDARY_CALL — the regression fixture mutates this exact call.
+_airlock_fixture_boundary "$_airlock_fixture_mode" \
+  || _airlock_arg_die "unsafe fixture execution refused before live effects"
+if [ -n "${AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR:-}" ]; then
+  printf '[airlock] verified fixture targets before effects: WEBROOT=%s CONFD=%s NGINX_SITE=%s\n' \
+    "${AIRLOCK_WEBROOT:-<private-dry-preview>}" \
+    "${AIRLOCK_CONFD:-<private-dry-preview>}" \
+    "${AIRLOCK_NGINX_SITE:-<no-site-write>}" >&2
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 # Never inherit a config reader from the caller. The private wrapper is set
@@ -400,39 +622,16 @@ _airlock_mark_nginx_restore_owed() {
   "$ROOT/bin/airlock-ledger" transaction-nginx-restore-owed
 }
 
-# Before anything is stopped: if this run is hosted by one of the units it is about
-# to restart, move it out of that cgroup so it survives its own teardown. Informs
-# and continues rather than refusing — see install/lib.sh.
-airlock_escape_selfkill_cgroup "$0" "$@"
-
-# Crash recovery is config-independent and precedes config
-# parsing: a bad new candidate must not prevent the last committed apps from
-# being restored. The same ledger lock remains held if this run continues.
+# Transaction inspection is config-independent but recovery is never implicit.  A
+# question may read the record; only one exact-id recovery invocation may mutate it.
+# In particular, refuse an ordinary install before self-kill escape can create a
+# transient unit on behalf of unrelated recovery debt.
 _airlock_recovery_lock=0
 _airlock_early_state_dir="$(devmon_migration_state_dir)"
 if [ -e "$_airlock_early_state_dir/install-transaction.json" ] \
     || [ -L "$_airlock_early_state_dir/install-transaction.json" ]; then
-  airlock_preflight_bootstrap
-  require_cmd flock
   airlock_pin_state_dir
   _airlock_early_state_dir="${AIRLOCK_STATE_DIR:-$_airlock_early_state_dir}"
-  if [ -n "${AIRLOCK_LEDGER_LOCK_FD:-}" ]; then
-    case "$AIRLOCK_LEDGER_LOCK_FD" in *[!0-9]*) die "inherited ledger lock fd must be numeric" ;; esac
-    [ "$AIRLOCK_LEDGER_LOCK_FD" -ge 3 ] 2>/dev/null \
-      && [ -f "/proc/self/fd/$AIRLOCK_LEDGER_LOCK_FD" ] \
-      && [ "/proc/self/fd/$AIRLOCK_LEDGER_LOCK_FD" -ef "$_airlock_early_state_dir/app-ledger.lock" ] \
-      || die "inherited ledger lock fd does not name $_airlock_early_state_dir/app-ledger.lock"
-    flock -n "$AIRLOCK_LEDGER_LOCK_FD" || die "inherited ledger lock fd is unavailable"
-    if [ "$AIRLOCK_LEDGER_LOCK_FD" != 9 ]; then
-      eval "exec 9<&$AIRLOCK_LEDGER_LOCK_FD"
-      eval "exec $AIRLOCK_LEDGER_LOCK_FD>&-"
-    fi
-  else
-    exec 9>>"$_airlock_early_state_dir/app-ledger.lock"
-    flock -n 9 || die "another airlock run holds the ledger lock ($_airlock_early_state_dir/app-ledger.lock) — recovery will not race it"
-  fi
-  AIRLOCK_LEDGER_LOCK_HELD=1
-  export AIRLOCK_LEDGER_LOCK_HELD
   _airlock_recovery_record="$("$ROOT/bin/airlock-ledger" transaction-show \
     | python3 -c '
 import json, sys
@@ -450,14 +649,67 @@ elif authorities:
 else:
     values = ("none", "-", "-")
 print("\t".join((d["id"], d["phase"], *values)))
-')" \
-    || die "cannot read unfinished install transaction"
+')" || die "cannot read existing install transaction"
   IFS=$'\t' read -r _airlock_recovery_id _airlock_recovery_phase \
     _airlock_recovery_activation _airlock_recovery_old_sha _airlock_recovery_new_sha \
     <<<"$_airlock_recovery_record"
+  _airlock_recovery_required=0
+  case "$_airlock_recovery_phase:$_airlock_recovery_activation" in
+    prepared:*|installing:*|rolling_back:*|degraded:*|committed:owed)
+      _airlock_recovery_required=1
+      ;;
+  esac
+  if [ -z "$_airlock_recover_transaction" ] && [ "$_airlock_recovery_required" = 1 ] \
+      && [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+    die "unfinished transaction blocks a new candidate
+  transaction: $_airlock_recovery_id
+  phase: $_airlock_recovery_phase${_airlock_recovery_activation:+/$_airlock_recovery_activation}
+  checkpoint: $_airlock_early_state_dir/install-checkpoints/$_airlock_recovery_id
+  recover: bash install/airlock-install.sh --recover-transaction=$_airlock_recovery_id"
+  fi
+  if [ -n "$_airlock_recover_transaction" ]; then
+    [ "$_airlock_recover_transaction" = "$_airlock_recovery_id" ] \
+      || die "requested recovery transaction $_airlock_recover_transaction does not match current transaction $_airlock_recovery_id"
+    if [ "$_airlock_recovery_required" != 1 ]; then
+      log "transaction $_airlock_recovery_id is already terminal ($_airlock_recovery_phase)"
+      exit 0
+    fi
+    # Recovery may stop this session's host service. Escape only after argv and the
+    # exact durable transaction id have been validated, then acquire the live-box
+    # lease inside that detached unit so its keeper survives the host restart.
+    airlock_escape_selfkill_cgroup "$0" "$@"
+    airlock_enter_live_box_lease "recover:$_airlock_recovery_id" "$0" "$@"
+    airlock_preflight_bootstrap
+    require_cmd flock
+  else
+    # A dry run may inspect a candidate beside recovery debt, but never repairs it.
+    [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || log "dry run leaves unfinished transaction $_airlock_recovery_id ($_airlock_recovery_phase) unchanged"
+  fi
+fi
+
+if [ -n "$_airlock_recover_transaction" ]; then
+  [ -e "$_airlock_early_state_dir/install-transaction.json" ] \
+    || die "requested recovery transaction $_airlock_recover_transaction does not exist"
+  if [ -n "${AIRLOCK_LEDGER_LOCK_FD:-}" ]; then
+    case "$AIRLOCK_LEDGER_LOCK_FD" in *[!0-9]*) die "inherited ledger lock fd must be numeric" ;; esac
+    [ "$AIRLOCK_LEDGER_LOCK_FD" -ge 3 ] 2>/dev/null \
+      && [ -f "/proc/self/fd/$AIRLOCK_LEDGER_LOCK_FD" ] \
+      && [ "/proc/self/fd/$AIRLOCK_LEDGER_LOCK_FD" -ef "$_airlock_early_state_dir/app-ledger.lock" ] \
+      || die "inherited ledger lock fd does not name $_airlock_early_state_dir/app-ledger.lock"
+    flock -n "$AIRLOCK_LEDGER_LOCK_FD" || die "inherited ledger lock fd is unavailable"
+    if [ "$AIRLOCK_LEDGER_LOCK_FD" != 9 ]; then
+      eval "exec 9<&$AIRLOCK_LEDGER_LOCK_FD"
+      eval "exec $AIRLOCK_LEDGER_LOCK_FD>&-"
+    fi
+  else
+    exec 9>>"$_airlock_early_state_dir/app-ledger.lock"
+    flock -n 9 || die "another airlock run holds the ledger lock ($_airlock_early_state_dir/app-ledger.lock) — recovery will not race it"
+  fi
+  AIRLOCK_LEDGER_LOCK_HELD=1
+  export AIRLOCK_LEDGER_LOCK_HELD
   case "$_airlock_recovery_phase" in
     prepared|installing|rolling_back|degraded)
-      log "recovering unfinished install transaction before reading the new candidate"
+      log "explicitly recovering install transaction $_airlock_recovery_id"
       case "$_airlock_recovery_activation" in
         owed)
           _airlock_trusted_measurer_root rollback "$_airlock_recovery_id" \
@@ -506,15 +758,24 @@ print("\t".join((d["id"], d["phase"], *values)))
       esac
       ;;
   esac
-  _airlock_recovery_lock=1
+  log "explicit recovery finished for transaction $_airlock_recovery_id"
+  exit 0
+fi
+
+# Before a normal mutating install can stop anything: if this run is hosted by one
+# of the units it may restart, move it out of that cgroup so it survives teardown.
+# Help, invalid argv, dry-run, and recovery-debt refusal have already returned.
+if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+  # The transient unit is admission transport, not the mutator. Acquire the lease
+  # after detaching so its keeper and fd survive any app service restarted below.
+  airlock_escape_selfkill_cgroup "$0" "$@"
+  airlock_enter_live_box_lease "install" "$0" "$@"
 fi
 
 # The exceptional path is one exact, package-scoped argv value.  Do not add an
 # environment alias: an exported value would silently remain active for later
 # runs. Lifecycle argv remains empty; a private temporary config wrapper gives
 # only this process tree the same package-scoped decision.
-_airlock_lifecycle_args=()
-_airlock_selected_apps=()
 _airlock_lifecycle_config_bin="$AIRLOCK_CONFIG_BIN"
 _airlock_config_wrapper=""
 _airlock_config_snapshot=""
@@ -523,67 +784,21 @@ _airlock_ledger_plan_file=""
 _airlock_ledger_dependencies_file=""
 _airlock_scoped_plan_file=""
 _airlock_candidate_webjson_file=""
-_airlock_update_channel_handoff=""
-_airlock_update_channel_handoff_sha256=""
 _airlock_managed_context_file=""
 _airlock_managed_authority_file=""
 _airlock_managed_authority_sha256=""
 _airlock_managed_next_measurer=""
 _airlock_managed_installed_measurer_sha256=""
 _airlock_managed_next_measurer_sha256=""
+_airlock_dry_preview_root=""
 _airlock_managed_mode=0
 _airlock_transaction_active=0
 _airlock_transaction_id=""
 _airlock_failure_phase="pre-mutation"
 _airlock_failure_app="-"
 _airlock_removed_after_first_reload=0
-for _airlock_install_arg in "$@"; do
-  case "$_airlock_install_arg" in
-    --dangerously-admit-unverified=*)
-      [ "${#_airlock_lifecycle_args[@]}" -eq 0 ] \
-        || die "--dangerously-admit-unverified is accepted only once"
-      _airlock_lifecycle_args+=("$_airlock_install_arg")
-      ;;
-    --dangerously-admit-unverified)
-      die "--dangerously-admit-unverified requires =<package-id>"
-      ;;
-    --select-app=*)
-      _airlock_selected_app="${_airlock_install_arg#*=}"
-      [ -n "$_airlock_selected_app" ] || die "--select-app requires =<package-id>"
-      _airlock_selected_apps+=("$_airlock_selected_app")
-      ;;
-    --select-app)
-      die "--select-app requires =<package-id>"
-      ;;
-    --update-channel-handoff=*)
-      [ -z "$_airlock_update_channel_handoff" ] \
-        || die "--update-channel-handoff is accepted only once"
-      _airlock_update_channel_handoff="${_airlock_install_arg#*=}"
-      [ -n "$_airlock_update_channel_handoff" ] \
-        || die "--update-channel-handoff requires =<absolute-private-path>"
-      ;;
-    --update-channel-handoff-sha256=*)
-      [ -z "$_airlock_update_channel_handoff_sha256" ] \
-        || die "--update-channel-handoff-sha256 is accepted only once"
-      _airlock_update_channel_handoff_sha256="${_airlock_install_arg#*=}"
-      ;;
-    --update-channel-handoff|--update-channel-handoff-sha256)
-      die "$_airlock_install_arg requires =<value>"
-      ;;
-    *)
-      die "unknown installer argument: $_airlock_install_arg"
-      ;;
-  esac
-done
 if [ -n "$_airlock_update_channel_handoff" ] \
     || [ -n "$_airlock_update_channel_handoff_sha256" ]; then
-  [ -n "$_airlock_update_channel_handoff" ] \
-    && [ -n "$_airlock_update_channel_handoff_sha256" ] \
-    || die "managed update requires the handoff path and SHA-256 together"
-  [ "${#_airlock_selected_apps[@]}" -gt 0 ] \
-    || die "managed update requires one or more --select-app arguments"
-  [ "${#_airlock_lifecycle_args[@]}" -eq 0 ] \
-    || die "managed update cannot use the unverified package escape hatch"
   _airlock_managed_mode=1
 fi
 
@@ -644,6 +859,7 @@ _airlock_cleanup_config_wrapper() {
   [ -z "$_airlock_candidate_webjson_file" ] || rm -f -- "$_airlock_candidate_webjson_file"
   [ -z "$_airlock_managed_context_file" ] || rm -f -- "$_airlock_managed_context_file"
   [ -z "$_airlock_managed_authority_file" ] || rm -f -- "$_airlock_managed_authority_file"
+  [ -z "$_airlock_dry_preview_root" ] || rm -rf -- "$_airlock_dry_preview_root"
   exit "$_exit_rc"
 }
 trap _airlock_cleanup_config_wrapper EXIT
@@ -1202,6 +1418,7 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
 fi
 
 airlock_load hub    # AIRLOCK_HUB_NGINX_PORT / _HTTPS_PORT / _HTTP_PORT / _REDIRECT_PORT
+_airlock_snapshot_owner="$AIRLOCK_OWNER"
 # The platform account/secret surface's port, validated once here. devterm proxies the
 # platform secret routes to it (airlock_accounts_port); exporting it keeps that a read of
 # this validation rather than a second one.
@@ -1220,32 +1437,99 @@ WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
 CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
 NGINX_SITE="${AIRLOCK_NGINX_SITE:-/etc/nginx/conf.d/airlock.conf}"
 
-# A dry run must not take root, and the mkdir below is inside airlock_run — so on a
-# box that has never been installed, $CONFD does not exist when the app installers
-# run. Each of them then writes its nginx fragment with a bare `install -d`, because
-# the fragments are config the renderer needs (install/test-integration.sh asserts
-# them from a dry run). Without root that died on EACCES in the first app installer:
+# A normal dry run always renders into a private scratch tree.  Trying the requested
+# live roots first is itself a write when their parent is writable, and app installers
+# write nginx fragments unconditionally because the renderer consumes them.  The old
+# fallback therefore made preview safety depend on permissions: root-owned /etc was
+# safe while a user-owned installed root was changed.
 #
-#   install: cannot create directory '/etc/airlock': Permission denied
-#
-# meaning `AIRLOCK_DRY_RUN=1` only worked on a box that had already completed a real
-# install — the preview step failed for exactly the people who had not installed
-# yet, and told them nothing about why. So a dry run that cannot use the real
-# directories gets scratch ones, and says where they went.
+# Hermetic render suites may request a pre-existing output directory explicitly.  It
+# is an output contract, not a live-root override: the orchestrator derives both
+# writable roots below it and never treats AIRLOCK_WEBROOT/AIRLOCK_CONFD as preview
+# destinations on their own.
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  for _d in "$WEBROOT/assets" "$CONFD/hub-locations.d" "$CONFD/servers.d"; do
-    [ -d "$_d" ] || install -d "$_d" 2>/dev/null || { _dry_scratch=1; break; }
-  done
-  if [ "${_dry_scratch:-0}" = 1 ]; then
-    _scratch="$(mktemp -d)"
-    log "[dry] $WEBROOT / $CONFD are not writable without root, which a dry run will not \
-take — previewing into $_scratch instead. Paths in the lines below are the scratch ones."
-    WEBROOT="$_scratch/hub"; CONFD="$_scratch/nginx"
-    install -d "$WEBROOT/assets" "$CONFD/hub-locations.d" "$CONFD/servers.d"
-    AIRLOCK_WEBROOT="$WEBROOT"; AIRLOCK_CONFD="$CONFD"
+  if [ -n "${AIRLOCK_DRY_RUN_OUTPUT_DIR:-}" ]; then
+    case "$AIRLOCK_DRY_RUN_OUTPUT_DIR" in
+      /*) ;;
+      *) die "AIRLOCK_DRY_RUN_OUTPUT_DIR must be an absolute pre-existing directory" ;;
+    esac
+    [ -d "$AIRLOCK_DRY_RUN_OUTPUT_DIR" ] && [ ! -L "$AIRLOCK_DRY_RUN_OUTPUT_DIR" ] \
+      && [ "$(stat -c %u "$AIRLOCK_DRY_RUN_OUTPUT_DIR")" = "$(id -u)" ] \
+      || die "AIRLOCK_DRY_RUN_OUTPUT_DIR must be a real directory owned by this user"
+    _scratch="$AIRLOCK_DRY_RUN_OUTPUT_DIR"
+  else
+    _airlock_dry_preview_root="$(mktemp -d)" || die "cannot create private dry-run render root"
+    chmod 0700 "$_airlock_dry_preview_root" || die "cannot protect dry-run render root"
+    _scratch="$_airlock_dry_preview_root"
+    log "[dry] previewing into private scratch $_scratch; live render roots stay untouched"
   fi
+  WEBROOT="$_scratch/web"; CONFD="$_scratch/confd"; NGINX_SITE="$_scratch/airlock.conf"
+  AIRLOCK_WEBROOT="$WEBROOT"; AIRLOCK_CONFD="$CONFD"; AIRLOCK_NGINX_SITE="$NGINX_SITE"
 fi
-export AIRLOCK_WEBROOT AIRLOCK_CONFD
+
+_airlock_canonical_nginx_site() { # <path>; resolve parent aliases, preserve final symlink
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.is_absolute():
+    path = pathlib.Path.cwd() / path
+print(path.parent.resolve(strict=False) / path.name)
+PY
+}
+NGINX_SITE="$(_airlock_canonical_nginx_site "$NGINX_SITE")" \
+  || die "cannot canonicalize nginx output path"
+AIRLOCK_NGINX_SITE="$NGINX_SITE"
+export AIRLOCK_WEBROOT AIRLOCK_CONFD AIRLOCK_NGINX_SITE
+
+_airlock_snapshot_nginx_site() { # <source> <private-copy>; prints 0 or 1
+  local _source="$1" _copy="$2"
+  : > "$_copy" || return 1
+  if [ -L "$_source" ]; then
+    printf '%s\n' "nginx owner continuity: current site must not be a symlink: $_source" >&2
+    return 1
+  fi
+  if [ ! -e "$_source" ]; then
+    printf '0\n'
+    return 0
+  fi
+  if [ ! -f "$_source" ]; then
+    printf '%s\n' "nginx owner continuity: current site must be a regular file: $_source" >&2
+    return 1
+  fi
+  if [ -r "$_source" ]; then
+    cat -- "$_source" > "$_copy" || return 1
+  else
+    # shellcheck disable=SC2024 # privilege is needed only to read source; copy is caller-owned
+    sudo cat -- "$_source" > "$_copy" || return 1
+  fi
+  printf '1\n'
+}
+
+# AIRLOCK_OWNER_CONTINUITY_PREWRITE — must stay before the first WEBROOT/CONFD write.
+_airlock_owner_site_snapshot="$(mktemp)" || die "cannot allocate owner continuity snapshot"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  : > "$_airlock_owner_site_snapshot"
+  _airlock_owner_site_present=0
+else
+  _airlock_owner_site_present="$(_airlock_snapshot_nginx_site \
+    "$NGINX_SITE" "$_airlock_owner_site_snapshot")" || {
+    rm -f "$_airlock_owner_site_snapshot"
+    die "cannot snapshot the current nginx site before output mutation"
+  }
+fi
+if ! airlock_require_nginx_owner_continuity \
+    "$_airlock_owner_site_snapshot" "$_airlock_owner_site_present" \
+    "$_airlock_snapshot_owner" "$_airlock_transfer_owner_from"; then
+  rm -f "$_airlock_owner_site_snapshot"
+  die "refusing output mutation without nginx owner continuity"
+fi
+rm -f "$_airlock_owner_site_snapshot"
+
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  install -d "$WEBROOT/assets" "$CONFD/hub-locations.d" "$CONFD/servers.d"
+fi
 
 # Resolve every read-only candidate projection now, while all recorded apps are
 # still active and after dry-run scratch roots have reached their final values.
@@ -1481,7 +1765,8 @@ PY
             "${_tx_specs[@]}")" \
         || die "could not bind managed authority and app-scoped plan to a verified install checkpoint — no app was deactivated"
     else
-      _airlock_transaction_id="$("$ROOT/bin/airlock-ledger" transaction-begin "${_tx_specs[@]}")" \
+      _airlock_transaction_id="$(printf '%s' "$AIRLOCK_PKG_INFO" \
+        | "$ROOT/bin/airlock-ledger" transaction-begin "${_tx_specs[@]}")" \
         || die "could not bind app-scoped plan to a verified install checkpoint — no app was deactivated"
     fi
     _airlock_transaction_active=1
@@ -1601,7 +1886,8 @@ if [ "$_ledger_gate" = 1 ] || { [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] \
     done <<<"$_plan"
     if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] && [ "${#_tx_specs[@]}" -gt 0 ]; then
       _airlock_failure_phase="checkpoint"
-      _airlock_transaction_id="$("$ROOT/bin/airlock-ledger" transaction-begin "${_tx_specs[@]}")" \
+      _airlock_transaction_id="$(printf '%s' "$AIRLOCK_PKG_INFO" \
+        | "$ROOT/bin/airlock-ledger" transaction-begin "${_tx_specs[@]}")" \
         || die "could not create a verified install checkpoint — no app was deactivated"
       _airlock_transaction_active=1
       AIRLOCK_INSTALL_TRANSACTION_ID="$_airlock_transaction_id"
@@ -1651,6 +1937,7 @@ log "installing platform account surface"
 AIRLOCK_ROOT="$ROOT" AIRLOCK_HUB_ACCOUNTS_PORT="$AIRLOCK_HUB_ACCOUNTS_PORT" \
   AIRLOCK_HUB_FLEET_STORE="${AIRLOCK_HUB_FLEET_STORE-}" \
   AIRLOCK_HUB_FLEET_STORE_URL="${AIRLOCK_HUB_FLEET_STORE_URL-}" \
+  AIRLOCK_HUB_XAI="${AIRLOCK_HUB_XAI-false}" \
   bash "$ROOT/install/airlock-accounts-api.sh" install
 
 # 1d) Retire platform units this tree no longer declares. Runs AFTER the installs above,
@@ -1836,8 +2123,47 @@ else
   tmp="$(mktemp)"
   AIRLOCK_CONFIG_BIN="$_airlock_lifecycle_config_bin" \
     bash "$ROOT/install/render-nginx.sh" > "$tmp"
+  if [ "$NGINX_SITE" = /etc/nginx/conf.d/airlock.conf ]; then
+    IFS=$'\t' read -r _airlock_publish_enabled _airlock_publish_gate_port \
+      _airlock_publish_selector < <(
+        if airlock_config apps | grep -qx publish; then
+          eval "$(airlock_config env publish)"
+          _selector=hub_ok
+          [ "${AIRLOCK_PUBLISH_TAILNET_VIEW:-false}" != true ] || _selector=tailnet_ok
+          printf '1\t%s\t%s\n' "${AIRLOCK_PUBLISH_GATE_PORT:?publish gate_port missing}" "$_selector"
+        else
+          printf '0\t-\t-\n'
+        fi
+      )
+  fi
+  # Re-snapshot at the last responsible moment: a changed owner_ok map between
+  # the pre-write decision and this copy is a TOCTOU refusal, not authority.
+  _airlock_owner_site_snapshot="$(mktemp)" || {
+    rm -f "$tmp"
+    die "cannot allocate final owner continuity snapshot"
+  }
+  _airlock_owner_site_present="$(_airlock_snapshot_nginx_site \
+    "$NGINX_SITE" "$_airlock_owner_site_snapshot")" || {
+    rm -f "$tmp" "$_airlock_owner_site_snapshot"
+    die "cannot snapshot the current nginx site before replacement"
+  }
+  if [ "$NGINX_SITE" = /etc/nginx/conf.d/airlock.conf ]; then
+    if ! airlock_require_nginx_publish_continuity \
+        "$_airlock_owner_site_snapshot" "$tmp" "$_airlock_publish_enabled" \
+        "$_airlock_publish_gate_port" "$_airlock_publish_selector"; then
+      rm -f "$tmp" "$_airlock_owner_site_snapshot"
+      die "refusing to replace the live nginx site without listener and publish-gate continuity"
+    fi
+  fi
+  # AIRLOCK_OWNER_CONTINUITY_PRECOPY — the last decision before the site copy.
+  if ! airlock_require_nginx_owner_continuity \
+      "$_airlock_owner_site_snapshot" "$_airlock_owner_site_present" \
+      "$_airlock_snapshot_owner" "$_airlock_transfer_owner_from" "$tmp"; then
+    rm -f "$tmp" "$_airlock_owner_site_snapshot"
+    die "refusing nginx replacement without current and rendered owner continuity"
+  fi
   airlock_run sudo cp "$tmp" "$NGINX_SITE"
-  rm -f "$tmp"
+  rm -f "$tmp" "$_airlock_owner_site_snapshot"
 fi
 
 # 4) validate + reload

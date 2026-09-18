@@ -636,6 +636,21 @@ sc "$SC_OK
 section = \"$(printf 'x%.0s' $(seq 33))\""
 if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects over-long section"; else ok "shortcut: rejects over-long section"; fi
 
+# ---- hub inherits the account-surface keys still written under [apps.devterm] ----
+# The surface moved to the platform; the operator's config did not. good.toml sets
+# devterm.xai = true and nothing under hub, which is exactly the migrated-box shape.
+hubenv="$(run "$TMP/good.toml" env hub 2>/dev/null)"
+case "$hubenv" in *"AIRLOCK_HUB_XAI=true"*) ok "hub: inherits devterm.xai" ;;
+  *) bad "hub: inherits devterm.xai ($(printf '%s' "$hubenv" | grep XAI))" ;; esac
+sed -e 's|^font_size = 16$|font_size = 16\nfleet_store = "~/usage.json"|' "$TMP/good.toml" >"$TMP/inherit.toml"
+case "$(run "$TMP/inherit.toml" env hub 2>/dev/null)" in
+  *"AIRLOCK_HUB_FLEET_STORE='~/usage.json'"*) ok "hub: inherits devterm.fleet_store" ;;
+  *) bad "hub: inherits devterm.fleet_store" ;; esac
+sed -e 's|^\[apps.hub\]$|[apps.hub]\nxai = false|' "$TMP/good.toml" >"$TMP/hubwins.toml"
+case "$(run "$TMP/hubwins.toml" env hub 2>/dev/null)" in
+  *"AIRLOCK_HUB_XAI=false"*) ok "hub: an explicit hub value beats the devterm fallback" ;;
+  *) bad "hub: an explicit hub value beats the devterm fallback" ;; esac
+
 echo "---"
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

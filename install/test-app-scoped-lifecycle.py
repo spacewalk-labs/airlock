@@ -131,10 +131,16 @@ def write_config(path: Path, packages: list[tuple[str, Path, int]]) -> None:
 
 
 def config_env(root: Path, config: Path) -> dict[str, str]:
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    marker = root / ".airlock-live-box-fixture-v1"
+    marker.write_text("airlock.live-box-fixture/v1\n", encoding="ascii")
+    marker.chmod(0o600)
     return dict(
         os.environ,
         AIRLOCK_CONFIG=str(config),
         AIRLOCK_STATE_DIR=str(root / "state"),
+        AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR=str(root / "airlock-live-box"),
         AIRLOCK_WEBROOT=str(root / "webroot"),
         AIRLOCK_CONFD=str(root / "confd"),
         AIRLOCK_UNIT_DIR_USER=str(root / "units-user"),
@@ -330,6 +336,7 @@ case " $* " in
 esac
 exit 0
 """)
+    write_executable(shims / "systemd-run", "#!/usr/bin/env bash\nexit 0\n")
     write_executable(shims / "tailscale", f"""#!/usr/bin/env bash
 set -euo pipefail
 if [ "${{1:-}}" = status ] && [ "${{2:-}}" = --json ]; then

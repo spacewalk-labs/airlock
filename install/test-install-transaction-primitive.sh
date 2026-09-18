@@ -121,6 +121,28 @@ begin_fixture() {
   "$ROOT/bin/airlock-ledger" transaction-deactivated fixture
 }
 
+candidate_package_info() {
+  python3 - "$CASE/pkg" <<'PY'
+import json, sys
+pkg, = sys.argv[1:]
+print(json.dumps({"packages": {"fixture": {
+    "dir": pkg,
+    "artifacts": {
+        "units": [],
+        "fragments": ["servers.d/fixture.conf"],
+        "webroot": ["app/tree"],
+        "files": ["~/files/link", "~/files/candidate"],
+        "rooted": [], "serve_ports": ["https_port"], "containers": [],
+    },
+    "serve_port_values": {"https_port": 19443},
+    "serve_mappings": {"https_port": {"listen": 19443, "mode": "https", "target": 19444}},
+    "unit_scopes": {},
+    "source_class": "shipped", "capabilities": [],
+    "lifecycle": {"install": True, "smoke": True, "deactivate": True}, "deps": [],
+}}}, sort_keys=True))
+PY
+}
+
 checkpoint_archive_for_path() {
   python3 - "$STATE/install-transaction.json" "$1" "$STATE/install-checkpoints" <<'PY'
 import json, os, sys
@@ -263,6 +285,149 @@ roundtrip() {
     ok "roundtrip: rooted class selects sudo; all bytes/modes/unit state/mapping restore"
   else
     bad "roundtrip: restore oracle failed (rc=$rc phase=${phase:-none} link=${link:-none} mode=${mode:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
+  fi
+}
+
+candidate_user_file_roundtrip() {
+  setup_case candidate-user-file
+  printf 'candidate-v1\n' > "$FAKEHOME/files/candidate"
+  chmod 0640 "$FAKEHOME/files/candidate"
+  python3 - "$STATE/app-ledger.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+record = value["entries"]["fixture"]["committed"]
+record["artifacts"]["units"] = []
+record["unit_scopes"] = {}
+record["artifacts"]["rooted"] = []
+record["capabilities"] = []
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PY
+  local package_sha archive rc phase mode receipt_bound
+  package_sha="$(candidate_package_info | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  AIRLOCK_INSTALL_PKG_INFO_SHA256="$package_sha"
+  export AIRLOCK_INSTALL_PKG_INFO_SHA256
+  candidate_package_info | "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture >/dev/null \
+    || { bad "candidate-user-file: checkpoint creation failed"; return; }
+  "$ROOT/bin/airlock-ledger" transaction-touch fixture
+  "$ROOT/bin/airlock-ledger" transaction-deactivated fixture
+  archive="$(checkpoint_archive_for_path "$FAKEHOME/files/candidate" 2>/dev/null || true)"
+  receipt_bound="$(python3 - "$STATE/install-transaction.json" "$FAKEHOME/files/candidate" "$package_sha" <<'PY'
+import json, sys
+path, candidate, package_sha = sys.argv[1:]
+tx = json.load(open(path, encoding="utf-8"))
+print(int(tx.get("package_sha256") == package_sha
+          and tx.get("candidate_user_files", {}).get("fixture") == [candidate]))
+PY
+)"
+  candidate_package_info | "$ROOT/bin/airlock-ledger" intent fixture >/dev/null \
+    || { bad "candidate-user-file: candidate intent admission failed"; return; }
+  "$ROOT/bin/airlock-ledger" teardown fixture >/dev/null \
+    || { bad "candidate-user-file: candidate teardown failed"; return; }
+  "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/restore.log" 2>&1
+  rc=$?
+  phase="$("$ROOT/bin/airlock-ledger" transaction-show | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')"
+  mode="$(stat -c %a "$FAKEHOME/files/candidate" 2>/dev/null || true)"
+  if [ "$rc" = 0 ] && [ "$phase" = rolled_back ] && [ "$receipt_bound" = 1 ] && [ -f "$archive" ] \
+      && grep -qx candidate-v1 "$FAKEHOME/files/candidate" && [ "$mode" = 640 ]; then
+    ok "candidate-user-file: newly declared pre-existing file survives teardown and rollback with bytes/mode"
+  else
+    bad "candidate-user-file: rollback oracle failed (rc=$rc phase=${phase:-none} mode=${mode:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
+  fi
+}
+
+candidate_user_file_action_roundtrip() {
+  local action="$1" name="$2"
+  setup_case "$name"
+  printf 'candidate-v1\n' > "$FAKEHOME/files/candidate"
+  chmod 0640 "$FAKEHOME/files/candidate"
+  python3 - "$STATE/app-ledger.json" "$action" <<'PY'
+import json, sys
+path, action = sys.argv[1:]
+value = json.load(open(path, encoding="utf-8"))
+record = value["entries"]["fixture"]["committed"]
+record["artifacts"]["units"] = []
+record["unit_scopes"] = {}
+record["artifacts"]["rooted"] = []
+record["capabilities"] = []
+if action == "fresh":
+    value["entries"] = {}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PY
+  local package_sha rc phase mode
+  package_sha="$(candidate_package_info | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  AIRLOCK_INSTALL_PKG_INFO_SHA256="$package_sha"
+  export AIRLOCK_INSTALL_PKG_INFO_SHA256
+  candidate_package_info | "$ROOT/bin/airlock-ledger" transaction-begin "$action:fixture" >/dev/null \
+    || { bad "$name: checkpoint creation failed"; return; }
+  "$ROOT/bin/airlock-ledger" transaction-touch fixture
+  candidate_package_info | "$ROOT/bin/airlock-ledger" intent fixture >/dev/null \
+    || { bad "$name: candidate intent admission failed"; return; }
+  "$ROOT/bin/airlock-ledger" teardown fixture >/dev/null \
+    || { bad "$name: candidate teardown failed"; return; }
+  "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/restore.log" 2>&1
+  rc=$?
+  phase="$("$ROOT/bin/airlock-ledger" transaction-show | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')"
+  mode="$(stat -c %a "$FAKEHOME/files/candidate" 2>/dev/null || true)"
+  if [ "$rc" = 0 ] && [ "$phase" = rolled_back ] \
+      && grep -qx candidate-v1 "$FAKEHOME/files/candidate" && [ "$mode" = 640 ]; then
+    ok "$name: candidate user file survives teardown and forced rollback"
+  else
+    bad "$name: rollback oracle failed (rc=$rc phase=${phase:-none} mode=${mode:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
+  fi
+}
+
+candidate_user_file_other_actions() {
+  candidate_user_file_action_roundtrip reinstall candidate-user-file-reinstall
+  candidate_user_file_action_roundtrip upgrade-diff candidate-user-file-upgrade-diff
+  candidate_user_file_action_roundtrip fresh candidate-user-file-fresh
+}
+
+forged_candidate_user_file_receipt() {
+  setup_case forged-candidate-user-file
+  printf 'candidate-v1\n' > "$FAKEHOME/files/candidate"
+  printf 'outside-v1\n' > "$ETC/forged"
+  python3 - "$STATE/app-ledger.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+record = value["entries"]["fixture"]["committed"]
+record["artifacts"]["units"] = []
+record["unit_scopes"] = {}
+record["artifacts"]["rooted"] = []
+record["capabilities"] = []
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PY
+  local package_sha rc phase
+  package_sha="$(candidate_package_info | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  AIRLOCK_INSTALL_PKG_INFO_SHA256="$package_sha"
+  export AIRLOCK_INSTALL_PKG_INFO_SHA256
+  candidate_package_info | "$ROOT/bin/airlock-ledger" transaction-begin upgrade-deactivate:fixture >/dev/null \
+    || { bad "forged-candidate-user-file: checkpoint creation failed"; return; }
+  python3 - "$STATE/install-transaction.json" "$FAKEHOME/files/candidate" "$ETC/forged" <<'PY'
+import json, sys
+path, original, forged = sys.argv[1:]
+tx = json.load(open(path, encoding="utf-8"))
+tx["candidate_user_files"]["fixture"] = [forged]
+for item in tx["checkpoints"]["fixture"]["artifacts"]:
+    if item["path"] == original:
+        item["path"] = forged
+        break
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(tx, fh)
+PY
+  "$ROOT/bin/airlock-ledger" transaction-restore >"$CASE/restore.log" 2>&1
+  rc=$?
+  phase="$("$ROOT/bin/airlock-ledger" transaction-show | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase"])')"
+  if [ "$rc" != 0 ] && [ "$phase" = degraded ] \
+      && grep -qx outside-v1 "$ETC/forged" \
+      && grep -q 'candidate user-file checkpoint escapes committed home' "$CASE/restore.log"; then
+    ok "forged-candidate-user-file: matching archive cannot restore an outside receipt path"
+  else
+    bad "forged-candidate-user-file: forged receipt was accepted or mutated outside path (rc=$rc phase=${phase:-none}); $(tr '\n' ';' < "$CASE/restore.log")"
   fi
 }
 
@@ -820,6 +985,9 @@ crash_reenter() {
 
 case "$case_name" in
   roundtrip) roundtrip ;;
+  candidate-user-file) candidate_user_file_roundtrip ;;
+  candidate-user-file-other-actions) candidate_user_file_other_actions ;;
+  forged-candidate-user-file) forged_candidate_user_file_receipt ;;
   corrupt) corrupt ;;
   permission) permission_denied ;;
   space) space_denied ;;
@@ -841,6 +1009,9 @@ case "$case_name" in
   crash-reenter) crash_reenter ;;
   all)
     roundtrip
+    candidate_user_file_roundtrip
+    candidate_user_file_other_actions
+    forged_candidate_user_file_receipt
     corrupt
     permission_denied
     space_denied

@@ -6,6 +6,10 @@ one, and it never reads TOML: package-info JSON is its only configuration
 input.
 
 Usage:
+  airlock-ledger live-box-lease-show
+  airlock-ledger live-box-lease-require
+  airlock-ledger live-box-lease-run --agent-id=<id> --card=<card> \
+    --reason=<reason> --ttl-seconds=<seconds> -- <command> [arguments]
   airlock-ledger plan
   airlock-ledger plan --dependency-snapshot <path>
   airlock-ledger intent <id>
@@ -19,12 +23,14 @@ Usage:
 from __future__ import annotations
 
 import copy
+import fcntl
 import glob
 import hashlib
 import json
 import os
 import pwd
 import re
+import select
 import shutil
 import secrets
 import stat
@@ -32,7 +38,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -41,6 +47,14 @@ LEDGER_VERSION = 7
 LEDGER_FILENAME = "app-ledger.json"
 TRANSACTION_VERSION = 1
 TRANSACTION_FILENAME = "install-transaction.json"
+LIVE_BOX_LEASE_FILENAME = "live-box-lease.json"
+LIVE_BOX_LEASE_LOCK_FILENAME = "live-box-lease.lock"
+LIVE_BOX_LEASE_SCHEMA = "airlock.live-box-lease/v1"
+LIVE_BOX_LEASE_DIRECTORY = "airlock-live-box"
+LIVE_BOX_RUNTIME_PARENT = Path("/run/user")
+LIVE_BOX_FALLBACK_PARENT = Path("/tmp")
+LIVE_BOX_FIXTURE_MARKER = ".airlock-live-box-fixture-v1"
+LIVE_BOX_FIXTURE_MARKER_CONTENT = "airlock.live-box-fixture/v1\n"
 TRANSACTION_PHASES = frozenset((
     "prepared", "installing", "rolling_back", "committed", "rolled_back", "degraded",
 ))
@@ -3492,6 +3506,361 @@ def _atomic_json(path: Path, value: Any) -> None:
         fail(f"cannot atomically write transaction {path}: {exc}")
 
 
+def _fixture_live_box_lease_directory() -> Path | None:
+    """Return a hermetic lease path only for an explicitly marked private fixture."""
+    raw = os.environ.get("AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR")
+    if not raw:
+        return None
+    requested = Path(raw)
+    if not requested.is_absolute() or requested.name != LIVE_BOX_LEASE_DIRECTORY:
+        fail("fixture live-box lease path must be absolute and end in /airlock-live-box")
+    try:
+        root = requested.parent.resolve(strict=True)
+        root_info = root.lstat()
+        marker = root / LIVE_BOX_FIXTURE_MARKER
+        marker_info = marker.lstat()
+        marker_value = marker.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        fail(f"fixture live-box lease root is not explicitly marked: {exc}")
+    if (requested.parent != root or root.is_symlink() or not root.is_dir()
+            or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) != 0o700):
+        fail("fixture live-box lease root must be a canonical owner-private directory")
+    if (marker.is_symlink() or not marker.is_file()
+            or marker_info.st_uid != os.getuid()
+            or stat.S_IMODE(marker_info.st_mode) != 0o600
+            or marker_value != LIVE_BOX_FIXTURE_MARKER_CONTENT):
+        fail("fixture live-box lease root has an invalid fixture marker")
+    return requested
+
+
+def _production_live_box_lease_directory() -> Path:
+    """Choose one environment-independent lease root for this installation user."""
+    uid = os.getuid()
+    runtime = LIVE_BOX_RUNTIME_PARENT / str(uid)
+    try:
+        info = runtime.lstat()
+    except OSError:
+        info = None
+    if (info is not None and not runtime.is_symlink() and runtime.is_dir()
+            and info.st_uid == uid and stat.S_IMODE(info.st_mode) & 0o300 == 0o300):
+        return runtime / LIVE_BOX_LEASE_DIRECTORY
+    # ssh, cron, and sudo sessions need a deterministic fail-closed fallback
+    # when /run/user/<uid> is absent or not writable. This path ignores HOME,
+    # XDG_RUNTIME_DIR, AIRLOCK_STATE_DIR, and all other caller inputs.
+    return LIVE_BOX_FALLBACK_PARENT / f"{LIVE_BOX_LEASE_DIRECTORY}-{uid}"
+
+
+def _live_box_lease_directory() -> Path:
+    fixture = _fixture_live_box_lease_directory()
+    return fixture if fixture is not None else _production_live_box_lease_directory()
+
+
+def _live_box_lease_path() -> Path:
+    return _live_box_lease_directory() / LIVE_BOX_LEASE_FILENAME
+
+
+def _live_box_lease_lock_path() -> Path:
+    return _live_box_lease_directory() / LIVE_BOX_LEASE_LOCK_FILENAME
+
+
+def _validate_live_box_lease(value: Any, path: Path) -> dict[str, Any]:
+    fields = {
+        "schema", "lease_id", "box_id", "agent_id", "card", "reason",
+        "holder_pid", "acquired_at", "heartbeat_at", "expires_at",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        fail(f"{path}: invalid live-box lease shape")
+    if value["schema"] != LIVE_BOX_LEASE_SCHEMA:
+        fail(f"{path}: unsupported live-box lease schema")
+    if not re.fullmatch(r"[0-9a-f]{32}", str(value["lease_id"])):
+        fail(f"{path}: invalid live-box lease id")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(value["box_id"])):
+        fail(f"{path}: invalid live-box id")
+    identity = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,159}\Z")
+    for key in ("agent_id", "card"):
+        if not isinstance(value[key], str) or not identity.fullmatch(value[key]):
+            fail(f"{path}: invalid live-box lease {key}")
+    if (not isinstance(value["reason"], str) or not value["reason"]
+            or len(value["reason"]) > 240 or any(ch in value["reason"] for ch in "\r\n\0")):
+        fail(f"{path}: invalid live-box lease reason")
+    if isinstance(value["holder_pid"], bool) or not isinstance(value["holder_pid"], int) \
+            or value["holder_pid"] < 1:
+        fail(f"{path}: invalid live-box lease holder pid")
+    times = []
+    for key in ("acquired_at", "heartbeat_at", "expires_at"):
+        if not isinstance(value[key], str) or not value[key].endswith("Z"):
+            fail(f"{path}: invalid live-box lease {key}")
+        try:
+            times.append(datetime.fromisoformat(value[key].removesuffix("Z") + "+00:00"))
+        except ValueError:
+            fail(f"{path}: invalid live-box lease {key}")
+    if not times[0] <= times[1] < times[2]:
+        fail(f"{path}: invalid live-box lease time ordering")
+    return value
+
+
+def _read_live_box_lease(*, required: bool) -> dict[str, Any] | None:
+    path = _live_box_lease_path()
+    if not os.path.lexists(path):
+        if required:
+            fail("no live-box lease record exists")
+        return None
+    if path.is_symlink() or not path.is_file():
+        fail(f"{path}: live-box lease must be a regular non-symlink file")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return _validate_live_box_lease(json.load(handle), path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"{path}: cannot read live-box lease: {exc}")
+
+
+def _live_box_id() -> str:
+    try:
+        raw = Path("/etc/machine-id").read_bytes()
+    except OSError:
+        raw = os.uname().nodename.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _live_box_lease_arguments(argv: list[str]) -> tuple[str, str, str, int, list[str]]:
+    values: dict[str, str] = {}
+    command: list[str] | None = None
+    for index, argument in enumerate(argv):
+        if argument == "--":
+            command = argv[index + 1:]
+            break
+        for name in ("agent-id", "card", "reason", "ttl-seconds"):
+            prefix = f"--{name}="
+            if argument.startswith(prefix):
+                if name in values:
+                    fail(f"live-box-lease-run accepts --{name} once")
+                values[name] = argument.removeprefix(prefix)
+                break
+        else:
+            fail(f"live-box-lease-run: unknown argument {argument!r}")
+    if command is None or not command:
+        fail("live-box-lease-run requires -- <command> [arguments]")
+    if set(values) != {"agent-id", "card", "reason", "ttl-seconds"}:
+        fail("live-box-lease-run requires --agent-id, --card, --reason, and --ttl-seconds")
+    try:
+        ttl = int(values["ttl-seconds"])
+    except ValueError:
+        fail("live-box-lease-run ttl must be an integer")
+    if not 30 <= ttl <= 86400:
+        fail("live-box-lease-run ttl must be between 30 and 86400 seconds")
+    now = datetime.now(timezone.utc)
+    probe = {
+        "schema": LIVE_BOX_LEASE_SCHEMA,
+        "lease_id": "0" * 32,
+        "box_id": "0" * 64,
+        "agent_id": values["agent-id"],
+        "card": values["card"],
+        "reason": values["reason"],
+        "holder_pid": 1,
+        "acquired_at": now.isoformat().replace("+00:00", "Z"),
+        "heartbeat_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": (now + timedelta(seconds=ttl)).isoformat().replace("+00:00", "Z"),
+    }
+    _validate_live_box_lease(probe, _live_box_lease_path())
+    return values["agent-id"], values["card"], values["reason"], ttl, command
+
+
+def command_live_box_lease_show() -> int:
+    value = _read_live_box_lease(required=False)
+    if value is not None:
+        print(json.dumps(value, sort_keys=True))
+    return 0
+
+
+def command_live_box_lease_require() -> int:
+    """Require that this process inherited the canonical lease's actual flock."""
+    lease_id = os.environ.get("AIRLOCK_LIVE_BOX_LEASE_ID", "")
+    lease_fd = os.environ.get("AIRLOCK_LIVE_BOX_LEASE_FD", "")
+    record_raw = os.environ.get("AIRLOCK_LIVE_BOX_LEASE_RECORD", "")
+    record_path = Path(record_raw)
+    directory = record_path.parent
+    lock_path = directory / LIVE_BOX_LEASE_LOCK_FILENAME
+    production_directory = _production_live_box_lease_directory()
+    if directory != production_directory:
+        fixture_raw = os.environ.get("AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR", "")
+        if not fixture_raw or directory != Path(fixture_raw):
+            fail("a non-production inherited lease is allowed only inside a fixture boundary")
+        try:
+            root = directory.parent.resolve(strict=True)
+            root_info = root.lstat()
+            marker = root / LIVE_BOX_FIXTURE_MARKER
+            marker_info = marker.lstat()
+            marker_value = marker.read_text(encoding="ascii")
+        except (OSError, UnicodeError) as exc:
+            fail(f"inherited fixture live-box lease is not explicitly marked: {exc}")
+        if (directory.name != LIVE_BOX_LEASE_DIRECTORY or directory.parent != root
+                or root.is_symlink() or not root.is_dir()
+                or root_info.st_uid != os.getuid()
+                or stat.S_IMODE(root_info.st_mode) != 0o700
+                or marker.is_symlink() or not marker.is_file()
+                or marker_info.st_uid != os.getuid()
+                or stat.S_IMODE(marker_info.st_mode) != 0o600
+                or marker_value != LIVE_BOX_FIXTURE_MARKER_CONTENT):
+            fail("inherited fixture live-box lease root is not canonical and owner-private")
+    if (not re.fullmatch(r"[0-9a-f]{32}", lease_id)
+            or not lease_fd.isdecimal() or int(lease_fd) < 3
+            or not record_path.is_absolute()
+            or record_path.name != LIVE_BOX_LEASE_FILENAME):
+        fail("live-box lease identity is missing or does not name the canonical lease")
+    if not os.path.lexists(record_path):
+        fail("no live-box lease record exists")
+    try:
+        value = _validate_live_box_lease(
+            json.loads(record_path.read_text(encoding="utf-8")), record_path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"cannot read inherited live-box lease: {exc}")
+    if value is None or value["lease_id"] != lease_id or value["box_id"] != _live_box_id():
+        fail("live-box lease identity is stale or belongs to another box")
+    try:
+        directory_info = record_path.parent.lstat()
+        record_info = record_path.lstat()
+        lock_info = lock_path.lstat()
+        opened = os.fstat(int(lease_fd))
+    except OSError as exc:
+        fail(f"cannot validate inherited live-box lease: {exc}")
+    if (record_path.parent.is_symlink() or not record_path.parent.is_dir()
+            or directory_info.st_uid != os.getuid()
+            or stat.S_IMODE(directory_info.st_mode) != 0o700
+            or record_path.is_symlink() or lock_path.is_symlink()
+            or not stat.S_ISREG(record_info.st_mode) or not stat.S_ISREG(lock_info.st_mode)
+            or record_info.st_uid != os.getuid() or lock_info.st_uid != os.getuid()
+            or stat.S_IMODE(record_info.st_mode) != 0o600
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (lock_info.st_dev, lock_info.st_ino)):
+        fail("inherited live-box lease does not own the canonical lock")
+    try:
+        fcntl.flock(int(lease_fd), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError) as exc:
+        fail(f"inherited live-box lease flock is no longer held: {exc}")
+    return 0
+
+
+def command_live_box_lease_run(argv: list[str]) -> int:
+    agent_id, card, reason, ttl, command = _live_box_lease_arguments(argv)
+    directory = _live_box_lease_directory()
+    try:
+        if os.path.lexists(directory):
+            info = directory.lstat()
+            if (directory.is_symlink() or not directory.is_dir()
+                    or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                fail(f"{directory}: live-box lease state must be an owner-private real directory")
+        else:
+            directory.mkdir(parents=True, mode=0o700)
+        lock_path = _live_box_lease_lock_path()
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except LedgerError:
+        raise
+    except OSError as exc:
+        fail(f"cannot open live-box lease lock: {exc}")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            fail(f"{lock_path}: live-box lease lock must be an owner regular file")
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            current = _read_live_box_lease(required=False)
+            if current is None:
+                fail("live box is leased by another process; holder metadata is not yet available")
+            fail(
+                "live box lease collision before mutation: "
+                f"agent_id={current['agent_id']} card={current['card']} "
+                f"reason={current['reason']} expires_at={current['expires_at']}"
+            )
+        now = datetime.now(timezone.utc)
+        timestamp = now.isoformat().replace("+00:00", "Z")
+        value = {
+            "schema": LIVE_BOX_LEASE_SCHEMA,
+            "lease_id": secrets.token_hex(16),
+            "box_id": _live_box_id(),
+            "agent_id": agent_id,
+            "card": card,
+            "reason": reason,
+            "holder_pid": os.getpid(),
+            "acquired_at": timestamp,
+            "heartbeat_at": timestamp,
+            "expires_at": (now + timedelta(seconds=ttl)).isoformat().replace("+00:00", "Z"),
+        }
+        _validate_live_box_lease(value, _live_box_lease_path())
+        _atomic_json(_live_box_lease_path(), value)
+        # Preserve the command's pid and signal behavior: a tiny keeper owns the
+        # durable record while this process execs the mutator in place. Both the
+        # flock fd and pipe writer are inherited by the command tree, so killing
+        # a wrapper cannot free the lease while a mutating descendant is alive.
+        read_fd, guard_fd = os.pipe()
+        os.set_inheritable(descriptor, True)
+        os.set_inheritable(guard_fd, True)
+        keeper_pid = os.fork()
+        if keeper_pid == 0:
+            os.close(guard_fd)
+            interval = max(1.0, min(float(ttl) / 3.0, 30.0))
+            try:
+                while True:
+                    readable, _, _ = select.select([read_fd], [], [], interval)
+                    if readable:
+                        if not os.read(read_fd, 4096):
+                            break
+                        continue
+                    try:
+                        current = _read_live_box_lease(required=False)
+                        if current is None or current["lease_id"] != value["lease_id"]:
+                            continue
+                        renewed = datetime.now(timezone.utc)
+                        current["heartbeat_at"] = renewed.isoformat().replace("+00:00", "Z")
+                        current["expires_at"] = (
+                            renewed + timedelta(seconds=ttl)
+                        ).isoformat().replace("+00:00", "Z")
+                        _validate_live_box_lease(current, _live_box_lease_path())
+                        _atomic_json(_live_box_lease_path(), current)
+                    except (LedgerError, OSError):
+                        # The flock remains authoritative. A failed heartbeat must
+                        # neither release it nor overwrite an unrecognized record.
+                        pass
+            finally:
+                try:
+                    current = _read_live_box_lease(required=False)
+                    if current is not None and current["lease_id"] == value["lease_id"]:
+                        _live_box_lease_path().unlink()
+                        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(directory_fd)
+                        finally:
+                            os.close(directory_fd)
+                except (LedgerError, OSError):
+                    pass
+                os.close(read_fd)
+                os.close(descriptor)
+                os._exit(0)
+
+        os.close(read_fd)
+        environment = os.environ.copy()
+        environment["AIRLOCK_LIVE_BOX_LEASE_ID"] = value["lease_id"]
+        environment["AIRLOCK_LIVE_BOX_LEASE_FD"] = str(descriptor)
+        environment["AIRLOCK_LIVE_BOX_LEASE_GUARD_FD"] = str(guard_fd)
+        environment["AIRLOCK_LIVE_BOX_LEASE_RECORD"] = os.fspath(_live_box_lease_path())
+        try:
+            os.execvpe(command[0], command, environment)
+        except OSError as exc:
+            os.close(guard_fd)
+            os.waitpid(keeper_pid, 0)
+            log(f"cannot start live-box lease command: {exc}")
+            return 126
+    finally:
+        os.close(descriptor)
+
+
 def _validate_trusted_measurer_activation(value: Any, tx: dict[str, Any], path: Path) -> None:
     fields = {"new_path", "new_sha256", "old_path", "old_sha256",
               "schema", "state", "target"}
@@ -3528,7 +3897,8 @@ def _validate_transaction(value: Any, path: Path) -> dict[str, Any]:
               "ledger_snapshot", "error", "restore_results"}
     optional_fields = {"forward_keep", "app_scoped_plan", "resource_results",
                        "managed_authorities", "managed_authority_sha256",
-                       "trusted_measurer_activation", "nginx_restore_owed"}
+                       "trusted_measurer_activation", "nginx_restore_owed",
+                       "candidate_user_files", "candidate_user_homes"}
     if not isinstance(value, dict) or not (fields <= set(value) <= fields | optional_fields):
         fail(f"{path}: invalid transaction shape")
     if "forward_keep" in value:
@@ -3621,6 +3991,21 @@ def _validate_transaction(value: Any, path: Path) -> dict[str, Any]:
         fail(f"{path}: checkpoints must cover every planned app")
     if not set(value["restore_results"]).issubset(value["touched"]):
         fail(f"{path}: restore results must name touched apps")
+    candidate_user_files = value.get("candidate_user_files", {})
+    candidate_user_homes = value.get("candidate_user_homes", {})
+    if (not isinstance(candidate_user_files, dict)
+            or not isinstance(candidate_user_homes, dict)
+            or set(candidate_user_files) != set(candidate_user_homes)
+            or not set(candidate_user_files).issubset(set(value["planned"]))):
+        fail(f"{path}: invalid candidate user-file checkpoint owners")
+    for app_id, files in candidate_user_files.items():
+        if (not isinstance(files, list)
+                or any(not isinstance(item, str) or not os.path.isabs(item)
+                       for item in files)
+                or files != _sort_paths(files)
+                or not isinstance(candidate_user_homes[app_id], str)
+                or not os.path.isabs(candidate_user_homes[app_id])):
+            fail(f"{path}: invalid candidate user-file checkpoint paths for {app_id}")
     if value["error"] is not None and not isinstance(value["error"], dict):
         fail(f"{path}: error must be null or an object")
     snapshot = value["ledger_snapshot"]
@@ -3896,37 +4281,57 @@ def _capture_unit_state(name: str, scope: str) -> dict[str, bool]:
     return {"active": active == 0, "enabled": enabled == 0}
 
 
-def _checkpoint_record(store: dict[str, Any], app_id: str, action: str, root: Path) -> dict[str, Any]:
+def _checkpoint_record(store: dict[str, Any], app_id: str, action: str, root: Path,
+                       candidate_user_files: list[str] | None = None) -> dict[str, Any]:
     entry = store["entries"].get(app_id) or {}
     committed = entry.get("committed")
-    if committed is None:
-        return {"artifacts": [], "units": {}, "mappings": {}}
-    if action == "upgrade-deactivate" and committed.get("container_runtime") is not None:
+    if (committed is not None and action == "upgrade-deactivate"
+            and committed.get("container_runtime") is not None):
         fail(f"container-backed upgrade for {app_id} cannot be losslessly restored; refusing before mutation")
-    artifacts = _committed_artifacts(committed)
-    units = _preflight_teardown_artifacts(artifacts, committed["capabilities"])
-    unit_scope = {path: scope for path, scope in units}
     captured: list[dict[str, Any]] = []
     seen: set[str] = set()
     index = 0
-    for artifact_class in PATH_CLASSES:
-        for path in artifacts[artifact_class]:
-            path = str(path)
-            if path in seen:
-                continue
-            seen.add(path)
-            scope = unit_scope.get(path)
-            item: dict[str, Any] = {"path": path, "class": artifact_class,
-                                    "scope": scope, "existed": True,
-                                    "archive": None, "sha256": None,
-                                    "ephemeral_sockets": []}
-            relative = f"{app_id}/{index:06d}.tar"
-            archive = root / relative
-            item["archive"] = relative
-            item["sha256"], item["ephemeral_sockets"] = _write_checkpoint_archive(
-                app_id, artifact_class, scope, path, archive)
-            captured.append(item)
-            index += 1
+    units: list[tuple[str, str]] = []
+    mappings: dict[str, Any] = {}
+    if committed is not None:
+        artifacts = _committed_artifacts(committed)
+        units = _preflight_teardown_artifacts(artifacts, committed["capabilities"])
+        unit_scope = {path: scope for path, scope in units}
+        mappings = copy.deepcopy(committed["serve_mappings"])
+        for artifact_class in PATH_CLASSES:
+            for path in artifacts[artifact_class]:
+                path = str(path)
+                if path in seen:
+                    continue
+                seen.add(path)
+                scope = unit_scope.get(path)
+                item: dict[str, Any] = {"path": path, "class": artifact_class,
+                                        "scope": scope, "existed": True,
+                                        "archive": None, "sha256": None,
+                                        "ephemeral_sockets": []}
+                relative = f"{app_id}/{index:06d}.tar"
+                archive = root / relative
+                item["archive"] = relative
+                item["sha256"], item["ephemeral_sockets"] = _write_checkpoint_archive(
+                    app_id, artifact_class, scope, path, archive)
+                captured.append(item)
+                index += 1
+    # These files are already present but are newly declared by the frozen
+    # candidate manifest. Teardown will remove them through the candidate
+    # intent, so preserve them before any mutation.
+    for path in candidate_user_files or []:
+        if path in seen:
+            continue
+        seen.add(path)
+        relative = f"{app_id}/{index:06d}.tar"
+        archive = root / relative
+        item: dict[str, Any] = {"path": path, "class": "files", "scope": None,
+                                "existed": True, "archive": relative, "sha256": None,
+                                "ephemeral_sockets": []}
+        item["sha256"], item["ephemeral_sockets"] = _write_checkpoint_archive(
+            app_id, "files", None, path, archive)
+        captured.append(item)
+        index += 1
     states: dict[str, dict[str, Any]] = {}
     for path, scope in units:
         name = os.path.basename(path)
@@ -3936,8 +4341,7 @@ def _checkpoint_record(store: dict[str, Any], app_id: str, action: str, root: Pa
             states[name] = {"scope": scope, "instances": instances}
         else:
             states[name] = {"scope": scope, **_capture_unit_state(name, scope)}
-    return {"artifacts": captured, "units": states,
-            "mappings": copy.deepcopy(committed["serve_mappings"])}
+    return {"artifacts": captured, "units": states, "mappings": mappings}
 
 
 def _read_ledger_snapshot(tx: dict[str, Any]) -> dict[str, Any]:
@@ -3976,6 +4380,19 @@ def _validate_checkpoint_archives(tx: dict[str, Any]) -> None:
                         seen.add(str(path))
             expected_units = {os.path.basename(path): scope for path, scope in expected_unit_pairs}
             expected_mappings = committed["serve_mappings"]
+        candidate_user_files = tx.get("candidate_user_files", {}).get(app_id, [])
+        if candidate_user_files:
+            receipt_home = tx["candidate_user_homes"][app_id]
+            expected_home = (os.path.realpath(committed["roots"]["home"])
+                             if committed is not None else _current_roots()["home"])
+            if receipt_home != expected_home:
+                fail(f"transaction {tx['id']}: candidate user-file home differs from its saved boundary")
+            _validate_candidate_user_files(
+                receipt_home, candidate_user_files,
+                f"transaction {tx['id']} candidate receipt for {app_id}")
+        for path in candidate_user_files:
+            if path not in {item[0] for item in expected_items}:
+                expected_items.append((path, "files", None))
         actual_items: list[tuple[str, str, str | None]] = []
         for item in checkpoint["artifacts"]:
             required = {"path", "class", "scope", "existed", "archive", "sha256"}
@@ -4025,6 +4442,48 @@ def _validate_checkpoint_archives(tx: dict[str, Any]) -> None:
                 fail(f"transaction {tx['id']}: invalid unit state for {app_id}/{name}")
         if checkpoint["mappings"] != expected_mappings:
             fail(f"transaction {tx['id']}: mappings differ from saved ledger for {app_id}")
+
+
+def _candidate_user_files(store: dict[str, Any], packages: dict[str, dict[str, Any]],
+                          actions: dict[str, str]) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Existing `files` newly claimed by a candidate that rollback can tear down."""
+    result: dict[str, list[str]] = {}
+    homes: dict[str, str] = {}
+    for app_id, action in actions.items():
+        if action not in {"fresh", "reinstall", "upgrade-diff", "upgrade-deactivate"} \
+                or app_id not in packages:
+            continue
+        package = packages[app_id]
+        candidate = expand_declared(package["artifacts"], package["serve_port_values"],
+                                    unit_scopes=package["unit_scopes"],
+                                    capabilities=package["capabilities"])
+        committed = (store["entries"].get(app_id) or {}).get("committed")
+        home = (os.path.realpath(committed["roots"]["home"])
+                if committed is not None else _current_roots()["home"])
+        recorded = (set(_committed_artifacts(committed)["files"])
+                    if committed is not None else set())
+        existing = [path for path in candidate["files"]
+                    if path not in recorded and os.path.lexists(path)]
+        if existing:
+            result[app_id] = _validate_candidate_user_files(
+                home, _sort_paths(existing), f"candidate package {app_id}")
+            homes[app_id] = home
+    return result, homes
+
+
+def _validate_candidate_user_files(home: str, paths: list[str],
+                                  where: str) -> list[str]:
+    """Keep candidate-only receipts within the committed user's file boundary."""
+    checked: list[str] = []
+    for path in paths:
+        canonical = _canonical_artifact(path)
+        if path != canonical or path == home or not _is_under(path, home):
+            fail(f"{where}: candidate user-file checkpoint escapes committed home")
+        refusal = _plain_artifact_refusal(path)
+        if refusal is not None:
+            fail(f"{where}: {refusal}")
+        checked.append(path)
+    return checked
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -4490,6 +4949,11 @@ def command_transaction_begin(arguments: list[str]) -> int:
             fail("transaction-begin requires AIRLOCK_APP_SCOPED_PLAN_SHA256=<lowercase sha256>")
         if not _is_hex_digest(dependency_snapshot_sha):
             fail("transaction-begin requires AIRLOCK_LEDGER_DEPENDENCIES_SHA256=<lowercase sha256>")
+    package_info = read_package_info()
+    if (package_info and _PACKAGE_INFO_INPUT_SHA256
+            != os.environ["AIRLOCK_INSTALL_PKG_INFO_SHA256"]):
+        fail("transaction-begin package-info differs from its supplied SHA-256")
+    packages = packages_from_info(package_info)
     if managed_authorities is not None:
         if scoped_plan_sha is None:
             fail("transaction-begin managed authorities require an app-scoped plan binding")
@@ -4500,10 +4964,6 @@ def command_transaction_begin(arguments: list[str]) -> int:
                 fail(f"transaction-begin managed authority cannot bind destructive-only app {app_id}")
             if authority["config_sha256"] != os.environ["AIRLOCK_CONFIG_SNAPSHOT_SHA256"]:
                 fail(f"transaction-begin managed authority for {app_id} differs from config binding")
-        package_info = read_package_info()
-        if _PACKAGE_INFO_INPUT_SHA256 != os.environ["AIRLOCK_INSTALL_PKG_INFO_SHA256"]:
-            fail("transaction-begin managed package-info differs from its supplied SHA-256")
-        packages = packages_from_info(package_info)
         managed_planned = {
             app_id for app_id in actions
             if app_id in packages and packages[app_id]["source_class"] == "managed"
@@ -4528,6 +4988,7 @@ def command_transaction_begin(arguments: list[str]) -> int:
     if previous is not None:
         _remove_transaction_checkpoints(previous)
     store = load_store()
+    candidate_user_files, candidate_user_homes = _candidate_user_files(store, packages, actions)
     transaction_id = secrets.token_hex(16)
     checkpoint_parent = state_dir() / "install-checkpoints"
     root = checkpoint_parent / transaction_id
@@ -4557,6 +5018,11 @@ def command_transaction_begin(arguments: list[str]) -> int:
             "ledger_snapshot": {"file": "ledger.json", "sha256": _sha256_file(snapshot_path)},
             "error": None, "restore_results": {},
         }
+        if candidate_user_files:
+            # package_sha256 already seals the exact package-info bytes that
+            # produced this candidate-only checkpoint inventory.
+            tx["candidate_user_files"] = candidate_user_files
+            tx["candidate_user_homes"] = candidate_user_homes
         if scoped_plan_sha is not None:
             tx["app_scoped_plan"] = {
                 "plan_sha256": scoped_plan_sha,
@@ -4567,7 +5033,9 @@ def command_transaction_begin(arguments: list[str]) -> int:
             tx["managed_authorities"] = copy.deepcopy(managed_authorities)
             tx["managed_authority_sha256"] = managed_authority_sha256
         for app_id in app_ids:
-            tx["checkpoints"][app_id] = _checkpoint_record(store, app_id, actions[app_id], root)
+            tx["checkpoints"][app_id] = _checkpoint_record(
+                store, app_id, actions[app_id], root,
+                candidate_user_files.get(app_id))
         _validate_checkpoint_archives(tx)
         write_transaction(tx)
     except BaseException:
@@ -5424,6 +5892,12 @@ def parse_cli(argv: list[str]) -> tuple[str, str | None, bool, str | None, str |
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv == ["live-box-lease-show"]:
+        return command_live_box_lease_show()
+    if raw_argv == ["live-box-lease-require"]:
+        return command_live_box_lease_require()
+    if raw_argv and raw_argv[0] == "live-box-lease-run":
+        return command_live_box_lease_run(raw_argv[1:])
     if (len(raw_argv) == 7 and raw_argv[0] == "_checkpoint-helper"
             and raw_argv[1] == "archive"):
         scope = None if raw_argv[4] == "-" else raw_argv[4]

@@ -9,7 +9,6 @@ const {
   KNOWN_BUNDLE_SHAPES,
   PINNED_SHA,
   SIDEBAR_POLL_MS,
-  SIDEBAR_REHYDRATE_REVISIONED,
   SUBAGENT_STREAM_PATCHES,
   patchBundleContent,
   productionShasForEdits,
@@ -36,10 +35,7 @@ assert.deepEqual(SUBAGENT_STREAM_PATCHES.map((patch) => patch.name), [
   "project-actions-coarse-pointer",
   "sidebar-tap-not-swallowed-on-web",
 ]);
-// The tablet "+" fix belongs to the ALWAYS-ON group. It rode on the optional browse
-// group until 2026-09-01, which meant a box with `browse = false` — the default —
-// silently never got it. Asserted on the group membership, not just the bytes: moving
-// it back would restore a touch fix nobody with the default config receives.
+// The tablet "+" fix belongs to the ALWAYS-ON group, not the optional browse group.
 assert.ok(byName("project-actions-coarse-pointer"));
 assert.ok(byName("project-actions-coarse-pointer").repl.includes("(pointer: coarse)"));
 assert.ok(!BROWSE_PATCHES.some((patch) => patch.repl.includes("(pointer: coarse)")));
@@ -54,8 +50,8 @@ assert.ok(!BROWSE_PATCHES.some((patch) => patch.repl.includes("(pointer: coarse)
   // Byte-for-byte: the only difference is the branch in front of the handler.
   assert.equal(patch.repl.replace("o.isWeb?()=>{}:", ""), patch.find);
   // The platform test MUST sit in the hook body, in front of the handler — never
-  // inside it. The handler declares its own `const o={x:c,y:u}` for the current touch
-  // point, so an `o.isWeb` written inside resolves to that local in its temporal dead
+  // inside it. The handler declares its own scratch locals for the current touch
+  // point, so an `o.isWeb` written inside resolves to a local in its temporal dead
   // zone and throws on EVERY touchmove. Measured: the first draft of this edit did
   // exactly that. This assertion is what keeps a "tidy-up" from moving it back in.
   assert.ok(patch.repl.indexOf("o.isWeb") < patch.repl.indexOf("e=>{"));
@@ -72,16 +68,20 @@ assert.ok(byName("tooltip-hover-none-is-compact").repl.includes('matchMedia?.("(
 assert.ok(byName("sidebar-order-shared-storage").repl.includes("/airlock-ui-state/"));
 assert.ok(byName("sidebar-order-shared-storage").repl.includes("local.getItem(key)"));
 assert.ok(byName("sidebar-order-shared-storage").repl.includes("await writeLocal(key,value)"));
+// 0.8.0: the backing storage passes directly to createValidatedPersistStorage's first
+// argument (no createJSONStorage factory wrapper) — our adapter is still the first arg.
+assert.ok(byName("sidebar-order-shared-storage").find.includes("createValidatedPersistStorage"));
+assert.ok(byName("sidebar-order-shared-storage").repl.includes("createValidatedPersistStorage"));
 // An already-open second device must converge when the owner switches back to it;
 // initial hydration alone only updates a device that performs a full page load.
-assert.ok(byName("sidebar-order-rehydrate-on-visibility").find.includes("migrate:j"));
+assert.ok(byName("sidebar-order-rehydrate-on-visibility").find.includes("migrate:y"));
 assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes('document.addEventListener("visibilitychange"'));
 assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes('"visible"===document.visibilityState'));
-assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes("f.persist.rehydrate()"));
+assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes("P.persist.rehydrate()"));
 {
   const patch = byName("sidebar-order-rehydrate-on-visibility");
   const start = patch.repl.indexOf('"undefined"!=typeof document');
-  const end = patch.repl.indexOf("},3544,[", start);
+  const end = patch.repl.indexOf("},3813,[", start);
   const expression = patch.repl.slice(start, end);
   const listeners = new Map();
   const windowListeners = new Map();
@@ -103,9 +103,9 @@ assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes("f.persi
       return intervals.length;
     },
   };
-  const f = { persist: { rehydrate: () => { rehydrates += 1; } } };
+  const P = { persist: { rehydrate: () => { rehydrates += 1; } } };
   const g = { __airlockUiState: { sync: (key) => { syncs.push(key); } } };
-  new Function("document", "window", "f", "g", `return (${expression});`)(documentStub, windowStub, f, g);
+  new Function("document", "window", "P", "g", `return (${expression});`)(documentStub, windowStub, P, g);
   const listener = listeners.get("visibilitychange");
   assert.ok(listener, "visibility listener was not registered");
   assert.ok(listeners.has("airlock-ui-state-stale"), "stale-write listener was not registered");
@@ -138,45 +138,31 @@ assert.ok(byName("sidebar-order-rehydrate-on-visibility").repl.includes("f.persi
   assert.equal(syncs.length, 4, "a visible tick syncs once per interval");
   assert.equal(rehydrates, 2, "the poll itself never rehydrates; only the stale event does");
 }
-// Every replacement for the rehydrate anchor — current or legacy — must carry the
-// anchor's own head and tail bytes, because the patcher swaps a legacy replacement for
-// the current one verbatim. A legacy string that is only the injected expression would
-// duplicate the surrounding `partialize:…}));` on a real installed bundle while this
-// fixture (which is built from the same strings) still came out equal. Caught on a live
-// box, 2026-09-12.
 {
   const patch = byName("sidebar-order-rehydrate-on-visibility");
   const head = patch.find.slice(0, "partialize:e=>".length);
-  const tail = "},3544,[3368,3273,3276]);";
+  const tail = "},3813,[1587,3401,3404,3313,3553]);";
   assert.ok(patch.find.endsWith(tail));
-  for (const candidate of [patch.repl, ...patch.legacyRepls]) {
-    assert.ok(candidate.startsWith(head), "rehydrate replacement lost the anchor head");
-    assert.ok(candidate.endsWith(tail), "rehydrate replacement lost the anchor tail");
-    assert.equal(candidate.split(head).length - 1, 1, "rehydrate replacement duplicates the anchor head");
-  }
+  assert.ok(patch.repl.startsWith(head), "rehydrate replacement lost the anchor head");
+  assert.ok(patch.repl.endsWith(tail), "rehydrate replacement lost the anchor tail");
+  assert.equal(patch.repl.split(head).length - 1, 1, "rehydrate replacement duplicates the anchor head");
 }
 // The adapter half: the poll needs the revision check the storage exposes.
 assert.ok(byName("sidebar-order-shared-storage").repl.includes("sync:key=>"));
 // The default the user sees on a device that has never saved settings. Asserted on
-// the bytes, not the name: a silent revert to upstream's 16/12 is the failure mode.
-assert.ok(byName("appearance-default-font-sizes").find.includes("_=16,O=11,T=24,F=12"));
-assert.ok(byName("appearance-default-font-sizes").repl.includes("_=18,O=11,T=24,F=14"));
+// the bytes, not the name: a silent revert to upstream's stock defaults is the
+// failure mode. 0.8.0's ui default is a function call (N(E.isNative)), not a bare
+// literal — the patch replaces the call outright with our literal default.
+assert.ok(byName("appearance-default-font-sizes").find.includes("const R=N(E.isNative)"));
+assert.ok(byName("appearance-default-font-sizes").repl.includes("const R=18"));
+assert.ok(byName("appearance-default-font-sizes").find.includes(",B=12,"));
+assert.ok(byName("appearance-default-font-sizes").repl.includes(",B=14,"));
 
 const ALL_EDITS = [
   ...SUBAGENT_STREAM_PATCHES.map((patch) => patch.name),
   ...BROWSE_PATCHES.map((patch) => patch.name),
 ];
 const GENERAL_EDITS = SUBAGENT_STREAM_PATCHES.map((patch) => patch.name);
-// The general group as it stood one revision back — the shape every already-installed
-// browse-less box carries when this revision reaches it.
-const PREVIOUS_GENERAL_EDITS = GENERAL_EDITS.filter(
-  (edit) => edit !== "sidebar-tap-not-swallowed-on-web",
-);
-// ...and as it stood before the visibility-rehydrate revision, which is the era every
-// pre-move browse shape below belongs to.
-const PRE_REHYDRATE_GENERAL_EDITS = PREVIOUS_GENERAL_EDITS.filter(
-  (edit) => edit !== "sidebar-order-rehydrate-on-visibility",
-);
 const BROWSE_EDITS = BROWSE_PATCHES.map((patch) => patch.name);
 const key = (edits) => [...edits].sort().join("|");
 
@@ -198,32 +184,18 @@ assert.equal(
   new Set(KNOWN_BUNDLE_SHAPES.flatMap((shape) => [shape.sha, ...(shape.legacyShas ?? [])])).size,
   KNOWN_BUNDLE_SHAPES.reduce((count, shape) => count + 1 + (shape.legacyShas?.length ?? 0), 0),
 );
+// 0.8.0 restarts the shape table fresh: pristine, always-on-only (browse=false, the
+// default), and both groups combined. No legacy/partial shapes exist yet — nothing
+// has ever installed a partially-patched 0.8.0 bundle.
+assert.equal(KNOWN_BUNDLE_SHAPES.length, 3);
+assert.deepEqual(KNOWN_BUNDLE_SHAPES[0].edits, []);
+assert.deepEqual(key(KNOWN_BUNDLE_SHAPES[1].edits), key(GENERAL_EDITS));
+assert.deepEqual(key(KNOWN_BUNDLE_SHAPES[2].edits), key(ALL_EDITS));
 
-// The four shapes the installer must be able to name, or a box in that state refuses.
 assert.deepEqual(productionShasForEdits([]), [PINNED_SHA]);
-// Fully patched, and the browse-less box this revision creates. Both must exist.
-assert.ok(productionShasForEdits(ALL_EDITS).length >= 1);
-assert.ok(productionShasForEdits(GENERAL_EDITS).length >= 1);
-assert.equal(productionShasForEdits(BROWSE_EDITS).length, 1);
-// The shape THIS box carried when the bug was found: the whole general group as it
-// stood before the move, no browse. Completing it is the entire point of the change.
-assert.ok(
-  productionShasForEdits(PRE_REHYDRATE_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer")).length >= 1,
-);
-// Both complete general shapes behind this revision stay nameable: the one before the
-// visibility rehydrate edit, and the one this revision's sidebar-tap fix migrates from.
-assert.ok(productionShasForEdits(PRE_REHYDRATE_GENERAL_EDITS).length >= 1);
-assert.ok(productionShasForEdits(PREVIOUS_GENERAL_EDITS).length >= 1);
-// Every pre-move browse box holds the coarse-pointer edit already, beside a general
-// group that is one, two, three or four edits old. All four must remain nameable.
-for (const revision of [1, 2, 3, 4]) {
-  const edits = [
-    ...PRE_REHYDRATE_GENERAL_EDITS.filter((e) => e !== "project-actions-coarse-pointer").slice(0, revision),
-    ...BROWSE_EDITS,
-    "project-actions-coarse-pointer",
-  ];
-  assert.ok(productionShasForEdits(edits).length >= 1, `pre-move browse revision ${revision}`);
-}
+assert.equal(productionShasForEdits(ALL_EDITS).length, 1);
+assert.equal(productionShasForEdits(GENERAL_EDITS).length, 1);
+assert.equal(productionShasForEdits(BROWSE_EDITS).length, 0, "browse alone, without the always-on group, is not a shape anything ships");
 // The lookup is set equality, so a repeated name must not turn a known shape into an
 // unknown one. Production cannot repeat a name today; the argument is a plain list and
 // this is what keeps that an implementation detail rather than a latent refusal.
@@ -265,83 +237,13 @@ assert.equal(combinedFromGeneral.alreadyPatched, false);
 for (const patch of BROWSE_PATCHES) assert.ok(combinedFromGeneral.source.includes(patch.repl));
 for (const patch of SUBAGENT_STREAM_PATCHES) assert.ok(combinedFromGeneral.source.includes(patch.repl));
 
-// pristine -> browse-only -> combined. The browse group no longer carries the
-// coarse-pointer edit, so a browse-only bundle must still be waiting for it.
+// pristine -> browse-only -> combined.
 const browseOnly = apply(pristine, "browse", [sha(pristine)]);
 assert.equal(browseOnly.alreadyPatched, false);
 for (const patch of SUBAGENT_STREAM_PATCHES) assert.ok(browseOnly.source.includes(patch.find));
 assert.ok(!browseOnly.source.includes("(pointer: coarse)"));
 const combinedFromBrowse = apply(browseOnly.source, "subagent-stream", [sha(browseOnly.source)]);
 assert.equal(combinedFromBrowse.source, combinedFromGeneral.source);
-
-// The migration this revision exists for: a box carrying the general group as it stood
-// BEFORE the move must end up with the coarse-pointer edit, not with none and not with
-// a marker that claims success.
-const preMoveGeneral = SUBAGENT_STREAM_PATCHES
-  .filter((patch) => patch.name !== "project-actions-coarse-pointer")
-  .reduce((source, patch) => source.replace(patch.find, patch.repl), pristine);
-const migratedMove = apply(preMoveGeneral, "subagent-stream", [sha(preMoveGeneral)]);
-assert.equal(migratedMove.alreadyPatched, false);
-assert.equal(migratedMove.states["subagent-stream"], "partial");
-assert.equal(migratedMove.source, general.source);
-assert.ok(migratedMove.source.includes("(pointer: coarse)"));
-
-// The migration THIS revision exists for: a box carrying the general group as it stood
-// one revision back must come out with the sidebar-tap fix, not with a marker that
-// claims success. This is the state every installed browse-less box is actually in.
-const preTapGeneral = SUBAGENT_STREAM_PATCHES
-  .filter((patch) => patch.name !== "sidebar-tap-not-swallowed-on-web")
-  .reduce((source, patch) => source.replace(patch.find, patch.repl), pristine);
-const migratedTap = apply(preTapGeneral, "subagent-stream", [sha(preTapGeneral)]);
-assert.equal(migratedTap.alreadyPatched, false);
-assert.equal(migratedTap.states["subagent-stream"], "partial");
-assert.equal(migratedTap.source, general.source);
-assert.ok(migratedTap.source.includes(byName("sidebar-tap-not-swallowed-on-web").repl));
-
-// PR #256's adapter is a migration source, not an ambiguous foreign bundle. It
-// already counts as the shared-storage edit for shape lookup, but running the
-// current group must replace it with the durable outbox/queue adapter and add the
-// visibility rehydrate edit.
-const storagePatch = byName("sidebar-order-shared-storage");
-assert.equal(storagePatch.legacyRepls.length, 3);
-const rehydratePatch = byName("sidebar-order-rehydrate-on-visibility");
-assert.equal(rehydratePatch.legacyRepls.length, 2);
-for (const legacyStorage of storagePatch.legacyRepls) {
-  for (const legacyRehydrate of rehydratePatch.legacyRepls) {
-  const legacyGeneral = general.source
-    .replace(storagePatch.repl, legacyStorage)
-    .replace(rehydratePatch.repl, legacyRehydrate);
-  const migratedStorage = apply(legacyGeneral, "subagent-stream", [sha(legacyGeneral)]);
-  assert.equal(migratedStorage.alreadyPatched, false);
-  assert.equal(migratedStorage.states["subagent-stream"], "partial");
-  assert.equal(migratedStorage.source, general.source);
-  assert.ok(!migratedStorage.source.includes(legacyStorage));
-  assert.ok(!migratedStorage.source.includes(legacyRehydrate));
-  }
-}
-
-// ...and the mirror case: a PRE-move browse box already holds the coarse-pointer edit,
-// so running the general group there must complete the rest around it and reach the
-// same bytes rather than trip on an edit it did not apply itself.
-const preMoveBrowse = [...BROWSE_PATCHES, byName("project-actions-coarse-pointer")]
-  .reduce((source, patch) => source.replace(patch.find, patch.repl), pristine);
-const migratedBrowseBox = apply(preMoveBrowse, "subagent-stream", [sha(preMoveBrowse)]);
-assert.equal(migratedBrowseBox.alreadyPatched, false);
-assert.equal(migratedBrowseBox.states["subagent-stream"], "partial");
-assert.equal(migratedBrowseBox.source, combinedFromGeneral.source);
-
-// Every earlier revision of the general group is still completable.
-for (const revision of [1, 2, 3, 4, 5, 6]) {
-  const older = SUBAGENT_STREAM_PATCHES.slice(0, revision).reduce(
-    (source, patch) => source.replace(patch.find, patch.repl),
-    pristine,
-  );
-  const migratedGeneral = apply(older, "subagent-stream", [sha(older)]);
-  assert.equal(migratedGeneral.alreadyPatched, false);
-  assert.equal(migratedGeneral.states["subagent-stream"], "partial");
-  assert.equal(migratedGeneral.source, general.source);
-  for (const patch of SUBAGENT_STREAM_PATCHES) assert.ok(migratedGeneral.source.includes(patch.repl));
-}
 
 // Combined and each individual group are idempotent, and the other group survives.
 assert.equal(apply(combinedFromGeneral.source, "browse", [sha(combinedFromGeneral.source)]).alreadyPatched, true);
@@ -356,7 +258,7 @@ assert.throws(
   /bundle SHA mismatch/,
 );
 // The refusal has to say WHICH shape it could not place, or the operator is left
-// diffing 15MB of minified JS to find out what state the box is in.
+// diffing 20MB of minified JS to find out what state the box is in.
 assert.throws(
   () => patchBundleContent(halfBrowse, { mode: "subagent-stream" }),
   /no known bundle shape holds exactly \[new-browser-gate-vo\]/,

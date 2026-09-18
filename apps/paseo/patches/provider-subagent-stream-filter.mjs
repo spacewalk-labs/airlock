@@ -3,16 +3,23 @@
 //
 // Target: @getpaseo/server .../server/session.js
 //
-// Provider-owned subagent updates currently use Session.emit(), which broadcasts
-// every update to every socket attached to a capable client session. Normal agent
-// streams already use source-local capabilities and viewed-parent subscriptions.
-// This patch gives provider-subagent updates the same delivery boundary without
-// changing their wire shape.
+// 0.8.0 note: upstream independently built forwardProviderSubagentUpdate — the
+// per-capability, per-source delivery method the 0.2.5-era version of this patch
+// had to add from scratch — but it still does not gate on the VIEWED parent
+// agent: it forwards to every source that supports the providerSubagents
+// capability, the same broadcast-within-capability shape the 0.2.5 patch closed
+// for normal agent streams. forwardAgentStream (this file's sibling method) is
+// the reference: it checks `usesSelectiveTimelineDelivery()` /
+// `viewedTimelineAgentIds` (no-source path) and `viewedTimelineAgentIdsBySource`
+// (per-source path) before delivering. This patch adds the same two checks to
+// forwardProviderSubagentUpdate, keyed on the update's parentAgentId (a child's
+// visibility follows its PARENT's viewed-agent subscription, not its own id —
+// nothing subscribes to a subagent id directly).
 //
 // Contract: argv[2] = target session.js.
 //   exit  0 = candidate written to <target>.paseo-new.mjs
 //   exit 10 = already patched
-//   exit 20 = a required anchor is missing or duplicated; writes nothing
+//   exit 20 = the anchor is missing or duplicated; writes nothing
 //   exit  1 = usage / IO / patch logic error
 import fs from "node:fs";
 
@@ -40,26 +47,18 @@ if (source.includes(SENTINEL)) {
 }
 
 const METHOD_ANCHOR = lines(
-    "    supportsForSource(capability, source) {",
-    "        return (this.clientCapabilitiesBySource.get(source)?.has(capability) ?? this.supports(capability));",
-    "    }",
-    "    emitProjectUpdate(update) {",
-);
-
-const METHOD_REPLACEMENT = lines(
-    "    supportsForSource(capability, source) {",
-    "        return (this.clientCapabilitiesBySource.get(source)?.has(capability) ?? this.supports(capability));",
-    "    }",
-    "    // [paseo-provider-subagent-stream-filter] Keep provider-owned child streams",
-    "    // inside the same source-local viewed-parent boundary as normal agent streams.",
     "    forwardProviderSubagentUpdate(update) {",
-    "        const parentAgentId = update.type === \"upsert\"",
-    "            ? update.subagent.parentAgentId",
-    "            : update.parentAgentId;",
-    "        const payload = update.type === \"upsert\"",
-    "            ? { kind: \"upsert\", subagent: update.subagent }",
-    "            : update.type === \"timeline\"",
-    "                ? {",
+    "        let message;",
+    "        if (update.type === \"upsert\") {",
+    "            message = {",
+    "                type: \"agent.provider_subagents.update\",",
+    "                payload: { kind: \"upsert\", subagent: update.subagent },",
+    "            };",
+    "        }",
+    "        else if (update.type === \"timeline\") {",
+    "            message = {",
+    "                type: \"agent.provider_subagents.update\",",
+    "                payload: {",
     "                    kind: \"timeline\",",
     "                    parentAgentId: update.parentAgentId,",
     "                    subagentId: update.subagentId,",
@@ -68,28 +67,87 @@ const METHOD_REPLACEMENT = lines(
     "                    timestamp: update.row.timestamp,",
     "                    seq: update.row.seq,",
     "                    epoch: update.epoch,",
-    "                }",
-    "                : {",
+    "                },",
+    "            };",
+    "        }",
+    "        else {",
+    "            message = {",
+    "                type: \"agent.provider_subagents.update\",",
+    "                payload: {",
     "                    kind: \"remove\",",
     "                    parentAgentId: update.parentAgentId,",
     "                    subagentId: update.subagentId,",
-    "                };",
-    "        const message = { type: \"agent.provider_subagents.update\", payload };",
+    "                },",
+    "            };",
+    "        }",
     "        if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {",
-    "            if (!this.supports(CLIENT_CAPS.providerSubagents)) {",
-    "                return;",
+    "            if (this.supports(CLIENT_CAPS.providerSubagents) &&",
+    "                (update.type !== \"timeline\" || this.supportsTimelineItem(update.row.item))) {",
+    "                this.emit(message);",
     "            }",
-    "            if (this.usesSelectiveTimelineDelivery() &&",
-    "                !this.viewedTimelineAgentIds.has(parentAgentId)) {",
-    "                return;",
-    "            }",
-    "            this.emit(message);",
     "            return;",
     "        }",
     "        for (const [source, capabilities] of this.clientCapabilitiesBySource) {",
-    "            if (!capabilities.has(CLIENT_CAPS.providerSubagents)) {",
+    "            if (!capabilities.has(CLIENT_CAPS.providerSubagents))",
     "                continue;",
+    "            if (update.type === \"timeline\" && !this.supportsTimelineItem(update.row.item, source))",
+    "                continue;",
+    "            this.onMessageToSource(source, message);",
+    "        }",
+    "    }",
+);
+
+const METHOD_REPLACEMENT = lines(
+    "    forwardProviderSubagentUpdate(update) {",
+    "        let message;",
+    "        if (update.type === \"upsert\") {",
+    "            message = {",
+    "                type: \"agent.provider_subagents.update\",",
+    "                payload: { kind: \"upsert\", subagent: update.subagent },",
+    "            };",
+    "        }",
+    "        else if (update.type === \"timeline\") {",
+    "            message = {",
+    "                type: \"agent.provider_subagents.update\",",
+    "                payload: {",
+    "                    kind: \"timeline\",",
+    "                    parentAgentId: update.parentAgentId,",
+    "                    subagentId: update.subagentId,",
+    "                    provider: update.provider,",
+    "                    item: update.row.item,",
+    "                    timestamp: update.row.timestamp,",
+    "                    seq: update.row.seq,",
+    "                    epoch: update.epoch,",
+    "                },",
+    "            };",
+    "        }",
+    "        else {",
+    "            message = {",
+    "                type: \"agent.provider_subagents.update\",",
+    "                payload: {",
+    "                    kind: \"remove\",",
+    "                    parentAgentId: update.parentAgentId,",
+    "                    subagentId: update.subagentId,",
+    "                },",
+    "            };",
+    "        }",
+    "        // [paseo-provider-subagent-stream-filter] a child's visibility follows its",
+    "        // PARENT's viewed-agent subscription — nothing subscribes to a subagent id.",
+    "        const parentAgentId = update.type === \"upsert\" ? update.subagent.parentAgentId : update.parentAgentId;",
+    "        if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {",
+    "            if (this.supports(CLIENT_CAPS.providerSubagents) &&",
+    "                (update.type !== \"timeline\" || this.supportsTimelineItem(update.row.item))) {",
+    "                if (!this.usesSelectiveTimelineDelivery() || this.viewedTimelineAgentIds.has(parentAgentId)) {",
+    "                    this.emit(message);",
+    "                }",
     "            }",
+    "            return;",
+    "        }",
+    "        for (const [source, capabilities] of this.clientCapabilitiesBySource) {",
+    "            if (!capabilities.has(CLIENT_CAPS.providerSubagents))",
+    "                continue;",
+    "            if (update.type === \"timeline\" && !this.supportsTimelineItem(update.row.item, source))",
+    "                continue;",
     "            if (capabilities.has(CLIENT_CAPS.selectiveAgentTimeline) &&",
     "                !this.viewedTimelineAgentIdsBySource.get(source)?.has(parentAgentId)) {",
     "                continue;",
@@ -97,55 +155,6 @@ const METHOD_REPLACEMENT = lines(
     "            this.onMessageToSource(source, message);",
     "        }",
     "    }",
-    "    emitProjectUpdate(update) {",
-);
-
-const BRANCH_ANCHOR = lines(
-    "            if (event.type === \"provider_subagent\") {",
-    "                if (!this.supports(CLIENT_CAPS.providerSubagents)) {",
-    "                    return;",
-    "                }",
-    "                const update = event.event;",
-    "                if (update.type === \"upsert\") {",
-    "                    this.emit({",
-    "                        type: \"agent.provider_subagents.update\",",
-    "                        payload: { kind: \"upsert\", subagent: update.subagent },",
-    "                    });",
-    "                }",
-    "                else if (update.type === \"timeline\") {",
-    "                    this.emit({",
-    "                        type: \"agent.provider_subagents.update\",",
-    "                        payload: {",
-    "                            kind: \"timeline\",",
-    "                            parentAgentId: update.parentAgentId,",
-    "                            subagentId: update.subagentId,",
-    "                            provider: update.provider,",
-    "                            item: update.row.item,",
-    "                            timestamp: update.row.timestamp,",
-    "                            seq: update.row.seq,",
-    "                            epoch: update.epoch,",
-    "                        },",
-    "                    });",
-    "                }",
-    "                else {",
-    "                    this.emit({",
-    "                        type: \"agent.provider_subagents.update\",",
-    "                        payload: {",
-    "                            kind: \"remove\",",
-    "                            parentAgentId: update.parentAgentId,",
-    "                            subagentId: update.subagentId,",
-    "                        },",
-    "                    });",
-    "                }",
-    "                return;",
-    "            }",
-);
-
-const BRANCH_REPLACEMENT = lines(
-    "            if (event.type === \"provider_subagent\") {",
-    "                this.forwardProviderSubagentUpdate(event.event);",
-    "                return;",
-    "            }",
 );
 
 function occurrences(haystack, needle) {
@@ -161,27 +170,16 @@ function occurrences(haystack, needle) {
     }
 }
 
-const anchors = [
-    ["method insertion", METHOD_ANCHOR, METHOD_REPLACEMENT],
-    ["provider_subagent branch", BRANCH_ANCHOR, BRANCH_REPLACEMENT],
-];
-const invalid = anchors
-    .map(([name, anchor]) => [name, occurrences(source, anchor)])
-    .filter(([, count]) => count !== 1);
-if (invalid.length > 0) {
-    console.error(`SKIP: anchors missing or duplicated (upstream drift?): ${invalid
-        .map(([name, count]) => `${name}=${count}`)
-        .join(", ")}`);
+const found = occurrences(source, METHOD_ANCHOR);
+if (found !== 1) {
+    console.error(`SKIP: anchors missing or duplicated (upstream drift?): provider_subagent branch=${found}`);
     process.exit(20);
 }
 
-let candidate = source;
-for (const [name, anchor, replacement] of anchors) {
-    candidate = candidate.replace(anchor, replacement);
-    if (occurrences(candidate, anchor) !== 0 || !candidate.includes(replacement)) {
-        console.error(`replacement failed: ${name}`);
-        process.exit(1);
-    }
+const candidate = source.replace(METHOD_ANCHOR, METHOD_REPLACEMENT);
+if (occurrences(candidate, METHOD_ANCHOR) !== 0 || !candidate.includes(METHOD_REPLACEMENT)) {
+    console.error("replacement failed: method insertion");
+    process.exit(1);
 }
 if (!candidate.includes(SENTINEL)) {
     console.error("sentinel absent after patching — logic error");
@@ -196,4 +194,3 @@ catch (error) {
     process.exit(1);
 }
 console.log("PATCHED");
-
