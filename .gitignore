@@ -1,5 +1,12 @@
 # The filled config — holds site-specific facts. Only the .example is tracked.
 airlock.toml
+# The package digest lock — machine-written box approval state, one per box. It rode
+# into the repository with a box commit (#659) and kept every installed clone
+# permanently dirty, which made the hourly canonical-clone sweep skip those clones and
+# let them go quietly stale. Absence means trust-on-first-use at the first successful
+# install; see docs/design/trust-and-capability-contract.md.
+airlock.lock
+
 # Operator backups of the filled config carry the same facts (hostname, ports).
 # `airlock-update` snapshots the checkout with `git add -A` before overwriting, and
 # on 2026-09-13 that vacuumed seven `airlock.toml.bak-*` copies into a box's history.

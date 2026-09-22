@@ -48,8 +48,10 @@ class NativeLinksTest(unittest.TestCase):
     def test_real_checkpoint_accepts_materialized_runtime(self):
         archive = self.base / "checkpoint.tar"
         with tarfile.open(archive, "w", dereference=False) as bundle:
-            with self.assertRaisesRegex(ledger["LedgerError"], "hard-linked"):
+            with self.assertRaisesRegex(ledger["LedgerError"], "hard-linked") as refused:
                 ledger["_capture_checkpoint_tree"](bundle, str(self.server), privileged=False)
+        # The refusal names the exact one-time recovery, and that command is what makes the retry pass.
+        self.assertIn(f"normalize-native-links.py {self.server}", str(refused.exception))
         normalize(self.server)
         with tarfile.open(archive, "w", dereference=False) as bundle:
             self.assertEqual(ledger["_capture_checkpoint_tree"](bundle, str(self.server), privileged=False), [])
@@ -58,6 +60,54 @@ class NativeLinksTest(unittest.TestCase):
             self.assertEqual(len(files), 2)
             for member in files:
                 self.assertEqual(bundle.extractfile(member).read(), b"native executable bytes")
+
+    def test_refusal_outside_esbuild_gives_the_generic_recovery(self):
+        other = self.base / "tree"
+        other.mkdir()
+        (other / "a").write_bytes(b"x")
+        os.link(other / "a", other / "b")
+        with tarfile.open(self.base / "other.tar", "w", dereference=False) as bundle:
+            with self.assertRaisesRegex(ledger["LedgerError"], "hard-linked") as refused:
+                ledger["_capture_checkpoint_tree"](bundle, str(other), privileged=False)
+        self.assertIn("-samefile", str(refused.exception))
+        self.assertNotIn("normalize-native-links.py", str(refused.exception))
+
+    def _pair(self, root: Path) -> tuple[Path, Path]:
+        native = root / "node_modules/@esbuild/linux-arm64/bin/esbuild"
+        shim = root / "node_modules/esbuild/bin/esbuild"
+        native.parent.mkdir(parents=True)
+        shim.parent.mkdir(parents=True)
+        native.write_bytes(b"n")
+        os.link(native, shim)
+        return native, shim
+
+    def test_refusal_recognizes_only_the_exact_closed_esbuild_pair(self):
+        refuse = ledger["_hard_link_refusal"]
+        for path in (self.native, self.shim):
+            self.assertIn(f"normalize-native-links.py {self.server}", refuse(str(path)))
+        # the last node_modules decides: a nested package tree names its own directory
+        nested = self.server / "node_modules/vite"
+        native, shim = self._pair(nested)
+        self.assertIn(f"normalize-native-links.py {nested}", refuse(str(shim)))
+        for other in (f"{self.shim}/extra", str(self.native.parent / "other"),
+                      str(self.server / "node_modules/@esbuild/bin/esbuild")):
+            self.assertNotIn("normalize-native-links.py", refuse(other))
+
+    def test_native_linked_outside_with_independent_shim_gets_generic_advice(self):
+        # Review (Sol): the normalizer would be a no-op here, so its command must not be offered.
+        self.shim.unlink()
+        self.shim.write_bytes(b"shim")
+        os.link(self.native, self.base / "outside")
+        advice = ledger["_hard_link_refusal"](str(self.native))
+        self.assertNotIn("normalize-native-links.py", advice)
+        self.assertIn("-samefile", advice)
+
+    def test_refusal_quotes_paths_it_asks_the_operator_to_run(self):
+        hostile = self.base / "a b;$(touch pwned)"
+        native, shim = self._pair(hostile)
+        self.assertIn(f"'{hostile}'", ledger["_hard_link_refusal"](str(shim)))
+        self.assertIn("-samefile '/srv/a b;$(x)/f'", ledger["_hard_link_refusal"]("/srv/a b;$(x)/f"))
+        self.assertFalse((Path.cwd() / "pwned").exists())
 
     def test_redirected_parent_is_rejected(self):
         directory = self.shim.parent

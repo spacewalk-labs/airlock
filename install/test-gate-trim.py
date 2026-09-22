@@ -176,6 +176,17 @@ def main() -> int:
         print(info_target.stderr)
         fail += 1
 
+    installer = (repo / "install/airlock-install.sh").read_text(encoding="utf-8")
+    targeted_calls = installer.count(
+        'airlock_config package-info "${_airlock_package_info_args[@]}"'
+    )
+    if (targeted_calls == 2
+            and '--lifecycle-targets=$_airlock_selected_csv' in installer):
+        print("ok   MERGE selected install: package-info receives only lifecycle targets")
+    else:
+        print("FAIL MERGE selected install: lifecycle targets are not wired to both package-info reads")
+        fail += 1
+
     info_stale = config_cmd(
         repo, cfg, ["package-info", "--lifecycle-targets=stale-pkg"])
     if info_stale.returncode != 0 and "package lock digest mismatch" in info_stale.stderr:

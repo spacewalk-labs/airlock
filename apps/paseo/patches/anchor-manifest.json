@@ -70,6 +70,13 @@
   },
   "patches": [
     {
+      "id": "agent-history-delete-guard",
+      "source": "apps/paseo/patches/agent-history-delete-guard.mjs",
+      "anchors": [
+        "export async function runDeleteCommand(id, options, _command)"
+      ]
+    },
+    {
       "id": "depth4-search",
       "source": "apps/paseo/install.sh",
       "anchors": [
@@ -158,6 +165,14 @@
       "anchors": [
         "this.warnInvalidSelection(modelId,",
         "throw new Error(`Model ${modelId} is not a valid ${this.provider} model`);"
+      ]
+    },
+    {
+      "id": "agent-resolve-by-id",
+      "source": "apps/paseo/patches/agent-resolve-by-id.mjs",
+      "anchors": [
+        "const ARCHIVE_RELOAD_OLD = ",
+        "const DETACH_OLD = "
       ]
     },
     {

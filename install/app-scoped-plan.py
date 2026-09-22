@@ -276,6 +276,48 @@ def connected_components(nodes: set[str], edges: list[tuple[str, str]]) -> list[
     return components
 
 
+def selected_components(selected: list[str], packages: dict[str, Any],
+                        handoffs: list[tuple[str, str]],
+                        ledger_dependencies: dict[str, Any]) -> list[set[str]]:
+    """Expand only toward prerequisites and destructive committed dependents.
+
+    Package dependencies are directional: selecting an app needs its prerequisites,
+    but must not reinstall sibling apps that happen to share one.  Resource handoffs
+    stay atomic.  The ledger snapshot contributes the reverse edge only for its
+    destructive rows, where changing a dependency must also settle a committed
+    dependent that is already being removed or deactivated.
+    """
+    forward: dict[str, set[str]] = {}
+    for app_id, package in packages.items():
+        forward.setdefault(app_id, set()).update(
+            dep for dep in package["deps"] if dep in packages
+        )
+    for old, new in handoffs:
+        forward.setdefault(old, set()).add(new)
+        forward.setdefault(new, set()).add(old)
+    for row in ledger_dependencies["rows"]:
+        dependent = row["app_id"]
+        for dependency in row["deps"]:
+            forward.setdefault(dependency, set()).add(dependent)
+
+    closures: list[set[str]] = []
+    for requested in selected:
+        closure: set[str] = set()
+        stack = [requested]
+        while stack:
+            app_id = stack.pop()
+            if app_id in closure:
+                continue
+            closure.add(app_id)
+            stack.extend(sorted(forward.get(app_id, ()), reverse=True))
+        overlaps = [item for item in closures if item & closure]
+        for item in overlaps:
+            closure.update(item)
+            closures.remove(item)
+        closures.append(closure)
+    return closures
+
+
 def coalesce_interleaved_destructive_components(
         components: list[set[str]], actions: dict[str, str],
         ledger_position: dict[str, int]) -> list[set[str]]:
@@ -372,8 +414,13 @@ def make_plan(package_info: dict[str, Any], ledger_actions: dict[str, str],
                     "to": dependent,
                 })
 
-    components = connected_components(nodes, edges)
-    if mode == "full":
+    if mode == "selected":
+        assert ledger_dependencies is not None
+        components = selected_components(
+            selected_ids, packages, handoffs, ledger_dependencies
+        )
+    else:
+        components = connected_components(nodes, edges)
         components = coalesce_interleaved_destructive_components(
             components, ledger_actions, ledger_position
         )
@@ -421,12 +468,11 @@ def make_plan(package_info: dict[str, Any], ledger_actions: dict[str, str],
             (app_id, ledger_actions[app_id])
             for app_id in ledger_order
             if (app_id not in selected_members
-                and (ledger_actions[app_id] != "reinstall"
-                     or not mapping_matches.get(app_id, False)))
+                and not mapping_matches.get(app_id, False))
         ]
         if unsafe_unrelated:
             detail = ", ".join(
-                f"{app_id} ({'reinstall; serve mapping differs' if action == 'reinstall' else action})"
+                f"{app_id} ({action}; serve mapping differs)"
                 for app_id, action in unsafe_unrelated
             )
             raise PlanError(

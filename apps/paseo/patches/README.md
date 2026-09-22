@@ -1,5 +1,8 @@
 # paseo patches — AGPL-3.0-only (our own choice, on an Apache-2.0 base)
 
+`agent-history-delete-guard.mjs` refuses CLI permanent deletion before connecting
+or cancelling agents; see [automatic cleanup](../README.md#automatic-cleanup).
+
 **License: `AGPL-3.0-only`** — marked separately from the repo's own AGPL-3.0,
 because the basis is different (see below).
 
@@ -168,6 +171,18 @@ upstream changed licence again.
   while valid choices reach the ACP connection. The ACP module is not pinned in
   `INSTALLED_SHA256SUMS`, so this follows the existing install-time ACP overlays
   without rebaking the vendor bundle.
+
+- **`agent-resolve-by-id.mjs`** (+ `.test.mjs`) — `paseo agent archive`, `detach` and `reload`
+  resolve their target by scanning the `includeArchived` agent list, which the server caps at
+  200 (`session.js` `limit ?? 200`; the CLI passes no `--page`). On a box with thousands of
+  archived agents an old or stopped seat sorts past the cap and the command answers `Agent not
+  found` — precisely the seat you are trying to clean up or reload (a 24h sweep on 2026-09-21
+  hit 17/17 failures). The sibling commands `stop`/`delete` already resolve a single id straight
+  from the daemon with `fetchAgent({agentId})`; this patch gives the three list-scanning commands
+  the same fast path, leaving prefix/name on the list (the daemon cannot resolve those directly).
+  CLI modules only, so **no daemon restart** — same class as `agent-history-delete-guard`.
+  **Remove this overlay when upstream resolves single ids in the CLI** (a `--page` loop or an id
+  lookup); the anchors disappear with the fix, so the patcher then skips with exit 20.
 
 - **`anchor-manifest.json`** — records the pinned Paseo/web-ui version, the pristine
   web-ui SHA, the **shape table** (every bundle state the fleet is known to carry: the

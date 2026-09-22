@@ -2796,15 +2796,17 @@ class Handler(BaseHTTPRequestHandler):
     ASSET_TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
 
     def _published_asset(self, name):
-        """발행본이 쓰는 공용 문서 자산(`_assets/` 아래 css·js). 이름 경계는 /doc 과 같은 규칙이다."""
+        """공용 문서 자산. doc.css·doc.js는 앱 frontend, 나머지는 publish _assets에서 읽는다."""
         if not name or name != os.path.basename(name) or name in (".", ".."):
             return self._send_json(400, {"error": "자산 이름이 올바르지 않습니다"})
         content_type = self.ASSET_TYPES.get(os.path.splitext(name)[1].lower())
         if content_type is None:
             return self._send_json(400, {"error": "자산은 .css · .js 만 내줍니다"})
-        public = configured_paths()["public"]
-        target = os.path.join(public, "_assets", name)
-        if os.path.dirname(os.path.abspath(target)) != os.path.join(public, "_assets"):
+        asset_dir = (os.path.join(BASE_DIR, "frontend")
+                     if name in ("doc.css", "doc.js")
+                     else os.path.join(configured_paths()["public"], "_assets"))
+        target = os.path.join(asset_dir, name)
+        if os.path.dirname(os.path.abspath(target)) != os.path.abspath(asset_dir):
             return self._send_json(400, {"error": "자산 디렉터리 밖입니다"})
         try:
             with open(target, "rb") as stream:

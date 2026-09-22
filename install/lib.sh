@@ -436,6 +436,13 @@ if d:
 ' "$app"
 }
 
+# airlock_doc_assets_dir — platform-owned, public-neutral document assets.
+# Apps receive this path through the sourced D5 ABI instead of reaching into the
+# platform tree themselves; package directories may live outside AIRLOCK_ROOT.
+airlock_doc_assets_dir() {
+  printf '%s\n' "$AIRLOCK_ROOT/docker/student-harness/skills/share-docs/assets"
+}
+
 # airlock_render_serve_https <app> — the platform's rendering of a packaged
 # app's `[serve.https]` manifest surface (docs/design/app-package-contract.md
 # D2 "Amended in child 4"; child-4 P2b STEP 0 infra). Reads AIRLOCK_PKG_INFO's

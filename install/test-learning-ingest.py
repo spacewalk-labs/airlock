@@ -120,6 +120,107 @@ def main(argv):
     RUNNER = load(os.path.join(backend_dir, "ingest_runner.py"), "learning_ingest_runner_test")
     BACKEND = RUNNER.BACKEND
 
+    # 실패요약은 신뢰하지 않는 로그를 에이전트에 넣는다. 모델 이름만 맞는 것으로는 부족하고,
+    # 첫 후보·폴백 순서와 각 CLI의 도구 차단이 실제 argv/cwd/env에 함께 있어야 한다.
+    real_summary_which = RUNNER.shutil.which
+    real_summary_run = RUNNER.subprocess.run
+    summary_calls = []
+    summary_mode = {"value": "agy-success"}
+
+    class SummaryResult:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_summary_which(name):
+        return f"/fake/{name}"
+
+    def fake_summary_run(argv, **kwargs):
+        name = os.path.basename(argv[0])
+        with open(os.path.join(kwargs["cwd"], ".agents", "hooks.json"), encoding="utf-8") as handle:
+            hooks = json.load(handle)
+        summary_calls.append((name, list(argv), dict(kwargs["env"]), hooks))
+        if name == "agy":
+            if summary_mode["value"] == "agy-success":
+                return SummaryResult(stdout=json.dumps({"status": "SUCCESS", "response": "agy 요약"}))
+            if summary_mode["value"] == "agy-timeout":
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            if summary_mode["value"] == "agy-empty":
+                return SummaryResult(stdout=json.dumps({"status": "SUCCESS", "response": ""}))
+            return SummaryResult(returncode=9, stderr="agy failed")
+        if summary_mode["value"] == "both-fail":
+            return SummaryResult(returncode=7, stderr="muse failed")
+        return SummaryResult(stdout=(json.dumps({"type": "text", "part": {"text": "Muse 요약"}})
+                                     + "\n"))
+
+    RUNNER.shutil.which = fake_summary_which
+    RUNNER.subprocess.run = fake_summary_run
+    old_gemini_key = os.environ.get("GEMINI_API_KEY")
+    old_openai_key = os.environ.get("OPENAI_API_KEY")
+    os.environ["GEMINI_API_KEY"] = "must-not-pass"
+    os.environ["OPENAI_API_KEY"] = "must-not-pass"
+    long_failure_log = "실패 로그 " * 200
+    try:
+        summary_calls.clear()
+        summary_mode["value"] = "agy-success"
+        summary, error = RUNNER.summarize_failure(long_failure_log)
+        agy_name, agy_argv, agy_env, hooks = summary_calls[0]
+        deny_hook = hooks.get("deny-summary-tools", {}).get("PreToolUse", [{}])[0]
+        check("실패요약은 agy Gemini 3.8 Flash를 먼저 쓴다",
+              summary == "agy 요약" and error is None and [c[0] for c in summary_calls] == ["agy"]
+              and "gemini-3.8-flash-low" in agy_argv,
+              f"summary={summary!r} error={error!r} calls={[c[0] for c in summary_calls]}")
+        check("agy 요약 작업공간이 모든 도구를 hard deny한다",
+              agy_name == "agy" and deny_hook.get("matcher") == "*"
+              and '"decision":"deny"' in deny_hook.get("hooks", [{}])[0].get("command", "")
+              and "--sandbox" in agy_argv and "--new-project" in agy_argv,
+              f"argv={agy_argv} hooks={hooks}")
+        check("agy 요약에 종량제 API 키를 넘기지 않는다",
+              "GEMINI_API_KEY" not in agy_env and "OPENAI_API_KEY" not in agy_env,
+              str(sorted(k for k in agy_env if "KEY" in k)))
+
+        summary_calls.clear()
+        summary_mode["value"] = "agy-empty"
+        summary, error = RUNNER.summarize_failure(long_failure_log)
+        muse_env = summary_calls[-1][2]
+        check("agy 빈 응답이면 Muse Spark 1.3으로 한 번 폴백한다",
+              summary == "Muse 요약" and error is None
+              and [c[0] for c in summary_calls] == ["agy", "opencode"]
+              and RUNNER.FAILURE_SUMMARY_FALLBACK_MODEL in summary_calls[-1][1],
+              f"summary={summary!r} error={error!r} calls={[c[0] for c in summary_calls]}")
+        check("Muse 폴백은 모든 도구를 거부하고 API 키를 넘기지 않는다",
+              json.loads(muse_env.get("OPENCODE_CONFIG_CONTENT", "{}"))
+              == {"permission": {"*": "deny"}}
+              and "GEMINI_API_KEY" not in muse_env and "OPENAI_API_KEY" not in muse_env,
+              str(muse_env.get("OPENCODE_CONFIG_CONTENT")))
+
+        summary_calls.clear()
+        summary_mode["value"] = "both-fail"
+        summary, error = RUNNER.summarize_failure(long_failure_log)
+        check("두 요약기가 실패하면 두 사유를 숨기지 않는다",
+              summary is None and "agy exit 9" in (error or "")
+              and "Muse Spark exit 7" in (error or ""), str(error))
+
+        summary_calls.clear()
+        summary_mode["value"] = "agy-timeout"
+        summary, error = RUNNER.summarize_failure(long_failure_log)
+        check("agy 시간초과도 Muse 폴백 조건이다",
+              summary == "Muse 요약" and error is None
+              and [c[0] for c in summary_calls] == ["agy", "opencode"],
+              f"summary={summary!r} error={error!r} calls={[c[0] for c in summary_calls]}")
+    finally:
+        RUNNER.shutil.which = real_summary_which
+        RUNNER.subprocess.run = real_summary_run
+        if old_gemini_key is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = old_gemini_key
+        if old_openai_key is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = old_openai_key
+
     # 접수 시점 제목은 실제 네트워크 대신 가짜 oEmbed 응답으로 검증한다.
     oembed_call = {}
 

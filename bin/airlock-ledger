@@ -33,6 +33,7 @@ import re
 import select
 import shutil
 import secrets
+import shlex
 import stat
 import subprocess
 import sys
@@ -4055,6 +4056,44 @@ def _checkpoint_io_failure(path: str, exc: OSError) -> NoReturn:
     fail(f"cannot inspect checkpoint artifact {path}: {exc}")
 
 
+def _is_closed_esbuild_pair(node_modules: Path) -> bool:
+    """True only when the shim and exactly one native binary are one inode with two names —
+    the case the normalizer materializes. Anything else would make its advice a no-op."""
+    try:
+        shim = os.lstat(node_modules / "esbuild" / "bin" / "esbuild")
+        natives = [os.lstat(p) for p in node_modules.glob("@esbuild/*/bin/esbuild")]
+    except OSError:
+        return False
+    same = [n for n in natives if (n.st_dev, n.st_ino) == (shim.st_dev, shim.st_ino)]
+    return stat.S_ISREG(shim.st_mode) and shim.st_nlink == 2 and len(same) == 1
+
+
+def _hard_link_refusal(path: str) -> str:
+    """Refuse a hard-linked artifact, naming the recovery the operator can run.
+
+    The checkpoint stays strict: it never rewrites a live tree before a durable
+    checkpoint exists. Paseo's installer materializes esbuild's closed native/shim
+    pair after that point, so only a tree installed before that step (or re-linked
+    outside Airlock) reaches here; its one-time fix is the same normalizer.
+    """
+    message = f"unsupported hard-linked checkpoint artifact at {path}"
+    parts = Path(path).parts
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index] != "node_modules":
+            continue
+        tail = parts[index + 1:]
+        if (tail == ("esbuild", "bin", "esbuild") or (
+                len(tail) == 4 and tail[0] == "@esbuild" and tail[2:] == ("bin", "esbuild"))) \
+                and _is_closed_esbuild_pair(Path(*parts[:index + 1])):
+            normalizer = Path(__file__).resolve().parent.parent / "apps" / "paseo" / "normalize-native-links.py"
+            command = shlex.join(["python3", str(normalizer), str(Path(*parts[:index]))])
+            return f"{message}; this is esbuild's native/shim pair. Materialize it once, then retry: {command}"
+        break
+    return (f"{message}; find its other names with `find <tree> -xdev -samefile {shlex.quote(path)}`. "
+            "If every name is inside this artifact, replace one with an independent copy "
+            "(`cp -p` to a temporary name, then `mv`) and retry; never copy a name that lives outside it")
+
+
 def _capture_checkpoint_tree(bundle: tarfile.TarFile, source: str, *,
                              privileged: bool) -> list[str]:
     """Validate and archive one tree in a single recursive walk.
@@ -4082,7 +4121,7 @@ def _capture_checkpoint_tree(bundle: tarfile.TarFile, source: str, *,
             return
         if stat.S_ISREG(mode):
             if item_stat.st_nlink != 1:
-                fail(f"unsupported hard-linked checkpoint artifact at {path}")
+                fail(_hard_link_refusal(path))
             try:
                 with open(path, "rb") as fh:
                     opened = os.fstat(fh.fileno())

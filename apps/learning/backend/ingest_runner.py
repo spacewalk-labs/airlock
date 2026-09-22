@@ -30,8 +30,10 @@ import os
 import re
 import signal
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -110,10 +112,11 @@ DOCUMENT_MIN_BYTES = SAVE.DOCUMENT_MIN_BYTES
 STOPPING = False
 
 
-FAILURE_SUMMARY_MODEL = "sonnet"
-# 🔴 요약은 워커 루프를 그동안 **멈춰 세운다** — 다음 적재가 이만큼 늦어진다. 실측
-#    2026-08-17 실제 요약 소요는 7.9초였고, 이 상한은 모델이 막혔을 때의 천장이다.
-FAILURE_SUMMARY_TIMEOUT_SECONDS = 120
+# 🔴 요약은 워커 루프를 그동안 **멈춰 세운다** — 다음 적재가 이만큼 늦어진다. 후보마다
+#    60초를 주면 첫 후보가 막혀도 한 적재가 요약 때문에 120초 이상 묶이지 않는다.
+FAILURE_SUMMARY_PRIMARY_MODEL = "gemini-3.8-flash-low"
+FAILURE_SUMMARY_FALLBACK_MODEL = "opencode-go/muse-spark-1.3-contributor"
+FAILURE_SUMMARY_TIMEOUT_SECONDS = 60
 # 이보다 짧은 로그는 요약할 원문이 없다(cli-missing 처럼 러너가 한 줄
 # 쓰고 끝난 경우). 이때는 이미 `error` 한 줄이 스스로 설명한다.
 FAILURE_SUMMARY_MIN_LOG_BYTES = 400
@@ -136,16 +139,15 @@ FAILURE_SUMMARY_PROMPT = (
 
 def failure_summary_enabled():
     """`INGEST_FAILURE_SUMMARY=0` 으로 끈다. 시험은 모델을 부르면 안 되고, 운영에서도
-    코덱스가 오래 막힐 때 사람이 끌 수 있어야 한다. 기본은 켜짐이다."""
+    요약 구독 모델이 오래 막힐 때 사람이 끌 수 있어야 한다. 기본은 켜짐이다."""
     raw = BACKEND.env_first("AIRLOCK_LEARNING_FAILURE_SUMMARY", "INGEST_FAILURE_SUMMARY",
                             default="1").strip().lower()
     return raw not in {"0", "false", "no", "off", ""}
 
 
-# 🔴 **허용목록**이다. 지울 것을 세는 방식(blacklist)은 졌다 — `CLAUDE_CODE_USE_BEDROCK`,
-#    `CLAUDE_CODE_USE_VERTEX`, AWS·GCP 자격증명, `CODEX_API_KEY` 처럼 과금 경로로 새는
-#    변수는 계속 늘어나고, 하나 빠뜨리면 조용히 과금된다. 요약에 필요한 것만 통과시킨다.
-#    (실측: placeholder AWS 환경 + `CLAUDE_CODE_USE_BEDROCK=1` 이면 claude 가 bedrock 을 고른다.)
+# 🔴 **허용목록**이다. 지울 것을 세는 방식(blacklist)은 졌다 — API 키·클라우드 자격증명은
+#    계속 늘어나고, 하나 빠뜨리면 agy/OpenCode 구독 대신 조용히 종량제로 샌다.
+#    요약에 필요한 로그인 탐색 경로와 로케일만 통과시킨다.
 FAILURE_SUMMARY_ENV_KEEP = (
     "HOME", "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TZ",
     "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
@@ -153,8 +155,7 @@ FAILURE_SUMMARY_ENV_KEEP = (
 
 
 def _subscription_env():
-    """자식에게 넘길 환경. 구독 로그인(`~/.codex`·`~/.claude`)은 HOME 으로 찾으므로
-    자격증명 변수는 하나도 필요 없다."""
+    """자식 환경. agy/OpenCode 구독 로그인은 HOME으로 찾으므로 자격증명 변수는 불필요하다."""
     return {name: os.environ[name] for name in FAILURE_SUMMARY_ENV_KEEP if name in os.environ}
 
 
@@ -167,44 +168,135 @@ def _clip_tail(text, max_bytes=FAILURE_SUMMARY_TAIL_BYTES):
     return data[-max_bytes:].decode("utf-8", "replace")
 
 
-def _summarize_with_claude(log_text):
-    """적재 본체가 이미 쓰는 실행 파일이라 새로 붙는 의존성이 없다.
-
-    🔴 요약기는 지금도 claude 전용이다. 도구를 전부 끄는 인자가 CLI 마다 다르고, 그
-    인자를 잘못 주면 신뢰할 수 없는 전사를 도구가 켜진 에이전트에 먹이게 된다 — 실패
-    요약 한 줄의 편의가 그 위험을 살 만하지 않다. claude 가 없으면 요약을 접고 원문
-    로그를 남긴다(아래 호출부가 그 실패를 삼킨다).
-    """
-    claude = PROVIDERS.by_id("claude").probe()[0]
-    if not claude:
-        raise FileNotFoundError("실패 요약은 claude 로만 만듭니다 — 찾지 못했습니다")
-    prompt = FAILURE_SUMMARY_PROMPT.replace("<stdin> 은", "아래 로그는") + (
+def _summary_prompt(log_text):
+    return FAILURE_SUMMARY_PROMPT.replace("<stdin> 은", "아래 로그는") + (
         "\n\n--- 로그 ---\n" + _clip_tail(log_text)
     )
-    result = subprocess.run(
-        # 🔴 도구를 전부 끈다. 이 박스의 사용자 설정은 `defaultMode=bypassPermissions` 라,
-        #    도구를 켠 채 신뢰할 수 없는 전사를 먹이면 프롬프트 주입 한 줄이 무승인 실행이
-        #    된다. 요약은 글자만 만들면 되므로 도구가 하나도 필요 없다.
-        # 🔴 `--tools ""` 만으로는 **부족하다** — 그건 내장 도구만 끄고 MCP 서버는 그대로
-        #    남긴다. 실측 2026-08-17: `--tools ""` 만 걸고 로컬 서버의 난수를 요청했더니
-        #    모델이 그 값을 정확히 가져왔고 서버 로그에 GET 이 찍혔다(= 유출 경로가 열려
-        #    있었다). MCP 까지 비우면 같은 요청에서 요청이 아예 나가지 않는다.
-        # 🔴 `--tools ""` 와 MCP 차단은 **도구만** 끈다. 훅·플러그인·CLAUDE.md·세션 저장은
-        #    그대로 살아 있었다(적대검증 2026-08-18). 그래서 신뢰할 수 없는 로그가 로컬
-        #    지침·훅 출력과 같은 컨텍스트에 들어가고, 프롬프트가 세션 파일로 디스크에
-        #    영구 복제됐다(실측: 요약 프롬프트가 담긴 세션 파일 4개, 최대 53KB).
-        #    `--safe-mode` 가 그 커스터마이즈 전부를, `--no-session-persistence` 가
-        #    디스크 복제를 끈다.
-        [claude, "-p", prompt, "--model", FAILURE_SUMMARY_MODEL, "--tools", "",
-         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-         "--safe-mode", "--no-session-persistence"],
-        shell=False, capture_output=True, text=True,
-        timeout=FAILURE_SUMMARY_TIMEOUT_SECONDS, env=_subscription_env(),
-    )
+
+
+def _summary_binary(name, label):
+    """Resolve from PATH; tests supply fake CLIs by putting a directory first."""
+    path = shutil.which(name)
+    if not path:
+        raise FileNotFoundError(f"{label} 실행 파일을 찾지 못했습니다: {name}")
+    return path
+
+
+def _write_summary_hooks(workdir):
+    """Create a disposable hook that denies every model tool invocation."""
+    agents_dir = os.path.join(workdir, ".agents")
+    os.mkdir(agents_dir, mode=0o700)
+    hooks = {
+        "deny-summary-tools": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": ("printf '%s\\n' "
+                                "'{\"decision\":\"deny\","
+                                "\"reason\":\"summary model has no tools\"}'"),
+                    "timeout": 5,
+                }],
+            }],
+        }
+    }
+    hooks_path = os.path.join(agents_dir, "hooks.json")
+    with open(hooks_path, "w", encoding="utf-8") as handle:
+        json.dump(hooks, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    os.chmod(hooks_path, 0o600)
+
+
+def _run_summary_process(argv, cwd, env, label):
+    try:
+        result = subprocess.run(
+            argv,
+            shell=False,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=FAILURE_SUMMARY_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{label} 실행 파일을 시작하지 못했습니다: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{label} 시간초과 ({FAILURE_SUMMARY_TIMEOUT_SECONDS}초)") from exc
+    except OSError as exc:
+        raise RuntimeError(f"{label} 실행 오류: {exc}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"claude exit {result.returncode}: {detail[-300:]}")
-    return (result.stdout or "").strip()
+        suffix = f": {_clip_tail(detail, 500)}" if detail else ""
+        raise RuntimeError(f"{label} exit {result.returncode}{suffix}")
+    return result.stdout or ""
+
+
+def _summarize_with_agy(prompt, workdir):
+    agy = _summary_binary("agy", "agy")
+    output = _run_summary_process(
+        [agy, "--model", FAILURE_SUMMARY_PRIMARY_MODEL,
+         "--output-format", "json", "--disable-slash-commands", "--sandbox",
+         "--new-project", f"-p={prompt}"],
+        workdir, _subscription_env(), "agy")
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("agy JSON 응답을 해석하지 못했습니다") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("agy JSON 응답이 객체가 아닙니다")
+    if payload.get("status") != "SUCCESS":
+        raise RuntimeError(f"agy 상태가 SUCCESS가 아닙니다: {payload.get('status')!r}")
+    response = payload.get("response")
+    if not isinstance(response, str) or not response.strip():
+        raise ValueError("agy 응답이 비어 있습니다")
+    return response.strip()
+
+
+def _event_text(event):
+    """Read only OpenCode text events; tool and status events are ignored."""
+    if not isinstance(event, dict):
+        return ""
+    part = event.get("part")
+    if isinstance(part, dict) and isinstance(part.get("text"), str):
+        return part["text"]
+    if event.get("type") == "text" and isinstance(event.get("text"), str):
+        return event["text"]
+    return ""
+
+
+def _parse_muse_events(output):
+    chunks = []
+    parsed = False
+    invalid = False
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            invalid = True
+            continue
+        parsed = True
+        text = _event_text(event)
+        if text:
+            chunks.append(text)
+    response = "".join(chunks).strip()
+    if response:
+        return response
+    if invalid and not parsed:
+        raise ValueError("Muse Spark JSON 이벤트를 해석하지 못했습니다")
+    raise ValueError("Muse Spark 응답에 텍스트 이벤트가 없습니다")
+
+
+def _summarize_with_muse(prompt, workdir):
+    opencode = _summary_binary("opencode", "Muse Spark")
+    env = _subscription_env()
+    env["OPENCODE_CONFIG_CONTENT"] = '{"permission":{"*":"deny"}}'
+    output = _run_summary_process(
+        [opencode, "run", "--pure", "-m", FAILURE_SUMMARY_FALLBACK_MODEL,
+         "--format", "json", prompt],
+        workdir, env, "Muse Spark")
+    return _parse_muse_events(output)
 
 
 def summarize_failure(log_text):
@@ -212,13 +304,22 @@ def summarize_failure(log_text):
     요약을 못 만든 이유도 화면까지 흘려야 사람이 '왜 설명이 없나'를 묻지 않는다."""
     if len(str(log_text).encode("utf-8", "replace")) < FAILURE_SUMMARY_MIN_LOG_BYTES:
         return None, "로그가 짧아 요약할 내용이 없습니다"
+    prompt = _summary_prompt(log_text)
+    errors = []
     try:
-        text = _summarize_with_claude(log_text)
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-        return None, f"요약을 만들지 못했습니다 — {exc}"
-    if not text:
-        return None, "요약을 만들지 못했습니다 — 빈 응답"
-    return text, None
+        with tempfile.TemporaryDirectory(prefix="airlock-learning-summary-") as workdir:
+            _write_summary_hooks(workdir)
+            try:
+                return _summarize_with_agy(prompt, workdir), None
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                errors.append(f"agy: {exc}")
+            try:
+                return _summarize_with_muse(prompt, workdir), None
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                errors.append(f"Muse Spark: {exc}")
+    except OSError as exc:
+        errors.append(f"요약 작업공간: {exc}")
+    return None, "요약을 만들지 못했습니다 — " + "; ".join(errors)
 
 
 def timeout_seconds():

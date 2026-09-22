@@ -45,6 +45,12 @@ case "$c_other" in 200) note "hub as non-owner: got 200 — the gate is not in f
 c_page=$(code -H "${HDR}: ${OWNER}" "http://127.0.0.1:${HUB}/learning/")
 [ "$c_page" = 200 ] || { note "page: expected 200, got $c_page"; fail=1; }
 
+# 5. the reader's two neutral document assets are owned by the installed app.
+c_doc_css=$(code "http://127.0.0.1:${PORT}/read/_assets/doc.css")
+[ "$c_doc_css" = 200 ] || { note "doc.css: expected 200, got $c_doc_css"; fail=1; }
+c_doc_js=$(code "http://127.0.0.1:${PORT}/read/_assets/doc.js")
+[ "$c_doc_js" = 200 ] || { note "doc.js: expected 200, got $c_doc_js"; fail=1; }
+
 if [ "$fail" = 0 ]; then
   echo "learning smoke: ok"
 else

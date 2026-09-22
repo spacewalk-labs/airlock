@@ -154,7 +154,9 @@ grant = ["rooted-artifact"]          # declared capabilities this package may us
 ```
 
 ```toml
-# airlock.lock — machine-written at first admission, reviewed by a human in diff
+# airlock.lock — machine-written at first admission. Box state, not source: it is
+# untracked (.gitignore), every box has its own, and a missing file means every
+# package is admitted on first use.
 [hello]
 digest = "sha256:…"
 ```

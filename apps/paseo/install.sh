@@ -472,6 +472,60 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   "$PY" "$HERE/normalize-native-links.py" "$PASEO_SERVER_DIR" \
     || die "Paseo native files cannot be materialized for rollback checkpoints"
 fi
+# Keep automatic cleanup reversible. Only the CLI is guarded; browser/direct RPC
+# deletion remains upstream behavior. Changing a CLI module needs no daemon restart.
+HISTORY_GUARD_CLI="$NPM_ROOT/$PASEO_PKG/dist/commands/agent/delete.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] refuse CLI permanent agent deletion before connecting/cancelling"
+else
+  rm -f "$HISTORY_GUARD_CLI.paseo-new.mjs"
+  history_guard_rc=0
+  node "$HERE/patches/agent-history-delete-guard.mjs" cli "$HISTORY_GUARD_CLI" \
+    || history_guard_rc=$?
+  case "$history_guard_rc" in
+    0)
+      node --check "$HISTORY_GUARD_CLI.paseo-new.mjs" \
+        || die "CLI deletion guard candidate is invalid"
+      node "$HERE/patches/agent-history-delete-guard.test.mjs" "$HISTORY_GUARD_CLI.paseo-new.mjs" \
+        || die "CLI deletion guard behaviour check failed"
+      mv "$HISTORY_GUARD_CLI.paseo-new.mjs" "$HISTORY_GUARD_CLI" \
+        || die "CLI deletion guard replacement failed"
+      ;;
+    10) ;;
+    *) die "CLI deletion guard could not be applied (rc=$history_guard_rc)" ;;
+  esac
+  log "CLI permanent deletion disabled; use archive or manual browser deletion"
+fi
+# archive/detach/reload resolve their target by scanning the includeArchived list, which
+# the server caps at 200 — an old seat sorts past it and the command says "Agent not
+# found". CLI modules only, so no daemon restart. See patches/README.md.
+RESOLVE_BYID_PATCHER="$HERE/patches/agent-resolve-by-id.mjs"
+RESOLVE_BYID_DIR="$NPM_ROOT/$PASEO_PKG/dist/commands/agent"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] resolve archive/detach/reload targets by exact id (bypass 200-cap list)"
+elif [ ! -f "$RESOLVE_BYID_PATCHER" ]; then
+  log "warning: agent-resolve-by-id patcher missing under $HERE — skipped"
+else
+  for rb in archive detach reload; do
+    rb_target="$RESOLVE_BYID_DIR/$rb.js"
+    [ -f "$rb_target" ] || { log "warning: agent-resolve-by-id target not found ($rb_target) — skipped"; continue; }
+    rm -f "$rb_target.paseo-new.mjs"
+    rb_rc=0; rb_out="$(node "$RESOLVE_BYID_PATCHER" "$rb_target")" || rb_rc=$?
+    case "$rb_rc" in
+      0)
+        if node --check "$rb_target.paseo-new.mjs"; then
+          mv "$rb_target.paseo-new.mjs" "$rb_target" || die "agent-resolve-by-id $rb mv failed"
+          log "agent $rb resolves exact ids directly (no 200-cap list)"
+        else
+          rm -f "$rb_target.paseo-new.mjs"
+          log "warning: agent-resolve-by-id $rb candidate invalid — skipped"
+        fi ;;
+      10) ;;
+      20) log "warning: agent-resolve-by-id $rb anchor missing/ambiguous (paseo drift) — skipped: $rb_out" ;;
+      *)  log "warning: agent-resolve-by-id $rb patcher error (rc=$rb_rc): $rb_out — skipped" ;;
+    esac
+  done
+fi
 SESSION_JS="$PASEO_SERVER_DIR/dist/server/server/session.js"
 PATCH_LINE='                maxDepth: searchesWorkspace ? undefined : 4,'
 PATCH_ANCHOR='confidentResultScanThreshold: searchesWorkspace ? undefined : 5000,'

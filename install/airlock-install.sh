@@ -53,7 +53,8 @@ for _airlock_install_arg in "$@"; do
       ;;
     --select-app=*)
       _airlock_selected_app="${_airlock_install_arg#*=}"
-      [ -n "$_airlock_selected_app" ] || _airlock_arg_die "--select-app requires =<package-id>"
+      [[ "$_airlock_selected_app" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] \
+        || _airlock_arg_die "--select-app requires one valid package id"
       _airlock_selected_apps+=("$_airlock_selected_app")
       ;;
     --select-app)
@@ -135,6 +136,16 @@ if [ -n "$_airlock_transfer_owner_from" ]; then
     && [ -z "$_airlock_update_channel_handoff_sha256" ] \
     && [ -z "$_airlock_recover_transaction" ] \
     || _airlock_arg_die "--transfer-owner-from is accepted only by a full ordinary install"
+fi
+
+# A selected install must not acquire mutation authority over unrelated local
+# packages.  airlock-config still parses the complete candidate for dependency
+# planning, but confirms package-lock bytes only for the explicitly selected
+# lifecycle targets.  The argument-free/full installer keeps its global gate.
+_airlock_package_info_args=()
+if [ "${#_airlock_selected_apps[@]}" -gt 0 ]; then
+  _airlock_selected_csv="$(IFS=,; printf '%s' "${_airlock_selected_apps[*]}")"
+  _airlock_package_info_args+=("--lifecycle-targets=$_airlock_selected_csv")
 fi
 
 # AIRLOCK_FIXTURE_* is executable test authority, not a harmless destination
@@ -1232,7 +1243,7 @@ fi
 # resolve the SAME config from any cwd — a packaged app's cwd is its package
 # dir, from which the upward search would find nothing), the packaged-app set,
 # and whether this run touches the installed-state ledger at all.
-AIRLOCK_PKG_INFO="$(airlock_config package-info)" || exit 2
+AIRLOCK_PKG_INFO="$(airlock_config package-info "${_airlock_package_info_args[@]}")" || exit 2
 export AIRLOCK_PKG_INFO
 _pkg_info_digest="$(printf '%s' "$AIRLOCK_PKG_INFO" \
   | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
@@ -1385,7 +1396,7 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] \
   # Re-read the immutable snapshot under the lock. This is intentionally the
   # same candidate as the gate probe, not a second read of a mutable operator
   # file: gate, plan/remove and app install must never observe A/B configs.
-  AIRLOCK_PKG_INFO="$(airlock_config package-info)" || exit 2
+  AIRLOCK_PKG_INFO="$(airlock_config package-info "${_airlock_package_info_args[@]}")" || exit 2
   export AIRLOCK_PKG_INFO
   _pkg_ids="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print("\n".join(sorted(json.load(sys.stdin)["packages"])))')"
   _app_ids="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print("\n".join(json.load(sys.stdin)["order"]))')"
@@ -1424,18 +1435,33 @@ _airlock_snapshot_owner="$AIRLOCK_OWNER"
 # this validation rather than a second one.
 export AIRLOCK_HUB_ACCOUNTS_PORT
 
+WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
+CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
+NGINX_SITE="${AIRLOCK_NGINX_SITE:-/etc/nginx/conf.d/airlock.conf}"
+_airlock_installed_webjson="$WEBROOT/__airlock.json"
+
 # Measure the deployment FQDN ONCE and hand it to everything downstream (the
 # renderers' redirect target, the launcher's cross-port links). Every one of those
 # must name the FQDN: the Tailscale cert covers it and nothing else, so a short
 # hostname produces links the browser refuses. An operator override wins, which is
 # also what lets CI render offline.
-if [ -z "${AIRLOCK_TS_FQDN:-}" ] && [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
-  AIRLOCK_TS_FQDN="$(ts_fqdn)"
+if [ -z "${AIRLOCK_TS_FQDN:-}" ]; then
+  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
+    AIRLOCK_TS_FQDN="$(ts_fqdn)"
+  elif [ -f "$_airlock_installed_webjson" ] \
+      && [ ! -L "$_airlock_installed_webjson" ]; then
+    AIRLOCK_TS_FQDN="$(python3 - "$_airlock_installed_webjson" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8")).get("fqdn")
+if isinstance(value, str) and value:
+    print(value)
+PY
+)" || die "cannot read the installed FQDN for dry-run discovery comparison"
+  fi
 fi
 export AIRLOCK_TS_FQDN
-WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
-CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
-NGINX_SITE="${AIRLOCK_NGINX_SITE:-/etc/nginx/conf.d/airlock.conf}"
 
 # A normal dry run always renders into a private scratch tree.  Trying the requested
 # live roots first is itself a write when their parent is writable, and app installers
@@ -1621,7 +1647,7 @@ if [ "${#_airlock_selected_apps[@]}" -gt 0 ]; then
   _scoped_contract="$(python3 - \
       "$_airlock_scoped_plan_file" "$_airlock_ledger_dependencies_file" \
       "$_candidate_preflight" "$_airlock_candidate_webjson_file" \
-      "$WEBROOT/__airlock.json" \
+      "$_airlock_installed_webjson" \
       "${_airlock_selected_apps[@]}" <<'PY'
 import hashlib
 import json

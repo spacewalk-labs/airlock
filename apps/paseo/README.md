@@ -26,6 +26,17 @@ browser ──https/WireGuard──▶ tailscale serve :19950
 Ports come from `airlock.toml` (`[apps.paseo]`: `https_port` / `gate_port` /
 `backend_port`); the values above are the defaults.
 
+## Automatic cleanup
+
+CLI permanent agent deletion is disabled before connection or runtime cancellation,
+including single-agent, `delete --all`, and `delete --cwd` commands. Use
+`paseo archive <agent-id>` for automatic cleanup. Existing browser deletion and
+archive behavior are unchanged. Unsupported CLI package shapes fail installation.
+
+This prevents the known CLI cleanup loop; it does not distinguish humans from
+agents using the same owner account. Direct RPC, filesystem mutation, and workspace
+or branch removal remain outside this protection.
+
 ## The three load-bearing gate headers
 
 The daemon serves its web UI (with a WebSocket) same-origin. Behind Airlock's TLS

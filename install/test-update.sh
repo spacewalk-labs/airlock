@@ -79,7 +79,7 @@ seed_tree() {   # seed_tree <dir> <marker>
   printf 'hub %s\n' "$m"                                   > "$d/apps/hub/manifest"
   # The real .gitignore's shape, including the negation that a 3-week-old box does NOT
   # have. That difference is the whole point of the at-risk pass.
-  printf 'airlock.toml\n!examples/app-package/airlock.toml\n' > "$d/.gitignore"
+  printf 'airlock.toml\nairlock.lock\n!examples/app-package/airlock.toml\n' > "$d/.gitignore"
   printf 'example config %s\n' "$m" > "$d/examples/app-package/airlock.toml"
 }
 
@@ -163,6 +163,36 @@ if [ -n "$sha2b" ]; then
 else
   bad "no undo revision printed for a box with uncommitted work"
 fi
+
+# ---------------------------------------------------------------- 2c) box state that rode into git
+# airlock.lock is machine-written per-box approval state that once rode into the
+# repository with a box commit. Every installed clone then read as permanently dirty,
+# the hourly canonical-clone sweep skips dirty clones, and those clones went quietly
+# stale. The release now declares the path ignored and no longer carries it, so the
+# update must drop it from the INDEX and keep the BYTES — an already-tracked path does
+# not stop being tracked just because a new .gitignore names it.
+make_box "$BOX"
+printf '[hello]\ndigest = "committed"\n' > "$BOX/airlock.lock"
+git -C "$BOX" add -f airlock.lock
+git -C "$BOX" commit -q -m "box: approval state rode in"
+# …and then the box's own machinery rewrote it — that rewrite is the permanent dirt.
+printf '[hello]\ndigest = "b0xstate"\n' > "$BOX/airlock.lock"
+out2c="$(run_update --no-install)"; rc2c=$?
+[ "$rc2c" = 0 ] || bad "update exited $rc2c on a box tracking release-declared state: $out2c"
+grep -q 'b0xstate' "$BOX/airlock.lock" \
+  && ok "the box's own approval bytes survive the update" \
+  || bad "the update destroyed the box's package lock"
+git -C "$BOX" ls-files --error-unmatch airlock.lock >/dev/null 2>&1 \
+  && bad "the release declared it box state, but it is still tracked — the clone stays dirty forever" \
+  || ok "a release-declared box-state path is dropped from the index"
+[ -z "$(git -C "$BOX" status --porcelain --untracked-files=no)" ] \
+  && ok "and the checkout is clean afterwards, so the sweep stops skipping it" \
+  || bad "the checkout is still dirty: $(git -C "$BOX" status --porcelain --untracked-files=no)"
+git -C "$BOX" ls-files --error-unmatch apps/dropped-app >/dev/null 2>&1 \
+  && ok "a stale path the release does NOT declare ignored stays tracked" \
+  || bad "an unrecognised operator path was untracked"
+printf '%s' "$out2c" | grep -q '추적에서만 뺍니다' \
+  && ok "the untracking is named, not silent" || bad "the index change was not reported"
 
 # A committed operator edit must not erase the older release provenance.  The local
 # repo is theirs; direction recovery walks its history instead of demanding that the

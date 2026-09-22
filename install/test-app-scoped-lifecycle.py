@@ -768,6 +768,15 @@ def exercise_installer_flow(root: Path, counts: dict[str, int]) -> None:
     action_log.write_text("", encoding="utf-8")
     _mutation_log.write_text("", encoding="utf-8")
 
+    dry_before = rejection_oracle(scenario, action_log, _mutation_log, _roots)
+    dry_env = dict(env, AIRLOCK_DRY_RUN="1")
+    dry_env.pop("AIRLOCK_TS_FQDN")
+    run("bash", str(INSTALLER), "--select-app=base", env=dry_env)
+    assert_rejection_preserved(
+        dry_before, scenario, action_log, _mutation_log, _roots,
+        "selected dry-run live discovery baseline",
+    )
+
     selected = run("bash", str(INSTALLER), "--select-app=base", env=env)
     actions = action_log.read_text(encoding="utf-8").splitlines()
     required = ["deactivate\tolddep", "deactivate\tbase", "install\tbase",
@@ -1029,7 +1038,7 @@ def exercise_installer_flow(root: Path, counts: dict[str, int]) -> None:
     ])
     before = rejection_oracle(scenario, action_log, mutation_log, roots)
     rejected = run("bash", str(INSTALLER), "--select-app=base", env=env, ok=False)
-    assert_rejected(rejected, "newapp (fresh)")
+    assert_rejected(rejected, "newapp (fresh; serve mapping differs)")
     assert_rejection_preserved(
         before, scenario, action_log, mutation_log, roots, "unselected fresh package"
     )
@@ -1746,7 +1755,11 @@ def exercise(emit_ac: bool) -> None:
         changed = write_package(
             package_root, "changed", port=22102, webroot="changed/", deps=("base",)
         )
-        isolated = write_package(package_root, "isolated", port=22103, webroot="isolated/")
+        # Shares base with changed, but is not a prerequisite of changed. Selected
+        # execution must not walk backward through base and reinstall this sibling.
+        isolated = write_package(
+            package_root, "isolated", port=22103, webroot="isolated/", deps=("base",)
+        )
         config = root / "airlock.toml"
         write_config(config, [
             ("changed", changed, 22102),
@@ -1806,6 +1819,42 @@ def exercise(emit_ac: bool) -> None:
         counts["handoff_group"] += 1
         if plan["unrelated_apps"] != ["isolated"]:
             raise AssertionError(f"wrong unrelated set: {plan['unrelated_apps']!r}")
+
+        # Source bytes may advance for an unrelated app between two selected
+        # installs.  That is safe to leave pending when its committed serve
+        # mapping and the separately checked discovery projection are unchanged.
+        unrelated_upgrade_plan = root / "ledger-plan-unrelated-upgrade.tsv"
+        unrelated_upgrade_plan.write_text(
+            "reinstall\tbase\nreinstall\tchanged\nupgrade-deactivate\tisolated\n",
+            encoding="utf-8",
+        )
+        unrelated_upgrade_dependencies = root / "ledger-dependencies-unrelated-upgrade.json"
+        write_ledger_dependencies(
+            unrelated_upgrade_dependencies,
+            [("isolated", (), "committed")],
+            unrelated_upgrade_plan,
+        )
+        unrelated_snapshot = json.loads(
+            unrelated_upgrade_dependencies.read_text(encoding="utf-8")
+        )
+        for row in unrelated_snapshot["candidate_serve_mappings"]:
+            if row["app_id"] == "isolated":
+                row["matches_committed"] = True
+        unrelated_upgrade_dependencies.write_text(
+            json.dumps(unrelated_snapshot) + "\n", encoding="utf-8"
+        )
+        pending_plan = json.loads(invoke_planner(
+            good.stdout,
+            unrelated_upgrade_plan,
+            selected=("base",),
+            ledger_dependencies=unrelated_upgrade_dependencies,
+        ).stdout)
+        if (pending_plan["unrelated_apps"] != ["changed", "isolated"]
+                or any(row["app_id"] in {"changed", "isolated"}
+                       for row in pending_plan["execution"]["actions"])):
+            raise AssertionError(
+                f"unrelated upgrade entered selected execution: {pending_plan!r}"
+            )
 
         reordered_raw = (json.dumps(canonical_reordered(info), separators=(",", ":")) + "\n").encode()
         second_raw = invoke_planner(
@@ -1972,7 +2021,7 @@ def exercise(emit_ac: bool) -> None:
             good.stdout, interleaved_plan, selected=("base",),
             ledger_dependencies=interleaved_snapshot, ok=False,
         )
-        assert_rejected(interleaved_selected, "middle (remove)")
+        assert_rejected(interleaved_selected, "middle (remove; serve mapping differs)")
         counts["interleaved_full_order"] += 1
 
         calls: list[tuple[str, str]] = []

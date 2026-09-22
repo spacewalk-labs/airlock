@@ -690,6 +690,28 @@ EOF
   # examples/app-package/airlock.toml, which is why the at-risk pass above exists.
   say "파일을 배포본으로 맞추는 중… (중간에 멈추면 git reset --hard HEAD 로 되돌립니다)"
   git checkout "$new" -- . || die "파일을 바꾸지 못했습니다 (아무것도 안 바뀌었을 수 있습니다)"
+  # A path this box tracks, the release no longer carries, AND the release's own
+  # .gitignore now declares ignored: that combination is the release saying "this is
+  # box state, not source". Drop it from the index and KEEP THE FILE — `git add -A`
+  # below would otherwise leave it tracked forever (a newly ignored path that is
+  # already tracked stays tracked), and the box's checkout stays permanently dirty.
+  # That is how airlock.lock, a machine-written per-box approval record, kept every
+  # installed clone dirty after it rode in with a box commit (#659): the hourly
+  # canonical-clone sweep skips dirty clones, so those clones went quietly stale.
+  # Deleting is never the answer here — see the stale report above, which exists
+  # precisely because an unrecognised file is as likely to be the operator's as ours.
+  if [ -n "$stale" ]; then
+    local _untrack_path
+    while IFS= read -r _untrack_path; do
+      [ -n "$_untrack_path" ] || continue
+      # --no-index: `git check-ignore` refuses to call a TRACKED path ignored, and
+      # every path here is tracked by definition. Without it the loop never fires.
+      git check-ignore -q --no-index -- "$_untrack_path" || continue
+      git rm --cached --quiet -- "$_untrack_path" \
+        || die "배포본이 박스 상태로 선언한 $_untrack_path 을(를) 추적에서 빼지 못했습니다"
+      say "박스 상태로 선언된 $_untrack_path — 파일은 그대로 두고 추적에서만 뺍니다"
+    done <<<"$stale"
+  fi
   git add -A || die "배포본 파일을 기록 대상으로 올리지 못했습니다"
   commit_release_or_die "airlock-update: 배포본 ${new:0:12} 으로 갱신" "$before" "$ROOT"
   local after="" update_rc=0
@@ -901,9 +923,9 @@ bootstrap_update_lease_tools() { # <release-url> <release-ref> <private-parent>
          bin/airlock-ledger install/lib.sh install/preflight.sh \
        | tar -C "$bootstrap/tools" -xf - \
      || [ "$(sha256_file "$bootstrap/tools/bin/airlock-ledger")" != \
-            2d8abccd6074c4c4c0d9dacd9820ca56efc17b88e603227ff8e661616c22bd7c ] \
+            1b2aed61020a16a08b9d52a17b5a9cb1e07c504ad7db127ce75e9e8277348c68 ] \
      || [ "$(sha256_file "$bootstrap/tools/install/lib.sh")" != \
-            70493cdfd6a2411155d8021d7038a9f5a648e2855320b19ad72e9f13776cda7b ] \
+            80e23baa900cb20aa625b109f935fdb1d5b0c4c56ba0d9478197f248c993b3fe ] \
      || [ "$(sha256_file "$bootstrap/tools/install/preflight.sh")" != \
             dcff752abe254921e6a788f8b27fd0151071c359185864dc6c19779625abdb35 ] \
      || ! chmod 0500 "$bootstrap/tools/bin/airlock-ledger"; then

@@ -139,6 +139,7 @@ airlock_run mkdir -p "$STATE_DIR"
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] install backend + frontend -> $APP_DIR_LOCAL/"
 else
+  DOC_ASSETS="$(airlock_doc_assets_dir)"
   install -d "$APP_DIR_LOCAL/backend" "$APP_DIR_LOCAL/frontend"
   install -m644 "$HERE/backend/airlock-learning.py" "$APP_DIR_LOCAL/backend/airlock-learning.py"
   install -m644 "$HERE/backend/ingest_runner.py"    "$APP_DIR_LOCAL/backend/ingest_runner.py"
@@ -159,6 +160,8 @@ else
   install -m644 "$HERE/skill/SKILL.md"             "$APP_DIR_LOCAL/skill/SKILL.md"
   install -m644 "$HERE/skill/transcript.py"        "$APP_DIR_LOCAL/skill/transcript.py"
   install -m644 "$HERE/frontend/learning.html"      "$APP_DIR_LOCAL/frontend/learning.html"
+  install -m644 "$DOC_ASSETS/doc.css"               "$APP_DIR_LOCAL/frontend/doc.css"
+  install -m644 "$DOC_ASSETS/doc.js"                "$APP_DIR_LOCAL/frontend/doc.js"
 fi
 
 # --- 3. units ---

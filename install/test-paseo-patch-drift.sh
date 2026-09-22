@@ -146,6 +146,7 @@ if (!patcher.SUBAGENT_STREAM_PATCHES.some((patch) => patch.name === "project-act
 }
 
 const expected = new Set([
+  "agent-history-delete-guard",
   "depth4-search",
   "claude-model-prune",
   "opencode-grok-defaults",
@@ -156,6 +157,7 @@ const expected = new Set([
   "acp-context-gauge",
   "acp-cross-provider-mode-default",
   "acp-model-rejection",
+  "agent-resolve-by-id",
   "patch-web-ui",
 ]);
 const seen = new Set();
@@ -169,7 +171,7 @@ for (const patch of manifest.patches) {
   }
 }
 if (seen.size !== expected.size || [...expected].some((id) => !seen.has(id))) {
-  throw new Error("anchor manifest does not cover exactly the eleven paseo patchers");
+  throw new Error("anchor manifest does not cover exactly the registered paseo patchers");
 }
 const group = manifest.patches.find((patch) => patch.id === "orphan-process-group");
 if (!group.requires || !group.requires.includes("orphan-process-guard")) {
@@ -182,7 +184,7 @@ if (subagent.paired_with !== "patch-web-ui:subagent-stream") {
 console.log("manifest agrees with the pinned version, SHA, anchors, and ordering");
 NODE
 if [ "$manifest_rc" -eq 0 ]; then
-  ok "anchor manifest: version, shape table, eleven patchers, and pair/order contracts"
+  ok "anchor manifest: version, shape table, registered patchers, and pair/order contracts"
 else
   bad "anchor manifest: version/SHA/coverage/order contract"
   sed 's/^/    /' "$manifest_out"
@@ -810,6 +812,32 @@ if [ "$web_states_rc" -eq 0 ]; then
 else
   bad "web-ui patch groups: state transition contract"
   sed 's/^/    /' "$WEB_STATES_OUT"
+fi
+
+# Exercise CLI refusal against the actual pinned package entry point.
+history_bundle="$ROOT/apps/paseo/vendor/guarded-0.8.0"
+if tar -xOf "$history_bundle/getpaseo-cli-0.8.0.tgz" package/dist/commands/agent/delete.js > "$TMP/history-delete.js" \
+  && node "$PATCH_DIR/agent-history-delete-guard.test.mjs" "$TMP/history-delete.js"; then
+  ok "CLI deletion guard: refuses before connecting/cancelling and refuses drift"
+else
+  bad "CLI deletion guard: pinned package behaviour"
+fi
+
+# --------------------------------------------------- resolve archive/detach/reload by id
+# Behaviour against the actual pinned bundle (same shape as the CLI deletion guard above):
+# the check re-patches its own copies, so it covers anchors, idempotence and drift too —
+# a full id resolves via fetchAgent and never consults the capped list; a prefix reverses.
+rbid_bundle_ok=1
+for rb in archive detach reload; do
+  tar -xOf "$history_bundle/getpaseo-cli-0.8.0.tgz" "package/dist/commands/agent/$rb.js" \
+    > "$TMP/rbid-bundle-$rb.js" 2>/dev/null || rbid_bundle_ok=0
+done
+if [ "$rbid_bundle_ok" = 1 ] \
+  && node "$PATCH_DIR/agent-resolve-by-id.test.mjs" \
+       "$TMP/rbid-bundle-archive.js" "$TMP/rbid-bundle-detach.js" "$TMP/rbid-bundle-reload.js" >/dev/null 2>&1; then
+  ok "resolve-by-id: pinned bundle — full id skips the 200-cap list, prefix falls back"
+else
+  bad "resolve-by-id: pinned bundle behaviour"
 fi
 
 printf 'paseo-patch-drift: %s ok, %s failed\n' "$pass" "$fail"

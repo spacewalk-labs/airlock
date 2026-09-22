@@ -36,10 +36,12 @@ const skill = fs.readFileSync(skillPath, 'utf8');
 const installPath = new URL('./install.sh', import.meta.url);
 const installScript = fs.readFileSync(installPath, 'utf8');
 const timestampModulePath = new URL('./backend/timestamp_links.py', import.meta.url);
-const sharedDocCss = fs.readFileSync(
-  new URL('../../docker/student-harness/skills/share-docs/assets/doc.css', import.meta.url), 'utf8');
-const sharedDocJs = fs.readFileSync(
-  new URL('../../docker/student-harness/skills/share-docs/assets/doc.js', import.meta.url), 'utf8');
+const sharedDocCssPath = new URL(
+  '../../docker/student-harness/skills/share-docs/assets/doc.css', import.meta.url);
+const sharedDocJsPath = new URL(
+  '../../docker/student-harness/skills/share-docs/assets/doc.js', import.meta.url);
+const sharedDocCss = fs.readFileSync(sharedDocCssPath, 'utf8');
+const sharedDocJs = fs.readFileSync(sharedDocJsPath, 'utf8');
 
 const newContractNames = [];
 function contract(name, check) {
@@ -500,6 +502,15 @@ contract('reader-quiz-shared-assets', () => {
   assert.match(getRoute, /return self\._published_asset\(unquote\(read_asset\.group\(1\)\)\)/);
   assert.match(installScript, /backend\/timestamp_links\.py/,
     '새 백엔드 모듈은 설치 산출물에도 들어가야 한다');
+  assert.match(installScript,
+    /DOC_ASSETS="\$\(airlock_doc_assets_dir\)"/,
+    '공개 문서 자산 경로는 D5 플랫폼 ABI가 넘겨야 한다');
+  assert.match(installScript,
+    /"\$DOC_ASSETS\/doc\.css"\s+"\$APP_DIR_LOCAL\/frontend\/doc\.css"/,
+    '공개 doc.css 정본은 Learning 설치 frontend에 복사해야 한다');
+  assert.match(installScript,
+    /"\$DOC_ASSETS\/doc\.js"\s+"\$APP_DIR_LOCAL\/frontend\/doc\.js"/,
+    '공개 doc.js 정본은 Learning 설치 frontend에 복사해야 한다');
   const probe = String.raw`
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("learning_backend", sys.argv[1])
@@ -522,6 +533,45 @@ print(json.dumps({"plain_css": rendered.count("doc.css"),
   assert.deepEqual(JSON.parse(result.stdout), {
     plain_css: 1, plain_js: 1, existing_css: 1, existing_js: 1,
   }, '누락 자산은 한 번 붙고 기존 자산은 중복되지 않아야 한다');
+
+  const routeProbe = String.raw`
+import importlib.util, json, os, shutil, sys, tempfile, threading, urllib.request
+spec = importlib.util.spec_from_file_location("learning_backend_http", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with tempfile.TemporaryDirectory(prefix="learning-reader-assets-") as root:
+    frontend = os.path.join(root, "frontend")
+    os.makedirs(frontend)
+    shutil.copyfile(sys.argv[2], os.path.join(frontend, "doc.css"))
+    shutil.copyfile(sys.argv[3], os.path.join(frontend, "doc.js"))
+    module.BASE_DIR = root
+    server = module.Server(("127.0.0.1", 0), module.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = "http://127.0.0.1:%d/read/_assets/" % server.server_port
+        with urllib.request.urlopen(base + "doc.css", timeout=5) as response:
+            css = (response.status, response.headers.get_content_type(), response.read())
+        with urllib.request.urlopen(base + "doc.js", timeout=5) as response:
+            js = (response.status, response.headers.get_content_type(), response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    print(json.dumps({
+        "css_status": css[0], "css_type": css[1], "css_match": css[2] == open(sys.argv[2], "rb").read(),
+        "js_status": js[0], "js_type": js[1], "js_match": js[2] == open(sys.argv[3], "rb").read(),
+    }))
+`;
+  const routed = spawnSync('python3', [
+    '-c', routeProbe, fileURLToPath(backendPath),
+    fileURLToPath(sharedDocCssPath), fileURLToPath(sharedDocJsPath),
+  ], { encoding: 'utf8' });
+  assert.equal(routed.status, 0, routed.stderr);
+  assert.deepEqual(JSON.parse(routed.stdout), {
+    css_status: 200, css_type: 'text/css', css_match: true,
+    js_status: 200, js_type: 'text/javascript', js_match: true,
+  }, '설치형 frontend 자산은 실제 HTTP 라우트에서 200과 정본 바이트를 보장해야 한다');
 });
 
 // --- 13b. 읽기 응답은 공용 CSS 가 여백을 거는 main.doc 루트를 보장한다 ---

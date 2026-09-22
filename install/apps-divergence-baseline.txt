@@ -621,3 +621,11 @@ only-work	apps/paseo/normalize-native-links.py
 # ACP invalid model rejection is a public install-time overlay; export picks it up.
 only-work	apps/paseo/patches/acp-model-rejection.mjs
 only-work	apps/paseo/patches/acp-model-rejection.test.mjs
+
+# 2026-09-19 explicit permanent-delete refusal is a public install overlay.
+# Work is the live source; the public mirror receives these two helpers at
+# the next approved publish sync, like the existing Paseo patch batches.
+only-work	apps/paseo/patches/agent-history-delete-guard.mjs
+only-work	apps/paseo/patches/agent-history-delete-guard.test.mjs
+only-work	apps/paseo/patches/agent-resolve-by-id.mjs
+only-work	apps/paseo/patches/agent-resolve-by-id.test.mjs
