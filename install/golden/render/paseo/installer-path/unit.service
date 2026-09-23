@@ -39,6 +39,28 @@ Environment=PASEO_VOICE_MODE_ENABLED=false
 # with a legacy service; candidate-side cleanup would mutate that live service's
 # singleton state on every failed start. The installer performs one authorized
 # cleanup only after it has measured and stopped the actual resource owner.
+#
+# One @getpaseo/server on this prefix, and it is the patched one. Node resolves
+# upward from the cli, so a copy nested under it — what `npm i -g @getpaseo/cli`
+# produces, and what any install from outside this installer leaves behind — wins
+# over the prefix-level bundle that every patch in apps/paseo/install.sh edits.
+# Measured on an operator box: a stray registry install on 2026-09-20 re-created the nested
+# copy, the 2026-09-22 boot bound the daemon to it, and the web UI came back with
+# upstream font sizes and sidebar order while the patched copy sat inert beside it.
+# The installer already removes a shadow it meets (install/test-paseo-bundle-install.sh
+# section 3), but nothing runs between installs, and the resolution is bound HERE, at
+# start. So the invariant is enforced here rather than reported: the prefix can only
+# offer the canonical copy.
+#
+# Guarded on the prefix-level copy existing, which is exactly the bundle layout this
+# installer owns — registry mode has no prefix-level server and legitimately runs from
+# the nested one, so it is left alone. Unlike the pidfile above, this touches only this
+# installer's own fixed npm prefix ($HOME/.npm-global, install.sh PASEO_PREFIX; derived
+# from HOME here the same way PASEO_HOME is), never another daemon's live singleton
+# state, and it is idempotent on every Restart= retry. It cannot fail the unit: a
+# removal that does not happen leaves exactly today's behaviour, and a boot loop would
+# be worse than an unpatched UI.
+ExecStartPre=/bin/sh -c '[ -d WDIR/home/.npm-global/lib/node_modules/@getpaseo/server ] && rm -rf WDIR/home/.npm-global/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server || true'
 # --foreground: Type=simple. --no-relay: no upstream relay outbound. --web-ui: the
 # browser UI. --listen 127.0.0.1: loopback bind (the gate is the only ingress).
 ExecStart=WDIR/home/.npm-global/bin/paseo daemon start --foreground --no-relay --web-ui --listen 127.0.0.1:19952

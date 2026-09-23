@@ -80,6 +80,29 @@ fi
 # so. The unit gets an absolute path because a user unit's PATH does not include
 # ~/.local/bin, where the agy installer puts it.
 AGY_BIN="$(PATH="$HOME/.local/bin:$PATH" command -v agy || true)"
+# Muse vault-key reader (MUSE_USAGE body): the helper prints the {item: key} map
+# the route reads. Both reader paths and the brokered key's full address arrive
+# via box-local install environment, never a default or a resolution here:
+# reader binary names and vault names do not ship in this repository. No reader
+# on this box means no Muse keys here, so the helper path stays empty and
+# /muse-usage answers disabled rather than broken.
+MUSE_SECRET_BIN="${AIRLOCK_MUSE_SECRET_BIN-}"
+MUSE_CHO_BIN="${AIRLOCK_MUSE_CHO_BIN-}"
+MUSE_KEYS_BIN=""
+# Executability is checked here, not hoped for in the unit: a handed-in path
+# that does not exist would otherwise render an enabled-looking route that
+# answers enabled:true with no entries. No usable reader means disabled.
+if [ -x "$MUSE_SECRET_BIN" ] || [ -x "$MUSE_CHO_BIN" ]; then
+  MUSE_KEYS_BIN="$ROOT/bin/airlock-muse-keys"
+fi
+MUSE_CHO_REF="${AIRLOCK_MUSE_CHO_REF-}"
+# Muse manual swap (MUSE_ROTATE): the assignment sheet pointer, this box's name
+# and the cho-only screen flag. All empty by default — the picker then offers
+# nothing (sheet), falls back to the short hostname (box) and hides the cho key
+# (screen). The cho reader box's deployment sets the registry URL and the cho flag to 1.
+MUSE_REGISTRY="${AIRLOCK_MUSE_REGISTRY-}"
+BOX_NAME="${AIRLOCK_BOX_NAME-}"
+MUSE_CHO_VISIBLE="${AIRLOCK_MUSE_CHO_VISIBLE-}"
 
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] render platform account surface unit into $UNIT_DIR (port $ACCOUNTS_PORT)"
@@ -87,6 +110,29 @@ if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   airlock_run systemctl --user enable --now "$SERVICE"
   exit 0
 fi
+
+# Atomicity: a death after the unit lands must not strand a disabled service.
+# 2026-09-23: the backend died via a stop after disable --now and served 502
+# until a human re-enabled it. Restart=on-failure never covers an intentional
+# stop, so no unit policy fixes this — the installer must not leave that state
+# behind. On any failing exit with a unit file present, best-effort reload and
+# re-enable. The exit code is preserved, so a failed install still fails loudly;
+# what the trap removes is the silent stranding, not the verdict. Recovery runs
+# at most once (the ERR arm is subsumed under `set -e` but kept literal: with
+# the guard it is a provable no-op duplicate). Uninstall never arms this: that
+# branch exits above, and re-enabling a service being removed would be wrong.
+# The dry run exits above too — it must not change state.
+_recovered=0
+_rc=0
+_recover_service() {
+  [ "$_recovered" = 0 ] || return 0
+  _recovered=1
+  [ -f "$UNIT_DIR/$SERVICE" ] || return 0
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  systemctl --user enable --now "$SERVICE" >/dev/null 2>&1 || true
+}
+trap '_rc=$?; [ "$_rc" = 0 ] || _recover_service; exit "$_rc"' EXIT
+trap '_recover_service' ERR
 
 install -d "$UNIT_DIR"
 python="$(command -v python3)" || die "python3 not found"
@@ -103,9 +149,16 @@ if ! sed -e "s|@AIRLOCK_ROOT@|$(escape "$ROOT")|g" \
           -e "s|@PANEL_STYLE_DIR@|$(escape "$PANEL_STYLE_DIR")|g" \
           -e "s|@FLEET_STORE_URL@|$(escape "$FLEET_STORE_URL")|g" \
           -e "s|@OPENCODE_BIN@|$(escape "$OPENCODE_BIN")|g" \
-          -e "s|@AGY_BIN@|$(escape "$AGY_BIN")|g" \
-          -e "s|@AGY_USAGE_BIN@|$(escape "$ROOT/bin/airlock-agy-usage")|g" \
-          "$HERE/systemd/$SERVICE.in" > "$tmp"; then
+           -e "s|@AGY_BIN@|$(escape "$AGY_BIN")|g" \
+           -e "s|@AGY_USAGE_BIN@|$(escape "$ROOT/bin/airlock-agy-usage")|g" \
+           -e "s|@MUSE_KEYS_BIN@|$(escape "$MUSE_KEYS_BIN")|g" \
+           -e "s|@MUSE_REGISTRY@|$(escape "$MUSE_REGISTRY")|g" \
+           -e "s|@BOX_NAME@|$(escape "$BOX_NAME")|g" \
+           -e "s|@MUSE_CHO_VISIBLE@|$(escape "$MUSE_CHO_VISIBLE")|g" \
+           -e "s|@MUSE_SECRET_BIN@|$(escape "$MUSE_SECRET_BIN")|g" \
+           -e "s|@MUSE_CHO_BIN@|$(escape "$MUSE_CHO_BIN")|g" \
+           -e "s|@MUSE_CHO_REF@|$(escape "$MUSE_CHO_REF")|g" \
+           "$HERE/systemd/$SERVICE.in" > "$tmp"; then
   rm -f "$tmp"
   die "could not render $SERVICE"
 fi

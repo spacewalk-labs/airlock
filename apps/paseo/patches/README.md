@@ -184,6 +184,17 @@ upstream changed licence again.
   **Remove this overlay when upstream resolves single ids in the CLI** (a `--page` loop or an id
   lookup); the anchors disappear with the fix, so the patcher then skips with exit 20.
 
+- **`archive-consistency.mjs`** (+ `.patch`, `.test.mjs`) — keeps the upstream self-archive
+  filter and additionally hides an otherwise-live agent only when its `workspaceId` matches a
+  workspace-registry record whose `archivedAt` is set. It applies atomically to `session.js` and
+  `agent-updates-service.js`: the initial live-plus-persisted snapshot and later stored/live
+  `agent_update` subscriptions agree, so an archived-workspace agent cannot reappear on the
+  next upsert. Agents with no workspace ID and agents pointing at an unknown workspace retain
+  their existing behavior, while `includeArchived=true` remains the diagnostic/recovery view.
+  The behavior check verifies active, archived, null, undefined, unknown, and self-archived
+  records across both paths. This server read/update patch requires a daemon restart when newly
+  applied.
+
 - **`anchor-manifest.json`** — records the pinned Paseo/web-ui version, the pristine
   web-ui SHA, the **shape table** (every bundle state the fleet is known to carry: the
   pinned bundle plus a named subset of the web-ui edits), every patcher's representative

@@ -98,3 +98,48 @@
 .tab-pop.acct.acct-panel { position: static; z-index: auto; width: auto; max-width: 100%;
                            max-height: none; overflow: visible;
                            box-shadow: none; border: none; background: transparent; }
+
+/* ---- subscription shell (POPUP_SHELL): collapsed sections + guided flows ----
+ * Four provider sections. Only Claude starts expanded; the rest are one-line
+ * headers (who · how much · next reset) until opened. A guided flow (login-type
+ * work) or a switch confirm strip renders inline in its own section — the list
+ * never closes underneath. Unread slots read 확인 중.
+ * These classes are emitted by hub/assets/accounts/accounts.js; devterm's own
+ * apps/devterm/web/popup.css carries the same block for the anchored popup until
+ * phase 4 retires the duplicate. */
+.tab-pop.acct .needs { font-size: 11.5px; color: #e6b34d; padding: 5px 8px;
+                   border-bottom: 1px solid #333a49; }
+.tab-pop.acct .needs:empty { display: none; }
+.tab-pop.acct .needs a { color: #e6b34d; text-decoration: underline; cursor: pointer; }
+.tab-pop.acct .sec { border-bottom: 1px solid #333a49; }
+.tab-pop.acct .sec:last-child { border-bottom: 0; }
+.tab-pop.acct .sec-head { display: flex; gap: 6px; align-items: baseline; padding: 7px 8px;
+                   cursor: pointer; font-size: 11.5px; color: #8a92a6; }
+.tab-pop.acct .sec-head:hover { background: #333a49; }
+.tab-pop.acct .sec-head .chev { width: 10px; flex: none; color: #6b7385; }
+.tab-pop.acct .sec-head .sec-title { color: #dde1e8; overflow: hidden;
+                   text-overflow: ellipsis; white-space: nowrap; }
+.tab-pop.acct .sec-body { padding: 2px 2px 8px; }
+.tab-pop.acct .dots { font-size: 11.5px; color: #8a92a6; padding: 4px 8px; }
+.tab-pop.acct .confirm-strip { margin: 4px 2px; padding: 7px 9px; border-radius: 6px;
+                   background: #223a5e; border: 1px solid #3a5f9a; font-size: 12px; }
+.tab-pop.acct .confirm-strip .codex-btns { margin-top: 7px; }
+.tab-pop.acct .prog { margin: 4px 2px; padding: 7px 9px; border-radius: 6px;
+                   background: #2b303b; border: 1px solid #3a4254; font-size: 12px; }
+.tab-pop.acct .flow-done { margin: 4px 2px; padding: 7px 9px; border-radius: 6px;
+                   background: #12261c; border: 1px solid #1f5138; font-size: 12px; }
+.tab-pop.acct .flow-done .codex-btns { margin-top: 7px; }
+.tab-pop.acct .flow-fail { margin: 4px 2px; padding: 7px 9px; border-radius: 6px;
+                   background: #2a1517; border: 1px solid #5a2a2d; font-size: 12px; }
+.tab-pop.acct .flow-fail .codex-btns { margin-top: 7px; }
+.tab-pop.acct .flow { padding: 2px 6px 4px; font-size: 12px; line-height: 1.5; }
+.tab-pop.acct .flow .step { font-size: 11px; color: #8a92a6; margin: 4px 0 2px; }
+.tab-pop.acct .flow .mu { color: #8a92a6; font-size: 11.5px; }
+.tab-pop.acct .flow .warnln { color: #e6b34d; font-size: 11.5px; margin-top: 4px; }
+.tab-pop.acct .flow .lbl { display: block; font-size: 11.5px; color: #9aa3b2; margin: 7px 0 3px; }
+.tab-pop.acct .flow input[type=text] { width: 100%; background: #161a24;
+                   border: 1px solid #3a4254; color: #dde1e8; border-radius: 6px;
+                   padding: 6px 8px; font: 12px system-ui; }
+.tab-pop.acct .flow input[type=text]:focus { outline: none; border-color: #2f6fed; }
+.tab-pop.acct button.acctrow.active { background: #132339; }
+.tab-pop.acct button.acctrow.dim { opacity: .42; pointer-events: none; }

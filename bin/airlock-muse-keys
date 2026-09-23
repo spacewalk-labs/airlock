@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""airlock-muse-keys — the current Muse vault-key map as JSON on stdout.
+
+Prints one line: {"<1Password item>": "<key>"}. An item that cannot be read
+maps to null, which the account surface turns into an err entry rather than
+dropping the key from the list. Values cross on the pipe only; nothing is
+printed to stderr and nothing is logged.
+
+Discovery, not enumeration: shared-side items are those matching
+^OPENCODE_[A-Z0-9_]+_API_KEY$ in the team reader's listing. No item or vault
+name is spelled out here — the names that would trip the public-mirror leak
+scan live in the vault and in box-local install environment, not in this file.
+A new key appears on the next request with no code change; a removed one
+simply stops being listed.
+
+Both readers are handed in, never guessed (see install/airlock-accounts-api.sh):
+AIRLOCK_MUSE_SECRET_BIN (team secret reader, `list` + `get <title>`) and the
+brokered single-key pair AIRLOCK_MUSE_CHO_BIN (`read <ref>`) with
+AIRLOCK_MUSE_CHO_REF (its full op:// address, provided at install time on the
+box — empty means this box holds no brokered key). Either side may be absent.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+ITEM_RE = re.compile(r"\AOPENCODE_[A-Z0-9_]+_API_KEY\Z")
+READ_TIMEOUT = 25
+
+
+def _lines(proc):
+    try:
+        out = subprocess.run(proc, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=READ_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    try:
+        text = (out.stdout or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    return [line.strip() for line in text.splitlines()]
+
+
+def _value(proc):
+    try:
+        out = subprocess.run(proc, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=READ_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        text = (out.stdout or b"").decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if text.endswith("\n"):
+        text = text[:-1]
+    return text or None
+
+
+def _ref_item(ref):
+    """The item title inside a full op://vault/item/field address, or None.
+
+    Only key-shaped titles enter the map: a misconfigured address can neither
+    smuggle an arbitrary vault item into usage reads nor rename one.
+    """
+    if not isinstance(ref, str) or not ref.startswith("op://"):
+        return None
+    parts = ref[len("op://"):].split("/")
+    if len(parts) != 3 or not all(parts):
+        return None
+    return parts[1] if ITEM_RE.match(parts[1]) else None
+
+
+def main():
+    secret_bin = os.environ.get("AIRLOCK_MUSE_SECRET_BIN", "").strip()
+    cho_bin = os.environ.get("AIRLOCK_MUSE_CHO_BIN", "").strip()
+    cho_ref = os.environ.get("AIRLOCK_MUSE_CHO_REF", "").strip()
+    jobs = []
+    if secret_bin and os.path.isfile(secret_bin):
+        for line in _lines([secret_bin, "list"]):
+            if ITEM_RE.match(line):
+                jobs.append((line, [secret_bin, "get", line]))
+    cho_item = _ref_item(cho_ref) if cho_bin and os.path.isfile(cho_bin) else None
+    if cho_item and cho_ref:
+        jobs.append((cho_item, [cho_bin, "read", cho_ref]))
+    seen = set()
+    unique = []
+    for item, argv in jobs:
+        if item not in seen:
+            seen.add(item)
+            unique.append((item, argv))
+
+    def read(job):
+        item, argv = job
+        return item, _value(argv)
+
+    result = {}
+    if unique:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for item, value in pool.map(read, unique):
+                result[item] = value
+    sys.stdout.write(json.dumps(result) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

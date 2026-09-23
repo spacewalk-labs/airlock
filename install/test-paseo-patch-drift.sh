@@ -158,6 +158,7 @@ const expected = new Set([
   "acp-cross-provider-mode-default",
   "acp-model-rejection",
   "agent-resolve-by-id",
+  "archive-consistency",
   "patch-web-ui",
 ]);
 const seen = new Set();
@@ -838,6 +839,93 @@ if [ "$rbid_bundle_ok" = 1 ] \
   ok "resolve-by-id: pinned bundle — full id skips the 200-cap list, prefix falls back"
 else
   bad "resolve-by-id: pinned bundle behaviour"
+fi
+
+# --------------------------------------------------- archive/workspace consistency
+# The self-test applies the atomic two-file patch, drives the initial snapshot and
+# stored/live updates, and checks mixed/drift refusal. The pinned bundle is checked
+# as a pair too. A v1 bundle (session-only patch from before the update-path fix) is
+# intentionally accepted only as a mixed state that the new patcher refuses; the
+# final guarded bundle must carry both sentinels and pass the behavior check.
+ARCHIVE_CONSISTENCY_OUT="$TMP/archive-consistency.out"
+archive_consistency_rc=0
+node "$PATCH_DIR/archive-consistency.test.mjs" --self-test "$PATCH_DIR/archive-consistency.mjs" \
+  >"$ARCHIVE_CONSISTENCY_OUT" 2>&1 || archive_consistency_rc=$?
+if [ "$archive_consistency_rc" -eq 0 ]; then
+  ok "archive/workspace consistency: live+persisted projection, archive predicate, includeArchived, and drift controls"
+else
+  bad "archive/workspace consistency: behavior/drift contract"
+  sed 's/^/    /' "$ARCHIVE_CONSISTENCY_OUT"
+fi
+archive_consistency_bundle_session="$TMP/archive-consistency-bundle-session.js"
+archive_consistency_bundle_updates="$TMP/archive-consistency-bundle-updates.js"
+archive_consistency_bundle_rc=0
+tar -xOf "$history_bundle/getpaseo-server-0.8.0.tgz" package/dist/server/server/session.js \
+  >"$archive_consistency_bundle_session" 2>/dev/null || archive_consistency_bundle_rc=$?
+tar -xOf "$history_bundle/getpaseo-server-0.8.0.tgz" package/dist/server/server/session/agent-updates/agent-updates-service.js \
+  >"$archive_consistency_bundle_updates" 2>/dev/null || archive_consistency_bundle_rc=$?
+if [ "$archive_consistency_bundle_rc" -ne 0 ]; then
+  bad "archive/workspace consistency: pinned bundle targets could not be extracted"
+else
+  bundle_session_patched=0
+  bundle_updates_patched=0
+  grep -qF 'paseo-archive-consistency' "$archive_consistency_bundle_session" && bundle_session_patched=1
+  grep -qF 'paseo-archive-consistency' "$archive_consistency_bundle_updates" && bundle_updates_patched=1
+  if [ "$bundle_session_patched" -eq 1 ] && [ "$bundle_updates_patched" -eq 1 ]; then
+    if node "$PATCH_DIR/archive-consistency.test.mjs" \
+      "$archive_consistency_bundle_session" "$archive_consistency_bundle_updates" >/dev/null 2>&1; then
+      pinned_patch_rc=0
+      node "$PATCH_DIR/archive-consistency.mjs" \
+        "$archive_consistency_bundle_session" "$archive_consistency_bundle_updates" >/dev/null 2>&1 \
+        || pinned_patch_rc=$?
+      if [ "$pinned_patch_rc" -eq 10 ]; then
+        ok "archive/workspace consistency: pinned bundle pair is patched, idempotent, and behavior-valid"
+      else
+        bad "archive/workspace consistency: pinned bundle pair did not report already-applied (rc=$pinned_patch_rc)"
+      fi
+    else
+      bad "archive/workspace consistency: pinned bundle pair behavior"
+    fi
+  elif [ "$bundle_session_patched" -eq 1 ] || [ "$bundle_updates_patched" -eq 1 ]; then
+    mixed_before_session="$(sha256sum "$archive_consistency_bundle_session" | cut -d' ' -f1)"
+    mixed_before_updates="$(sha256sum "$archive_consistency_bundle_updates" | cut -d' ' -f1)"
+    mixed_patch_rc=0
+    node "$PATCH_DIR/archive-consistency.mjs" \
+      "$archive_consistency_bundle_session" "$archive_consistency_bundle_updates" >/dev/null 2>&1 \
+      || mixed_patch_rc=$?
+    if [ "$mixed_patch_rc" -eq 20 ] \
+      && [ ! -f "$archive_consistency_bundle_session.paseo-new.mjs" ] \
+      && [ ! -f "$archive_consistency_bundle_updates.paseo-new.mjs" ] \
+      && [ "$mixed_before_session" = "$(sha256sum "$archive_consistency_bundle_session" | cut -d' ' -f1)" ] \
+      && [ "$mixed_before_updates" = "$(sha256sum "$archive_consistency_bundle_updates" | cut -d' ' -f1)" ]; then
+      ok "archive/workspace consistency: pinned v1 mixed bundle is refused without candidates"
+    else
+      bad "archive/workspace consistency: mixed pinned bundle was not refused atomically (rc=$mixed_patch_rc)"
+    fi
+  else
+    pristine_patch_rc=0
+    node "$PATCH_DIR/archive-consistency.mjs" \
+      "$archive_consistency_bundle_session" "$archive_consistency_bundle_updates" >/dev/null 2>&1 \
+      || pristine_patch_rc=$?
+    if [ "$pristine_patch_rc" -eq 0 ] \
+      && node --check "$archive_consistency_bundle_session.paseo-new.mjs" >/dev/null 2>&1 \
+      && node --check "$archive_consistency_bundle_updates.paseo-new.mjs" >/dev/null 2>&1 \
+      && node "$PATCH_DIR/archive-consistency.test.mjs" \
+        "$archive_consistency_bundle_session.paseo-new.mjs" \
+        "$archive_consistency_bundle_updates.paseo-new.mjs" >/dev/null 2>&1; then
+      ok "archive/workspace consistency: pristine pinned bundle produces behavior-valid pair candidates"
+    else
+      bad "archive/workspace consistency: pristine pinned bundle pair patch failed (rc=$pristine_patch_rc)"
+    fi
+  fi
+fi
+if grep -qF 'ARCHIVE_CONSISTENCY_PATCHER="$HERE/patches/archive-consistency.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'ARCHIVE_CONSISTENCY_TEST="$HERE/patches/archive-consistency.test.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'node "$ARCHIVE_CONSISTENCY_TEST" "$ac_session_tmp" "$ac_updates_tmp"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'node "$ARCHIVE_CONSISTENCY_TEST" "$SESSION_JS" "$ARCHIVE_CONSISTENCY_UPDATES"' "$ROOT/apps/paseo/install.sh"; then
+  ok "archive/workspace consistency: installer applies, verifies candidate, and rechecks installed bytes"
+else
+  bad "archive/workspace consistency: installer wiring is absent"
 fi
 
 printf 'paseo-patch-drift: %s ok, %s failed\n' "$pass" "$fail"

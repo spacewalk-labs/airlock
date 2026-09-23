@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""airlock-fleet-registry — the Muse key assignment sheet.
+
+WHY THIS EXISTS
+    Muse keys are safe-house keys (1Password API keys, usable from any box), and the
+    owner fixed one key per person with manual on-screen swaps. The sheet records WHO
+    holds WHICH key — key name (op:// address) -> holding box — and nothing else. No
+    credential values, no usage, no metadata: there is nothing here worth stealing,
+    which is what makes it safe to serve as a plain URL.
+
+SHAPE (the contract MUSE_ROTATE and FLEET_MATRIX code against)
+    A bare JSON object: {"op://vault/item/field": "box-name", ...}. No envelope, no
+    version, no per-entry fields — "nothing else" is literal, so a future need changes
+    the shape by a new card, not by a quiet extra field.
+
+WRITES
+    Single writer: exactly one box. Manual swaps are processed there in turn, so a key
+    held by another box is never reassigned out from under it — assign() refuses. The
+    writer's name is deployment state, not source: the caller passes allowed_writer
+    (the live sheet's host binds it; the campaign board names that box), so this
+    module never carries a hostname and stays safe to publish. The live sheet itself
+    is served read-only over HTTP; this module owns only the in-memory rule. Anything
+    else that writes is refused before the sheet is touched.
+"""
+
+import re
+
+# An op:// address names vault/item/field. Three segments, no whitespace, no empty
+# parts — anything else is not a key name and is refused rather than stored.
+_KEY_RE = re.compile(r"\Aop://[^/\s]+/[^/\s]+/[^/\s]+\Z")
+# A box name is a hostname-shaped identifier. Without it a pasted secret could sit in
+# the value slot and this sheet would stop being value-free. The 63-char cap is the
+# DNS label limit — a box name is a hostname, and anything longer cannot be one,
+# which is what keeps a real API key (always longer, besides its charset) out of the
+# value slot. A hostname-shaped string stays indistinguishable from a box by shape
+# alone; that remainder is covered by the single writer plus review, not by regex.
+_BOX_RE = re.compile(r"\A[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\Z")
+_BOX_MAX = 63
+
+
+def is_valid(sheet):
+    """True when the sheet is exactly the mapping and nothing else."""
+    if not isinstance(sheet, dict):
+        return False
+    return all(isinstance(key, str) and isinstance(box, str)
+               and _KEY_RE.match(key) and len(box) <= _BOX_MAX and _BOX_RE.match(box)
+               for key, box in sheet.items())
+
+
+def assign(sheet, key, box, writer, allowed_writer):
+    """Assign key to box. Returns (ok, reason); the sheet moves only on ok.
+
+    Refusals, in the order they are checked: a writer other than the single allowed
+    one never touches the sheet ("unauthorized-writer" — compared exactly, so
+    "writer-box " with a trailing space is a different writer and is refused); a
+    malformed key or box never enters it ("invalid-assignment"); a key another box
+    holds stays where it is ("held-by-other-box"). Re-assigning a box's own key is
+    an idempotent no-op.
+    """
+    if not isinstance(allowed_writer, str) or not allowed_writer \
+            or writer != allowed_writer:
+        return False, "unauthorized-writer"
+    if (not isinstance(key, str) or not isinstance(box, str) or len(box) > _BOX_MAX
+            or not _KEY_RE.match(key) or not _BOX_RE.match(box)):
+        return False, "invalid-assignment"
+    holder = sheet.get(key)
+    if holder is not None and holder != box:
+        return False, "held-by-other-box"
+    sheet[key] = box
+    return True, "assigned"

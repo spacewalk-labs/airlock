@@ -176,6 +176,18 @@
       ]
     },
     {
+      "id": "archive-consistency",
+      "source": "apps/paseo/patches/archive-consistency.mjs",
+      "anchors": [
+        "const SESSION_PLACEMENT_ANCHOR = lines(",
+        "const SESSION_LIST_ANCHOR = lines(",
+        "const SESSION_PLACEMENT_CALL_ANCHOR = lines(",
+        "const ACTIVE_PLACEMENT_ANCHOR = lines(",
+        "const SUB_PLACEMENT_CALL = ",
+        "[paseo-archive-consistency]"
+      ]
+    },
+    {
       "id": "patch-web-ui",
       "source": "apps/paseo/browse-host/bin/patch-web-ui.js",
       "anchors": [

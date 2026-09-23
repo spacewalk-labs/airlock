@@ -22,6 +22,8 @@ another machine (log in on each). Secret values are never printed — only ident
 expiry and health.
 """
 import base64, hashlib, json, os, re, stat, sys, time, shutil, subprocess, tempfile
+import socket
+import threading
 import urllib.request, urllib.error, urllib.parse
 
 HOME = os.path.expanduser("~")
@@ -36,6 +38,20 @@ CODEX_AUTH_BAK = CODEX_AUTH + ".pre-relogin"
 # login attempt and dies with it; nothing here is a credential (the device code is
 # useless without the browser approval it asks for).
 CODEX_LOGIN_OUT = os.path.join(CODEX_HOME, ".relogin-capture.out")
+# One pending device-auth at a time. codex wipes auth.json the moment the flow starts,
+# so a pending record is what lets an abandoned attempt (browser/popup closed, no
+# explicit cancel) be recovered after the TTL below instead of staying wiped.
+CODEX_RELOGIN_PENDING = os.path.join(CODEX_HOME, ".relogin-pending.json")
+# How long an uncompleted attempt may leave the box without a login before the
+# previous one is put back on its own. 15 minutes: the panel tells the person to
+# enter the code "within 15 min", so past that the attempt is abandoned by definition.
+CODEX_RELOGIN_TTL_SEC = 15 * 60
+# No verdict inside the first minute of an attempt. A device flow cannot complete
+# that fast (the person must open a browser and type the code), but codex wipes
+# auth.json within milliseconds of starting — so a sweep landing in that window
+# would otherwise read "a login is present" from the not-yet-wiped file and
+# mistake the attempt it was meant to protect for a completed one.
+CODEX_RELOGIN_GRACE_SEC = 60
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _CODEX_DEVICE_URL_RE = re.compile(r"https://\S*openai\.com/codex/device\S*")
 _CODEX_DEVICE_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b")
@@ -728,18 +744,98 @@ def _saveback():
         print(f"  warn: save-back failed ({e}) — continuing", file=sys.stderr)
 
 
+def _rollback_switch(previous_live, previous_active, previous_bak, had_bak):
+    """Put live, .active and the live backup back the way they were. Best-effort:
+    every step is guarded, because this runs inside failure handling already."""
+    try:
+        if previous_live is None:
+            try:
+                os.unlink(LIVE)
+            except OSError:
+                pass
+        else:
+            tmp = LIVE + ".rollback-tmp"
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(previous_live)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, LIVE)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    try:
+        if previous_active is None:
+            try:
+                os.unlink(ACTIVE)
+            except OSError:
+                pass
+        else:
+            _set_active(previous_active)
+    except OSError:
+        pass
+    try:
+        bak = LIVE + ".switch-bak"
+        if previous_bak is None:
+            if not had_bak:
+                # The failed commit must not leave a backup it staged itself.
+                try:
+                    os.unlink(bak)
+                except OSError:
+                    pass
+            # else: a backup existed but could not be read — leave it alone.
+            # Deleting the only copy of the previous login on the way out of a
+            # failed switch would be the exact data loss rollback exists to stop.
+        else:
+            with open(bak + ".rollback-tmp", "wb") as f:
+                f.write(previous_bak)
+            os.chmod(bak + ".rollback-tmp", 0o600)
+            os.replace(bak + ".rollback-tmp", bak)
+    except OSError:
+        pass
+
+
 def _switch_core(name, saveback=True):
     _ensure_pool()
     target = _pool_path(name)
     if not os.path.isfile(target):
         die(f"'{name}' is not in the pool. Check 'airlock-accounts list'")
-    # 1) save the current account back (rotation-safe). A caller that has ALREADY saved
+    # 1) verify the candidate BEFORE anything is written. A slot the server
+    #    already rejected (a recorded death verdict) is refused here, with live,
+    #    active and every pool file untouched — no refresh is attempted against a
+    #    lineage that is already known dead, and no save-back can smear live's
+    #    tokens across slots on the way out.
+    try:
+        creds = _load(target)
+    except Exception as exc:
+        die(f"'{name}': cannot read the stored credential ({type(exc).__name__}) — "
+            "live and active are untouched")
+    if not isinstance(creds, dict) or "claudeAiOauth" not in creds:
+        die(f"'{name}': the stored credential is not in OAuth form — "
+            "live and active are untouched")
+    if account_health.dead_marker(creds) is not None:
+        die(f"'{name}': the server rejected this account's refresh token — re-login "
+            "required ('airlock-accounts login-url'). Live and active are untouched.")
+    # 2) save the current account back (rotation-safe). A caller that has ALREADY saved
     #    live back — and then stored a newer record for the same identity — passes
     #    saveback=False, or this step would overwrite that newer record with the old live.
     if saveback and _get_active() != name:
         _saveback()
-    # 2) load the target, refreshing directly if it is about to expire
-    creds = _load(target)
+        # The save-back may have refreshed the target slot itself (live turned out to
+        # be this identity under a drifted .active). Re-read so the commit below and
+        # the verdict above both see the same bytes.
+        try:
+            creds = _load(target)
+        except Exception as exc:
+            die(f"'{name}': cannot re-read the stored credential ({type(exc).__name__}) — "
+                "live and active are untouched")
+        if account_health.dead_marker(creds) is not None:
+            die(f"'{name}': the server rejected this account's refresh token — re-login "
+                "required ('airlock-accounts login-url'). Live and active are untouched.")
+    # 3) a last live-server verdict for a token about to expire, still before live moves
     o = _oauth(creds)
     if o.get("expiresAt", 0) / 1000 <= time.time() + REFRESH_IF_WITHIN_SEC:
         print(f"  '{name}' accessToken near expiry -> refreshing")
@@ -761,13 +857,36 @@ def _switch_core(name, saveback=True):
         elif not _at_valid(o):
             die(f"'{name}': refresh failed and the accessToken is expired — re-login "
                 "required ('airlock-accounts login-url')")
-    # 3) back live up, then replace it atomically
-    if os.path.isfile(LIVE):
-        shutil.copy2(LIVE, LIVE + ".switch-bak")
-        os.chmod(LIVE + ".switch-bak", 0o600)
-    os.makedirs(os.path.dirname(LIVE), exist_ok=True)
-    _save_atomic(LIVE, creds)
-    _set_active(name)
+    # 4) commit, with auto-rollback. From here on every failure restores live, .active
+    #    and the previous backup instead of leaving a half-written switch behind.
+    try:
+        previous_live = None
+        if os.path.isfile(LIVE):
+            with open(LIVE, "rb") as f:
+                previous_live = f.read()
+    except OSError as exc:
+        die(f"cannot snapshot the live credential ({exc}) — refusing to switch blind")
+    previous_active = _get_active()
+    bak_path = LIVE + ".switch-bak"
+    had_bak = os.path.isfile(bak_path)
+    previous_bak = None
+    if had_bak:
+        try:
+            with open(bak_path, "rb") as f:
+                previous_bak = f.read()
+        except OSError:
+            previous_bak = None
+    try:
+        if os.path.isfile(LIVE):
+            shutil.copy2(LIVE, bak_path)
+            os.chmod(bak_path, 0o600)
+        os.makedirs(os.path.dirname(LIVE), exist_ok=True)
+        _save_atomic(LIVE, creds)
+        _set_active(name)
+    except Exception as exc:
+        _rollback_switch(previous_live, previous_active, previous_bak, had_bak)
+        die(f"'{name}': switch failed midway ({type(exc).__name__}) — live, active and "
+            "the previous account were restored; fix the cause and retry")
     print(f"  active account -> '{name}' (no browser needed)")
 
 
@@ -823,6 +942,120 @@ def _codex_kill_pending_login():
         pass
 
 
+def _relogin_now():
+    """Clock for the relogin TTL. AIRLOCK_CODEX_RELOGIN_NOW is a test hook (an absolute
+    epoch): the offline safety gate judges the 16-minute TTL instantly with a fake clock
+    instead of waiting out 15 real minutes. It is honoured only together with
+    AIRLOCK_CODEX_RELOGIN_TEST, so a stray NOW value in a production environment is
+    inert rather than able to freeze the TTL. Production sets neither."""
+    if os.environ.get("AIRLOCK_CODEX_RELOGIN_TEST", "").strip():
+        raw = os.environ.get("AIRLOCK_CODEX_RELOGIN_NOW", "").strip()
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                pass
+    return time.time()
+
+
+def _codex_relogin_record_pending(backed_up):
+    """Write the pending record AFTER the backup verified, BEFORE codex starts.
+
+    Returns None on success, an error string when the record cannot be written while a
+    previous login exists to protect: starting then would leave a wiped auth.json with
+    no TTL recovery. With no previous login there is nothing to recover, so only the
+    error text differs, not the decision — the caller refuses either way when backed_up.
+    """
+    try:
+        _save_atomic(CODEX_RELOGIN_PENDING,
+                     {"startedAt": _relogin_now(), "backedUp": bool(backed_up)})
+    except OSError as exc:
+        if backed_up:
+            return ("could not record the pending Codex login: %s — refusing to start "
+                    "rather than risk the saved login" % (exc.strerror or exc))
+        return "could not record the pending Codex login: %s" % (exc.strerror or exc)
+    return None
+
+
+def _codex_relogin_clear_pending():
+    """Drop the pending record. Best-effort: a stale record only delays the next sweep's
+    verdict to 'idle' one call later, it never touches a credential."""
+    try:
+        os.unlink(CODEX_RELOGIN_PENDING)
+    except OSError:
+        pass
+
+
+def _codex_relogin_sweep(now=None):
+    """Recover an abandoned device-auth after the TTL. Never raises, never prompts.
+
+    States — `restored` is True only when bytes actually moved back:
+      idle               no attempt was ever recorded (or the record is unreadable)
+      pending            the attempt is still inside its TTL: hands off
+      completed          a login newer than the attempt exists: the person finished it.
+                         The pending record AND the stale backup are dropped, so a later
+                         cancel cannot resurrect the OLD lineage over the new login.
+      recovered          TTL lapsed with no login: the saved login was put back
+      expired-no-backup  TTL lapsed and there was never a login to save: nothing to do
+      recovery-failed    TTL lapsed and the saved login could not be put back. This is
+                         reported, never hidden: the box still has no login.
+
+    Completion is judged by file mtime against the recorded start, not by parsing
+    id_token: codex-status=ok only parses claims and performs no authenticated call, so
+    it must never be the pass line for recovery.
+    """
+    now = _relogin_now() if now is None else now
+    try:
+        pending = _load(CODEX_RELOGIN_PENDING)
+    except (OSError, ValueError):
+        return {"state": "idle", "restored": False}
+    if not isinstance(pending, dict):
+        _codex_relogin_clear_pending()
+        return {"state": "idle", "restored": False}
+    started = pending.get("startedAt")
+    if isinstance(started, bool) or not isinstance(started, (int, float)):
+        _codex_relogin_clear_pending()
+        return {"state": "idle", "restored": False}
+    if now - started < CODEX_RELOGIN_GRACE_SEC:
+        # Too young to judge: codex may not have wiped yet (a present login would
+        # read as "completed"), and no device flow completes this fast either.
+        return {"state": "pending", "restored": False}
+    if os.path.isfile(CODEX_AUTH):
+        try:
+            mtime = os.stat(CODEX_AUTH).st_mtime
+        except OSError:
+            return {"state": "pending", "restored": False}
+        # A login is present. Newer than the attempt (2s grace for coarse mtimes)
+        # = the person finished the flow; older but past the TTL = the attempt is
+        # long dead and something else owns the current login. Either way the box
+        # is not login-less, so there is nothing to restore — and the stale backup
+        # must go, or a later cancel would resurrect the OLD lineage over it.
+        if mtime >= started - 2 or now - started > CODEX_RELOGIN_TTL_SEC:
+            # The person finished the flow (or something else owns the current
+            # login): it stays, the attempt's leftovers go. The backup holds the
+            # PREVIOUS lineage — keeping it would let a later cancel silently
+            # downgrade a working login.
+            _codex_relogin_clear_pending()
+            try:
+                os.unlink(CODEX_AUTH_BAK)
+            except OSError:
+                pass
+            return {"state": "completed", "restored": False}
+        return {"state": "pending", "restored": False}
+    if now - started <= CODEX_RELOGIN_TTL_SEC:
+        return {"state": "pending", "restored": False}
+    try:
+        restored = _codex_auth_restore()
+    except OSError as exc:
+        return {"state": "recovery-failed", "restored": False,
+                "error": "could not restore the previous Codex login: %s"
+                         % (exc.strerror or exc)}
+    _codex_relogin_clear_pending()
+    if restored:
+        return {"state": "recovered", "restored": True}
+    return {"state": "expired-no-backup", "restored": False}
+
+
 def _codex_login_start():
     """Start `codex login --device-auth` and capture the pairing URL + code.
 
@@ -830,17 +1063,33 @@ def _codex_login_start():
     the code. codex wipes auth.json the moment it starts, so the previous login is backed
     up FIRST and a failure to back it up aborts before codex gets the chance — turning a
     re-login attempt into silent credential loss is the one outcome that has no recovery.
-    An abandoned attempt is undone by `codex-auth login-cancel`.
+    An abandoned attempt is undone by `codex-auth login-cancel`, or on its own by
+    `codex-auth login-sweep` once the TTL lapses.
+
+    Order is the contract: sweep (a stale attempt's backup must be recovered before a
+    new backup overwrites it) -> backup (verified) -> record pending -> start.
     """
     binary = _codex_bin()
     if binary is None:
         return {"ok": False, "error": _codex_missing_error()}
+    # A previous attempt may have lapsed while nobody was watching (popup closed).
+    # Sweep it now: otherwise the backup below overwrites the saved login that the
+    # sweep would have restored, and the old lineage is gone for good.
+    try:
+        _codex_relogin_sweep()
+    except Exception:
+        pass
     # Fail closed before codex can erase auth.json. An absent old login is a successful
     # backedUp=false; a copy failure is different and must stop here.
     try:
         backup = _codex_auth_backup()
     except OSError as exc:
         return {"ok": False, "error": f"could not preserve the current Codex login: {exc.strerror or exc}"}
+    # The pending record is what makes TTL recovery possible. Without it a wiped
+    # auth.json stays wiped until a human runs cancel.
+    pending_error = _codex_relogin_record_pending(backup)
+    if pending_error is not None:
+        return {"ok": False, "error": pending_error}
     _codex_kill_pending_login()
     try:
         outf = open(CODEX_LOGIN_OUT, "w")
@@ -885,10 +1134,19 @@ def _codex_login_cancel():
     """
     _codex_kill_pending_login()
     try:
+        sweep = _codex_relogin_sweep()
+    except Exception:
+        sweep = {}
+    if isinstance(sweep, dict) and sweep.get("state") == "completed":
+        # The attempt finished: there is nothing to undo, and restoring the stale
+        # backup now would downgrade the working login to the previous lineage.
+        return {"ok": True, "restored": False}
+    try:
         restored = _codex_auth_restore()
     except OSError as exc:
         return {"ok": False,
                 "error": f"could not restore the previous Codex login: {exc.strerror or exc}"}
+    _codex_relogin_clear_pending()
     return {"ok": True, "restored": restored}
 
 
@@ -950,6 +1208,15 @@ def cmd_codex_auth(action, as_json=False):
         # previous login cannot be committed after auth.json is replaced. Keep both
         # path knowledge and the stat here; nanosecond mtime is metadata, not credential
         # material, and an absent login has an explicit shape instead of an exception.
+        #
+        # Sweep first: the accounts-api server reads generation ahead of its usage
+        # probes, so this is what recovers an abandoned attempt on the next poll even
+        # when the browser and the popup are long closed. A sweep failure must never
+        # fail the generation read itself.
+        try:
+            _codex_relogin_sweep()
+        except Exception:
+            pass
         try:
             generation = os.stat(CODEX_AUTH).st_mtime_ns
         except FileNotFoundError:
@@ -959,6 +1226,17 @@ def cmd_codex_auth(action, as_json=False):
             return 1
         result = {"ok": True, "present": generation is not None,
                   "generation": generation}
+    elif action == "login-sweep":
+        # TTL recovery as an explicit verb: what the server runs ahead of its Codex
+        # routes, and what the offline safety gate drives with a fake clock. `state`
+        # is the whole answer; `restored` is True only when bytes actually moved back.
+        # A recovery-failed state carries `error` and is never collapsed into silence.
+        try:
+            sweep = _codex_relogin_sweep()
+        except Exception as exc:
+            sweep = {"state": "recovery-failed", "restored": False,
+                     "error": "sweep failed: %s" % exc}
+        result = {"ok": True, **sweep}
     elif action == "login-start":
         result = _codex_login_start()
     elif action == "login-cancel":
@@ -967,7 +1245,7 @@ def cmd_codex_auth(action, as_json=False):
         result = _codex_logout()
     else:
         print("codex-auth action must be backup, restore, generation, login-start, "
-              "login-cancel or logout", file=sys.stderr)
+              "login-cancel, login-sweep or logout", file=sys.stderr)
         return 2
     if as_json:
         # JSON is the machine ABI: `ok` carries whether the OPERATION succeeded, and the
@@ -985,12 +1263,504 @@ def cmd_codex_auth(action, as_json=False):
     elif action == "login-start":
         # The code is what the user types; the URL is where. Neither is a secret.
         print(f"  open {result['url']} and enter {result['code']}")
+    elif action == "login-sweep":
+        state = result.get("state")
+        if result.get("restored"):
+            print("recovered the previous Codex login (abandoned attempt past its TTL)")
+        elif state == "recovery-failed":
+            print(f"  ERROR: {result.get('error') or 'recovery failed'}", file=sys.stderr)
+        else:
+            print(f"relogin state: {state}")
     elif action == "logout":
         print("logged out")
     else:
         print("backed up" if result.get("backedUp") else
               "restored" if result.get("restored") else "no saved login")
     return 0 if result.get("ok") else 1
+
+
+# ---------- Muse manual key swap (MUSE_ROTATE) ----------
+#
+# One key per person, picked by a human on screen — NEVER auto-rotated (2026-09-20
+# owner decision). The swap is backup -> verify-candidate -> commit, fixed order: the
+# existing key is kept before the candidate is ever touched, and a candidate the
+# provider rejects changes nothing. Running opencode sessions keep the key their
+# process started with (measured 2026-09-23: a live `serve` process serves the old
+# key to old AND new sessions after auth.json changes; only a restarted process
+# serves the new one) — so every success reports needsRestart and the panel words
+# the seat-recovery guidance from it.
+#
+# The live key is opencode's own `opencode-go` entry in its auth.json. Nothing here
+# prints a key value: resolve failures name the item, verify failures name the
+# reason, and the JSON ABI carries only the account name and the step list.
+#
+# The usage-shape rules (three windows, all valid numbers, never a fabricated 0%)
+# mirror bin/airlock-accounts-api's _muse_window/_muse_entry by hand rather than by
+# import: the API shells out to this CLI, so importing the API here would reverse
+# that dependency. install/test-muse-swap.py pins the same acceptance rules on
+# both sides (T-MU1..3 shape in, AC-MUSE-SWAP-* out).
+
+MUSE_KEYS_BIN = os.environ.get("AIRLOCK_MUSE_KEYS_BIN", "").strip()
+MUSE_USAGE_URL = os.environ.get("AIRLOCK_MUSE_USAGE_URL", "").strip() or "https://opencode.ai"
+# Explicit override for tests and operators. Unset means opencode's own convention:
+# $XDG_DATA_HOME/opencode/auth.json, i.e. ~/.local/share/opencode/auth.json.
+MUSE_AUTH_JSON = os.environ.get("AIRLOCK_OPENCODE_AUTH_JSON", "").strip()
+# The assignment sheet, this box's name and the cho-only screen flag ride the
+# same variable names as the API: the API shells out to this CLI with its own
+# environment, so one deployment sets both layers, and the mutation boundary
+# enforces the picker policy itself instead of trusting the screen to have
+# filtered (a crafted POST names any helper item).
+MUSE_REGISTRY = os.environ.get("AIRLOCK_MUSE_REGISTRY", "").strip()
+MUSE_BOX = os.environ.get("AIRLOCK_BOX_NAME", "").strip() \
+    or socket.gethostname().split(".")[0]
+MUSE_CHO_ITEM = "OPENCODE_CHO_API_KEY"
+MUSE_CHO_VISIBLE = os.environ.get("AIRLOCK_MUSE_CHO_VISIBLE", "").strip() == "1"
+MUSE_KEYS_TIMEOUT = 30
+MUSE_VERIFY_TIMEOUT = 10
+MUSE_MAX_KEYS = 32
+MUSE_WINDOWS = ("rolling", "weekly", "monthly")
+# A window read at 100% used is exhausted, not a candidate. This is the whole of the
+# card's "임계": the backend guarantees provably-valid and not-exhausted, and the
+# picker shows the three numbers so the human decides how close is too close.
+MUSE_SWAP_MAX_USED = 100
+MUSE_SWAP_BAK_SUFFIX = ".muse-swap-bak"
+
+
+def _muse_auth_path():
+    if MUSE_AUTH_JSON:
+        return MUSE_AUTH_JSON
+    data_home = os.environ.get("XDG_DATA_HOME", "").strip() \
+        or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(data_home, "opencode", "auth.json")
+
+
+def _muse_account(item):
+    """The name the team calls the key by: OPENCODE_FINANCE_API_KEY -> finance.
+
+    An op:// vault address contributes its item segment first, so both helper key
+    shapes (bare title and op://vault/title/field) land on the same account.
+    Anything outside those shapes keeps its full name lowercased rather than being
+    guessed into a collision.
+    """
+    core = item.strip()
+    if core.startswith("op://"):
+        parts = core.split("/")
+        if len(parts) >= 4 and parts[3]:
+            core = parts[3]
+    if core.upper().startswith("OPENCODE_"):
+        core = core[len("OPENCODE_"):]
+    for suffix in ("_API_KEY", "_KEY"):
+        if core.upper().endswith(suffix) and len(core) > len(suffix):
+            core = core[:-len(suffix)]
+            break
+    return core.strip().lower() or item.strip().lower()
+
+
+def _muse_read_keys():
+    """The current {item: key-or-None} map from the helper, or {}.
+
+    Values cross on the pipe only and are never logged or returned. An item whose
+    value is missing or not a string stays in the map as None and fails resolve
+    rather than silently disappearing.
+    """
+    if not (MUSE_KEYS_BIN and os.path.isfile(MUSE_KEYS_BIN)):
+        return {}
+    box = {}
+
+    def run():
+        try:
+            proc = subprocess.Popen([MUSE_KEYS_BIN], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            box["rc"] = -1
+            return
+        try:
+            box["out"] = proc.stdout.read(65537)
+        except OSError:
+            box["out"] = b""
+        finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        box["rc"] = proc.returncode
+
+    worker = threading.Thread(target=run, daemon=True, name="muse-keys-read")
+    worker.start()
+    worker.join(timeout=MUSE_KEYS_TIMEOUT)
+    if worker.is_alive() or box.get("rc") != 0:
+        return {}
+    out = box.get("out") or b""
+    if len(out) > 65536:
+        return {}
+    try:
+        raw = json.loads(out.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    keys = {}
+    for item, key in sorted(raw.items()):
+        if not isinstance(item, str) or not item.strip():
+            continue
+        item = item.strip()
+        keys[item] = key if isinstance(key, str) and key else None
+        if len(keys) >= MUSE_MAX_KEYS:
+            break
+    return keys
+
+
+class _MuseNoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects instead of following them: urllib would re-send the
+    candidate Authorization to wherever a redirect points."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _muse_verify(key):
+    """GET <base>/zen/go/v1/usage with the candidate. Returns (ok, detail).
+
+    ok means 200 with all three windows valid and none exhausted. detail is a
+    machine reason — "refused" | "unverifiable" | "exhausted" — and the caller
+    words the fixed human sentence from it, so a 401 is never reported as
+    exhaustion and a timeout is never reported as a refusal.
+    """
+    url = MUSE_USAGE_URL.rstrip("/") + "/zen/go/v1/usage"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Authorization": "Bearer " + key,
+                          "User-Agent": "airlock-accounts"})
+        opener = urllib.request.build_opener(_MuseNoRedirect)
+        with opener.open(req, timeout=MUSE_VERIFY_TIMEOUT) as r:
+            if r.status != 200:
+                return False, "refused"
+            raw = json.loads(r.read(65536).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (301, 302, 303, 307, 308):
+            # The no-redirect handler turns a redirect into this: the endpoint
+            # moved, which verifies nothing about the candidate either way.
+            return False, "unverifiable"
+        return False, "refused"
+    except Exception:
+        return False, "unverifiable"
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(usage, dict):
+        return False, "unverifiable"
+    for window in MUSE_WINDOWS:
+        entry = usage.get(window)
+        if not isinstance(entry, dict):
+            return False, "unverifiable"
+        percent = entry.get("percent")
+        if (isinstance(percent, bool) or not isinstance(percent, int)
+                or not 0 <= percent <= 100):
+            return False, "unverifiable"
+        if not isinstance(entry.get("status"), str) or not entry.get("status"):
+            return False, "unverifiable"
+        if not isinstance(entry.get("resetsAt"), str) or not entry.get("resetsAt"):
+            return False, "unverifiable"
+        if percent >= MUSE_SWAP_MAX_USED:
+            return False, "exhausted"
+    return True, ""
+
+
+_MUSE_VERIFY_ERROR = {
+    "refused": "the provider refused the candidate key",
+    "unverifiable": "the candidate key could not be verified",
+    "exhausted": "the candidate key is already exhausted",
+}
+
+
+def _muse_item_title(key):
+    """Join key for the vault map and the assignment sheet (see the API's copy:
+    an op:// address contributes its item segment, a bare name itself)."""
+    core = key.strip() if isinstance(key, str) else ""
+    if core.startswith("op://"):
+        parts = core.split("/")
+        if len(parts) >= 4 and parts[3]:
+            return parts[3]
+    return core
+
+
+def _muse_registry():
+    """The assignment sheet as {title: holder}, or None when it cannot be read.
+
+    None refuses every swap: without the sheet no box can prove a key is held
+    by no one else, and offering it anyway would risk two boxes on one key.
+    """
+    if not MUSE_REGISTRY:
+        return None
+    raw = None
+    if MUSE_REGISTRY.startswith(("http://", "https://")):
+        try:
+            with urllib.request.urlopen(MUSE_REGISTRY, timeout=6) as r:
+                raw = json.load(r)
+        except Exception:
+            return None
+    else:
+        try:
+            with open(MUSE_REGISTRY, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    sheet = {}
+    for key, holder in raw.items():
+        if (not isinstance(key, str) or not isinstance(holder, str)
+                or not _muse_item_title(key) or not holder.strip()):
+            return None
+        sheet[_muse_item_title(key)] = holder.strip()
+    return sheet
+
+
+def _muse_write_private(path, data):
+    """Write bytes atomically with mode 0600 however the umask reads.
+
+    A plain open() honors the umask from 0666, which on a default 022 umask
+    lands a credential-adjacent file at 0644 — readable by every user on the
+    box until a later chmod closes it. O_EXCL|0600 plus rename never has that
+    window. os.replace on an existing symlink swaps the link itself, never the
+    target it points at. A failed rename unlinks the tmp: either way no
+    credential bytes outlive this call beside live.
+    """
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _muse_swap_core(item):
+    """Backup -> verify -> commit. Returns (ok, result dict with a step list).
+
+    The step list is the observable order: ["backup", "verify", "commit"] on
+    success, ["backup", "verify"] when the candidate is refused (commit never
+    runs), ["backup", "verify", "commit", "rollback"] when the commit itself
+    fails. Every refusal leaves live byte-identical and stages no debris.
+    """
+    steps = ["backup"]
+    try:
+        with open(_muse_auth_path(), "rb") as f:
+            previous = f.read()
+    except FileNotFoundError:
+        previous = None
+    except OSError:
+        return False, {"ok": False, "error": "the current key file is not readable",
+                       "steps": steps}
+    if previous is not None:
+        try:
+            live = json.loads(previous.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return False, {"ok": False, "error": "the current key file is not readable",
+                           "steps": steps}
+        if not isinstance(live, dict):
+            return False, {"ok": False, "error": "the current key file is not readable",
+                           "steps": steps}
+    else:
+        live = {}
+
+    steps.append("verify")
+    keys = _muse_read_keys()
+    candidate = keys.get(item)
+    if not isinstance(candidate, str) or not candidate:
+        return False, {"ok": False, "error": "that key is not available on this box",
+                       "steps": steps}
+    # The picker policy is enforced at this mutation boundary, not trusted from
+    # the screen: a crafted call names any helper item, and only this check
+    # keeps another box's key or the off-box cho key out of the commit.
+    if _muse_item_title(item) == _muse_item_title(MUSE_CHO_ITEM) and not MUSE_CHO_VISIBLE:
+        return False, {"ok": False, "error": "that key is not offered on this box",
+                       "steps": steps}
+    sheet = _muse_registry()
+    if sheet is None:
+        return False, {"ok": False, "error": "the assignment sheet is unavailable",
+                       "steps": steps}
+    holder = sheet.get(_muse_item_title(item))
+    if holder is not None and holder != MUSE_BOX:
+        return False, {"ok": False, "error": "that key is held by another box",
+                       "steps": steps}
+    verified, detail = _muse_verify(candidate)
+    if not verified:
+        return False, {"ok": False, "error": _MUSE_VERIFY_ERROR[detail], "steps": steps}
+
+    steps.append("commit")
+    auth_path = _muse_auth_path()
+    # Compare-and-swap against concurrent writers: the verify above takes
+    # seconds on the network, and opencode itself rewrites this file. Rebuilding
+    # the commit from a stale snapshot would clobber another entry's fresh
+    # tokens while promising to touch only opencode-go.key — so re-read now and
+    # abort when anything outside our field moved. A spurious abort retries
+    # cleanly; a clobber does not.
+    try:
+        with open(auth_path, "rb") as f:
+            current = f.read()
+    except FileNotFoundError:
+        current = None
+    except OSError:
+        steps.append("rollback")
+        return False, {"ok": False, "error": "the commit failed — the key file "
+                                             "cannot be re-read, nothing was changed",
+                       "steps": steps}
+    if previous is not None:
+        if current is None:
+            steps.append("rollback")
+            return False, {"ok": False, "error": "the commit failed — the key file "
+                                                 "vanished during verification, nothing was changed",
+                           "steps": steps}
+        try:
+            before = json.loads(previous.decode("utf-8"))
+            now = json.loads(current.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            before = now = None
+        # Presence matters, not just value: .get() reads a missing key and an
+        # explicit null identically, so strip our own field and compare whole
+        # dicts instead.
+        if (not isinstance(before, dict) or not isinstance(now, dict)
+                or {k: v for k, v in before.items() if k != "opencode-go"}
+                != {k: v for k, v in now.items() if k != "opencode-go"}):
+            steps.append("rollback")
+            return False, {"ok": False, "error": "the commit failed — the key file "
+                                                 "changed during verification, nothing was changed",
+                           "steps": steps}
+        live = now
+    elif current is not None:
+        steps.append("rollback")
+        return False, {"ok": False, "error": "the commit failed — the key file "
+                                             "appeared during verification, nothing was changed",
+                       "steps": steps}
+    updated = dict(live)
+    updated["opencode-go"] = {"type": "api", "key": candidate}
+    committed = False
+    try:
+        os.makedirs(os.path.dirname(auth_path) or ".", mode=0o700, exist_ok=True)
+        _muse_write_private(auth_path, json.dumps(updated).encode("utf-8"))
+        committed = True
+        with open(auth_path, "rb") as f:
+            reread = json.load(f)
+        if not isinstance(reread, dict) \
+                or reread.get("opencode-go", {}).get("key") != candidate:
+            raise ValueError("read-back mismatch")
+    except (OSError, ValueError, TypeError, UnicodeError):
+        steps.append("rollback")
+        # A failed replace leaves its tmp beside live; a failed read-back leaves
+        # live committed-but-wrong. Either way the tmp must not outlive us.
+        try:
+            os.remove("%s.tmp.%d" % (auth_path, os.getpid()))
+        except OSError:
+            pass
+        restored = False
+        try:
+            if previous is None:
+                if not committed:
+                    restored = True  # nothing was ever written
+                else:
+                    # The file did not exist before and the commit created
+                    # something the read-back rejected: removing it IS the
+                    # restore, and absence after removal proves it.
+                    try:
+                        os.remove(auth_path)
+                    except FileNotFoundError:
+                        pass
+                    try:
+                        with open(auth_path, "rb"):
+                            pass
+                    except FileNotFoundError:
+                        restored = True
+                    except OSError:
+                        restored = False
+            else:
+                _muse_write_private(auth_path, previous)
+                with open(auth_path, "rb") as f:
+                    restored = (f.read() == previous)
+        except OSError:
+            restored = False
+        if not restored:
+            return False, {"ok": False, "error": "the commit failed and the previous "
+                                                 "key could not be restored — check the key file by hand",
+                           "steps": steps}
+        # Restored is bytes, not health: say whether the old key still works
+        # rather than calling it a recovery, and keep the verify categories —
+        # a refused old key is refused, not exhausted. This read happens only
+        # here, on the one path the card names.
+        if previous is None:
+            error = "the commit failed — there was no previous key, nothing was changed"
+            return False, {"ok": False, "error": error, "steps": steps}
+        old_key = None
+        try:
+            old_entry = json.loads(previous.decode("utf-8")).get("opencode-go", {})
+            old_key = old_entry.get("key") if isinstance(old_entry, dict) else None
+        except (UnicodeDecodeError, ValueError, AttributeError):
+            old_key = None
+        if isinstance(old_key, str) and old_key:
+            old_ok, old_detail = _muse_verify(old_key)
+        else:
+            old_ok, old_detail = False, "unverifiable"
+        if old_ok:
+            error = "the commit failed — the previous key is back in place and still valid"
+        elif old_detail == "exhausted":
+            error = ("the commit failed — the previous key is back in place "
+                     "but it is exhausted, pick another key")
+        elif old_detail == "refused":
+            error = ("the commit failed — the previous key is back in place "
+                     "but the provider refuses it, pick another key")
+        else:
+            error = ("the commit failed — the previous key is back in place "
+                     "but it could not be re-verified, pick another key")
+        return False, {"ok": False, "error": error, "steps": steps}
+    bak_saved = False
+    if previous is not None:
+        try:
+            _muse_write_private(auth_path + MUSE_SWAP_BAK_SUFFIX, previous)
+            bak_saved = True
+        except (OSError, TypeError):
+            bak_saved = False
+    return True, {"ok": True, "account": _muse_account(item), "steps": steps,
+                  "needsRestart": True, "bakSaved": bak_saved}
+
+
+def cmd_muse_swap(item, as_json):
+    if not isinstance(item, str) or not item.strip() or len(item) > 256:
+        if as_json:
+            json.dump({"ok": False, "error": "not a key name", "steps": []}, sys.stdout)
+            print()
+            return 0
+        print("airlock-accounts: muse-swap needs a vault key name", file=sys.stderr)
+        return 2
+    ok, result = _muse_swap_core(item.strip())
+    if as_json:
+        # Unlike codex-auth's ABI (where ok:false is a readable state), a refused
+        # swap is a failure outcome: the JSON still lands on stdout, and the exit
+        # status says whether the box changed. install/test-muse-swap.py pins rc!=0.
+        json.dump(result, sys.stdout)
+        print()
+        return 0 if ok else 1
+    if ok:
+        print("swapped to %s (new sessions pick it up; running ones need seat-recovery)"
+              % result["account"])
+    else:
+        print("  ERROR: %s" % result["error"], file=sys.stderr)
+    return 0 if ok else 1
 
 
 USAGE = """airlock-accounts — switch Claude accounts without a browser
@@ -1008,6 +1778,9 @@ Switch / inspect:
   airlock-accounts list [--json] [--usage]  accounts + health (+ 5h/7d utilization)
   airlock-accounts to <name> [-- args...]   switch, then claude --continue
   airlock-accounts swap <name>              switch only (no re-launch; buttons/scripts)
+  airlock-accounts muse-swap <item> [--json]  swap this box's Muse key (manual only:
+                              backup -> verify the candidate -> commit; a refused
+                              candidate leaves the old key untouched)
   airlock-accounts prune [--yes]            remove all dead slots (explicit only)
   airlock-accounts remove <name> [--yes]    remove one slot by name (active is refused)
 
@@ -1017,6 +1790,7 @@ Platform lifecycle (called through the D5 ABI; never emits credential values):
   airlock-accounts codex-auth generation [--json]
   airlock-accounts codex-auth login-start [--json]    device-auth: capture URL + code
   airlock-accounts codex-auth login-cancel [--json]   abandon it, put the old login back
+  airlock-accounts codex-auth login-sweep [--json]    TTL recovery for an abandoned attempt
   airlock-accounts codex-auth logout [--json]         remove this box's Codex login"""
 
 
@@ -1057,6 +1831,9 @@ def main(argv):
             extra = extra[1:]
         cmd_to(rest[0], extra)
     elif cmd == "swap" and len(rest) == 1:    cmd_swap(rest[0])
+    elif cmd == "muse-swap" and rest:
+        item = next((a for a in rest if not a.startswith("-")), None)
+        return cmd_muse_swap(item, "--json" in rest)
     elif cmd == "codex-auth" and rest:
         return cmd_codex_auth(rest[0], "--json" in rest[1:])
     else:

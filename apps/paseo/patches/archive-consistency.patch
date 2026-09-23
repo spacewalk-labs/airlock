@@ -1,0 +1,55 @@
+diff --git a/node_modules/@getpaseo/server/dist/server/server/session.js b/node_modules/@getpaseo/server/dist/server/server/session.js
+--- a/node_modules/@getpaseo/server/dist/server/server/session.js
++++ b/node_modules/@getpaseo/server/dist/server/server/session.js
+@@
+-    async buildProjectPlacementForWorkspaceId(workspaceId) {
++    async buildProjectPlacementForWorkspaceId(workspaceId, includeArchived) {
+         const workspace = await this.workspaceRegistry.get(workspaceId);
+         if (!workspace)
+             return null;
++        // [paseo-archive-consistency] Omitted includeArchived preserves legacy callers; false filters archived workspaces.
++        if (includeArchived === false && workspace.archivedAt != null)
++            return null;
+         const project = await this.projectRegistry.get(workspace.projectId);
+@@
+         let agents = [...liveAgents, ...persistedAgents];
+         agents = agents.filter((agent) => this.isProviderVisibleToClient(agent.provider));
+         if (!includeArchived) {
+-            agents = agents.filter((agent) => !agent.archivedAt);
++            // [paseo-archive-consistency] Archived workspace records hide otherwise-live agents.
++            const workspaceRecords = await this.workspaceRegistry.list();
++            const archivedWorkspaceIds = new Set(workspaceRecords
++                .filter((record) => record.archivedAt != null)
++                .map((record) => record.workspaceId));
++            agents = agents.filter((agent) => !agent.archivedAt &&
++                (agent.workspaceId == null || !archivedWorkspaceIds.has(agent.workspaceId)));
+         }
+@@
+-            const placementPromise = this.buildProjectPlacementForWorkspaceId(workspaceId);
++            const placementPromise = this.buildProjectPlacementForWorkspaceId(
++                workspaceId,
++                filter?.includeArchived === true,
++            );
+             placementByWorkspaceId.set(workspaceId, placementPromise);
+diff --git a/node_modules/@getpaseo/server/dist/server/server/session/agent-updates/agent-updates-service.js b/node_modules/@getpaseo/server/dist/server/server/session/agent-updates/agent-updates-service.js
+--- a/node_modules/@getpaseo/server/dist/server/server/session/agent-updates/agent-updates-service.js
++++ b/node_modules/@getpaseo/server/dist/server/server/session/agent-updates/agent-updates-service.js
+@@
+         if (subscription !== activeSubscription || !deps.isProviderVisibleToClient(payload.provider)) {
+             return false;
+         }
++        // [paseo-archive-consistency] Default subscriptions must remove archived-workspace agents too.
+         const project = payload.workspaceId
+-            ? await deps.buildProjectPlacementForWorkspaceId(payload.workspaceId)
++            ? await deps.buildProjectPlacementForWorkspaceId(payload.workspaceId, activeSubscription.filter?.includeArchived === true)
+             : null;
+@@
+         const project = payload.workspaceId
+-            ? await deps.buildProjectPlacementForWorkspaceId(payload.workspaceId)
++            ? await deps.buildProjectPlacementForWorkspaceId(payload.workspaceId, sub.filter?.includeArchived === true)
+             : null;
+@@
+                 const project = payload.workspaceId
+-                    ? await deps.buildProjectPlacementForWorkspaceId(payload.workspaceId)
++                    ? await deps.buildProjectPlacementForWorkspaceId(payload.workspaceId, sub.filter?.includeArchived === true)
+                     : null;

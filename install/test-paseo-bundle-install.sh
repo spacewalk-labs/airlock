@@ -116,6 +116,8 @@ for want in \
   'pasted-image persistence already applied' \
   'schedule schema busy-pending patch already applied' \
   'schedule service busy-pending patch already applied' \
+  'archive/workspace consistency already applied' \
+  'archive/workspace consistency behaviour check passed' \
   'provider-subagent server filter already applied' \
   'provider-subagent selective delivery pair verified' \
   'orphan guard already applied (claude)' \
@@ -151,6 +153,24 @@ else
 fi
 [ -f "$HOME_DIR/.config/systemd/user/airlock-paseo.service" ] \
   && ok "the unit was rendered" || bad "no unit rendered"
+
+# The unit's own shadow guard, run rather than read. Node resolves upward from the
+# cli, so a server nested under it wins over the patched prefix-level one at the next
+# daemon start — the 2026-09-20 shadow on an operator box was created between installs and
+# surfaced two days later at boot. The installer heals a shadow it meets (section 3
+# below); this line is what holds the invariant in between, so assert the rendered
+# command actually removes a shadow and leaves the canonical copy alone.
+UNIT_FILE="$HOME_DIR/.config/systemd/user/airlock-paseo.service"
+mkdir -p "$NESTED/dist"; : >"$NESTED/dist/shadow-marker"
+guard="$(sed -n "s|^ExecStartPre=/bin/sh -c '\(.*\)'$|\1|p" "$UNIT_FILE")"
+if [ -z "$guard" ]; then
+  bad "the unit carries no ExecStartPre shadow guard"
+elif sh -c "$guard" && [ ! -e "$NESTED" ] && [ -f "$TOP/dist/server/server/session.js" ]; then
+  ok "the unit's ExecStartPre drops a nested server and keeps the prefix-level one"
+else
+  bad "the unit's ExecStartPre did not clear $NESTED (or removed the wrong tree)"
+fi
+rm -rf "$NESTED"
 grep -q 'systemctl --user restart airlock-paseo.service' "$EVENTS" \
   && ok "the daemon restart was requested" || bad "no restart requested"
 # INSTALLED_SHA256SUMS is written against the prefix-level layout; the installer

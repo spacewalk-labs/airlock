@@ -78,7 +78,7 @@ B="http://127.0.0.1:$PORT"
 
 panel="$(body "$B/panel.html")"
 case "$panel" in
-  *"Subscription accounts"*) account_markup=1; ok "the served panel is the account view" ;;
+  *구독?계정*) account_markup=1; ok "the served panel is the account view" ;;
   *) bad "the served panel lost its account markup" ;;
 esac
 case "$panel" in

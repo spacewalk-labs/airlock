@@ -104,6 +104,17 @@ patch closed. The fix adds the same `viewedTimelineAgentIds`/
 `viewedTimelineAgentIdsBySource` checks `forwardAgentStream` (normal agent
 streams) already uses, keyed on the update's `parentAgentId`.
 
+`archive-consistency` is baked into `session.js` and
+`session/agent-updates/agent-updates-service.js`. Upstream 0.8.0 can archive a
+workspace record while leaving its agent record unarchived; the default agent
+snapshot used to expose that orphan as live, and a later live/stored
+`agent_update` could insert it again. The patch applies the same workspace
+archive predicate to the snapshot and subscription boundaries: default updates
+emit `remove`, while `includeArchived=true` keeps the diagnostic/recovery
+`upsert`. Agents with no or unknown workspace identity keep their existing
+snapshot behavior. Its behavior test covers both paths, idempotence, mixed-state
+refusal, and anchor drift.
+
 `orphan-process-guard` (claude) and `orphan-process-group` (claude-agent,
 claude-query, codex-transport) are baked in for the same reason as
 provider-subagent-stream-filter: both have their own runtime behaviour tests
@@ -127,7 +138,9 @@ pinned file on every run, so the very next idempotency check saw a checksum
 mismatch and reinstalled from scratch every time. Baking removes the
 mutation from the post-install steady state and restores idempotency.
 
-This adds `session.js` (depth4, provider-subagent-stream-filter),
+This adds `session.js` (depth4, provider-subagent-stream-filter,
+archive-consistency),
+`session/agent-updates/agent-updates-service.js` (archive-consistency),
 `agent/providers/claude/agent.js` (image persistence, orphan-process-guard,
 orphan-process-group), `agent/providers/claude/query.js`
 (orphan-process-group), `agent/providers/claude/model-manifest.js` (model
@@ -183,8 +196,8 @@ dependencies) succeeds clean. A real `npm i -g` of these seven tarballs into a
 scratch prefix lands `@getpaseo/*` as siblings (no nesting under `cli`, the
 layout `install.sh` depends on), `paseo --version` reports `0.8.0`, and a real
 `bash apps/paseo/install.sh` run against that tree (the actual installer, not
-a fixture) applies all eight baked-in patches (depth4, image-attachments-
+a fixture) applies all nine baked-in patches (depth4, image-attachments-
 persist, claude-model-prune, opencode-grok-defaults,
 provider-subagent-stream-filter, orphan-process-guard, orphan-process-group,
-schedule-busy-pending-delivery) idempotently, restarts the daemon, and
-installs successfully end to end.
+schedule-busy-pending-delivery, archive-consistency) idempotently, restarts the
+daemon, and installs successfully end to end.

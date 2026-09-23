@@ -230,5 +230,95 @@ else
     || bad "T11 wrong failure: $(tail -2 "$TMP/out8b")"
 fi
 
+# ---- T12: a death after the unit lands does not strand a disabled service ----
+# 2026-09-23: the backend died via a stop after disable --now and served 502
+# until a human re-enabled it; Restart=on-failure never covers an intentional
+# stop. The installer re-enables best-effort on any failing exit while the
+# verdict stays failed. The shim fails the first enable --now only, so a green
+# run here proves the recovery arm ran, not the initial call.
+cat > "$BIN_DIR/systemctl" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$AIRLOCK_SYSTEMCTL_LOG"
+case "$*" in
+  *is-active*) [ -f "$AIRLOCK_SHIM_STATE/is-active" ] && cat "$AIRLOCK_SHIM_STATE/is-active" ;;
+esac
+case "$*" in
+  *enable\ --now*)
+    if [ ! -f "$AIRLOCK_SHIM_STATE/enable-failed-once" ]; then
+      : > "$AIRLOCK_SHIM_STATE/enable-failed-once"
+      exit 1
+    fi ;;
+esac
+exit 0
+SH
+chmod 0755 "$BIN_DIR/systemctl"
+rm -f "$TMP/enable-failed-once" "$unit"
+printf 'active\n' > "$TMP/is-active"
+: > "$LOG"
+if run install >"$TMP/out12" 2>&1; then
+  bad "T12 a failed enable --now was reported as success"
+else
+  grep -q 'could not enable' "$TMP/out12" \
+    && ok "T12 the failed install still fails loudly, with the reason" \
+    || bad "T12 wrong failure: $(tail -2 "$TMP/out12")"
+fi
+[ "$(grep -c 'enable --now' "$LOG")" -ge 2 ] \
+  && ok "T12 the exit trap re-enabled the service after the death" \
+  || bad "T12 only one enable --now ran — the stranded unit was left disabled: $(grep . "$LOG" | tail -4)"
+# The trap belongs to install only: removing the service must never resurrect it.
+mk_shim
+: > "$LOG"
+run install >/dev/null 2>&1
+: > "$LOG"
+run uninstall >/dev/null 2>&1
+grep -q 'enable --now' "$LOG" \
+  && bad "T12 uninstall re-enabled the service it was removing" \
+  || ok "T12 uninstall leaves no enable behind"
+
+# ---- T13: handed-in Muse readers reach the unit; absent ones stay empty ----
+# Reader paths and the brokered address arrive box-locally (vault and tool
+# names do not ship), so the helper renders exactly what it was handed — but
+# only for readers that actually execute. A handed-in path to nothing must
+# leave the route disabled, not enabled-looking and empty.
+printf '#!/bin/sh\nexit 0\n' > "$BIN_DIR/team-reader"; chmod 0755 "$BIN_DIR/team-reader"
+printf '#!/bin/sh\nexit 0\n' > "$BIN_DIR/broker"; chmod 0755 "$BIN_DIR/broker"
+rm -f "$unit"
+if env HOME="$HOME_DIR" PATH="$BIN_DIR:$PATH" AIRLOCK_SYSTEMCTL_LOG="$LOG" \
+       AIRLOCK_SHIM_STATE="$TMP" AIRLOCK_CONFIG="$TMP/broken.toml" AIRLOCK_ROOT="$ROOT" \
+       AIRLOCK_HUB_ACCOUNTS_PORT=19904 \
+       AIRLOCK_MUSE_SECRET_BIN="$BIN_DIR/team-reader" AIRLOCK_MUSE_CHO_BIN="$BIN_DIR/broker" \
+       AIRLOCK_MUSE_CHO_REF='op://fixture-vault/OPENCODE_MU_B_API_KEY/password' \
+       bash "$ROOT/install/airlock-accounts-api.sh" install >"$TMP/out13" 2>&1; then
+  wired=1
+  grep -qxF "Environment=AIRLOCK_MUSE_KEYS_BIN=$ROOT/bin/airlock-muse-keys" "$unit" || wired=0
+  grep -qxF "Environment=AIRLOCK_MUSE_SECRET_BIN=$BIN_DIR/team-reader" "$unit" || wired=0
+  grep -qxF "Environment=AIRLOCK_MUSE_CHO_BIN=$BIN_DIR/broker" "$unit" || wired=0
+  grep -qxF 'Environment=AIRLOCK_MUSE_CHO_REF=op://fixture-vault/OPENCODE_MU_B_API_KEY/password' "$unit" || wired=0
+  [ "$wired" = 1 ] && ok "T13 handed-in Muse readers reach the unit verbatim" \
+    || bad "T13 Muse wiring wrong: $(grep MUSE "$unit" || echo none)"
+else
+  bad "T13 install with handed-in readers failed: $(tail -2 "$TMP/out13")"
+fi
+rm -f "$unit"
+if env HOME="$HOME_DIR" PATH="$BIN_DIR:$PATH" AIRLOCK_SYSTEMCTL_LOG="$LOG" \
+       AIRLOCK_SHIM_STATE="$TMP" AIRLOCK_CONFIG="$TMP/broken.toml" AIRLOCK_ROOT="$ROOT" \
+       AIRLOCK_HUB_ACCOUNTS_PORT=19904 \
+       AIRLOCK_MUSE_SECRET_BIN=/definitely/missing AIRLOCK_MUSE_CHO_BIN=/also/missing \
+       bash "$ROOT/install/airlock-accounts-api.sh" install >"$TMP/out13b" 2>&1; then
+  grep -qxF 'Environment=AIRLOCK_MUSE_KEYS_BIN=' "$unit" \
+    && ok "T13 missing readers leave the route disabled, not enabled-empty" \
+    || bad "T13 missing readers rendered enablement: $(grep MUSE "$unit" || echo none)"
+else
+  bad "T13 install with missing readers failed: $(tail -2 "$TMP/out13b")"
+fi
+rm -f "$unit"
+if run install >/dev/null 2>&1; then
+  grep -qxF 'Environment=AIRLOCK_MUSE_KEYS_BIN=' "$unit" \
+    && ok "T13 with no readers the route stays disabled, not broken" \
+    || bad "T13 unexpected Muse wiring: $(grep MUSE "$unit" || echo none)"
+else
+  bad "T13 baseline reinstall failed"
+fi
+
 printf '\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

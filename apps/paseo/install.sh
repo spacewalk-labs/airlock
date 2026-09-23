@@ -548,6 +548,63 @@ else
   log "warning: depth4 anchor not found (paseo version drift?) — search may be slow; see patches/depth4-search.patch"
 fi
 
+# --- 2a. archive/workspace consistency at the server read + update boundaries ---
+# A workspace archive can leave an otherwise-live agent record behind. Keep the
+# stored records untouched, but hide agents whose workspace registry record is
+# archived from the default list and remove them from default live subscriptions.
+# Agents with no/unknown workspace stay visible in the snapshot; includeArchived=true
+# remains the upstream diagnostic/recovery view. The two server files are one patch:
+# a read-only snapshot fix without the update-path fix would make the next upsert revive it.
+ARCHIVE_CONSISTENCY_PATCHER="$HERE/patches/archive-consistency.mjs"
+ARCHIVE_CONSISTENCY_TEST="$HERE/patches/archive-consistency.test.mjs"
+ARCHIVE_CONSISTENCY_UPDATES="$PASEO_SERVER_DIR/dist/server/server/session/agent-updates/agent-updates-service.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply archive/workspace consistency patch to $SESSION_JS and $ARCHIVE_CONSISTENCY_UPDATES"
+elif [ ! -f "$SESSION_JS" ] || [ ! -f "$ARCHIVE_CONSISTENCY_UPDATES" ]; then
+  log "warning: archive-consistency server target missing ($SESSION_JS or $ARCHIVE_CONSISTENCY_UPDATES) — skipped"
+elif [ ! -f "$ARCHIVE_CONSISTENCY_PATCHER" ] || [ ! -f "$ARCHIVE_CONSISTENCY_TEST" ]; then
+  log "warning: archive/workspace consistency patcher or behaviour test missing under $HERE — skipped"
+else
+  ac_session_tmp="${SESSION_JS}.paseo-new.mjs"
+  ac_updates_tmp="${ARCHIVE_CONSISTENCY_UPDATES}.paseo-new.mjs"
+  rm -f "$ac_session_tmp" "$ac_updates_tmp"
+  ac_rc=0
+  ac_out="$(node "$ARCHIVE_CONSISTENCY_PATCHER" "$SESSION_JS" "$ARCHIVE_CONSISTENCY_UPDATES")" || ac_rc=$?
+  case "$ac_rc" in
+    10) log "archive/workspace consistency already applied" ;;
+    20) log "warning: archive/workspace consistency anchor missing or ambiguous (paseo version drift) — skipped: $ac_out" ;;
+    0)
+      if [ ! -f "$ac_session_tmp" ] || [ ! -f "$ac_updates_tmp" ]; then
+        rm -f "$ac_session_tmp" "$ac_updates_tmp"
+        log "warning: archive/workspace consistency did not produce both candidates — skipped"
+      elif ! node --check "$ac_session_tmp" || ! node --check "$ac_updates_tmp"; then
+        rm -f "$ac_session_tmp" "$ac_updates_tmp"
+        log "warning: archive/workspace consistency candidate is invalid JS — not applied"
+      elif ! node "$ARCHIVE_CONSISTENCY_TEST" "$ac_session_tmp" "$ac_updates_tmp" >/dev/null 2>&1; then
+        rm -f "$ac_session_tmp" "$ac_updates_tmp"
+        log "warning: archive/workspace consistency candidates failed their behaviour check — not applied"
+      else
+        mv "$ac_session_tmp" "$SESSION_JS" || die "archive/workspace consistency session.js mv failed"
+        mv "$ac_updates_tmp" "$ARCHIVE_CONSISTENCY_UPDATES" || die "archive/workspace consistency update-service mv failed"
+        need_restart=1
+        log "archive/workspace consistency applied"
+      fi
+      ;;
+    *) log "warning: archive/workspace consistency patcher error (rc=$ac_rc): $ac_out — skipped" ;;
+  esac
+  # The sentinel is only a comment; verify the actual installed bytes before
+  # allowing the daemon restart transaction to proceed.
+  if grep -qF 'paseo-archive-consistency' "$SESSION_JS" \
+    || grep -qF 'paseo-archive-consistency' "$ARCHIVE_CONSISTENCY_UPDATES"; then
+    grep -qF 'paseo-archive-consistency' "$SESSION_JS" \
+      && grep -qF 'paseo-archive-consistency' "$ARCHIVE_CONSISTENCY_UPDATES" \
+      || die "installed archive/workspace consistency is partially applied"
+    node "$ARCHIVE_CONSISTENCY_TEST" "$SESSION_JS" "$ARCHIVE_CONSISTENCY_UPDATES" >/dev/null 2>&1 \
+      || die "installed archive/workspace consistency behavior check failed"
+    log "archive/workspace consistency behaviour check passed"
+  fi
+fi
+
 # --- 2b. provider-subagent selective delivery (server + always-on web UI) ---
 # Upstream sends every provider-owned subagent update to every browser socket that
 # advertises the feature, even when that socket is viewing another agent. The normal

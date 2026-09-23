@@ -32,6 +32,22 @@ Environment=AIRLOCK_OPENCODE_BIN=@OPENCODE_BIN@
 # Antigravity CLI for the quota row. Empty = no agy on this box; the row says so.
 Environment=AIRLOCK_AGY_BIN=@AGY_BIN@
 Environment=AIRLOCK_AGY_USAGE_BIN=@AGY_USAGE_BIN@
+# Muse vault-key reader. Empty KEYS_BIN = /muse-usage answers disabled. The
+# helper that prints the {item: key} map ships in this repository; the two
+# vault readers resolve at install time, and the brokered key's address arrives
+# box-locally (never a default in this template: vault names do not ship).
+Environment=AIRLOCK_MUSE_KEYS_BIN=@MUSE_KEYS_BIN@
+Environment=AIRLOCK_MUSE_SECRET_BIN=@MUSE_SECRET_BIN@
+Environment=AIRLOCK_MUSE_CHO_BIN=@MUSE_CHO_BIN@
+Environment=AIRLOCK_MUSE_CHO_REF=@MUSE_CHO_REF@
+# Muse manual swap (MUSE_ROTATE): the assignment sheet (file path or http(s) URL;
+# empty = the picker offers nothing and says the sheet is why), this box's name
+# for the held-by-other filter (empty = the box's own short hostname), and the
+# cho-only screen flag (set to 1 on the cho reader box alone — anywhere else the cho key
+# never reaches a screen even when the local helper holds it).
+Environment=AIRLOCK_MUSE_REGISTRY=@MUSE_REGISTRY@
+Environment=AIRLOCK_BOX_NAME=@BOX_NAME@
+Environment=AIRLOCK_MUSE_CHO_VISIBLE=@MUSE_CHO_VISIBLE@
 ExecStart=@PYTHON@ "@AIRLOCK_ROOT@/bin/airlock-accounts-api"
 Restart=on-failure
 RestartSec=2

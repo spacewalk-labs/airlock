@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Airlock panel</title>
+<title>구독 계정</title>
 <link rel="stylesheet" href="popup.css">
 <!--
   panel.html — the Airlock subscription account panel and secret drop, on a page with
@@ -58,8 +58,8 @@
 </head>
 <body>
 <div id="top">
-  <span class="ttl" id="ttl">Subscription accounts</span>
-  <button type="button" id="closeBtn">Close</button>
+  <span class="ttl" id="ttl">구독 계정</span>
+  <button type="button" id="closeBtn">닫기</button>
 </div>
 <div id="body"><div id="host"></div></div>
 
@@ -72,7 +72,7 @@
   var embedded = params.get('embed') === '1';
   // Unknown ?p= falls back to accounts rather than rendering an empty page.
   var page = params.get('p') === 'secret' ? 'secret' : 'accounts';
-  if (page === 'secret') document.getElementById('ttl').textContent = 'Secret drop';
+  if (page === 'secret') document.getElementById('ttl').textContent = '시크릿 전달';
   // Embedded in the widget's modal, the modal owns the header (title + close), so ours
   // would be a second one. Standalone (opened as a tab) we keep it.
   if (embedded) document.getElementById('top').hidden = true;

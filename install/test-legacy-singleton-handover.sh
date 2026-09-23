@@ -836,10 +836,23 @@ run_paseo_case() {
   done
   after_hash="$(sha256sum "$pidfile" 2>/dev/null | awk '{print $1}')"
   after_inode="$(stat -c '%d:%i' "$pidfile" 2>/dev/null || true)"
-  if [ "$prestarts" -eq 0 ]; then
-    ok "paseo: rendered candidate has no pidfile-mutating ExecStartPre"
+  # The invariant is that a failing candidate never touches the SHARED singleton
+  # state (PASEO_HOME, the pidfile) — not that the unit has no pre-start command at
+  # all. The unit does carry one: it drops a @getpaseo/server nested under the cli,
+  # which would otherwise shadow the patched prefix-level bundle at the next start
+  # (apps/paseo/render.sh). That lives in this installer's own npm prefix, which no
+  # legacy daemon's singleton state occupies, and the 53-attempt measurement below
+  # is what proves the pidfile and its holder survive either way.
+  offending=0
+  for line in "${paseo_lines[@]}"; do
+    case "$line" in
+      *"$paseo_home"*|*"$pidfile"*|*paseo.pid*) offending=$((offending + 1)) ;;
+    esac
+  done
+  if [ "$offending" -eq 0 ]; then
+    ok "paseo: none of the $prestarts rendered ExecStartPre command(s) touch PASEO_HOME or the pidfile"
   else
-    bad "paseo: rendered candidate still has $prestarts pre-start cleanup command(s)"
+    bad "paseo: $offending of $prestarts rendered pre-start command(s) mutate legacy singleton state"
   fi
   if [ -f "$pidfile" ] && [ "$before_hash" = "$after_hash" ] \
      && [ "$before_inode" = "$after_inode" ] && kill -0 "$retry_holder" 2>/dev/null; then

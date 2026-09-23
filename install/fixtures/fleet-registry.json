@@ -1,0 +1,4 @@
+{
+  "op://example-vault/muse-spark-example-1/password": "writer-box",
+  "op://example-vault/muse-spark-example-2/password": "peer-box"
+}

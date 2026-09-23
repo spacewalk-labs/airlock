@@ -245,7 +245,7 @@ def platform_statuses(module, bindings: dict[str, set[str]]) -> dict[tuple[str, 
             return True
 
         def _json_body(self):
-            return {"name": "fixture", "code": "ABCD-1234"}
+            return {"name": "fixture", "code": "ABCD-1234", "item": "fixture"}
 
     replacements = {
         "_probe": lambda _args=(): (200, {}),
@@ -636,8 +636,17 @@ def main() -> int:
         (route, method) for route, methods in route_mutant_bindings.items()
         if route not in ALLOWED_DEVTERM_ROUTES for method in methods
     }
+    # 20 -> 21 routes (and 16 -> 17 retired 404s) with MUSE_USAGE's GET
+    # /muse-usage: the platform surface grew by exactly one non-fleet route, and
+    # the retired probe set is derived from that surface, so its coverage grows
+    # with it. Advanced deliberately, not adjusted to fit.
+    # 21 -> 23 routes (and 17 -> 19 retired 404s) with MUSE_ROTATE's GET
+    # /muse-swap-candidates and POST /muse-swap: two non-fleet routes, both
+    # probed 200 in fixture (the POST's patched CLI reports ok with empty
+    # stdout, which the handler answers 200 with empty steps rather than
+    # inventing a refusal). Advanced deliberately, not adjusted to fit.
     p4a_expected = (
-        "retired_404==16 && platform_200==20 && platform_routes==20 && registered_routes==24 "
+        "retired_404==19 && platform_200==23 && platform_routes==23 && registered_routes==24 "
         "&& registered_runtime_200==25 && account_domain_routes==0 && account_domain_200==0"
     )
     p4a_observed = {

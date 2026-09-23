@@ -48,6 +48,7 @@ import math
 import os
 import re
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -80,6 +81,35 @@ AGY_USAGE_PROBE = os.environ.get("AIRLOCK_AGY_USAGE_BIN", "").strip()
 # The platform secret-drop CLI. Handed in like the account CLIs; unset means every secret
 # route answers the fixed failure below rather than guessing a path.
 SECRET_BIN = os.environ.get("AIRLOCK_SECRET_BIN", "").strip()
+# Muse Spark (opencode-go) vault keys. A helper CLI that prints the current
+# {1Password-item: key} JSON map on its stdout; handed in like every other CLI
+# above. Unset means /muse-usage answers disabled rather than guessing where
+# the keys live. The map spans vaults under different reader identities, which
+# is why the reader is a helper rather than one vault call.
+MUSE_KEYS_BIN = os.environ.get("AIRLOCK_MUSE_KEYS_BIN", "").strip()
+# Overridable only so the fixture can point the fetch at loopback. Production
+# is always https://opencode.ai; the /zen/go/v1 path is appended by the fetch.
+MUSE_USAGE_URL = os.environ.get("AIRLOCK_MUSE_USAGE_URL", "").strip() or "https://opencode.ai"
+# The Muse key assignment sheet (REGISTRY): a file path or an http(s) URL the
+# taskboard server serves, read through the same file-or-URL seam as the usage
+# store. Empty means no sheet: the picker offers nothing rather than risking two
+# boxes on one key, and says the sheet is why.
+MUSE_REGISTRY = os.environ.get("AIRLOCK_MUSE_REGISTRY", "").strip()
+# This box's name for the held-by-other filter and the cho-only screen rule.
+# Deployment state, not source: the installer may export it, otherwise the box's
+# own short hostname — a machine fact, not a guessed path.
+MUSE_BOX = os.environ.get("AIRLOCK_BOX_NAME", "").strip() \
+    or socket.gethostname().split(".")[0]
+# The cho-only vault item, by the title both merged fixtures already use
+# (OPENCODE_CHO_API_KEY in MUSE_USAGE's and MUSE_ROTATE's tests). Shown only
+# where AIRLOCK_MUSE_CHO_VISIBLE=1 — set by the installer on the cho reader
+# box alone —
+# and swappable only where the local helper actually holds its value.
+MUSE_CHO_ITEM = "OPENCODE_CHO_API_KEY"
+MUSE_CHO_VISIBLE = os.environ.get("AIRLOCK_MUSE_CHO_VISIBLE", "").strip() == "1"
+# A window read at 100% used is exhausted, not a candidate. Same constant as
+# bin/airlock-accounts' MUSE_SWAP_MAX_USED; install/test-muse-swap.py pins both.
+MUSE_SWAP_MAX_USED = 100
 
 # The platform nginx surface widens exactly four GETs for a configured fleet identity
 # domain. It overwrites these headers before proxying so this loopback service can
@@ -813,6 +843,31 @@ def _codex_auth_call(action, timeout):
     return payload, None
 
 
+def _codex_relogin_sweep():
+    """Best-effort TTL recovery for an abandoned Codex device-auth.
+
+    The browser and the popup may both be closed, so nothing will ever call
+    login-cancel for that attempt. The next poll of a Codex route is what notices:
+    the CLI owns the pending record and the TTL, this only asks it to run. A sweep
+    failure never fails the request it rode along with; a recovery-failed verdict is
+    written to stderr (state names only, never credential material) so it is not
+    silent either.
+    """
+    if not (ACCOUNTS_BIN and os.path.isfile(ACCOUNTS_BIN)):
+        return
+    try:
+        proc = subprocess.run([ACCOUNTS_BIN, "codex-auth", "login-sweep", "--json"],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=15, check=False)
+        payload = json.loads((proc.stdout or b"").decode("utf-8"))
+        if (isinstance(payload, dict) and payload.get("state") == "recovery-failed"):
+            sys.stderr.write("airlock-accounts-api: Codex relogin TTL lapsed but "
+                             "the previous login could not be restored (%s)\n"
+                             % (payload.get("error") or "unknown"))
+    except Exception:
+        pass
+
+
 def _codex_login_start():
     """Codex re-login 1/2 — the platform CLI starts `codex login --device-auth`.
 
@@ -1352,6 +1407,355 @@ def _agy_usage_payload():
     return out
 
 
+# ---- Muse Spark usage ------------------------------------------------------
+# The keys are API keys in 1Password (one per person, fixed — never auto-rotated),
+# read through GET https://opencode.ai/zen/go/v1/usage with `Authorization: Bearer`.
+# Measured 2026-09-23: {"usage": {"rolling"|"weekly"|"monthly":
+# {"status": str, "percent": int-used, "resetsAt": str-ISO}}}.
+# Reads happen per request only — no background poll (2026-09-20 owner decision:
+# usage is read when the panel opens, never on a timer).
+MUSE_TIMEOUT = 10
+MUSE_MAX_KEYS = 32
+MUSE_WINDOWS = ("rolling", "weekly", "monthly")
+# A sequential vault read of six keys measured ~13s on the reference box
+# (2026-09-23: five secret reads ~1.8s each plus one brokered read ~3.5s), so the helper gets a generous ceiling.
+# The helper itself should read in parallel; this bound is only the fail-closed.
+MUSE_KEYS_TIMEOUT = 30
+
+
+def _muse_account(item):
+    """The name the team calls the key by: the vault item's middle segment.
+
+    OPENCODE_FINANCE_API_KEY -> finance. Anything outside that shape keeps its
+    full name lowercased rather than being guessed into a collision.
+    """
+    core = item.strip()
+    if core.upper().startswith("OPENCODE_"):
+        core = core[len("OPENCODE_"):]
+    for suffix in ("_API_KEY", "_KEY"):
+        if core.upper().endswith(suffix) and len(core) > len(suffix):
+            core = core[:-len(suffix)]
+            break
+    return core.strip().lower() or item.strip().lower()
+
+
+def _muse_keys():
+    """The current {item: key-or-None} map from the helper, or {}.
+
+    stderr is dropped, not captured: it can carry item names, and like the
+    status probe this process must not put them in a journal. Values cross on
+    the pipe only and are never logged or returned. stdout is read capped
+    (64 KiB) inside a bounded worker so a broken helper can neither balloon
+    this process nor stall the route; an item whose value is missing or not a
+    string stays in the map as None and becomes an err entry rather than
+    silently disappearing from the list.
+    """
+    if not (MUSE_KEYS_BIN and os.path.isfile(MUSE_KEYS_BIN)):
+        return {}
+    box = {}
+
+    def run():
+        try:
+            # Explicit interpreter, like AGY_USAGE_PROBE: the helper is
+            # committed 100644 (the cutline allows a new regular file but not
+            # a new executable bit), so it is never exec'd directly.
+            proc = subprocess.Popen([sys.executable, MUSE_KEYS_BIN],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            box["rc"] = -1
+            return
+        try:
+            box["out"] = proc.stdout.read(65537)
+        except OSError:
+            box["out"] = b""
+        finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        box["rc"] = proc.returncode
+
+    worker = threading.Thread(target=run, daemon=True, name="muse-keys-read")
+    worker.start()
+    worker.join(timeout=MUSE_KEYS_TIMEOUT)
+    if worker.is_alive() or box.get("rc") != 0:
+        return {}
+    out = box.get("out") or b""
+    if len(out) > 65536:
+        return {}
+    try:
+        raw = json.loads(out.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    keys = {}
+    for item, key in sorted(raw.items()):
+        if not isinstance(item, str) or not item.strip():
+            continue
+        item = item.strip()
+        keys[item] = key if isinstance(key, str) and key else None
+        if len(keys) >= MUSE_MAX_KEYS:
+            break
+    return keys
+
+
+class _MuseNoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects instead of following them.
+
+    urllib re-sends Authorization to wherever a redirect points; a compromised
+    or misconfigured endpoint (or proxy) answering 302 would otherwise turn one
+    /muse-usage request into six key exfiltrations. A redirect is a provider
+    outage from this surface's view, and the key becomes an err entry.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _muse_fetch(key):
+    """GET <base>/zen/go/v1/usage with one key. Returns (raw, err)."""
+    url = MUSE_USAGE_URL.rstrip("/") + "/zen/go/v1/usage"
+    try:
+        # A User-Agent is required, not cosmetic: the endpoint's fronting WAF
+        # answers the stdlib default with 403 (measured 2026-09-23), which would
+        # otherwise misclassify every key as unreadable.
+        req = urllib.request.Request(
+            url, headers={"Authorization": "Bearer " + key,
+                          "User-Agent": "airlock-accounts-api"})
+        opener = urllib.request.build_opener(_MuseNoRedirect)
+        with opener.open(req, timeout=MUSE_TIMEOUT) as r:
+            if r.status != 200:
+                return None, "usage query failed"
+            raw = json.loads(r.read(65536).decode("utf-8"))
+    except Exception:
+        # Fixed sentence only: a body fragment here could carry provider text
+        # worth misreading, and the type never reaches the response anyway.
+        return None, "usage query failed"
+    return raw, None
+
+
+def _muse_window(raw):
+    """One window as (percent, resetAt), or None. status passes through as read."""
+    if not isinstance(raw, dict):
+        return None
+    status = raw.get("status")
+    percent = raw.get("percent")
+    reset_at = raw.get("resetsAt")
+    if not isinstance(status, str) or not status:
+        return None
+    if isinstance(percent, bool) or not isinstance(percent, int):
+        return None
+    if not 0 <= percent <= 100:
+        return None
+    if not isinstance(reset_at, str) or not reset_at:
+        return None
+    return status, percent, reset_at
+
+
+def _muse_entry(item, raw, observed_at):
+    """One uniform entry. Anything unreadable is 확인 불가: empty limits with err,
+    never a fabricated 0% — MUSE_ROTATE treats err != null as inactive."""
+    base = {"provider": "muse", "account": _muse_account(item),
+            "observedAt": observed_at}
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(usage, dict):
+        return {**base, "limits": [], "err": "usage query failed"}
+    limits = []
+    for window in MUSE_WINDOWS:
+        parsed = _muse_window(usage.get(window))
+        if parsed is None:
+            return {**base, "limits": [], "err": "usage query failed"}
+        _, percent, reset_at = parsed
+        limits.append({"window": window, "percent": percent, "resetAt": reset_at})
+    return {**base, "limits": limits, "err": None}
+
+
+def _muse_usage_payload():
+    """`GET /muse-usage` — one entry per vault key, fetched live per request.
+
+    Fetched in parallel threads (six keys against one provider endpoint). The
+    route answers inside one overall deadline no matter how many keys stall: a
+    key with no answer by then is an err entry. Threads that outlive the
+    response are daemons holding only in-memory values — never logged — and
+    finish on their own.
+    """
+    if not (MUSE_KEYS_BIN and os.path.isfile(MUSE_KEYS_BIN)):
+        return {"enabled": False, "entries": []}
+    keys = _muse_keys()
+    observed_at = int(time.time())
+    results = {}
+    lock = threading.Lock()
+
+    def one(item, key):
+        raw = None
+        if key is not None:
+            fetched, err = _muse_fetch(key)
+            raw = fetched if err is None else None
+        with lock:
+            results[item] = _muse_entry(item, raw, observed_at)
+
+    threads = [threading.Thread(target=one, args=(item, key), daemon=True,
+                                name="muse-usage-fetch")
+               for item, key in keys.items()]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + MUSE_TIMEOUT + 5
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    with lock:
+        return {"enabled": True,
+                "entries": [results.get(item, _muse_entry(item, None, observed_at))
+                            for item in keys]}
+
+
+def _muse_item_title(key):
+    """Join key for the vault map and the assignment sheet: an op:// address
+    contributes its item segment, a bare helper name contributes itself."""
+    core = key.strip() if isinstance(key, str) else ""
+    if core.startswith("op://"):
+        parts = core.split("/")
+        if len(parts) >= 4 and parts[3]:
+            return parts[3]
+    return core
+
+
+def _muse_registry():
+    """The assignment sheet as {title: holder}, or None when it cannot be read.
+
+    The sheet carries no values by design (REGISTRY), so reading it needs no
+    guard beyond shape: anything but a non-empty string map is unusable, and an
+    unusable sheet offers nothing rather than risking two boxes on one key.
+    """
+    if not MUSE_REGISTRY:
+        return None
+    raw = None
+    if MUSE_REGISTRY.startswith(("http://", "https://")):
+        try:
+            with urllib.request.urlopen(MUSE_REGISTRY, timeout=6) as r:
+                raw = json.load(r)
+        except Exception:
+            return None
+    else:
+        try:
+            with open(MUSE_REGISTRY, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    sheet = {}
+    for key, holder in raw.items():
+        if (not isinstance(key, str) or not isinstance(holder, str)
+                or not _muse_item_title(key) or not holder.strip()):
+            return None
+        sheet[_muse_item_title(key)] = holder.strip()
+    return sheet
+
+
+def _muse_live_key():
+    """The live opencode-go key value, or None. Read for in-memory compare only."""
+    auth_path = (os.environ.get("AIRLOCK_OPENCODE_AUTH_JSON", "").strip()
+                 or os.path.join(os.environ.get("XDG_DATA_HOME", "").strip()
+                                 or os.path.join(os.path.expanduser("~"), ".local", "share"),
+                                 "opencode", "auth.json"))
+    try:
+        with open(auth_path, encoding="utf-8") as f:
+            live = json.load(f)
+        key = live.get("opencode-go", {}).get("key")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return key if isinstance(key, str) and key else None
+
+
+def _muse_swap_candidates():
+    """`GET /muse-swap-candidates` — what the manual picker may offer.
+
+    Always 200: an unconfigured helper, an unreadable sheet and an unreadable
+    key are picker states (disabled/hidden/blocked pill), never transport
+    failures. Held-by-other keys and the cho-only key (off its box) are
+    omitted, not disabled — offering them as clickable-then-refused would be a
+    trap, and the fleet matrix already shows the whole pool. Key values never
+    leave this process: eligibility is computed on them, only names and numbers
+    cross HTTP.
+    """
+    if not (MUSE_KEYS_BIN and os.path.isfile(MUSE_KEYS_BIN)):
+        return {"enabled": False, "box": MUSE_BOX, "active": None,
+                "choVisible": False, "sheet": "not-configured", "candidates": []}
+    keys = _muse_keys()
+    sheet = _muse_registry()
+    sheet_state = ("ok" if sheet is not None
+                   else ("not-configured" if not MUSE_REGISTRY else "unavailable"))
+    if sheet is None:
+        # Fail closed: without the sheet no box can prove a key is held by no
+        # one else, so nothing is offered. The picker words the sheet state as
+        # the blocked reason rather than an empty screen.
+        return {"enabled": True, "box": MUSE_BOX, "active": None,
+                "choVisible": MUSE_CHO_VISIBLE, "sheet": sheet_state,
+                "candidates": []}
+    live = _muse_live_key()
+    active = None
+    if live is not None:
+        for item, value in keys.items():
+            if isinstance(value, str) and value and value == live:
+                # Title first: the display name must match what the swap core
+                # reports (bin/airlock-accounts derives from the item segment,
+                # while _muse_account below only knows bare helper names).
+                active = _muse_account(_muse_item_title(item) or item)
+                break
+    cho_title = _muse_item_title(MUSE_CHO_ITEM)
+    observed_at = int(time.time())
+    fetched = {}
+    lock = threading.Lock()
+
+    def one(item, key):
+        raw = None
+        if key is not None:
+            got, err = _muse_fetch(key)
+            raw = got if err is None else None
+        with lock:
+            # The entry's account comes from the title so an op:// helper key
+            # lands on the same display name the swap core reports.
+            fetched[item] = _muse_entry(_muse_item_title(item) or item, raw, observed_at)
+
+    threads = [threading.Thread(target=one, args=(item, key), daemon=True,
+                                name="muse-swap-fetch")
+               for item, key in keys.items()]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + MUSE_TIMEOUT + 5
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    candidates = []
+    with lock:
+        for item in keys:
+            if _muse_item_title(item) == cho_title and not MUSE_CHO_VISIBLE:
+                continue
+            holder = sheet.get(_muse_item_title(item))
+            if holder is not None and holder != MUSE_BOX:
+                continue
+            entry = fetched.get(item, _muse_entry(_muse_item_title(item) or item,
+                                                  None, observed_at))
+            if entry.get("err") is not None:
+                eligible, reason = False, "unreadable"
+            elif any(window.get("percent", 0) >= MUSE_SWAP_MAX_USED
+                     for window in entry.get("limits", [])):
+                eligible, reason = False, "exhausted"
+            else:
+                eligible, reason = True, "ok"
+            candidates.append({"account": entry["account"], "item": item,
+                               "limits": entry["limits"], "err": entry["err"],
+                               "eligible": eligible, "reason": reason})
+    return {"enabled": True, "box": MUSE_BOX, "active": active,
+            "choVisible": MUSE_CHO_VISIBLE, "sheet": sheet_state,
+            "candidates": candidates}
+
+
 def _live_usage_cached():
     """The active account's own 5h/7d reading, cached for LIVE_USAGE_TTL."""
     with _cache_lock:
@@ -1658,6 +2062,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/codex-status":
             # Local-only Codex identity (auth.json id_token): the panel's first paint.
+            # Sweep first: this poll is what recovers an abandoned re-login after its
+            # TTL when the browser and the popup are both already closed.
+            _codex_relogin_sweep()
             status, payload = _probe(["--codex"])
             self._send(status, payload)
             return
@@ -1684,6 +2091,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/agy-usage":
             self._send(200, _agy_usage_payload())
+            return
+        if self.path == "/muse-usage":
+            self._send(200, _muse_usage_payload())
+            return
+        if self.path == "/muse-swap-candidates":
+            self._send(200, _muse_swap_candidates())
             return
         if self.path == "/claude-usage-store":
             self._send(200, _fetch_fleet_store() if FLEET_STORE else {})
@@ -1777,6 +2190,43 @@ class Handler(BaseHTTPRequestHandler):
         payload = _secret_cli("del", name=name)
         self._send(_secret_status(payload), payload)
 
+    def _serve_muse_swap(self):
+        """POST /muse-swap — the manual key swap the picker drives.
+
+        The item name is the only thing that crosses HTTP; the CLI resolves the
+        value, verifies the candidate and commits backup -> verify -> commit.
+        Its JSON carries the step list (empty when the tool ran without machine
+        output, as in the retirement probe); a refusal is 400 with the steps
+        that did run, so the caller can see commit never did.
+        """
+        if not self._guarded():
+            return
+        body = self._json_body() or {}
+        item = body.get("item")
+        if not isinstance(item, str) or not item.strip() or len(item) > 256:
+            self._send(400, {"ok": False, "error": "not a key name", "steps": []})
+            return
+        ok, out, err = _cli(["muse-swap", item.strip(), "--json"])
+        result = {}
+        if out:
+            try:
+                parsed = json.loads(out)
+                result = parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                result = {}
+        steps = result.get("steps")
+        steps = steps if isinstance(steps, list) else []
+        if ok:
+            account = result.get("account")
+            self._send(200, {"ok": True,
+                             "account": account if isinstance(account, str) else None,
+                             "steps": steps, "needsRestart": True})
+            return
+        detail = result.get("error")
+        error = (detail[:200] if isinstance(detail, str) and detail
+                 else (err or out or "the swap failed")[:200])
+        self._send(400, {"ok": False, "error": error, "steps": steps})
+
     def do_POST(self):  # noqa: N802
         if not self._platform_ingress_allowed():
             return
@@ -1816,6 +2266,10 @@ class Handler(BaseHTTPRequestHandler):
             # invalidation the previous step said would land here when /codex-usage
             # arrived; it has.
             _invalidate_codex_usage_cache()
+            # A stale attempt's backup must be recovered before a new backup
+            # overwrites it. The CLI sweeps internally too; this covers a server
+            # that has been up since before the attempt lapsed.
+            _codex_relogin_sweep()
             if self.path == "/codex-login-start":
                 status, payload = _codex_login_start()
             else:
@@ -1886,6 +2340,9 @@ class Handler(BaseHTTPRequestHandler):
                     _invalidate_acct_caches()
                 self._send(200 if ok else 400,
                            {"ok": ok} if ok else {"ok": False, "error": (err or out)[:200]})
+            return
+        if self.path == "/muse-swap":
+            self._serve_muse_swap()
             return
         self._not_found()
 

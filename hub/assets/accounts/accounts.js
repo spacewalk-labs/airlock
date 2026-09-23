@@ -16,6 +16,13 @@
  *   gate and from the same directory. That is why the devterm gate aliases this file
  *   rather than the hub serving it at its own origin — until the surface moves.
  * Load order: before panel.html's inline host; the panel calls this factory.
+ *
+ * Shell (POPUP_SHELL, 2026-09-23): four collapsed sections with one-line headers
+ *   (who · how much · next reset) plus an action-needed summary line. Only Claude
+ *   starts expanded. Login-type work runs as guided flows (ready → approve → check →
+ *   done) inside its own section, and a saved-account switch runs as an inline
+ *   confirm strip → progress → done card — the popup/panel never closes underneath.
+ *   Unread slots read 「확인 중」; every user-visible string is Korean.
  */
 window.initAccounts = function initAccounts(deps) {
   // Where the account API answers. Every fetch below is same-origin to the page that
@@ -81,30 +88,29 @@ function rtLeft(a) {   // days left (fractional) · null if unknown
   return a && a.rtExpiry ? (a.rtExpiry - Date.now()) / 86400000 : null;
 }
 function rtWarnText(d) {
-  if (d <= 0) return '⚠ Expired · re-login';
-  if (d < 1) return '⚠ Expires today · re-login';
-  return '⚠ Expires in ' + Math.floor(d) + ' days · re-login';
+  if (d <= 0) return '⚠ 만료됨 · 다시 로그인';
+  if (d < 1) return '⚠ 오늘 만료 · 다시 로그인';
+  return '⚠ ' + Math.floor(d) + '일 뒤 만료 · 다시 로그인';
 }
 function acctTipText(u, a) {
   const L = [];
   if (u.use5h == null && u.use7d == null) {
-    L.push(u.err === 'no data' ? 'Collecting usage\n(every minute)'
-         : u.err === 'no store' ? 'No shared usage store is configured,\n'
-             + 'so only the active account can be read here.'
-         : 'Query failed\n' + (u.err || '?'));
+    L.push(u.err === 'no data' ? '사용량 수집 중\n(1분마다)'
+         : u.err === 'no store' ? '공유 사용량 저장소가 없어\n여기서는 사용 중인 계정만 읽힙니다.'
+         : '조회 실패\n' + (u.err || '?'));
   } else {
-    L.push('5h↻ ' + (u.reset5h ? fmtReset(u.reset5h, false) : '—') +
-           '\n7d↺ ' + (u.reset7d ? fmtReset(u.reset7d, true) : '—') +
-           (u.stale ? '\n(last value)' : ''));
+    L.push('5시간↻ ' + (u.reset5h ? fmtReset(u.reset5h, false) : '—') +
+           '\n주간↺ ' + (u.reset7d ? fmtReset(u.reset7d, true) : '—') +
+           (u.stale ? '\n(마지막 값)' : ''));
   }
   // who holds it = the shared store's holders. Using the same account in two places burns 5h twice as fast.
   const h = (a && a.holders) || [];
-  if (h.length) L.push('In use by\n' + h.map(function (x) { return '· ' + x.who; }).join('\n'));
+  if (h.length) L.push('사용 중\n' + h.map(function (x) { return '· ' + x.who; }).join('\n'));
   const d = rtLeft(a);
   if (d != null) {
     L.push(d <= rtWarnDays()
-      ? rtWarnText(d) + '\n(expiry is fixed ~30 days after login —\n it does not extend with use)'
-      : 'Login expires in ' + Math.floor(d) + ' days');
+      ? rtWarnText(d) + '\n(만료일은 로그인 뒤 약 30일로 고정 —\n써도 늘어나지 않습니다)'
+      : '로그인 만료까지 ' + Math.floor(d) + '일');
   }
   return L.join('\n\n');
 }
@@ -156,61 +162,118 @@ function showAcctTip(e, u, a) {
   placeAcctTip(e);
 }
 
-// Load the pool from the backend (/accounts) into a popup (left = account, right = 5h/7d usage).
-// Selecting one runs `claude-switch swap <name>` server-side. No secrets (plan, health, usage% only).
-// Add account = completed inside the popup: the backend runs login-url/login-code; the human just
-// approves the link and pastes the returned code.
-function startAddAcct(list, addBtn, reflow) {
-  postJson(API + 'acct-login-url', {}).then(function (res) {
-    if (!res || !res.ok || !res.url) {
-      addBtn.disabled = false; addBtn.textContent = '+ Add account (login)';
-      flash('Failed to issue login link' + (res && res.error ? ': ' + res.error : ''), 3000); return;
-    }
-    addBtn.remove();
-    const hd = document.createElement('div'); hd.className = 'hd';
-    hd.textContent = '(1) Approve the link -> (2) paste the code';
-    const a = document.createElement('a'); a.className = 'acct-link';
-    a.href = res.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-    a.textContent = '🔗 Open in browser to log in / approve';
-    const form = document.createElement('div'); form.className = 'addform';
-    const inp = document.createElement('input');
-    inp.type = 'text'; inp.placeholder = 'Code from the approval'; inp.autocomplete = 'off'; inp.spellcheck = false;
-    const go = document.createElement('button'); go.textContent = 'Register';
-    const submit = function () {
-      const code = inp.value.trim();
-      if (!code) { inp.focus(); return; }
-      go.disabled = true; inp.disabled = true; go.textContent = 'Registering…';
-      postJson(API + 'acct-login-code', { code: code }).then(function (r) {
-        if (r && r.ok) { closeTabPops(); flash('✓ ' + (r.msg || 'Account registered'), 4000); refreshAcctIcon(); mkFocus(); }
-        else {
-          go.disabled = false; inp.disabled = false; go.textContent = 'Register'; inp.value = '';
-          // the code is one-time and short-lived -> on failure, start from the link again. Surface the reason.
-          flash('Registration failed' + (r && r.error ? ': ' + r.error : '') + ' — press the link again for a new code', 6000);
-        }
-      }).catch(function () {
-        go.disabled = false; inp.disabled = false; go.textContent = 'Register';
-        flash('Registration request failed', 2500);
-      });
-    };
-    go.onclick = submit;
-    inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
-    form.appendChild(inp); form.appendChild(go);
-    list.appendChild(hd); list.appendChild(a); list.appendChild(form);
-    if (reflow) reflow();          // the link/form change the height -> re-place
-    inp.focus();
-  }).catch(function () {
-    addBtn.disabled = false; addBtn.textContent = '+ Add account (login)';
-    flash('Login link request failed', 2500);
-  });
+// ---- small DOM helpers (the shell below is built from these) ----
+function mk(tag, cls, text) {
+  const e = document.createElement(tag || 'div');
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
 }
+function mkBtn(label, cls, fn) {
+  const b = mk('button', cls || '', label);
+  b.addEventListener('pointerdown', function (e) { e.preventDefault(); });
+  if (fn) b.onclick = function (e) { e.stopPropagation(); fn(); };
+  return b;
+}
+function mkBtnRow() {
+  const d = mk('div', 'codex-btns');
+  for (let i = 0; i < arguments.length; i++) if (arguments[i]) d.appendChild(arguments[i]);
+  return d;
+}
+// per-list shell state. One list = one popup opening or one panel render.
+function newShellState() {
+  return {
+    expand: { claude: true, codex: false, agy: false, muse: false },
+    flow: null,                       // {sec, kind, step, ...} — one guided flow at a time
+    claude: null, codex: null, codexUsage: null, agy: null, muse: null,
+  };
+}
+function activeClaude(st) {
+  const list = (st.claude && st.claude.accounts) || [];
+  return list.find(function (a) { return a.active; }) || null;
+}
+// "how much" for a Claude usage pair. Unread slots read 확인 중 — never 0%, never blank.
+function claudeUsageText(u) {
+  u = u || {};
+  if (u.use5h == null && u.use7d == null) {
+    if (u.err === 'no data') return '수집 중\n(1분 이내)';
+    if (u.err === 'no store') return '사용량 출처\n없음';
+    if (u.err) return '확인 실패\n' + u.err;
+    return '확인 중';
+  }
+  return '5시간 ' + (u.use5h == null ? '—' : u.use5h + '%') +
+       '\n주간 ' + (u.use7d == null ? '—' : u.use7d + '%');
+}
+
+// ---- one-line headers: who · how much · next reset ----
+function claudeHead(st) {
+  const j = st.claude;
+  if (!j) return 'Claude · 확인 중';
+  if (j.enabled === false) return 'Claude · 이 앱에서는 전환 꺼짐';
+  const list = j.accounts || [];
+  const a = activeClaude(st);
+  if (!a) return 'Claude · 계정 ' + list.length + '개 · 사용 중 없음';
+  const u = a.usage || {};
+  const much = (u.use5h == null && u.use7d == null)
+    ? '확인 중'
+    : '5시간 ' + (u.use5h == null ? '—' : u.use5h + '%') +
+      ' · 주간 ' + (u.use7d == null ? '—' : u.use7d + '%');
+  const reset = u.reset5h ? ' · 다음 초기화 ' + fmtReset(u.reset5h, false) : '';
+  return 'Claude · 사용 중 ' + (a.email || a.name) + ' · ' + much + reset + ' · 계정 ' + list.length + '개';
+}
+function codexHead(st) {
+  const cx = st.codex;
+  if (!cx) return 'Codex · 확인 중';
+  if (cx.state === 'pending') return 'Codex · 로그인 진행 중';
+  if (cx.state !== 'ok') return 'Codex · 로그인 필요';
+  const u = st.codexUsage || {};
+  const much = u.codexUse7d == null ? '확인 중' : '주간 ' + u.codexUse7d + '%';
+  const reset = u.codexReset7d ? ' · ' + fmtReset(u.codexReset7d, true) + ' 초기화' : '';
+  if (u.codexErr === 'auth') return 'Codex · 로그인 해제됨 · 다시 로그인';
+  return 'Codex · 로그인됨 ' + (cx.email || '') + ' · ' + much + reset;
+}
+function agyHead(st) {
+  const u = st.agy;
+  if (!u) return 'Gemini · 확인 중';
+  const acc = u.account || '';
+  const gs = u.groups || [];
+  if (!acc && !gs.length) {
+    if (u.refreshing) return 'Gemini · 읽는 중…';
+    return 'Gemini · 아직 읽은 값 없음';
+  }
+  let worst5 = null, worst7 = null;
+  gs.forEach(function (g) {
+    const w5 = Math.max(0, Math.round(100 - g.fiveHourRemaining));
+    const w7 = Math.max(0, Math.round(100 - g.weeklyRemaining));
+    worst5 = worst5 == null ? w5 : Math.max(worst5, w5);
+    worst7 = worst7 == null ? w7 : Math.max(worst7, w7);
+  });
+  const much = worst5 == null ? '확인 중' : '5시간 ' + worst5 + '% · 주간 ' + worst7 + '%';
+  return 'Gemini · 사용 중 ' + (acc || '확인 중') + ' · ' + much + ' · 계정 ' + gs.length + '개';
+}
+// action-needed summary. Always rendered: calm days read 조치 필요 없음, not silence.
+function shellIssues(st) {
+  const out = [];
+  const cx = st.codex;
+  if (cx && cx.state === 'pending') out.push({ sec: 'codex', label: 'Codex 로그인 진행 중' });
+  else if (cx && cx.state !== 'ok' && cx.state !== 'unknown') out.push({ sec: 'codex', label: 'Codex 로그인 필요' });
+  else if (cx && cx.state === 'ok' && st.codexUsage && st.codexUsage.codexErr === 'auth')
+    out.push({ sec: 'codex', label: 'Codex 로그인 해제됨' });
+  const dead = ((st.claude && st.claude.accounts) || []).filter(function (a) {
+    return a.health && a.health.state === 'dead';
+  });
+  if (dead.length) out.push({ sec: 'claude', label: 'Claude 로그인 만료 ' + dead.length + '건' });
+  if (st.geminiUsageBad) out.push({ sec: 'gemini', label: 'Gemini 사용량 확인 불가' });
+  return out;
+}
+
 // ---- Codex (ChatGPT) — this box's single account. No pool/swap (Codex design) -> status + re-login + logout ----
 // Codex usage is read from /codex-usage, which spawns an app-server behind a cache, so
 // it is asked for separately from the identity (/claude-status) and only while the
 // section is open. The identity string guards against showing a previous account's
 // numbers: a reply that arrives after a logout/login is dropped.
 let _codexIdentity = null, _codexUsage = null, _codexViewGeneration = 0,
-    _codexOperationPending = false, _xaiOperationPending = false,
-    _xaiViewGeneration = 0;
+    _codexOperationPending = false;
 const CODEX_STALE_REASK_MS = 3000;
 function setCodexIdentity(cx) {
   const state = cx && cx.state ? cx.state : 'unknown';
@@ -231,35 +294,36 @@ function codexUsageView(u) {
     codexErr: u && (u.lastErr || u.err),
   };
 }
-function fetchCodexUsage(box, cx, identity, reflow, alive, reaskState, revalidate) {
+function fetchCodexUsage(st, paint, alive, reaskState, revalidate) {
+  const cx = st.codex, identity = _codexIdentity;
   alive = alive || function () { return true; };
   reaskState = reaskState || { scheduled: false };
-  if (!alive() || _codexIdentity !== identity) return;
+  if (!alive() || !cx || cx.state !== 'ok') return;
   const fetchOpts = { cache: 'no-store' };
   if (revalidate) fetchOpts.headers = { 'X-Airlock-Revalidate': 'wait' };
   fetch(API + 'codex-usage', fetchOpts).then(function (x) { return x.json(); }).then(function (u) {
-    if (!alive() || _codexIdentity !== identity) return;   // login state changed or section closed -> drop
+    if (!alive() || _codexIdentity !== identity) return;   // login state changed -> drop
     const hasValue = u && u.use7d != null;
-    if (hasValue && (cx.state !== 'ok' || !cx.accountId || !u.accountId || cx.accountId !== u.accountId)) {
+    if (hasValue && (!u.accountId || (cx.accountId && cx.accountId !== u.accountId))) {
       // numbers we cannot tie to the account we are showing are not displayed at all
       _codexUsage = null;
-      renderCodexBody(box, cx, { codexErr: 'account mismatch' });
+      st.codexUsage = { codexErr: 'account mismatch' };
     } else {
       _codexUsage = codexUsageView(u);
-      renderCodexBody(box, cx, _codexUsage);
+      st.codexUsage = _codexUsage;
     }
-    if (reflow) reflow();
+    paint();
     if (hasValue && u.stale && !reaskState.scheduled) {
       reaskState.scheduled = true;
       setTimeout(function () {
         if (!alive() || _codexIdentity !== identity) return;
-        fetchCodexUsage(box, cx, identity, reflow, alive, reaskState, true);
+        fetchCodexUsage(st, paint, alive, reaskState, true);
       }, CODEX_STALE_REASK_MS);
     }
   }).catch(function () {
     if (!alive() || _codexIdentity !== identity) return;
-    renderCodexBody(box, cx, { codexErr: 'query failed' });
-    if (reflow) reflow();
+    st.codexUsage = { codexErr: '확인 실패' };
+    paint();
   });
 }
 
@@ -268,132 +332,379 @@ function fetchCodexUsage(box, cx, identity, reflow, alive, reaskState, revalidat
 // to do so), so this paints the remembered numbers first and asks again until the
 // re-read is done. agy reports "remaining"; rows show "used" like every other section.
 const AGY_REASK_MS = 4000, AGY_REASK_MAX = 25;
-function renderAgySection(list, reflow, parentAlive) {
-  const box = document.createElement('div'); box.className = 'agy-box codex-box';
-  const sep = document.createElement('div'); sep.className = 'sep';
-  const hd = document.createElement('div'); hd.className = 'hd'; hd.textContent = 'Antigravity · this box';
-  const alive = function () { return (!parentAlive || parentAlive()) && document.body.contains(box); };
-  let tries = 0, shown = false;
-  const ask = function () {
-    fetch(API + 'agy-usage', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (u) {
-      if (!alive() && shown) return;
-      if (!u || u.enabled !== true) return;        // no agy on this box: no section at all
-      if (!shown) { list.appendChild(sep); list.appendChild(hd); list.appendChild(box); shown = true; }
-      renderAgyBody(box, u); if (reflow) reflow();
-      if (u.refreshing && ++tries <= AGY_REASK_MAX) setTimeout(function () { if (alive()) ask(); }, AGY_REASK_MS);
-    }).catch(function () {
-      if (shown && alive()) { box.textContent = 'Antigravity quota query failed'; if (reflow) reflow(); }
-    });
-  };
-  ask();
+function fetchAgy(st, paint, alive, tries) {
+  tries = tries || 0;
+  fetch(API + 'agy-usage', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (u) {
+    if (!alive()) return;
+    if (!u || u.enabled !== true) { st.agy = { enabled: false }; paint(); return; }
+    st.agy = u;
+    st.geminiUsageBad = !!u.lastErr;
+    paint();
+    if (u.refreshing && tries < AGY_REASK_MAX) {
+      setTimeout(function () { if (alive()) fetchAgy(st, paint, alive, tries + 1); }, AGY_REASK_MS);
+    }
+  }).catch(function () {
+    if (!alive()) return;
+    if (!st.agy) { st.agyFailed = true; paint(); }
+  });
 }
-function renderAgyBody(box, u) {
+function renderAgyBody(box, u, onReask) {
   box.textContent = '';
-  const head = document.createElement('div'); head.className = 'codex-row';
-  const nm = document.createElement('span'); nm.className = 'nm';
-  const pl = document.createElement('span'); pl.className = 'pl';
-  nm.textContent = u.account || (u.refreshing ? 'reading…' : 'no reading yet');
+  const head = mk('div', 'codex-row');
+  const nm = mk('span', 'nm', u.account || (u.refreshing ? '읽는 중…' : '아직 읽은 값 없음'));
   if (!u.account) nm.style.color = C_GRAY;
+  const pl = mk('span', 'pl');
   const bits = [];
-  if (u.age != null) bits.push(u.age < 60 ? 'just now' : Math.round(u.age / 60) + ' min ago');
-  if (u.refreshing) bits.push('refreshing…');
-  else if (u.lastErr) bits.push('last read failed: ' + u.lastErr);
+  if (u.age != null) bits.push(u.age < 60 ? '방금' : Math.round(u.age / 60) + '분 전');
+  if (u.refreshing) bits.push('다시 읽는 중…');
+  else if (u.lastErr) bits.push('마지막 읽기 실패: ' + u.lastErr);
   pl.textContent = bits.join(' · ');
   head.appendChild(nm); head.appendChild(pl); box.appendChild(head);
+  if (!u.account && !u.refreshing) {
+    // AGY_SWAP ① RED: agy offers no login/switch path, so this section stays
+    // read-only. When there is no reading, say the one true thing: a human
+    // signs in by running agy in a terminal on this box. (Wording owned by
+    // AGY_SWAP — kept verbatim so its gate keeps passing.)
+    const hint = mk('div', 'codex-row', 'Manual login only — run agy in a terminal on this box and sign in with Google.');
+    hint.style.color = C_GRAY;
+    box.appendChild(hint);
+  }
   (u.groups || []).forEach(function (g) {
-    const row = document.createElement('div'); row.className = 'codex-row';
-    const gn = document.createElement('span'); gn.className = 'nm';
-    const gp = document.createElement('span'); gp.className = 'pl';
+    const row = mk('div', 'codex-row');
+    const gn = mk('span', 'nm'), gp = mk('span', 'pl');
     const used5 = Math.max(0, Math.round(100 - g.fiveHourRemaining));
     const used7 = Math.max(0, Math.round(100 - g.weeklyRemaining));
     const name = String(g.name || '').replace(/ MODELS$/, '').toLowerCase().replace(/\b\w/g, function (c) { return c.toUpperCase(); });
-    gn.textContent = name + ' · 5h ' + used5 + '% · 7d ' + used7 + '%';
+    gn.textContent = name + ' · 5시간 ' + used5 + '% · 주간 ' + used7 + '%';
     gn.style.color = levelColor(Math.max(usageLevel('5h', used5), usageLevel('7d', used7)));
-    gp.textContent = 'resets ' + fmtReset(new Date(g.fiveHourResetAt * 1000).toISOString()) +
-      ' / ' + fmtReset(new Date(g.weeklyResetAt * 1000).toISOString(), true);
+    gp.textContent = fmtReset(new Date(g.fiveHourResetAt * 1000).toISOString()) +
+      ' / ' + fmtReset(new Date(g.weeklyResetAt * 1000).toISOString(), true) + ' 초기화';
     row.appendChild(gn); row.appendChild(gp); box.appendChild(row);
   });
+  if (u.lastErr) {
+    box.appendChild(mk('div', 'dots', '로그인은 정상입니다 — 사용량만 읽지 못했습니다. 다시 로그인할 필요 없습니다.'));
+    box.appendChild(mkBtnRow(mkBtn('사용량 다시 읽기', '', function () { if (onReask) onReask(); })));
+  }
 }
 
-function renderCodexSection(list, reflow, parentAlive) {
-  _codexOperationPending = false;        // a newly opened/redrawn section owns new work
-  const sep = document.createElement('div'); sep.className = 'sep'; list.appendChild(sep);
-  const hd = document.createElement('div'); hd.className = 'hd'; hd.textContent = 'Codex (ChatGPT) · this box';
-  list.appendChild(hd);
-  const box = document.createElement('div'); box.className = 'codex-box'; box.textContent = 'Loading…';
-  list.appendChild(box);
-  const generation = ++_codexViewGeneration;
-  const alive = function () {
-    return generation === _codexViewGeneration
-      && (!parentAlive || parentAlive()) && document.body.contains(box);
-  };
-  const reaskState = { scheduled: false };
-  // /codex-status is this box's Codex login read from auth.json (email, plan, account
-  // id) — one file, no network. It used to be /claude-status here, which probes every
-  // Claude slot against the API first; the Codex row waited seconds for numbers that
-  // were on disk. Whether the login is still honoured is what the usage probe finds out
-  // right after (an `auth` error there turns the row into "sign-in revoked").
-  fetch(API + 'codex-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (cx) {
+// Muse key status (POPUP_SHELL rework). Current key only: the row shows the
+// three usage numbers or 확인 불가, never a candidate list and never a swap
+// button. Swapping lives in the fleet app now (it owns the picker and the
+// POST /muse-swap call); this shell keeps reading GET /muse-swap-candidates
+// so the numbers stay, but offers nothing to click. A swap can therefore never
+// originate here, so there is no swapped banner and no 교체 막힘 pill.
+function fetchMuse(st, paint, alive) {
+  fetch(API + 'muse-swap-candidates', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (m) {
     if (!alive()) return;
-    cx = (cx && cx.state) ? cx : { state: 'unknown' };
-    const identity = setCodexIdentity(cx);
-    renderCodexBody(box, cx, _codexUsage);       // cached numbers first (stay snappy)
-    if (reflow) reflow();          // the Codex section changes the height -> re-place
-    if (cx.state === 'ok') fetchCodexUsage(box, cx, identity, reflow, alive, reaskState);
+    st.muse = m && m.enabled === true ? m : { enabled: false };
+    paint();
   }).catch(function () {
     if (!alive()) return;
-    box.textContent = 'Codex status query failed'; if (reflow) reflow();
+    if (!st.muse) { st.museFailed = true; paint(); }
   });
 }
-function renderCodexBody(box, cx, usage) {
-  box.textContent = '';
-  const ok = cx.state === 'ok';
-  const row = document.createElement('div'); row.className = 'codex-row';
-  const nm = document.createElement('span'); nm.className = 'nm';
-  nm.textContent = ok ? (cx.email || '(logged in)')
-                      : (cx.state === 'none' ? 'Not logged in' : (cx.reason || cx.state));
-  if (!ok) nm.style.color = '#e6b34d';
-  const pl = document.createElement('span'); pl.className = 'pl';
-  pl.textContent = ok ? ((cx.plan ? cx.plan + ' · ' : '') + 'ChatGPT') : (cx.state === 'none' ? 'codex login required' : '');
-  row.appendChild(nm); row.appendChild(pl); box.appendChild(row);
-  if (ok) box.appendChild(codexUsageRow(usage));
-  const btns = document.createElement('div'); btns.className = 'codex-btns';
-  const relog = document.createElement('button'); relog.className = 'codex-btn';
-  relog.textContent = ok ? 'Re-login' : 'Log in';
-  relog.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-  relog.onclick = function () {
-    _codexOperationPending = true;
-    const generation = ++_codexViewGeneration;
-    startCodexLogin(box, relog, function () {
-      return generation === _codexViewGeneration && document.body.contains(box);
+function museHead(st) {
+  const m = st.muse;
+  if (!m) return 'Muse · 확인 중';
+  return 'Muse · 사용 중 ' + (m.active || '확인 불가');
+}
+function museLimitsText(entry) {
+  const order = ['rolling', 'weekly', 'monthly'];
+  const by = {};
+  (entry.limits || []).forEach(function (w) { by[w.window] = w.percent; });
+  return order.map(function (k) { return k + ' ' + by[k] + '%'; }).join(' · ');
+}
+function renderMuseBody(st, body, paint, alive) {
+  body.textContent = '';
+  const m = st.muse || {};
+  const head = mk('div', 'codex-row');
+  const nm = mk('span', 'nm', m.active ? ('현재 키: ' + m.active) : '현재 키 확인 불가');
+  if (!m.active) nm.style.color = C_GRAY;
+  head.appendChild(nm);
+  const ep = mk('span', 'pl');
+  const cur = (m.candidates || []).find(function (e) { return e.account === m.active; });
+  if (cur && !cur.err) {
+    ep.textContent = museLimitsText(cur);
+    const worst = Math.max.apply(null, (cur.limits || []).map(function (w) { return w.percent; }));
+    if (worst >= 100) ep.style.color = C_RED;
+  } else {
+    ep.textContent = '확인 불가';
+    ep.style.color = C_GRAY;
+  }
+  head.appendChild(ep); body.appendChild(head);
+  body.appendChild(mk('div', 'codex-row', '키 교체는 플릿 앱에서 한다'));
+}
+
+// ---- section bodies ----
+function renderClaudeBody(st, body, paint, alive) {
+  body.textContent = '';
+  const j = st.claude;
+  if (!j) { body.appendChild(mk('div', 'dots', '계정·사용량 확인 중…')); return; }
+  if (j.enabled === false) {
+    body.appendChild(mk('div', 'dots', '이 앱에서는 Claude 계정 전환이 꺼져 있습니다')); return;
+  }
+  const f = st.flow;
+  if (f && f.sec === 'claude' && f.kind === 'add') { renderClaudeAdd(st, body, paint, alive); return; }
+  (j.accounts || []).forEach(function (a) {
+    const dead = a.health && a.health.state === 'dead';
+    const u = a.usage || {};
+    const b = mkBtn('', 'acctrow' + (dead ? ' dead' : '') + (a.active ? ' active' : ''), null);
+    const L = mk('div', 'acct-l');
+    const nm = mk('span', 'nm', (a.active ? '✓ ' : dead ? '❌ ' : '') + (a.email || a.name));
+    const pl = mk('span', 'pl');
+    pl.textContent = dead ? (a.health.reason || '사용 불가')
+                          : (a.kind ? a.kind + ' · ' : '') + a.sub;
+    if (!dead && u.stale && (u.use5h != null || u.use7d != null)) pl.textContent += ' · (마지막 값)';
+    if (dead) b.title = a.health.reason || '';
+    const rtd = dead ? null : rtLeft(a);
+    if (rtd != null && rtd <= rtWarnDays()) {
+      const w = mk('span', '', ' · ' + rtWarnText(rtd));
+      w.style.color = rtd <= 2 ? C_RED : C_AMBER; w.style.fontWeight = '600';
+      pl.appendChild(w);
+    }
+    L.appendChild(nm); L.appendChild(pl);
+    const R = mk('div', 'acct-r');
+    if (dead) {
+      R.style.color = C_AMBER;
+      R.textContent = '다시 로그인';
+    } else if (u.use5h != null || u.use7d != null) {
+      R.style.color = usageColor(u.use5h, u.use7d);
+      R.textContent = '5시간 ' + (u.use5h == null ? '—' : u.use5h + '%') + '\n주간 ' + (u.use7d == null ? '—' : u.use7d + '%');
+    } else {
+      R.style.color = '#8a92a6';
+      R.textContent = claudeUsageText(u);
+    }
+    if (!dead) {
+      b.addEventListener('mouseenter', function (e) { showAcctTip(e, u, a); });
+      b.addEventListener('mousemove', placeAcctTip);
+      b.addEventListener('mouseleave', hideAcctTip);
+    }
+    b.appendChild(L); b.appendChild(R);
+    if (!a.active) {
+      const x = mk('span', 'acct-x', '✕');
+      x.title = '풀에서 이 계정 지우기';
+      x.addEventListener('pointerdown', function (e) { e.preventDefault(); e.stopPropagation(); });
+      x.addEventListener('click', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        const label = a.email || a.name;
+        if (!window.confirm('계정 지우기: ' + label + '\n\n풀에서 지웁니다.\n다시 로그인하면 같은 자리가 살아납니다. 계속할까요?')) return;
+        hideAcctTip();
+        postJson(API + 'acct-remove', { name: a.name }).then(function (res) {
+          if (res && res.ok) {
+            flash('🗑 ' + label + ' 지웠습니다', 2500);
+            st.claude = null; st.flow = null; paint(); fetchClaude(st, paint, alive);
+            refreshAcctIcon();
+          }
+          else flash('지우지 못했습니다' + (res && res.error ? ': ' + res.error : ''), 3500);
+        }).catch(function () { flash('지우기 요청이 닿지 않았습니다', 2000); });
+      });
+      b.appendChild(x);
+    }
+    b.onclick = function () {
+      if (dead) { startFlow(st, paint, 'claude', 'add', { relogin: a.email || a.name }); return; }
+      if (a.active) { flash('이미 사용 중입니다: ' + a.name, 1400); return; }
+      // A switch is confirm strip → progress → done, inline. The list is never
+      // closed or redrawn away underneath it (POPUP_SHELL).
+      st.flow = { sec: 'claude', kind: 'switch', step: 'confirm', target: a.name };
+      paint();
+    };
+    body.appendChild(b);
+    if (f && f.sec === 'claude' && f.kind === 'switch' && f.target === a.name) {
+      body.appendChild(renderSwitchCard(st, a, paint, alive));
+    }
+  });
+  const busy = !!(f && f.sec === 'claude');
+  const add = mkBtn('계정 추가', 'addacct', function () { startFlow(st, paint, 'claude', 'add', {}); });
+  if (busy) add.disabled = true;
+  body.appendChild(add);
+}
+
+// switch confirm strip → progress → done/fail. Never closes the list.
+function renderSwitchCard(st, a, paint, alive) {
+  const f = st.flow;
+  if (f.step === 'confirm') {
+    const c = mk('div', 'confirm-strip');
+    const t = mk('div', '', '');
+    const b = mk('span', '', ''); b.style.fontWeight = '700';
+    b.textContent = (a.email || a.name);
+    t.appendChild(b);
+    t.appendChild(mk('span', '', ' 로 전환 · 새 세션부터 적용 · 지금 돌아가는 세션은 그대로'));
+    c.appendChild(t);
+    c.appendChild(mkBtnRow(
+      mkBtn('전환', 'p', function () {
+        f.step = 'run'; paint();
+        postJson(API + 'acct-switch', { name: a.name }).then(function (res) {
+          if (!alive()) return;
+          if (res && res.ok) {
+            (st.claude.accounts || []).forEach(function (x) { x.active = (x.name === a.name); });
+            flash('✓ ' + (a.email || a.name) + ' 사용 중 (1분 안에 적용 · 바로 쓰려면 세션을 다시 시작하세요)', 3000);
+            refreshAcctIcon();
+            f.step = 'done';
+          } else {
+            f.step = 'fail'; f.why = (res && res.error) || '알 수 없는 실패';
+          }
+          paint();
+        }).catch(function () {
+          if (!alive()) return;
+          f.step = 'fail'; f.why = '요청이 닿지 않았습니다'; paint();
+        });
+      }),
+      mkBtn('취소', '', function () { st.flow = null; paint(); })));
+    return c;
+  }
+  if (f.step === 'run') return mk('div', 'prog', '⟳ ' + (a.email || a.name) + ' 로 전환 중…');
+  if (f.step === 'done') {
+    const c = mk('div', 'flow-done', '✓ ' + (a.email || a.name) + ' 사용 중 · 새 세션부터 적용');
+    c.appendChild(mkBtnRow(mkBtn('완료', 'p', function () { st.flow = null; paint(); })));
+    return c;
+  }
+  // fail
+  const c = mk('div', 'flow-fail');
+  c.appendChild(mk('div', '', '전환하지 못했습니다 — 기존 계정 그대로'));
+  c.appendChild(mk('div', 'mu', f.why || ''));
+  c.appendChild(mkBtnRow(
+    mkBtn('다시 로그인', 'p', function () { startFlow(st, paint, 'claude', 'add', { relogin: a.email || a.name }); }),
+    mkBtn('닫기', '', function () { st.flow = null; paint(); }),
+    mkBtn('진단 정보 복사', '', function () {
+      if (navigator.clipboard) navigator.clipboard.writeText('acct-switch ' + a.name + ': ' + (f.why || ''));
+      flash('진단 정보를 복사했습니다', 1500);
+    })));
+  return c;
+}
+
+// Claude add/re-login: ready → approve → check → done/fail. The live account is
+// untouched until the new code verifies (keep → verify → commit).
+function renderClaudeAdd(st, body, paint, alive) {
+  const f = st.flow, box = mk('div', 'flow');
+  const j = st.claude, active = activeClaude(st);
+  const cancel = mkBtn('취소', '', function () { st.flow = null; paint(); });
+  if (f.step === 'ready') {
+    box.appendChild(mk('div', 'step', '① 준비'));
+    box.appendChild(mk('div', '', f.relogin
+      ? '「' + f.relogin + '」 로그인을 되살립니다. 같은 자리로 돌아옵니다.'
+      : 'Claude 계정을 이 박스 풀에 추가합니다. 현재 계정(' + (active ? (active.email || active.name) : '없음') + ')은 바뀌지 않습니다.'));
+    box.appendChild(mk('div', 'mu', '브라우저에서 한 번 승인하면 그 뒤로는 브라우저 없이 전환합니다. 로그인은 약 30일 유지됩니다.'));
+    box.appendChild(mkBtnRow(
+      mkBtn('Claude 승인 페이지 열기', 'p', function () {
+        postJson(API + 'acct-login-url', {}).then(function (res) {
+          if (!alive()) return;
+          if (res && res.ok && res.url) { f.step = 'approve'; f.url = res.url; paint(); }
+          else { f.step = 'fail'; f.why = (res && res.error) || '승인 링크를 만들지 못했습니다'; paint(); }
+        }).catch(function () { if (alive()) { f.step = 'fail'; f.why = '승인 링크 요청이 닿지 않았습니다'; paint(); } });
+      }), cancel));
+  } else if (f.step === 'approve') {
+    box.appendChild(mk('div', 'step', '② 승인'));
+    const p = mk('div', '',
+      '① 새 탭에서 추가할 계정으로 로그인하고 승인하세요. ② 승인이 끝나면 Claude가 일회용 코드를 보여줍니다.');
+    box.appendChild(p);
+    if (f.url) {
+      const a = mk('a', 'acct-link', '🔗 브라우저에서 로그인·승인하기');
+      a.href = f.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      box.appendChild(a);
+    }
+    const lbl = mk('label', 'lbl', '③ 승인 페이지에서 받은 일회용 코드 → 여기에 붙여넣기');
+    box.appendChild(lbl);
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.placeholder = '승인 페이지에서 받은 코드'; inp.autocomplete = 'off'; inp.spellcheck = false;
+    inp.value = f.codeText || '';
+    inp.addEventListener('input', function () { f.codeText = inp.value; });
+    inp.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); submitCode(); }
     });
-  };
-  btns.appendChild(relog);
+    box.appendChild(inp);
+    const submitCode = function () {
+      const code = (f.codeText || inp.value || '').trim();
+      if (!code) { inp.focus(); flash('코드를 붙여넣으세요', 2000); return; }
+      f.step = 'check'; paint();
+      postJson(API + 'acct-login-code', { code: code }).then(function (r) {
+        if (!alive()) return;
+        if (r && r.ok) {
+          f.added = f.relogin || (r.email || '새 계정');
+          const list = (st.claude && st.claude.accounts) || [];
+          const t = list.find(function (x) { return (x.email || x.name) === f.relogin; });
+          if (t) { delete t.health; t.usage = { use5h: 0, use7d: 0 }; t.rtExpiry = Date.now() + 30 * 86400000; }
+          else if (!f.relogin && !list.some(function (x) { return (x.email || x.name) === f.added; })) {
+            list.push({ name: f.added, email: f.added, kind: '', sub: '', active: false,
+              usage: { use5h: 0, use7d: 0 }, rtExpiry: Date.now() + 30 * 86400000, holders: [] });
+          }
+          f.step = 'done'; refreshAcctIcon();
+        } else { f.step = 'fail'; f.why = (r && r.error) || '코드를 확인할 수 없습니다'; }
+        paint();
+      }).catch(function () { if (alive()) { f.step = 'fail'; f.why = '확인 요청이 닿지 않았습니다'; paint(); } });
+    };
+    box.appendChild(mkBtnRow(
+      mkBtn('승인 페이지 다시 열기', '', function () { flash('새 승인 링크는 위 링크를 다시 여세요', 2500); }),
+      mkBtn('코드 확인하고 추가', 'p', submitCode), cancel));
+  } else if (f.step === 'check') {
+    box.appendChild(mk('div', 'step', '③ 확인 중'));
+    box.appendChild(mk('div', 'prog', '⟳ 코드 확인 중 · 풀은 아직 그대로'));
+    box.appendChild(mkBtnRow(cancel));
+  } else if (f.step === 'done') {
+    box.appendChild(mk('div', 'step', '④ 완료'));
+    const c = mk('div', 'flow-done', '✓ ' + f.added + (f.relogin ? ' 로그인을 되살렸습니다' : ' 을 풀에 추가했습니다') + ' · 현재 계정은 바꾸지 않았습니다');
+    box.appendChild(c);
+    box.appendChild(mkBtnRow(
+      mkBtn('이 계정으로 전환', 'p', function () {
+        const t = ((st.claude && st.claude.accounts) || []).find(function (x) { return (x.email || x.name) === f.added; });
+        if (t && !t.active) st.flow = { sec: 'claude', kind: 'switch', step: 'confirm', target: t.name };
+        else st.flow = null;
+        paint();
+      }),
+      mkBtn('완료', '', function () { st.flow = null; paint(); })));
+  } else {
+    box.appendChild(mk('div', 'step', '④′ 실패'));
+    const c = mk('div', 'flow-fail');
+    c.appendChild(mk('div', '', '코드를 확인할 수 없습니다'));
+    c.appendChild(mk('div', 'mu', (f.why || '') + ' · 코드는 일회용이라 짧게 유지됩니다. 새 승인 링크에서 다시 받으세요.'));
+    box.appendChild(c);
+    box.appendChild(mkBtnRow(
+      mkBtn('승인 페이지 다시 열기', 'p', function () { f.step = 'approve'; f.codeText = ''; paint(); }),
+      cancel));
+  }
+  body.appendChild(box);
+}
+
+function renderCodexBody(st, box, paint, alive) {
+  box.textContent = '';
+  const cx = st.codex;
+  const f = st.flow;
+  if (f && f.sec === 'codex') { renderCodexFlow(st, box, paint, alive); return; }
+  if (!cx) { box.appendChild(mk('div', 'dots', '확인 중…')); return; }
+  const ok = cx.state === 'ok';
+  const row = mk('div', 'codex-row');
+  const nm = mk('span', 'nm', ok ? (cx.email || '(로그인됨)')
+    : cx.state === 'none' ? '로그인 필요'
+    : cx.state === 'pending' ? '로그인 진행 중' : (cx.reason || cx.state));
+  if (!ok) nm.style.color = '#e6b34d';
+  const pl = mk('span', 'pl', ok ? ((cx.plan ? cx.plan + ' · ' : '') + 'ChatGPT')
+    : cx.state === 'none' ? ' 로그인이 필요합니다' : '');
+  row.appendChild(nm); row.appendChild(pl); box.appendChild(row);
+  if (ok) box.appendChild(codexUsageRow(st.codexUsage));
+  const busy = _codexOperationPending;
+  const relog = mkBtn(ok ? '다시 로그인' : '로그인', '', function () {
+    startFlow(st, paint, 'codex', 'relogin', {});
+  });
+  if (busy) relog.disabled = true;
+  const btns = mkBtnRow(relog);
   if (ok) {
-    const lo = document.createElement('button'); lo.className = 'codex-btn danger'; lo.textContent = 'Log out';
-    lo.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-    lo.onclick = function () {
-      if (!window.confirm('Codex logout — auth.json will be removed.\nThe re-login button reconnects. Continue?')) return;
-      _codexOperationPending = true;
-      const generation = ++_codexViewGeneration;
-      const alive = function () {
-        return generation === _codexViewGeneration && document.body.contains(box);
-      };
+    const lo = mkBtn('로그아웃', 'danger', function () {
+      if (!window.confirm('Codex 로그아웃 — 이 박스의 로그인을 지웁니다. 계속할까요?')) return;
       lo.disabled = true; lo.textContent = '…';
       postJson(API + 'codex-logout', {}).then(function (r) {
         if (!alive()) return;
         _codexOperationPending = false;
         if (r && r.ok) {
           setCodexIdentity({ state: 'none' });
-          flash('Codex logged out', 2000); renderCodexBody(box, { state: 'none' });
-        }
-        else { lo.disabled = false; lo.textContent = 'Log out'; flash('Logout failed' + (r && r.error ? ': ' + r.error : ''), 3000); }
+          st.codex = { state: 'none' }; st.codexUsage = null;
+          flash('Codex 로그아웃했습니다', 2000); paint();
+        } else { lo.disabled = false; lo.textContent = '로그아웃'; flash('로그아웃하지 못했습니다' + (r && r.error ? ': ' + r.error : ''), 3000); }
       }).catch(function () {
         if (!alive()) return;
         _codexOperationPending = false;
-        lo.disabled = false; lo.textContent = 'Log out'; flash('Logout request failed', 2000);
+        lo.disabled = false; lo.textContent = '로그아웃'; flash('로그아웃 요청이 닿지 않았습니다', 2000);
       });
-    };
+    });
+    if (busy) lo.disabled = true;
     btns.appendChild(lo);
   }
   box.appendChild(btns);
@@ -402,277 +713,176 @@ function renderCodexBody(box, cx, usage) {
 // show. Graded against the same server thresholds as the Claude rows, so "amber" means
 // the same thing in both sections.
 function codexUsageRow(usage) {
-  const row = document.createElement('div'); row.className = 'codex-row';
-  const nm = document.createElement('span'); nm.className = 'nm';
-  const pl = document.createElement('span'); pl.className = 'pl';
+  const row = mk('div', 'codex-row');
+  const nm = mk('span', 'nm'), pl = mk('span', 'pl');
   const u7 = usage && usage.codexUse7d;
   // auth.json is still here (so the row above shows an email and a plan) but the token
   // behind it was revoked — the account line must say so, or the first symptom is an
   // agent dying with "please sign in again". Numbers, if any, are from before the death.
   if (usage && usage.codexErr === 'auth') {
-    nm.textContent = 'sign-in revoked — Re-login';
+    nm.textContent = '로그인이 해제됨 — 다시 로그인';
     nm.style.color = C_RED;
-    pl.textContent = 'logged out elsewhere, or signed in to another account';
+    pl.textContent = '다른 곳에서 로그아웃했거나 다른 계정으로 로그인했습니다';
     row.appendChild(nm); row.appendChild(pl);
     return row;
   }
   if (u7 == null) {
-    nm.textContent = '7d usage';
+    nm.textContent = '주간 사용량';
     nm.style.color = C_GRAY;
-    pl.textContent = usage && usage.codexErr ? String(usage.codexErr) : 'reading…';
+    pl.textContent = usage && usage.codexErr ? String(usage.codexErr) : '확인 중…';
   } else {
-    nm.textContent = '7d ' + u7 + '%' + (usage.codexStale ? ' (last value)' : '');
+    nm.textContent = '주간 ' + u7 + '%' + (usage.codexStale ? ' (마지막 값)' : '');
     nm.style.color = levelColor(usageLevel('7d', u7));
     const bits = [];
-    if (usage.codexReset7d) bits.push('resets ' + fmtReset(usage.codexReset7d, true));
-    if (usage.codexCredits != null) bits.push(usage.codexCredits + ' credits');
+    if (usage.codexReset7d) bits.push(fmtReset(usage.codexReset7d, true) + ' 초기화');
+    if (usage.codexCredits != null) bits.push('크레딧 ' + usage.codexCredits);
     pl.textContent = bits.join(' · ');
   }
   row.appendChild(nm); row.appendChild(pl);
   return row;
 }
 
-// codex login --device-auth = headless device auth: no port-forward/callback. Open the link, enter the code.
-// Starting re-login wipes auth.json immediately (backend backs it up) -> [Cancel] restores it if not completed.
-function startCodexLogin(box, btn, alive) {
-  alive = alive || function () { return document.body.contains(box); };
-  btn.disabled = true; btn.textContent = 'codex login…';
-  postJson(API + 'codex-login-start', {}).then(function (r) {
-    if (!alive()) return;
-    if (!r || !r.ok || !r.code) { btn.disabled = false; btn.textContent = 'Re-login';
-      _codexOperationPending = false;
-      flash('codex login failed to start' + (r && r.error ? ': ' + r.error : ''), 4500); return; }
-    box.textContent = '';
-    const g = document.createElement('div'); g.className = 'codex-guide';
-    const warn = document.createElement('div'); warn.className = 'cg-step'; warn.style.color = '#e6b34d';
-    warn.textContent = '⚠ Current login is cleared — finish, or press [Cancel] to restore.';
-    const s1 = document.createElement('div'); s1.className = 'cg-step'; s1.textContent = '(1) Open in a browser:';
-    const a = document.createElement('a'); a.className = 'acct-link'; a.href = r.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-    a.textContent = '🔗 ' + r.url;
-    const s2 = document.createElement('div'); s2.className = 'cg-step'; s2.textContent = '(2) Enter this code (within 15 min · click to copy):';
-    const codeEl = document.createElement('code'); codeEl.className = 'cg-cmd'; codeEl.textContent = r.code; codeEl.title = 'click to copy';
-    codeEl.onclick = function () { if (navigator.clipboard) { navigator.clipboard.writeText(r.code); flash('Copied', 1200); } };
-    const s3 = document.createElement('div'); s3.className = 'cg-step'; s3.textContent = '(3) After logging in / approving:';
-    const brow = document.createElement('div'); brow.className = 'codex-btns';
-    const chk = document.createElement('button'); chk.className = 'codex-btn'; chk.textContent = 'Check';
-    chk.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-    chk.onclick = function () {
-      chk.disabled = true; chk.textContent = 'Checking…';
-      fetch(API + 'claude-status').then(function (x) { return x.json(); }).then(function (st) {
-        if (!alive()) return;
-        const cx = (st && st.codex) || {};
-        if (cx.state === 'ok') {
+// Codex re-login: keep → verify → commit. Starting keeps the existing login in a
+// backup; cancelling (or the server TTL, SAFETY) restores it. Nothing is discarded
+// before the new credential verifies.
+function renderCodexFlow(st, box, paint, alive) {
+  const f = st.flow, cbox = mk('div', 'flow');
+  const cx = st.codex || { state: 'none' };
+  if (f.step === 'ready') {
+    cbox.appendChild(mk('div', 'step', '① 준비'));
+    cbox.appendChild(mk('div', '', '지금: ' + (cx.state === 'ok'
+      ? '로그인됨 ' + (cx.email || '') + ' · 주간 ' + ((st.codexUsage && st.codexUsage.codexUse7d) != null ? st.codexUsage.codexUse7d + '%' : '확인 중')
+      : '로그인 없음')));
+    cbox.appendChild(mk('div', '', '시작하면 Codex를 잠시 쓸 수 없습니다. 기존 로그인은 임시 보관되고, 취소하거나 15분이 지나면 자동 복구됩니다.'));
+    cbox.appendChild(mk('div', 'mu', '이 박스에서 Codex로 돌아가는 세션이 있으면 다음 요청에서 멈출 수 있습니다.'));
+    cbox.appendChild(mkBtnRow(
+      mkBtn('재로그인 시작', 'p', function () {
+        f.backup = cx.state === 'ok' ? Object.assign({}, cx) : null;
+        _codexOperationPending = true;
+        postJson(API + 'codex-login-start', {}).then(function (r) {
+          if (!alive()) return;
+          if (r && r.ok && r.code) {
+            st.codex = { state: 'pending' };
+            f.step = 'approve'; f.code = r.code; f.url = r.url; paint();
+          } else {
+            _codexOperationPending = false;
+            flash('Codex 로그인을 시작하지 못했습니다' + (r && r.error ? ': ' + r.error : ''), 4500);
+          }
+        }).catch(function () {
+          if (!alive()) return;
           _codexOperationPending = false;
-          flash('✓ Codex login complete: ' + (cx.email || ''), 3000);
-          // new identity -> drop any cached numbers and read this account's own
-          const identity = setCodexIdentity(cx);
-          renderCodexBody(box, cx, _codexUsage);
-          fetchCodexUsage(box, cx, identity, null, alive, { scheduled: false });
-        }
-        else { chk.disabled = false; chk.textContent = 'Check'; flash('Not logged in yet — enter the code / approve, then check again', 4000); }
-      }).catch(function () { if (alive()) { chk.disabled = false; chk.textContent = 'Check'; } });
-    };
-    const cancel = document.createElement('button'); cancel.className = 'codex-btn danger'; cancel.textContent = 'Cancel (restore)';
-    cancel.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-    cancel.onclick = function () {
-      cancel.disabled = true; cancel.textContent = '…';
-      postJson(API + 'codex-login-cancel', {}).then(function (rr) {
-        if (!alive()) return;
-        if (rr && rr.ok) {
-          _codexOperationPending = false;
-          flash(rr.restored ? 'Cancelled — previous login restored' : 'Cancelled', 2500);
-          fetch(API + 'claude-status').then(function (x) { return x.json(); })
-            .then(function (st) {
-              if (!alive()) return;
-              const rcx = (st && st.codex) || { state: 'unknown' };
-              const identity = setCodexIdentity(rcx);
-              renderCodexBody(box, rcx, _codexUsage);
-              if (rcx.state === 'ok') fetchCodexUsage(box, rcx, identity, null, alive, { scheduled: false });
-            }).catch(function () {});
-        } else { cancel.disabled = false; cancel.textContent = 'Cancel (restore)'; flash('Cancel failed' + (rr && rr.error ? ': ' + rr.error : ''), 3000); }
-      }).catch(function () { if (alive()) { cancel.disabled = false; cancel.textContent = 'Cancel (restore)'; } });
-    };
-    brow.appendChild(chk); brow.appendChild(cancel);
-    g.appendChild(warn); g.appendChild(s1); g.appendChild(a); g.appendChild(s2); g.appendChild(codeEl); g.appendChild(s3); g.appendChild(brow);
-    box.appendChild(g);
-  }).catch(function () {
-    if (!alive()) return;
-    _codexOperationPending = false;
-    btn.disabled = false; btn.textContent = 'Re-login'; flash('codex login request failed', 2000);
-  });
-}
-
-// ---- OpenCode xAI — a separate credential from Orca's ~/.grok/auth.json ----
-function renderXaiSection(list, reflow, parentAlive) {
-  _xaiOperationPending = false;
-  const sep = document.createElement('div'); sep.className = 'sep'; list.appendChild(sep);
-  const hd = document.createElement('div'); hd.className = 'hd'; hd.textContent = 'OpenCode xAI · this box';
-  list.appendChild(hd);
-  const box = document.createElement('div'); box.className = 'xai-box codex-box'; box.textContent = 'Loading…';
-  list.appendChild(box);
-  const generation = ++_xaiViewGeneration;
-  const alive = function () {
-    return generation === _xaiViewGeneration
-      && (!parentAlive || parentAlive()) && document.body.contains(box);
-  };
-  fetch(API + 'xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (xai) {
-    if (!alive()) return;
-    if (xai && xai.enabled === false) {
-      sep.remove(); hd.remove(); box.remove(); if (reflow) reflow(); return;
+          flash('Codex 로그인 요청이 닿지 않았습니다', 2000);
+        });
+      }),
+      mkBtn('취소', '', function () { st.flow = null; paint(); })));
+  } else if (f.step === 'approve') {
+    cbox.appendChild(mk('div', 'step', '② 브라우저 승인'));
+    cbox.appendChild(mk('div', '', '① 새 탭 열기 → OpenAI 승인 페이지'));
+    cbox.appendChild(mk('div', '', '② 아래 코드를 그 페이지에 입력'));
+    if (f.url) {
+      const a = mk('a', 'acct-link', '🔗 ' + f.url);
+      a.href = f.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      cbox.appendChild(a);
     }
-    renderXaiBody(box, xai || { state: 'err', reason: 'query failed' }, alive);
-    if (reflow) reflow();
-  }).catch(function () {
-    if (!alive()) return;
-    renderXaiBody(box, { state: 'err', reason: 'query failed' }, alive);
-    if (reflow) reflow();
-  });
-}
-
-function renderXaiBody(box, xai, alive) {
-  box.textContent = '';
-  const state = xai && xai.state ? xai.state : 'err';
-  const signed = state === 'ok' || state === 'expired';
-  const row = document.createElement('div'); row.className = 'codex-row';
-  const nm = document.createElement('span'); nm.className = 'nm';
-  const pl = document.createElement('span'); pl.className = 'pl';
-  if (state === 'ok') {
-    nm.textContent = 'Signed in';
-    const expiry = new Date(xai.expires);
-    pl.textContent = xai.expires != null && !isNaN(expiry.getTime())
-      ? 'access token expires ' + fmtReset(expiry.toISOString(), true)
-      : 'OpenCode xAI';
-  } else if (state === 'expired') {
-    nm.textContent = 'Access token refresh needed'; nm.style.color = C_AMBER;
-    pl.textContent = 'Signed in · OpenCode refreshes on use';
-  } else if (state === 'none') {
-    nm.textContent = 'Not signed in'; nm.style.color = C_AMBER;
-    pl.textContent = 'OpenCode xAI login required';
-  } else if (state === 'malformed') {
-    nm.textContent = 'Credential unreadable'; nm.style.color = C_AMBER;
-    pl.textContent = xai.reason || 'unexpected credential shape';
+    const codeEl = mk('code', 'cg-cmd', f.code || '');
+    codeEl.title = '누르면 복사';
+    codeEl.onclick = function () {
+      if (navigator.clipboard && f.code) { navigator.clipboard.writeText(f.code); flash('복사했습니다', 1200); }
+    };
+    cbox.appendChild(codeEl);
+    cbox.appendChild(mk('div', 'mu', '이 코드는 Airlock이 만든 코드입니다 → 브라우저에 입력'));
+    cbox.appendChild(mk('div', 'warnln', '⏱ 15분 안에 승인 · 기존 로그인 보관됨'));
+    const chk = mkBtn('승인 확인', 'p', function () {
+      chk.disabled = true; chk.textContent = '확인 중…';
+      fetch(API + 'claude-status').then(function (x) { return x.json(); }).then(function (s) {
+        if (!alive()) return;
+        const ncx = (s && s.codex) || {};
+        if (ncx.state === 'ok') {
+          _codexOperationPending = false;
+          flash('✓ Codex 로그인했습니다: ' + (ncx.email || ''), 3000);
+          const identity = setCodexIdentity(ncx);
+          st.codex = ncx; st.codexUsage = _codexUsage;
+          f.step = 'done'; paint();
+          fetchCodexUsage(st, paint, alive, { scheduled: false });
+        } else {
+          chk.disabled = false; chk.textContent = '승인 확인';
+          flash('아직 승인되지 않았습니다 — 코드를 입력·승인하고 다시 확인하세요', 4000);
+        }
+      }).catch(function () { if (alive()) { chk.disabled = false; chk.textContent = '승인 확인'; } });
+    });
+    cbox.appendChild(mkBtnRow(chk,
+      mkBtn('취소하고 기존 로그인 복구', 'danger', function () {
+        postJson(API + 'codex-login-cancel', {}).then(function (rr) {
+          if (!alive()) return;
+          _codexOperationPending = false;
+          if (rr && rr.ok) {
+            if (f.backup) { st.codex = Object.assign({}, f.backup); st.codex.state = 'ok'; setCodexIdentity(st.codex); }
+            else st.codex = { state: 'none' };
+            st.codexUsage = null;
+            flash(rr.restored ? '취소했습니다 — 기존 로그인을 복구했습니다' : '취소했습니다', 2500);
+            st.flow = null; paint();
+          } else flash('취소하지 못했습니다' + (rr && rr.error ? ': ' + rr.error : ''), 3000);
+        }).catch(function () {});
+      })));
+  } else if (f.step === 'check') {
+    cbox.appendChild(mk('div', 'step', '③ 확인 중'));
+    cbox.appendChild(mk('div', 'prog', '⟳ 새 로그인 확인 중…'));
   } else {
-    nm.textContent = 'Credential status error'; nm.style.color = C_AMBER;
-    pl.textContent = xai.reason || 'query failed';
+    cbox.appendChild(mk('div', 'step', '④ 완료'));
+    cbox.appendChild(mk('div', 'flow-done', '✓ ' + ((st.codex && st.codex.email) || '') + ' 으로 다시 로그인했습니다 · 사용량은 새 계정 것으로 다시 읽습니다'));
+    cbox.appendChild(mkBtnRow(mkBtn('완료', 'p', function () { st.flow = null; paint(); })));
   }
-  row.appendChild(nm); row.appendChild(pl); box.appendChild(row);
-
-  const btns = document.createElement('div'); btns.className = 'codex-btns';
-  if (state !== 'err') {
-    const login = document.createElement('button'); login.className = 'codex-btn';
-    login.textContent = state === 'none' ? 'Log in' : 'Re-login';
-    login.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-    login.onclick = function () {
-      _xaiOperationPending = true;
-      const generation = ++_xaiViewGeneration;
-      startXaiLogin(box, login, function () {
-        return generation === _xaiViewGeneration && document.body.contains(box);
-      });
-    };
-    btns.appendChild(login);
-  }
-  if (signed) {
-    const logout = document.createElement('button'); logout.className = 'codex-btn danger';
-    logout.textContent = 'Log out';
-    logout.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-    logout.onclick = function () {
-      if (!window.confirm('Log OpenCode out of xAI on this box?')) return;
-      _xaiOperationPending = true;
-      const generation = ++_xaiViewGeneration;
-      const operationAlive = function () {
-        return generation === _xaiViewGeneration && document.body.contains(box);
-      };
-      logout.disabled = true; logout.textContent = '…';
-      postJson(API + 'xai-logout', {}).then(function (res) {
-        if (!operationAlive()) return;
-        _xaiOperationPending = false;
-        if (res && res.ok) {
-          flash('OpenCode xAI logged out', 2000);
-          renderXaiBody(box, { state: 'none' }, operationAlive);
-        } else {
-          logout.disabled = false; logout.textContent = 'Log out';
-          flash('xAI logout failed' + (res && res.error ? ': ' + res.error : ''), 3000);
-        }
-      }).catch(function () {
-        if (!operationAlive()) return;
-        _xaiOperationPending = false;
-        logout.disabled = false; logout.textContent = 'Log out';
-        flash('xAI logout request failed', 2000);
-      });
-    };
-    btns.appendChild(logout);
-  }
-  box.appendChild(btns);
+  box.appendChild(cbox);
 }
 
-function startXaiLogin(box, btn, alive) {
-  const idleLabel = btn.textContent;
-  btn.disabled = true; btn.textContent = 'OpenCode login…';
-  postJson(API + 'xai-login-start', {}).then(function (res) {
+// xAI section removed (POPUP_SHELL rework, 사람 결정 9dac31a6 팝업에서 제거):
+// the backend xai-* routes stay, but this shell no longer lists, fetches or
+// flows them. The section below used to live here; deleting it outright keeps
+// a removed section from ever reading as a passing one.
+function startFlow(st, paint, sec, kind, extra) {
+  if (st.flow) { flash('진행 중인 작업을 먼저 끝내거나 취소하세요', 2500); return; }
+  st.flow = Object.assign({ sec: sec, kind: kind, step: 'ready' }, extra || {});
+  st.expand[sec] = true;
+  if (sec === 'codex') _codexOperationPending = kind === 'relogin';
+  paint();
+}
+
+// ---- data fetches (each paints on arrival; sections never wait for each other) ----
+function fetchClaude(st, paint, alive) {
+  fetch(API + 'accounts').then(function (x) { return x.json(); }).then(function (j) {
     if (!alive()) return;
-    if (!res || !res.ok || !res.url || !res.code) {
-      _xaiOperationPending = false;
-      btn.disabled = false; btn.textContent = idleLabel;
-      flash('OpenCode xAI login failed to start' +
-            (res && res.error ? ': ' + res.error : ''), 4500);
-      return;
-    }
-    box.textContent = '';
-    const guide = document.createElement('div'); guide.className = 'codex-guide';
-    const note = document.createElement('div'); note.className = 'cg-step';
-    note.textContent = 'Existing OpenCode xAI credential stays active until login completes.';
-    const s1 = document.createElement('div'); s1.className = 'cg-step'; s1.textContent = '(1) Open in a browser:';
-    const a = document.createElement('a'); a.className = 'acct-link'; a.href = res.url;
-    a.target = '_blank'; a.rel = 'noopener noreferrer'; a.textContent = '🔗 ' + res.url;
-    const s2 = document.createElement('div'); s2.className = 'cg-step'; s2.textContent = '(2) Enter this code:';
-    const code = document.createElement('code'); code.className = 'cg-cmd'; code.textContent = res.code;
-    code.onclick = function () {
-      if (navigator.clipboard) navigator.clipboard.writeText(res.code);
-    };
-    const buttons = document.createElement('div'); buttons.className = 'codex-btns';
-    const check = document.createElement('button'); check.className = 'codex-btn'; check.textContent = 'Check';
-    check.onclick = function () {
-      check.disabled = true; check.textContent = 'Checking…';
-      fetch(API + 'xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (status) {
-        if (!alive()) return;
-        if (status && status.loginState === 'succeeded'
-            && (status.state === 'ok' || status.state === 'expired')) {
-          _xaiOperationPending = false;
-          flash('✓ OpenCode xAI login complete', 2500);
-          renderXaiBody(box, status, alive);
-        } else if (status && status.loginState === 'failed') {
-          check.disabled = false; check.textContent = 'Check';
-          flash('OpenCode xAI login failed — start Re-login again', 3500);
-        } else {
-          check.disabled = false; check.textContent = 'Check';
-          flash('Not signed in yet — enter the code, approve, then check again', 3500);
-        }
-      }).catch(function () { if (alive()) { check.disabled = false; check.textContent = 'Check'; } });
-    };
-    const cancel = document.createElement('button'); cancel.className = 'codex-btn danger'; cancel.textContent = 'Cancel';
-    cancel.onclick = function () {
-      cancel.disabled = true; cancel.textContent = '…';
-      postJson(API + 'xai-login-cancel', {}).then(function (r) {
-        if (!alive()) return;
-        if (r && r.ok) {
-          _xaiOperationPending = false;
-          fetch(API + 'xai-status', { cache: 'no-store' }).then(function (x) { return x.json(); })
-            .then(function (status) { if (alive()) renderXaiBody(box, status, alive); });
-        } else {
-          cancel.disabled = false; cancel.textContent = 'Cancel';
-          flash('xAI login cancel failed', 2500);
-        }
-      }).catch(function () { if (alive()) { cancel.disabled = false; cancel.textContent = 'Cancel'; } });
-    };
-    buttons.appendChild(check); buttons.appendChild(cancel);
-    guide.appendChild(note); guide.appendChild(s1); guide.appendChild(a);
-    guide.appendChild(s2); guide.appendChild(code); guide.appendChild(buttons);
-    box.appendChild(guide);
+    if (j && j.thresholds) setThresholds(j.thresholds);
+    st.claude = j && j.enabled === false ? { enabled: false } : j;
+    paint();
+    if (j && j.enabled === false) return;
+    postJson(API + 'acct-usage-now', {}).then(function (fresh) {
+      if (!alive()) return;
+      if (st.flow && st.flow.sec === 'claude') return;    // a login form owns the section
+      if (!fresh || !fresh.usage || fresh.usage.err
+          || (fresh.usage.use5h == null && fresh.usage.use7d == null)) return;
+      ((st.claude && st.claude.accounts) || []).forEach(function (a) {
+        if (a.email === fresh.email && a.kind === fresh.kind) a.usage = fresh.usage;
+      });
+      paint();
+    }).catch(function () {});
   }).catch(function () {
     if (!alive()) return;
-    _xaiOperationPending = false;
-    btn.disabled = false; btn.textContent = idleLabel;
-    flash('OpenCode xAI login request failed', 2000);
+    st.claudeFailed = true; paint();
+  });
+}
+function fetchCodex(st, paint, alive) {
+  _codexOperationPending = false;
+  fetch(API + 'codex-status', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (cx) {
+    if (!alive()) return;
+    cx = (cx && cx.state) ? cx : { state: 'unknown' };
+    setCodexIdentity(cx);
+    st.codex = cx;
+    st.codexUsage = _codexUsage;
+    paint();
+    if (cx.state === 'ok') fetchCodexUsage(st, paint, alive, { scheduled: false });
+  }).catch(function () {
+    if (!alive()) return;
+    st.codex = { state: 'unknown', reason: '조회 실패' }; paint();
   });
 }
 // account popup placement — under the anchor, but flip above it if there isn't room below (bottom key bar).
@@ -696,150 +906,92 @@ function placeAcctMenu(pop, anchor) {
 //   alive()      — is the container still on the page (drop late replies)
 //   onSwitched() — what to do after a successful switch (popup closes, panel redraws)
 function fillAcctList(list, opts) {
-  const reflow = opts.reflow, reopen = opts.reopen;
-  const alive = opts.alive || function () { return true; };
-  const onSwitched = opts.onSwitched || function () {};
-  // The Claude rows live in their own box so a usage refresh can redraw them alone.
-  // Redrawing the whole list used to recreate the Codex and xAI sections too, which
-  // re-ran both status probes and flickered every section on every refresh.
-  // Build the shell NOW, before any request answers. /accounts runs the account CLI
-  // (up to 15 s) and then the fleet store; the Codex and xAI rows do not depend on
-  // it and must not wait for it — they paint from their own local status calls.
+  const reflow = opts.reflow, alive = opts.alive || function () { return true; };
+  const st = newShellState();
   list.textContent = '';
-  const claudeBox = document.createElement('div'); claudeBox.className = 'claude-box';
-  const loading = document.createElement('div'); loading.className = 'sep'; loading.textContent = 'Loading accounts / usage…';
-  claudeBox.appendChild(loading);
-  list.appendChild(claudeBox);
-  // Codex and xAI are this box's own logins, independent of the Claude pool — they are
-  // drawn whether or not account switching is enabled here.
-  renderCodexSection(list, reflow, alive);
-  renderXaiSection(list, reflow, alive);
-  renderAgySection(list, reflow, alive);
-  const render = function (j) {
-    claudeBox.textContent = '';
-    if (j && j.enabled === false) {
-      const d = document.createElement('div'); d.className = 'sep';
-      d.textContent = 'Claude account switching is off in this app (accounts = false)';
-      claudeBox.appendChild(d); reflow(); return;
-    }
-    const hd = document.createElement('div'); hd.className = 'hd';
-    hd.textContent = 'Switch account · right = 5h / 7d usage';
-    claudeBox.appendChild(hd);
-    const accts = (j && j.accounts) || [];
-    accts.forEach(function (a) {
-      const dead = a.health && a.health.state === 'dead';
-      const u = a.usage || {};
-      const b = document.createElement('button'); b.className = 'acctrow' + (dead ? ' dead' : '');
-      const L = document.createElement('div'); L.className = 'acct-l';
-      // label = the real id (email) + kind (personal/team). Fall back to name if no email.
-      const nm = document.createElement('span'); nm.className = 'nm';
-      nm.textContent = (a.active ? '✓ ' : dead ? '❌ ' : '') + (a.email || a.name);
-      const pl = document.createElement('span'); pl.className = 'pl';
-      // a dead account shows its reason — without it the user can't act.
-      pl.textContent = dead ? (a.health.reason || 'unavailable')
-                            : (a.kind ? a.kind + ' · ' : '') + a.sub;
-      // A persisted panel reading is display memory, not a fresh fleet observation.
-      // Keep that qualifier inline on the prose side so touch and keyboard users see it.
-      if (!dead && u.stale && (u.use5h != null || u.use7d != null)) {
-        pl.textContent += ' · (last value)';
-      }
-      if (dead) b.title = a.health.reason || '';
-      // still alive but expiring soon = re-login now to cross over without interruption.
-      const rtd = dead ? null : rtLeft(a);
-      if (rtd != null && rtd <= rtWarnDays()) {
-        const w = document.createElement('span');
-        w.style.color = rtd <= 2 ? C_RED : C_AMBER; w.style.fontWeight = '600';
-        w.textContent = ' · ' + rtWarnText(rtd);
-        pl.appendChild(w);
-      }
-      L.appendChild(nm); L.appendChild(pl);
-      const R = document.createElement('div'); R.className = 'acct-r';
-      if (dead) {
-        R.style.color = C_AMBER;      // show the action, not usage (click = re-login flow)
-        R.textContent = 'Re-login';
-      } else if (u.use5h != null || u.use7d != null) {
-        // exhaustion is judged only by utilization (429 is a query throttle, not an exhaustion signal).
-        R.style.color = usageColor(u.use5h, u.use7d);
-        R.textContent = '5h ' + (u.use5h == null ? '—' : u.use5h + '%') + '\n7d ' + (u.use7d == null ? '—' : u.use7d + '%');
-      } else {
-        R.style.color = '#8a92a6';
-        // "no store" = this gate has no usage source configured, so this row will never
-        // fill in. Saying "Collecting" there is a promise nothing keeps; the only account
-        // this box can read on its own is the active one.
-        R.textContent = u.err === 'no data' ? 'Collecting\n(<1 min)'
-                      : u.err === 'no store' ? 'No usage\nsource'
-                      : (u.err ? 'Query failed\n' + u.err : 'Usage\n—');
-      }
-      // hover = when it recovers + who holds it + expiry. Next to the cursor immediately.
-      if (!dead) {
-        b.addEventListener('mouseenter', function (e) { showAcctTip(e, u, a); });
-        b.addEventListener('mousemove', placeAcctTip);
-        b.addEventListener('mouseleave', hideAcctTip);
-      }
-      b.appendChild(L); b.appendChild(R);
-      // remove (x) — non-active slots only (the CLI refuses active). Shown always (touch too).
-      if (!a.active) {
-        b.classList.add('removable');
-        const x = document.createElement('span'); x.className = 'acct-x'; x.textContent = '✕';
-        x.title = 'Remove this account from the pool';
-        x.addEventListener('pointerdown', function (e) { e.preventDefault(); e.stopPropagation(); });
-        x.addEventListener('click', function (e) {
-          e.preventDefault(); e.stopPropagation();
-          const label = a.email || a.name;
-          if (!window.confirm('Remove account: ' + label + '\n\nDeleted from the pool.\nRe-login revives the same slot. Continue?')) return;
-          hideAcctTip();
-          postJson(API + 'acct-remove', { name: a.name }).then(function (res) {
-            if (res && res.ok) { flash('🗑 ' + label + ' removed', 2500); reopen(); refreshAcctIcon(); }
-            else flash('Remove failed' + (res && res.error ? ': ' + res.error : ''), 3500);
-          }).catch(function () { flash('Remove request failed', 2000); });
-        });
-        b.appendChild(x);
-      }
-      b.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-      b.onclick = function () {
-        // dead account = switching would fail. Send to re-login instead — name = id, same slot revives.
-        if (dead) { startAddAcct(claudeBox, b, reflow); return; }
-        if (a.active) { onSwitched(); flash('Already using ' + a.name, 1400); return; }
-        onSwitched();
-        postJson(API + 'acct-switch', { name: a.name }).then(function (res) {
-          if (res && res.ok) { flash('✓ Switched to ' + (a.email || a.name) + ' (applies within ~1 min; restart the session for immediate effect)', 3000);
-            refreshAcctIcon(); onSwitched(); }
-          else flash('Switch failed' + (res && res.error ? ': ' + res.error : ''), 2800);
-        }).catch(function () { flash('Switch request failed', 2000); });
-      };
-      claudeBox.appendChild(b);
-    });
-    const add = document.createElement('button'); add.className = 'addacct';
-    add.textContent = '+ Add account (login)';
-    add.addEventListener('pointerdown', function (e) { e.preventDefault(); });
-    add.onclick = function () { add.disabled = true; add.textContent = 'Getting login link…'; startAddAcct(claudeBox, add, reflow); };
-    claudeBox.appendChild(add);
-    reflow();                           // re-place at the full rendered height (flip above from a bottom key bar)
-  };
-  fetch(API + 'accounts').then(function (x) { return x.json(); }).then(function (j) {
-    if (j && j.thresholds) setThresholds(j.thresholds);
-    render(j);                       // draw with cached values first (stay snappy)
-    if (j && j.enabled === false) return;
-    // the value at the moment it opened — the timer polls active every minute, so it can be up to 1 min stale.
-    postJson(API + 'acct-usage-now', {}).then(function (fresh) {
-      if (!alive()) return;                                  // already closed -> drop
-      // A login form in progress owns the Claude box; the provider sections are no longer
-      // touched by this redraw, so their pending operations need no guard here.
-      if (claudeBox.querySelector('.addform')) return;
-      // Both login flows temporarily own the section. Re-rendering the whole list here
-      // can erase a captured device code (or a pending logout) after auth already moved.
-      if (!fresh || !fresh.usage || fresh.usage.err
-          || (fresh.usage.use5h == null && fresh.usage.use7d == null)) return;
-      (j.accounts || []).forEach(function (a) {
-        if (a.email === fresh.email && a.kind === fresh.kind) a.usage = fresh.usage;
-      });
-      render(j);
-    }).catch(function () {});
-  }).catch(function () {
-    list.textContent = '';
-    const d = document.createElement('div'); d.className = 'sep'; d.textContent = 'Failed to load list (check claude-switch)';
-    list.appendChild(d);
+  const needs = mk('div', 'needs', '조치 필요 확인 중…');
+  list.appendChild(needs);
+  // Build the section shells NOW, before any request answers. /accounts runs the
+  // account CLI (up to 15 s) and then the fleet store; the Codex and agy rows do
+  // not depend on it and must not wait for it — they paint from their own calls.
+  const secs = {};
+  const order = ['claude', 'codex', 'agy', 'muse'];
+  const titles = { claude: 'Claude', codex: 'Codex', agy: 'Gemini', muse: 'Muse' };
+  order.forEach(function (key) {
+    const sec = mk('div', 'sec'); sec.dataset.sec = key;
+    const head = mk('div', 'sec-head');
+    head.appendChild(mk('span', 'chev', '▸'));
+    head.appendChild(mk('span', 'sec-title'));
+    head.onclick = function () {
+      if (st.flow && st.flow.sec === key) return;   // a guided flow owns its section
+      st.expand[key] = !st.expand[key];
+      paint();
+      if (reflow) reflow();
+    };
+    const body = mk('div', 'sec-body');
+    sec.appendChild(head); sec.appendChild(body);
+    list.appendChild(sec);
+    secs[key] = { sec: sec, head: head, body: body };
   });
+  const headText = { claude: claudeHead, codex: codexHead, agy: agyHead, muse: museHead };
+  function paint() {
+    if (!alive()) return;
+    // summary line
+    needs.textContent = '';
+    const iss = shellIssues(st);
+    if (!st.claude && !st.codex && !st.agy) {
+      needs.appendChild(mk('span', '', '조치 필요 확인 중…'));
+    } else if (!iss.length) {
+      needs.appendChild(mk('span', '', '조치 필요 없음'));
+    } else {
+      needs.appendChild(mk('span', '', '조치 필요 ' + iss.length + '건 · '));
+      iss.forEach(function (it, i) {
+        if (i) needs.appendChild(mk('span', '', ' · '));
+        const a = mk('a', '', it.label);
+        a.dataset.go = it.sec;
+        a.onclick = function () { st.expand[it.sec] = true; paint(); if (reflow) reflow(); };
+        needs.appendChild(a);
+      });
+    }
+    order.forEach(function (key) {
+      const S = secs[key];
+      const open = !!st.expand[key];
+      // agy unreadable box / Muse keys absent: no section at all (as before).
+      const hide = (key === 'agy' && st.agy && st.agy.enabled === false) ||
+                   (key === 'muse' && st.muse && st.muse.enabled === false);
+      S.sec.style.display = hide ? 'none' : '';
+      if (hide) return;
+      S.head.querySelector('.chev').textContent = open ? '▾' : '▸';
+      S.head.querySelector('.sec-title').textContent = headText[key](st);
+      S.body.style.display = open ? '' : 'none';
+      if (!open) return;
+      if (key === 'claude') renderClaudeBody(st, S.body, paint, alive);
+      else if (key === 'codex') renderCodexBody(st, S.body, paint, alive);
+      else if (key === 'agy') {
+        S.body.textContent = '';
+        if (!st.agy && !st.agyFailed) S.body.appendChild(mk('div', 'dots', '확인 중…'));
+        else if (st.agyFailed) S.body.appendChild(mk('div', 'dots', '사용량을 읽지 못했습니다'));
+        else if (st.agy && st.agy.enabled === false) S.body.appendChild(mk('div', 'dots', '이 박스에 없음'));
+        else renderAgyBody(S.body, st.agy || {}, function () {
+          st.agy = null; st.agyFailed = false; paint();
+          fetchAgy(st, paint, alive);
+        });
+      }
+      else if (key === 'muse') {
+        S.body.textContent = '';
+        if (!st.muse && !st.museFailed) S.body.appendChild(mk('div', 'dots', '확인 중…'));
+        else if (st.museFailed) S.body.appendChild(mk('div', 'dots', 'Muse 키를 읽지 못했습니다'));
+        else if (st.muse && st.muse.enabled === false) S.body.appendChild(mk('div', 'dots', '이 박스에 없음'));
+        else renderMuseBody(st, S.body, paint, alive);
+      }
+    });
+    if (reflow) reflow();
+  }
+  paint();
+  fetchClaude(st, paint, alive);
+  fetchCodex(st, paint, alive);
+  fetchAgy(st, paint, alive);
+  fetchMuse(st, paint, alive);
 }
 
 // devterm: the popup anchored to the account icon.
@@ -847,8 +999,7 @@ function openAcctMenu(anchor) {
   closeTabPops();
   const pop = document.createElement('div'); pop.className = 'tab-pop acct';
   const list = document.createElement('div');
-  const loading = document.createElement('div'); loading.className = 'sep'; loading.textContent = 'Loading accounts / usage…';
-  list.appendChild(loading); pop.appendChild(list);
+  list.appendChild(mk('div', 'dots', '계정·사용량 확인 중…')); pop.appendChild(list);
   const r = anchor.getBoundingClientRect();
   placePop(pop, r.right - 320, r.bottom + 6);   // append to body first so we can measure
   const reflow = function () { placeAcctMenu(pop, anchor); };
@@ -857,18 +1008,17 @@ function openAcctMenu(anchor) {
     reflow: reflow,
     reopen: function () { openAcctMenu(anchor); },
     alive: function () { return document.body.contains(pop); },
-    onSwitched: function () { closeTabPops(); mkFocus(); },
+    onSwitched: function () { openAcctMenu(anchor); },
   });
 }
 
-// panel.html: the same list filling a container, with no popup framing. The panel does
-// not close on a switch, so it redraws — otherwise the ✓ would stay on the old account.
+// panel.html: the same list filling a container, with no popup framing. The panel never
+// closes underneath a switch — the ✓ moves inline and the list redraws in place.
 function renderAcctPanel(container) {
   container.className = 'tab-pop acct acct-panel';
   container.textContent = '';
   const list = document.createElement('div');
-  const loading = document.createElement('div'); loading.className = 'sep'; loading.textContent = 'Loading accounts / usage…';
-  list.appendChild(loading); container.appendChild(list);
+  container.appendChild(list);
   fillAcctList(list, {
     reflow: function () {},
     reopen: function () { renderAcctPanel(container); },
