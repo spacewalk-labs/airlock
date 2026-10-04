@@ -31,5 +31,10 @@ fi
 
 log "running stock installer as $USER_NAME"
 # runuser preserves a login-ish env; the installer uses passwordless sudo internally.
-runuser -l "$USER_NAME" -c "cd '$REPO_DIR' && bash install/airlock-install.sh"
+runuser -l "$USER_NAME" -c "bash -s -- '$REPO_DIR' '$REPO_DIR/airlock.toml'" <<'SH_APPLY'
+cd "$1" || exit 1
+export AIRLOCK_CONFIG="$2"
+. install/lib.sh
+airlock_install_selected
+SH_APPLY
 log "install complete"

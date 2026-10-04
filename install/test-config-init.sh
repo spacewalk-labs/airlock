@@ -117,8 +117,7 @@ elif ! printf '%s' "$dep_err" | grep -q "added as dependencies: publish"; then
 else
   ok "a dependency is added to close the set, and the addition is announced"
 fi
-if [ "$(grep -n '^\[apps\.publish\]' "$scratch/dep.toml" | cut -d: -f1)" -lt \
-     "$(grep -n '^\[apps\.notepad\]' "$scratch/dep.toml" | cut -d: -f1)" ]; then
+if python3 -c 'import sys,tomllib; apps=list(tomllib.load(open(sys.argv[1],"rb"))["apps"]); assert apps.index("publish") < apps.index("notepad")' "$scratch/dep.toml"; then
   ok "a dependency is written before the app that needs it"
 else
   bad "notepad was written before publish"
@@ -252,13 +251,13 @@ fi
 #     a caller that builds its selection in pieces ends up with a box missing an app, with
 #     nothing anywhere saying so.
 "$CFG" init --owner owner@fixture.dev --apps devterm --apps paseo > "$scratch/acc.toml" 2>/dev/null
-if grep -q '^\[apps\.devterm\]' "$scratch/acc.toml" && grep -q '^\[apps\.paseo\]' "$scratch/acc.toml"; then
+if python3 -c 'import sys,tomllib; assert {"devterm","paseo"} <= tomllib.load(open(sys.argv[1],"rb"))["apps"].keys()' "$scratch/acc.toml"; then
   ok "a repeated --apps accumulates instead of silently replacing"
 else
   bad "a repeated --apps dropped an earlier selection silently"
 fi
 "$CFG" init --owner owner@fixture.dev --apps ' devterm , paseo ' > "$scratch/ws.toml" 2>/dev/null
-if grep -q '^\[apps\.devterm\]' "$scratch/ws.toml" && grep -q '^\[apps\.paseo\]' "$scratch/ws.toml"; then
+if python3 -c 'import sys,tomllib; assert {"devterm","paseo"} <= tomllib.load(open(sys.argv[1],"rb"))["apps"].keys()' "$scratch/ws.toml"; then
   ok "spaces around a comma-separated list are tolerated"
 else
   bad "a list with spaces after the commas was rejected"
@@ -280,8 +279,7 @@ AIRLOCK_SHIPPED_APPS_ROOT="$cyc" timeout 10 "$CFG" init --owner owner@fixture.de
 cyc_rc=$?
 if [ "$cyc_rc" -eq 124 ]; then
   bad "a dependency cycle hangs init — the ordering loop has no cycle guard"
-elif [ "$cyc_rc" -eq 0 ] && grep -q '^\[apps\.aa\]' "$scratch/cyc.toml" \
-     && grep -q '^\[apps\.bb\]' "$scratch/cyc.toml"; then
+elif [ "$cyc_rc" -eq 0 ] && python3 -c 'import sys,tomllib; assert {"aa","bb"} <= tomllib.load(open(sys.argv[1],"rb"))["apps"].keys()' "$scratch/cyc.toml"; then
   ok "a dependency cycle terminates and writes both apps instead of hanging"
 else
   bad "a dependency cycle produced rc=$cyc_rc"

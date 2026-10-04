@@ -51,7 +51,9 @@ git clone <your-fork>/airlock && cd airlock
 cp airlock.toml.example airlock.toml
 $EDITOR airlock.toml            # set owner, apps, ports, branding
 bash bin/airlock-preflight      # optional: report every enabled-app prerequisite
-bash install/airlock-install.sh # installs enabled apps, renders nginx, runs smoke
+bash install/airlock-install.sh # platform and core apps already recorded here
+# New apps use an explicit source; repeat for the apps you selected:
+bin/airlock-ledger apply fileview --source "$PWD/apps/fileview"
 ```
 
 Then open `https://<your-box>/` (Tailscale HTTPS) and add to home screen.

@@ -335,7 +335,12 @@ step_ok repo
 # ---- 5. run the STOCK installer ----------------------------------------------
 step install
 log "running install/airlock-install.sh inside the machine"
-inmc bash -lc "cd '$MC_REPO' && bash install/airlock-install.sh"
+inmc bash -s -- "$MC_REPO" "$MC_REPO/airlock.toml" <<'SH_APPLY'
+cd "$1" || exit 1
+export AIRLOCK_CONFIG="$2"
+. install/lib.sh
+airlock_install_selected
+SH_APPLY
 step_ok install
 
 FQDN="$(inroot tailscale status --json 2>/dev/null \

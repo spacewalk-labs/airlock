@@ -328,6 +328,65 @@ if command -v nginx >/dev/null 2>&1; then
   else
     bad "nginx -t: rendered site invalid"; nginx -t -c "$TMP/nginx.conf" -p "$TMP" 2>&1 | sed 's/^/    /'
   fi
+  if python3 -B - "$ROOT" "$TMP" "$(command -v nginx)" <<'PY_EXACT_FRAGMENTS'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root, base = map(Path, sys.argv[1:3])
+base = base / "exact-fragments"
+base.mkdir()
+confd = base / "confd"
+names = ["My App", "Line\nApp", "Star*App", "Question?App", "Bracket[ab]App",
+         r"Slash\App", r"Slash\*App", 'Quote"App', "-sample",
+         "before\npublish\nafter", "before\ndevterm\nafter"]
+config = base / "airlock.toml"
+config.write_text('[auth]\nowner="fixture@test"\n[apps.hub]\n' +
+                  "".join('[apps.' + json.dumps(name) + ']\n' for name in names))
+for sub in ("hub-locations.d", "servers.d"):
+    directory = confd / sub
+    directory.mkdir(parents=True)
+    for index, name in enumerate(names):
+        directive = (f"location = /fixture-{index} {{ return 204; }}" if sub == "hub-locations.d"
+                     else f"map $host $fixture_{index} {{ default 1; }}")
+        (directory / (name + ".conf")).write_text(f"# exact {sub} {index}\n{directive}\n")
+    for name in ("StarOtherApp", "QuestionXApp", "BracketaApp", r"Slash\OtherApp"):
+        (directory / (name + ".conf")).write_text("bogus_unselected_directive;\n")
+env = {**os.environ, "AIRLOCK_CONFIG": str(config), "AIRLOCK_CONFD": str(confd),
+       "AIRLOCK_STATE_DIR": str(base / "state"), "HOME": str(base / "home"),
+       "XDG_CONFIG_HOME": str(base / "home/config"), "XDG_STATE_HOME": str(base / "home/state")}
+env["AIRLOCK_PROJECT_IDS"] = json.dumps(["hub", *names])
+for selection in ("project JSON", "config keys"):
+    rendered = subprocess.run(["bash", str(root / "install/render-nginx.sh")], env=env,
+                              text=True, capture_output=True, check=True).stdout
+    # A line inside an ID must not turn into publish/devterm membership.
+    assert "# ==== End publish dedicated document-view gate ====" not in rendered, rendered
+    nginx_config = base / "nginx.conf"
+    nginx_config.write_text(f'pid "{base}/nginx.pid";\nerror_log stderr;\nevents {{}}\n'
+                            'http {\naccess_log off;\n' +
+                            "".join(f'{kind}_temp_path "{base}/{kind}";\n' for kind in
+                                    ("client_body", "proxy", "fastcgi", "uwsgi", "scgi")) +
+                            rendered + "\n}\n")
+    parsed = subprocess.run([sys.argv[3], "-T", "-c", str(nginx_config), "-p", str(base)],
+                            text=True, capture_output=True, check=True)
+    for sub in ("hub-locations.d", "servers.d"):
+        for index in range(len(names)):
+            assert f"# exact {sub} {index}\n" in parsed.stdout, (selection, sub, index, parsed.stdout)
+    print(f"PASS {selection}: nginx reads every exact whitespace/glob/quoted fragment in both contexts")
+    env.pop("AIRLOCK_PROJECT_IDS", None)
+config.write_text(config.read_text() + '[apps.devterm]\nfleet_read_domain="fixture; return 1"\n')
+env["AIRLOCK_PROJECT_IDS"] = json.dumps(["hub", "before\ndevterm\nafter"])
+subprocess.run(["bash", str(root / "install/render-nginx.sh")], env=env,
+               text=True, capture_output=True, check=True)
+print("PASS newline ID does not select devterm's fleet-domain configuration")
+PY_EXACT_FRAGMENTS
+  then
+    ok "nginx parses exact app fragments and preserves JSON/config ID membership"
+  else
+    bad "nginx exact-fragment selection"
+  fi
 else
   echo "skip nginx -t (nginx not installed)"
 fi

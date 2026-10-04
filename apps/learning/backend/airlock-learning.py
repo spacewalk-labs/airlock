@@ -26,6 +26,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from glob import glob
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -1780,7 +1781,14 @@ def fetch_oembed_metadata(url):
 
 
 def _freerelay_script():
-    """설치된 free-relay 래퍼 하나를 고른다. 없으면 호출 실패로 처리된다."""
+    """소유 레포의 CLI를 읽고, 이전 설치의 전역 경로도 호환한다."""
+    override = os.environ.get("LEARNING_FREERELAY_CALL")
+    if override:
+        return os.path.expanduser(override)
+    for path in sorted(glob(os.path.expanduser(
+            "~/workspace/*/.claude/skills/free-relay/freerelay_call.py"))):
+        if os.path.isfile(path):
+            return path
     for relative in (
         ".claude/skills/free-relay/freerelay_call.py",
         ".agents/skills/free-relay/freerelay_call.py",

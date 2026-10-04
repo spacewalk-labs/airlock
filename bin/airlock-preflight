@@ -16,6 +16,9 @@ airlock_config validate >/dev/null || exit 2
 # F11: the standalone report must evaluate the SAME assembled inventory the
 # installer does — without package-info, packaged prerequisites are silently
 # never evaluated and the paseo nvm gate acts on the wrong contract.
-AIRLOCK_PKG_INFO="$(airlock_config package-info)" || exit 2
-export AIRLOCK_PKG_INFO
+AIRLOCK_PKG_INFO_FILE="$(mktemp)" || exit 2
+trap 'rm -f -- "$AIRLOCK_PKG_INFO_FILE"' EXIT
+unset AIRLOCK_PKG_INFO
+export AIRLOCK_PKG_INFO_FILE
+airlock_config package-info >"$AIRLOCK_PKG_INFO_FILE" || exit 2
 if [ -n "$quiet" ]; then airlock_preflight "$quiet"; else airlock_preflight; fi

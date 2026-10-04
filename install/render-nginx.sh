@@ -16,8 +16,6 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # shellcheck source=/dev/null
 . "$ROOT/install/lib.sh"
 
-airlock_config validate >/dev/null    # fail-closed before we render anything
-
 eval "$(airlock_config env hub)"
 HUB_PORT="${AIRLOCK_HUB_NGINX_PORT:?hub nginx_port missing}"
 REDIRECT_PORT="${AIRLOCK_HUB_REDIRECT_PORT:?hub redirect_port missing}"
@@ -33,22 +31,46 @@ IDENT="$(ident_var "$AIRLOCK_IDENTITY_HEADER")"
 # read below of "which apps" goes through here, so the render and the engine's
 # record cannot disagree. Unset = today's behaviour: whatever airlock-config
 # resolves from airlock.toml.
-airlock_project_apps() {
-  if [ -n "${AIRLOCK_PROJECT_IDS+x}" ]; then
-    printf '%s\n' $AIRLOCK_PROJECT_IDS
-  else
-    airlock_config apps
-  fi
+if [ -n "${AIRLOCK_PROJECT_IDS+x}" ]; then
+  PROJECT_APPS_JSON="$AIRLOCK_PROJECT_IDS"
+else
+  PROJECT_APPS_JSON="$(airlock_config json)"
+fi
+mapfile -d '' -t PROJECT_APPS < <(python3 -B -c '
+import json, sys
+apps = json.loads(sys.argv[1])
+if isinstance(apps, dict):
+    apps = apps["apps"]
+for app in apps:
+    sys.stdout.buffer.write(app.encode() + b"\0")
+' "$PROJECT_APPS_JSON")
+
+airlock_project_has() {
+  local app
+  for app in "${PROJECT_APPS[@]}"; do
+    [ "$app" = "$1" ] && return 0
+  done
+  return 1
 }
 
 emit_canonical_fragment_includes() {
-  local sub="$1" app
-  airlock_project_apps | while IFS= read -r app; do
-    [ -n "$app" ] || continue
-    printf '%s' "$app" | grep -qE '^[a-z0-9][a-z0-9-]{0,31}$' || continue
-    [ -f "$CONFD/$sub/$app.conf" ] || continue
-    printf 'include %s/%s/%s.conf;\n' "$CONFD" "$sub" "$app"
-  done
+  python3 -B - "$CONFD" "$1" "${PROJECT_APPS[@]}" <<'PY_INCLUDES'
+from pathlib import Path
+import sys
+for app in sys.argv[3:]:
+    fragment = Path(sys.argv[1]) / sys.argv[2] / (app + ".conf")
+    if not fragment.is_file():
+        continue
+    path = str(fragment)
+    # nginx invokes POSIX glob when the path contains *?[. Escape that
+    # parser first, then nginx's quoted-string parser; ordinary paths do
+    # not pass through glob and keep their literal backslashes.
+    if any(char in path for char in "*?["):
+        path = "".join("\\" + char if char in "\\*?[]" else char for char in path)
+    path = (path.replace("\\", "\\\\").replace('"', '\\"')
+                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+    print(f'include "{path}";')
+PY_INCLUDES
 }
 
 # publish's dedicated document-view port is always present when the app is
@@ -67,7 +89,7 @@ PUBLISH_TITLE_META=false
 HUB_GATE="hub_ok"
 HUB_GATE_EXCEPTION=""
 HUB_EXACT_SCOPE=""
-if airlock_project_apps | grep -qx publish; then
+if airlock_project_has publish; then
   eval "$(airlock_config env publish)"
   PUBLISH_ENABLED=true
   PUBLISH_HTTPS_PORT="${AIRLOCK_PUBLISH_HTTPS_PORT:?publish https_port missing}"
@@ -127,7 +149,7 @@ fi
 # maps and proxy headers stand alone afterwards.  Keep the read in a subshell so the
 # app-specific env cannot overwrite the hub values already selected above.
 ACCOUNTS_FLEET_READ_DOMAIN=""
-if airlock_project_apps | grep -qx devterm; then
+if airlock_project_has devterm; then
   ACCOUNTS_FLEET_READ_DOMAIN="$({
     eval "$(airlock_config env devterm)"
     printf '%s' "${AIRLOCK_DEVTERM_FLEET_READ_DOMAIN:-}"

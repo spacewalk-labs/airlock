@@ -206,50 +206,14 @@ if [ "$PUBLISH_SHARE" != "$HOME/public_html" ] && [ -d "$HOME/public_html" ]; th
 fi
 
 # NOTE: smoke runs from the orchestrator AFTER nginx reload (gate not live before).
-# --- 5. the ingest skill, where each agent CLI looks for one ---
-# A symlink, not a copy: the skill and the save helper it calls have to move together,
-# and a copy drifts from the package the moment either changes.
-#
-# 🔴 Never clobber. `learning-ingest` is a name a user could already own — the reference
-# box has one in its content repository. If something is already there and it is not our
-# link, we leave it and say so. Installing over somebody's skill would be the app
-# deciding it knows better about a file it did not write.
-skill_link() {   # skill_link <dir>
-  local root="$1" target="$1/learning-ingest"
-  [ -n "$root" ] || return 0
-  if [ -L "$target" ]; then
-    if [ "$(readlink "$target")" = "$APP_DIR_LOCAL/skill" ]; then return 0; fi
-    log "note: ${target} is a symlink to something else — leaving it alone; ingest will use whatever it points at"
-    return 0
-  fi
-  if [ -e "$target" ]; then
-    log "note: ${target} already exists and is not ours — leaving it alone"
-    return 0
-  fi
-  # 🔴 `install -d` 가 아니라 `mkdir -p` 다. `install -d` 는 **이미 있는 디렉터리의 모드도
-  # 바꾼다** — 사용자가 0700 으로 잠가 둔 스킬 디렉터리가 링크 하나 걸었다고 0755 가 된다.
-  mkdir -p "$root" || { log "note: could not create ${root} — ingest skill not linked there"; return 0; }
-  ln -s "$APP_DIR_LOCAL/skill" "$target" \
-    || { log "note: could not link the ingest skill into ${root} — that CLI will not find it"; return 0; }
-  log "linked ingest skill: ${target}"
-}
-
-# 🔴 자리는 어댑터가 안다. 여기 다시 적으면 새 CLI 를 붙일 때 한쪽만 고치게 되고,
-# 그 CLI 는 스킬을 못 찾는데 아무 데서도 실패하지 않는다.
-# 🔴 스킬을 못 걸어도 **설치를 죽이지 않는다.** 이 절은 유닛·nginx 조각을 이미 쓴 뒤에
-# 오므로, 여기서 죽으면 절반만 설치된 상태로 끝나고 성공 줄도 안 찍힌다. 그리고 적재는
-# 이 앱의 절반일 뿐이다 — 열람과 공유는 스킬 없이 완전히 돈다. 이 절 전체가 non-fatal 이다.
-SKILL_ROOTS="$(python3 "$HERE/backend/providers.py" --skill-roots 2>/dev/null || true)"
-[ -n "$SKILL_ROOTS" ] \
-  || log "note: could not read the skill directories from the provider adapter — ingest skill not linked"
+# --- 5. retire former app-owned global skill links ---
+# The worker loads the package contract directly. Retire only links this app
+# created before that change; personal skills and foreign symlinks stay intact.
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "[dry] link ingest skill into: $(echo "$SKILL_ROOTS" | tr '\n' ' ')"
+  log "[dry] remove former app-owned ingest skill links"
 else
-  while IFS= read -r _root; do
-    [ -n "$_root" ] && skill_link "$_root"
-  done <<EOF
-$SKILL_ROOTS
-EOF
+  bash "$HERE/deactivate.sh" \
+    || log "note: could not retire all former ingest links — package contract loading is independent; leaving directory permissions unchanged"
 fi
 
 # --- 5c. an agent CLI is not required to install, but say so when there is none ---

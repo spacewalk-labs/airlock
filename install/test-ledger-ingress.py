@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -129,8 +130,7 @@ class IngressTests(unittest.TestCase):
         return result
 
     def ledger(self, *args, ok=True):
-        info = {"company_repo": self.company_url} if hasattr(self, "company_url") else {}
-        return self.command(sys.executable, str(ROOT / "bin/airlock-ledger"), *args, ok=ok, stdin=json.dumps(info))
+        return self.command(sys.executable, str(ROOT / "bin/airlock-ledger"), *args, ok=ok)
 
     def loaded(self):
         code = ('from importlib.machinery import SourceFileLoader\nimport json,sys\n'
@@ -164,6 +164,51 @@ class IngressTests(unittest.TestCase):
     def assert_operator(self):
         self.assertEqual(self.read("serve.json")["http:9999"], "operator")
 
+    def test_project_retires_old_hub_default_and_keeps_operator(self):
+        self.put("serve.json", {"http:19901": "old-hub", "http:9999": "operator"})
+        self.configure(http=19902)
+        self.ledger("project")
+        self.assertNotIn("http:19901", self.read("serve.json"))
+        self.assertIn("http:19902", self.read("serve.json"))
+        self.assert_operator()
+
+    def assert_app_using_hub_default_survives(self, *, moving):
+        directory = self.local_app("alpha")
+        self.configure(http=19902)
+        def manifest(port):
+            self.write(directory / "airlock-app.toml",
+                       'contract = 1\nid = "alpha"\n[config.defaults]\n'
+                       + f'http_port = {port}\n[artifacts]\nserve_ports = ["http_port"]\n')
+        if moving:
+            manifest(45678)
+            self.ledger("apply", "alpha", "--source", str(directory))
+        manifest(19901)
+        self.ledger("apply", "alpha", *([] if moving else ["--source", str(directory)]))
+        self.assertIn("http:19901", self.read("serve.json"))
+        self.assertIn("http:19901", self.loaded()["alpha"]["artifacts"])
+        self.assertIn("http:19902", self.read("serve.json"))
+        if moving:
+            self.assertNotIn("http:45678", self.read("serve.json"))
+        self.assert_operator()
+
+    def test_new_app_using_prior_hub_default_keeps_applied_ingress(self):
+        self.assert_app_using_hub_default_survives(moving=False)
+
+    def test_app_moving_to_prior_hub_default_keeps_applied_ingress(self):
+        self.assert_app_using_hub_default_survives(moving=True)
+
+    def test_container_declaration_loads_config_without_admission(self):
+        directory = self.local_app("alpha")
+        self.write(directory / "airlock-app.toml",
+                   'contract = 1\nid = "alpha"\n[artifacts]\ncontainers = ["alpha"]\n')
+        marker = self.base / "hook-loaded"
+        self.write(directory / "install.sh",
+                   '. "$AIRLOCK_ROOT/install/lib.sh"\nairlock_load alpha\n'
+                   + 'printf loaded > ' + __import__("shlex").quote(str(marker)) + '\n')
+        self.ledger("apply", "alpha", "--source", str(directory))
+        self.assertEqual(marker.read_text(), "loaded")
+        self.assertIn("alpha", self.loaded())
+
     def test_legacy_https_and_aux_http_transfer_read_only_then_remove(self):
         self.legacy()
         before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (self.base / "state").iterdir()}
@@ -188,11 +233,11 @@ class IngressTests(unittest.TestCase):
             self.assertIn(token, self.read("serve.json"))
         self.assert_operator()
 
-    def test_project_retires_old_hub_default_and_keeps_operator(self):
-        self.put("serve.json", {"http:19901": "old-hub", "http:9999": "operator"})
+    def test_project_applies_hub_without_retiring_unrecorded_listeners(self):
+        self.put("serve.json", {"http:19907": "operator-custom", "http:9999": "operator"})
         self.configure(http=19902)
         self.ledger("project")
-        self.assertNotIn("http:19901", self.read("serve.json"))
+        self.assertEqual(self.read("serve.json")["http:19907"], "operator-custom")
         self.assertIn("http:19902", self.read("serve.json"))
         self.assert_operator()
 
@@ -256,9 +301,9 @@ class IngressTests(unittest.TestCase):
         self.company()
         self.ledger("apply", "alpha", "--source", "company")
         newest = self.company(ports=(45679,), files=("alpha.new",))
-        # Project retires the live stale port first. Fail the later explicit
-        # old-resource cleanup, rather than conflating it with projection failure.
-        self.put("faults.json", {"off_nth": {"http:45678": 2}})
+        # Only the explicit recorded-resource cleanup owns retirement. Fail its
+        # first call; projection must never sweep the same listener beforehand.
+        self.put("faults.json", {"off_nth": {"http:45678": 1}})
         self.ledger("apply", "alpha", "--source", "company", ok=False)
         row = self.loaded()["alpha"]
         self.assertEqual(row["commit"], newest)
@@ -324,6 +369,17 @@ class IngressTests(unittest.TestCase):
         self.put("state/installed-apps.json", unrelated)
         self.ledger("list")
         self.ledger("project")
+        broken = self.local_app("broken")
+        self.write(broken / "airlock-app.toml", "broken TOML =")
+        self.put("state/installed-apps.json", dict(unrelated, broken={
+            "repo": str(broken), "commit": "", "artifacts": []}))
+        direct = self.command("env", "AIRLOCK_PROJECT_IDS=" + json.dumps(list(unrelated) + ["broken"]),
+                              str(ROOT / "bin/airlock-config"), "webjson")
+        projected = self.ledger("project")
+        self.assertIn("invalid TOML", direct.stderr)
+        self.assertIn(direct.stderr, projected.stderr)
+        self.assertNotIn("broken", self.read("web/__airlock.json")["apps"])
+        self.put("state/installed-apps.json", unrelated)
         self.ledger("apply", "alpha", "--source", str(directory))
         rows = self.loaded()
         self.assertEqual({key: rows[key] for key in unrelated}, unrelated)
@@ -418,36 +474,116 @@ class IngressTests(unittest.TestCase):
         self.write(bad / 'airlock-app.toml', 'contract = 1\nid = "alpha"\n')
         self.write(bad / 'install.sh', '#!/bin/sh\nprintf "bad\\n" >>"$HOME/install-order"\nexit 42\n')
         result = self.ledger('apply', 'alpha', '--source', str(bad), ok=False)
-        self.assertIn('restored alpha', result.stderr)
+        self.assertIn('failed apply was not retried', result.stderr)
         self.assertNotIn('Traceback', result.stderr)
-        self.assertEqual((self.base / 'home/install-order').read_text(), 'old\nbad\nold\n')
+        self.assertEqual((self.base / 'home/install-order').read_text(), 'old\nbad\n')
         self.assertEqual(self.loaded()['alpha']['repo'], str(directory))
 
         rows = self.loaded()
         rows['hub'] = {'repo': 42, 'artifacts': []}
         self.put('state/installed-apps.json', rows)
-        installer = (ROOT / 'install/airlock-install.sh').read_text()
-        selection = installer.split("<<'PY_CORE'\n", 1)[1].split('\nPY_CORE', 1)[0]
-        result = self.command(sys.executable, '-B', '-c', selection,
-                              str(ROOT / 'bin/airlock-ledger'), str(ROOT / 'apps'),
-                              '', '', '', str(ROOT / 'bin/airlock-config'))
-        self.assertNotIn('hub', json.loads(result.stdout)['core'])
+        # Old updater's release-ledger read API remains usable without platform
+        # selection/provenance helpers. Full installer selection is exercised
+        # through real hook consumers by test-update.sh.
+        from importlib.machinery import SourceFileLoader
+        reader = SourceFileLoader('old_updater_reader', str(ROOT / 'bin/airlock-ledger')).load_module()
+        snapshot = self.base / 'old-updater-installed.json'
+        self.assertTrue(reader.snapshot_installed(snapshot, self.base / 'state'))
+        self.assertEqual(reader.validate_installed_bytes(snapshot.read_bytes()), rows)
         self.assertEqual(self.loaded(), rows)
-        previous = self.base / 'previous-core'
-        self.write(previous / 'bin/airlock-status', '#!/bin/sh\nexit 0\n')
-        self.put('runtime-snapshot.json', {
-            'broken': {'repo': 42}, '../metadata': 'uninterpreted',
-            'owned': {'repo': str(previous / 'apps/owned'), 'artifacts': []}})
-        updater = (ROOT / 'bin/airlock-update').read_text()
-        function = updater[updater.index('installed_record() {'):].split('\n}\n', 1)[0] + '\n}\n'
-        script = function + '\ninstalled_record "$1" runtime-root "$2" "$3" "$4"\n'
-        older = self.base / 'older-ledger'
-        older.write_text((ROOT / 'bin/airlock-ledger').read_text().replace(
-            'def _recorded_repo(', 'def _older_unused_recorded_repo('))
-        for engine in (ROOT / 'bin/airlock-ledger', older):
-            result = self.command('bash', '-c', script, 'record-test', str(engine),
-                                  str(self.base / 'runtime-snapshot.json'), str(previous), 'fallback')
-            self.assertEqual(result.stdout.strip(), str(previous))
+
+    def test_leading_hyphen_id_through_actual_wrapper_and_ledger(self):
+        from importlib.machinery import SourceFileLoader
+        wrapper = SourceFileLoader('leading_id_wrapper', str(
+            ROOT / 'apps/dev-monitor/backend/devmon_update_exec.py')).load_module()
+        app_id = '-sample'
+        directory = self.local_app(app_id)
+        self.write(directory / 'install.sh',
+                   '#!/bin/sh\nprintf "installed\\n" >>"$HOME/dash-app-installed"\n')
+        runs = self.base / 'wrapper-runs'
+        wrapper.ensure_dirs(runs)
+        for action in ('install', 'app', 'teardown'):
+            wrapper.write_record(runs, wrapper.start_record(action, action, app_id))
+            self.command(*wrapper.build_exec_argv(
+                ROOT, runs, action, action, app_id, package_path=str(directory)))
+            record = wrapper.read_record(runs, action)
+            self.assertEqual((record['appId'], record['status'], record['exitCode']),
+                             (app_id, 'done', 0))
+            if action != 'teardown':
+                self.assertEqual(self.loaded()[app_id]['repo'], str(directory))
+            else:
+                self.assertNotIn(app_id, self.loaded())
+        self.assertEqual((self.base / 'home/dash-app-installed').read_text(),
+                         'installed\ninstalled\n')
+
+    def test_whitespace_ids_and_sources_reach_hooks_and_machine_consumers(self):
+        ids = ['Tab\tApp', 'Line\nApp', ' My App ', 'Trailing ', 'Trailing\n',
+               'Carriage\rApp', 'Star*App']
+        decoys = [self.base / 'web/assets/apps' / name / 'icon.svg'
+                  for name in ('Carriage\nApp', 'StarOtherApp')]
+        for path in decoys:
+            self.write(path, 'other app icon')
+        for app_id in ids:
+            directory = self.local_app(app_id)
+            self.write(directory / 'airlock-app.toml', 'contract=1\nid=' + json.dumps(app_id)
+                       + '\n[tile]\nicon="icon.svg"\n')
+            self.write(directory / 'icon.svg', '<svg xmlns="http://www.w3.org/2000/svg"/>')
+            self.write(directory / 'install.sh', '#!/bin/sh\npython3 - <<\'PY\'\n'
+                       'import json,os,pathlib\n'
+                       'with (pathlib.Path(os.environ["HOME"])/"boundary-hooks.jsonl").open("a") as f:\n'
+                       ' f.write(json.dumps([os.environ["AIRLOCK_APP_ID"],os.environ["AIRLOCK_APP_DIR"]])+"\\n")\nPY\n')
+            self.ledger('apply', '--source', str(directory), '--', app_id)
+            self.assertEqual(self.loaded()[app_id]['repo'], str(directory))
+            icon = self.base / 'web/assets/apps' / app_id / 'icon.svg'
+            self.assertTrue(icon.is_file())
+            self.assertIn(str(icon), self.loaded()[app_id]['artifacts'])
+            self.assertTrue(set(map(str, decoys)).isdisjoint(self.loaded()[app_id]['artifacts']))
+        hooks = [json.loads(line) for line in
+                 (self.base / 'home/boundary-hooks.jsonl').read_text().splitlines()]
+        self.assertEqual(hooks, [[app, str(self.base / 'sources' / app)] for app in ids])
+        self.assertEqual(json.loads(self.ledger('list', '--json').stdout), self.loaded())
+        self.assertEqual(json.loads(self.ledger('plan', '--json').stdout),
+                         [['reinstall', app] for app in sorted(ids)])
+        code = ('import json,sys\nfrom pathlib import Path\n'
+                'root=Path(sys.argv[1]); sys.path.insert(0,str(root/"apps/dev-monitor/backend"))\n'
+                'import devmon_apps,devmon_update_exec\n'
+                'ids=json.loads(sys.argv[2]); assert devmon_apps.installed_ids(root)==sorted(ids)\n'
+                'for app in ids:\n'
+                ' row=devmon_update_exec.app_summary(root,app)\n'
+                ' assert row["installed"] is True and row["appId"]==app, row\n')
+        self.command(sys.executable, '-B', '-c', code, str(ROOT), json.dumps(ids))
+
+        shell = 'export AIRLOCK_ROOT="$1"; source "$AIRLOCK_ROOT/install/lib.sh"; airlock_installed_app_ids; airlock_app_installed "$2"'
+        for app in ids:
+            result = self.command('bash', '-c', shell, 'membership', str(ROOT), app)
+            self.assertEqual(json.loads(result.stdout), sorted(ids))
+        company = self.base / 'company'
+        company.mkdir()
+        for app in ids:
+            source = self.base / 'sources' / app
+            shutil.copytree(source, company / 'apps' / app)
+            shutil.copytree(source, self.base / 'data/apps' / app)
+        self.command('git', '-C', str(company), 'init', '-q', '-b', 'main')
+        self.command('git', '-C', str(company), 'add', 'apps')
+        self.command('git', '-C', str(company), '-c', 'user.name=Fixture', '-c',
+                     'user.email=fixture@example.invalid', 'commit', '-qm', 'apps')
+        self.configure(company=company.as_uri())
+        rows = self.loaded()
+        for row in rows.values():
+            row.update(repo=company.as_uri(), commit='')
+        self.put('state/installed-apps.json', rows)
+        code = ('import json,sys\nfrom pathlib import Path\n'
+                'root=Path(sys.argv[1]); sys.path.insert(0,str(root/"apps/dev-monitor/backend"))\n'
+                'import devmon_updates\n'
+                'rows=devmon_updates._apps(root)\n'
+                'assert [row["id"] for row in rows]==sorted(json.loads(sys.argv[2])), rows\n'
+                'assert all(row["action"]=="upgrade" for row in rows), rows\n')
+        self.command(sys.executable, '-B', '-c', code, str(ROOT), json.dumps(ids))
+
+        for app_id in ('Carriage\rApp', 'Star*App'):
+            self.ledger('remove', '--', app_id)
+            self.assertFalse((self.base / 'web/assets/apps' / app_id).exists())
+        self.assertTrue(all(path.read_text() == 'other app icon' for path in decoys))
 
     def test_cut_readable_install_hook_symlink_runs(self):
         directory = self.local_app("alpha")
@@ -459,6 +595,51 @@ class IngressTests(unittest.TestCase):
         self.ledger("apply", "alpha", "--source", str(directory))
         self.assertEqual((self.base / "home/hook-ran").read_text(), "installed")
         self.assertIn("alpha", self.loaded())
+
+    def test_apply_hook_reads_the_package_info_apply_read(self):
+        directory = self.local_app("alpha")
+        self.write(directory / "install.sh",
+                   '#!/bin/sh\ncat "$AIRLOCK_PKG_INFO_FILE" >"$HOME/hook-pkg-info"\n')
+        self.env["AIRLOCK_PKG_INFO"] = '{"packages":{"stale":{}}}'
+        self.env["AIRLOCK_INSTALL_PKG_INFO_SHA256"] = "f" * 64
+        self.env["AIRLOCK_CONFIG_SNAPSHOT"] = str(self.base / "missing-snapshot")
+        self.env["AIRLOCK_PKG_INFO_FILE"] = str(self.base / "missing-projection")
+        self.command(sys.executable, str(ROOT / "bin/airlock-ledger"),
+                     "apply", "alpha", "--source", str(directory), stdin="invalid stdin")
+        info = json.loads((self.base / "home/hook-pkg-info").read_text())
+        self.assertIn("alpha", info["packages"])
+        self.assertNotIn("stale", info["packages"])
+
+    def test_large_package_info_reaches_hook_and_projection_by_file(self):
+        directory = self.local_app("alpha")
+        self.write(directory / "airlock-app.toml", 'contract = 1\nid = "alpha"\n'
+                   '[config.tables.registry]\nallowed_keys = ["vaults"]\n'
+                   '[[registry]]\nname="vaults"\ntable="registry"\n'
+                   'entries="vaults"\nkey="id"\nenabled="sync"\nenabled_default=true\nfields={path="path"}\n')
+        with (self.base / "airlock.toml").open("a") as handle:
+            handle.write('[apps.alpha.registry]\nvaults=[\n'
+                         + ''.join('{id="v%d",path="$HOME/v%d"},\n' % (i, i)
+                                   for i in range(2000)) + ']\n')
+        self.write(directory / "install.sh",
+                   '#!/bin/bash\n. "$AIRLOCK_ROOT/install/lib.sh"\n'
+                   'airlock_package_info >"$HOME/hook-pkg-info"\n'
+                   'printf "%s" "$AIRLOCK_PKG_INFO_FILE" >"$HOME/projection-path"\n'
+                   'airlock_pkg_dir alpha >"$HOME/hook-dir"\n')
+        self.ledger("apply", "alpha", "--source", str(directory))
+        raw = (self.base / "home/hook-pkg-info").read_bytes()
+        self.assertGreater(len(raw), 131072)
+        self.assertEqual(len(json.loads(raw)["packages"]["alpha"]["registry_projections"]["vaults"]["rows"]), 2000)
+        self.assertEqual((self.base / "home/hook-dir").read_text().strip(), str(directory))
+        self.assertFalse(Path((self.base / "home/projection-path").read_text()).exists())
+        self.assertIn("alpha", self.loaded())
+
+    def test_new_app_requires_explicit_source_despite_config_candidate(self):
+        directory = self.local_app("alpha")
+        self.env["AIRLOCK_APP_ID"] = "alpha"
+        self.env["AIRLOCK_APP_DIR"] = str(directory)
+        result = self.ledger("apply", "alpha", ok=False)
+        self.assertIn("new apps require --source", result.stderr)
+        self.assertNotIn("alpha", self.loaded())
 
     def test_cut_absent_remove_has_no_effects(self):
         self.put("state/installed-apps.json", {})

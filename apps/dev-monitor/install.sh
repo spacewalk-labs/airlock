@@ -330,26 +330,16 @@ if [ -n "$FQDN" ]; then
   # Ports come from the platform's own package-info, so a box that does not install a
   # tool grants nothing for it, and a re-configured port cannot drift away from reality.
   #
-  # package-info is exported by install/airlock-install.sh; a standalone app install has
-  # to ask for it. It is the SAME projection either way — one method, so the two entry
-  # points cannot answer differently. An earlier draft re-derived the ports here from
-  # individual config keys and got it wrong twice: it granted `compat_https` even when
-  # that listener is disabled (only serve_port_values knows), and it swallowed lookup
-  # failures into a short list nobody was told about.
-  _pkg_info="${AIRLOCK_PKG_INFO:-}"
-  if [ -z "$_pkg_info" ]; then
-    log "note: package-info absent (standalone app install) — asking airlock-config for it"
-    _pkg_info="$(airlock_config package-info)" \
-      || die "could not read package-info; badge origins are unresolvable"
-  fi
-  # An empty projection would reach the parser as `json.loads("")`, whose message names a
-  # column rather than a cause. Say the cause here instead.
-  [ -n "$_pkg_info" ] || die "package-info was empty; badge origins are unresolvable"
-  cors_origins="$(BADGE_APPS="$BADGE_APPS" FQDN="$FQDN" AIRLOCK_PKG_INFO="$_pkg_info" \
-    python3 - <<'DEVMON_CORS_PY'
+  # Badge origins require only installed badge tools, not every app source.
+  # Read those explicit peers through the same parser; keep JSON on stdin.
+  _badge_ids=(dev-monitor)
+  for _badge_app in $BADGE_APPS; do
+    if airlock_app_installed "$_badge_app"; then _badge_ids+=("$_badge_app"); fi
+  done
+  cors_origins="$(airlock_config package-info "${_badge_ids[@]}" | BADGE_APPS="$BADGE_APPS" FQDN="$FQDN" \
+    python3 -c '
 import json, os, sys
-# No `or "{}"`: an empty projection here is a bug upstream, not a quiet empty set.
-info = json.loads(os.environ["AIRLOCK_PKG_INFO"])
+info = json.load(sys.stdin)
 packages = info.get("packages") or {}
 fqdn = os.environ["FQDN"].strip().lower()
 hosts = [fqdn]
@@ -364,7 +354,7 @@ for app in os.environ["BADGE_APPS"].split():
     # BADGE_APPS names the SHIPPED tools. An operator may point [packages.<id>] at a
     # local tree that takes one of those ids, and that package is not the audited thing
     # the name refers to — it is whatever is on disk, on whatever port it declares.
-    # Matching by id alone would hand it the owner's message preview by inheritance.
+    # Matching by id alone would hand it the owner message preview by inheritance.
     if pkg.get("source_class") != "shipped":
         sys.stderr.write(
             "skip %s: a local package shadows this id, so it is not the shipped tool "
@@ -377,7 +367,7 @@ for app in os.environ["BADGE_APPS"].split():
 # dict.fromkeys: stable order, not a set shuffle, so the rendered unit is
 # byte-identical across runs and the golden stays meaningful.
 sys.stdout.write(",".join(dict.fromkeys(out)))
-DEVMON_CORS_PY
+'
 )"
   [ -n "$cors_origins" ] \
     || log "WARN: no badge-drawing tool is installed — the unread badge stays hub-only"

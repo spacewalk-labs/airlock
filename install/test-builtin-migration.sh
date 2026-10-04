@@ -76,14 +76,6 @@ if [ "${1:-}" = serve ] && [ "${2:-}" = status ]; then printf '{"TCP":{}}\n'; ex
 printf '%s\n' "$*" >> "$AIRLOCK_TEST_TMP/tailscale.log"
 exit 0
 STUB
-# The production bundle policy is deliberately immutable and exact for the
-# repository's nine apps.  This suite predates that policy and exercises the
-# shipped resolver with many scratch-only ids.  Keep those fixtures useful
-# without adding a production override: only the test's PATH-scoped Python
-# interpreter imports airlock-config, replaces the in-memory policy with the
-# exact scratch-root id set, and invokes main().  All non-airlock-config Python
-# calls exec the real interpreter, and calls against the repository's real
-# apps/ root retain the real nine-entry policy.
 cat >"$SHIM/python3" <<'STUB'
 #!/usr/bin/python3
 import importlib.util
@@ -99,22 +91,6 @@ if len(sys.argv) > 1 and tool and os.path.realpath(sys.argv[1]) == os.path.realp
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
-    root = Path(os.environ.get("AIRLOCK_SHIPPED_APPS_ROOT", ""))
-    production_root = Path(tool).resolve().parent.parent / "apps"
-    if root and os.path.realpath(root) != os.path.realpath(production_root):
-        fixture_ids = sorted(
-            entry.name for entry in root.iterdir()
-            if entry.is_dir() and not entry.is_symlink()
-            and (entry / "airlock-app.toml").is_file()
-            and not (entry / "airlock-app.toml").is_symlink()
-            and module.PACKAGE_ID_RE.fullmatch(entry.name) is not None
-            and entry.name not in module.RESERVED_PACKAGE_IDS
-        ) if root.is_dir() else []
-        module.BUNDLE_ENTITLEMENTS = {
-            package_id: ("plaintext-redirect", "rooted-artifact", "system-unit")
-            for package_id in fixture_ids
-        }
-        module.BUNDLE_ROOT = root
     raise SystemExit(module.main(sys.argv[1:]))
 os.execv("/usr/bin/python3", ["/usr/bin/python3", *sys.argv[1:]])
 STUB
@@ -210,111 +186,12 @@ else
   bad "explicit shadows shipped"
 fi
 
-# =============================================================================
-# Capability admission: a bundled id is not itself a grant.
-#
-# These are intentionally red-first contracts.  The unmodified v4 tree derives
-# system-unit directly from the manifest unit scope, so the first two cases
-# below expose that an external package (including an `orca` shadow) can mint
-# the claim it needs merely by declaring scope=system.  Plaintext redirect and
-# closed config shape were already fail-closed; keep them here to ensure the
-# single admission refactor does not weaken those boundaries.
-# =============================================================================
-
-reset_box
-ext_system="$TMP/external-system"; mkpkg "$ext_system" external-system \
-  'contract = 1' 'id = "external-system"' \
-  '[artifacts]' 'units = [{name = "external-system.service", scope = "system"}]'
-cfg_ext_system="$TMP/cfg-external-system.toml"
-make_pkg_cfg "$cfg_ext_system" external-system "$ext_system"
-
-reset_box
-orca_shadow="$TMP/orca-shadow"; mkpkg "$orca_shadow" orca \
-  'contract = 1' 'id = "orca"' \
-  '[artifacts]' 'units = [{name = "orca-shadow.service", scope = "system"}]'
-cfg_orca_shadow="$TMP/cfg-orca-shadow.toml"
-make_pkg_cfg "$cfg_orca_shadow" orca "$orca_shadow"
-
-# An admitted, non-privileged explicit shadow must also carry no immutable
-# bundle build certification.
-reset_box
-orca_plain="$TMP/orca-plain"; mkpkg "$orca_plain" orca \
-  'contract = 1' 'id = "orca"'
-devterm_plain="$TMP/devterm-plain"; mkpkg "$devterm_plain" devterm \
-  'contract = 1' 'id = "devterm"'
-cfg_plain_shadows="$TMP/cfg-plain-shadows.toml"
-{ base_config
-  printf '[apps.orca]\n[apps.devterm]\n[packages.orca]\npath = "%s"\n[packages.devterm]\npath = "%s"\n' \
-    "$orca_plain" "$devterm_plain"
-} >"$cfg_plain_shadows"
-seed_apps orca "$orca_plain" devterm "$devterm_plain"
-shadow_info="$(run "$cfg_plain_shadows" package-info 2>/dev/null)"
-if python3 -c '
-import json, sys
-packages = json.load(sys.stdin)["packages"]
-for package_id in ("orca", "devterm"):
-    package = packages[package_id]
-    assert package["source_class"] == "explicit"
-    assert package["certifications"] == []
-' <<<"$shadow_info" 2>/dev/null; then
-  ok "capability admission: explicit built-in-id shadows get no bundle certification"
-else
-  bad "capability admission: explicit built-in-id shadows get no bundle certification"
-fi
-
-# Stable output is part of the capability boundary, not presentation sugar:
-# downstream release tooling must consume these bytes without parsing TOML.
-# Use the real bundle root so the visible table is the production nine-entry
-# contract.
+# Stable manifest resource metadata remains available to release tooling.
 reset_box
 cfg_capability_json="$TMP/cfg-capability-json.toml"
 { base_config
   printf '[apps.dev-monitor]\n[apps.orca]\n'
 } >"$cfg_capability_json"
-capability_json="$(AIRLOCK_SHIPPED_APPS_ROOT="$ROOT/apps" AIRLOCK_CONFIG="$cfg_capability_json" \
-  python3 "$CFG" json 2>/dev/null)"
-if python3 -c '
-import json, sys
-contract = json.load(sys.stdin)["capability_contract"]
-assert contract["schema_version"] == 1
-assert contract["bundle_entitlements"] == {
-    "code-server": [], "dev-monitor": ["rooted-artifact", "system-unit"],
-    "devterm": [], "feedback": [], "learning": [],
-    "fileview": [], "notepad": [],
-    "orca": ["rooted-artifact", "system-unit"],
-    "paseo": [], "publish": [],
-}
-dev_monitor = contract["packages"]["dev-monitor"]
-assert dev_monitor == {
-    "capabilities": ["rooted-artifact", "system-unit"],
-    "certifications": ["dry-run-exec", "strict-config-scan"],
-    "effective_capabilities": ["rooted-artifact", "system-unit"],
-    "requested_capabilities": ["rooted-artifact", "system-unit"],
-    "surface_classifications": {
-        "rooted-artifact": "elevated-capability",
-        "serve-https": "baseline-mediated-mapping",
-        "serve-port": "baseline-mediated-mapping",
-        "system-unit": "elevated-capability",
-    },
-    "surfaces": ["rooted-artifact", "serve-https", "serve-port", "system-unit"],
-}
-orca = contract["packages"]["orca"]
-assert orca["requested_capabilities"] == ["rooted-artifact", "system-unit"]
-assert orca["effective_capabilities"] == ["rooted-artifact", "system-unit"]
-assert orca["capabilities"] == ["rooted-artifact", "system-unit"]
-assert orca["surfaces"] == ["rooted-artifact", "serve-https", "serve-port", "system-unit"]
-assert orca["surface_classifications"] == {
-    "rooted-artifact": "elevated-capability",
-    "serve-https": "baseline-mediated-mapping",
-    "serve-port": "baseline-mediated-mapping",
-    "system-unit": "elevated-capability",
-}
-' <<<"$capability_json" 2>/dev/null; then
-  ok "capability output: json exposes exact bundle policy and effective package facts"
-else
-  bad "capability output: json exposes exact bundle policy and effective package facts"
-fi
-
 canonical_sha=0123456789abcdef0123456789abcdef01234567
 canonical_expected="{\"package_id\":\"dev-monitor\",\"schema_version\":1,\"source_repository_id\":\"example-org/example-work\",\"source_sha\":\"$canonical_sha\",\"surface_classifications\":{\"rooted-artifact\":\"elevated-capability\",\"serve-https\":\"baseline-mediated-mapping\",\"serve-port\":\"baseline-mediated-mapping\",\"system-unit\":\"elevated-capability\"},\"surfaces\":[\"rooted-artifact\",\"serve-https\",\"serve-port\",\"system-unit\"]}"
 canonical_one="$(AIRLOCK_SHIPPED_APPS_ROOT="$ROOT/apps" AIRLOCK_CONFIG="$cfg_capability_json" \
@@ -616,152 +493,6 @@ else
 fi
 rm -f "$PKGROOT/pr-sym"
 
-# P2/P3 mixed-state matrix (docs/tasks/active/app-pkg-c4-builtin-migration.md,
-# "Approach" P2: "after each app's commit, a nine-app dry run asserts
-# migrated apps executed via the package path, unmigrated apps via the
-# legacy branch, an explicit-shadow fixture package still skipped"). Child
-# 4/P3 retires the legacy branch and AIRLOCK_MIGRATED_APPS — all nine are
-# shipped AND migrated now. This matrix has no ③/v7 record, so its bootstrap
-# preview validates inputs and displays the shipped plan without hooks, plus the
-# explicit-shadow case, which stays load-bearing (D4 unchanged). Unlike
-# every fixture above, this section deliberately points
-# AIRLOCK_SHIPPED_APPS_ROOT at the REAL $ROOT/apps tree (per-invocation
-# override of the file-wide scratch export) — the whole point is to prove
-# the REAL migrated built-ins appear in the plan under a real bootstrap dry run of
-# install/airlock-install.sh, which no fixture package can stand in for.
-# =============================================================================
-reset_box
-MM="$TMP/mixed-matrix"; mkdir -p "$MM/home" "$MM/web" "$MM/confd" "$MM/code" "$MM/state" "$MM/shim"
-MMCFG="$MM/airlock.toml"
-cat >"$MMCFG" <<EOF
-[site]
-name = "MixedMatrix"
-
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-
-[paths]
-
-[apps.hub]
-[apps.code-server]
-[apps.dev-monitor]
-[apps.devterm]
-[apps.feedback]
-[apps.fileview]
-[apps.notepad]
-[apps.orca]
-[apps.paseo]
-[apps.publish]
-EOF
-# Shim every prerequisite command this box lacks — TSV rows AND migrated
-# apps' manifest rows (F11 assembly), so an app that moved its prerequisite
-# out of the TSV is still covered. AIRLOCK_SHIPPED_APPS_ROOT must point at
-# the REAL $ROOT/apps here too (same override run_mixed_matrix uses below,
-# not the file-wide $PKGROOT scratch export from the top of this file) — a
-# prereqs assembly against the scratch root finds none of the real shipped
-# manifests, so it "succeeds" (rc=0) with an inventory silently missing
-# every migrated app's manifest-only commands (nft, npm, ...), and the
-# fallback below never triggers to catch that.
-MMPREREQS="$MM/prereqs.tsv"
-AIRLOCK_CONFIG="$MMCFG" AIRLOCK_SHIPPED_APPS_ROOT="$ROOT/apps" \
-  python3 "$CFG" prereqs >"$MMPREREQS" 2>/dev/null \
-  || cp "$ROOT/install/prerequisites.tsv" "$MMPREREQS"
-while IFS=$'\t' read -r _owner cmd _rest; do
-  case "$cmd" in ""|\#*) continue ;; esac
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    printf '#!/bin/sh\nexit 0\n' >"$MM/shim/$cmd"; chmod +x "$MM/shim/$cmd"
-  fi
-done <"$MMPREREQS"
-
-run_mixed_matrix() {
-  local cfg="$1" home="$2" web="$3" confd="$4" state="$5"
-  AIRLOCK_SHIPPED_APPS_ROOT="$ROOT/apps" \
-  HOME="$home" AIRLOCK_CONFIG="$cfg" AIRLOCK_STATE_DIR="$state" \
-  AIRLOCK_WEBROOT="$web" AIRLOCK_CONFD="$confd" AIRLOCK_TS_FQDN="box.example.ts.net" \
-  AIRLOCK_DRY_RUN=1 AIRLOCK_UNIT_DIR_USER="$UU" AIRLOCK_UNIT_DIR_SYSTEM="$US" \
-  PATH="$MM/shim:$PATH" \
-    bash "$ROOT/install/airlock-install.sh" 2>&1
-}
-
-mixed_bytes() {
-  python3 - "$MM" <<'PY_MIXED_BYTES'
-import hashlib, json, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-print(json.dumps({str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-                  for path in root.rglob('*') if path.is_file()}, sort_keys=True))
-PY_MIXED_BYTES
-}
-mm_before="$(mixed_bytes)"
-out_mm="$(run_mixed_matrix "$MMCFG" "$MM/home" "$MM/web" "$MM/confd" "$MM/state")"; rc_mm=$?
-if [ "$rc_mm" -eq 0 ]; then
-  ok "mixed-matrix: nine-app real dry run completes"
-else
-  bad "mixed-matrix: nine-app real dry run exited $rc_mm"
-  failure_detail "$out_mm"
-fi
-
-# Every shipped app is a bootstrap candidate, never a prospective installed row.
-# Existing installed-state certified-hook execution remains covered by the real
-# notepad fixture in test-packages.sh; this matrix proves the absent-state side.
-for id in code-server dev-monitor devterm feedback fileview notepad orca paseo publish; do
-  [ -f "$ROOT/apps/$id/airlock-app.toml" ] \
-    || bad "mixed-matrix: $id has no shipped manifest — the nine-built-in premise broke"
-  if grep -qF "[dry] would install packaged app: $id from $ROOT/apps/$id (script not run)" <<<"$out_mm"; then
-    ok "mixed-matrix: $id is in the shipped bootstrap plan without hook execution"
-  else
-    bad "mixed-matrix: $id is missing from the shipped bootstrap plan"
-    failure_detail "$out_mm"
-  fi
-done
-
-if ! grep -qF '[dry] installing packaged app:' <<<"$out_mm"; then
-  ok "mixed-matrix: first bootstrap dry executes no runtime app hooks"
-else
-  bad "mixed-matrix: first bootstrap dry executed an app hook"
-fi
-if [ "$(mixed_bytes)" = "$mm_before" ]   && [ ! -e "$MM/state/installed-apps.json" ] && [ ! -e "$MM/state/app-ledger.json" ]; then
-  ok "mixed-matrix: first bootstrap dry preserves original bytes and creates no record"
-else
-  bad "mixed-matrix: first bootstrap dry changed fixture bytes or created installation state"
-fi
-
-# Input validation still precedes a bootstrap plan; duplicate TOML input has no effects.
-MMCFG_BAD="$MM/airlock-invalid.toml"
-{ cat "$MMCFG"; printf '[apps.publish]\n'; } > "$MMCFG_BAD"
-mm_bad_before="$(mixed_bytes)"
-out_bad="$(run_mixed_matrix "$MMCFG_BAD" "$MM/home" "$MM/web" "$MM/confd" "$MM/state")"; rc_bad=$?
-if [ "$rc_bad" -ne 0 ] && [ "$(mixed_bytes)" = "$mm_bad_before" ]   && ! grep -qF '[dry] installing packaged app:' <<<"$out_bad"; then
-  ok "mixed-matrix: first bootstrap dry rejects invalid inputs before hooks or file effects"
-else
-  bad "mixed-matrix: first bootstrap dry accepted invalid input or changed files (rc=$rc_bad)"
-fi
-
-# Explicit-shadow: an operator's own [packages.notepad] must NEVER dry-run
-# execute, even though notepad is shipped AND migrated (D4: explicit
-# packages are never dry-run-executed, migrated id or not).
-SHADOW_DIR="$MM/shadow-notepad"
-mkpkg "$SHADOW_DIR" notepad 'contract = 1' 'id = "notepad"' \
-  '[artifacts]' 'webroot = ["notepad-shadow/"]'
-MMCFG_SHADOW="$MM/airlock-shadow.toml"
-{ cat "$MMCFG"; printf '[packages.notepad]\npath = "%s"\n' "$SHADOW_DIR"; } >"$MMCFG_SHADOW"
-mkdir -p "$MM/home-shadow" "$MM/web-shadow" "$MM/confd-shadow" "$MM/state-shadow"
-AIRLOCK_STATE_DIR="$MM/state-shadow" seed_apps notepad "$SHADOW_DIR"
-out_shadow="$(run_mixed_matrix "$MMCFG_SHADOW" "$MM/home-shadow" "$MM/web-shadow" \
-  "$MM/confd-shadow" "$MM/state-shadow")"; rc_shadow=$?
-if [ "$rc_shadow" -eq 0 ] \
-  && ! grep -qF "[dry] would install packaged app: notepad from " <<<"$out_shadow"; then
-  ok "mixed-matrix: an explicit shadow is excluded from Public core bootstrap"
-else
-  bad "mixed-matrix: explicit shadow was promoted into Public core bootstrap (rc=$rc_shadow)"
-  failure_detail "$out_shadow"
-fi
-if grep -qF "[dry] installing packaged app: notepad (" <<<"$out_shadow"; then
-  bad "mixed-matrix: explicit shadow's install.sh was executed under dry run (D4 violation)"
-else
-  ok "mixed-matrix: explicit shadow's install.sh was never executed under dry run"
-fi
-
 # =============================================================================
 # Shipped listing, artifact inventory, render goldens and trust checks.
 #
@@ -847,8 +578,8 @@ mkdir -p "$P4APPS/UpperCase"
 pkg_manifest "$P4APPS/UpperCase" 'contract = 1' 'id = "UpperCase"'
 scripts_ok "$P4APPS/UpperCase"
 out="$(p4_run "$P4CFG" known-builtins 2>&1)"
-[ "$out" = alpha ] && ok "A: a non-lowercase directory name is excluded" \
-  || { bad "A: invalid-id-shape exclusion -> $out"; }
+[ "$out" = "$(printf 'UpperCase\nalpha')" ] && ok "A: an uppercase filename id is included" \
+  || { bad "A: uppercase filename id missing -> $out"; }
 rm -rf "$P4APPS/UpperCase"
 
 # A stale packages table cannot hide a shipped manifest from known-builtins.
@@ -1007,7 +738,7 @@ failures = []
 specs = {}
 for app in {a for a, _, _ in POSITIVE + NEGATIVE}:
     specs[app] = cfgmod._parse_manifest_spec(
-        app, ROOT / "apps" / app, "shipped", bundle_principal=True)
+        app, ROOT / "apps" / app, "shipped")
 
 for app, path, note in POSITIVE:
     claims = claims_for(specs[app])

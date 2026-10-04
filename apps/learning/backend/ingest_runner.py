@@ -646,7 +646,15 @@ def build_prompt(row, state_dir):
     `MAX_ARG_STRLEN`(128KiB)에 걸려 바이트 단위 클리핑 상수와 로그 회전 절차가 따라붙었다.
     경로 한 줄이면 그 전부가 필요 없다. 옛 시도의 로그는 그 자리에 그대로 남는다.
     """
-    prompt = f"/learning-ingest {row['url']}"
+    contract_path = os.path.join(BACKEND_DIR, "..", "skill", "SKILL.md")
+    contract_path = os.path.abspath(contract_path)
+    with open(contract_path, encoding="utf-8") as handle:
+        contract = handle.read()
+    prompt = (
+        f"앱 패키지 적재 계약 ({contract_path}):\n\n{contract}"
+        f"\n\n위 계약에 따라 이 링크를 적재하세요: {row['url']}"
+        "\n계약의 스킬 폴더는 위 SKILL.md가 들어 있는 디렉터리입니다."
+    )
     if row.get("retry_of"):
         previous = QUEUE.log_path(state_dir, row["retry_of"])
         if os.path.exists(previous):

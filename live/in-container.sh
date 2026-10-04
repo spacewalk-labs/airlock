@@ -158,8 +158,6 @@ messages = $LIVE_DEVMON_MESSAGES
 [apps.feedback]
 [apps.hello-example]
 
-[packages.hello-example]
-path = "$HOMEDIR/hello-example/package"
 TOML
 chown "$LIVE_USER:$LIVE_USER" "$HOMEDIR/airlock.toml"
 
@@ -175,9 +173,19 @@ chown "$LIVE_USER:$LIVE_USER" "$HOMEDIR/airlock.toml"
 # wrong fix string turns this run red instead of turning up on somebody's fresh box
 # six months later.
 say "== prerequisites: running the manifests' own fix strings =="
-FIXES="$(su - "$LIVE_USER" -c \
-  "cd '$SRC' && AIRLOCK_CONFIG='$HOMEDIR/airlock.toml' python3 bin/airlock-config prereqs" 2>/dev/null \
-  | awk -F '\t' 'NF >= 5 && $5 != "" && $5 != "-" {print $5}' | sort -u)"
+FIXES="$(su - "$LIVE_USER" -c "bash -s -- '$SRC' '$HOMEDIR/airlock.toml'" <<'SH_PREREQS' \
+  | awk -F '\t' 'NF >= 5 && $5 != "" && $5 != "-" {print $5}' | sort -u
+cd "$1" || exit 1
+export AIRLOCK_CONFIG="$2"
+config_json="$(python3 bin/airlock-config json)" || exit 1
+while IFS= read -r -d '' app; do
+  [ "$app" = hub ] && continue
+  source="$PWD/apps/$app"
+  [ "$app" = hello-example ] && source="$HOME/hello-example/package"
+  AIRLOCK_APP_ID="$app" AIRLOCK_APP_DIR="$source" python3 bin/airlock-config prereqs || exit 1
+done < <(printf '%s' "$config_json" | python3 -c 'import json,sys; [sys.stdout.buffer.write(app.encode()+b"\0") for app in json.load(sys.stdin).get("apps", {})]')
+SH_PREREQS
+)"
 [ -n "$FIXES" ] || die "no prerequisite fix strings — the manifests declare nothing to install"
 fix_failed=""
 while IFS= read -r fix; do
@@ -195,9 +203,13 @@ EOF
 
 say "== installing =="
 install_rc=0
-su - "$LIVE_USER" -c \
-  "cd '$SRC' && AIRLOCK_CONFIG='$HOMEDIR/airlock.toml' bash install/airlock-install.sh" \
-  >/tmp/install.log 2>&1 || install_rc=$?
+su - "$LIVE_USER" -c "bash -s -- '$SRC' '$HOMEDIR/airlock.toml'" \
+  >/tmp/install.log 2>&1 <<'SH_APPLY' || install_rc=$?
+cd "$1" || exit 1
+export AIRLOCK_CONFIG="$2"
+. install/lib.sh
+airlock_install_selected hello-example "$HOME/hello-example/package"
+SH_APPLY
 say "install exited $install_rc (log: $(wc -l </tmp/install.log) lines)"
 tail -40 /tmp/install.log >&2
 

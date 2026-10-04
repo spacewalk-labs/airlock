@@ -72,6 +72,49 @@ if [ -n "${AIRLOCK_RENDER_DIR:-}" ] && [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   die "AIRLOCK_RENDER_DIR is a test-harness hook; requires AIRLOCK_DRY_RUN=1"
 fi
 
+# Fresh callers apply only operator-selected apps. Existing rows keep their source;
+# explicit directories belong only to apps that have not been installed yet.
+airlock_install_selected() {
+  local install_rc=0
+  bash "$AIRLOCK_ROOT/install/airlock-install.sh" </dev/null || install_rc=$?
+  python3 -B - "$AIRLOCK_ROOT" "$install_rc" "$@" <<'PY_SELECTED_APPS'
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+import os, subprocess, sys
+
+root = Path(sys.argv[1])
+rc = int(sys.argv[2])
+config = SourceFileLoader("fresh_config", str(root / "bin/airlock-config")).load_module()
+ledger = SourceFileLoader("fresh_ledger", str(root / "bin/airlock-ledger")).load_module()
+# load() is operator input; resolved JSON adds installed apps outside the selection.
+os.environ.pop("AIRLOCK_CONFIG_SNAPSHOT", None)
+os.environ["AIRLOCK_CONFIG_BIN"] = str(root / "bin/airlock-config")
+cfg = config.load()
+selected = [app for app in cfg.get("apps", {}) if app != "hub"]
+installed = ledger.load_installed()
+overrides = dict(zip(sys.argv[3::2], sys.argv[4::2]))
+sources = {app: overrides.get(app, str(root / "apps" / app))
+           for app in selected if app not in installed}
+deps = {}
+for app in selected:
+    try:
+        directory = (ledger._source_from_row(app, installed[app])["dir"]
+                     if app in installed else sources[app])
+        deps[app] = ledger.read_dir_package(app, directory).get("deps", [])
+    except (ledger.LedgerError, KeyError, TypeError, ValueError):
+        # apply reports this app's bad source/manifest; the other apps still run.
+        deps[app] = []
+for app in config.dependency_order(selected, deps):
+    argv = [sys.executable, "-B", str(root / "bin/airlock-ledger"), "apply"]
+    if app not in installed:
+        argv.extend(["--source", sources[app]])
+    argv.extend(["--", app])
+    if subprocess.run(argv).returncode:
+        rc = 1
+raise SystemExit(rc)
+PY_SELECTED_APPS
+}
+
 require_cmd() {
   local c
   for c in "$@"; do
@@ -359,12 +402,22 @@ airlock_pin_state_dir() {
   export AIRLOCK_STATE_DIR
 }
 
-# airlock_pkg_dir <app> — the directory from config's engine-backed package projection. Callers set AIRLOCK_PKG_INFO once (the output of
-# `airlock_config package-info`) so N apps cost one config run, not N.
+# airlock_package_info — read the hook projection without exporting JSON bytes.
+# Legacy callers may still supply AIRLOCK_PKG_INFO while they migrate.
+airlock_package_info() {
+  if [ -n "${AIRLOCK_PKG_INFO_FILE:-}" ]; then
+    cat -- "$AIRLOCK_PKG_INFO_FILE"
+  elif [ -n "${AIRLOCK_PKG_INFO:-}" ]; then
+    printf '%s' "$AIRLOCK_PKG_INFO"
+  else
+    airlock_config package-info
+  fi
+}
+
+# airlock_pkg_dir <app> — directory from config's engine-backed projection.
 airlock_pkg_dir() {
   local app="${1:?airlock_pkg_dir: app required}"
-  [ -n "${AIRLOCK_PKG_INFO:-}" ] || return 0
-  printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c '
+  airlock_package_info | python3 -c '
 import json, sys
 d = (json.load(sys.stdin).get("packages") or {}).get(sys.argv[1])
 if d:
@@ -380,16 +433,16 @@ airlock_doc_assets_dir() {
 }
 
 # Installation membership is ③, regardless of retained app input tables.
-# Consume the complete list so a matching id cannot SIGPIPE the producer.
+# Return a JSON array: an id may itself contain tabs, newlines or spaces.
 airlock_installed_app_ids() {
   local installed
-  installed="$("$AIRLOCK_ROOT/bin/airlock-ledger" list)" || return "$?"
-  printf '%s\n' "$installed" | awk -F '\t' 'NF { print $1 }'
+  installed="$("$AIRLOCK_ROOT/bin/airlock-ledger" list --json)" || return "$?"
+  printf '%s' "$installed" | python3 -c 'import json,sys; print(json.dumps(list(json.load(sys.stdin))))'
 }
 
 # Recorded source only: absent directories must never fall back to candidates.
 airlock_installed_app_dir() {
-  python3 - "$AIRLOCK_ROOT/bin/airlock-ledger" "$1" <<'PY_INSTALLED_DIR'
+  python3 - "$AIRLOCK_ROOT/bin/airlock-ledger" "$1" "${2:-}" <<'PY_INSTALLED_DIR'
 import os
 import sys
 from importlib.machinery import SourceFileLoader
@@ -398,17 +451,14 @@ ledger = SourceFileLoader("installed_source_ledger", sys.argv[1]).load_module()
 directory = ledger.app_dirs({}).get(sys.argv[2])
 if not directory or not os.path.isdir(directory):
     sys.exit(2)
-print(directory)
+sys.stdout.write(directory + ("\0" if sys.argv[3] == "--null" else "\n"))
 PY_INSTALLED_DIR
 }
 
 airlock_app_installed() {
   local installed
   installed="$(airlock_installed_app_ids)" || return "$?"
-  printf '%s\n' "$installed" | awk -v app="$1" '
-    $0 == app { found = 1 }
-    END { exit !found }
-  '
+  printf '%s' "$installed" | python3 -c 'import json,sys; sys.exit(0 if sys.argv[1] in json.load(sys.stdin) else 1)' "$1"
 }
 
 # airlock_panel_url — base URL of devterm's account panel for the return widget, or
@@ -845,93 +895,6 @@ laptop once; that is the check."
   return 0
 }
 
-# ts_stale_plaintext_ports <wanted_ports> — plaintext serve mappings to retire.
-# Prints the tailnet ports that are (a) currently served over plain http, and
-# (b) a port Airlock knows as one of its own plaintext ports, but (c) not in the
-# wanted list. `tailscale serve --bg` persists forever, so without this an app
-# removed from airlock.toml — or a changed port — leaves a plaintext listener
-# proxying its old target for good. Deliberately conservative: a port Airlock does
-# not recognise is left alone, because the operator may have added it by hand.
-ts_stale_plaintext_ports() {
-  local wanted="${1:-}" known status
-  known="$(airlock_config plaintext-known)" || return $?
-  status="$(tailscale serve status --json 2>/dev/null)" || return 0
-  [ -n "$status" ] || return 0
-  printf '%s' "$status" | python3 -c '
-import json, sys
-wanted = set(sys.argv[1].split())
-known  = set(sys.argv[2].split())
-try:
-    tcp = (json.load(sys.stdin).get("TCP") or {})
-except Exception:
-    sys.exit(0)                      # unreadable status: retire nothing
-for port, spec in tcp.items():
-    if (spec or {}).get("HTTPS"):    # TLS listener: not our concern here
-        continue
-    if port in known and port not in wanted:
-        print(port)
-' "$wanted" "$known"
-}
-
-# ts_absent_plaintext_retirement_ports <wanted_ports> — cleanup records whose
-# mapping is already absent. A failed/unreadable Tailscale status proves nothing,
-# so it preserves every record. Live stale mappings are handled by the function
-# above and are dropped only after `tailscale serve ... off` succeeds.
-ts_absent_plaintext_retirement_ports() {
-  local wanted="${1:-}" recorded status
-  recorded="$(airlock_config plaintext-retirement-known)" || return $?
-  [ -n "$recorded" ] || return 0
-  status="$(tailscale serve status --json 2>/dev/null)" || return 0
-  [ -n "$status" ] || return 0
-  printf '%s' "$status" | python3 -c '
-import json, sys
-wanted = set(sys.argv[1].split())
-recorded = set(sys.argv[2].split())
-try:
-    tcp = (json.load(sys.stdin).get("TCP") or {})
-except Exception:
-    sys.exit(0)
-live_plain = {port for port, spec in tcp.items() if not (spec or {}).get("HTTPS")}
-for port in sorted(recorded - wanted - live_plain, key=int):
-    print(port)
-' "$wanted" "$recorded"
-}
-
-# ts_apply_plaintext_mapping <app> <listen> <redirect> — cross the ownership
-# commit point for one desired mapping. The caller records all package intents
-# first; this helper promotes only after the persistent mutation succeeds.
-ts_apply_plaintext_mapping() {
-  local app="${1:?app required}" listen="${2:?listen required}" redirect="${3:?redirect required}"
-  airlock_run sudo tailscale serve --bg --http="$listen" "http://127.0.0.1:${redirect}" \
-    || return $?
-  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] && [ "$app" != hub ]; then
-    airlock_config plaintext-retirement-commit "$app" "$listen" "$redirect" \
-      || return $?
-  fi
-}
-
-# ts_reconcile_plaintext_ports <wanted_ports> — retire committed ownership only.
-# `airlock_run` returning nonzero stops before the drop, so a failed off retains
-# the record and the next run retries. Intent rows never enter either helper.
-ts_reconcile_plaintext_ports() {
-  local wanted="${1:-}" stale stale_ports absent_ports
-  stale_ports="$(ts_stale_plaintext_ports "$wanted")" || return $?
-  for stale in $stale_ports; do
-    log "retiring stale plaintext ingress: :$stale (no longer in airlock.toml)"
-    airlock_run sudo tailscale serve --http="$stale" off || return $?
-    if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
-      airlock_config plaintext-retirement-drop "$stale" || return $?
-    fi
-  done
-  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
-    absent_ports="$(ts_absent_plaintext_retirement_ports "$wanted")" || return $?
-    for stale in $absent_ports; do
-      log "clearing plaintext retirement record: :$stale is already absent"
-      airlock_config plaintext-retirement-drop "$stale" || return $?
-    done
-  fi
-}
-
 # ring_icon_svg <color> <source> — print an SVG that wraps <source> in a ring.
 #
 # Why: someone who runs more than one Airlock cannot tell the boxes apart from the
@@ -1018,69 +981,4 @@ install_if_changed() {
     return 0
   fi
   install -m "$mode" "$src" "$dest"
-}
-
-# airlock_sweep_platform_units <owner> <declared-unit>...
-#
-# Remove platform systemd user units this tree no longer declares.
-#
-# Why this exists: apps declare [artifacts] and D6 record-diff deletes what a package
-# stopped declaring. The platform has no equivalent — its only ledger entry is a set of
-# path claims (bin/airlock-config _platform_state_claims), which names no units. Removal
-# therefore depended on each helper's own `uninstall` branch, and **that code disappears
-# with the tree**: a box that only took an update never runs it. The unit stays in
-# ~/.config/systemd/user, enabled, its ExecStart pointing at a script that is gone, and it
-# fails quietly on every trigger. (airlock-update-detect.timer was already in that state —
-# nothing called its uninstall.)
-#
-# The fix is to make removal the NEW tree's job rather than the removing one's: units
-# carry `X-Airlock-Owner=<installer>`, and each installer deletes marked units of its own
-# owner that it did not just declare. Nothing has to be remembered across revisions.
-#
-# Why a marker and not a name prefix: app units are `airlock-<app>.service` too
-# (airlock-devterm.service, airlock-paseo.service, ...), so an `airlock-*` sweep would
-# delete units that D6 owns. Unmarked files are structurally out of reach here.
-#
-# Why the owner is part of the marker: platform units come from TWO installers —
-# install/systemd/* (this one) and live/systemd/* (live/install-timer.sh, which is
-# independent and does not source this file). A bare "platform" marker would make each
-# installer delete the other's units.
-#
-# Scope note: this only sees units rendered since the marker was introduced. Both
-# installers re-render unconditionally, so one pass marks everything they own — but a unit
-# retired in the SAME revision that adds the marker is not covered retroactively. Nothing
-# is in that position today.
-airlock_sweep_platform_units() {
-  local owner="${1:?airlock_sweep_platform_units: owner required}"; shift
-  # An empty declared set would make every marked unit an orphan, so an empty
-  # call is treated as nothing to sweep rather than a wipe.
-  if [ "$#" -eq 0 ]; then
-    log "WARN: airlock_sweep_platform_units: empty declared set (owner=$owner) — skipping the sweep"
-    return 0
-  fi
-
-  local unit_dir="${AIRLOCK_UNIT_DIR_USER:-$HOME/.config/systemd/user}"
-  [ -d "$unit_dir" ] || return 0
-
-  local declared=" $* "
-  local removed=0 path base
-  # Timers before services: disabling a timer whose service is already gone is noisier
-  # than the reverse, and `ls` gives no ordering guarantee worth relying on.
-  for path in "$unit_dir"/*.timer "$unit_dir"/*.service; do
-    [ -f "$path" ] || continue
-    base="$(basename "$path")"
-    grep -qx "X-Airlock-Owner=${owner}" "$path" || continue
-    case "$declared" in *" $base "*) continue ;; esac
-    log "removing orphaned platform unit: $base (owner=$owner, no longer declared)"
-    airlock_run systemctl --user disable --now "$base" \
-      || log "WARN: could not disable $base — removing the file anyway"
-    airlock_run rm -f -- "$path"
-    removed=$((removed + 1))
-  done
-
-  if [ "$removed" -gt 0 ]; then
-    airlock_run systemctl --user daemon-reload \
-      || log "WARN: removed $removed orphaned unit(s) but could not reload the user unit manager"
-    log "swept $removed orphaned platform unit(s) (owner=$owner)"
-  fi
 }

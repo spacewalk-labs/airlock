@@ -1,12 +1,12 @@
 ---
 name: learning-ingest
-description: 유튜브 링크 하나를 학습자료 문서로 만들어 라이브러리에 저장한다. Airlock learning 앱의 적재 워커가 부른다.
+description: Airlock Learning에서 유튜브 자료를 학습 문서로 만들고 라이브러리에 넣을 때 사용한다.
 ---
 
 # learning-ingest — 링크 하나를 학습자료로
 
-`/learning-ingest <url>` 로 불린다. 부르는 쪽은 사람이 아니라 **적재 워커**다. 헤드리스로
-돌리고 로그만 읽는다.
+적재 워커가 이 패키지 계약을 프롬프트에 싣고 대상 URL을 넘긴다. 헤드리스로
+돌리고 로그만 읽는다. 전역 스킬 카탈로그에 등록하지 않는다.
 
 원칙 셋.
 

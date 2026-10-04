@@ -73,15 +73,18 @@ def _apps(root: Path) -> list[dict[str, str]]:
         package_info = json.loads(config.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError("airlock-config package-info did not return JSON") from exc
-    plan = _run([sys.executable, str(root / "bin" / "airlock-ledger"), "plan"],
+    plan = _run([sys.executable, str(root / "bin" / "airlock-ledger"), "plan", "--json"],
                 input_text=config.stdout)
     if plan.returncode not in (0, 3):
         raise RuntimeError("airlock-ledger plan failed: " + plan.stderr.strip())
+    try:
+        actions = json.loads(plan.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("airlock-ledger plan did not return JSON") from exc
     classes = _source_classes(package_info)
     result = []
-    for line in plan.stdout.splitlines():
-        action, sep, app_id = line.partition("\t")
-        if not sep or not app_id or not action.startswith("upgrade-"):
+    for action, app_id in actions:
+        if not app_id or not action.startswith("upgrade-"):
             continue                         # reinstall means it is already current.
         result.append({"id": app_id, "action": "upgrade",
                        "sourceClass": classes.get(app_id, "explicit")})

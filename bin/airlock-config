@@ -13,14 +13,10 @@ Usage:
   airlock-config apps                # list enabled app names (one per line)
   airlock-config get <dotted.key>    # e.g. auth.owner, apps.devterm.public_port
   airlock-config env <app>           # KEY=VALUE lines for `eval` in bash
-  airlock-config container-admit <app>
-                                     # pre-container-mutation runtime guard
   airlock-config json                # full resolved config (defaults merged)
   airlock-config webjson             # frontend-safe subset (/__airlock.json)
   airlock-config plaintext           # app<TAB>listen<TAB>target plaintext rows
   airlock-config plaintext-known     # every plaintext port Airlock could own
-  airlock-config plaintext-retirement-drop <port>
-                                     # recovery: forget a manually verified intent
   airlock-config package-preview <path>
                                      # validate one local package as JSON without
                                      #   changing config or package trust state
@@ -29,11 +25,6 @@ Usage:
                                      # package-info for one app resolved from its
                                      #   directory alone (Company source: no
                                      #   [packages.<id>] table on this box)
-  airlock-config install-snapshot <private-path>
-                                     # ORCHESTRATOR-INTERNAL: freeze the exact
-                                     #   operator config bytes for one run
-  airlock-config install-preflight   # ORCHESTRATOR-INTERNAL: resolve every
-                                     #   candidate projection before reconcile
   airlock-config canonical-package-info <id> <repository-id> <full-40-hex-sha>
                                      # stable six-field release boundary JSON
   airlock-config known-builtins      # shipped ids (hub/core, shadowed excluded) (F15)
@@ -48,9 +39,9 @@ Requires Python >= 3.11 (tomllib).
 """
 from __future__ import annotations
 
-import ast
 import copy
 import contextlib
+import glob
 import hashlib
 import heapq
 import io
@@ -61,9 +52,8 @@ import shlex
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 try:
     import tomllib
@@ -197,7 +187,7 @@ RETIRED_KEYS: dict[str, str] = {
 
 # Packaged ids: env export flattens `-` and `_` to the same character
 # (_envkey below), so `a-b` and `a_b` would collide.
-PACKAGE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
+PACKAGE_ID_RE = re.compile(r"^(?!\.{1,2}\Z)[^/\x00]+\Z")
 
 MANIFEST_NAME = "airlock-app.toml"
 
@@ -213,7 +203,7 @@ _SERVE_KEYS = ("https", "https_registry")
 _PREREQ_FIELDS = ("command", "predicate", "expected", "fix", "note")
 _TYPE_NAMES = {"string": str, "integer": int, "boolean": bool}
 # Manifest config keys become env vars through _envkey: keep them shell-safe
-# and collision-free (`-` would flatten onto `_`). Also the F12 scan grammar.
+# and collision-free (`-` would flatten onto `_`).
 _MANIFEST_KEY_RE = re.compile(r"^[a-z0-9_]+\Z")
 # Prereq fields become TSV row cells: a tab or newline would inject rows (F11).
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -222,40 +212,7 @@ _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 RESERVED_PACKAGE_IDS = {"hub": "reserved platform core and cannot be shadowed",
                         "core": "the prerequisites pseudo-owner (F11)"}
 
-# Trust/capability contract v1.  This is repository policy, not operator
-# configuration: config shape stays closed and there is deliberately no env or
-# file override.  Empty entries are load-bearing — adding a tenth bundled app
-# without an explicit review must fail parity instead of inheriting privilege.
-CAPABILITY_SCHEMA_VERSION = 1
-LEDGER_CAPABILITIES = frozenset({"rooted-artifact", "system-unit"})
-GRANTABLE_CAPABILITIES = LEDGER_CAPABILITIES
-ELEVATED_CAPABILITIES = GRANTABLE_CAPABILITIES | {"plaintext-redirect"}
-BUNDLE_CERTIFICATIONS = ("dry-run-exec", "strict-config-scan")
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BUNDLE_ROOT = REPO_ROOT / "apps"
-BUNDLE_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
-    "code-server": (),
-    "dev-monitor": ("rooted-artifact", "system-unit"),
-    "devterm": (),
-    "feedback": (),
-    # learning: two USER units, one hub-locations fragment, one share dir under
-    # ~/.local/share. No sudo, no system unit, nothing rooted — so it grants
-    # nothing elevated. The ingest worker spawns an agent CLI, which is a child
-    # of a user unit and needs no capability the platform mediates.
-    "learning": (),
-    "fileview": (),
-    "notepad": (),
-    "orca": ("rooted-artifact", "system-unit"),
-    "paseo": (),
-    "publish": (),
-}
-SURFACE_CLASSIFICATIONS = {
-    "rooted-artifact": "elevated-capability",
-    "system-unit": "elevated-capability",
-    "serve-port": "baseline-mediated-mapping",
-    "serve-https": "baseline-mediated-mapping",
-    "plaintext-redirect": "shipped-only-restricted",
-}
 
 
 def _state_dir() -> Path:
@@ -285,6 +242,11 @@ def _load_plaintext_retirement(path: Path) -> dict:
             raw = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot parse record: {exc}") from exc
+    return _normalise_plaintext_retirement(raw)
+
+
+def _normalise_plaintext_retirement(raw: dict) -> dict:
+    """Project a parsed cleanup record through the canonical reader."""
     normalised = [
         {"package": entry["package"], "listen": entry["listen"],
          "target": entry["target"], "state": entry["state"]}
@@ -300,53 +262,6 @@ def _read_plaintext_retirement() -> dict:
         return _load_plaintext_retirement(path)
     except ValueError:
         return {"version": PLAINTEXT_RETIREMENT_VERSION, "entries": []}
-
-
-def _write_plaintext_retirement(record: dict) -> "None":
-    """Atomically replace the cleanup record in the installed-state directory."""
-    path = _plaintext_retirement_path()
-    directory = path.parent
-    try:
-        _ledger_module()._ensure_state_dir()
-        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except (OSError, _ledger_module().LedgerError) as exc:
-        die(f"cannot prepare plaintext retirement record directory {directory}: {exc}", code=2)
-    temp_name = None
-    data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    try:
-        try:
-            os.fsync(directory_fd)
-            with tempfile.NamedTemporaryFile(
-                    mode="wb", dir=directory, prefix=".plaintext-retirement.",
-                    delete=False) as handle:
-                temp_name = handle.name
-                os.fchmod(handle.fileno(), 0o600)
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_name, path)
-            temp_name = None
-        except OSError as exc:
-            die(f"cannot atomically write plaintext retirement record {path}: {exc}", code=2)
-        try:
-            os.fsync(directory_fd)
-        except OSError as exc:
-            # Replacement is the commit point; report an uncertain directory sync.
-            log("WARNING: plaintext retirement record was atomically replaced, "
-                f"but directory sync could not be confirmed ({exc}); treating "
-                "the replacement as committed")
-    finally:
-        if temp_name is not None:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-        os.close(directory_fd)
-
-
-def _update_plaintext_retirement(action) -> "None":
-    """Update the atomic sidecar without a writer lock."""
-    action()
 
 
 def _read_ledger() -> dict:
@@ -403,10 +318,6 @@ def find_config() -> Path:
     env = os.environ.get("AIRLOCK_CONFIG")
     if env:
         p = Path(env).expanduser()
-        # The installer has already resolved and frozen this origin together
-        # with AIRLOCK_CONFIG_SNAPSHOT. Do not resolve it again: replacing,
-        # deleting, or retargeting the operator path during the run must not
-        # change package-info.config_path.
         if os.environ.get("AIRLOCK_CONFIG_SNAPSHOT"):
             return p
         if not p.exists():
@@ -425,13 +336,8 @@ def find_config() -> Path:
 
 def load() -> dict:
     path = find_config()
-    # The installer freezes the operator file once. Every later command reads those
-    # exact bytes while ``find_config()`` deliberately continues to return the
-    # original operator path in package-info.config_path.
-    snapshot = os.environ.get("AIRLOCK_CONFIG_SNAPSHOT")
-    read_path = Path(snapshot) if snapshot else path
+    read_path = Path(os.environ.get("AIRLOCK_CONFIG_SNAPSHOT") or path)
     try:
-        # Read and parse the frozen bytes once.
         data = read_path.read_bytes()
         cfg = tomllib.loads(data.decode("utf-8"))
         return cfg
@@ -441,39 +347,6 @@ def load() -> dict:
         # one invalid byte raises a plain UnicodeDecodeError first — missing
         # that turned a clean die() into a raw traceback.
         die(f"{path}: invalid TOML: {e}")
-
-
-def _freeze_config(target: str) -> tuple[Path, bytes, str]:
-    """Copy the operator bytes once into an already-created private file."""
-    source = find_config()
-    destination = Path(target)
-    try:
-        data = source.read_bytes()
-        # Reject invalid bytes before publishing them as the run's authority.
-        tomllib.loads(data.decode("utf-8"))
-        flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(destination, flags)
-        with os.fdopen(fd, "wb") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except (OSError, UnicodeError, ValueError) as exc:
-        die(f"cannot freeze install config {source} -> {destination}: {exc}", code=2)
-    return source, data, hashlib.sha256(data).hexdigest()
-
-
-def cmd_install_snapshot(target: str) -> "None":
-    """Freeze the exact operator-file bytes for one installer invocation.
-
-    This is orchestrator-internal.  The caller supplies an already-created,
-    private regular file (mktemp); refusing links and non-regular targets keeps
-    the snapshot from becoming a general write primitive.
-    """
-    source, _data, frozen_digest = _freeze_config(target)
-    print(json.dumps({"config_path": str(source),
-                      "sha256": frozen_digest},
-                     sort_keys=True, separators=(",", ":")))
 
 
 def resolved(cfg: dict) -> dict:
@@ -494,9 +367,7 @@ def resolved(cfg: dict) -> dict:
     # Registered candidates are sources, not installation membership. Only the
     # installed ledger and the engine's current hook supply implicit app tables.
     for name, directory in runtime_dirs.items():
-        if not Path(directory).is_dir() and name not in specs:
-            apps.pop(name, None)
-        elif name in specs:
+        if name in specs:
             apps.setdefault(name, {})
     for name, table in list(apps.items()):
         spec = specs.get(name)
@@ -565,11 +436,6 @@ def cmd_validate(cfg: dict) -> "None":
     _read_ledger()
     packages_resolved(cfg)  # D1/D2: serve values, port spans, disjointness
     app_order(cfg)          # D3/F5: dependency-ordered install sequence
-    for pid, spec in specs.items():   # F12: declared vs actually-read keys
-        port_scalars, port_tables, platform_scalars = _port_contract_keys(spec)
-        _scan_config_reads(pid, Path(spec["dir"]), spec["schema"],
-                           spec["audience"], port_scalars, port_tables,
-                           platform_scalars)
     _emit_glyph_validation_ac(package_glyphs, shipped_declared, shipped_glyphs)
     print("ok: config valid")
 
@@ -851,8 +717,7 @@ def _validate_plaintext_redirect(pid: str, raw) -> dict:
 
 def _regular_file(p: Path) -> bool:
     """lstat, not stat: a symlinked manifest or lifecycle script is rejected.
-    The D6 digest records only a symlink's TARGET STRING, so a symlinked
-    script could change behind an unchanged digest."""
+    Shipped manifest discovery keeps the payload within its own directory."""
     try:
         return stat.S_ISREG(os.lstat(p).st_mode)
     except OSError:
@@ -894,8 +759,7 @@ def _validate_config_schema(pid: str, raw) -> dict:
         out["port_spans"].append({"base": row.get("base"), "count": row.get("count")})
     # runtime_env — env-var NAMES the installer WRITES into units, secrets or test
     # seams. Not config: no values, no defaults, not merged into resolved config,
-    # never exported. It exists so the F12 scan can tell "the installer writes this
-    # into a unit" apart from "somebody read a key that does not exist".
+    # never exported.
     out["runtime_env"] = list(raw.get("runtime_env", []) or [])
     return out
 
@@ -1042,699 +906,6 @@ def _validate_audience(pid: str, raw):
             "default": raw.get("default")}
 
 
-def _shell_word(text: str, i: int) -> tuple:
-    """Read ONE shell word starting at `text[i]` the way bash would, and say
-    whether it is a literal.
-
-    Pattern-matching the argument's visible characters is not good enough in
-    either direction: `get "apps.x.port"` is the same key as the unquoted
-    form (a regex sees a stray quote), and `get a\\pps.x.port` reads
-    `apps.x.port` (a regex sees no call at all). So expand exactly what the
-    shell expands for free — quotes and backslashes — and flag anything that
-    needs runtime expansion ($, `) as dynamic, which the caller refuses.
-
-    Returns (literal_value, end_index, dynamic)."""
-    out, n, dynamic = [], len(text), False
-    while i < n:
-        c = text[i]
-        if c == "\x00":
-            # The placeholder marks a removed backslash-newline: bash SPLICES
-            # there, so `port\<newline>evil` is the single word `portevil`.
-            # Skipping (not breaking) is what keeps that a scanned read.
-            i += 1
-            continue
-        if c in " \t\n" or c in ");|&<>":
-            break
-        if c == "\\":
-            if i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-            else:
-                i += 1
-            continue
-        if c == "'":
-            j = text.find("'", i + 1)
-            if j == -1:            # unterminated: not analysable
-                return "".join(out), n, True
-            out.append(text[i + 1:j])
-            i = j + 1
-            continue
-        if c == "$" and i + 1 < n and text[i + 1] == "'":
-            # ANSI-C quoting: $'…' yields a literal. An escape inside it
-            # ($'po\162t' is `port`) is a C decoding this reader does not
-            # do — mark the word dynamic so it is WARNED about rather than
-            # judged on the raw bytes.
-            j = text.find("'", i + 2)
-            if j == -1:
-                return "".join(out), n, True
-            body = text[i + 2:j]
-            if "\\" in body:
-                dynamic = True
-            out.append(body)
-            i = j + 1
-            continue
-        if c == '"':
-            j = i + 1
-            buf = []
-            while j < n and text[j] != '"':
-                # Inside double quotes bash treats backslash as an escape ONLY
-                # before $ ` " \ and newline; anywhere else the backslash is a
-                # literal character of the word ("po\rt" is po\rt, not port).
-                if text[j] == "\\" and j + 1 < n and text[j + 1] in '$`"\\\n':
-                    if text[j + 1] != "\n":
-                        buf.append(text[j + 1])
-                    j += 2
-                    continue
-                if text[j] in "$`":
-                    dynamic = True
-                buf.append(text[j])
-                j += 1
-            if j >= n:
-                return "".join(out), n, True
-            out.append("".join(buf))
-            i = j + 1
-            continue
-        if c in "$`":
-            dynamic = True
-            out.append(c)
-            i += 1
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out), i, dynamic
-
-
-def _warn(pid: str, msg: str) -> "None":
-    sys.stderr.write(f"airlock-config: warning: package '{pid}': {msg}\n")
-
-
-def _in_comment_line(text: str, pos: int) -> bool:
-    """Is `pos` after an unquoted `#` on its own line?
-
-    This is the ONLY source-structure heuristic left in the scan, and it can
-    afford to be approximate: every F12 diagnostic is advisory (see
-    _scan_config_reads), so a comment the check misreads costs one warning
-    line, never a blocked install. Earlier revisions grew a whole shell
-    reader here — quote stacks, here-doc masking, arithmetic spans — and each
-    round of review traded one edge case for another. The runtime, not the
-    scan, is what fails closed."""
-    line_start = text.rfind("\n", 0, pos) + 1
-    prefix = text[line_start:pos]
-    quote = None
-    for i, ch in enumerate(prefix):
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in "\"'":
-            quote = ch
-        elif ch == "#" and (i == 0 or prefix[i - 1] in " \t\x00;&|()"):
-            return True
-    return False
-
-
-def _python_env_reads(text: str) -> set[str]:
-    """Return literal environment names read by Python syntax, not prose.
-
-    Port ownership is fail-closed, so a name in a docstring or an inert string
-    cannot count.  Recognise the ordinary stdlib spellings and leave unusual
-    wrappers to the package's shell renderer (or to an explicit config get).
-    """
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return set()
-    reads: set[str] = set()
-
-    def _literal(node):
-        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
-
-    def _is_environ(node) -> bool:
-        return (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "os"
-            and node.attr == "environ"
-        ) or (isinstance(node, ast.Name) and node.id == "environ")
-
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load)
-                and _is_environ(node.value)):
-            name = _literal(node.slice)
-            if name is not None:
-                reads.add(name)
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        func = node.func
-        is_getenv = (
-            isinstance(func, ast.Attribute)
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "os"
-            and func.attr == "getenv"
-        ) or (isinstance(func, ast.Name) and func.id == "getenv")
-        is_environ_get = (
-            isinstance(func, ast.Attribute)
-            and func.attr == "get"
-            and _is_environ(func.value)
-        )
-        if is_getenv or is_environ_get:
-            name = _literal(node.args[0])
-            if name is not None:
-                reads.add(name)
-    return reads
-
-
-def _in_shell_heredoc(text: str, start: int) -> bool:
-    """Whether start lies in a simple shell heredoc body.
-
-    The admitted port grammar is deliberately small; recognising the ordinary
-    `<<EOF`, quoted delimiter, and `<<-EOF` forms is sufficient to reject data
-    lines that merely resemble assignments.  An ambiguous delimiter fails
-    closed because the caller then sees no admitted read.
-    """
-    pending = []
-    opener_re = re.compile(
-        r"(?<!<)<<(-?)(?!<)\s*(?:\\([A-Za-z0-9_.-]+)"
-        r"|(['\"])([A-Za-z0-9_.-]+)\3|([A-Za-z0-9_.-]+))"
-    )
-    offset = 0
-    for line in text[:start].splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        if pending:
-            delimiter, strip_tabs = pending[0]
-            candidate = body.lstrip("\t") if strip_tabs else body
-            if candidate == delimiter:
-                pending.pop(0)
-            offset += len(line)
-            continue
-        for match in opener_re.finditer(body):
-            if _in_comment_line(text, offset + match.start()):
-                break
-            delimiter = match.group(2) or match.group(4) or match.group(5)
-            pending.append((delimiter, match.group(1) == "-"))
-        offset += len(line)
-    return bool(pending)
-
-
-def _shell_expands_env(text: str, start: int, end: int, full: str) -> bool:
-    """Whether this token is an admitted shell expansion of the env name.
-
-    A package may assign the platform value locally or pass it straight to a
-    renderer/installer's port-shaped option. Both consume the value. Keeping
-    command arguments limited to --port/--*-port avoids turning arbitrary
-    logging/prose arguments into listener-ownership evidence. Escaped,
-    single-quoted, and heredoc text stays inert; discard-only commands are
-    rejected separately by _consumes_port_read.
-    """
-    if text[start:end] != full or _in_shell_heredoc(text, start):
-        return False
-    line_start = text.rfind("\n", 0, start) + 1
-    line_end = text.find("\n", end)
-    if line_end < 0:
-        line_end = len(text)
-    line = text[line_start:line_end].replace("\x00", "")
-    expansion = r"\$\{?" + re.escape(full) + r"(?::[-+?][^}]*)?\}?"
-    if re.fullmatch(  # noqa: regex-anchor - runtime composition, fullmatch
-        r"\s*(?:(?:local|export|readonly)\s+)?[A-Za-z_][A-Za-z0-9_]*="
-        r"\s*\"?" + expansion + r"\"?\s*(?:#.*)?",
-        line,
-    ) is not None:
-        return True
-
-    if start >= 2 and text[start - 2:start] == "${":
-        expansion_start = start - 2
-        close = text.find("}", end)
-        if close < 0 or re.fullmatch(r"(?::[-+?][^}]*)?", text[end:close]) is None:
-            return False
-        expansion_end = close + 1
-    elif start >= 1 and text[start - 1] == "$":
-        expansion_start = start - 1
-        expansion_end = end
-    else:
-        return False
-
-    quote = None
-    quote_start = None
-    escaped = False
-    prefix = text[line_start:expansion_start]
-    for i, char in enumerate(prefix):
-        if char == "\x00":
-            continue  # a normalised backslash-newline is removed by the shell
-        if quote == "'":
-            if char == "'":
-                quote = None
-                quote_start = None
-            continue
-        if escaped:
-            escaped = False
-            continue
-        if quote == '"':
-            if char == "\\" and (i + 1 == len(prefix)
-                    or prefix[i + 1] in '$`"\\'):
-                escaped = True
-            elif char == '"':
-                quote = None
-                quote_start = None
-            continue
-        if char == "\\":
-            escaped = True
-        elif char in "'\"":
-            quote = char
-            quote_start = i
-    if quote == "'" or escaped or (quote == '"' and quote_start != len(prefix) - 1):
-        return False
-    option_prefix = prefix.replace("\x00", " ")
-    return re.search(
-        r"(?:^|[\s;&|()])--(?:[A-Za-z0-9]+-)*port(?:=|\s+)\"?\Z",
-        option_prefix,
-    ) is not None and (
-        (quote == '"' and text[expansion_end:expansion_end + 1] == '"'
-         and (expansion_end + 1 == len(text)
-              or text[expansion_end + 1] in " \t\n\x00;&|()<>"))
-        or (quote is None and (expansion_end == len(text)
-            or text[expansion_end] in " \t\n\x00;&|()<>"))
-    )
-
-
-def _shell_assignment_runs_get(text: str, start: int, end: int) -> bool:
-    """Whether the matched get is the sole assigned command substitution."""
-    if _in_shell_heredoc(text, start):
-        return False
-    line_start = text.rfind("\n", 0, start) + 1
-    line_end = text.find("\n", end)
-    if line_end < 0:
-        line_end = len(text)
-    prefix = text[line_start:start].replace("\x00", "")
-    suffix = text[end:line_end].replace("\x00", "")
-    return (
-        re.fullmatch(
-            r"\s*(?:(?:local|export|readonly)\s+)?[A-Za-z_][A-Za-z0-9_]*="
-            r"\s*\"?\$\(\s*",
-            prefix,
-        ) is not None
-        and re.fullmatch(r"\s*\)\"?\s*(?:#.*)?", suffix) is not None
-    )
-
-
-def _line_of(text: str, pos: int) -> int:
-    """1-based line number, counting the NUL placeholders that stand in for
-    normalised shell line continuations (see the scanner below)."""
-    return text.count("\n", 0, pos) + text.count("\x00", 0, pos) + 1
-
-
-def _port_contract_keys(spec: dict) -> tuple[
-        set[str], set[tuple[str, str]], set[str]]:
-    """Config scalars that the package must consume to own its listeners.
-
-    The name convention catches ordinary loopback listeners. Explicit serve,
-    redirect, and span declarations are semantic claims even when their keys
-    use arbitrary names. The platform itself consumes HTTPS/redirect LISTEN
-    keys and optional enable controls, so those stay platform-owned and do not
-    require a fake package read. Active listens still enter global uniqueness;
-    TARGET keys remain package-owned and fail closed.
-    """
-    schema = spec["schema"]
-    declared = set(schema["required"]) | set(schema["defaults"])
-    scalar_keys = {key for key in declared if _is_port_config_key(key)}
-    scalar_keys.update(spec["artifacts"]["serve_ports"])
-    scalar_keys.update(mapping["target_key"] for mapping in spec["serve"].values())
-    scalar_keys.update(spec["plaintext_redirect"])
-    scalar_keys.update(spec["plaintext_redirect"].values())
-    for span in schema["port_spans"]:
-        scalar_keys.update((span["base"], span["count"]))
-    table_keys = {(table, leaf) for table, leaves in schema["tables"].items()
-                  for leaf in leaves if _is_port_config_key(leaf)}
-    package_targets = {mapping["target_key"] for mapping in spec["serve"].values()}
-    package_targets.update(spec["plaintext_redirect"].values())
-    platform_listens = set(spec["serve"])
-    platform_listens.update(spec["plaintext_redirect"])
-    platform_controls = {
-        mapping["enabled_key"] for mapping in spec["serve"].values()
-        if mapping.get("enabled_key") is not None
-    }
-    # A key may be the platform listen for one mapping and the package target
-    # for another. Target ownership wins; only listen/public-only keys are
-    # exempt from package-read proof.
-    scalar_keys.difference_update(platform_listens - package_targets)
-    return scalar_keys, table_keys, platform_listens | platform_controls
-
-
-def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
-                       port_contract_keys: set[str],
-                       port_contract_table_keys: set[tuple[str, str]],
-                       platform_config_keys: set[str]) -> "None":
-    """F12: compare the manifest's declared key space with the reads the
-    package's own files actually contain, and report findings via warnings.
-
-    This is an ADVISORY LINT for the package AUTHOR, not an enforcement of the
-    declaration contract — every finding here is reported through _warn(),
-    never fatal. An undeclared read usually surfaces by itself —
-    `airlock-config get apps.x.undeclared` exits non-zero with "key not
-    found" — but a package that suppresses the failure
-    (`… 2>/dev/null || true`, a pattern this repo's own feedback and publish
-    installers use) will simply see an empty value, and the platform cannot
-    tell that from a legitimately empty one. Pinned call-site grammar:
-
-      airlock_config get apps.<id>.<key>       (nested: apps.<id>.<table>.<leaf>)
-      AIRLOCK_<ID>_<KEY>                       (the real _envkey shape)
-
-    both matched as whole tokens — dynamically-constructed names are a stated
-    limitation of the lint. Scope:
-    the package root plus an explicit, package-scoped list of platform-owned
-    consumers; regular files <= 1 MiB that decode as UTF-8
-    (decode failure = binary = skipped); symlinks (file or dir) not followed;
-    README*, docs/, and *.md are excluded (examples are not reads). The
-    mechanical whole-table env export never counts as a read."""
-    # Findings that are FULLY LITERAL: a name written out in the file, with nothing
-    # assembled at runtime. Only these can be made fatal — the dynamic ones stay
-    # warnings forever, because deciding them needs the shell parser this scan gave
-    # up on after eleven rounds (see the docstring).
-    hard: list = []
-
-    def _hard(msg: str) -> None:
-        hard.append(msg)
-        _warn(pid, msg)
-
-    def _consumes_port_read(text: str, start: int, end: int) -> bool:
-        """Reject syntactically explicit discard-only port references.
-
-        F12 is intentionally not a shell/data-flow interpreter, but two forms
-        have no possible runtime effect and must not satisfy a listener
-        ownership proof: the shell no-op builtin and a discarded config-get.
-        Keeping this check narrow makes its fail-closed boundary auditable.
-        """
-        line_start = text.rfind("\n", 0, start) + 1
-        line_end = text.find("\n", end)
-        if line_end < 0:
-            line_end = len(text)
-        logical_line = text[line_start:line_end].replace("\x00", " ")
-        # A no-op may be wrapped, be the second command on a line, or live in
-        # a shell branch (`command : "$PORT"`, `x=1; : "$PORT"`,
-        # `if : "$PORT"`). Inspect the command segment that CONTAINS this
-        # read; a `true` in an earlier condition must not invalidate a later
-        # real assignment on the same line.
-        before_read = logical_line[:max(0, start - line_start)]
-        line = logical_line.strip()
-
-        def _wrapped_noop(prefix: str) -> bool:
-            """Recognise direct/path-qualified true and nested env wrappers."""
-            def _command_name(word: str) -> str:
-                return word.rsplit("/", 1)[-1]
-
-            option = re.search(
-                r"(?:^|\s)--(?:[A-Za-z0-9]+-)*port(?:=|\s+)\"?\$\{?\Z",
-                prefix,
-            )
-            if option is None:
-                return False
-            command = re.split(
-                r"(?:;|&&|\|\||\||\bthen\b|\bdo\b|\belse\b|[(){}])",
-                prefix[:option.start()],
-            )[-1].strip()
-            try:
-                words = shlex.split(command)
-            except ValueError:
-                return False
-            while words and words[0] in {"if", "elif", "while", "until", "!"}:
-                words.pop(0)
-            while words and re.fullmatch(
-                    r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) is not None:
-                words.pop(0)
-            if words[:1] and words[0] in {"command", "builtin"}:
-                words.pop(0)
-            while words and _command_name(words[0]) == "env":
-                words.pop(0)
-                options = True
-                while words:
-                    word = words[0]
-                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word):
-                        words.pop(0)
-                        continue
-                    if options and word == "--":
-                        words.pop(0)
-                        options = False
-                        continue
-                    if not options or not word.startswith("-"):
-                        break
-                    words.pop(0)
-                    split_value = None
-                    if word in {"-u", "--unset", "-C", "--chdir",
-                                "-S", "--split-string", "-a", "--argv0"}:
-                        if not words:
-                            return False
-                        value = words.pop(0)
-                        if word in {"-S", "--split-string"}:
-                            split_value = value
-                    elif word.startswith("-S") and word != "-S":
-                        split_value = word[2:]
-                    elif word.startswith("--split-string="):
-                        split_value = word.split("=", 1)[1]
-                    if split_value is not None:
-                        try:
-                            words[:0] = shlex.split(split_value)
-                        except ValueError:
-                            return False
-                while words and re.fullmatch(
-                        r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]) is not None:
-                    words.pop(0)
-            return bool(words) and (
-                words[0] == ":" or _command_name(words[0]) == "true"
-            )
-
-        if _wrapped_noop(before_read):
-            return False
-        if re.search(
-            r"(?:^|(?:;|&&|\|\||\||\(|\{|\)|\bthen\b|\bdo\b|\belse\b)\s*)"
-            r"(?:(?:if|elif|while|until|!)\s+)?"
-            r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
-            r"(?:(?:command|builtin)\s+)?"
-            r"(?::|true)(?=\s|\Z)[^;&|]*\Z",
-            before_read,
-        ):
-            return False
-        if re.search(
-            r"\bairlock[-_]config\b.*\bget\b.*(?:>\s*/dev/null|\|\s*(?::|true)(?:\s|\Z))",
-            line,
-        ):
-            return False
-        return True
-
-    scalar_declared = set(schema["required"]) | set(schema["defaults"])
-    # Names the installer WRITES rather than reads. Declared, so the scan can tell
-    # them from a read of a key that does not exist. Deliberately NOT applied to the
-    # `airlock_config get` path below: a literal `get apps.<id>.<key>` really is a
-    # config read and really will fail at runtime, whatever this list says.
-    runtime_env = set(schema.get("runtime_env") or [])
-    common_ok = {"external"} | ({"audience"} if audience is not None else set())
-    table_declared = {(t, leaf) for t, leaves in schema["tables"].items()
-                      for leaf in leaves}
-    envid = pid.replace("-", "_").upper()
-    # Env names the PLATFORM exports to every lifecycle script (cmd_env's
-    # common block + the orchestrator's per-app vars). For an unlucky package
-    # id these collide with the AIRLOCK_<ID>_<KEY> shape — a package named
-    # `app` reads AIRLOCK_APP_DIR in every install.sh — and are neither
-    # config-key reads nor errors.
-    # Exactly the names the platform GUARANTEES: cmd_env's common block (which
-    # every lifecycle script evals) plus the variables the orchestrator
-    # exports. Nothing else — exempting a name that is merely sometimes set
-    # would turn a real undeclared read into a runtime-unset surprise.
-    platform_env = {
-        "AIRLOCK_SITE_NAME", "AIRLOCK_PRODUCT", "AIRLOCK_ICON_RING",
-        "AIRLOCK_AUTH_PROVIDER", "AIRLOCK_IDENTITY_HEADER", "AIRLOCK_OWNER",
-        "AIRLOCK_COLLABORATORS", "AIRLOCK_CODE_ROOT", "AIRLOCK_WIKI",
-        "AIRLOCK_APP_DIR", "AIRLOCK_APP_ID", "AIRLOCK_ROOT", "AIRLOCK_CONFIG",
-        "AIRLOCK_ACCOUNTS_BIN", "AIRLOCK_ACCOUNTS_STATUS_BIN", "AIRLOCK_SECRET_BIN",
-        # STATE_DIR is exported only when the operator sets it; a package
-        # reading it is still reading a PLATFORM name (with its own fallback),
-        # never a config key called `dir` — so exempt it in both cases.
-        "AIRLOCK_STATE_DIR", "AIRLOCK_WEBROOT", "AIRLOCK_CONFD",
-        "AIRLOCK_TS_FQDN", "AIRLOCK_PKG_INFO", "AIRLOCK_INSTALL_NONCE",
-        "AIRLOCK_CONTAINER_RECONCILE_MODE",
-        "AIRLOCK_CONTAINER_DAEMON_IDENTITY",
-    }
-    # Built at runtime around the package id; both are SEARCH patterns
-    # (finditer over file text), not validators — matches are compared
-    # against the declared set, so no end anchor applies. The get capture
-    # spans the WHOLE shell argument token (everything up to whitespace,
-    # quotes, or a shell metacharacter): stopping at the key grammar would
-    # silently truncate `apps.<id>.port-bad` or `apps.<id>.port/evil` to a
-    # declared `port` and pass validate for a read that fails at runtime —
-    # the invalid tail must reach the segment checks below and die.
-    # \x00 is the line-continuation placeholder (see below). The capture runs
-    # to the first character that could END a shell word; anything that could
-    # CONTINUE it (quote, backtick, backslash-continuation, $) is handled by
-    # the terminator check at the call site, which fails closed — a regex
-    # cannot expand shell quoting, so an argument it cannot read literally is
-    # refused rather than analysed as its visible prefix.
-    # Locate the CALL; the key argument itself is read with _shell_word, not
-    # matched as text — see that function for why.
-    get_re = re.compile(r"(?<![A-Za-z0-9_.-])airlock[-_]config\b[^\n]*?\bget([\s\x00]+)")  # noqa: regex-anchor
-    prefix = f"apps.{pid}."
-    env_re = re.compile(r"\bAIRLOCK_" + re.escape(envid) + r"_([A-Z0-9_]+)\b")  # noqa: regex-anchor
-    read_scalars, read_tables = set(), set()
-    port_read_scalars, port_read_tables = set(), set()
-    platform_root = Path(__file__).resolve().parent.parent
-
-    def _scan_walk():
-        yield from os.walk(pdir, followlinks=False)
-        # publish's dedicated read-only gate is rendered by the platform core,
-        # not the package lifecycle. Keep that exceptional consumer explicit:
-        # scanning every core file for every package would let an unrelated
-        # token satisfy a package's listener-ownership proof.
-        if pid == "publish":
-            consumer = platform_root / "install" / "render-nginx.sh"
-            yield str(consumer.parent), [], [consumer.name]
-
-    for dirpath, dirnames, filenames in _scan_walk():
-        if Path(dirpath) == pdir:
-            # docs/ is excluded at the PACKAGE ROOT only — a nested docs
-            # directory is ordinary package content and stays scanned (the
-            # exclusion list is part of the spec, not a heuristic).
-            dirnames[:] = [d for d in dirnames if d != "docs"]
-        # Determinism, not a validation rule: os.walk's readdir order is
-        # filesystem-dependent, and warnings are emitted in scan order, so an
-        # unsorted walk makes F12's diagnostic ORDER (never its content —
-        # which files/keys are flagged is unchanged by sorting) depend on
-        # directory-entry order rather than the package's own bytes. Sorting
-        # dirnames in place also steers os.walk's descent order, so nested
-        # directories are visited in a fixed order too.
-        dirnames.sort()
-        for fname in sorted(filenames):
-            if fname.startswith("README") or fname.endswith(".md"):
-                continue
-            if fname == MANIFEST_NAME and Path(dirpath) == pdir:
-                continue   # the declaration itself is not a read site
-            fp = Path(dirpath) / fname
-            try:
-                st = os.lstat(fp)
-            except OSError:
-                continue
-            if not stat.S_ISREG(st.st_mode) or st.st_size > 1024 * 1024:
-                continue
-            try:
-                text = fp.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                continue   # binary (or vanished): skipped by spec
-            raw_text = text
-            # A shell line continuation would split a call site across the
-            # single-line get pattern — normalise it away first, keeping a
-            # NUL placeholder so the line counter below stays accurate
-            # (a plain removal would shift every later diagnostic up by one
-            # per preceding continuation).
-            text = text.replace("\\\n", "\x00")
-            try:
-                where = str(fp.relative_to(pdir))
-            except ValueError:
-                where = f"<platform>/{fp.relative_to(platform_root)}"
-            port_runtime_site = (
-                not fname.startswith(".")
-                and (
-                    bool(st.st_mode & 0o111)
-                    or fp.suffix in {
-                        ".sh", ".py", ".service", ".in", ".conf", ".js", ".mjs",
-                        ".cjs", ".ts", ".tsx", ".go", ".rs", ".rb", ".php",
-                        ".lua", ".pl",
-                    }
-                )
-            )
-            first_line = raw_text.split("\n", 1)[0]
-            shell_runtime_site = (
-                fp.suffix == ".sh"
-                or (bool(st.st_mode & 0o111)
-                    and first_line.startswith("#!")
-                    and re.search(r"\b(?:ba|da|k|z)?sh\b", first_line) is not None)
-            )
-            python_env_reads = _python_env_reads(raw_text) if fp.suffix == ".py" else set()
-            for m in get_re.finditer(text):
-                if not any(ch in " \t\n" for ch in m.group(1)):
-                    continue   # only a splice: `get\<newline>apps…` is one word
-                line = _line_of(text, m.start())
-                if _in_comment_line(text, m.start()):
-                    continue   # a commented-out example is not a call site
-                word, _end, dynamic = _shell_word(text, m.end())
-                if not word.startswith(prefix):
-                    if dynamic and word.startswith("apps."):
-                        _warn(pid, f"{where}:{line} builds an app-config key "
-                                   "at runtime; F12 cannot tell whether it "
-                                   "reads this package")
-                    continue   # another app's key, or an unresolvable name
-                if dynamic:
-                    _warn(pid, f"{where}:{line} builds the key for "
-                               f"apps.{pid}.… at runtime; F12 cannot check it")
-                    continue
-                chain = word[len(prefix):].split(".")
-                if any(_MANIFEST_KEY_RE.fullmatch(seg) is None for seg in chain):
-                    _warn(pid, f"{where}:{line} reads apps.{pid}."
-                               f"{'.'.join(chain)}, which is not a valid key "
-                               "chain ([a-z0-9_]+ per segment)")
-                elif len(chain) == 1:
-                    if chain[0] in scalar_declared | common_ok:
-                        read_scalars.add(chain[0])
-                        if (port_runtime_site and shell_runtime_site
-                                and _shell_assignment_runs_get(text, m.start(), _end)
-                                and _consumes_port_read(text, m.start(), _end)):
-                            port_read_scalars.add(chain[0])
-                    else:
-                        _hard(f"{where}:{line} reads apps.{pid}."
-                              f"{chain[0]}, which the manifest does not "
-                              "declare (it will fail at runtime; declare "
-                              "it in [config])")
-                elif len(chain) == 2 and tuple(chain) in table_declared:
-                    read_tables.add(tuple(chain))
-                    if (port_runtime_site and shell_runtime_site
-                            and _shell_assignment_runs_get(text, m.start(), _end)
-                            and _consumes_port_read(text, m.start(), _end)):
-                        port_read_tables.add(tuple(chain))
-                else:
-                    _hard(f"{where}:{line} reads apps.{pid}."
-                          f"{'.'.join(chain)}, which the manifest does "
-                          "not declare (declare the table and key in "
-                          "[config.tables])")
-            for m in env_re.finditer(text):
-                if _in_comment_line(text, m.start()):
-                    continue
-                full = f"AIRLOCK_{envid}_{m.group(1)}"
-                if full in platform_env:
-                    continue   # a platform export, not a config-key read
-                if full in runtime_env:
-                    continue   # declared as a name the installer writes, not reads
-                key = m.group(1).lower()
-                if key in scalar_declared | common_ok:
-                    read_scalars.add(key)
-                    full_is_read = (
-                        (shell_runtime_site
-                         and _shell_expands_env(text, m.start(), m.end(), full))
-                        or (fp.suffix == ".py" and full in python_env_reads)
-                    )
-                    if (port_runtime_site and full_is_read
-                            and _consumes_port_read(text, m.start(), m.end())):
-                        port_read_scalars.add(key)
-                else:
-                    line = _line_of(text, m.start())
-                    _hard(f"{where}:{line} references AIRLOCK_{envid}_"
-                          f"{m.group(1)}, but '{key}' is neither a declared config "
-                          "key nor a declared [config].runtime_env name (the export "
-                          "will not exist)")
-    # Individual findings are already reported through _hard()/_warn() above
-    # as they are discovered, so nothing further to do with `hard` here.
-
-    unread_scalars = scalar_declared - read_scalars - platform_config_keys
-    unread_port_contract = sorted(
-        (scalar_declared - port_read_scalars) & port_contract_keys
-    )
-    unread_port_contract += sorted(
-        f"{table}.{leaf}" for table, leaf
-        in (table_declared - port_read_tables) & port_contract_table_keys)
-
-    unread = sorted(unread_scalars)
-    unread += sorted(f"{t}.{leaf}" for (t, leaf) in table_declared - read_tables)
-    unread += unread_port_contract
-    if unread:
-        sys.stderr.write(f"airlock-config: warning: package '{pid}' declares "
-                         "config key(s) its files never read: "
-                         + ", ".join(unread)
-                         + " (dead declarations rot; drop them or use them)\n")
-
-
 # One PackageSpec per (config object, package): manifests are parsed ONCE per
 # process and every command projects from the same descriptor. The value
 # RETAINS the cfg object: keying on id() alone would let a freed dict's
@@ -1742,55 +913,11 @@ def _scan_config_reads(pid: str, pdir: Path, schema: dict, audience,
 _SPEC_CACHE: dict = {}
 
 
-def _package_tree_digest(pid: str, pdir: Path) -> str:
-    """Use the ledger's one tree-digest implementation, preserving failures."""
-    ledger = _ledger_module()
-    try:
-        return ledger.digest_tree(str(pdir))
-    except ledger.LedgerError as exc:
-        die(f"package '{pid}': cannot compute package digest: {exc}")
-
-
 def _spec_cache_key(cfg: dict):
     return id(cfg)
 
 
-def _bundle_admission(pid: str, pdir: Path, bundle_principal: bool,
-                      granted_capabilities=(),
-                      requested_capabilities=(), *,
-                      source_class: str = "explicit") -> tuple[set[str], list[str]]:
-    """Return the admitted elevated names and immutable certifications.
-
-    A package id is not a principal.  Bundle policy applies only to the
-    canonical direct child under this checkout's immutable bundle root; an explicit
-    package reusing `orca` or `devterm` therefore receives nothing. Explicit
-    package grants enter only here. Only the two ledger-verifiable capability
-    names are grantable; plaintext redirect remains bundle-only.
-    """
-    grants = set(granted_capabilities)
-    requested = set(requested_capabilities)
-    canonical = (bundle_principal and os.path.realpath(pdir)
-                 == os.path.join(os.path.realpath(BUNDLE_ROOT), pid))
-    if not canonical:
-        # An admitted package already runs arbitrary sudo bash (SECURITY.md), so a
-        # grant list is not a boundary: it gets the grantable capabilities it asks for.
-        return requested & GRANTABLE_CAPABILITIES, []
-    return set(BUNDLE_ENTITLEMENTS.get(pid, ())) | grants, list(BUNDLE_CERTIFICATIONS)
-
-
-def _capability_projection(spec: dict) -> dict:
-    """The stable effective-policy subset shared by both JSON producers."""
-    return {
-        "requested_capabilities": list(spec["requested_capabilities"]),
-        "effective_capabilities": list(spec["effective_capabilities"]),
-        "capabilities": list(spec["capabilities"]),
-        "certifications": list(spec["certifications"]),
-        "surfaces": list(spec["surfaces"]),
-        "surface_classifications": dict(spec["surface_classifications"]),
-    }
-
-
-def package_specs(cfg: dict) -> dict:
+def package_specs(cfg: dict, selected: set[str] | None = None, *, observation: bool = False) -> dict:
     """Resolve installed/shipped apps (D1) and parse each manifest ONCE into an
     immutable PackageSpec: {id, contract, deps, schema, prerequisites,
     artifacts, tile, audience, lifecycle, dir}. Every consumer — validate,
@@ -1798,7 +925,8 @@ def package_specs(cfg: dict) -> dict:
     structure; no command re-reads the manifest. Fatal on any manifest
     violation (F10: unknown fields anywhere are fatal); {} when no apps
     are resolved. Config cross-checks (serve values, spans, disjointness)
-    live in packages_resolved."""
+    live in packages_resolved. Runtime launcher observation can omit a source
+    whose parse already reported failure; required execution inputs stay strict."""
     cached = _SPEC_CACHE.get(_spec_cache_key(cfg))
     if cached is not None:
         return cached[1]
@@ -1806,6 +934,8 @@ def package_specs(cfg: dict) -> dict:
     sources = {}
     shipped_root_real = os.path.realpath(shipped_root)
     for pid in (cfg.get("apps") or {}):
+        if selected is not None and pid not in selected:
+            continue
         if pid in RESERVED_PACKAGE_IDS:
             continue
         if isinstance(pid, str) and PACKAGE_ID_RE.fullmatch(pid):
@@ -1827,6 +957,8 @@ def package_specs(cfg: dict) -> dict:
     except ledger.LedgerError as exc:
         die(f"cannot resolve installed app directories: {exc}", code=2)
     for pid, directory in installed_dirs.items():
+        if selected is not None and pid not in selected:
+            continue
         if pid in RESERVED_PACKAGE_IDS:
             continue
         app_dir = Path(directory)
@@ -1839,18 +971,20 @@ def package_specs(cfg: dict) -> dict:
     prepared = {}
     for pid in sorted(sources):
         table, source_class, bundle_principal = sources[pid]
-        granted = []
         raw = table.get("path", "")
-        p = _expanduser(str(raw).strip())
+        p = _expanduser(str(raw))
         pdir = p.resolve()
-        prepared[pid] = (source_class, bundle_principal, granted, pdir)
+        prepared[pid] = (source_class, pdir)
 
     out = {}
     for pid in sorted(prepared):
-        source_class, bundle_principal, granted, pdir = prepared[pid]
-        spec = _parse_manifest_spec(pid, pdir, source_class,
-                                    bundle_principal=bundle_principal,
-                                    granted_capabilities=granted)
+        source_class, pdir = prepared[pid]
+        try:
+            spec = _parse_manifest_spec(pid, pdir, source_class)
+        except SystemExit:
+            if not observation:
+                raise
+            continue
         out[pid] = spec
     _SPEC_CACHE[_spec_cache_key(cfg)] = (cfg, out)
     return out
@@ -1876,9 +1010,7 @@ def _read_manifest_document(pid: str | None, pdir: Path) -> dict:
 
 
 def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
-                         bundle_principal=False, granted_capabilities=(), *,
-                         manifest_document: dict | None = None,
-                         preview=False) -> dict:
+                         *, manifest_document: dict | None = None) -> dict:
     """Parse + validate ONE manifest at `pdir` into the PackageSpec shape
     `package_specs` stores (child 4/P4: extracted so the known-builtins scan
     can parse a SHIPPED manifest the exact same way for an id that has no
@@ -1911,16 +1043,7 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
         requested.add("system-unit")
     if plaintext_redirect:
         requested.add("plaintext-redirect")
-    grants = set(granted_capabilities)
-    if preview:
-        # A click on "approve and install" is the grant for the two capabilities
-        # whose effects the ledger can verify.  Bundle-only capabilities remain
-        # refused and are returned as data so the sheet can disable its button.
-        grants |= requested & GRANTABLE_CAPABILITIES
-    admitted, certifications = _bundle_admission(
-        pid, pdir, bundle_principal, grants, requested, source_class=source_class)
-    effective_capabilities = sorted(requested & admitted)
-    capabilities = sorted(set(effective_capabilities) & LEDGER_CAPABILITIES)
+    capabilities = sorted(requested & {"rooted-artifact", "system-unit"})
     surfaces = set(requested)
     if arts["serve_ports"]:
         surfaces.add("serve-port")
@@ -1928,7 +1051,10 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
         surfaces.add("serve-https")
     surfaces = sorted(surfaces)
     surface_classifications = {
-        surface: SURFACE_CLASSIFICATIONS[surface] for surface in surfaces
+        surface: ("elevated-capability" if surface in {"rooted-artifact", "system-unit"}
+                  else "shipped-only-restricted" if surface == "plaintext-redirect"
+                  else "baseline-mediated-mapping")
+        for surface in surfaces
     }
     # Serve surfaces must be pairwise disjoint per app (structural half):
     # a config key may serve exactly one of {serve_ports (bare or
@@ -1962,11 +1088,12 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
         "plaintext_redirect": plaintext_redirect,
         "source_class": source_class,
         "requested_capabilities": sorted(requested),
-        "effective_capabilities": effective_capabilities,
+        "effective_capabilities": sorted(requested),
         "capabilities": capabilities,
-        "certifications": sorted(certifications),
+        "certifications": [],
         "surfaces": surfaces,
         "surface_classifications": surface_classifications,
+
         "tile": tile,
         "icon": icon,
         "audience": audience,
@@ -1975,67 +1102,25 @@ def _parse_manifest_spec(pid: str, pdir: Path, source_class: str,
 
 
 def cmd_package_preview(cfg: dict, raw_path: str) -> "None":
-    """Validate a local package against this box without mutating any authority.
-
-    The candidate is an in-memory copy of the current config.  Its PackageSpec is
-    produced by ``_parse_manifest_spec`` and injected into the ordinary projections,
-    so defaults, ports, dependencies and collision checks are the same ones that
-    the engine hook will use for this explicitly selected directory.
-    """
-    path = _expanduser(str(raw_path or "").strip())
+    """Preview only the selected directory through the engine's package resolver."""
+    path = _expanduser(str(raw_path or ""))
     if not path.is_absolute():
         path = find_config().parent / path
     pdir = path.resolve()
-
-    document = _read_manifest_document(None, pdir)
-    pid = document.get("id")
-    spec = _parse_manifest_spec(
-        pid, pdir, "explicit", manifest_document=document, preview=True)
-    requested = set(spec["requested_capabilities"])
-    grants = sorted(requested & GRANTABLE_CAPABILITIES)
-    rejected = sorted(requested - set(spec["effective_capabilities"]))
-    digest = _package_tree_digest(pid, pdir)
-
-    # Parse the rest of the live config normally, except for this candidate id.
-    base = copy.deepcopy(cfg)
-    (base.get("apps") or {}).pop(pid, None)
-    (base.get("packages") or {}).pop(pid, None)
-    specs = dict(package_specs(base))
-    specs[pid] = spec
-
-    candidate = copy.deepcopy(cfg)
-    apps = candidate.setdefault("apps", {})
-    # Installed dependencies participate in this read-only candidate check even
-    # when their operator input tables are absent. No table is written to ⑤.
-    for installed_id in _ledger_module().load_installed():
-        if installed_id in specs:
-            apps.setdefault(installed_id, {})
-    packages = candidate.setdefault("packages", {})
-    existing_app = apps.get(pid)
-    apps[pid] = copy.deepcopy(existing_app) if isinstance(existing_app, dict) else {}
-    packages[pid] = {"path": str(pdir)}
-    if grants:
-        packages[pid]["grant"] = grants
-    _SPEC_CACHE[_spec_cache_key(candidate)] = (candidate, specs)
-
-    # Full candidate validation is still useful for a refused capability: the UI can
-    # show all other manifest/config problems before the owner edits that capability
-    # out. Ordinary registration reparses without preview mode and refuses it again.
+    pid = _read_manifest_document(None, pdir).get("id")
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
-        cmd_validate(candidate)
-    package = packages_resolved(candidate)[pid]
-
+        cmd_dir_package_info(cfg, pid, str(pdir))
+    package = json.loads(output.getvalue())["packages"][pid]
     print(json.dumps({
         "id": pid,
         "path": str(pdir),
-        "digest": digest,
         "package": package,
-        "requested_capabilities": sorted(requested),
-        "effective_capabilities": list(spec["effective_capabilities"]),
-        "grants": grants,
-        "rejected_capabilities": rejected,
-        "installable": not rejected,
+        "requested_capabilities": package["requested_capabilities"],
+        "effective_capabilities": package["effective_capabilities"],
+        "grants": [],
+        "rejected_capabilities": [],
+        "installable": True,
     }, indent=2, sort_keys=True))
 
 
@@ -2043,14 +1128,6 @@ def packages_resolved(cfg: dict) -> dict:
     """PackageSpecs cross-checked against the resolved config: serve-port
     values, port-span values, and disjoint ownership (D1/D2). Fatal on any
     violation; {} when no packages are configured."""
-    frozen_digest = os.environ.get("AIRLOCK_INSTALL_PKG_INFO_SHA256", "")
-    if frozen_digest:
-        raw = os.environ.get("AIRLOCK_PKG_INFO", "")
-        try:
-            frozen = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            die(f"frozen install package-info is invalid JSON: {exc}")
-        return frozen.get("packages", {}) or {}
     specs = package_specs(cfg)
     if not specs:
         return {}
@@ -2110,7 +1187,7 @@ def packages_resolved(cfg: dict) -> dict:
         arts_out["serve_ports"].extend(sorted(redirect_mappings))
         if spec["icon"] is not None:
             # The engine records this app's staged icon directory.
-            arts_out["webroot"] = arts_out["webroot"] + [f"assets/apps/{pid}"]
+            arts_out["webroot"] = arts_out["webroot"] + [f"assets/apps/{glob.escape(pid)}"]
         out[pid] = dict(spec, artifacts=arts_out, serve=active_serve,
                         serve_port_values=spv, serve_mappings=serve_mappings,
                         serve_registry_rows=registry_rows,
@@ -2131,27 +1208,8 @@ def packages_resolved(cfg: dict) -> dict:
     return out
 
 
-def app_order(cfg: dict) -> list:
-    """Stable install order (F5, D3 stage 4 — the D3 demotion), consumed
-    identically by validate, `apps`, and package-info.
-
-    No installed/shipped specs -> TOML input order, byte-identical (the
-    built-in fast path). With packages -> Kahn over REAL manifest
-    [dependencies] edges ONLY (dep -> pid: the dep runs first) — no synthetic
-    input-order chain (child 4/P3 demotes it; r3 review showed the edge-drop
-    rule it replaced could create transitive cycles). The ready queue is
-    prioritized by config INPUT ORDER (then C-collation name order for two
-    ids at equal input position, which cannot occur — each name appears once
-    in one file). Properties that fall out of this: with no real edges the
-    order IS input order, so this is byte-identical to the no-packages fast
-    path above; real-edge cycles remain fatal; a config that used to be
-    contradiction-fatal under the synthetic chain (a manifest edge disagreeing
-    with [apps.*] position) is now simply ordered by the real edge — a
-    deliberate relaxation, previously-invalid boxes only."""
-    names = list(cfg.get("apps") or {})
-    specs = package_specs(cfg)
-    if not specs:
-        return names
+def dependency_order(names: list[str], deps: dict[str, list[str]]) -> list[str]:
+    """Dependencies first; input order breaks ties. Unresolved cycles retain input order."""
     configured = set(names)
     pos = {n: i for i, n in enumerate(names)}   # config input order, for ties
     edges: dict = {n: set() for n in names}   # X -> {Y}: X runs before Y
@@ -2162,10 +1220,10 @@ def app_order(cfg: dict) -> list:
             edges[x].add(y)
             indeg[y] += 1
 
-    for pid, spec in specs.items():
+    for pid, required in deps.items():
         if pid not in configured:
             continue
-        for dep in spec["deps"]:
+        for dep in required:
             if dep in configured:
                 add(dep, pid)
     ready = sorted((pos[n], n) for n in names if indeg[n] == 0)
@@ -2187,6 +1245,12 @@ def app_order(cfg: dict) -> list:
         seen = set(order)
         order.extend(n for _, n in sorted((pos[n], n) for n in names if n not in seen))
     return order
+
+
+def app_order(cfg: dict) -> list:
+    """Order configured apps by their real manifest edges, preserving input-order ties."""
+    return dependency_order(list(cfg.get("apps") or {}),
+                            {app: spec["deps"] for app, spec in package_specs(cfg).items()})
 
 
 # ---- shipped apps ---------------------------------------------------------
@@ -2251,8 +1315,7 @@ def known_builtin_specs(cfg: dict) -> dict:
     out = {}
     for pid, pdir in _shipped_dirs(cfg).items():
         try:
-            out[pid] = _parse_manifest_spec(pid, pdir, "shipped",
-                                            bundle_principal=True)
+            out[pid] = _parse_manifest_spec(pid, pdir, "shipped")
         except SystemExit:
             continue
     return out
@@ -2442,7 +1505,14 @@ def cmd_init(owner: str, site_name, selected: list) -> "None":
     # validate (notepad without publish dies in app_order). Closing it silently
     # would install an app nobody ticked, so the additions are reported — one
     # place owns the rule, and the caller can still say why the box grew an app.
-    chosen, added = set(selected) - {"hub"}, set()
+    requested = []
+    for value in selected:
+        if value in catalog or value == "hub":
+            requested.append(value)
+        else:
+            requested.extend(part if part in catalog else part.strip()
+                             for part in value.split(",") if part.strip())
+    chosen, added = set(requested) - {"hub"}, set()
     frontier = list(chosen)
     while frontier:
         pid = frontier.pop()
@@ -2492,7 +1562,7 @@ def cmd_init(owner: str, site_name, selected: list) -> "None":
     # it is a RESERVED_PACKAGE_ID with no apps/hub tree, so it never appears in
     # `catalog` either. A picker cannot offer to switch off the front door.
     lines += ["", "[apps.hub]"]
-    lines += [f"[apps.{pid}]" for pid in ordered]
+    lines += [f"[apps.{_toml_str(pid)}]" for pid in ordered]
     print("\n".join(lines))
 
 
@@ -2515,7 +1585,7 @@ def cmd_icon_src(cfg: dict, app: str) -> "None":
     contained validation at the moment the orchestrator is about to copy
     (validate-to-stage TOCTOU), then print two lines — the resolved source
     path and the webroot-relative destination. No output = no icon to stage."""
-    specs = package_specs(cfg)
+    specs = package_specs(cfg, {app})
     spec = specs.get(app)
     if spec is None or spec["icon"] is None:
         return
@@ -2526,7 +1596,7 @@ def cmd_icon_src(cfg: dict, app: str) -> "None":
 
 def cmd_icon_stage(cfg: dict, app: str) -> "None":
     """Revalidate and atomically stage the app's declared tile icon."""
-    specs = package_specs(cfg)
+    specs = package_specs(cfg, {app})
     spec = specs.get(app)
     if spec is None:
         return
@@ -2566,57 +1636,43 @@ def _prereq_tsv_path() -> Path:
     return Path(__file__).resolve().parent.parent / "install" / "prerequisites.tsv"
 
 
-def cmd_prereqs(cfg: dict) -> "None":
-    """F11 assembly of the prerequisites inventory: six-column TSV rows
-    (owner, command, predicate, expected, fix, note) on stdout.
-
-    Assembly steps only — ALL cross-row rules (duplicate owner+command,
-    conflicting fix, stricter-wins) stay in preflight, step 5, so the
-    built-in path is byte-identical and every cross-row rule has exactly
-    one owner:
-      1. existing TSV data rows pass through verbatim, in file order
-         (core rows immutable — 'core' is a reserved package id);
-      2. rows whose owner is a manifest-bearing package id are dropped
-         (a shadowing package replaces the built-in's rows);
-      3. each configured package appends its manifest rows, owner = the
-         package id (a zero-prereq manifest contributes no rows);
-      4. per-row validity: a TSV row that does not split into exactly six
-         non-empty fields is fatal (rc 2) — it could not be passed through
-         faithfully. Manifest rows were validated at manifest parse.
-    Cardinality is preserved: multiple rows per command stay as-is."""
-    try:
-        specs = package_specs(cfg)
-    except SystemExit as e:
-        # Assembly surface: rc 2 is preflight's contract-error vocabulary
-        # (F11), and a manifest whose prereq rows cannot be assembled is an
-        # assembly violation when reached THROUGH this command. validate
-        # keeps its own rc for the same errors.
-        raise SystemExit(2) from e
-    path = _prereq_tsv_path()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as e:
-        die(f"prerequisites declaration file not readable: {path} ({e})", code=2)
+def _prerequisite_rows(specs: dict, path: Path) -> list[list[str]]:
+    """Assemble core rows and the already selected package prerequisites."""
     rows = []
-    for ln, rawline in enumerate(text.splitlines(), 1):
-        # Same skip rule as preflight's reader (empty, or '#' in COLUMN ONE):
-        # an indented '#' is a malformed data row THERE, so silently dropping
-        # it HERE would make the two paths disagree about the same file.
+    for rawline in path.read_text(encoding="utf-8").splitlines():
         if not rawline or rawline.startswith("#"):
             continue
         fields = rawline.split("\t")
-        if fields[0] in specs:
-            continue   # replaced by the manifest's rows below
-        rows.append(rawline)
-    for pid in sorted(specs):
-        for row in specs[pid]["prerequisites"]:
-            rows.append("\t".join([pid, row["command"], row["predicate"],
-                                   row["expected"], row["fix"], row["note"]]))
+        if fields[0] not in specs:
+            rows.append(fields)
+    for pid, spec in sorted(specs.items()):
+        for row in spec.get("prerequisites", []):
+            rows.append([pid, row["command"], row["predicate"], row["expected"],
+                         row["fix"], row["note"]])
+    return rows
+
+
+def cmd_prereqs(cfg: dict) -> "None":
+    """Serialize the canonical assembled rows as the legacy TSV view.
+
+    Owner replacement and manifest row appending belong to _prerequisite_rows.
+    Executable/version evaluation belongs to preflight. Row order and cardinality
+    are preserved; a manifest with no prerequisites replaces its old TSV rows.
+    """
+    try:
+        specs = package_specs(cfg)
+    except SystemExit as e:
+        raise SystemExit(2) from e
+    path = _prereq_tsv_path()
+    try:
+        rows = _prerequisite_rows(specs, path)
+    except (OSError, UnicodeError) as e:
+        die(f"prerequisites declaration file not readable: {path} ({e})", code=2)
     for row in rows:
-        print(row)
+        print("\t".join(row))
 
 
-def cmd_package_info(cfg: dict) -> "None":
+def cmd_package_info(cfg: dict, selected: list[str] | None = None) -> "None":
     """Everything bash needs about resolved apps, as one JSON object. Consumed
     by the orchestrator and bin/airlock-ledger (which parses no TOML).
 
@@ -2624,6 +1680,10 @@ def cmd_package_info(cfg: dict) -> "None":
     configuration this box reads, handed to a consumer that parses no TOML.
     Absent, the key is an empty string — a box with no Company source is a
     normal state, not an error."""
+    if selected is not None:
+        cfg = copy.deepcopy(cfg)
+        cfg["apps"] = {pid: (cfg.get("apps") or {}).get(pid, {}) for pid in selected}
+        package_specs(cfg, set(selected))
     rendered = json.dumps({
         "config_path": str(find_config()),
         "order": app_order(cfg),
@@ -2643,45 +1703,11 @@ def cmd_dir_package_info(cfg: dict, package_id: str, raw_dir: str) -> "None":
     if not PACKAGE_ID_RE.fullmatch(package_id):
         die(f"package id {package_id!r} is not a valid id", code=2)
     shipped = os.path.realpath(pdir) == os.path.join(os.path.realpath(_shipped_root()), package_id)
-    spec = _parse_manifest_spec(package_id, pdir, "shipped" if shipped else "explicit",
-                                bundle_principal=shipped)
+    spec = _parse_manifest_spec(package_id, pdir, "shipped" if shipped else "explicit")
     candidate = copy.deepcopy(cfg)
     candidate.setdefault("apps", {}).setdefault(package_id, {})
     _SPEC_CACHE[_spec_cache_key(candidate)] = (candidate, {package_id: spec})
     print(json.dumps({"packages": packages_resolved(candidate)}, indent=2, sort_keys=True))
-
-
-def cmd_install_preflight(cfg: dict) -> "None":
-    """Resolve every read-only projection before reconcile can remove an app.
-
-    A candidate that fails only when a later projection is first read must be
-    rejected while every old app is still active. Run once, before any
-    mutation; one writer at a time (K1) means nothing can change the
-    candidate between here and reconcile, so there is nothing to re-check.
-    """
-    projections: dict[str, str] = {}
-
-    def capture(name: str, function, *args) -> None:
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            function(cfg, *args)
-        projections[name] = output.getvalue()
-
-    capture("validate", cmd_validate)
-    capture("package-info", cmd_package_info)
-    capture("apps", cmd_apps)
-    capture("webjson", cmd_webjson)
-    capture("plaintext", cmd_plaintext)
-    capture("plaintext-known", cmd_plaintext_known)
-    capture("prereqs", cmd_prereqs)
-    capture("known-builtins", cmd_known_builtins)
-    for app in app_order(cfg):
-        # Preflight captures config without runtime container admission.
-        capture(f"env:{app}", cmd_env, app, False)
-    for package_id in sorted(package_specs(cfg)):
-        capture(f"icon-src:{package_id}", cmd_icon_src, package_id)
-    payload = json.dumps(projections, sort_keys=True, separators=(",", ":")).encode()
-    print(hashlib.sha256(payload).hexdigest())
 
 
 def cmd_canonical_package_info(cfg: dict, package_id: str,
@@ -2693,15 +1719,17 @@ def cmd_canonical_package_info(cfg: dict, package_id: str,
     config may point outside its own checkout.  The release layer already owns
     that pinned source boundary; guessing it here would create false provenance.
     """
+    package_specs(cfg, {package_id})
     packages = packages_resolved(cfg)
     spec = packages[package_id]
     out = {
         "package_id": package_id,
-        "schema_version": CAPABILITY_SCHEMA_VERSION,
+        "schema_version": 1,
         "source_repository_id": source_repository_id,
         "source_sha": source_sha,
         "surfaces": list(spec["surfaces"]),
         "surface_classifications": dict(spec["surface_classifications"]),
+
     }
     sys.stdout.write(json.dumps(out, sort_keys=True, separators=(",", ":")) + "\n")
 
@@ -2767,94 +1795,6 @@ def cmd_plaintext(cfg: dict) -> "None":
             print(f"{pid}\t{listen}\t{target}")
 
 
-def _current_plaintext_retirement_entries(cfg: dict) -> list[dict]:
-    """Resolved package plaintext rows that must exist before a mapping does."""
-    packaged = packages_resolved(cfg)
-    app_tables = resolved(cfg).get("apps", {})
-    entries = []
-    for pid, package in sorted(packaged.items()):
-        table = app_tables.get(pid) or dict(package["schema"]["defaults"])
-        for public_key, redirect_key in sorted(package["plaintext_redirect"].items()):
-            entries.append({"package": pid, "listen": table[public_key],
-                            "target": table[redirect_key], "state": "intent"})
-    return sorted(entries, key=lambda entry: (entry["package"], entry["listen"]))
-
-
-def cmd_plaintext_retirement_record(cfg: dict) -> "None":
-    """Durably journal intents before the orchestrator opens mappings."""
-    current = _current_plaintext_retirement_entries(cfg)
-    if not current:
-        return
-    _update_plaintext_retirement(
-        lambda: _record_plaintext_retirement(current))
-
-
-def _record_plaintext_retirement(current: list[dict]) -> "None":
-    record = _read_plaintext_retirement()
-    merged = {(entry["package"], entry["listen"]): entry
-              for entry in record["entries"]}
-    for entry in current:
-        key = (entry["package"], entry["listen"])
-        old = merged.get(key)
-        # A matching committed row stays committed across an idempotent rerun.
-        # A target change is a new ownership attempt and returns to intent until
-        # the corresponding tailscale command succeeds.
-        if old is None or old["target"] != entry["target"]:
-            merged[key] = entry
-    result = {"version": PLAINTEXT_RETIREMENT_VERSION,
-              "entries": sorted(merged.values(),
-                                key=lambda entry: (entry["package"], entry["listen"]))}
-    if result != record:
-        _write_plaintext_retirement(result)
-
-
-def cmd_plaintext_retirement_commit(cfg: dict, package: str,
-                                    listen: int, target: int) -> "None":
-    """Promote one exact intent after the persistent mapping command succeeds."""
-    expected = {(entry["package"], entry["listen"], entry["target"])
-                for entry in _current_plaintext_retirement_entries(cfg)}
-    if (package, listen, target) not in expected:
-        # `cmd_plaintext` also emits ordinary mode=http serve_mappings. They
-        # are already ledgered and are not this sidecar's plaintext_redirect
-        # contract, so there is deliberately no intent to promote.
-        return
-    _update_plaintext_retirement(
-        lambda: _commit_plaintext_retirement(
-            package, listen, target))
-
-
-def _commit_plaintext_retirement(package: str, listen: int,
-                                            target: int) -> "None":
-    record = _read_plaintext_retirement()
-    found = False
-    entries = []
-    for entry in record["entries"]:
-        if entry["package"] == package and entry["listen"] == listen:
-            entry = dict(entry, target=target, state="committed")
-            found = True
-        entries.append(entry)
-    if not found:
-        entries.append({"package": package, "listen": listen, "target": target,
-                        "state": "committed"})
-    result = {"version": PLAINTEXT_RETIREMENT_VERSION, "entries": entries}
-    if result != record:
-        _write_plaintext_retirement(result)
-
-
-def cmd_plaintext_retirement_drop(port: int) -> "None":
-    """Drop responsibility only after the orchestrator proved the mapping absent."""
-    _update_plaintext_retirement(
-        lambda: _drop_plaintext_retirement(port))
-
-
-def _drop_plaintext_retirement(port: int) -> "None":
-    record = _read_plaintext_retirement()
-    entries = [entry for entry in record["entries"] if entry["listen"] != port]
-    if len(entries) != len(record["entries"]):
-        _write_plaintext_retirement(
-            {"version": PLAINTEXT_RETIREMENT_VERSION, "entries": entries})
-
-
 def cmd_plaintext_retirement_known() -> "None":
     for port in sorted({entry["listen"] for entry in
                         _read_plaintext_retirement()["entries"]
@@ -2881,7 +1821,7 @@ def _shipped_plaintext_redirect_defaults() -> set:
     ports = set()
     # Empty cfg is deliberate: stale-default retirement is shadow-agnostic.
     # `known_builtin_specs` walks every canonical bundle entry and uses the
-    # same complete manifest parser/admission result as configured packages;
+    # same complete manifest parser result as configured packages;
     # this function never opens TOML itself.
     for spec in known_builtin_specs({}).values():
         defaults = spec["schema"]["defaults"]
@@ -2912,6 +1852,16 @@ def cmd_plaintext_known(cfg: dict) -> "None":
     ports = {entry["listen"] for entry in
              _read_plaintext_retirement()["entries"]
              if entry["state"] == "committed"}
+    if os.environ.get("AIRLOCK_PROJECT_IDS") is not None:
+        # The running engine already recorded the app-owned transport endpoints.
+        # Reading unrelated source manifests cannot grant cleanup ownership.
+        ports.update(_ledger_module().recorded_active_ports(_read_ledger(), mode="http"))
+        for hub in (APP_DEFAULTS["hub"], (cfg.get("apps") or {}).get("hub") or {}):
+            ports.update(value for key in _PLAINTEXT_PORT_KEYS
+                         if isinstance(value := hub.get(key), int) and not isinstance(value, bool))
+        for port in sorted(ports):
+            print(port)
+        return
     packaged = packages_resolved(cfg)
     for table in APP_DEFAULTS.values():
         for k in _PLAINTEXT_PORT_KEYS:
@@ -2959,28 +1909,27 @@ def cmd_plaintext_known(cfg: dict) -> "None":
 
 def _dig(cfg: dict, dotted: str):
     cur = cfg
-    for part in dotted.split("."):
-        if not isinstance(cur, dict) or part not in cur:
+    remaining = dotted
+    while remaining:
+        keys = [key for key in cur if remaining == key or remaining.startswith(key + ".")] if isinstance(cur, dict) else []
+        if not keys:
             die(f"key not found: {dotted}")
+        part = max(keys, key=len)
         cur = cur[part]
+        remaining = remaining[len(part) + 1:]
     return cur
 
 
-def _require_runtime_source(app: str) -> None:
-    ledger = _ledger_module()
-    try:
-        directory = ledger.app_dirs({}).get(app)
-    except ledger.LedgerError as exc:
-        die(f"cannot resolve installed app directories: {exc}", code=2)
-    if directory and (not Path(directory).is_dir()
-                      or not (Path(directory) / MANIFEST_NAME).is_file()):
-        die(f"recorded source for {app} is missing: {directory}")
-
-
 def cmd_get(cfg: dict, dotted: str) -> "None":
-    parts = dotted.split(".")
-    if len(parts) >= 2 and parts[0] == "apps":
-        _require_runtime_source(parts[1])
+    selected = None if dotted == "apps" else set()
+    if dotted.startswith("apps."):
+        path = dotted[len("apps."):]
+        ids = set(cfg.get("apps") or {}) | set(_read_ledger())
+        if app_id := os.environ.get("AIRLOCK_APP_ID"):
+            ids.add(app_id)
+        matches = [pid for pid in ids if path == pid or path.startswith(pid + ".")]
+        selected.add(max(matches, key=len) if matches else path.split(".")[0])
+    package_specs(cfg, selected)
     val = _dig(resolved(cfg), dotted)
     if isinstance(val, bool):
         print("true" if val else "false")
@@ -2991,12 +1940,12 @@ def cmd_get(cfg: dict, dotted: str) -> "None":
 
 
 def _envkey(app: str, key: str) -> str:
-    return f"AIRLOCK_{app.replace('-', '_').upper()}_{key.upper()}"
+    prefix = re.sub(r"[^A-Za-z0-9_]", "_", app).upper()
+    return f"AIRLOCK_{prefix}_{key.upper()}"
 
 
-def cmd_env(cfg: dict, app: str, lifecycle: bool = True) -> "None":
-    _require_runtime_source(app)
-    specs = package_specs(cfg)
+def cmd_env(cfg: dict, app: str) -> "None":
+    specs = package_specs(cfg, {app})
     _warn_deprecated_config(cfg, specs, only_app=app)
     r = resolved(cfg)
     if app not in r.get("apps", {}):
@@ -3022,22 +1971,6 @@ def cmd_env(cfg: dict, app: str, lifecycle: bool = True) -> "None":
         "AIRLOCK_AGENT_PROVIDER": r.get("agent", {}).get("provider",
                                                          AGENT_PROVIDER_DEFAULT),
     }
-    spec = specs.get(app)
-    if spec is not None and spec["artifacts"]["containers"]:
-        common["AIRLOCK_INSTALL_NONCE"] = ""
-        common["AIRLOCK_CONTAINER_RECONCILE_MODE"] = ""
-        common["AIRLOCK_CONTAINER_DAEMON_IDENTITY"] = ""
-        if lifecycle:
-            ledger = _ledger_module()
-            try:
-                admission = ledger.container_install_admission_for_load(
-                    app, _read_ledger().get(app) or {})
-            except ledger.LedgerError:
-                admission = None
-            if admission is not None:
-                common["AIRLOCK_INSTALL_NONCE"] = admission["install_nonce"]
-                common["AIRLOCK_CONTAINER_RECONCILE_MODE"] = admission["mode"]
-                common["AIRLOCK_CONTAINER_DAEMON_IDENTITY"] = admission["daemon_identity"]
     lines = [f"{k}={shlex.quote(str(v))}" for k, v in common.items()]
     for key, val in r["apps"][app].items():
         # Nested tables (e.g. [apps.publish.public_target]) are not flattened into
@@ -3049,34 +1982,13 @@ def cmd_env(cfg: dict, app: str, lifecycle: bool = True) -> "None":
     print("\n".join(lines))
 
 
-def cmd_container_admit(cfg: dict, app: str) -> "None":
-    if app not in resolved(cfg).get("apps", {}):
-        die(f"app configuration source not found: {app}")
-    entry = _read_ledger().get(app) or {}
-    ledger_mod = _ledger_module()
-    try:
-        admission = ledger_mod.container_install_admission_for_load(app, entry)
-    except ledger_mod.LedgerError:
-        admission = None
-    if admission is None:
-        print("\t\t")
-        return
-    print(f"{admission['mode']}\t{admission['install_nonce']}\t"
-          f"{admission['daemon_identity']}")
-
-
-def cmd_json(cfg: dict) -> "None":
+def cmd_json(cfg: dict, selected: list[str] | None = None) -> "None":
+    if selected is not None:
+        package_specs(cfg, set(selected))
     out = resolved(cfg)
-    specs = package_specs(cfg)
-    out["capability_contract"] = {
-        "schema_version": CAPABILITY_SCHEMA_VERSION,
-        "bundle_entitlements": {
-            pid: list(BUNDLE_ENTITLEMENTS[pid]) for pid in sorted(BUNDLE_ENTITLEMENTS)
-        },
-        "packages": {
-            pid: _capability_projection(spec) for pid, spec in sorted(specs.items())
-        },
-    }
+    if selected is not None:
+        out["apps"] = {pid: table for pid, table in out.get("apps", {}).items()
+                       if pid in selected}
     print(json.dumps(out, indent=2, sort_keys=True))
 
 
@@ -3232,15 +2144,20 @@ def _tile_candidate(app_id: str, tile: Any, icon_dest=None) -> "dict | None":
     return row
 
 
+def _app_icon_url(app_id: str, filename: str) -> str:
+    return f"/assets/apps/{quote(app_id, safe='')}/{quote(filename, safe='')}"
+
+
 def _company_app_candidates(mirror: Path, sha: str) -> list:
     """Read only manifests in the engine's pinned Company commit."""
     ledger = _ledger_module()
-    entries = ledger._git(["-C", str(mirror), "ls-tree", "--name-only", f"{sha}:apps"],
+    entries = ledger._git_bytes(["-C", str(mirror), "ls-tree", "-z", "--name-only", f"{sha}:apps"],
                           "list Company apps")
     if entries.returncode:
         return []
     rows = []
-    for app_id in entries.stdout.splitlines():
+    for raw_id in entries.stdout.split(b"\0")[:-1]:
+        app_id = os.fsdecode(raw_id)
         if PACKAGE_ID_RE.fullmatch(app_id) is None:
             continue
         try:
@@ -3256,7 +2173,7 @@ def _company_app_candidates(mirror: Path, sha: str) -> list:
             continue
         tile = document.get("tile")
         icon = tile.get("icon") if isinstance(tile, dict) else None
-        dest = f"/assets/apps/{app_id}/{Path(icon.strip()).name}" if isinstance(icon, str) and icon.strip() else None
+        dest = _app_icon_url(app_id, Path(icon.strip()).name) if isinstance(icon, str) and icon.strip() else None
         rows.append(_tile_candidate(app_id, tile, dest))
     return rows
 
@@ -3305,7 +2222,7 @@ def read_sources(cfg: dict) -> dict:
         rows = []
         for pid in sorted(specs):
             row = _tile_candidate(pid, specs[pid]["tile"],
-                                  None if specs[pid]["icon"] is None else "/" + specs[pid]["icon"]["dest"])
+                                  None if specs[pid]["icon"] is None else _app_icon_url(pid, Path(specs[pid]["icon"]["dest"]).name))
             if local:
                 row["source"] = specs[pid]["dir"]
             rows.append(row)
@@ -3373,6 +2290,9 @@ def cmd_webjson(cfg: dict) -> "None":
     Contains ONLY what the browser needs: product name and the enabled apps with
     their public port (if any). No owner, no identity header, no internal ports.
     """
+    project_ids = os.environ.get("AIRLOCK_PROJECT_IDS")
+    if project_ids is not None:
+        package_specs(cfg, set(json.loads(project_ids)), observation=True)
     r = resolved(cfg)
     specs = package_specs(cfg)
     # WHICH apps are installed is the engine's answer, not this file's, once the
@@ -3386,7 +2306,7 @@ def cmd_webjson(cfg: dict) -> "None":
     # its tile from the manifest is the Company 일원화 PR (card PR4), not here.
     project_ids = os.environ.get("AIRLOCK_PROJECT_IDS")
     if project_ids is not None:
-        installed = set(project_ids.split())
+        installed = set(json.loads(project_ids))
         configured = {k: v for k, v in r.get("apps", {}).items() if k in installed}
         r = dict(r, apps=configured)
     apps = {}
@@ -3428,7 +2348,7 @@ def cmd_webjson(cfg: dict) -> "None":
                 if spec["tile"]["glyph"] is not None:
                     tile["glyph"] = spec["tile"]["glyph"]
                 if spec["icon"] is not None:
-                    tile["icon"] = "/" + spec["icon"]["dest"]
+                    tile["icon"] = _app_icon_url(name, Path(spec["icon"]["dest"]).name)
                 entry["tile"] = tile
         apps[name] = entry
     # Links reach the launcher through this projection rather than through the
@@ -3468,7 +2388,7 @@ def main(argv: list[str]) -> int:
     if not argv:
         die("usage: airlock-config "
             "<validate|apps|catalog|init|plaintext|get|env|json|package-preview|"
-            "install-snapshot> [arg]",
+            "dir-package-info> [arg]",
             code=2)
     cmd, rest = argv[0], argv[1:]
     # `catalog` runs BEFORE load(): it answers "what could I install?", which is
@@ -3493,9 +2413,9 @@ def main(argv: list[str]) -> int:
                     # Accumulate, do not replace: a caller that builds the list in
                     # pieces (`--apps a --apps b`) would otherwise lose the first
                     # one silently, and end up with a box missing an app nobody
-                    # noticed was dropped. Whitespace is stripped because a list
-                    # typed by a person has spaces after the commas.
-                    apps += [a.strip() for a in value.split(",") if a.strip()]
+                    # noticed was dropped. The catalog resolves exact IDs before
+                    # interpreting legacy comma lists and their optional spaces.
+                    apps.append(value)
             else:
                 die(f"unknown argument for init: {arg}\n"
                     "  usage: airlock-config init --owner <login> "
@@ -3510,11 +2430,6 @@ def main(argv: list[str]) -> int:
             die("catalog takes no arguments", code=2)
         cmd_catalog()
         return 0
-    if cmd == "install-snapshot":
-        if len(rest) != 1:
-            die("install-snapshot requires one private target path", code=2)
-        cmd_install_snapshot(rest[0])
-        return 0
     cfg = load()
     if cmd == "validate":
         cmd_validate(cfg)
@@ -3524,24 +2439,8 @@ def main(argv: list[str]) -> int:
         cmd_plaintext(cfg)
     elif cmd == "plaintext-known":
         cmd_plaintext_known(cfg)
-    elif cmd == "plaintext-retirement-record":
-        if rest:
-            die("plaintext-retirement-record takes no arguments", code=2)
-        cmd_plaintext_retirement_record(cfg)
     elif cmd == "plaintext-retirement-known":
-        if rest:
-            die("plaintext-retirement-known takes no arguments", code=2)
         cmd_plaintext_retirement_known()
-    elif cmd == "plaintext-retirement-commit":
-        if (len(rest) != 3 or PACKAGE_ID_RE.fullmatch(rest[0]) is None
-                or not rest[1].isdigit() or not 1 <= int(rest[1]) <= 65535
-                or not rest[2].isdigit() or not 1 <= int(rest[2]) <= 65535):
-            die("plaintext-retirement-commit requires <package> <listen> <target>", code=2)
-        cmd_plaintext_retirement_commit(cfg, rest[0], int(rest[1]), int(rest[2]))
-    elif cmd == "plaintext-retirement-drop":
-        if len(rest) != 1 or not rest[0].isdigit() or not 1 <= int(rest[0]) <= 65535:
-            die("plaintext-retirement-drop requires one port number 1-65535", code=2)
-        cmd_plaintext_retirement_drop(int(rest[0]))
     elif cmd == "get":
         if not rest:
             die("get requires a dotted.key", code=2)
@@ -3550,12 +2449,8 @@ def main(argv: list[str]) -> int:
         if not rest:
             die("env requires an app name", code=2)
         cmd_env(cfg, rest[0])
-    elif cmd == "container-admit":
-        if len(rest) != 1:
-            die("container-admit requires one app name", code=2)
-        cmd_container_admit(cfg, rest[0])
     elif cmd == "json":
-        cmd_json(cfg)
+        cmd_json(cfg, rest or None)
     elif cmd == "webjson":
         cmd_webjson(cfg)
     elif cmd == "package-preview":
@@ -3563,17 +2458,11 @@ def main(argv: list[str]) -> int:
             die("package-preview requires exactly one package directory path", code=2)
         cmd_package_preview(cfg, rest[0])
     elif cmd == "package-info":
-        if rest:
-            die("package-info takes no arguments", code=2)
-        cmd_package_info(cfg)
+        cmd_package_info(cfg, rest or None)
     elif cmd == "dir-package-info":
         if len(rest) != 2:
             die("dir-package-info requires <package-id> <directory>", code=2)
         cmd_dir_package_info(cfg, rest[0], rest[1])
-    elif cmd == "install-preflight":
-        if rest:
-            die("install-preflight takes no arguments", code=2)
-        cmd_install_preflight(cfg)
     elif cmd == "canonical-package-info":
         if len(rest) != 3:
             die("canonical-package-info requires <package-id> "

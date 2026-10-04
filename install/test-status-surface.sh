@@ -747,6 +747,59 @@ if [ "$got" = "unchecked unchecked" ]; then
   ok "O ingress.serve and apps.backends refuse to judge an incomplete list"
 else bad "O got '$got', expected 'unchecked unchecked'"; fi
 
+# JSON app identity and Serve mappings preserve actual filename components.
+reset_box
+if python3 -B - "$ROOT" "$TMP" "$CFG" <<'PY_STATUS_IDS'
+from importlib.machinery import SourceFileLoader
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root, base, healthy_config = map(Path, sys.argv[1:])
+base = base / "status-special-ids"
+base.mkdir()
+state = base / "state"
+state.mkdir()
+names = ("Line\nApp", " Tab\tApp ")
+rows = {}
+for name, listen in zip(names, (23450, 23452)):
+    directory = base / "shipped" / name
+    directory.mkdir(parents=True)
+    (directory / "airlock-app.toml").write_text(
+        'contract=1\nid=' + json.dumps(name) + '\n[config.defaults]\n' +
+        f'public_port={listen}\nredirect_port={listen + 1}\n' +
+        '[plaintext_redirect]\npublic_port="redirect_port"\n')
+    rows[name] = {"repo": str(directory), "commit": "", "artifacts": []}
+config = base / "airlock.toml"
+config.write_text(healthy_config.read_text().split('[apps.devterm]', 1)[0] +
+                  ''.join('[apps.' + json.dumps(name) + ']\n' for name in names))
+os.environ.update(AIRLOCK_CONFIG=str(config), AIRLOCK_STATE_DIR=str(state),
+                  AIRLOCK_SHIPPED_APPS_ROOT=str(base / "shipped"),
+                  AIRLOCK_TEST_CONFIG_FAIL="apps plaintext")
+status = SourceFileLoader("_special_id_status", str(root / "bin/airlock-status")).load_module()
+status.ledger_module().write_installed(rows)
+report = status.Report()
+cfg = status.check_config(report)
+assert cfg is not None, report.checks()
+facts = status.mappings(cfg)
+hub = cfg["resolved"]["apps"]["hub"]
+assert facts == {"listens": {str(hub["https_port"]), str(hub["http_port"]), "23450", "23452"},
+                 "targets": {str(hub["nginx_port"]), str(hub["redirect_port"]), "23451", "23453"},
+                 "why": ""}, facts
+result = subprocess.run([sys.executable, '-B', str(root / "bin/airlock-status"), '--json'],
+                        text=True, capture_output=True)
+assert result.returncode in (0, 1, 3), (result.returncode, result.stdout, result.stderr)
+checks = {row["id"]: row for row in json.loads(result.stdout)["checks"]}
+assert checks["install.drift"]["status"] == "ok", checks["install.drift"]
+assert checks["apps.enabled"]["status"] == "ok", checks["apps.enabled"]
+assert all(name in checks["apps.enabled"]["detail"] for name in names), checks["apps.enabled"]
+print("PASS real status: newline/tab/edge-space IDs agree with ledger; only real Hub/package mapping ports")
+PY_STATUS_IDS
+then ok "Q JSON inventory and Serve mappings preserve newline/tab/edge-space app IDs"
+else bad "Q status special-ID consumers"; fi
+
 # ---- K. a loopback target with nothing on it is red -------------------------
 # Last, because it takes a held port away for good. Without this case, an
 # airlock-status whose port probe always answered "listening" would pass every

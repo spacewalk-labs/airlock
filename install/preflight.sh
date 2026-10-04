@@ -155,55 +155,67 @@ airlock_preflight() {
   [ -r "$AIRLOCK_PREREQUISITES" ] \
     || { log "preflight: declaration file not readable: $AIRLOCK_PREREQUISITES"; return 2; }
 
-  local enabled app apps line_no=0 declaration_line owner cmd predicate expected fix note extra
-  enabled=$'\ncore\n'
-  apps="$(airlock_config apps)" \
+  local apps owner cmd predicate expected fix note owner_key owner_label
+  apps="$(airlock_config json)" \
     || { log "preflight: could not read enabled apps"; return 2; }
-  while IFS= read -r app; do
-    [ -n "$app" ] || continue
-    enabled+="$app"$'\n'
-  done <<<"$apps"
 
-  # F11: with [packages.*] configured, airlock-config OWNS assembly (steps
-  # 1-4: TSV pass-through, shadowed-owner row replacement, manifest rows,
-  # per-row validity) and this function keeps evaluation — every cross-row
-  # rule below runs unchanged on the assembled inventory. Without packages
-  # the raw TSV is read exactly as before (byte-identical path).
-  local packaged=$'\n' decl_file="$AIRLOCK_PREREQUISITES" decl_name="$AIRLOCK_PREREQUISITES" tmp_decl=""
-  if [ -n "${AIRLOCK_PKG_INFO:-}" ]; then
-    local pkg_id_lines
-    pkg_id_lines="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c \
-      'import sys, json; print("\n".join(sorted(json.load(sys.stdin)["packages"])))')" \
-      || { log "preflight: could not read package ids from package-info"; return 2; }
-    while IFS= read -r app; do
-      [ -n "$app" ] || continue
-      packaged+="$app"$'\n'
-    done <<<"$pkg_id_lines"
+  # Core declarations stay TSV. Package keys and prerequisite arrays are JSON;
+  # NUL fields keep every allowed ID intact through the shell reader.
+  local tmp_decl tmp_info cleanup
+  tmp_decl="$(mktemp)" || { log "preflight: mktemp failed"; return 2; }
+  tmp_info="$(mktemp)" || { rm -f -- "$tmp_decl"; return 2; }
+  printf -v cleanup 'rm -f -- %q %q; trap - RETURN' "$tmp_decl" "$tmp_info"
+  trap "$cleanup" RETURN
+  airlock_package_info >"$tmp_info" || return 2
+  if ! python3 - "$AIRLOCK_ROOT/bin/airlock-config" "$AIRLOCK_PREREQUISITES" "$apps" "$tmp_info" >"$tmp_decl" <<'PY_PREREQS'
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+tool, path, config_json, package_file = sys.argv[1:]
+loader = importlib.machinery.SourceFileLoader("_airlock_preflight_config", tool)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+config = importlib.util.module_from_spec(spec)
+loader.exec_module(config)
+enabled = set(json.loads(config_json).get("apps", {})) | {"core"}
+packages = json.loads(Path(package_file).read_text()).get("packages", {})
+
+def emit(owner, fields):
+    command = fields[0]
+    if owner not in enabled or not command:
+        return
+    owner_key = json.dumps([command, owner], ensure_ascii=False)
+    owner_label = json.dumps(owner, ensure_ascii=False)[1:-1]
+    sys.stdout.write("\0".join([owner, *fields, owner_key, owner_label]) + "\0")
+
+for row in config._prerequisite_rows(packages, Path(path)):
+    owner, *values = (row + [""] * 6)[:6]
+    emit(owner, values)
+PY_PREREQS
+  then
+    log "preflight: prerequisite assembly failed"
+    return 2
   fi
-  if [ "$packaged" != $'\n' ]; then
-    tmp_decl="$(mktemp)" || { log "preflight: mktemp failed"; return 2; }
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmp_decl'; trap - RETURN" RETURN
-    # Capture to a file and test the exit status DIRECTLY: process
-    # substitution would discard the producer's failure and evaluate a
-    # truncated inventory as if it were complete.
-    if ! AIRLOCK_PREREQUISITES="$AIRLOCK_PREREQUISITES" airlock_config prereqs > "$tmp_decl"; then
-      log "preflight: prerequisite assembly failed (airlock-config prereqs)"
-      return 2
+
+  local -A predicates=() expecteds=() fixes=() owner_set=() owner_display=()
+  local select_nvm=0
+  while IFS= read -r -d '' owner \
+    && IFS= read -r -d '' cmd \
+    && IFS= read -r -d '' predicate \
+    && IFS= read -r -d '' expected \
+    && IFS= read -r -d '' fix \
+    && IFS= read -r -d '' note \
+    && IFS= read -r -d '' owner_key \
+    && IFS= read -r -d '' owner_label; do
+    if [ -z "${owner_set[$owner_key]:-}" ]; then
+      owner_set[$owner_key]=1
+      # Presentation only: IDs are never recovered by splitting this string.
+      owner_display[$cmd]="${owner_display[$cmd]:+${owner_display[$cmd]},}$owner_label"
     fi
-    decl_file="$tmp_decl"
-    decl_name="airlock-config prereqs"
-  fi
-
-  local -A predicates=() expecteds=() fixes=() owners=()
-  while IFS= read -r declaration_line || [ -n "$declaration_line" ]; do
-    line_no=$((line_no + 1))
-    case "$declaration_line" in ""|\#*) continue ;; esac
-    owner='' cmd='' predicate='' expected='' fix='' note='' extra=''
-    IFS=$'\t' read -r owner cmd predicate expected fix note extra <<<"$declaration_line"
-    [ -n "$cmd" ] || continue
-
-    case "$enabled" in *$'\n'"$owner"$'\n'*) ;; *) continue ;; esac
+    [ "$cmd:$owner" != node:paseo ] || select_nvm=1
     if [ -n "${predicates[$cmd]:-}" ]; then
       case "${predicates[$cmd]}:$predicate" in
         present:present) ;;
@@ -216,26 +228,20 @@ airlock_preflight() {
           fi ;;
         *) ;;
       esac
-      owners[$cmd]="${owners[$cmd]},$owner"
     else
       predicates[$cmd]="$predicate"; expecteds[$cmd]="$expected"
-      fixes[$cmd]="$fix"; owners[$cmd]="$owner"
+      fixes[$cmd]="$fix"
     fi
-  done < "$decl_file"
+  done < "$tmp_decl"
   # Runtime selection precedes the version probe. Key this to the effective
   # manifest row, not merely the package id: a package
   # shadowing paseo without a Node prerequisite made no NVM contract.
-  case ",${owners[node]:-}," in *,paseo,*) airlock_load_nvm ;; esac
+  [ "$select_nvm" = 0 ] || airlock_load_nvm
 
   local -a failures=()
   local path version req status detected selected_owners=""
   for cmd in "${!predicates[@]}"; do
-    selected_owners=""
-    IFS=',' read -ra _owners <<<"${owners[$cmd]}"
-    for owner in "${_owners[@]}"; do
-      case "$enabled" in *$'\n'"$owner"$'\n'*) selected_owners="${selected_owners:+$selected_owners,}$owner" ;; esac
-    done
-    [ -n "$selected_owners" ] || continue
+    selected_owners="${owner_display[$cmd]}"
     path="$(airlock_find_cmd "$cmd")" || path=""
     status=present; detected="$path"; req="$cmd"
     if [ -z "$path" ]; then

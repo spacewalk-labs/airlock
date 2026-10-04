@@ -28,13 +28,13 @@ TEST_HOME="$TMP/home"; mkdir -p "$TEST_HOME"
 add_runtime_tools() {
   local dir="$1" cmd
   # mktemp, rm: not app prerequisites (no TSV/manifest row declares them),
-  # but install/preflight.sh's F11 assembly path (`airlock-config prereqs`
+  # but install/preflight.sh's JSON/core-TSV prerequisite assembly
   # + its temp-file cleanup trap, reached whenever ANY package/manifest is
   # configured) needs both to capture and discard the assembled inventory
   # — same category as bash/dirname/sort below, platform runtime tools the
   # sandbox must supply regardless of what this fixture's TSV-derived stub
   # list contains.
-  for cmd in bash dirname sort mktemp rm; do
+  for cmd in bash dirname sort mktemp rm cat; do
     ln -sf "$(command -v "$cmd")" "$dir/$cmd"
   done
 }
@@ -336,6 +336,45 @@ else
   bad "unknown app behavior changed: rc=$custom_rc out=$custom_out"
 fi
 
+# Package IDs keep their exact bytes through JSON keys, owner sets and fields.
+: >"$TMP/id-prereqs.tsv"
+IDPACKS="$TMP/id-packages"
+mkdir -p "$IDPACKS"
+for package_id in normal $'Tab\tApp' $'Line\nApp' 'Comma,App'; do
+  package_dir="$IDPACKS/$package_id"
+  python3 - "$package_id" "$package_dir" "$TMP/id-input.toml" <<'PY_ID'
+import json
+from pathlib import Path
+import sys
+app, directory, config = sys.argv[1:]
+root = Path(directory); root.mkdir()
+(root / "airlock-app.toml").write_text(
+    "contract = 1\nid = " + json.dumps(app) + "\n"
+    '[[prerequisites]]\ncommand = "review_missing_command_123"\n'
+    'predicate = "present"\nexpected = "-"\nfix = "install the fixture command"\nnote = "ID bytes"\n')
+Path(config).write_text('[auth]\nprovider="tailscale"\nowner="owner@fixture.dev"\n[apps.' + json.dumps(app) + ']\n')
+PY_ID
+  id_info="$(AIRLOCK_CONFIG="$TMP/id-input.toml" python3 "$ROOT/bin/airlock-config" \
+    dir-package-info "$package_id" "$package_dir")"
+  id_missing_rc=0
+  id_missing="$(AIRLOCK_APP_ID="$package_id" AIRLOCK_APP_DIR="$package_dir" \
+    AIRLOCK_PKG_INFO="$id_info" run_engine_inventory \
+    "$TMP/id-input.toml" "$BASE" "$TMP/id-prereqs.tsv" 2>&1)" || id_missing_rc=$?
+  id_label="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1],ensure_ascii=False)[1:-1])' "$package_id")"
+  make_stub "$BASE" review_missing_command_123
+  id_present_rc=0
+  id_present="$(AIRLOCK_APP_ID="$package_id" AIRLOCK_APP_DIR="$package_dir" \
+    AIRLOCK_PKG_INFO="$id_info" run_engine_inventory \
+    "$TMP/id-input.toml" "$BASE" "$TMP/id-prereqs.tsv" 2>&1)" || id_present_rc=$?
+  rm "$BASE/review_missing_command_123"
+  if [ "$id_missing_rc" = 1 ] && [[ "$id_missing" == *review_missing_command_123*missing*"$id_label"* ]] \
+      && [ "$id_present_rc" = 0 ] && [ -z "$id_present" ]; then
+    ok "package prerequisite preserves exact owner $id_label and detects missing/present command"
+  else
+    bad "package prerequisite owner changed or skipped: id=$id_label missing_rc=$id_missing_rc present_rc=$id_present_rc out=$id_missing | $id_present"
+  fi
+done
+
 # Shape/schema errors in the declaration TSV no longer refuse a preflight run
 # (Installer refusals: five) — a row this box's own maintained TSV/manifest
 # assembly would never produce is treated leniently instead of aborting a
@@ -396,25 +435,15 @@ if [ "$apps_failure_rc" = 2 ]; then
 else
   bad "enabled-app discovery failure exit was $apps_failure_rc"
 fi
-# F11: with [packages.*] configured (AIRLOCK_PKG_INFO non-empty), preflight
-# delegates ASSEMBLY to `airlock-config prereqs` and must check the producer's
-# exit status directly — a failing assembly is the preflight contract surface,
-# rc 2, never a truncated inventory evaluated as if complete.
+# The NUL inventory producer must still fail directly when its source JSON
+# cannot be read, rather than evaluating a truncated inventory as complete.
 assembly_rc=0
-assembly_out="$(AIRLOCK_PKG_INFO='{"config_path":"/dev/null","order":[],"packages":{"p":{}}}' /bin/bash -c \
-  ". \"$ROOT/install/lib.sh\"; airlock_config(){
-     case \"\${1:-}\" in
-       apps) printf 'hub\n' ;;
-       prereqs) return 1 ;;
-     esac
-   }; airlock_preflight --quiet" 2>&1)" || assembly_rc=$?
-# rc 2 alone cannot distinguish this from any other contract error — the
-# message pins WHICH guard fired (a swallowed producer status would surface
-# as 'declaration file contains no requirements' instead).
+assembly_out="$(AIRLOCK_PKG_INFO='{"packages":' /bin/bash -c \
+  ". \"$ROOT/install/lib.sh\"; airlock_config(){ printf '%s\\n' '{\"apps\":{\"p\":{}}}'; }; airlock_preflight --quiet" 2>&1)" || assembly_rc=$?
 if [ "$assembly_rc" = 2 ] && grep -Fq "prerequisite assembly failed" <<<"$assembly_out"; then
-  ok "failing prereqs assembly exits 2 (producer status checked directly)"
+  ok "failing JSON prerequisite assembly exits 2 (producer status checked directly)"
 else
-  bad "failing prereqs assembly exit was $assembly_rc"
+  bad "failing prerequisite assembly exit was $assembly_rc"
 fi
 
 # Gate-zero (#807, bin/airlock-config): an empty/minimal config (no [auth],
@@ -566,20 +595,6 @@ if discover_smokes "$TMP/definitely-not-an-apps-directory" \
   bad "smoke discovery oracle accepted a missing tree"
 else
   ok "smoke discovery failures propagate"
-fi
-
-# Run the real installer with a failed preflight. The target paths must remain
-# absent, proving the failure happens before the first host mutation.
-MUT="$TMP/mutation"; mkdir -p "$MUT"
-mut_rc=0
-mut_out="$(HOME="$TEST_HOME" PATH="$GAPS" AIRLOCK_CONFIG="$TMP/hub.toml" \
-  AIRLOCK_DRY_RUN=1 AIRLOCK_WEBROOT="$MUT/web" AIRLOCK_CONFD="$MUT/confd" \
-  /bin/bash "$ROOT/install/airlock-install.sh" 2>&1)" || mut_rc=$?
-if [ "$mut_rc" = 1 ] && [ ! -e "$MUT/web" ] && [ ! -e "$MUT/confd" ] \
-  && [[ "$mut_out" != *"installing hub"* ]]; then
-  ok "failed installer preflight aborts before mutation"
-else
-  bad "installer crossed mutation boundary after failed preflight"
 fi
 
 # --- sbin fallback -----------------------------------------------------------

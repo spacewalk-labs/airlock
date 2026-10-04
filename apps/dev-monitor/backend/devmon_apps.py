@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-APP_ID = re.compile(r"\A[a-z0-9][a-z0-9-]{0,31}\Z")
+APP_ID = re.compile(r"\A(?!\.{1,2}\Z)[^/\x00]+\Z")
 
 
 class AppsError(RuntimeError):
@@ -98,7 +98,7 @@ def installed_ids(root: Path) -> list[str]:
     for name in ("AIRLOCK_CONFIG_SNAPSHOT", "AIRLOCK_CONFIG_SNAPSHOT_SHA256",
                  "AIRLOCK_INSTALL_PKG_INFO_SHA256"):
         env.pop(name, None)
-    argv = [sys.executable, str(base / "bin" / "airlock-ledger"), "list"]
+    argv = [sys.executable, str(base / "bin" / "airlock-ledger"), "list", "--json"]
     try:
         result = subprocess.run(argv, cwd=str(base), env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -108,18 +108,10 @@ def installed_ids(root: Path) -> list[str]:
     if result.returncode:
         raise AppsError("ledger_unavailable",
                         result.stderr.strip() or "airlock-ledger list failed")
-    ids = []
-    for line in result.stdout.splitlines():
-        fields = line.split("\t")
-        if len(fields) < 2:
-            continue
-        if not (fields[1].startswith("repo=") or
-                "committed" in fields[1].replace("state=", "").split("+")):
-            continue
-        app_id = fields[0].strip()
-        if app_id and app_id not in ids:
-            ids.append(app_id)
-    return ids
+    try:
+        return list(json.loads(result.stdout))
+    except json.JSONDecodeError as exc:
+        raise AppsError("ledger_unavailable", "airlock-ledger list did not return JSON") from exc
 
 
 def _sources(root: Path) -> dict[str, Any]:

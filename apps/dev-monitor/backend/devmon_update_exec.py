@@ -1,7 +1,7 @@
 """Run one app's ledger apply/remove, or the platform updater, through the action runner.
 
 The runner survives the dev-monitor service restarting and writes its result to disk.
-Only the platform action invokes airlock-update and offers its rollback command.
+The platform action invokes airlock-update and records its result.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ SCHEMA_VERSION = 1
 # The same id grammar bin/airlock-config enforces for a package.  Used to refuse an
 # app id before it can reach a run record. Reinstall actions only record it; the closed
 # teardown action is the sole action that passes the already-validated id to a command.
-APP_ID = re.compile(r"\A[a-z0-9][a-z0-9-]{0,31}\Z")
+APP_ID = re.compile(r"\A(?!\.{1,2}\Z)[^/\x00]+\Z")
 
 # A status run probes tailscale, nginx, the gate and every unit; on a loaded box it is
 # tens of seconds.  Two of them plus a release fetch plus a full installer run is the
@@ -154,65 +154,58 @@ def pid_alive(pid: Any, marker: bytes = b"devmon_update_exec") -> bool:
     return marker in raw
 
 
-def git_dir(root: Path) -> Path | None:
-    """The absolute git directory airlock-update locks, or None if there is none yet.
-
-    A box installed by `clone; rm -rf .git; git init` may not have run `git init` at
-    all until its first update, which is a supported state — airlock-update creates
-    the repository itself.  No repository means nothing holds the mutex.
-    """
-    try:
-        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--absolute-git-dir"],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                text=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode:
-        return None
-    value = result.stdout.strip()
-    return Path(value) if value else None
-
-
 def updater_busy(root: Path) -> bool | None:
-    """Is ANY airlock-update or rollback running — including one started in a terminal?
+    """Observe this checkout's updater/installer processes without taking a lock.
 
-    True / False / **None when it cannot be measured**, and the third value is the point:
-    a "no" that is really "I could not look" is the absence claim this whole panel exists
-    to stop making.
-
-    Measured by READING /proc/locks, never by taking the lock.  airlock-update serialises
-    itself with a non-blocking exclusive `flock` on its own git directory
-    (bin/airlock-update, acquire_update_mutex).  A probe that acquired that lock — even
-    for microseconds — would make a real update, started one poll tick later, die with
-    "another airlock-update is in progress".  Asking the kernel who holds it takes
-    nothing.  (Verified against a live flock 2026-09-01: a lock held on a directory
-    appears as `FLOCK ADVISORY WRITE <pid> <maj:min:ino> 0 EOF`, matched here on
-    maj:min:ino.  apps/dev-monitor/test-backend.py holds one and asserts both answers,
-    so the probe cannot regress into a function that only ever says "free".)
-
-    Not a second opinion, either: this is the updater's OWN lock, so a run started over
-    SSH and the daily detection timer's `--dry-run` are both visible, and there is no
-    state of ours to drift out of step with it.
+    UI wrapper processes cover their preparation and completion as well. On a
+    host without readable process metadata, None means it could not be measured.
     """
-    directory = git_dir(root)
-    if directory is None:
-        return False                     # no repository yet: nothing can hold the mutex
+    root = root.resolve()
     try:
-        stat = os.stat(directory)
+        processes = list(Path("/proc").iterdir())
     except OSError:
         return None
-    try:
-        raw = Path("/proc/locks").read_text()
-    except OSError:
-        return None                      # no procfs — say so rather than answering "free"
-    wanted = "%02x:%02x:%d" % (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino)
-    for line in raw.splitlines():
-        fields = line.split()
-        if fields[1:2] == ["->"]:
-            fields = fields[:1] + fields[2:]   # a blocked waiter is written "N: -> FLOCK …"
-        if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == wanted:
-            return True
-    return False
+    targets = {root / "bin/airlock-update", root / "install/airlock-install.sh"}
+    unknown = False
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            argv = [os.fsdecode(arg) for arg in
+                    (process / "cmdline").read_bytes().split(b"\0") if arg]
+            if not argv or "--dry-run" in argv:
+                continue
+            executable = Path(argv[0]).name
+            if executable not in {"bash", "sh", "dash", "zsh"} and not executable.startswith("python"):
+                continue
+            script = None
+            for arg in argv[1:]:
+                if arg in {"-c", "-lc", "-ic", "-m"}:
+                    break                     # command text is not a script path
+                if not arg.startswith("-"):
+                    script = Path(arg)
+                    break
+            if script is None:
+                continue
+            if script.name in {"airlock-update", "airlock-install.sh"}:
+                candidate = script
+                if not candidate.is_absolute():
+                    candidate = (process / "cwd").resolve() / candidate
+                if candidate.resolve() in targets:
+                    return True
+            if (script.name == "devmon_update_exec.py"
+                    and "--root" in argv and "--action" in argv):
+                checkout = argv[argv.index("--root") + 1]
+                action = argv[argv.index("--action") + 1]
+                if action == "platform" and Path(checkout).resolve() == root:
+                    return True
+        except (FileNotFoundError, ProcessLookupError):
+            continue                         # exited while being observed
+        except (OSError, IndexError):
+            unknown = True
+    return None if unknown else False
 
 
 def active(record: dict[str, Any] | None) -> bool:
@@ -255,8 +248,8 @@ def observed(record: dict[str, Any] | None,
         return record
     resolved = dict(record)
     resolved["status"] = "interrupted"
-    resolved["note"] = ("실행이 결과를 남기지 못하고 끝났습니다 — 아래 복구 명령으로 "
-                        "되돌린 뒤 다시 시도하십시오.")
+    resolved["note"] = ("실행이 결과를 남기지 못하고 끝났습니다 — 현재 상태를 확인하고 "
+                        "같은 작업을 다시 실행하십시오.")
     resolved.setdefault("recovery", None)
     return resolved
 
@@ -270,7 +263,7 @@ def build_exec_argv(root: Path, directory: Path, run_id: str, action: str,
             "--root", str(root), "--dir", str(directory), "--run", run_id,
             "--action", action]
     if app_id:
-        argv += ["--app", app_id]
+        argv += [f"--app={app_id}"]
     if package_path is not None:
         argv += ["--package-path", package_path]
     return argv
@@ -375,37 +368,23 @@ def status_summary(root: Path) -> dict[str, Any]:
 def app_summary(root: Path, app_id: str) -> dict[str, Any]:
     """Read the selected app's committed revision without probing other apps or Paseo."""
     try:
-        result = subprocess.run([sys.executable, str(root / "bin/airlock-ledger"), "list"],
+        result = subprocess.run([sys.executable, str(root / "bin/airlock-ledger"), "list", "--json"],
                                 stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                 cwd=str(root), timeout=60, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"rc": 127, "verdict": None, "error": str(exc)}
-    row = next((line.split("\t") for line in result.stdout.splitlines()
-                if line.partition("\t")[0] == app_id), [])
-    revision = next((field.removeprefix("commit=") for field in row
-                     if field.startswith("commit=")), None)
+    if result.returncode != 0:
+        return {"rc": result.returncode, "verdict": None, "appId": app_id,
+                "revision": None, "installed": None}
+    try:
+        store = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return {"rc": result.returncode, "verdict": None, "error": str(exc),
+                "appId": app_id, "revision": None, "installed": None}
+    row = store.get(app_id)
+    revision = row.get("commit") if isinstance(row, dict) else None
     return {"rc": result.returncode, "verdict": None, "appId": app_id,
-            "revision": revision, "installed": bool(row) if result.returncode == 0 else None}
-
-
-def recovery_hint(root: Path) -> dict[str, Any]:
-    """The `--rollback` line airlock-update armed, read from where it armed it.
-
-    airlock-update copies itself into <git-dir>/airlock-update-rollback and prints this
-    command on every failure path.  Reading the directory rather than composing a
-    command from memory means the panel cannot offer a recovery that was never armed:
-    a run that failed before the arming step gets `available: false` and says so.
-    """
-    directory = git_dir(root)
-    recovery = directory / "airlock-update-rollback" if directory else None
-    if recovery is not None and (recovery / "airlock-update").is_file():
-        return {"available": True,
-                "command": 'AIRLOCK_DIR="%s" bash "%s" --rollback'
-                           % (root, recovery / "airlock-update")}
-    return {"available": False,
-            "command": 'AIRLOCK_DIR="%s" bash "%s" --rollback' % (root, root / "bin" / "airlock-update"),
-            "reason": ("자동 복구 기준점이 만들어지기 전에 멈췄습니다 — 되돌릴 변경이 "
-                       "없을 수 있습니다. 위 명령은 남은 기록이 있을 때만 동작합니다.")}
+            "revision": revision, "installed": app_id in store}
 
 
 def _claim(directory: Path, run_id: str) -> dict[str, Any]:
@@ -448,9 +427,10 @@ def main(argv: list[str] | None = None) -> int:
             write_record(directory, record)
             return 2
         argv_update = [sys.executable, str(root / "bin" / "airlock-ledger"),
-                       "remove" if args.action == "teardown" else "apply", args.app]
+                       "remove" if args.action == "teardown" else "apply"]
         if args.action != "teardown" and args.package_path:
             argv_update += ["--source", args.package_path]
+        argv_update += ["--", args.app]
     subject = {"platform": "플랫폼 업데이트", "app": "앱 업데이트",
                "install": "앱 설치", "teardown": "앱 teardown"}[args.action]
     print("실행: %s" % " ".join(argv_update), flush=True)
@@ -474,15 +454,14 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n적용 뒤 상태를 확인합니다…", flush=True)
     record["after"] = status_summary(root) if args.action == "platform" else app_summary(root, args.app)
-    if code != 0 and args.action == "platform":
-        record["recovery"] = recovery_hint(root)
-    elif code != 0 and not record.get("note"):
+    if code != 0 and not record.get("note"):
         record["note"] = ({
+            "platform": "플랫폼 업데이트가 실패했습니다. 실행 창의 출력을 확인하고 다시 실행하십시오.",
             "app": "앱 업데이트가 실패했습니다. 실행 창에서 엔진의 복원 결과를 확인하십시오.",
             "install": ("앱 설치가 실패했습니다. 실행 창의 출력을 확인하고, "
                         "엔진의 복원 결과를 확인하십시오."),
             "teardown": ("앱 teardown이 실패했습니다. 실행 창의 출력을 확인하십시오. "
-                         "airlock-update 롤백은 이 작업의 복구 절차가 아닙니다."),
+                         "실패한 자원의 상태를 확인하고 다시 실행하십시오."),
         }[args.action])
     record["endedAt"] = now_iso()
     write_record(directory, record)

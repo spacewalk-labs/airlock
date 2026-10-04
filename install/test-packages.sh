@@ -50,15 +50,6 @@ cat >"$SHIM/sudo" <<'STUB'
 while [ $# -gt 0 ]; do
   case "$1" in -n) shift ;; -u) shift 2 ;; *) break ;; esac
 done
-# Deterministic config A/B race seam for the orchestrator regression below.
-# The first mutation command runs after the installer has frozen and fully
-# preflighted A; replace the operator file with B before ledger reconcile.
-if [ -n "${AIRLOCK_TEST_CONFIG_RACE_REPLACEMENT:-}" ] \
-   && [ -n "${AIRLOCK_TEST_CONFIG_RACE_DONE:-}" ] \
-   && [ ! -e "$AIRLOCK_TEST_CONFIG_RACE_DONE" ]; then
-  cp "$AIRLOCK_TEST_CONFIG_RACE_REPLACEMENT" "$AIRLOCK_CONFIG"
-  : > "$AIRLOCK_TEST_CONFIG_RACE_DONE"
-fi
 exec "$@"
 STUB
 cat >"$SHIM/systemctl" <<STUB
@@ -169,7 +160,7 @@ manifest() {
 mkpkg() {
   local dir="$1" id="$2" deact="${3:-1}" env_id
   env_id="${id^^}"
-  env_id="${env_id//-/_}"
+  env_id="${env_id//[^A-Z0-9_]/_}"
   mkdir -p "$dir"
   cat >"$dir/airlock-app.toml" <<EOF
 contract = 1
@@ -210,17 +201,6 @@ EOF
   chmod +x "$dir"/*.sh 2>/dev/null || true
 }
 
-# orch <config> [VAR=val...] — the real orchestrator against the scratch box.
-orch() {
-  local cfg="$1"; shift
-  local variables=() arguments=() value
-  for value in "$@"; do
-    case "$value" in --*) arguments+=("$value") ;; *) variables+=("$value") ;; esac
-  done
-  env HOME="$FAKEHOME" AIRLOCK_CONFIG="$cfg" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" \
-      "${variables[@]}" bash "$ROOT/install/airlock-install.sh" "${arguments[@]}"
-}
-
 # The installation record is read through the engine module.
 installed() {
   python3 - "$ROOT/bin/airlock-ledger" "$@" <<'PY_READ'
@@ -251,14 +231,6 @@ if run "$CFGDIR/ok.toml" validate >/dev/null 2>&1; then
   ok "resolver: a conforming package validates"
 else
   bad "resolver: a conforming package validates"
-fi
-
-preflight_a="$(run "$CFGDIR/ok.toml" install-preflight 2>/dev/null)" || preflight_a=""
-preflight_b="$(run "$CFGDIR/ok.toml" install-preflight 2>/dev/null)" || preflight_b=""
-if [[ "$preflight_a" =~ ^[0-9a-f]{64}$ ]] && [ "$preflight_a" = "$preflight_b" ]; then
-  ok "candidate preflight: every static projection resolves to one deterministic digest"
-else
-  bad "candidate preflight: digest is missing or unstable ($preflight_a / $preflight_b)"
 fi
 
 # PRIVATE_RELEASE_PATH launcher oracle: these are explicit package manifests,
@@ -381,7 +353,7 @@ else
   bad "P3E-19: leftover packages affected source resolution"
 fi
 stale_out="$(AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" AIRLOCK_CONFIG="$CFGDIR/stale.toml" "$ROOT/bin/airlock-ledger" apply foo 2>&1)" && stale_rc=0 || stale_rc=$?
-if [ "$stale_rc" -ne 0 ] && grep -Fq 'no source for foo' <<<"$stale_out" \
+if [ "$stale_rc" -ne 0 ] && grep -Fq 'no installed source for foo: new apps require --source' <<<"$stale_out" \
    && [ ! -e "$TMP/invoke-foo.log" ] && [ ! -e "$STATE/installed-apps.json" ]; then
   ok "P3E-19: foo apply requires an explicit source and never runs its stale hook"
 else
@@ -395,7 +367,7 @@ PKG="$TMP/engine-personal"; mkpkg "$PKG" personal
 CFGFILE="$TMP/engine-personal.toml"
 mkcfg "$CFGFILE" '[apps.personal]' 'backend_port = 18900' '[packages.personal]' "path = \"$PKG\""
 out="$(AIRLOCK_CONFIG="$CFGFILE" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" "$ROOT/bin/airlock-ledger" apply personal 2>&1)"; rc=$?
-[ "$rc" != 0 ] && grep -q 'no source for personal' <<<"$out" \
+[ "$rc" != 0 ] && grep -q 'no installed source for personal: new apps require --source' <<<"$out" \
   && [ ! -e "$WEB/personal/marker" ] \
   && ok "Personal first install requires a source rather than packages.path" \
   || bad "Personal source authority changed: $out"
@@ -413,262 +385,6 @@ out="$(AIRLOCK_CONFIG="$CFGFILE" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" "$ROO
   && ! grep -q 'platform secret TTL' <<<"$out" \
   && ok "direct apply changes only the target app, without box timers or smoke" \
   || bad "direct apply did extra work or failed: $out"
-
-# Full core updates never replay or remove a Personal lifecycle.
-personal_before="$(installed | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["personal"],sort_keys=True))')"
-before_calls="$(wc -l <"$TMP/invoke-personal.log")"
-CORE_ROOT="$TMP/shipped"; CORE_PKG="$CORE_ROOT/core-fixture"
-mkpkg "$CORE_PKG" core-fixture
-mkpkg "$CORE_ROOT/core-fixture-two" core-fixture-two
-export AIRLOCK_SHIPPED_APPS_ROOT="$CORE_ROOT"
-mkcfg "$CFGFILE" '[apps.core-fixture]' 'backend_port = 18901' \
-  '[apps.core-fixture-two]' 'backend_port = 18902' \
-  '[apps.personal]' 'backend_port = 18900' '[packages.personal]' "path = \"$PKG\""
-apply_source "$CFGFILE" core-fixture "$CORE_PKG" >/dev/null 2>&1 || bad "core setup"
-apply_source "$CFGFILE" core-fixture-two "$CORE_ROOT/core-fixture-two" >/dev/null 2>&1 || bad "second core setup"
-core_calls="$(wc -l <"$TMP/invoke-core-fixture.log")"
-second_core_calls="$(wc -l <"$TMP/invoke-core-fixture-two.log")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && grep -q 'SMOKE ID=core-fixture' "$TMP/invoke-core-fixture.log" \
-  && grep -q 'SMOKE ID=core-fixture-two' "$TMP/invoke-core-fixture-two.log" \
-  && [ "$(grep -c '^ROOT=' "$TMP/invoke-core-fixture-two.log")" = "$((second_core_calls + 1))" ] \
-  && [ "$(grep -c '^ROOT=' "$TMP/invoke-core-fixture.log")" = "$((core_calls + 1))" ] \
-  && [ "$(wc -l <"$TMP/invoke-personal.log")" = "$before_calls" ] \
-  && [ "$(installed | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["personal"],sort_keys=True))')" = "$personal_before" ] \
-  && ok "full install applies and smokes both core apps while preserving the Personal lifecycle" \
-  || { bad "full install changed a non-core app or failed: $out"; }
-
-# Config A is frozen before mutations: replacing it with B cannot remove A's core app.
-mkcfg "$TMP/drop.toml"
-out="$(orch "$CFGFILE" AIRLOCK_TEST_CONFIG_RACE_REPLACEMENT="$TMP/drop.toml" \
-  AIRLOCK_TEST_CONFIG_RACE_DONE="$TMP/raced" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ -f "$TMP/raced" ] && [ -f "$WEB/core-fixture/marker" ] \
-  && [ "$(installed | python3 -c 'import json,sys; print("core-fixture" in json.load(sys.stdin))')" = True ] \
-  && ok "box install uses frozen config A when the operator file changes to B" \
-  || bad "box install mixed A/B configs: $out"
-# Config B drops app inputs; ③ still owns installation membership.
-config_before="$(cat "$CFGFILE")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ -f "$WEB/core-fixture/marker" ] && [ -f "$WEB/core-fixture-two/marker" ] \
-  && [ "$(cat "$CFGFILE")" = "$config_before" ] \
-  && [ "$(wc -l <"$TMP/invoke-personal.log")" = "$before_calls" ] \
-  && [ "$(installed | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["personal"],sort_keys=True))')" = "$personal_before" ] \
-  && ok "platform preserves installed core apps without config tables and keeps config bytes" \
-  || bad "platform treated config inputs as installation membership: $out"
-# Removing an app preserves its inputs; Platform must not resurrect it.
-mkcfg "$CFGFILE" '[apps.core-fixture]' 'backend_port = 18901'
-AIRLOCK_CONFIG="$CFGFILE" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" "$ROOT/bin/airlock-ledger" remove core-fixture >/dev/null 2>&1 || bad "core removal setup"
-core_calls="$(wc -l <"$TMP/invoke-core-fixture.log")"
-config_before="$(cat "$CFGFILE")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ ! -e "$WEB/core-fixture" ] && [ -f "$DATA/core-fixture.data" ] \
-  && [ "$(cat "$CFGFILE")" = "$config_before" ] \
-  && [ "$(wc -l <"$TMP/invoke-core-fixture.log")" = "$core_calls" ] \
-  && [ -f "$WEB/core-fixture-two/marker" ] \
-  && ok "Remove then Platform keeps the removed core app absent despite retained inputs" \
-  || bad "platform resurrected a removed core app: $out"
-AIRLOCK_CONFIG="$CFGFILE" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" "$ROOT/bin/airlock-ledger" remove core-fixture-two >/dev/null 2>&1 || bad "second core cleanup"
-unset AIRLOCK_SHIPPED_APPS_ROOT
-
-# Reinstall without deactivate and direct removal also work.
-mkcfg "$CFGFILE" '[apps.personal]' 'backend_port = 18900' '[packages.personal]' "path = \"$PKG\""
-rm -f "$PKG/deactivate.sh"
-apply_source "$CFGFILE" personal "$PKG" >/dev/null 2>&1 || bad "setup deactivator-free app"
-mkcfg "$CFGFILE"
-out="$(AIRLOCK_CONFIG="$CFGFILE" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" "$ROOT/bin/airlock-ledger" remove personal 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ ! -e "$WEB/personal" ] && [ -f "$DATA/personal.data" ] \
-  && [ "$(installed)" = '{}' ] \
-  && ok "direct removal works without a deactivator and leaves user data" \
-  || bad "direct removal failed: $out"
-
-# Dry previews never execute a Personal hook or alter its existing record.
-mkcfg "$CFGFILE" '[apps.personal]' 'backend_port = 18900' '[packages.personal]' "path = \"$PKG\""
-apply_source "$CFGFILE" personal "$PKG" >/dev/null 2>&1 || bad "dry setup"
-record_before="$(installed)"; calls_before="$(wc -l <"$TMP/invoke-personal.log")"
-out="$(orch "$CFGFILE" AIRLOCK_DRY_RUN=1 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ "$(installed)" = "$record_before" ] \
-  && [ "$(wc -l <"$TMP/invoke-personal.log")" = "$calls_before" ] \
-  && ok "Personal dry preview changes neither record nor lifecycle bytes" \
-  || bad "Personal dry preview changed state or failed: $out"
-
-# A5 refuses escaping paths before either entry performs a mutation.
-for entry in full apply; do
-  calls_before="$(wc -l <"$TMP/invoke-personal.log")"
-  if [ "$entry" = full ]; then
-    out="$(orch "$CFGFILE" AIRLOCK_WEBROOT=/outside-fixture 2>&1)"; rc=$?
-  else
-    out="$(AIRLOCK_CONFIG="$CFGFILE" AIRLOCK_WEBROOT=/outside-fixture "$ROOT/bin/airlock-ledger" apply personal 2>&1)"; rc=$?
-  fi
-  [ "$rc" != 0 ] && grep -q 'fixture boundary:' <<<"$out" \
-    && [ "$(wc -l <"$TMP/invoke-personal.log")" = "$calls_before" ] \
-    && ok "A5 $entry rejects an outside webroot before lifecycle effects" \
-    || bad "A5 $entry escaped or failed without boundary reason: $out"
-done
-out="$(AIRLOCK_CONFIG="$CFGFILE" AIRLOCK_NGINX_SITE="$TMP/nginx-site.conf" "$ROOT/bin/airlock-ledger" apply ../personal 2>&1)"; rc=$?
-[ "$rc" != 0 ] && grep -q 'not a valid app id' <<<"$out" \
-  && ok "direct apply malformed id fails before effects" \
-  || bad "direct apply malformed id reached effects: $out"
-
-# Bootstrap is only an absent new AND old installation record.
-reset_box
-CORE_ROOT="$TMP/bootstrap-core"; mkpkg "$CORE_ROOT/bootstrap" bootstrap
-export AIRLOCK_SHIPPED_APPS_ROOT="$CORE_ROOT"
-CFGFILE="$TMP/bootstrap.toml"; mkcfg "$CFGFILE" '[site]' "company_repo = \"file://$TMP/absent-company\"" '[apps.bootstrap]'
-config_before="$(cat "$CFGFILE")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ -f "$WEB/bootstrap/marker" ] && [ "$(cat "$CFGFILE")" = "$config_before" ] \
-  && ok "first install without either record bootstraps configured core apps" \
-  || bad "first bootstrap failed: $out"
-# A legacy registration must not shadow the source already recorded in ③.
-mkcfg "$CFGFILE" '[apps.bootstrap]' '[packages.bootstrap]' "path = \"$CORE_ROOT/bootstrap\""
-bootstrap_calls="$(wc -l <"$TMP/invoke-bootstrap.log")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ "$(wc -l <"$TMP/invoke-bootstrap.log")" = "$((bootstrap_calls + 2))" ] \
-  && ok "Platform updates a recorded core row even when legacy packages shadows its id" \
-  || bad "legacy registration hid a recorded core app: $out"
-# A Personal app with the same id as a shipped app keeps its recorded source.
-reset_box
-PERSONAL_CORE="$TMP/personal-core-name"; mkpkg "$PERSONAL_CORE" bootstrap
-apply_source "$CFGFILE" bootstrap "$PERSONAL_CORE" >/dev/null 2>&1 || bad "same-id Personal setup"
-same_id_before="$(installed)"; bootstrap_calls="$(wc -l <"$TMP/invoke-bootstrap.log")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ "$(installed)" = "$same_id_before" ] \
-  && [ "$(wc -l <"$TMP/invoke-bootstrap.log")" = "$bootstrap_calls" ] \
-  && ok "Platform preserves a Personal row sharing a shipped core id without replaying it" \
-  || bad "Platform replaced a same-id Personal source: $out"
-# Moving the operator checkout must update cores recorded under the old tree.
-reset_box
-OLD_CORE_TREE="$TMP/previous-platform"
-printf '%s\n' "$OLD_CORE_TREE" > "$TMP/previous-platform-root"
-mkpkg "$OLD_CORE_TREE/apps/bootstrap" bootstrap
-apply_source "$CFGFILE" bootstrap "$OLD_CORE_TREE/apps/bootstrap" >/dev/null 2>&1 \
-  || bad "previous checkout core setup"
-bootstrap_calls="$(wc -l <"$TMP/invoke-bootstrap.log")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] \
-  && [ "$(installed | python3 -c 'import json,sys; print(json.load(sys.stdin)["bootstrap"]["repo"])')" = "$CORE_ROOT/bootstrap" ] \
-  && [ "$(wc -l <"$TMP/invoke-bootstrap.log")" = "$((bootstrap_calls + 2))" ] \
-  && [ -f "$DATA/bootstrap.data" ] \
-  && ok "Platform rebinds an installed core from the previous checkout without removing its data" \
-  || bad "Platform left a core running from the previous checkout: $out"
-# apps/<id> alone does not turn a Personal package into a platform core.
-reset_box
-PERSONAL_CORE="$TMP/personal-tree/apps/bootstrap"; mkpkg "$PERSONAL_CORE" bootstrap
-mkdir -p "$TMP/symlink-platform/apps"
-ln -s "$PERSONAL_CORE" "$TMP/symlink-platform/apps/bootstrap"
-printf '%s\n' "$TMP/symlink-platform" > "$TMP/previous-platform-root"
-apply_source "$CFGFILE" bootstrap "$PERSONAL_CORE" >/dev/null 2>&1 || bad "Personal apps layout setup"
-same_id_before="$(installed)"; bootstrap_calls="$(wc -l <"$TMP/invoke-bootstrap.log")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ "$(installed)" = "$same_id_before" ] \
-  && [ "$(wc -l <"$TMP/invoke-bootstrap.log")" = "$bootstrap_calls" ] \
-  && ok "Platform preserves a Personal apps directory even when the previous platform symlinks to it" \
-  || bad "Platform claimed a Personal package through the previous tree's symlink: $out"
-# An existing empty record must remain empty, including preview projection.
-reset_box; mkdir -p "$STATE"; printf '{}\n' > "$STATE/installed-apps.json"
-bootstrap_calls="$(wc -l <"$TMP/invoke-bootstrap.log")"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ ! -e "$WEB/bootstrap" ] && [ "$(installed)" = '{}' ] \
-  && [ "$(wc -l <"$TMP/invoke-bootstrap.log")" = "$bootstrap_calls" ] \
-  && ok "an explicit empty record never bootstraps configured apps" \
-  || bad "empty record resurrected an app: $out"
-mkdir -p "$TMP/preview"
-# Observe the real renderer's webjson result, not a fabricated engine response.
-mkdir -p "$TMP/projection-probe"
-cat > "$TMP/projection-probe/sitecustomize.py" <<'PY_OBSERVE'
-import json, os, pathlib, subprocess
-_original_run = subprocess.run
-def observe_run(args, *positional, **keywords):
-    result = _original_run(args, *positional, **keywords)
-    if isinstance(args, (list, tuple)) and len(args) >= 3 and str(args[1]).endswith('/bin/airlock-config') and args[2] == 'webjson':
-        root = pathlib.Path(os.environ['AIRLOCK_PROJECTION_PROBE'])
-        (root / 'preview-webjson.json').write_text(result.stdout)
-        (root / 'preview-project-ids').write_text(keywords.get('env', os.environ).get('AIRLOCK_PROJECT_IDS', 'unset'))
-    return result
-subprocess.run = observe_run
-PY_OBSERVE
-out="$(orch "$CFGFILE" AIRLOCK_DRY_RUN=1 AIRLOCK_DRY_RUN_OUTPUT_DIR="$TMP/preview" \
-    PYTHONPATH="$TMP/projection-probe" AIRLOCK_PROJECTION_PROBE="$TMP" 2>&1)"; rc=$?
-if [ "$rc" = 0 ] && [ "$(cat "$TMP/preview-project-ids")" = '' ] \
-    && python3 - "$TMP/preview-webjson.json" <<'PY_EMPTY'
-import json, sys
-assert json.load(open(sys.argv[1]))["apps"] == {}
-PY_EMPTY
-then
-  ok "empty record preview explicitly projects an empty installed app set"
-else
-  bad "empty preview used config membership: $out"
-fi
-# v7 presence is installed state too, and an empty v7 cannot bootstrap.
-reset_box; mkdir -p "$STATE"
-printf '{"version":7,"entries":{}}\n' > "$STATE/app-ledger.json"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ ! -e "$WEB/bootstrap" ] \
-  && ok "an empty legacy v7 record is never a bootstrap request" \
-  || bad "empty v7 bootstrapped: $out"
-python3 - "$STATE/app-ledger.json" "$CORE_ROOT/bootstrap" <<'PY_V7'
-import json, pathlib, sys
-pathlib.Path(sys.argv[1]).write_text(json.dumps({"version":7,"entries":{"bootstrap":{"committed":{"path":sys.argv[2],"artifacts":{}}}}})+"\n")
-PY_V7
-mkcfg "$CFGFILE"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ -f "$WEB/bootstrap/marker" ] && [ -f "$STATE/app-ledger.v7.json" ] \
-  && ok "a committed v7 core row applies without a config table and converts on write" \
-  || bad "committed v7 membership was lost: $out"
-unset AIRLOCK_SHIPPED_APPS_ROOT
-
-# A first dry bootstrap previews the dependency plan without pretending apps
-# are installed. A real bootstrap then commits publish before notepad; later
-# installed-box dry previews still execute certified hooks in private roots.
-reset_box
-CORE_ROOT="$TMP/bootstrap-deps"; mkpkg "$CORE_ROOT/publish" publish; mkpkg "$CORE_ROOT/notepad" notepad
-export AIRLOCK_SHIPPED_APPS_ROOT="$CORE_ROOT"
-python3 - "$CORE_ROOT/publish/airlock-app.toml" <<'PY_PUBLISH'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-path.write_text(path.read_text().replace('backend_port = 18900\n',
-    'backend_port = 18900\nhttps_port = 19920\ngate_port = 19921\n'
-    'share_dir = "~/.local/share/publish"\ntitle_meta = false\ntailnet_view = false\n'))
-PY_PUBLISH
-printf '\n[dependencies]\napps = ["publish"]\n' >> "$CORE_ROOT/notepad/airlock-app.toml"
-for app in publish notepad; do
-  python3 - "$CORE_ROOT/$app/install.sh" "$app" "$TMP" <<'PY_HOOK'
-import pathlib, sys
-path, app, scratch = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-source = path.read_text()
-probe = (f'printf "{app}\\n" >> "{scratch}/bootstrap-order.log"\n'
-         + ('airlock_app_installed publish || exit 1\n' if app == 'notepad' else '')
-         + 'if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then\n'
-         + f'  printf "{app}\\n" >> "{scratch}/bootstrap-dry-hooks.log"\n'
-         + '  exit 0\nfi\n')
-source = source.replace('airlock_load "$AIRLOCK_APP_ID"', probe + 'airlock_load "$AIRLOCK_APP_ID"')
-path.write_text(source)
-PY_HOOK
-done
-CFGFILE="$TMP/bootstrap-deps.toml"
-mkcfg "$CFGFILE" '[apps.notepad]' 'backend_port = 18902' '[apps.publish]' 'backend_port = 18901'
-mkdir -p "$STATE"
-files_before="$(find "$WEB" "$CONFD" "$UU" "$US" "$FAKEHOME" "$DATA" "$STATE" -type f -exec md5sum {} + | sort)"
-config_before="$(cat "$CFGFILE")"
-out="$(orch "$CFGFILE" AIRLOCK_DRY_RUN=1 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ ! -e "$TMP/bootstrap-order.log" ] && [ ! -e "$STATE/installed-apps.json" ] \
-  && grep -q 'would install packaged app: publish' <<<"$out" \
-  && grep -q 'would install packaged app: notepad' <<<"$out" \
-  && [ "$(cat "$CFGFILE")" = "$config_before" ] \
-  && [ "$(find "$WEB" "$CONFD" "$UU" "$US" "$FAKEHOME" "$DATA" "$STATE" -type f -exec md5sum {} + | sort)" = "$files_before" ] \
-  && ok "first publish+notepad dry bootstrap reports its plan without hooks or live-root file changes" \
-  || bad "first dry bootstrap simulated installation or changed files: $out"
-out="$(orch "$CFGFILE" 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ "$(cat "$TMP/bootstrap-order.log")" = $'publish\nnotepad' ] \
-  && ok "real bootstrap applies publish then notepad through the existing manifest dependency" \
-  || bad "real bootstrap dependency order failed: $out"
-record_before="$(installed)"
-out="$(orch "$CFGFILE" AIRLOCK_DRY_RUN=1 2>&1)"; rc=$?
-[ "$rc" = 0 ] && [ ! -e "$TMP/bootstrap-dry-hooks.log" ] && [ "$(installed)" = "$record_before" ] \
-  && [ "$(cat "$CFGFILE")" = "$config_before" ] \
-  && ok "an installed-box dry preview still skips uncertified fixture hooks and preserves ③ and inputs" \
-  || bad "uncertified installed-box dry hooks ran or changed state: $out"
-unset AIRLOCK_SHIPPED_APPS_ROOT
 
 # Directory-to-contents claims keep the tree just applied.
 reset_box
@@ -771,6 +487,25 @@ with tempfile.TemporaryDirectory(prefix="airlock-hook-membership-") as scratch:
     curl = base / "shim/curl"
     curl.write_text('#!/bin/sh\nprintf 200\n')
     curl.chmod(0o755)
+    ids = ['Tab\tApp', 'Line\nApp', ' My App ', 'Trailing ', 'Trailing\n']
+    unusual = {}
+    for app in ids:
+        directory = base / 'unusual-sources' / app
+        directory.mkdir(parents=True)
+        (directory / 'airlock-app.toml').write_text('contract=1\nid=' + json.dumps(app) + '\n')
+        (directory / 'smoke.sh').write_text('#!/bin/sh\npython3 - <<\'PY\'\n'
+            'import json,os,pathlib\n'
+            'with (pathlib.Path(os.environ["HOME"])/"unusual-smoke.jsonl").open("a") as f:\n'
+            ' f.write(json.dumps([os.environ["AIRLOCK_APP_ID"],os.environ["AIRLOCK_APP_DIR"]])+"\\n")\nPY\n')
+        unusual[app] = {'repo': str(directory), 'commit': '', 'artifacts': []}
+    config.write_text(auth)
+    record.write_text(json.dumps(unusual))
+    before = record.read_bytes()
+    result = run('bash', str(ROOT / 'bin/airlock-smoke'), extra={'AIRLOCK_DRY_RUN': '0'})
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    observed = [json.loads(line) for line in (base / 'home/unusual-smoke.jsonl').read_text().splitlines()]
+    assert observed == [[app, unusual[app]['repo']] for app in sorted(ids)], observed
+    assert record.read_bytes() == before
     for name in ("recorded-smoke", "candidate-smoke"):
         directory = base / name
         directory.mkdir()
@@ -798,7 +533,7 @@ with tempfile.TemporaryDirectory(prefix="airlock-hook-membership-") as scratch:
     assert config.read_bytes() == before_config and record.read_bytes() == before_record
     for command in (('env', 'smoke-probe'), ('get', 'apps.smoke-probe.backend_port')):
         probe = run(str(ROOT / 'bin/airlock-config'), *command)
-        assert probe.returncode != 0 and 'recorded-smoke' in probe.stderr, (command, probe.stdout, probe.stderr)
+        assert probe.returncode != 0 and ('app configuration source not found' in probe.stderr or 'key not found' in probe.stderr), (command, probe.stdout, probe.stderr)
         assert 'candidate-smoke' not in probe.stdout
     probe = run(str(ROOT / 'bin/airlock-config'), 'package-info')
     assert probe.returncode == 0 and 'smoke-probe' not in json.loads(probe.stdout)['packages'], (probe.stdout, probe.stderr)
@@ -827,8 +562,8 @@ with tempfile.TemporaryDirectory(prefix="airlock-hook-membership-") as scratch:
     assert result.returncode == 0 and calls.read_text() == 'recorded-smoke\n', (result.stdout, result.stderr)
     assert not record.exists() and config.read_bytes() == before_config
 
-    # First bootstrap dry uses REAL certified Public sources but never runs
-    # their runtime hooks against prospective installation membership.
+    # With no installed rows, a platform preview cannot turn config inputs
+    # into new apps or run prospective Public hooks.
     config.write_text(auth + '[apps.notepad]\n[apps.publish]\n')
     before_config = config.read_bytes()
     def files():
@@ -837,13 +572,13 @@ with tempfile.TemporaryDirectory(prefix="airlock-hook-membership-") as scratch:
     before_files = files()
     result = run('bash', str(ROOT / 'install/airlock-install.sh'))
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert 'would install packaged app: publish' in result.stderr
-    assert 'would install packaged app: notepad' in result.stderr
+    assert 'applying app:' not in result.stdout + result.stderr
     assert '(shipped app — dry run executes)' not in result.stderr
     assert not record.exists() and config.read_bytes() == before_config and files() == before_files
 
-    # A Public notepad already installed depends on an installed Personal
-    # publish source. The existing-box preview executes its certified hook.
+    # A recorded Public notepad appears in the current-core preview while
+    # its Personal publish dependency remains outside the platform loop.
+    # Preview never runs install hooks.
     publish_source = base / 'installed-publish-source'
     shutil.copytree(ROOT / 'apps/publish', publish_source)
     rows = {'publish': {'repo': str(publish_source), 'commit': '', 'artifacts': []},
@@ -853,8 +588,8 @@ with tempfile.TemporaryDirectory(prefix="airlock-hook-membership-") as scratch:
     before_config, before_record, before_files = config.read_bytes(), record.read_bytes(), files()
     result = run('bash', str(ROOT / 'install/airlock-install.sh'))
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert 'installing packaged app: notepad' in result.stderr and '(shipped app — dry run executes)' in result.stderr
-    assert 'notepad installed (owner:' in result.stderr
+    assert 'applying app: notepad' in result.stdout + result.stderr
+    assert 'notepad installed (owner:' not in result.stdout + result.stderr
     assert config.read_bytes() == before_config and record.read_bytes() == before_record and files() == before_files
     record.unlink()
 

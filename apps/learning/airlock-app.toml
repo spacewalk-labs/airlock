@@ -127,9 +127,8 @@ note = "Smoke check"
 units = ["airlock-learning.service", "airlock-learning-ingest.service"]
 fragments = ["hub-locations.d/learning.conf"]
 files = ["~/.local/share/airlock-learning/"]
-# The ingest skill is symlinked into each agent CLI's skill directory from the share
-# dir above. Those two links live in the user's own directories rather than ours, so
-# deactivate.sh removes them explicitly — and only when they are still OUR links.
+# The worker loads the contract from the share dir above. deactivate.sh also
+# retires former global skill links, only when they still point at this app package.
 
 [audience]
 supported = ["owner"]

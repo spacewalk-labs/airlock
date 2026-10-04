@@ -212,23 +212,13 @@ def require_clean_checkout(action: str = "backup", *, allowed: tuple[pathlib.Pat
 
 
 def snapshot_config(temp: pathlib.Path) -> tuple[bytes, str, str]:
-    target = temp / "config.toml"
-    target.touch(mode=0o600)
-    proc = run([sys.executable, str(CONFIG_BIN), "install-snapshot", str(target)],
-               env=subprocess_env(), timeout=60)
-    if proc.returncode != 0:
-        fail("cannot freeze Airlock config: " + proc.stderr.decode("utf-8", "replace").strip(), 2)
-    try:
-        receipt = json.loads(proc.stdout)
-        origin = receipt["config_path"]
-        digest = receipt["sha256"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        fail(f"airlock-config returned an invalid snapshot receipt: {exc}", 2)
-    data = checked_regular(target, "config snapshot", required=True)
+    origin = selected_config_path()
+    data = checked_regular(origin, "Airlock config", required=True)
     assert data is not None
-    if sha256(data) != digest or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-        fail("airlock-config snapshot receipt does not match its bytes", 2)
-    return data, str(origin), digest
+    target = temp / "config.toml"
+    target.write_bytes(data)
+    target.chmod(0o600)
+    return data, str(origin), sha256(data)
 
 
 def selected_config_path() -> pathlib.Path:
@@ -244,7 +234,6 @@ def snapshot_env(config_origin: str, snapshot: pathlib.Path, digest: str, select
     env.update({
         "AIRLOCK_CONFIG": config_origin,
         "AIRLOCK_CONFIG_SNAPSHOT": str(snapshot),
-        "AIRLOCK_CONFIG_SNAPSHOT_SHA256": digest,
         "AIRLOCK_STATE_DIR": str(selected_state),
     })
     return env
@@ -254,10 +243,10 @@ def config_apps(env: dict[str, str]) -> list[str]:
     validate = run([sys.executable, str(CONFIG_BIN), "validate"], env=env, timeout=120)
     if validate.returncode != 0:
         fail("config snapshot does not validate: " + validate.stderr.decode("utf-8", "replace").strip(), 2)
-    proc = run([sys.executable, str(CONFIG_BIN), "apps"], env=env, timeout=120)
+    proc = run([sys.executable, str(CONFIG_BIN), "json"], env=env, timeout=120)
     if proc.returncode != 0:
         fail("cannot read enabled apps from config snapshot", 2)
-    apps = sorted({line.strip() for line in proc.stdout.decode().splitlines() if line.strip()} - {"hub"})
+    apps = sorted(set(json.loads(proc.stdout)["apps"]) - {"hub"})
     return apps
 
 
@@ -424,7 +413,7 @@ def require_record_safe(name: str, data: bytes | None) -> None:
                 fail("plaintext-retirement.json has an invalid entry shape")
             package, listen, target, state = (entry["package"], entry["listen"],
                                                entry["target"], entry["state"])
-            if not isinstance(package, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", package):
+            if not isinstance(package, str) or not ledger_module()._ID_RE.fullmatch(package):
                 fail("plaintext-retirement.json has an invalid package id")
             if state not in {"intent", "committed"}:
                 fail("plaintext-retirement.json has an invalid entry state")

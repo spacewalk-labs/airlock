@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """airlock-ledger — apply, restore and remove one app from installed state.
 
-Configuration arrives as package-info JSON; this module never parses TOML.
+Configuration is read by airlock-config; this module never parses TOML.
 Usage: airlock-ledger {apply <id> [--source company|<abs-dir>]|remove <id>|project|list|plan}
 """
 from __future__ import annotations
@@ -246,24 +246,26 @@ def _ensure_state_dir() -> Path:
     return directory
 
 
-def read_package_info() -> dict[str, Any]:
-    raw_bytes = b"" if sys.stdin.isatty() else sys.stdin.buffer.read()
-    try:
-        raw = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        fail(f"stdin: package-info is not UTF-8: {exc}")
-    if not raw.strip():
-        raw = os.environ.get("AIRLOCK_PKG_INFO", "")
-    if not raw.strip():
-        result = subprocess.run([*_airlock_config_argv(), "package-info"],
-                                capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            fail("cannot read app configuration: " + _last_line(result.stderr))
-        raw = result.stdout
+def _current_config_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in ("AIRLOCK_PKG_INFO", "AIRLOCK_PKG_INFO_FILE", "AIRLOCK_INSTALL_PKG_INFO_SHA256",
+                "AIRLOCK_CONFIG_SNAPSHOT"):
+        env.pop(key, None)
+    return env
+
+
+def read_package_info(selected: list[str] | None = None) -> dict[str, Any]:
+    env = _current_config_env()
+    result = subprocess.run([*_airlock_config_argv(), "package-info", *(selected or [])], env=env,
+                            stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True, check=False)
+    if result.returncode != 0:
+        fail("cannot read app configuration: " + _last_line(result.stderr))
+    raw = result.stdout
     try:
         info = json.loads(raw)
     except json.JSONDecodeError as exc:
-        fail(f"stdin: invalid package-info JSON: {exc}")
+        fail(f"invalid package-info JSON: {exc}")
     return info
 
 
@@ -1200,11 +1202,6 @@ def installed_units(store: dict[str, dict[str, Any]] | None = None) -> list[tupl
                    if _is_unit_path(item)})
 
 
-def container_install_admission_for_load(app_id: str, entry: dict[str, Any]) -> None:
-    """The installed-state engine has no nonce-based installation intent."""
-    return None
-
-
 def teardown_installed(core_root: str | Path | None = None) -> int:
     store = load_installed()
     fixture_boundary(engine_boundary_paths())
@@ -1440,6 +1437,7 @@ def read_dir_package(app_id: str, directory: str) -> dict[str, Any]:
     try:
         result = subprocess.run(
             [*_airlock_config_argv(), "dir-package-info", app_id, directory],
+            env=_current_config_env(), stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False)
     except OSError as exc:
         fail(f"cannot read the manifest of {app_id}: {exc}")
@@ -1483,18 +1481,16 @@ def app_dirs(info: dict[str, Any]) -> dict[str, str]:
             continue
         candidate = (str(engine_apps_root() / app_id) if _is_git_url(repo) else repo)
         dirs[app_id] = candidate
-    env_id = (os.environ.get("AIRLOCK_APP_ID") or "").strip()
-    env_dir = (os.environ.get("AIRLOCK_APP_DIR") or "").strip()
+    env_id = os.environ.get("AIRLOCK_APP_ID") or ""
+    env_dir = os.environ.get("AIRLOCK_APP_DIR") or ""
     if env_id and env_dir and _ID_RE.match(env_id):
         dirs[env_id] = _expand_path(env_dir)
     return dirs
 
 
 def resolve_source(app_id: str, info: dict[str, Any], explicit: str) -> dict[str, Any]:
-    """Where this app's bytes come from, in one order: what the caller asked
-    for, the row ③ already has, Company main, this checkout's own apps/. No
-    search beyond that, and no answer that depends on an operator's clone."""
-    explicit = (explicit or "").strip()
+    """Use the explicit source or this app's installed source."""
+    explicit = explicit or ""
     if explicit and explicit != "company":
         if not os.path.isabs(explicit):
             fail(f"--source {explicit}: expected 'company' or an absolute directory")
@@ -1528,18 +1524,7 @@ def resolve_source(app_id: str, info: dict[str, Any], explicit: str) -> dict[str
             fail(f"recorded source for {app_id} is missing: {directory}")
         return {"kind": "local", "repo": directory,
                 "commit": _git_head(directory), "dir": directory}
-    if company_repo(info):
-        mirror = company_mirror_path()
-        sha = pin_main(info)
-        if _mirror_has_app(mirror, sha, app_id):
-            return {"kind": "company", "repo": company_repo(info), "commit": sha,
-                    "sha": sha, "mirror": str(mirror),
-                    "dir": str(engine_apps_root() / app_id)}
-    core = os.path.join(_repo_root(), "apps", app_id)
-    if os.path.isdir(core):
-        return {"kind": "core", "repo": core, "commit": _git_head(core), "dir": core}
-    fail(f"no source for {app_id}: not in Company main, no installed row naming a "
-         f"directory, and no apps/{app_id} in this checkout")
+    fail(f"no installed source for {app_id}: new apps require --source")
 
 
 def _source_from_row(app_id: str, row: dict[str, Any]) -> dict[str, Any]:
@@ -1710,14 +1695,14 @@ def _stage_icon(app_id: str, env: dict[str, str] | None = None) -> str:
     webroot-relative path it wrote; empty means the manifest declares none."""
     try:
         result = subprocess.run([*_airlock_config_argv(), "icon-stage", app_id],
-                                capture_output=True, text=True, env=env, check=False)
+                                capture_output=True, env=env, check=False)
     except OSError as exc:
         raise ApplyFailed(f"icon staging for {app_id} could not start: {exc}")
     if result.returncode != 0:
-        detail = (result.stderr or "").strip().splitlines()
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
         raise ApplyFailed(f"icon staging for {app_id} failed: "
                           + (detail[-1] if detail else "airlock-config icon-stage failed"))
-    return result.stdout.strip()
+    return result.stdout.decode("utf-8").removesuffix("\n")
 
 
 def _apply_ingress(app_id: str, package: dict[str, Any],
@@ -1743,12 +1728,12 @@ def _apply_ingress(app_id: str, package: dict[str, Any],
 
 
 def project(app_ids: list[str], app_env: dict[str, str] | None = None,
-            active_ports: set[int] | None = None) -> None:
+            protected_ingress: set[str] | None = None) -> None:
     """The two WHOLE-store projections: the nginx site and the Hub manifest.
     Everything else an apply touches belongs to the one app it is applying.
     Every failure here is an apply failure (A4), not a warning."""
-    env = os.environ.copy() if app_env is None else app_env.copy()
-    env["AIRLOCK_PROJECT_IDS"] = " ".join(app_ids)
+    env = _current_config_env() if app_env is None else app_env.copy()
+    env["AIRLOCK_PROJECT_IDS"] = json.dumps(app_ids)
     try:
         render = subprocess.run(["bash", os.path.join(_repo_root(), "install", "render-nginx.sh")],
                                 capture_output=True, text=True, env=env, check=False)
@@ -1757,6 +1742,7 @@ def project(app_ids: list[str], app_env: dict[str, str] | None = None,
     if render.returncode != 0:
         raise ApplyFailed("install/render-nginx.sh failed: "
                           + _last_line(render.stderr))
+    sys.stderr.write(render.stderr)
     try:
         webjson = subprocess.run([*_airlock_config_argv(), "webjson"],
                                  capture_output=True, text=True, env=env, check=False)
@@ -1765,6 +1751,7 @@ def project(app_ids: list[str], app_env: dict[str, str] | None = None,
     if webjson.returncode != 0:
         raise ApplyFailed("airlock-config webjson failed: "
                           + _last_line(webjson.stderr))
+    sys.stderr.write(webjson.stderr)
     if os.environ.get("AIRLOCK_DRY_RUN") == "1":
         log(f"[dry] would publish {nginx_site_path()} and {hub_manifest_path()} and reload nginx")
         return
@@ -1780,31 +1767,19 @@ def project(app_ids: list[str], app_env: dict[str, str] | None = None,
                 raise ApplyFailed(f"could not publish {target}")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+    if _run_command(["sudo", "nginx", "-t"], "sudo nginx -t") != 0:
+        raise ApplyFailed("nginx configuration test failed")
     if _run_command(["sudo", "systemctl", "reload", "nginx"],
                     "sudo systemctl reload nginx") != 0:
         raise ApplyFailed("nginx reload failed")
-    hub_ports = _project_hub_ingress(env)
-    wanted = recorded_active_ports(mode="http") if active_ports is None else active_ports
-    env["AIRLOCK_ROOT"] = _repo_root()
-    env["AIRLOCK_CONFIG_BIN"] = _airlock_config_argv()[-1]
-    ports = " ".join(str(port) for port in sorted(wanted | hub_ports))
-    # The validated transport leaf retains its conservative legacy ownership
-    # rule. The engine owns the call; there is no second Python sweep or journal.
-    try:
-        result = subprocess.run(["bash", "-c",
-                                 '. "$AIRLOCK_ROOT/install/lib.sh"\nts_reconcile_plaintext_ports "$1"',
-                                 "airlock-project", ports], env=env,
-                                capture_output=True, text=True, check=False)
-    except OSError as exc:
-        raise ApplyFailed(f"cannot retire plaintext ingress: {exc}")
-    if result.returncode != 0:
-        raise ApplyFailed("plaintext retirement failed: " + _last_line(result.stderr))
+    _project_hub_ingress(env, protected_ingress)
 
 
-def _project_hub_ingress(env: dict[str, str]) -> set[int]:
+def _project_hub_ingress(env: dict[str, str],
+                         protected_ingress: set[str] | None = None) -> set[int]:
     """The reserved Hub has no app hook; publish its entrances after nginx reload."""
     try:
-        result = subprocess.run([*_airlock_config_argv(), "json"],
+        result = subprocess.run([*_airlock_config_argv(), "json", "hub"],
                                 capture_output=True, text=True, env=env, check=False)
     except OSError as exc:
         raise ApplyFailed(f"cannot read Hub ingress configuration: {exc}")
@@ -1824,8 +1799,33 @@ def _project_hub_ingress(env: dict[str, str]) -> set[int]:
         mappings.append({"mode": "http", "listen": hub["http_port"],
                          "target": hub["redirect_port"]})
     tokens = _apply_ingress("hub", {"serve_mappings": dict(enumerate(mappings))})
-    return {int(value[1]) for token in tokens
-            if (value := _serve_token(token)) is not None and value[0] == "http"}
+    active = {int(value[1]) for token in tokens
+              if (value := _serve_token(token)) is not None and value[0] == "http"}
+    # Hub is platform-owned rather than a ledger app. Preserve its existing
+    # default-port retirement without sweeping any app or operator port.
+    from importlib.machinery import SourceFileLoader
+    prior = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        config = SourceFileLoader("hub_ingress_config", _airlock_config_argv()[-1]).load_module()
+    finally:
+        sys.dont_write_bytecode = prior
+    default = config.APP_DEFAULTS["hub"].get("http_port")
+    if (default and default not in active
+            and f"http:{default}" not in (protected_ingress or set())
+            and default not in recorded_active_ports(mode="http")):
+        status = subprocess.run(["tailscale", "serve", "status", "--json"],
+                                capture_output=True, text=True, check=False)
+        if status.returncode == 0:
+            try:
+                listener = (json.loads(status.stdout).get("TCP") or {}).get(str(default))
+            except (ValueError, AttributeError):
+                listener = None
+            if listener is not None and not listener.get("HTTPS"):
+                if _run_command(["sudo", "tailscale", "serve", f"--http={default}", "off"],
+                                "retire the prior Hub HTTP default") != 0:
+                    raise ApplyFailed("prior Hub HTTP ingress retirement failed")
+    return active
 
 
 def _other_ingress(store: dict[str, dict[str, Any]], removed_ids: set[str]) -> set[str]:
@@ -1854,14 +1854,23 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
         raise
     hook = os.path.join(directory, "install.sh")
     before = _declared_paths(package)
-    env = os.environ.copy()
+    env = _current_config_env()
     env["AIRLOCK_CONFD"] = _conf_dir()
     env["AIRLOCK_ROOT"] = _repo_root()
     env["AIRLOCK_APP_DIR"] = directory
     env["AIRLOCK_APP_ID"] = app_id
     icon_dest = ""
     ingress: list[str] = []
+    projection = tempfile.TemporaryDirectory(prefix=".package-info-", dir=_ensure_state_dir())
     try:
+        info = subprocess.run([*_airlock_config_argv(), "package-info", app_id], env=env,
+                              stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, check=False)
+        if info.returncode != 0:
+            raise ApplyFailed("cannot read app configuration: " + _last_line(info.stderr))
+        info_path = Path(projection.name) / "package-info.json"
+        info_path.write_text(info.stdout, encoding="utf-8")
+        env["AIRLOCK_PKG_INFO_FILE"] = str(info_path)
         try:
             result = subprocess.run(["bash", hook], cwd=directory, env=env,
                                     stdin=subprocess.DEVNULL, check=False)
@@ -1871,10 +1880,7 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
             raise ApplyFailed(f"install hook for {app_id} exited {result.returncode}")
         icon_dest = _stage_icon(app_id, env)
         _apply_ingress(app_id, package, ingress)
-        active = recorded_active_ports(store, skip_id=app_id, mode="http")
-        active.update(int(value[1]) for token in ingress
-                      if (value := _serve_token(token)) is not None and value[0] == "http")
-        project(sorted(set(store) | {app_id}), env, active)
+        project(sorted(set(store) | {app_id}), env, set(ingress))
     except ApplyFailed as exc:
         # A4. One more apply against the (repo, commit) this app had when we
         # started — never recursively: a restore that fails too is reported,
@@ -1897,6 +1903,12 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
                 log(f"residue {app_id}: " + "; ".join(residue))
             else:
                 log(f"rolled back the failed first install of {app_id}")
+            return 1
+        if not _is_git_url(start["repo"]):
+            log(f"residue {app_id}: local source cannot reproduce recorded commit "
+                f"{start.get('commit', '')}; failed apply was not retried")
+            if residue:
+                log(f"residue {app_id}: " + "; ".join(residue))
             return 1
         try:
             restore_rc = _apply_run(
@@ -1921,6 +1933,8 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
             log(f"residue {app_id}: " + "; ".join(residue))
         log(f"restored {app_id} {start.get('commit', '')}")
         return 1
+    finally:
+        projection.cleanup()
     # EVERY declared path that exists now, not just the ones this run created:
     # ③ has to name every path removal may later take, and a path the operator
     # happened to have before the apply is still this app's declared artifact.
@@ -1981,7 +1995,7 @@ def command_remove(app_id: str) -> int:
         return 1
     remaining = {key: value for key, value in store.items() if key != app_id}
     try:
-        project(sorted(remaining), active_ports=recorded_active_ports(remaining, mode="http"))
+        project(sorted(remaining))
     except ApplyFailed as exc:
         residue.append(str(exc))
     if residue:
@@ -2004,40 +2018,57 @@ def _company_action(app_id: str, row: dict[str, Any], sha: str) -> str:
     return "reinstall" if diff.returncode == 0 else "upgrade-diff"
 
 
-def command_plan_installed(info: dict[str, Any]) -> int:
-    """`action<TAB>id`, the shape devmon_updates.py already reads. The rule is
+def command_plan_installed(info: dict[str, Any], json_output: bool = False) -> int:
+    """Human `action<TAB>id`, or JSON pairs for machine consumers. The rule is
     the commit, not a tree digest: has apps/<id> changed between what we
     recorded and that row's source main right now."""
     store = load_installed()
     ids = sorted(set(store) | set(app_dirs(info)) | set(info.get("packages") or {}))
+    plan = []
     for app_id in ids:
         row = store.get(app_id)
         if row is None:
-            print(f"fresh\t{app_id}")
+            action = "fresh"
         elif _is_git_url(_recorded_repo(row)):
             sha = pin_main(dict(info, company_repo=row["repo"]))
-            print(f"{_company_action(app_id, row, sha)}\t{app_id}")
+            action = _company_action(app_id, row, sha)
         else:
-            print(f"reinstall\t{app_id}")
+            action = "reinstall"
+        plan.append([action, app_id])
+    if json_output:
+        print(json.dumps(plan))
+    else:
+        for action, app_id in plan:
+            print(f"{action}\t{app_id}")
     return 0
 
 
-def command_list() -> int:
-    for app_id, row in sorted(load_installed().items()):
+def command_list(json_output: bool = False) -> int:
+    store = load_installed()
+    if json_output:
+        print(json.dumps(store, sort_keys=True))
+        return 0
+    for app_id, row in sorted(store.items()):
         commit = row.get("commit", "") if isinstance(row, dict) else ""
         print(f"{app_id}\trepo={_recorded_repo(row)}"
               f"\tcommit={commit or '-'}\tartifacts={len(_recorded_artifacts(row))}")
     return 0
 
 
-def parse_cli(argv: list[str]) -> tuple[str, list[str], str]:
+def parse_cli(argv: list[str]) -> tuple[str, list[str], str, bool]:
     if not argv or argv[0] not in {"apply", "remove", "project", "list", "plan"}:
         fail("usage: airlock-ledger {apply|remove|project|list|plan} ...")
     command, positional, source = argv[0], [], ""
+    json_output = False
     index = 1
     while index < len(argv):
         argument = argv[index]
-        if argument == "--source" or argument.startswith("--source="):
+        if argument == "--":
+            positional.extend(argv[index + 1:])
+            break
+        elif argument == "--json" and command in {"list", "plan"}:
+            json_output = True
+        elif argument == "--source" or argument.startswith("--source="):
             if command != "apply" or source:
                 fail("--source is accepted only once by apply")
             if argument == "--source":
@@ -2059,25 +2090,25 @@ def parse_cli(argv: list[str]) -> tuple[str, list[str], str]:
         fail(f"usage: airlock-ledger {command}" + (" <id>" if expected else ""))
     for app_id in positional:
         _require_app_id(app_id)
-    return command, positional, source
+    return command, positional, source, json_output
 
 
 def main(argv: list[str] | None = None) -> int:
-    command, ids, source = parse_cli(list(sys.argv[1:] if argv is None else argv))
+    command, ids, source, json_output = parse_cli(list(sys.argv[1:] if argv is None else argv))
     if command == "remove":
         return command_remove(ids[0])
     if command == "list":
-        return command_list()
+        return command_list(json_output)
     if command == "project":
         load_installed()
         if os.environ.get("AIRLOCK_DRY_RUN") != "1":
             fixture_boundary(engine_boundary_paths())
         project(ids or sorted(load_installed()))
         return 0
-    info = read_package_info()
+    info = read_package_info(ids if command == "apply" else None)
     if command == "apply":
         return command_apply(ids[0], info, source)
-    return command_plan_installed(info)
+    return command_plan_installed(info, json_output)
 
 
 if __name__ == "__main__":

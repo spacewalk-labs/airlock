@@ -21,3 +21,8 @@ apps/code-server/smoke.sh:generic-api-key:45
 # exchange and never stored. Both scripts refresh a token the user already holds.
 apps/devterm/bin/claude-switch:generic-api-key:45
 apps/devterm/bin/claude-status:generic-api-key:41
+
+# Current locations of the same RFC sample nonce and public OAuth client ID.
+apps/code-server/smoke.sh:generic-api-key:49
+bin/airlock-accounts-status:generic-api-key:45
+bin/airlock-accounts:generic-api-key:75

@@ -11,7 +11,7 @@
   · `probe`        — 이 박스에 그 CLI 가 있나, 그리고 로그인 흔적이 있나
   · `build_argv`   — 프롬프트 하나를 헤드리스로 돌리는 명령줄
   · `build_env`    — 자식에게 줄 환경 (종량 과금 변수를 걷어낸)
-  · `skill_target` — 적재 스킬을 심어야 그 CLI 가 찾는 자리
+  · `skill_target` — 업그레이드 시 회수할 옛 전역 스킬 링크의 자리
 
 🔴 **스트림 파싱은 판정이 아니라 진행 표시다.** 완료의 근거는 로그의 DONE 표시 하나이고,
 그것은 어느 CLI 든 자기 표준출력에 그대로 흘린다. claude 의 `stream-json` 은 그 줄을 JSON
@@ -79,7 +79,7 @@ class Provider:
     id = ""
     label = ""
     command = ""
-    # 스킬을 심는 자리 (홈 기준 상대경로).
+    # 회수할 옛 전역 스킬 링크의 자리 (홈 기준 상대경로).
     skill_root = ""
 
     def probe(self, env=None):
@@ -331,12 +331,7 @@ def streams_json(provider):
 
 
 def skill_roots(home=None):
-    """스킬을 심어야 할 디렉터리들. 설치 스크립트가 이 목록을 읽는다.
-
-    🔴 설치가 `~/.claude/skills` 를 직접 적으면 자리를 아는 곳이 둘이 된다. 새 CLI 를
-    붙일 때 어댑터만 고치고 설치를 잊으면, 그 CLI 는 스킬을 못 찾는데 아무 데서도
-    실패하지 않는다 — 조용히 안 되는 종류다.
-    """
+    """설치·해제에서 회수할 옛 링크의 자리. 새 전역 스킬을 등록하지 않는다."""
     return [os.path.dirname(provider.skill_target(home)) for provider in PROVIDERS]
 
 

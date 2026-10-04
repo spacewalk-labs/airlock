@@ -738,6 +738,215 @@ else
   bad "config membership consumer regression"
 fi
 
+if python3 -B - "$HERE/.." <<'PY_GATE_CUT'
+#!/usr/bin/env python3
+"""Normal inputs that unrelated-source and preview gates used to reject."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import sys
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+from urllib.request import urlopen
+
+ROOT = Path(sys.argv[1])
+with tempfile.TemporaryDirectory() as raw:
+    base = Path(raw)
+    (base / 'home').mkdir()
+    (base / 'state').mkdir()
+    selected = base / 'selected'
+    selected.mkdir()
+    package_id = 'Selected.App-' + 'x' * 40
+    (selected / 'airlock-app.toml').write_text(f'contract=1\nid="{package_id}"\n[artifacts]\nrooted=["payload"]\n')
+    broken = base / 'broken'
+    broken.mkdir()
+    (broken / 'airlock-app.toml').write_text('broken TOML =')
+    config = base / 'airlock.toml'
+    config.write_text('[auth]\nowner="fixture@test"\n[apps.hub]\n[apps.missing]\nvalue="operator input"\n')
+    (base / 'state/installed-apps.json').write_text(json.dumps({
+        'broken': {'repo': str(broken), 'commit': '', 'artifacts': []},
+        'missing': {'repo': str(base / 'missing'), 'commit': '', 'artifacts': []},
+    }))
+    env = {**os.environ, 'HOME': str(base / 'home'), 'AIRLOCK_CONFIG': str(config),
+           'AIRLOCK_STATE_DIR': str(base / 'state'), 'AIRLOCK_SHIPPED_APPS_ROOT': str(base / 'shipped')}
+    def run(*args):
+        result = subprocess.run([str(ROOT / 'bin/airlock-config'), *args], env=env,
+                                text=True, capture_output=True, check=True)
+        return result.stdout
+    preview = json.loads(run('package-preview', str(selected)))
+    assert preview['id'] == package_id and preview['installable'] is True, preview
+    assert preview['package']['artifacts']['rooted'] == ['payload'], preview
+    print('PASS C08: selected Personal preview ignores unrelated broken manifest and capability wording')
+    with config.open('a') as handle:
+        handle.write('[apps.' + json.dumps(package_id) + ']\nvalue="selected input"\n')
+    selected_env = run('env', package_id)
+    bash_env = subprocess.run(['bash', '-c', 'eval "$1"; printf %s "$AIRLOCK_SELECTED_APP_' + 'X' * 40 + '_VALUE"', 'bash', selected_env], text=True, capture_output=True, check=True)
+    assert bash_env.stdout == 'selected input', bash_env
+    print('PASS K01: upper-case long filename id with punctuation reaches the actual shell env consumer')
+    assert run('get', 'apps.missing.value').strip() == 'operator input'
+    assert 'AIRLOCK_MISSING_VALUE=' in run('env', 'missing')
+    print('PASS C14: get/env retain explicit values when recorded source is absent')
+    projection = json.loads(run('package-info', 'hub'))
+    assert projection['order'] == ['hub'] and projection['packages'] == {}, projection
+    # The real writer reads hub/core inputs, not every configured shipped app.
+    fragments = base / 'confd/hub-locations.d'
+    fragments.mkdir(parents=True)
+    (fragments / (package_id + '.conf')).write_text('# fixture fragment\n')
+    env['AIRLOCK_CONFD'] = str(base / 'confd')
+    env['AIRLOCK_PROJECT_IDS'] = json.dumps(['hub', 'broken', 'missing', package_id])
+    rendered = subprocess.run(['bash', str(ROOT / 'install/render-nginx.sh')], env=env, text=True, capture_output=True)
+    assert rendered.returncode == 0, (rendered.stdout, rendered.stderr)
+    assert 'server {' in rendered.stdout and (package_id + '.conf') in rendered.stdout, rendered
+    observed = subprocess.run([str(ROOT / 'bin/airlock-config'), 'webjson'], env=env, text=True, capture_output=True)
+    assert observed.returncode == 0 and set(json.loads(observed.stdout)['apps']) == {'hub', 'missing', package_id}, observed
+    assert 'invalid TOML' in observed.stderr, observed.stderr
+    hub = json.loads(run('json', 'hub'))
+    assert set(hub['apps']) == {'hub'} and hub['apps']['hub']['nginx_port'] == 19902, hub
+    assert run('plaintext-known').strip() == '19901'
+    assert run('get', 'apps.' + package_id + '.value').strip() == 'selected input'
+    for name in ('My App', 'Line\nApp', 'Star*App', '-sample'):
+        with config.open('a') as handle:
+            handle.write('[apps.' + json.dumps(name) + ']\nvalue="operator"\n')
+        (fragments / (name + '.conf')).write_text('# exact fragment\n')
+        env['AIRLOCK_PROJECT_IDS'] = json.dumps(['hub', name])
+        assert run('get', 'apps.' + name + '.value').strip() == 'operator'
+        assert set(json.loads(run('webjson'))['apps']) == {'hub', name}
+        rendered = subprocess.run(['bash', str(ROOT / 'install/render-nginx.sh')], env=env, text=True, capture_output=True)
+        assert rendered.returncode == 0, (name, rendered.stdout, rendered.stderr)
+    env['AIRLOCK_APP_ID'], env['AIRLOCK_APP_DIR'] = package_id, str(selected)
+    run('icon-stage', package_id)
+    env.pop('AIRLOCK_APP_ID'); env.pop('AIRLOCK_APP_DIR')
+    env.pop('AIRLOCK_PROJECT_IDS')
+    print('PASS C09: selected core inputs and runtime projections ignore unrelated malformed app manifest')
+    saved_env = env.copy()
+    default_source = base / 'trailing-shipped'
+    default_config = base / 'defaults.toml'
+    default_config.write_text('[auth]\nowner="fixture@test"\n[apps.hub]\n')
+    env.update(AIRLOCK_CONFIG=str(default_config), AIRLOCK_STATE_DIR=str(base / 'default-state'),
+               AIRLOCK_SHIPPED_APPS_ROOT=str(default_source))
+    env.pop('AIRLOCK_PROJECT_IDS', None)
+    try:
+        for name in ('Trailing ', 'Trailing\n', 'My App', 'Selected.App', 'Comma,App'):
+            directory = default_source / name
+            directory.mkdir(parents=True)
+            (directory / 'airlock-app.toml').write_text(
+                'contract=1\nid=' + json.dumps(name) + '\n[config.defaults]\nvalue="default"\n')
+            with default_config.open('a') as handle:
+                handle.write('[apps.' + json.dumps(name) + ']\n')
+            assert json.loads(run('package-preview', str(directory)))['id'] == name
+            assert run('get', 'apps.' + name + '.value').strip() == 'default'
+            assert 'VALUE=default' in run('env', name)
+            all_apps = json.loads(run('get', 'apps'))
+            assert all_apps[name]['value'] == 'default' and all_apps[name]['audience'] == 'owner', all_apps
+            generated = base / 'init.toml'
+            generated.write_text(run('init', '--owner', 'fixture@test', '--apps', name))
+            env['AIRLOCK_CONFIG'] = str(generated)
+            run('validate')
+            assert set(json.loads(run('json'))['apps']) == {'hub', name}
+            env['AIRLOCK_CONFIG'] = str(default_config)
+        generated.write_text(run('init', '--owner', 'fixture@test', '--apps',
+                                 'My App, Selected.App', '--apps', 'Comma,App'))
+        env['AIRLOCK_CONFIG'] = str(generated)
+        run('validate')
+        assert set(json.loads(run('json'))['apps']) == {'hub', 'My App', 'Selected.App', 'Comma,App'}
+        env['AIRLOCK_CONFIG'] = str(default_config)
+        assert run('get', 'auth.owner').strip() == 'fixture@test'
+    finally:
+        env.clear(); env.update(saved_env)
+    print('PASS actual trailing-space/LF paths and full apps defaults remain intact')
+    # Public/Personal launcher and store URLs must fetch the unchanged staged
+    # filename, including URL delimiters in the app's actual directory name.
+    icon_config = base / 'icons.toml'
+    public_ids = ('Hash#App', 'Query?App')
+    personal_ids = ('Personal#App', 'Personal?App')
+    icon_config.write_text('[auth]\nowner="fixture@test"\n' +
+                          ''.join('[apps.' + json.dumps(name) + ']\n'
+                                  for name in (*public_ids, *personal_ids)))
+    icon_state = base / 'icon-state'
+    icon_state.mkdir()
+    installed = {}
+    for name in (*public_ids, *personal_ids):
+        directory = base / ('icon-shipped' if name in public_ids else 'icon-personal') / name
+        directory.mkdir(parents=True)
+        (directory / 'airlock-app.toml').write_text(
+            'contract=1\nid=' + json.dumps(name) + '\n[tile]\nlabel="Fixture"\nicon="icon.svg"\n')
+        (directory / 'icon.svg').write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+        if name in personal_ids:
+            installed[name] = {'repo': str(directory), 'commit': '', 'artifacts': []}
+    (icon_state / 'installed-apps.json').write_text(json.dumps(installed))
+    webroot = base / 'icon-webroot'
+    webroot.mkdir()
+    icon_env = {**env, 'AIRLOCK_CONFIG': str(icon_config), 'AIRLOCK_STATE_DIR': str(icon_state),
+                'AIRLOCK_SHIPPED_APPS_ROOT': str(base / 'icon-shipped'), 'AIRLOCK_WEBROOT': str(webroot)}
+    def icon_run(*args):
+        return subprocess.run([str(ROOT / 'bin/airlock-config'), *args], env=icon_env,
+                              text=True, capture_output=True, check=True).stdout
+    for name in (*public_ids, *personal_ids):
+        icon_run('icon-stage', name)
+        assert (webroot / 'assets/apps' / name / 'icon.svg').is_file()
+    launcher = json.loads(icon_run('webjson'))['apps']
+    sources = json.loads(icon_run('sources'))['apps']
+    class QuietHTTP(SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+    with ThreadingHTTPServer(('127.0.0.1', 0), partial(QuietHTTP, directory=str(webroot))) as server:
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            for origin, names in (('public', public_ids), ('personal', personal_ids)):
+                candidates = {row['id']: row for row in sources[origin]}
+                for name in names:
+                    url = launcher[name]['tile']['icon']
+                    assert ('%23' if '#' in name else '%3F') in url, (name, url)
+                    assert candidates[name]['icon'] == url, (name, candidates[name], url)
+                    with urlopen(f'http://127.0.0.1:{server.server_port}' + url) as response:
+                        assert response.status == 200 and response.read().startswith(b'<svg')
+        finally:
+            server.shutdown()
+            worker.join()
+    print('PASS icon URLs: real HTTP 200 for percent-encoded Public/Personal launcher and store icons')
+
+    # Git's default quotePath output must not become a candidate's identity.
+    company = base / 'company'
+    company.mkdir()
+    company_ids = ('Plain', 'Quote"App', '한국앱', 'Tab\tApp', 'Line\nApp', *public_ids)
+    for name in company_ids:
+        directory = company / 'apps' / name
+        directory.mkdir(parents=True)
+        (directory / 'airlock-app.toml').write_text(
+            'contract=1\nid=' + json.dumps(name, ensure_ascii=False) +
+            '\n[tile]\nlabel="Fixture"\nicon="icon.svg"\n')
+    def git(*args):
+        return subprocess.run(['git', '-C', str(company), *args], env=icon_env,
+                              text=True, capture_output=True, check=True).stdout
+    git('init', '-q')
+    git('config', 'core.quotePath', 'true')
+    git('add', 'apps')
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@test', 'commit', '-qm', 'Company fixtures')
+    sha = git('rev-parse', 'HEAD').strip()
+    candidate_code = '''
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+import json, sys
+config = SourceFileLoader('_icon_fixture_config', sys.argv[1]).load_module()
+print(json.dumps(config._company_app_candidates(Path(sys.argv[2]), sys.argv[3])))
+'''
+    candidate_rows = subprocess.run(['python3', '-B', '-c', candidate_code,
+                                     str(ROOT / 'bin/airlock-config'), str(company), sha],
+                                    env=icon_env, text=True, capture_output=True, check=True)
+    candidates = {row['id']: row for row in json.loads(candidate_rows.stdout)}
+    assert set(candidates) == set(company_ids), (candidates, candidate_rows.stderr)
+    for name in public_ids:
+        assert candidates[name]['icon'] == launcher[name]['tile']['icon'], candidates[name]
+    print('PASS Company git: quoted/Unicode/tab/newline IDs and encoded icon URLs retain exact identities')
+
+PY_GATE_CUT
+then ok "selected configuration accepts unrelated failures and absent source input";
+else bad "selected configuration gate-cut counterexamples"; fi
+
 echo "---"
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

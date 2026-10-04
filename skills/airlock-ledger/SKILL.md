@@ -33,10 +33,11 @@ For an explicit Company move, use `--source company`; its git URL comes from
 
 Apply runs the install hook, stages that app's icon and ingress, refreshes the
 nginx site and Hub manifest, then records its source, commit and artifacts. A
-failed update replays the starting source once. `restored <id> <commit>` means
+failed Company update replays its recorded starting commit once. Local and core
+source failures report residue without replaying the same mutable checkout. `restored <id> <commit>` means
 that replay succeeded; `residue <id>: ...` names what could not finish. Both
 return nonzero. Fix the reported cause and repeat the same apply. Core apps use
-the checkout in place; core checkout restoration remains `airlock-update --rollback`.
+the checkout in place; platform updates run `airlock-update`, and failed runs can be retried after fixing the reported cause.
 
 Remove an app's recorded artifacts while preserving unrecorded user data:
 

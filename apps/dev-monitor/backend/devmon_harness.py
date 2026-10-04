@@ -25,10 +25,10 @@ are imported rather than copied — one record format, one liveness rule.
 
 Why it does NOT reuse the update run record
 -------------------------------------------
-A Codex upgrade and `bin/airlock-update` share no failure: the updater holds a git
-mutex, restarts this backend under itself and arms a rollback directory; npm does
-none of that and must not be blocked by, or reported over, an update in flight.  Two
-independent runs, two records, two lines on the panel.
+A Codex upgrade and `bin/airlock-update` update different installed software.
+The platform installer may restart this backend; npm updates the Codex binary.
+Each action reports its own progress and result. Two independent runs, two records,
+two lines on the panel.
 """
 from __future__ import annotations
 

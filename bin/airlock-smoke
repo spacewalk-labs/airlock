@@ -35,19 +35,22 @@ airlock_config validate >/dev/null || exit 2
 # only from ③, even if a recorded directory has disappeared. Smoke mutates nothing, so
 # it takes no ledger lock. AIRLOCK_CONFIG is pinned so an app script's own
 # airlock_config calls resolve the same config from the package cwd.
-AIRLOCK_PKG_INFO="$(airlock_config package-info)" || exit 2
-export AIRLOCK_PKG_INFO
-AIRLOCK_CONFIG="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print(json.load(sys.stdin)["config_path"])')" || exit 2
+AIRLOCK_PKG_INFO_FILE="$(mktemp)" || exit 2
+trap 'rm -f -- "$AIRLOCK_PKG_INFO_FILE"' EXIT
+unset AIRLOCK_PKG_INFO
+export AIRLOCK_PKG_INFO_FILE
+airlock_config package-info >"$AIRLOCK_PKG_INFO_FILE" || exit 2
+AIRLOCK_CONFIG="$(airlock_package_info | python3 -c 'import sys,json; print(json.load(sys.stdin)["config_path"])')" || exit 2
 export AIRLOCK_CONFIG
 
 installed_apps="$(airlock_installed_app_ids)" || exit 2
 fail=0 ran=0
 # Installation membership and source directories come from ③. No record is
 # a bootstrap box: diagnose ingress below, without running candidate app hooks.
-while read -r app; do
+while IFS= read -r -d '' app; do
   [ -n "$app" ] || continue
   [ "$app" = hub ] && continue
-  if ! pkg_dir="$(airlock_installed_app_dir "$app")"; then
+  if ! IFS= read -r -d '' pkg_dir < <(airlock_installed_app_dir "$app" --null); then
     log "FAILED '$app': recorded source directory is missing"
     fail=1; continue
   fi
@@ -63,7 +66,11 @@ while read -r app; do
   ran=$((ran + 1))
   if (cd "$pkg_dir" && AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$pkg_dir" AIRLOCK_APP_ID="$app" bash "$s"); then :
   else log "smoke FAILED: $app"; fail=1; fi
-done <<<"$installed_apps"
+done < <(printf '%s' "$installed_apps" | python3 -c '
+import json,sys
+for app in json.load(sys.stdin):
+    sys.stdout.buffer.write(app.encode() + b"\0")
+')
 
 if [ "$ran" -eq 0 ]; then
   log "no installed app smokes ran"

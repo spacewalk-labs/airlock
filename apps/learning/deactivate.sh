@@ -10,10 +10,9 @@
 # Deliberately NOT declared, therefore never touched: the library folder (the
 # user's documents) and ~/.local/state/airlock-learning/ (ingest history and
 # logs). Deactivating an app must not be a way to lose what you wrote.
-# The one thing the generic classes cannot express: the ingest skill is a SYMLINK we
-# planted in the user's own skill directories, and `files` only removes paths under our
-# share dir. Removing the link here — and only when it is still ours — keeps a dangling
-# `learning-ingest` out of every agent CLI's skill list after the app is gone.
+# Retire former global skill links on both upgrade and deactivate. The worker
+# loads its package contract directly. Only app-owned symlinks are removed;
+# personal skill directories and foreign links remain untouched.
 set -euo pipefail
 
 APP_DIR_LOCAL="$HOME/.local/share/airlock-learning"
@@ -27,11 +26,11 @@ while IFS= read -r root; do
   [ -n "$root" ] || continue
   target="$root/learning-ingest"
   # 🔴 우리 링크만. 사용자의 진짜 스킬이나 다른 곳을 가리키는 링크는 남긴다 — 앱을 끄는
-  # 것은 그 앱이 만들지 않은 파일을 지울 권한이 아니다. 비교는 문자열이 아니라 realpath 로
+  # 것은 그 앱이 만들지 않은 파일을 지울 권한이 아니다. 비교는 문자열이 아니라 realpath -m 으로
   # 한다(후행 슬래시나 상대경로 철자 하나로 "남의 것" 이 되면 끊어진 링크가 남는다).
   if [ -L "$target" ] \
-     && [ "$(readlink -f "$target" 2>/dev/null)" = "$(readlink -f "$APP_DIR_LOCAL/skill" 2>/dev/null)" ] \
-     && [ -n "$(readlink -f "$APP_DIR_LOCAL/skill" 2>/dev/null)" ]; then
+     && [ "$(realpath -m "$target" 2>/dev/null)" = "$(realpath -m "$APP_DIR_LOCAL/skill" 2>/dev/null)" ] \
+     && [ -n "$(realpath -m "$APP_DIR_LOCAL/skill" 2>/dev/null)" ]; then
     rm -f "$target"
     echo "[airlock] removed ingest skill link: $target"
   fi

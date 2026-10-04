@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import importlib.machinery
+import importlib.util
 import hashlib
 import os
 import pathlib
@@ -22,40 +24,39 @@ LEDGER_TOOL = SOURCE_ROOT / "bin" / "airlock-ledger"
 
 CONFIG_STUB = r'''#!/usr/bin/env python3
 import hashlib, json, os, pathlib, shutil, sys
-if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
-    raise SystemExit(97)
 root = pathlib.Path(__file__).resolve().parent.parent
-source = pathlib.Path(os.environ.get("AIRLOCK_CONFIG_SNAPSHOT")
-                      or os.environ.get("AIRLOCK_CONFIG", root / "airlock.toml")).resolve()
-cmd = sys.argv[1]
-if cmd == "install-snapshot":
-    data = source.read_bytes()
-    pathlib.Path(sys.argv[2]).write_bytes(data)
-    print(json.dumps({"config_path": str(source), "sha256": hashlib.sha256(data).hexdigest()}))
-elif cmd == "validate":
-    raise SystemExit(0)
-elif cmd == "apps":
-    print("hub\nnotes")
-elif cmd == "package-info":
-    print(json.dumps({
-        "config_path": str(source),
-        "order": ["notes"],
-        "packages": {"notes": {
-            "dir": str(root / "package-notes"),
-            "artifacts": {"units": ["airlock-notes.service"], "fragments": [],
-                          "webroot": [], "files": [], "rooted": [],
-                          "serve_ports": [], "containers": []},
-            "serve_port_values": {}, "serve_mappings": {},
-            "unit_scopes": {"airlock-notes.service": "user"},
-            "source_class": "shipped", "capabilities": [],
-            "lifecycle": {"install": True, "smoke": False, "deactivate": False},
-            "deps": [],
-        }},
-    }))
-elif cmd == "adopt-scan":
-    raise SystemExit(0)
-else:
-    raise SystemExit(2)
+
+if __name__ == "__main__":
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+        raise SystemExit(97)
+    root = pathlib.Path(__file__).resolve().parent.parent
+    source = pathlib.Path(os.environ.get("AIRLOCK_CONFIG_SNAPSHOT")
+                          or os.environ.get("AIRLOCK_CONFIG", root / "airlock.toml")).resolve()
+    cmd = sys.argv[1]
+    if cmd == "validate":
+        raise SystemExit(0)
+    elif cmd == "json":
+        print(json.dumps({"apps": {"hub": {}, "notes": {}}}))
+    elif cmd == "package-info":
+        print(json.dumps({
+            "config_path": str(source),
+            "order": ["notes"],
+            "packages": {"notes": {
+                "dir": str(root / "package-notes"),
+                "artifacts": {"units": ["airlock-notes.service"], "fragments": [],
+                              "webroot": [], "files": [], "rooted": [],
+                              "serve_ports": [], "containers": []},
+                "serve_port_values": {}, "serve_mappings": {},
+                "unit_scopes": {"airlock-notes.service": "user"},
+                "source_class": "shipped", "capabilities": [],
+                "lifecycle": {"install": True, "smoke": False, "deactivate": False},
+                "deps": [],
+            }},
+        }))
+    elif cmd == "adopt-scan":
+        raise SystemExit(0)
+    else:
+        raise SystemExit(2)
 '''
 
 
@@ -136,6 +137,7 @@ class Case:
         (self.root / "install").mkdir()
         shutil.copy2(TOOL, self.root / "bin" / "airlock-backup")
         shutil.copy2(LEDGER_TOOL, self.root / "bin" / "airlock-ledger")
+        shutil.copy2(SOURCE_ROOT / "bin/airlock-config", self.root / "bin/fixture-config")
         self.write(self.root / "bin" / "airlock-config", CONFIG_STUB)
         self.write(self.root / "bin" / "airlock-status", STATUS_STUB)
         self.write(self.root / "install" / "airlock-install.sh", INSTALL_STUB)
@@ -213,6 +215,73 @@ def tracked_mode(path: pathlib.Path) -> str:
         ["git", "-C", SOURCE_ROOT, "ls-files", "-s", "--", relative], text=True).strip()
     return line.split()[0] if line else ""
 
+
+
+def normal_id_records():
+    """Actual config and retirement writers preserve each permitted ID boundary."""
+    normal = Case()
+    ids = ["Tab\tApp", "Line\nApp", " My App ", "Trailing ", "My App"]
+    loader = importlib.machinery.SourceFileLoader("backup_normal_ids", str(TOOL))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    backup = importlib.util.module_from_spec(spec)
+    loader.exec_module(backup)
+    old_state = os.environ.get("AIRLOCK_STATE_DIR")
+    try:
+        config = '[auth]\nowner = "owner@fixture.dev"\n[apps.hub]\n'
+        for app_id in ids:
+            directory = normal.temp / app_id
+            directory.mkdir()
+            (directory / "airlock-app.toml").write_text(
+                'contract = 1\nid = ' + json.dumps(app_id) + '\n[artifacts]\n')
+            (directory / "install.sh").write_text('#!/bin/sh\nexit 0\n')
+            config += '[apps.' + json.dumps(app_id) + ']\n'
+        installed = {app_id: {"repo": str(normal.temp / app_id), "commit": "", "artifacts": []}
+                     for app_id in ids}
+        (normal.source_state / "installed-apps.json").write_text(json.dumps(installed) + "\n")
+        (normal.root / "airlock.toml").write_text(config)
+        env = {**os.environ, "AIRLOCK_CONFIG": str(normal.root / "airlock.toml"),
+               "AIRLOCK_STATE_DIR": str(normal.source_state)}
+        check(backup.config_apps(env) == sorted(ids),
+              "actual config JSON preserves tab, newline and surrounding spaces in backup IDs")
+        os.environ["AIRLOCK_STATE_DIR"] = str(normal.source_state)
+        # Retired sweep records remain readable as historical backup input.
+        # Their writer was removed; ownership now comes from installed rows.
+        entries = sorted([{"package": app_id, "listen": 23450 + n, "target": 23460 + n,
+                           "state": "committed"} for n, app_id in enumerate(ids)],
+                         key=lambda row: (row["package"], row["listen"]))
+        (normal.source_state / "plaintext-retirement.json").write_text(
+            json.dumps({"version": 1, "entries": entries}) + "\n")
+        record = (normal.source_state / "plaintext-retirement.json").read_bytes()
+        installed = {app_id: {"repo": str(normal.temp / app_id), "commit": "", "artifacts": []}
+                     for app_id in ids}
+        (normal.source_state / "installed-apps.json").write_text(json.dumps(installed) + "\n")
+        check(backup.record_bytes(normal.source_state)["plaintext-retirement.json"] == record
+              and [entry["package"] for entry in json.loads(record)["entries"]] == sorted(ids)
+              and all(entry["state"] == "committed" for entry in json.loads(record)["entries"]),
+              "backup reads exact historical retirement bytes with lossless IDs")
+        stub = CONFIG_STUB.replace('{"hub": {}, "notes": {}}',
+                                   repr({"hub": {}, **{app_id: {} for app_id in ids}}))
+        normal.write(normal.root / "bin/airlock-config", stub)
+        normal.write(normal.root / "bin/airlock-status", STATUS_STUB.replace(
+            '\'{"version":1,"entries":[]}\\n\'', repr(record.decode())).replace(
+            'bool(ledger["notes"])', 'bool(ledger)'))
+        normal.git("add", "bin/airlock-config", "bin/airlock-status")
+        normal.git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                   "commit", "-qm", "normal ID backup fixture")
+        created = normal.run("create", normal.archive, "--state-dir", normal.source_state,
+                             env={"AIRLOCK_CONFIG": str(normal.root / "airlock.toml")})
+        check(created.returncode == 0, "normal IDs and historical retirement reach backup create", created.stderr)
+        if created.returncode == 0:
+            manifest, members = backup.read_archive(normal.archive)
+            check(members["records/plaintext-retirement.json"] == record
+                  and manifest["installed_apps"] == sorted(ids),
+                  "actual archive reader preserves exact retirement bytes and lossless installed IDs")
+    finally:
+        if old_state is None:
+            os.environ.pop("AIRLOCK_STATE_DIR", None)
+        else:
+            os.environ["AIRLOCK_STATE_DIR"] = old_state
+        normal.cleanup()
 
 
 def real_engine_restore():
@@ -798,6 +867,7 @@ check(tracked_mode(TOOL) == "100644",
 check(tracked_mode(pathlib.Path(__file__)) == "100644",
       "new install test remains mode 100644 and is invoked through python3")
 
+normal_id_records()
 real_engine_restore()
 print(f"passed={passed} failed={failed}")
 raise SystemExit(0 if failed == 0 else 1)

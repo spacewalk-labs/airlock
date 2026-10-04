@@ -1,5 +1,0 @@
-contract = 1
-id = "zz-install-recovery-fail"
-
-[artifacts]
-webroot = ["zz-install-recovery-fail/"]

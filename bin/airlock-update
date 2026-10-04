@@ -1,666 +1,10 @@
 #!/usr/bin/env bash
-# bin/airlock-update — update an installed Airlock to the released tree, then re-run
-# the installer over it.
-#
-#   bash bin/airlock-update              # update ~/workspace/airlock (or this checkout)
-#   bash bin/airlock-update --dry-run    # show what would change; change nothing
-#   bash bin/airlock-update --no-install # replace the files, skip the reinstall
-#   bash bin/airlock-update --rollback   # restore the last failed update
-#   bash bin/airlock-update --machine m  # name the Linux machine instead of detecting it
-#   bash bin/airlock-update --from-unknown  # a box no published release can identify
-#                                           # (installed before 2026-08-21): see below
-#
-# It also runs with no checkout in hand, which is how the FIRST update happens — the
-# installed tree predates this file, so there is nothing to invoke locally:
-#
-#   curl -fsSL https://raw.githubusercontent.com/spacewalk-labs/airlock/main/bin/airlock-update | bash
-#
-# ---------------------------------------------------------------------------------
-# Why this is not `git pull`.
-#
-# The documented install (and every box that followed it) does `git clone --depth=1`,
-# then `rm -rf .git`, then `git init` — deliberately, so the operator owns their copy
-# and can commit their own config. The consequence is that no installed box has a
-# remote pointing here, and the history it does have shares no commit with ours. So
-# `git pull` has nothing to pull, and `git merge --allow-unrelated-histories` resolves
-# against an EMPTY merge base, which makes a conflict out of every file that changed
-# on either side. Neither is an update path.
-#
-# What works is that a git tree is content-addressed independently of history:
-# `git checkout <ref> -- .` writes a tree into the working copy and does not care
-# whether the ref is an ancestor. So this fetches the release, writes it over the
-# checkout, and commits the result to the operator's OWN repository — which is what
-# records the applied release. Local edits are kept in a private tar archive,
-# without adding an operator snapshot commit to this repository.
-#
-# The executable program is inside one outer function, called on the last line. A
-# `curl | bash` that is cut off mid-transfer then runs NOTHING instead of running the
-# first half: bash executes what it has read so far, and a truncated outer function is
-# a syntax error, not a partial update. (Measured: an earlier draft, truncated,
-# replaced every file and exited 0 without committing or re-running the installer.)
-# ---------------------------------------------------------------------------------
+# Fetch a release, preserve operator history/edits, then run its installer.
+# One outer function makes a truncated curl | bash transfer a syntax error.
 set -uo pipefail
-
 airlock_update_program() {
-main() {
-  # Internal state never comes from an ambient caller.
-  unset AIRLOCK_UPDATE_KEEPER_PID
-  local RELEASE_URL="${AIRLOCK_RELEASE_URL:-https://github.com/spacewalk-labs/airlock}"
-  local RELEASE_REF="${AIRLOCK_RELEASE_REF:-main}"
-  # A remote of our own, so we never touch `origin` — on an installed box that is the
-  # operator's private repository and the only copy of their edits.
-  local RELEASE_REMOTE=airlock-release
-  # The install guide pins this location; it is the fallback when the script is piped
-  # in from curl and has no checkout around it to infer from.
-  local DEFAULT_DIR="${AIRLOCK_DIR:-$HOME/workspace/airlock}"
-  # Present after every install, before and after the ledger existed (the webroot,
-  # install/airlock-install.sh). Version-independent, which is the point: the boxes
-  # this has to recognise were installed by code that no longer exists here.
-  local MACHINE_MARKER=/opt/airlock/hub
-
-  local -a original_argv=("$@")
-  local dry=0 do_install=1 rollback=0 machine="" from_unknown=0 unknown_hint=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --dry-run)    dry=1 ;;
-    --json)       AIRLOCK_UPDATE_JSON=1 ;;
-      --no-install) do_install=0 ;;
-      --from-unknown) from_unknown=1 ;;
-      --rollback)   rollback=1 ;;
-      --machine)    shift; [ $# -gt 0 ] || die "--machine 뒤에 머신 이름이 필요합니다"; machine="$1" ;;
-      --machine=*)  machine="${1#--machine=}" ;;
-      -h|--help)    usage; return 0 ;;
-      *)            die "모르는 옵션: $1" ;;
-    esac
-    shift
-  done
-  if [ "$rollback" = 1 ] && { [ "$dry" = 1 ] || [ "$do_install" = 0 ] || [ "$from_unknown" = 1 ]; }; then
-    die "--rollback 은 --dry-run·--no-install·--from-unknown 과 함께 쓸 수 없습니다"
-  fi
-  if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && [ "$dry" != 1 ]; then
-    die "--json 은 --dry-run 과 함께만 쓸 수 있습니다"
-  fi
-  local ROOT="" record_engine=""
-  if [ -n "${AIRLOCK_DIR:-}" ]; then
-    # An explicit path wins over everything: the operator is telling us where it is.
-    is_checkout "$AIRLOCK_DIR" && ROOT="$AIRLOCK_DIR"
-  else
-    local _src="${BASH_SOURCE[0]:-}" _here _cand
-    if [ -n "$_src" ] && [ -f "$_src" ]; then
-      _here="$(cd "$(dirname "$_src")" && pwd)"
-      _cand="$(cd "$_here/.." && pwd)"
-      is_checkout "$_cand" && ROOT="$_cand"
-    fi
-    [ -n "$ROOT" ] || { is_checkout "$DEFAULT_DIR" && ROOT="$DEFAULT_DIR"; }
-  fi
-
-  if [ -z "$ROOT" ]; then
-    die "Airlock 설치본을 찾지 못했습니다.
-       찾은 곳: $DEFAULT_DIR
-       다른 곳에 있으면 그 경로를 알려 주세요:  AIRLOCK_DIR=/경로 bash bin/airlock-update"
-  fi
-
-  # AIRLOCK_FIXTURE_BOUNDARY_CALL — the regression fixture mutates this exact call.
-  fixture_boundary "$ROOT" "$dry" "$machine" \
-    || die "unsafe fixture execution refused before live effects"
-
-  command -v git >/dev/null 2>&1 \
-    || die "git 이 없습니다. 맥이면 터미널에서 'xcode-select --install' 을 한 번 실행하세요."
-
-  if [ "$dry" != 1 ]; then
-    # If this run is hosted inside the very unit it is about to stop (an agent
-    # session under airlock-paseo.service is the everyday case), move out of
-    # that cgroup first so it survives the restart it is about to ask for. The
-    # installer this update calls at the end (step 7) takes its own ledger
-    # lock (A1) once it starts; nothing to acquire here beforehand.
-    airlock_escape_selfkill_cgroup "$0" "${original_argv[@]}"
-  fi
-
-  cd "$ROOT" || die "$ROOT 로 들어가지 못했습니다"
-  ROOT="$(pwd -P)"
-  trap release_update_mutex EXIT
-  say "대상: $ROOT"
-
-  if [ "$rollback" = 1 ]; then
-    [ -e .git ] || die "되돌릴 업데이트 기록이 없습니다 (.git 없음)"
-    rollback_update "$ROOT" "$machine" "$MACHINE_MARKER"
-    return $?
-  fi
-
-  # ---------------------------------------------------------------- 1) 저장소
-  #
-  # Scratch isolates preview metadata and frozen installer inputs.
-  local scratch scratch_created scratch_cleanup
-  scratch_created="$(mktemp -d)" \
-    || die "업데이트용 비공개 임시 디렉터리를 만들지 못했습니다"
-  scratch="$(canonical_private_scratch "$scratch_created")" || {
-    rmdir -- "$scratch_created" 2>/dev/null || true
-    die "업데이트용 임시 디렉터리를 안전한 절대 경로로 고정하지 못했습니다"
-  }
-  printf -v scratch_cleanup 'release_update_mutex; rm -rf -- %q' "$scratch"
-  trap "$scratch_cleanup" EXIT
-  if [ "$dry" = 1 ] && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    local source_git_dir="" source_common_dir="" preview_git_dir="$scratch/preview.git"
-    source_git_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-dir 2>/dev/null)" \
-      || die "미리보기에서 원본 Git 메타데이터 경로를 읽지 못했습니다"
-    source_common_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
-      || die "미리보기에서 공통 Git 메타데이터 경로를 읽지 못했습니다"
-    mkdir -p "$preview_git_dir" \
-      || die "미리보기용 임시 Git 메타데이터 디렉터리를 만들지 못했습니다"
-    if ! tar -C "$source_common_dir" --exclude=objects -cf - . \
-      | tar -C "$preview_git_dir" -xf -; then
-      die "미리보기용 임시 Git 메타데이터를 복제하지 못했습니다"
-    fi
-    if [ "$source_git_dir" != "$source_common_dir" ]; then
-      cp -- "$source_git_dir/HEAD" "$preview_git_dir/HEAD" \
-        || die "미리보기용 worktree HEAD 를 고정하지 못했습니다"
-      if [ -f "$source_git_dir/index" ]; then
-        cp -- "$source_git_dir/index" "$preview_git_dir/index" \
-          || die "미리보기용 worktree index 를 고정하지 못했습니다"
-      else
-        rm -f -- "$preview_git_dir/index"
-      fi
-      if [ -f "$source_git_dir/config.worktree" ]; then
-        cp -- "$source_git_dir/config.worktree" "$preview_git_dir/config.worktree" \
-          || die "미리보기용 worktree config 를 고정하지 못했습니다"
-      fi
-      rm -f -- "$preview_git_dir/commondir"
-    fi
-    mkdir -p "$preview_git_dir/objects" \
-      || die "미리보기용 임시 Git 메타데이터를 복제하지 못했습니다"
-    export GIT_ALTERNATE_OBJECT_DIRECTORIES="$source_common_dir/objects"
-    export GIT_DIR="$preview_git_dir" GIT_WORK_TREE="$ROOT"
-  fi
-  if [ ! -e .git ]; then
-    if [ "$dry" = 1 ]; then
-      # A preview must not create a repository in someone's directory, but every
-      # comparison below is a git operation. So the preview gets a THROWAWAY git
-      # directory pointed at their files: the index and objects land in $scratch and
-      # their tree is never written to. An earlier draft just skipped `git init` here
-      # and then ran `git remote add` in a non-repository, so --dry-run died on
-      # exactly the boxes it existed for — and three tests passed anyway, because the
-      # failure and the intended behaviour look identical from outside (nothing
-      # changed).
-      say "[미리보기] 이 폴더는 아직 git 저장소가 아닙니다 — 임시 저장소로 비교만 합니다."
-      export GIT_DIR="$scratch/preview.git" GIT_WORK_TREE="$ROOT"
-      git init -q 2>/dev/null || git init -q --bare 2>/dev/null \
-        || die "미리보기용 임시 Git 저장소를 만들지 못했습니다"
-      git add -A 2>/dev/null || die "미리보기에서 현재 파일 상태를 읽지 못했습니다"
-    else
-      say "이 폴더는 아직 git 저장소가 아닙니다 — 배포본 기록용으로 만듭니다."
-      git init -q -b main 2>/dev/null || git init -q
-    fi
-  fi
-
-  local git_dir recovery_dir
-  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" \
-    || die "git 메타데이터 경로를 읽지 못했습니다"
-  local installed_head=""
-  git rev-parse --verify -q HEAD >/dev/null 2>&1 \
-    && installed_head="$(git rev-parse HEAD)"
-  if [ -z "${AIRLOCK_UPDATE_KEEPER_PID:-}" ]; then
-    [ "$dry" = 1 ] || acquire_update_mutex "$git_dir"
-  fi
-  recovery_dir="$git_dir/airlock-update-rollback"
-  if [ "$dry" != 1 ] && [ -e "$recovery_dir" ]; then
-    die "끝나지 않은 업데이트 복구 기록이 있습니다.
-       먼저 되돌리십시오:  AIRLOCK_DIR=\"$ROOT\" bash \"$recovery_dir/airlock-update\" --rollback"
-  fi
-
-  # ---------------------------------------------------------------- 2) 배포본 받기
-  #
-  # Deliberately NOT `--depth=1`. A shallow fetch writes .git/shallow and marks the
-  # OPERATOR's repository shallow permanently, changing how their own clones, gc and
-  # later fetches behave — a lasting side effect on their property in exchange for
-  # nothing, since the release repository is a squashed mirror only a few commits deep.
-  say "최신 배포본을 받는 중… ($RELEASE_URL, $RELEASE_REF)"
-  if git remote get-url "$RELEASE_REMOTE" >/dev/null 2>&1; then
-    git remote set-url "$RELEASE_REMOTE" "$RELEASE_URL" || die "remote 를 고치지 못했습니다"
-  else
-    git remote add "$RELEASE_REMOTE" "$RELEASE_URL" || die "remote 를 추가하지 못했습니다"
-  fi
-  git fetch -q "$RELEASE_URL" "$RELEASE_REF" \
-    || die "배포본을 받지 못했습니다 — 인터넷 연결을 확인해 주세요. (레포는 공개라 로그인은 필요 없습니다)"
-  local new; new="$(git rev-parse --verify 'FETCH_HEAD^{commit}')" \
-    || die "받은 내용을 commit 으로 읽지 못했습니다"
-  local direction direction_rc
-  direction="$(release_direction "$new" "$installed_head" "$RELEASE_REF" "$RELEASE_URL" "$scratch/installed-release")"
-  direction_rc=$?
-  case "$direction" in
-    rollback)
-      say "받은 배포본은 현재 설치본보다 뒤입니다 — 업데이트 감지에는 표시하지 않습니다."
-      if [ "$dry" = 1 ]; then
-        [ "${AIRLOCK_UPDATE_JSON:-0}" != 1 ] \
-          || emit_update_json 0 0 "$new" \
-          || die "업데이트 감지 JSON을 만들지 못했습니다"
-        return 0
-      fi
-      ;;
-    ambiguous)
-      say "받은 배포본이 현재 설치본보다 앞서는지 확인하지 못했습니다."
-      if [ "$dry" = 1 ]; then
-        # A semantic ambiguity (for example a release naming another source) is a
-        # measured non-update. Missing provenance is not: the daily collector must
-        # keep its last complete value and old checkedAt instead of replacing it with
-        # a fresh-looking zero.
-        if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ] && [ "$direction_rc" -ne 0 ]; then
-          die "배포본 방향을 재는 로컬 Git 증거가 없어 이전 감지값을 유지합니다."
-        fi
-        [ "${AIRLOCK_UPDATE_JSON:-0}" != 1 ] \
-          || emit_update_json 0 0 "$new" \
-          || die "업데이트 감지 JSON을 만들지 못했습니다"
-        return 0
-      fi
-      ;;
-    unknown)
-      # The public history starts at 2026-08-21; a box installed from an earlier tree
-      # matches no release that exists now, so no evidence can say forward or back.
-      # A person who has seen the preview can say it; the daily detector cannot.
-      if [ "$from_unknown" = 1 ]; then
-        say "--from-unknown: 어느 배포본에서 설치했는지 모르는 박스를 운영자 확인으로 갱신합니다."
-      else
-        say "이 설치본은 지금 공개된 어떤 배포본과도 파일이 일치하지 않아, 받은 배포본이 더 새것인지 확인할 수 없습니다."
-        say "공개 이력이 시작된 2026-08-21 이전에 설치한 박스라면 정상입니다."
-        if [ "$dry" = 1 ]; then
-          if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
-            emit_update_json 0 0 "$new" || die "업데이트 감지 JSON을 만들지 못했습니다"
-            return 0
-          fi
-          unknown_hint=1
-
-        fi
-      fi ;;
-    same|forward) ;;
-    *) say "배포본 방향 판정값: $direction" ;;
-  esac
-
-  # ---------------------------------------------------------------- 3) 무엇이 바뀌나
-  #
-  # `-c core.quotePath=false` on every listing: without it git renders non-ASCII names
-  # as octal escapes, and the one message that names the OPERATOR's OWN files is
-  # exactly where that is least acceptable.
-  local release_paths diff_paths tracked_paths changed_list changed stale retired="" installed_release=""
-  release_paths="$(git -c core.quotePath=false ls-tree -r --name-only "$new" | sort)" \
-    || die "받은 배포본의 파일 목록을 읽지 못했습니다"
-  # Restricted to paths the RELEASE carries. Without that intersection the operator's
-  # own tracked files read as differences and the script could never report an
-  # up-to-date box — it would claim work to do forever.
-  diff_paths="$(git -c core.quotePath=false diff --name-only "$new" -- . 2>/dev/null | sort)" \
-    || die "현재 파일과 받은 배포본의 차이를 재지 못했습니다"
-  changed_list="$(comm -12 <(printf '%s\n' "$diff_paths") \
-    <(printf '%s\n' "$release_paths"))" \
-    || die "바뀔 파일 목록을 계산하지 못했습니다"
-  changed="$(awk 'NF { count++ } END { print count + 0 }' <<<"$changed_list")" \
-    || die "바뀔 파일 수를 계산하지 못했습니다"
-  # Only the identified previous release establishes source ownership. Operator
-  # paths absent from both releases remain theirs; retired public source must leave
-  # the checkout, otherwise catalogue discovery resurrects removed apps.
-  installed_release="$(cat "$scratch/installed-release")"
-  if [ -n "$installed_release" ]; then
-    retired="$(comm -23 <(git -c core.quotePath=false ls-tree -r --name-only "$installed_release" | sort) \
-                         <(printf '%s\n' "$release_paths"))" \
-      || die "이전 배포본에서 사라진 파일 목록을 계산하지 못했습니다"
-  fi
-  tracked_paths="$(git -c core.quotePath=false ls-files | sort)" \
-    || die "현재 checkout의 파일 목록을 읽지 못했습니다"
-  stale="$(comm -23 <(printf '%s\n' "$tracked_paths") \
-                    <(printf '%s\n' "$release_paths") 2>/dev/null)" \
-    || die "배포본에 없는 기존 파일 목록을 계산하지 못했습니다"
-  stale="$(comm -23 <(printf '%s\n' "$stale") <(printf '%s\n' "$retired"))"
-  changed_list="$(printf '%s\n%s\n' "$changed_list" "$retired" | sort -u)"
-  changed="$(awk 'NF { count++ } END { print count + 0 }' <<<"$changed_list")"
-
-  # An older .gitignore can hide a file the release will overwrite. Include
-  # these paths in the private file archive alongside uncommitted edits.
-  local at_risk=""
-  local p
-  while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    [ -e "$p" ] || continue
-    git ls-files --error-unmatch -- "$p" >/dev/null 2>&1 && continue
-    at_risk="$at_risk$p"$'\n'
-  done <<EOF
-$release_paths
-EOF
-
-  if [ "$direction" = same ]; then
-    say "이미 같은 배포본입니다 — 새 업데이트가 아닙니다."
-    [ "$dry" != 1 ] || {
-      [ "${AIRLOCK_UPDATE_JSON:-0}" != 1 ] \
-        || emit_update_json 0 0 "$new" \
-        || die "업데이트 감지 JSON을 만들지 못했습니다"
-      return 0
-    }
-  fi
-
-  if [ "$changed" = 0 ]; then
-    say "이미 최신입니다 — 바뀔 파일이 없습니다."
-    [ "$do_install" = 1 ] || return 0
-  else
-    say "바뀔 파일 $changed 개:"
-    report_list "$changed_list"
-  fi
-  if [ -n "$stale" ]; then
-    say "배포본에 없는 파일 $(printf '%s' "$stale" | grep -c .) 개 — 지우지 않고 그대로 둡니다:"
-    report_list "$stale"
-  fi
-  if [ -n "$retired" ]; then
-    say "이전 공개 배포본에서 사라진 파일은 보관 뒤 제거합니다:"
-    report_list "$retired"
-  fi
-  if [ -n "$at_risk" ]; then
-    say "이 폴더의 .gitignore 가 가려 두었지만 배포본이 덮어쓸 파일 $(printf '%s' "$at_risk" | grep -c .) 개 — 되돌릴 수 있도록 먼저 기록합니다:"
-    report_list "$at_risk"
-  fi
-
-  # ---------------------------------------------------------------- 3b) 설정 사전 검사
-  #
-  # The installer validates airlock.toml with the NEW release's rules — after the files
-  # are already overwritten. A key the release retired (markwand became fileview on
-  # 2026-08-23) then stops it with the new tree on disk and the old services running,
-  # and a box old enough to hit that has no bin/airlock-status, so no rollback is armed.
-  # Ask the same validator the same question first. Linux only: on a Mac the installer
-  # runs inside the machine, with its own Python and its own copy of the config. No
-  # changed file, no mixed box: a reinstall over the same tree needs no preflight.
-  if [ "$(platform)" != Darwin ] && [ "${AIRLOCK_UPDATE_JSON:-0}" != 1 ] \
-     && [ "$changed" != 0 ] && { [ "$dry" = 1 ] || [ "$do_install" = 1 ]; }; then
-    local preflight="$scratch/preflight" config_check="" config_rc=0
-    mkdir -p "$preflight" && git archive "$new" | tar -x -C "$preflight" \
-      || die "새 배포본의 설정 검사기를 꺼내지 못했습니다"
-    config_check="$(cd "$ROOT" && python3 "$preflight/bin/airlock-config" validate 2>&1)" \
-      || config_rc=$?
-    if [ "$config_rc" != 0 ]; then
-      say "airlock.toml 이 새 배포본의 설정 검사를 통과하지 못합니다 — 설치기가 여기서 멈춥니다:"
-      printf '%s\n' "$config_check" | sed 's/^/         /'
-      if [ "$dry" != 1 ]; then
-        die "설정을 먼저 고친 뒤 다시 실행하세요. 아무것도 바꾸지 않았습니다.
-       (airlock.toml.example 이 새 형식입니다. 파일만 먼저 바꾸려면 --no-install)"
-      fi
-    fi
-  fi
-
-  if [ "$dry" = 1 ]; then
-    if [ "$unknown_hint" = 1 ]; then
-      say "위 내용이 맞으면 --from-unknown 을 붙여 실행하세요:  bash bin/airlock-update --from-unknown"
-      say "  (curl 로 받았다면:  curl -fsSL https://raw.githubusercontent.com/spacewalk-labs/airlock/main/bin/airlock-update | bash -s -- --from-unknown)"
-    fi
-    say "[미리보기] 여기까지입니다. 아무것도 바꾸지 않았습니다."
-    if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
-      emit_update_json "$([ "$changed" -gt 0 ] && printf 1 || printf 0)" \
-        "$changed" "$new" || die "업데이트 감지 JSON을 만들지 못했습니다"
-    fi
-    return 0
-  fi
-
-  # ---------------------------------------------------------------- 4) 머신 확인
-  #
-  # BEFORE anything is written. Detection can fail (no machine, two machines, orb not
-  # running), and failing after the overwrite leaves the worst state of all: a new
-  # checkout against an old install, which is neither the version they had nor the one
-  # they asked for.
-  if [ "$do_install" = 1 ] && [ "$(platform)" = Darwin ]; then
-    machine="$(resolve_machine "$machine" "$MACHINE_MARKER")" || return 1
-  fi
-
-  # ---------------------------------------------------------------- 5) 로컬 파일 보관
-  # Preserve overwritten local bytes outside Git history. A snapshot commit used
-  # to turn every update into an unpublished operator commit (and git pull then
-  # advanced from those commits). Only the release commit below belongs on HEAD.
-  local files_backup=""
-  if [ -n "$(git status --porcelain 2>/dev/null)" ] || [ -n "$at_risk" ] || [ -n "$retired" ]; then
-    files_backup="$(mktemp -d "$git_dir/airlock-update-files.XXXXXX")" \
-      || die "로컬 파일 보관 디렉터리를 만들지 못했습니다"
-    local_files save "$ROOT" "$files_backup" "$new" "$installed_release" \
-      || die "로컬 파일을 보관하지 못했습니다"
-    # Save the same restoration function for manual checkout recovery after an
-    # update replaces this script. No second implementation or snapshot commit.
-    { printf '#!/usr/bin/env bash\n'; declare -f local_files;
-      printf 'local_files restore "$1" "$(dirname "$0")"\n';
-    } >"$files_backup/restore.sh" || die "파일 복원 명령을 보존하지 못했습니다"
-    chmod 0600 "$files_backup/restore.sh" || die "파일 복원 명령 권한을 좁히지 못했습니다"
-    say "로컬 파일 보관: $files_backup/files.tar"
-    local restore_files
-    printf -v restore_files 'bash %q %q' "$files_backup/restore.sh" "$ROOT"
-    say "checkout 을 되돌린 뒤 로컬 편집 복원: $restore_files"
-  fi
-
-  local before=""
-  git rev-parse --verify -q HEAD >/dev/null 2>&1 && before="$(git rev-parse HEAD)"
-
-  # ---------------------------------------------------------------- 5b) 복구 기준점
-  #
-  # A tree revision alone is not a healthy-box snapshot.  The previous version did
-  # print one, but reset + a failing old installer merely trades one mixed box for a
-  # different mixed box.  Arm rollback only from a status run that inspected every
-  # check (rc 0, never rc 3), and freeze the exact config + installed-state records
-  # that the old installer will converge from.
-  local rollback_ready=0 config_receipt="" config_path="" rollback_state_dir="" runtime_root="$ROOT"
-  if [ "$do_install" = 1 ] && [ -f bin/airlock-status ]; then
-    say "업데이트 전 상태를 확인하는 중…"
-    # 🔴 The CALLER creates this file. `airlock-config install-snapshot` opens it with
-    # O_WRONLY|O_TRUNC|O_NOFOLLOW and deliberately WITHOUT O_CREAT, so that it can never
-    # become a general write primitive — it freezes bytes into a file you already own and
-    # refuses everything else. Its two other callers honour that (install/airlock-install.sh
-    # uses `mktemp`, bin/airlock-backup uses `touch(mode=0o600)`); this one passed a path
-    # inside a `mktemp -d` directory that nothing had ever created, so `os.open` raised
-    # ENOENT and EVERY real update died here, fail-closed, before changing anything.
-    # Only real ones: --dry-run returns above this block and --no-install never enters it,
-    # which is the whole reason it reached a release (measured 2026-09-01, reproduced 100%).
-    #
-    # `set -C` is the point of the subshell, not tidiness: it opens with O_EXCL, so a path
-    # that already exists as ANYTHING — including a symlink someone raced into place — fails
-    # here instead of being followed. That is the same refusal O_NOFOLLOW makes on the callee
-    # side, kept on this side too rather than assumed from the 0700 mktemp directory.
-    # `umask 077` gives it 0600 from birth instead of widening then narrowing.
-    ( umask 077; set -C; : >"$scratch/config.snapshot" ) \
-      || die "업데이트 전 설정을 담을 파일을 만들지 못했습니다: $scratch/config.snapshot"
-    config_receipt="$(python3 bin/airlock-config install-snapshot "$scratch/config.snapshot")" \
-      || die "업데이트 전 설정을 고정하지 못했습니다"
-    config_path="$(printf '%s' "$config_receipt" \
-      | python3 -c 'import json,sys; print(json.load(sys.stdin)["config_path"])')" \
-      || die "고정한 설정 경로를 읽지 못했습니다"
-    case "$config_path" in *$'\n'*|*$'\r'*) die "설정 경로에 줄바꿈이 있어 안전하게 기록할 수 없습니다" ;; esac
-    # Preserve the release's state reader before replacing the target checkout.
-    # An older target has no snapshot API; rollback must keep this reader after
-    # resetting that checkout to its old bytes as well.
-    record_engine="$scratch/airlock-ledger"
-    git show "$new:bin/airlock-ledger" >"$record_engine" \
-      || die "설치 기록을 읽는 배포본 모듈을 보존하지 못했습니다"
-    chmod 0600 "$record_engine" || die "설치 기록 모듈을 보호하지 못했습니다"
-    snapshot_box_state "$ROOT" "$machine" "$scratch" \
-      || die "업데이트 전 설치 상태를 보존하지 못했습니다"
-    rollback_state_dir="$(cat "$scratch/state-dir")" \
-      || die "고정한 설치 상태 경로를 읽지 못했습니다"
-    if [ "$(platform)" != Darwin ]; then
-      local previous_root
-      previous_root="$(systemctl --user show airlock-update-detect.service -p WorkingDirectory --value 2>/dev/null || true)"
-      # The operator checkout can lag the checkout its installed units run.
-      # Measure and restore that actual installation, not an unused old reader.
-      runtime_root="$(installed_record "$record_engine" runtime-root "$scratch/install-record.json" "$previous_root" "$ROOT")" \
-        || die "업데이트 전 실행 경로를 읽지 못했습니다"
-    fi
-    box_status "$runtime_root" "$machine" "$rollback_state_dir" "$config_path" \
-      >"$scratch/status-before.json" || true
-    cat "$scratch/status-before.json"
-    if [ -f "${BASH_SOURCE[0]:-}" ]; then
-      cp "${BASH_SOURCE[0]}" "$scratch/airlock-update" \
-        || die "복구 명령을 보존하지 못했습니다"
-    else
-      git show "$new:bin/airlock-update" >"$scratch/airlock-update" \
-        || die "복구 명령을 배포본에서 보존하지 못했습니다"
-    fi
-    chmod 0600 "$scratch/airlock-update" || die "복구 명령을 보호하지 못했습니다"
-    rollback_ready=1
-  elif [ "$do_install" = 1 ]; then
-    say "주의: 이 설치본에는 bin/airlock-status 가 없어 자동 롤백 기준점을 만들 수 없습니다."
-  fi
-
-  if [ "$rollback_ready" = 1 ] && [ -z "$before" ]; then
-    rollback_ready=0
-    say "기존 Git revision 이 없어 자동 롤백은 제공하지 않습니다. 로컬 파일 보관본은 남겨 둡니다."
-  fi
-
-  # Preserve the recovery record and pin the before commit before changing files.
-  if [ "$rollback_ready" = 1 ]; then
-    arm_recovery "$recovery_dir" "$scratch" "$before" \
-      "$config_path" "$(platform)" "$machine" "$files_backup" "$runtime_root"
-  fi
-
-  # ---------------------------------------------------------------- 6) 덮어쓰기
-  #
-  # `-- .` writes every path the release carries and touches nothing else, so files the
-  # operator added stay. `airlock.toml` at the root is in .gitignore on BOTH sides and
-  # in no tree, so it is never a candidate — but note that is a statement about that
-  # one path, not about the name: the release does carry
-  # examples/app-package/airlock.toml, which is why the at-risk pass above exists.
-  local undo_command
-  undo_command="$(checkout_undo_command "$ROOT" "$before" "$files_backup")"
-  say "파일을 배포본으로 맞추는 중… (checkout 복원: $undo_command)"
-  git checkout "$new" -- . || die "파일을 바꾸지 못했습니다 (아무것도 안 바뀌었을 수 있습니다)"
-  if [ -n "$retired" ]; then
-    # Use the same node-aware file implementation as recovery. It never follows
-    # an operator's replacement parent link or recursively deletes their directory.
-    local_files retire "$ROOT" "$files_backup" "$installed_release" "$new" \
-      || die "사라진 공개 소스를 제거하지 못했습니다 (복원: $undo_command)"
-  fi
-  # A path this box tracks, the release no longer carries, AND the release's own
-  # .gitignore now declares ignored: that combination is the release saying "this is
-  # box state, not source". Drop it from the index and KEEP THE FILE — `git add -A`
-  # below would otherwise leave it tracked forever (a newly ignored path that is
-  # already tracked stays tracked), and the box's checkout stays permanently dirty.
-  # That is how airlock.lock, a machine-written per-box approval record, kept every
-  # installed clone dirty after it rode in with a box commit (#659): the hourly
-  # canonical-clone sweep skips dirty clones, so those clones went quietly stale.
-  # These paths have no previous-public ownership; keep their operator bytes.
-  if [ -n "$stale" ]; then
-    local _untrack_path
-    while IFS= read -r _untrack_path; do
-      [ -n "$_untrack_path" ] || continue
-      # --no-index: `git check-ignore` refuses to call a TRACKED path ignored, and
-      # every path here is tracked by definition. Without it the loop never fires.
-      git check-ignore -q --no-index -- "$_untrack_path" || continue
-      git rm --cached --quiet -- "$_untrack_path" \
-        || die "배포본이 박스 상태로 선언한 $_untrack_path 을(를) 추적에서 빼지 못했습니다"
-      say "박스 상태로 선언된 $_untrack_path — 파일은 그대로 두고 추적에서만 뺍니다"
-    done <<<"$stale"
-  fi
-  git add -A || die "배포본 파일을 기록 대상으로 올리지 못했습니다"
-  commit_release_or_die "airlock-update: 배포본 ${new:0:12} 으로 갱신" "$before" "$ROOT" "$files_backup"
-  local after="" update_rc=0
-  after="$(git rev-parse HEAD)" || die "갱신 뒤 revision 을 읽지 못했습니다"
-  if [ "$rollback_ready" = 1 ]; then
-    activate_recovery "$recovery_dir" "$after"
-    if [ -n "$files_backup" ]; then
-      local_files updated-modes "$ROOT" "$recovery_dir/local-files" \
-        || die "갱신한 원본 노드의 권한을 복원 자료에 기록하지 못했습니다"
-    fi
-  fi
-  say "갱신했습니다."
-  [ -n "$before" ] && say "되돌리려면:  $undo_command"
-
-  [ "$do_install" = 1 ] || { say "설치기는 건너뜁니다 (--no-install)."; return 0; }
-
-  # ---------------------------------------------------------------- 7) 설치기 재실행
-  #
-  # Note what `reset --hard` does and does not undo: it restores THIS CHECKOUT. It does
-  # not roll back what the installer did inside the Linux machine — /opt/airlock, the
-  # user units, the rendered nginx config, the package versions. Undoing the files and
-  # re-running the installer is what returns the box, and the message above is worded
-  # for the checkout because that is what it actually restores.
-  if [ "$(platform)" != Darwin ]; then
-    say "설치기를 다시 돌립니다…"
-    AIRLOCK_CONFIG="$config_path" bash install/airlock-install.sh || update_rc=$?
-  else
-    say "설치기를 다시 돌립니다 (머신: $machine)…"
-    say "설치 중 경고가 여러 줄 나올 수 있습니다 — 마지막의 Entrance 주소가 나오면 성공입니다."
-    # The host checkout and Orb VM are distinct live boxes.
-    AIRLOCK_MACHINE="$machine" bash docker/orbstack-machine-setup.sh || update_rc=$?
-  fi
-
-  if [ "$rollback_ready" != 1 ]; then
-    return "$update_rc"
-  fi
-
-  if [ "$update_rc" != 0 ]; then
-    if capture_failed_state "$ROOT" "$machine" "$recovery_dir"; then
-      printf '%s\n' failed >"$recovery_dir/phase"
-    else
-      printf '%s\n' failed-unbound >"$recovery_dir/phase"
-    fi
-    box_status "$ROOT" "$machine" "$rollback_state_dir" "$config_path" \
-      >"$recovery_dir/status-after-failure.json" 2>/dev/null || true
-    record_update_event "$git_dir" update-failed "$before" "$after" "$update_rc"
-    say "설치가 실패했습니다 (rc=$update_rc). 이전 상태는 보존돼 있습니다."
-    say "되돌리기:  AIRLOCK_DIR=\"$ROOT\" bash \"$recovery_dir/airlock-update\" --rollback"
-    return "$update_rc"
-  fi
-
-  box_status "$ROOT" "$machine" "$rollback_state_dir" "$config_path" \
-    >"$recovery_dir/status-after.json" || true
-  cat "$recovery_dir/status-after.json"
-
-  record_update_event "$git_dir" update-ok "$before" "$after" 0
-  git update-ref -d refs/worktree/airlock-update-rollback "$before" \
-    || die "성공한 업데이트의 복구용 Git ref 를 정리하지 못했습니다"
-  rm -rf -- "$recovery_dir"
-  say "업데이트를 적용했습니다."
-  return 0
-}
-
-say()  {
-  if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
-    printf '[airlock-update] %s\n' "$*" >&2
-  else
-    printf '\033[1;36m[airlock-update]\033[0m %s\n' "$*"
-  fi
-}
-die()  { printf '\033[1;31m[airlock-update] 중단:\033[0m %s\n' "$*" >&2; exit 1; }
-
-fixture_boundary() { # <checkout-root> <dry> <machine>
-  local checkout="$1" dry="$2" machine="$3" orb_path=""
-  [ -n "${AIRLOCK_FIXTURE_ROOT:-}" ] || return 0
-  [ -z "$machine" ] || orb_path="$(command -v orb 2>/dev/null || true)"
-  python3 - "$AIRLOCK_FIXTURE_ROOT" "$checkout" "$dry" "$machine" "${HOME:-}" \
-    "${AIRLOCK_STATE_DIR:-}" "$orb_path" <<'PY'
-import pathlib
-import sys
-
-root_raw, checkout_raw, dry, machine, home, state, orb_path = sys.argv[1:]
-root = pathlib.Path(root_raw)
-if not root.is_absolute():
-    raise SystemExit("fixture boundary: AIRLOCK_FIXTURE_ROOT must be absolute")
-
-def below(label, raw, required):
-    if not raw:
-        if required:
-            raise SystemExit(f"fixture boundary: {label} must be explicit")
-        return
-    path = pathlib.Path(raw)
-    if not path.is_absolute():
-        raise SystemExit(f"fixture boundary: {label} must be absolute")
-    resolved = path.resolve(strict=False)
-    if resolved != root and root not in resolved.parents:
-        raise SystemExit(f"fixture boundary: {label} escapes AIRLOCK_FIXTURE_ROOT: {resolved}")
-
-below("checkout", checkout_raw, True)
-below("HOME", home, True)
-below("AIRLOCK_STATE_DIR", state, dry != "1")
-if machine:
-    below("orb mutation command", orb_path, True)
-PY
-}
-
-# airlock_escape_selfkill_cgroup SCRIPT [ARGS...] — survive stopping our own host.
-#
-# Copied in from install/lib.sh (not sourced): a streamed `curl | bash` run has no
-# checkout to fetch it from, and the installer already carries the canonical copy
-# for its own use. See that copy's comment for the full incident history — the
-# short version is that an install/update run hosted inside the very
-# airlock-*.service unit it is about to stop dies mid-way (units left stopped,
-# disabled, and unit files reclaimed) unless it first moves itself out of that
-# cgroup into its own transient scope/service.
-#
-# This does NOT refuse the run; it warns and continues in place if it cannot escape.
+say() { printf '[airlock-update] %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
 airlock_escape_selfkill_cgroup() {
   [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && return 0
   [ -n "${AIRLOCK_SELFKILL_ESCAPED:-}" ] && return 0
@@ -742,1373 +86,395 @@ airlock_escape_selfkill_cgroup() {
   exit "$rc"
 }
 
-usage() { printf '%s\n' \
-  "airlock-update — 이미 깔린 Airlock 을 최신 배포본으로 갱신합니다." \
-  "  bash bin/airlock-update              # 갱신하고 설치기까지 다시 돌립니다" \
-  "  bash bin/airlock-update --dry-run    # 무엇이 바뀌는지만 보여 줍니다" \
-  "  bash bin/airlock-update --dry-run --json # 감지기용 JSON 요약만 출력" \
-  "  bash bin/airlock-update --no-install # 파일만 갱신하고 설치기는 건너뜁니다" \
-  "  bash bin/airlock-update --rollback   # 마지막으로 실패한 갱신을 되돌립니다" \
-  "  bash bin/airlock-update --machine m  # 리눅스 머신 이름을 직접 지정합니다" \
-  "  bash bin/airlock-update --from-unknown # 어느 배포본인지 모르는 옛 설치본(2026-08-21 이전)을 확인 후 갱신" \
-  "  AIRLOCK_DIR=/경로 를 앞에 붙이면 그 폴더를 갱신합니다."; }
-
-# The test seam for the macOS branch: a Linux CI cannot reach it, and it is the branch
-# that can install into the wrong machine. install/test-update.sh sets this and puts a
-# stub `orb` on PATH. Nothing else reads it.
-platform() { printf '%s' "${AIRLOCK_UPDATE_UNAME:-$(uname -s)}"; }
-
-is_checkout() {
-  [ -f "$1/bin/airlock-config" ] \
-    && [ -f "$1/install/airlock-install.sh" ] \
-    && [ -f "$1/docker/orbstack-machine-setup.sh" ]
-}
-
-emit_update_json() { # <available:0|1> <changed-count> <release-ref>
-  local output=""
-  output="$(python3 - "$@" <<'PY'
-import json
-import sys
-
-available, changed, ref = sys.argv[1:]
-print(json.dumps({"available": available == "1", "changedCount": int(changed),
-                  "ref": ref}, separators=(",", ":")))
-PY
-)" || return 1
-  printf '%s\n' "$output"
-}
-
-local_files() { # <save|updated-modes|restore|rollback> <checkout> <private-bundle> [release]
-  python3 - "$@" <<'FILES'
-import base64
-import hashlib
+main() {
+  local dry=0 json=0 install=1 machine="${AIRLOCK_MACHINE:-}"
+  local url="${AIRLOCK_RELEASE_URL:-https://github.com/spacewalk-labs/airlock}"
+  local ref="${AIRLOCK_RELEASE_REF:-main}" root="${AIRLOCK_DIR:-}"
+  local -a original=("$@")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      --json) json=1 ;;
+      --no-install) install=0 ;;
+      --machine) shift; machine="${1:?--machine requires a name}" ;;
+      --machine=*) machine="${1#*=}" ;;
+      --help|-h)
+        printf '%s\n' 'airlock-update [--dry-run [--json]] [--no-install] [--machine NAME]' \
+          'AIRLOCK_DIR, AIRLOCK_RELEASE_URL and AIRLOCK_RELEASE_REF select checkout/release.'
+        return 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+    shift
+  done
+  if [ -z "$root" ]; then
+    local source="${BASH_SOURCE[0]:-}"
+    if [ -f "$source" ]; then root="$(cd "$(dirname "$source")/.." && pwd)"; fi
+    root="${root:-$HOME/workspace/airlock}"
+  fi
+  cd "$root" || return 1
+  root="$(pwd -P)"
+  if [ "$dry" = 0 ]; then airlock_escape_selfkill_cgroup "$0" "${original[@]}"; fi
+  python3 - "$root" "$url" "$ref" "$dry" "$json" <<'PYTHON'
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 
-action, root_raw, bundle_raw, *extra = sys.argv[1:]
-root, bundle = Path(root_raw), Path(bundle_raw)
+root, url, ref, dry, output_json = sys.argv[1:]
+root = Path(root)
+dry = dry == '1'
 
-def git(*args):
-    return subprocess.check_output(["git", "-C", str(root), *args])
+def git(*args, env=None, check=True, data=None):
+    result = subprocess.run(['git', '-C', str(root), *args], input=data,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=env, check=False)
+    if check and result.returncode:
+        raise RuntimeError(result.stderr.decode(errors='replace').strip())
+    return result.stdout
 
-def names(raw):
-    return sorted(set(os.fsdecode(p) for p in raw.split(b"\0") if p))
+def tree(revision):
+    if not revision:
+        return {}
+    result = {}
+    for row in git('ls-tree', '-rz', revision).split(b'\0'):
+        if row:
+            header, name = row.split(b'\t', 1)
+            mode, kind, oid = header.decode().split()
+            result[os.fsdecode(name)] = (mode, oid)
+    return result
 
-def digest(data):
-    return hashlib.sha256(data).hexdigest()
+def blob(entry):
+    return git('cat-file', 'blob', entry[1])
 
-def index_path():
-    path = Path(os.fsdecode(git("rev-parse", "--git-path", "index")).rstrip("\n"))
-    return path if path.is_absolute() else root / path
-
-def staged_blobs():
-    # Gitlinks name commits in another repository, not blobs in this one.
-    return sorted({entry.split(b"\t", 1)[0].split()[1]
-                   for entry in git("ls-files", "--stage", "-z").split(b"\0")
-                   if entry and not entry.startswith(b"160000 ")})
-
-def readable_staging():
-    for oid in staged_blobs():
-        subprocess.run(["git", "-C", str(root), "cat-file", "blob", os.fsdecode(oid)],
-                       stdout=subprocess.DEVNULL, check=True)
-
-def parents(relative):
-    return [p for p in reversed(Path(relative).parents) if str(p) != "."]
-
-def blocking_parent(relative):
-    for parent in parents(relative):
-        path = root / parent
-        if os.path.lexists(path) and (path.is_symlink() or not path.is_dir()):
-            return parent
+def node(path):
+    # lstat each ancestor: an operator link must never lead writes outside checkout.
+    for parent in reversed(path.parents):
+        if parent == root or root not in parent.parents:
+            continue
+        if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+            return None
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(mode):
+        return ('link', os.readlink(path), stat.S_IMODE(mode))
+    if stat.S_ISREG(mode):
+        return ('file', path.read_bytes(), stat.S_IMODE(mode))
+    if stat.S_ISDIR(mode):
+        return ('dir', {p.name: node(p) for p in path.iterdir()}, stat.S_IMODE(mode))
     return None
 
-def discard(path):
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    elif os.path.lexists(path):
+def matches(value, entry):
+    if entry is None:
+        return value is None
+    if value is None:
+        return False
+    mode, _ = entry
+    if mode == '120000':
+        return value[0] == 'link' and os.fsencode(value[1]) == blob(entry)
+    return (value[0] == 'file' and value[1] == blob(entry)
+            and bool(value[2] & 0o111) == (mode == '100755'))
+
+def matches_path(value, name, entries):
+    if value is None or value[0] != 'dir':
+        return matches(value, entries.get(name))
+    children = {key[len(name) + 1:].split('/')[0] for key in entries
+                if key.startswith(name + '/')}
+    return (set(value[1]) == children and
+            all(matches_path(child, name + '/' + key, entries)
+                for key, child in value[1].items()))
+
+def remove(path):
+    if path.is_symlink() or path.is_file():
         path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
 
-if action == "save":
-    tracked = git("ls-files", "-z", "--cached", "--others", "--exclude-standard")
-    released = git("ls-tree", "-r", "-z", "--name-only", extra[0])
-    if len(extra) > 1 and extra[1]:
-        released += git("ls-tree", "-r", "-z", "--name-only", extra[1])
-    has_head = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "-q", "HEAD"],
-                              stdout=subprocess.DEVNULL).returncode == 0
-    previous = git("ls-tree", "-r", "-z", "--name-only", "HEAD") if has_head else b""
-    absent, covered = [], set()
-    with open(bundle / "files.tar", "xb") as output, tarfile.open(fileobj=output, mode="w", dereference=False) as saved:
-        os.chmod(bundle / "files.tar", 0o600)
-        for candidate in names(tracked + released + previous):
-            relative = str(blocking_parent(candidate) or candidate)
-            if relative in covered or any(str(parent) in covered for parent in parents(relative)):
-                continue
-            path = root / relative
-            if os.path.lexists(path):
-                # A directory replacing a Git file owns its whole original tree.
-                # Tarfile includes empty directories and never follows its links.
-                saved.add(path, arcname=relative)
-                covered.add(relative)
-            else:
-                absent.append(relative)
-    metadata = {"absent": absent,
-                "index_stage_sha256": digest(git("ls-files", "--stage", "-z")),
-                "untracked": names(git("ls-files", "-z", "--others", "--exclude-standard")),
-                "archive_sha256": digest((bundle / "files.tar").read_bytes())}
-    if has_head:
-        index = index_path()
-        metadata["index"] = None
-        if index.exists():
-            # Expand a split index in a private copy; leave the operator's index
-            # untouched and avoid depending on an expiring sharedindex.* file.
-            with tempfile.NamedTemporaryFile(dir=index.parent) as portable:
-                portable.write(index.read_bytes())
-                portable.flush()
-                subprocess.run(["git", "-C", str(root), "update-index", "--no-split-index"],
-                               env={**os.environ, "GIT_INDEX_FILE": portable.name}, check=True)
-                metadata["index"] = base64.b64encode(Path(portable.name).read_bytes()).decode()
-        blobs = b"".join(oid + b"\n" for oid in staged_blobs())
-        # An index alone does not root its blobs against object expiry. Store a
-        # native pack outside Git history, alongside the working-tree archive.
-        packed = subprocess.check_output(["git", "-C", str(root), "pack-objects", "--stdout"],
-                                         input=blobs)
-        metadata["staged_blobs"] = base64.b64encode(packed).decode()
-    with open(bundle / "files.json", "x") as output:
-        os.chmod(bundle / "files.json", 0o600)
-        json.dump(metadata, output, sort_keys=True)
-    raise SystemExit(0)
+def write(path, value):
+    # Prepare each release leaf before replacing its old bytes. A failed write
+    # leaves the previous leaf available for the next ordinary update.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kind, content, mode = value
+    with tempfile.TemporaryDirectory(prefix='.airlock-write-', dir=path.parent) as temporary:
+        staged = Path(temporary) / 'leaf'
+        if kind == 'link':
+            staged.symlink_to(content)
+        else:
+            staged.write_bytes(content)
+            staged.chmod(mode)
+        if path.is_dir() and not path.is_symlink():
+            remove(path)
+        os.replace(staged, path)
 
-if action == "retire":
-    previous = set(names(git("ls-tree", "-r", "-z", "--name-only", extra[0])))
-    released = set(names(git("ls-tree", "-r", "-z", "--name-only", extra[1])))
-    for relative in sorted(previous - released):
-        ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", "--no-index", "--", relative]).returncode == 0
-        if not ignored and blocking_parent(relative) is None:
-            path = root / relative
-            if path.is_symlink() or (os.path.lexists(path) and not path.is_dir()):
-                path.unlink()
-        # A newly ignored path is box state; replacement directories/parent links
-        # belong to the operator. Keep them, but retire the old source index entry.
-        subprocess.run(["git", "-C", str(root), "update-index", "--force-remove", "--", relative], check=True)
-    raise SystemExit(0)
-
-def write_metadata(value):
-    with tempfile.NamedTemporaryFile(dir=bundle, mode="w", delete=False) as output:
-        json.dump(value, output, sort_keys=True)
-    os.replace(output.name, bundle / "files.json")
-
-metadata = json.loads((bundle / "files.json").read_bytes())
-original_metadata = dict(metadata)
-if action == "rollback" and metadata.get("restored"):
-    # File and index restoration finished before HEAD was recorded. Resume the
-    # recorded Git move only; later chmod/staging/deletions are already the user's.
-    if git("rev-parse", "HEAD").strip() != os.fsencode(extra[0]):
-        subprocess.run(["git", "-C", str(root), "update-ref", "HEAD", *extra], check=True)
-    raise SystemExit(0)
-if digest((bundle / "files.tar").read_bytes()) != metadata["archive_sha256"]:
-    raise SystemExit("local file archive changed")
-with tarfile.open(bundle / "files.tar", errorlevel=2) as saved:
-    members = saved.getmembers()
-
-    if action == "updated-modes":
-        # Record only the original nodes' actual permissions after Git updated
-        # the checkout. A later chmod is carried into restoration, never refused.
-        metadata["updated_modes"] = {
-            member.name: stat.S_IMODE((root / member.name).stat().st_mode)
-            for member in members
-            if blocking_parent(member.name) is None
-            and not (root / member.name).is_symlink()
-            and (((member.isfile() or member.islnk()) and (root / member.name).is_file())
-                 or (member.isdir() and (root / member.name).is_dir()))}
-        write_metadata(metadata)
-        raise SystemExit(0)
-
-    def files_match():
-        for relative in metadata["absent"]:
-            if blocking_parent(relative) is not None or os.path.lexists(root / relative):
-                return False
-        for member in members:
-            if blocking_parent(member.name) is not None:
-                return False
-            path = root / member.name
-            if not os.path.lexists(path) or stat.S_IMODE(path.lstat().st_mode) != member.mode:
-                return False
-            if member.issym():
-                if not path.is_symlink() or os.readlink(path) != member.linkname:
-                    return False
-            elif member.isdir():
-                if path.is_symlink() or not path.is_dir():
-                    return False
-            elif member.isfile() or member.islnk():
-                if path.is_symlink() or not path.is_file():
-                    return False
-                if digest(path.read_bytes()) != digest(saved.extractfile(member).read()):
-                    return False
-        return True
-
-    if action == "rollback":
-        before, after = extra
-        def tree(ref):
-            result = {}
-            for line in git("ls-tree", "-r", "-z", ref).split(b"\0"):
-                if line:
-                    fields, relative = line.split(b"\t", 1)
-                    mode, kind, oid = fields.split()
-                    result[os.fsdecode(relative)] = (mode, oid)
-            return result
-        previous, failed = tree(before), tree(after)
-        def entry(entries, relative):
-            if relative in entries:
-                return entries[relative]
-            if any(name.startswith(relative + "/") for name in entries):
-                return (b"040000", b"")
-            return None
-        def blob(data):
-            return subprocess.check_output(["git", "-C", str(root), "hash-object", "--stdin"],
-                                           input=data).strip()
-        def captured(member):
-            if member.isdir(): return (b"040000", b"")
-            if member.issym(): return (b"120000", blob(os.fsencode(member.linkname)))
-            return (b"100755" if member.mode & 0o111 else b"100644",
-                    blob(saved.extractfile(member).read()))
-        def current(relative):
-            path = root / relative
-            if path.is_symlink(): return (b"120000", blob(os.fsencode(os.readlink(path))))
-            if path.is_dir(): return (b"040000", b"")
-            if not path.exists(): return None
-            if not path.is_file(): return (b"special", b"")
-            return (b"100755" if path.stat().st_mode & 0o111 else b"100644", blob(path.read_bytes()))
-        archived = {member.name: captured(member) for member in members
-                    if member.isfile() or member.islnk() or member.issym() or member.isdir()}
-        changed = {name for name, value in archived.items()
-                   if value != entry(failed, name)
-                   and (entry(failed, name) is not None or entry(previous, name) is not None
-                        or any(str(parent) in failed for parent in parents(name)))}
-        absent = [name for name in metadata["absent"] if name in failed]
-        # Only nodes the rollback will replace need to retain their captured or
-        # failed-update value. Native read-tree protects its own changed paths.
-        targets = changed | set(absent)
-        targets |= {str(parent) for name in targets for parent in parents(name)
-                    if blocking_parent(name) is not None}
-        for name in targets:
-            if current(name) not in (entry(failed, name), entry(previous, name), archived.get(name)):
-                raise SystemExit("local file changed after update: " + name)
-        restored_modes = {member.name: stat.S_IMODE((root / member.name).stat().st_mode)
-                          for member in members if member.name in changed
-                          and (member.isdir() or member.isfile() or member.islnk())
-                          and (current(member.name) == archived[member.name]
-                               or (member.name in metadata.get("updated_modes", {})
-                                   and not (root / member.name).is_symlink()
-                                   and (((member.isfile() or member.islnk()) and (root / member.name).is_file())
-                                        or (member.isdir() and (root / member.name).is_dir()))
-                                   and stat.S_IMODE((root / member.name).stat().st_mode)
-                                       != metadata["updated_modes"][member.name]))}
-        index = index_path()
-        def stages(raw):
-            result = {}
-            for line in raw.split(b"\0"):
-                if line:
-                    fields, name = line.split(b"\t", 1)
-                    result.setdefault(os.fsdecode(name), []).append(fields)
-            return result
-        old_index = {}
-        if metadata.get("index") is not None:
-            subprocess.run(["git", "-C", str(root), "unpack-objects", "-q"],
-                           input=base64.b64decode(metadata["staged_blobs"]), check=True)
-            with tempfile.NamedTemporaryFile(dir=index.parent) as original:
-                original.write(base64.b64decode(metadata["index"])); original.flush()
-                old_index = stages(subprocess.check_output(
-                    ["git", "-C", str(root), "ls-files", "--stage", "-z"],
-                    env={**os.environ, "GIT_INDEX_FILE": original.name}))
-        now_index = stages(git("ls-files", "--stage", "-z"))
-        with tempfile.TemporaryDirectory(dir=bundle) as native_dir:
-            native = Path(native_dir) / "index"
-            env = {**os.environ, "GIT_INDEX_FILE": str(native)}
-            subprocess.run(["git", "-C", str(root), "read-tree", before], env=env, check=True)
-            removed = b"".join(b"0 " + b"0" * 40 + b"\t" + os.fsencode(name) + b"\0"
-                               for name in metadata["absent"])
-            if removed:
-                subprocess.run(["git", "-C", str(root), "update-index", "-z", "--index-info"],
-                               input=removed, env=env, check=True)
-            # An untouched operator file is never removed/recreated just because
-            # git add recorded it in the update commit.
-            keep = {name for name, value in archived.items() if value == entry(failed, name)}
-            keep.update(metadata["untracked"])
-            overrides = b"".join(mode + b" " + oid + b"\t" + os.fsencode(name) + b"\0"
-                                 for name in sorted(keep) if name in failed
-                                 for mode, oid in [failed[name]])
-            if overrides:
-                subprocess.run(["git", "-C", str(root), "update-index", "-z", "--index-info"],
-                               input=overrides, env=env, check=True)
-            restored_staging = b""
-            for name, wanted in old_index.items():
-                if now_index.get(name) == wanted and len(wanted) == 1 and wanted[0].endswith(b" 0"):
-                    restored_staging += wanted[0] + b"\t" + os.fsencode(name) + b"\0"
-            if restored_staging:
-                subprocess.run(["git", "-C", str(root), "update-index", "-z", "--index-info"],
-                               input=restored_staging, env=env, check=True)
-            target = subprocess.check_output(["git", "-C", str(root), "write-tree"], env=env).strip()
-            target_entries = tree(os.fsdecode(target))
-        # chmod changes cached ctime even when the indexed bytes and executable
-        # bit are unchanged. Refresh stat data; dirty paths do not gate recovery.
-        subprocess.run(["git", "-C", str(root), "update-index", "-q", "--refresh"],
-                       stdout=subprocess.DEVNULL)
-        subprocess.run(["git", "-C", str(root), "read-tree", "-u", "-m", after,
-                        os.fsdecode(target)], check=True)
-        now_index = stages(git("ls-files", "--stage", "-z"))
-        updates = b""
-        for name in sorted(set(old_index) | set(failed)):
-            wanted, actual = old_index.get(name, []), now_index.get(name, [])
-            expected = [b" ".join((*target_entries[name], b"0"))] if name in target_entries else []
-            # Keep a later unrelated staged edit; only undo the updater's index
-            # entries. This never replaces the entire index with the old copy.
-            if actual != wanted and actual == expected:
-                path = os.fsencode(name)
-                updates += b"0 " + b"0" * 40 + b"\t" + path + b"\0"
-                updates += b"".join(value + b"\t" + path + b"\0" for value in wanted)
-        if updates:
-            subprocess.run(["git", "-C", str(root), "update-index", "-z", "--index-info"],
-                           input=updates, check=True)
-        metadata.pop("index", None)
-        for member in members:
-            if member.name in restored_modes:
-                member.mode = restored_modes[member.name]
-        members = [member for member in members if member.name in changed
-                   and (current(member.name) != archived[member.name]
-                        or ((member.isdir() or member.isfile() or member.islnk())
-                            and stat.S_IMODE((root / member.name).stat().st_mode) != member.mode))]
-        metadata["absent"] = absent
-
-    if action in ("restore", "rollback"):
-        # Prepare real parents and resolve type collisions before native tarfile
-        # extraction, which defers directory permissions until children are done.
-        for member in sorted(members, key=lambda m: len(Path(m.name).parts)):
-            for parent in parents(member.name):
-                path = root / parent
-                if path.is_symlink() or (os.path.lexists(path) and not path.is_dir()):
-                    discard(path)
-                path.mkdir(exist_ok=True)
-            path = root / member.name
-            if member.isdir():
-                if path.is_symlink() or (os.path.lexists(path) and not path.is_dir()):
-                    discard(path)
-                path.mkdir(exist_ok=True)
-            else:
-                discard(path)
-        # These are the operator's own captured nodes, protected alongside the
-        # recovery metadata. Python 3.11.0 has no later filter keyword argument.
-        saved.extraction_filter = lambda member, path: member
-        saved.extractall(root, members=members)
-        for relative in metadata["absent"]:
-            if blocking_parent(relative) is not None:
-                raise SystemExit("local file parent changed")
-            discard(root / relative)
-        if "index" in metadata:
-            subprocess.run(["git", "-C", str(root), "unpack-objects", "-q"],
-                           input=base64.b64decode(metadata["staged_blobs"]), check=True)
-            index = index_path()
-            if metadata["index"] is None:
-                index.unlink(missing_ok=True)
-            else:
-                with tempfile.NamedTemporaryFile(dir=index.parent, delete=False) as restored:
-                    restored.write(base64.b64decode(metadata["index"]))
-                os.replace(restored.name, index)
-            if digest(git("ls-files", "--stage", "-z")) != metadata["index_stage_sha256"]:
-                raise SystemExit("local staging restoration incomplete")
-            readable_staging()
-        if not files_match():
-            raise SystemExit("local file restoration incomplete")
-        if action == "rollback":
-            original_metadata["restored"] = True
-            write_metadata(original_metadata)
-            if git("rev-parse", "HEAD").strip() != os.fsencode(extra[0]):
-                subprocess.run(["git", "-C", str(root), "update-ref", "HEAD", *extra], check=True)
+def restore(path, value):
+    remove(path)
+    if value is None:
+        return
+    if value[0] == 'dir':
+        path.mkdir(parents=True, exist_ok=True)
+        for name, child in value[1].items():
+            restore(path / name, child)
+        path.chmod(value[2])
     else:
-        raise SystemExit("unknown local-files action")
-FILES
-}
+        write(path, value)
 
-canonical_private_scratch() { # <fresh-mktemp-directory>
-  python3 - "$1" <<'PY'
-from pathlib import Path
-import sys
-print(Path(sys.argv[1]).resolve(strict=True))
-PY
-}
-
-release_tree_matches_state() { # <public-release-commit> <local-commit-or-empty-for-worktree>
-  local ref="$1" local_commit="$2" paths diff_names changed
-  paths="$(git -c core.quotePath=false ls-tree -r --name-only "$ref" | sort)" || return 2
-  if [ -n "$local_commit" ]; then
-    diff_names="$(git -c core.quotePath=false diff --name-only "$ref" "$local_commit" \
-      2>/dev/null)" || return 2
-  else
-    diff_names="$(git -c core.quotePath=false diff --name-only "$ref" -- . \
-      2>/dev/null)" || return 2
-  fi
-  changed="$(printf '%s\n' "$diff_names" | sort \
-    | comm -12 - <(printf '%s\n' "$paths"))" || return 2
-  [ -z "$changed" ]
-}
-
-repository_name_from_url() { # <repository-url-or-path>
-  local url="${1%/}"
-  url="${url%.git}"
-  printf '%s' "${url##*/}"
-}
-
-resolve_object_prefix() { # <hex-object-prefix>
-  local prefix="$1" objects="" object="" resolved="" type="" count=0
-  objects="$(git rev-parse --disambiguate="$prefix" 2>/dev/null)" || return 2
-  while IFS= read -r object; do
-    [ -n "$object" ] || continue
-    count=$((count + 1))
-    [ "$count" -le 1 ] || return 2
-    resolved="$object"
-  done <<<"$objects"
-  [ "$count" = 1 ] || return 1
-  type="$(git cat-file -t "$resolved" 2>/dev/null)" || return 2
-  [ "$type" = commit ] || return 2
-  printf '%s\n' "$resolved"
-}
-
-release_direction() { # <candidate-public-commit> <installed-head-or-empty> <requested-ref> <release-url> [provenance-receipt]
-  # Dynamic scope lets the existing classifier share the provenance it already
-  # resolved, without a second installed-history scan or a new version marker.
-  local installed_release="" installed_source="" result_rc=0
-  release_direction_value "$@" || result_rc=$?
-  if [ -n "${5:-}" ]; then
-    if [ -z "$installed_release" ] && [ -n "$installed_source" ]; then
-      local history ref subject label token resolved
-      label="$(repository_name_from_url "$4")-work"
-      history="$(git log --format='%H%x09%s' "$1" 2>/dev/null)" || history=""
-      while IFS=$'\t' read -r ref subject; do
-        if [[ "$subject" =~ ^release[[:space:]]from[[:space:]]([[:alnum:]_.-]+)[[:space:]]@[[:space:]]([0-9a-f]{7,40})$ ]] \
-           && [ "${BASH_REMATCH[1]}" = "$label" ]; then
-          token="${BASH_REMATCH[2]}"
-          resolved="$(resolve_object_prefix "$token")" || continue
-          [ "$resolved" = "$installed_source" ] || continue
-          installed_release="$ref"
-          break
-        fi
-      done <<<"$history"
-    fi
-    printf '%s' "$installed_release" >"$5" || return 2
-  fi
-  return "$result_rc"
-}
-
-release_direction_value() {
-  local candidate="$1" installed_head="$2" requested_ref="$3" release_url="$4"
-  local origin_url="" release_name="" private_name="" subject="" subject_label=""
-  local source_token="" source_commit="" private_tip=""
-  local history_subject="" history_label="" history_token=""
-  local history_source="" token="" ref="" first_parent_graph="" parent_line=""
-  local marker_history="" marker_subject=""
-  local first_parent="" side_parent="" candidate_history="" graph_rc=0 ancestor_rc=0
-  local source_rc=0 reverse_rc=0 origin_rc=0
-  local -a parents=()
-
-  # A developer checkout has the private graph locally. Public release commits name
-  # their source repository and SHA, so compare those commits rather than pretending
-  # the unrelated public and private histories share ancestry. Build the source name
-  # from the public repository identity instead of publishing a private name here.
-  # Read the configured identity, not `remote get-url`: Git rewrites the latter via
-  # url.*.insteadOf, which is transport routing and must not redefine repository
-  # identity.  The tests use that distinction to route this canonical URL locally.
-  origin_url="$(git config --get remote.origin.url 2>/dev/null)"
-  origin_rc=$?
-  if [ "$origin_rc" != 0 ] && [ "$origin_rc" != 1 ]; then
-    printf '%s' ambiguous
-    return 2
-  fi
-  origin_url="${origin_url%/}"
-  origin_url="${origin_url%.git}"
-  release_name="$(repository_name_from_url "$release_url")"
-  private_name="${release_name}-work"
-  case "$origin_url" in
-    "https://github.com/spacewalk-labs/$private_name"|"git@github.com:spacewalk-labs/$private_name"|"ssh://git@github.com/spacewalk-labs/$private_name")
-      # Deployment checkouts can have a local merge commit around the deployed
-      # private source point. Comparing the public source directly with HEAD would
-      # call the current release a rollback. The clone already records the private
-      # main tip used by that deployment, so use that local evidence; fetching origin
-      # here made one detector run contact two repositories. If the ref is absent or
-      # too old to decide, return ambiguous with a measurement-failure status so the
-      # collector retains its last successful snapshot and original checkedAt.
-      private_tip="$(git rev-parse --verify -q "refs/remotes/origin/main^{commit}" 2>/dev/null)"
-      source_rc=$?
-      if [ "$source_rc" != 0 ] && [ "$source_rc" != 1 ]; then
-        printf '%s' ambiguous
-        return 2
-      fi
-      subject="$(git log -1 --format=%s "$candidate" 2>/dev/null)"
-      graph_rc=$?
-      if [ "$graph_rc" != 0 ]; then
-        printf '%s' ambiguous
-        return 2
-      fi
-      if [[ "$subject" =~ ^release[[:space:]]from[[:space:]]([[:alnum:]_.-]+)[[:space:]]@[[:space:]]([0-9a-f]{7,40})$ ]]; then
-        subject_label="${BASH_REMATCH[1]}"
-        source_token="${BASH_REMATCH[2]}"
-      fi
-      if [ -z "$subject_label" ] || [ -z "$source_token" ]; then
-        printf '%s' ambiguous
-        return 2
-      fi
-      if [ "$subject_label" != "$private_name" ]; then
-        printf '%s' ambiguous
-        return 0
-      fi
-      if [ -n "$installed_head" ] && [ -n "$private_tip" ]; then
-        source_commit="$(resolve_object_prefix "$source_token")"
-        source_rc=$?
-        if [ "$source_rc" = 2 ]; then
-          printf '%s' ambiguous
-          return 2
-        fi
-
-        # Deployment is a first-parent sequence of private states, with the public
-        # release as a side parent of each deployment merge.  That topology records
-        # which release was installed last even when public histories diverge or
-        # commit timestamps are skewed.  A whole-graph log has neither property.
-        first_parent_graph="$(git rev-list --first-parent --parents "$installed_head" 2>/dev/null)"
-        graph_rc=$?
-        if [ "$graph_rc" != 0 ]; then
-          printf '%s' ambiguous
-          return 2
-        fi
-        while IFS= read -r parent_line; do
-          read -r -a parents <<<"$parent_line"
-          [ "${#parents[@]}" -gt 2 ] || continue
-          first_parent="${parents[1]}"
-          for side_parent in "${parents[@]:2}"; do
-            history_subject="$(git log -1 --format=%s "$side_parent" 2>/dev/null)"
-            graph_rc=$?
-            if [ "$graph_rc" != 0 ]; then
-              printf '%s' ambiguous
-              return 2
-            fi
-            history_label=""; history_token=""; history_source=""
-            if [[ "$history_subject" =~ ^release[[:space:]]from[[:space:]]([[:alnum:]_.-]+)[[:space:]]@[[:space:]]([0-9a-f]{7,40})$ ]]; then
-              history_label="${BASH_REMATCH[1]}"
-              history_token="${BASH_REMATCH[2]}"
-            fi
-            [ "$history_label" = "$private_name" ] || continue
-            history_source="$(resolve_object_prefix "$history_token")"
-            source_rc=$?
-            if [ "$source_rc" != 0 ] || [ -z "$history_source" ]; then
-              printf '%s' ambiguous
-              return 2
-            fi
-            git merge-base --is-ancestor "$history_source" "$first_parent" 2>/dev/null
-            ancestor_rc=$?
-            if [ "$ancestor_rc" = 0 ]; then
-              installed_release="$side_parent"
-              installed_source="$history_source"
-              break 2
-            fi
-            [ "$ancestor_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-          done
-        done <<<"$first_parent_graph"
-
-        if [ -z "$installed_source" ]; then
-          installed_source="$(git merge-base "$installed_head" "$private_tip" 2>/dev/null)"
-          graph_rc=$?
-          if [ "$graph_rc" != 0 ] || [ -z "$installed_source" ]; then
-            printf '%s' ambiguous
-            return 2
-          fi
-          # With no deployment marker, a tracking tip strictly behind HEAD cannot
-          # distinguish private source progress from operator commits. Refuse to
-          # turn that stale evidence into a successful direction measurement.
-          git merge-base --is-ancestor "$private_tip" "$installed_head" 2>/dev/null
-          ancestor_rc=$?
-          if [ "$ancestor_rc" = 0 ] && [ "$private_tip" != "$installed_head" ]; then
-            printf '%s' ambiguous
-            return 2
-          fi
-          [ "$ancestor_rc" = 0 ] || [ "$ancestor_rc" = 1 ] \
-            || { printf '%s' ambiguous; return 2; }
-        fi
-
-        if [ -n "$source_commit" ] && [ -n "$installed_source" ]; then
-          git merge-base --is-ancestor "$source_commit" "$private_tip" 2>/dev/null
-          ancestor_rc=$?
-        else
-          ancestor_rc=1
-        fi
-        if [ "$ancestor_rc" = 0 ]; then
-          [ "$source_commit" = "$installed_source" ] && { printf '%s' same; return 0; }
-          git merge-base --is-ancestor "$source_commit" "$installed_source" 2>/dev/null
-          graph_rc=$?
-          [ "$graph_rc" = 0 ] && { printf '%s' rollback; return 0; }
-          [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-          git merge-base --is-ancestor "$installed_source" "$source_commit" 2>/dev/null
-          graph_rc=$?
-          [ "$graph_rc" = 0 ] && { printf '%s' forward; return 0; }
-          [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-          printf '%s' ambiguous
-          return 0
-        fi
-        [ "$ancestor_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-        # Both commits exist and diverge, so this is a measured off-main release,
-        # not a failed observation. A reverse ancestor means origin/main is merely
-        # stale, so public release ancestry remains the available ordering evidence.
-        if [ -n "$source_commit" ] && [ -n "$installed_source" ]; then
-          git merge-base --is-ancestor "$private_tip" "$source_commit" 2>/dev/null
-          reverse_rc=$?
-          if [ "$reverse_rc" = 1 ]; then
-            printf '%s' ambiguous
-            return 0
-          fi
-          [ "$reverse_rc" = 0 ] || { printf '%s' ambiguous; return 2; }
-        fi
-
-        # A quiet deployment does not fetch its private remote merely to detect an
-        # update. The source object for a later release can therefore be absent (or
-        # newer than the locally recorded private tip). Public releases already form
-        # a fetched ancestry and name their source digest. Find the release that names
-        # this checkout's deployed source, then compare public release ancestry. This
-        # keeps forward detection live without a second network fetch or a new version
-        # identifier. The divergent-object case above is deliberately excluded: when
-        # Git can prove a source is off private main, public ordering must not bless it.
-        candidate_history="$(git log --format='%H%x09%s' "$candidate" 2>/dev/null)"
-        graph_rc=$?
-        if [ "$graph_rc" != 0 ]; then
-          printf '%s' ambiguous
-          return 2
-        fi
-        while IFS=$'\t' read -r ref history_subject; do
-          history_label=""; history_token=""; history_source=""
-          if [[ "$history_subject" =~ ^release[[:space:]]from[[:space:]]([[:alnum:]_.-]+)[[:space:]]@[[:space:]]([0-9a-f]{7,40})$ ]]; then
-            history_label="${BASH_REMATCH[1]}"
-            history_token="${BASH_REMATCH[2]}"
-          fi
-          [ "$history_label" = "$private_name" ] || continue
-          history_source="$(resolve_object_prefix "$history_token")"
-          source_rc=$?
-          [ "$source_rc" != 1 ] || continue
-          if [ "$source_rc" != 0 ] || [ -z "$history_source" ]; then
-            printf '%s' ambiguous
-            return 2
-          fi
-          if [ "$history_source" = "$installed_source" ]; then
-            installed_release="$ref"
-            break
-          fi
-        done <<<"$candidate_history"
-        if [ -n "$installed_release" ]; then
-          [ "$installed_release" = "$candidate" ] && { printf '%s' same; return 0; }
-          git merge-base --is-ancestor "$installed_release" "$candidate" 2>/dev/null
-          graph_rc=$?
-          [ "$graph_rc" = 0 ] && { printf '%s' forward; return 0; }
-          [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-          git merge-base --is-ancestor "$candidate" "$installed_release" 2>/dev/null
-          graph_rc=$?
-          [ "$graph_rc" = 0 ] && { printf '%s' rollback; return 0; }
-          [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-        fi
-      fi
-      printf '%s' ambiguous
-      return 2
-      ;;
-  esac
-
-  # A box updated by this command has an unrelated local safety history, but its
-  # commit subject records the public release SHA.  Resolve the newest such marker
-  # against the public objects retained by the airlock-release remote.
-  if [ -n "$installed_head" ]; then
-    # Read subjects without a truncating pipeline. With pipefail, `head -1`
-    # eventually turned a healthy git log into SIGPIPE on long-lived boxes. Git's
-    # --grep is not a substitute: it also searches commit bodies, so an operator note
-    # quoting marker text could hide the newest real marker.
-    marker_history="$(git log --format=%s "$installed_head" 2>/dev/null)"
-    graph_rc=$?
-    if [ "$graph_rc" != 0 ]; then
-      printf '%s' ambiguous
-      return 2
-    fi
-    while IFS= read -r marker_subject; do
-      if [[ "$marker_subject" =~ ^airlock-update:[[:space:]]배포본[[:space:]]([0-9a-f]{12,40})[[:space:]]으로[[:space:]]갱신$ ]]; then
-        token="${BASH_REMATCH[1]}"
-        break
-      fi
-    done <<<"$marker_history"
-    if [ -n "$token" ]; then
-      installed_release="$(resolve_object_prefix "$token")"
-      source_rc=$?
-      if [ "$source_rc" != 0 ] || [ -z "$installed_release" ]; then
-        printf '%s' ambiguous
-        return 2
-      fi
-    fi
-  fi
-
-  # Legacy first installs have no marker.  For the normal moving `main` ref, recover
-  # provenance by finding the newest public ancestor whose complete public path set
-  # matches any local commit.  Looking only at HEAD would reject a valid old install
-  # after its operator committed an edit to a release-owned file.  Do not apply this
-  # to an explicitly pinned old ref: files added by a later release would otherwise
-  # be mistaken for operator files.
-  if [ -z "$installed_release" ] && [ "$requested_ref" = main ]; then
-    if [ -n "$installed_head" ]; then
-      local local_ref match_rc lookup_failed=0 local_history="" release_history=""
-      local_history="$(git rev-list "$installed_head" 2>/dev/null)"
-      graph_rc=$?
-      if [ "$graph_rc" != 0 ]; then
-        printf '%s' ambiguous
-        return 2
-      fi
-      release_history="$(git rev-list "$candidate" 2>/dev/null)"
-      graph_rc=$?
-      if [ "$graph_rc" != 0 ]; then
-        printf '%s' ambiguous
-        return 2
-      fi
-      while IFS= read -r ref; do
-        while IFS= read -r local_ref; do
-          if release_tree_matches_state "$ref" "$local_ref"; then
-            installed_release="$ref"
-            break
-          else
-            match_rc=$?
-            [ "$match_rc" = 1 ] || { lookup_failed=1; break; }
-          fi
-        done <<<"$local_history"
-        if [ "$lookup_failed" != 0 ] || [ -n "$installed_release" ]; then
-          break
-        fi
-      done <<<"$release_history"
-      [ "$lookup_failed" = 0 ] || { printf '%s' ambiguous; return 2; }
-    else
-      local match_rc release_history=""
-      release_history="$(git rev-list "$candidate" 2>/dev/null)"
-      graph_rc=$?
-      if [ "$graph_rc" != 0 ]; then
-        printf '%s' ambiguous
-        return 2
-      fi
-      while IFS= read -r ref; do
-        if release_tree_matches_state "$ref" ""; then
-          installed_release="$ref"
-          break
-        else
-          match_rc=$?
-          [ "$match_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-        fi
-      done <<<"$release_history"
-    fi
-  fi
-
-  # Nothing to disagree with, only nothing to go on: no marker, and on `main` no local
-  # state matches any published tree. A pinned ref stays ambiguous — tree matching was
-  # never applied to it, so "no match" there is not a measurement.
-  if [ -z "$installed_release" ]; then
-    [ "$requested_ref" = main ] && { printf '%s' unknown; return 0; }
-    printf '%s' ambiguous
-    return 0
-  fi
-  [ "$installed_release" = "$candidate" ] && { printf '%s' same; return 0; }
-  git merge-base --is-ancestor "$installed_release" "$candidate" 2>/dev/null
-  graph_rc=$?
-  [ "$graph_rc" = 0 ] && { printf '%s' forward; return 0; }
-  [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-  git merge-base --is-ancestor "$candidate" "$installed_release" 2>/dev/null
-  graph_rc=$?
-  [ "$graph_rc" = 0 ] && { printf '%s' rollback; return 0; }
-  [ "$graph_rc" = 1 ] || { printf '%s' ambiguous; return 2; }
-  printf '%s' ambiguous
-}
-
-# Serialize the whole updater without a host `flock` dependency (macOS does not ship
-# util-linux flock) and without an inherited lock fd that a lifecycle background
-# process could keep forever.  The keeper locks the existing git directory itself,
-# so only mutation of that checkout holds the mutex.
-acquire_update_mutex() { # <absolute-git-dir>
-  local git_dir="$1" ready keeper status="" spins=0
-  ready="$(mktemp)" || die "업데이트 잠금 응답 파일을 만들지 못했습니다"
-  rm -f -- "$ready"
-  python3 - "$git_dir" "$ready" "$$" <<'PY' >/dev/null 2>&1 &
-import fcntl, os, pathlib, sys, time
-
-git_dir, ready, parent_raw = sys.argv[1:]
-parent = int(parent_raw)
 try:
-    descriptor = os.open(git_dir, os.O_RDONLY)
-    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    pathlib.Path(ready).write_text("busy", encoding="ascii")
-    raise SystemExit(0)
-except Exception as exc:
-    pathlib.Path(ready).write_text(f"error:{exc}", encoding="utf-8")
-    raise SystemExit(0)
-pathlib.Path(ready).write_text("ok", encoding="ascii")
-while os.getppid() == parent:
-    try:
-        os.kill(parent, 0)
-    except ProcessLookupError:
-        break
-    time.sleep(0.1)
-PY
-  keeper=$!
-  while [ ! -s "$ready" ] && kill -0 "$keeper" 2>/dev/null; do
-    spins=$((spins + 1))
-    [ "$spins" -lt 1000 ] || break
-    sleep 0.01
-  done
-  [ ! -s "$ready" ] || status="$(cat "$ready")"
-  rm -f -- "$ready"
-  case "$status" in
-    ok) AIRLOCK_UPDATE_KEEPER_PID="$keeper"; return 0 ;;
-    busy) wait "$keeper" 2>/dev/null || true
-      die "다른 airlock-update 또는 rollback 이 진행 중입니다 — 끝난 뒤 다시 시도하세요" ;;
-    *) kill "$keeper" 2>/dev/null || true
-      wait "$keeper" 2>/dev/null || true
-      die "업데이트 실행 잠금을 잡지 못했습니다${status:+ ($status)}" ;;
-  esac
-}
+    with tempfile.TemporaryDirectory(prefix='airlock-update-') as temporary:
+        temp = Path(temporary)
+        # All preview fetch/index writes belong to a disposable repository.
+        env = os.environ.copy()
+        if dry:
+            git('init', '--bare', '-q', str(temp / 'preview.git'))
+            original = git('rev-parse', '--git-common-dir', check=False).decode().strip()
+            if original:
+                common = (root / original).resolve()
+                env['GIT_ALTERNATE_OBJECT_DIRECTORIES'] = str(common / 'objects')
+            env.update(GIT_DIR=str(temp / 'preview.git'), GIT_WORK_TREE=str(root))
+        elif not (root / '.git').exists():
+            git('init', '-q')
+        head = git('rev-parse', '--verify', 'HEAD', check=False).decode().strip()
+        previous_release = git('rev-parse', '--verify',
+                               'refs/remotes/airlock-release/main^{commit}',
+                               check=False).decode().strip()
+        if not dry:
+            # URL fetches replaced this product-owned remote; keep its source ref.
+            git('config', '--remove-section', 'remote.airlock-release', check=False)
+        print('[airlock-update] Fetching %s %s' % (url, ref), file=sys.stderr)
+        git('fetch', '-q', url, ref, env=env)
+        release = git('rev-parse', 'FETCH_HEAD^{commit}', env=env).decode().strip()
+        # Explicit prior update receipt, solely for ownership/edit comparison.
+        # Release direction never decides whether this update may run.
+        prior = ''
+        if head:
+            subjects = git('log', '--first-parent', '--format=%s',
+                           '--grep=^airlock-update: 배포본 ', '-1').decode()
+            match = re.search(r'airlock-update: 배포본 ([0-9a-f]+)', subjects)
+            if match:
+                prior = git('rev-parse', '--verify', match[1] + '^{commit}',
+                            env=env, check=False).decode().strip()
+        # ls-tree/blob reads above and below share fetched preview objects.
+        if dry:
+            os.environ.update({k: env[k] for k in ('GIT_DIR', 'GIT_WORK_TREE')})
+            if 'GIT_ALTERNATE_OBJECT_DIRECTORIES' in env:
+                os.environ['GIT_ALTERNATE_OBJECT_DIRECTORIES'] = env['GIT_ALTERNATE_OBJECT_DIRECTORIES']
+        old_head = tree(head)
+        indexed = {}
+        for row in git('ls-files', '--stage', '-z', check=False).split(b'\0'):
+            if row:
+                header, name = row.split(b'\t', 1)
+                mode, oid, stage = header.decode().split()
+                if stage == '0':
+                    indexed[os.fsdecode(name)] = (mode, oid)
+        # A normal clone shares its installed release with the fetched tree.
+        # An operator-created repository starts at its initial install commit.
+        installed = prior
+        release_baseline = bool(prior)
+        if not installed and head:
+            # A clone's upstream records the release it was installed from,
+            # even when the requested release is older than that checkout.
+            upstream = git('rev-parse', '--verify', '@{upstream}^{commit}',
+                           check=False).decode().strip()
+            shared = git('merge-base', upstream, release, env=env,
+                         check=False).decode().strip() if upstream else ''
+            installed = git('merge-base', head, upstream if shared else release,
+                            env=env, check=False).decode().strip()
+            release_baseline = bool(installed)
+            if not installed:
+                installed = git('rev-list', '--first-parent', '--max-parents=0',
+                                head).decode().splitlines()[0]
+        baseline = tree(installed)
+        if installed and not release_baseline:
+            # An operator's initial commit may mix shipped source and private
+            # files. Only the same path/mode/blob in a released Git tree is a
+            # source baseline; initial membership alone establishes no ownership.
+            unmatched = dict(baseline)
+            baseline = {}
+            for revision in git('rev-list', release).decode().splitlines():
+                released = tree(revision)
+                for name, entry in list(unmatched.items()):
+                    if released.get(name) == entry:
+                        baseline[name] = unmatched.pop(name)
+                if not unmatched:
+                    break
+        previous_source = tree(previous_release)
+        incoming = tree(release)
+        owned_paths = set(baseline) | set(previous_source)
+        retired = owned_paths - set(incoming)
+        def release_owned(value, name):
+            return matches_path(value, name, baseline) or (previous_release
+                    and matches_path(value, name, previous_source))
+        preserve = set()
+        for name in set(incoming) | retired:
+            path = root / name
+            # Capture a changed parent as one node (including dangling symlinks).
+            for parent in reversed(path.parents):
+                if parent == root or root not in parent.parents:
+                    continue
+                if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                    parent_name = str(parent.relative_to(root))
+                    if not release_owned(node(parent), parent_name):
+                        preserve.add(parent_name)
+                    break
+            else:
+                value = node(path)
+                if head and not release_owned(value, name):
+                    preserve.add(name)
+                elif not head and value is not None:
+                    # Without history existing conflicting bytes have no baseline.
+                    preserve.add(name)
+        def operator_path(name):
+            return any(name == saved or name.startswith(saved + '/')
+                       or saved.startswith(name + '/') for saved in preserve)
+        if dry:
+            changed = [name for name in sorted(set(incoming) | retired)
+                       if not operator_path(name)
+                       and not matches(node(root / name), incoming.get(name))]
+            if output_json == '1':
+                print(json.dumps({'available': bool(changed), 'changedCount': len(changed),
+                                  'ref': release}, separators=(',', ':')))
+            else:
+                print('[airlock-update] 바뀔 파일 %d 개:' % len(changed))
+                print('\n'.join(changed))
+            sys.exit(0)
+        stage_delta = {name: indexed.get(name) for name in set(indexed) | set(old_head)
+                       if indexed.get(name) != old_head.get(name)}
+        next_tree = dict(old_head)
+        next_tree.update(incoming)
+        for name in retired:
+            next_tree.pop(name, None)
+        # Remove file/directory collisions from the release index overlay.
+        for name in incoming:
+            for other in list(next_tree):
+                if other != name and (name.startswith(other + '/') or other.startswith(name + '/')):
+                    if other not in incoming:
+                        del next_tree[other]
+        index_env = os.environ.copy()
+        index_env['GIT_INDEX_FILE'] = str(temp / 'index')
+        git('read-tree', '--empty', env=index_env)
+        def set_entries(entries, index_env):
+            records = b''.join((('%s %s\t' % (entry[0], entry[1])).encode() + os.fsencode(name) + b'\0')
+                               if entry else b'0 ' + b'0'*40 + b'\t' + os.fsencode(name) + b'\0'
+                               for name, entry in entries.items())
+            git('update-index', '-z', '--index-info', env=index_env, data=records)
+        set_entries(next_tree, index_env)
+        new_tree = git('write-tree', env=index_env).decode().strip()
+        staging = dict(next_tree)
+        for name, entry in stage_delta.items():
+            if entry:
+                for other in list(staging):
+                    if other != name and (name.startswith(other + '/') or other.startswith(name + '/')):
+                        del staging[other]
+                staging[name] = entry
+            else:
+                staging.pop(name, None)
+        identity = os.environ.copy()
+        identity.setdefault('GIT_AUTHOR_NAME', 'Airlock')
+        identity.setdefault('GIT_AUTHOR_EMAIL', 'airlock@localhost')
+        identity.setdefault('GIT_COMMITTER_NAME', 'Airlock')
+        identity.setdefault('GIT_COMMITTER_EMAIL', 'airlock@localhost')
+        # This existing Git source ref records only source leaves actually
+        # applied. Failed writes never claim bytes; later targets apply directly.
+        ownership = dict(baseline)
+        ownership.update(previous_source)
+        owned_env = os.environ.copy()
+        owned_env['GIT_INDEX_FILE'] = str(temp / 'source-index')
+        git('read-tree', '--empty', env=owned_env)
+        set_entries(ownership, owned_env)
+        source_parents = ['-p', release]
+        if prior and prior != release:
+            source_parents.extend(['-p', prior])
+        def record_source():
+            owned_tree = git('write-tree', env=owned_env).decode().strip()
+            source_commit = git('commit-tree', owned_tree, *source_parents,
+                                env=identity, data=b'airlock-update: source bytes\n').decode().strip()
+            git('update-ref', 'refs/remotes/airlock-release/main', source_commit)
+        def remember(name, entry):
+            changes = {}
+            if entry:
+                for other in list(ownership):
+                    if other != name and (name.startswith(other + '/') or other.startswith(name + '/')):
+                        ownership.pop(other)
+                        changes[other] = None
+                ownership[name] = entry
+            else:
+                ownership.pop(name, None)
+            changes[name] = entry
+            set_entries(changes, owned_env)
+            record_source()
+        def change_leaf(name, entry, value):
+            path = root / name
+            before = node(path)
+            try:
+                if value is None:
+                    remove(path)
+                else:
+                    write(path, value)
+                remember(name, entry)
+            except (OSError, RuntimeError):
+                # A leaf is owned only once its source ref records it. Undo this
+                # one mutation immediately if either write fails.
+                restore(path, before)
+                raise
+        # Retire only recorded release paths, keeping operator nodes in place.
+        for name in sorted(retired, key=lambda name: name.count('/'), reverse=True):
+            if operator_path(name):
+                continue
+            path = root / name
+            if node(path) is not None and (path.is_symlink() or not path.is_dir()):
+                change_leaf(name, None, None)
+            else:
+                remember(name, None)
+        for name, entry in sorted(incoming.items()):
+            if operator_path(name):
+                continue
+            path = root / name
+            for parent in reversed(path.parents):
+                if parent == root or root not in parent.parents:
+                    continue
+                if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                    change_leaf(str(parent.relative_to(root)), None, None)
+            mode, _ = entry
+            value = ('link', os.fsdecode(blob(entry)), 0o777) if mode == '120000' else (
+                'file', blob(entry), 0o755 if mode == '100755' else 0o644)
+            if not matches(node(path), entry):
+                change_leaf(name, entry, value)
+        record_source()
+        # Record the completed release only after its disk writes succeed.
+        git('read-tree', '--empty', env=index_env)
+        set_entries(staging, index_env)
+        staging_tree = git('write-tree', env=index_env).decode().strip()
+        if (head and release == prior
+                and new_tree == git('rev-parse', head + '^{tree}').decode().strip()):
+            commit = head
+        else:
+            parents = ['-p', head] if head else []
+            commit = git('commit-tree', new_tree, *parents, env=identity,
+                         data=('airlock-update: 배포본 %s 으로 갱신\n' % release).encode()).decode().strip()
+            git('update-ref', 'HEAD', commit, *([head] if head else []))
+        # A failed HEAD write must not turn updater bytes into operator staging.
+        # Publish the prepared index with one native atomic write after HEAD.
+        git('read-tree', staging_tree)
+        print('[airlock-update] 갱신했습니다. 운영자 편집 %d 개를 유지했습니다.' % len(preserve))
 
-release_update_mutex() {
-  local keeper="${AIRLOCK_UPDATE_KEEPER_PID:-}"
-  [ -n "$keeper" ] || return 0
-  AIRLOCK_UPDATE_KEEPER_PID=""
-  kill "$keeper" 2>/dev/null || true
-  wait "$keeper" 2>/dev/null || true
-}
-
-# Run the status surface against the box that the installer actually changes.  On a
-# Mac the checkout is shared into OrbStack, but the services/state live inside the
-# machine; asking macOS would be a clean answer about the wrong computer.
-box_status() { # box_status <checkout> <machine> [state-dir config-path]
-  local root="$1" machine="$2" state_dir="${3-}" config_path="${4-}"
-  if [ "$(platform)" != Darwin ]; then
-    if [ $# -ge 4 ]; then
-      (cd "$root" && AIRLOCK_STATE_DIR="$state_dir" AIRLOCK_CONFIG="$config_path" \
-        python3 bin/airlock-status --json)
-    else
-      (cd "$root" && python3 bin/airlock-status --json)
-    fi
-    return $?
-  fi
-  # shellcheck disable=SC2016 # $1 expands inside the remote bash, not here.
-  if [ $# -ge 4 ]; then
-    orb -m "$machine" env "AIRLOCK_STATE_DIR=$state_dir" \
-      "AIRLOCK_CONFIG=/mnt/mac$config_path" \
-      bash -c 'cd "$1" && python3 bin/airlock-status --json' \
-      airlock-status "/mnt/mac$root"
+except (OSError, RuntimeError) as exc:
+    print('[airlock-update] %s' % exc, file=sys.stderr)
+    sys.exit(1)
+PYTHON
+  local rc=$?
+  [ "$rc" = 0 ] || return "$rc"
+  [ "$dry" = 0 ] && [ "$install" = 1 ] || return 0
+  if [ "${AIRLOCK_UPDATE_UNAME:-$(uname -s)}" = Darwin ]; then
+    AIRLOCK_MACHINE="$machine" bash docker/orbstack-machine-setup.sh
   else
-    orb -m "$machine" bash -c 'cd "$1" && python3 bin/airlock-status --json' \
-      airlock-status "/mnt/mac$root"
+    bash install/airlock-install.sh
   fi
 }
-
-snapshot_regular() { # snapshot_regular <source> <snapshot-dir> <name>
-  local source="$1" out="$2" name="$3"
-  if [ -L "$source" ] || { [ -e "$source" ] && [ ! -f "$source" ]; }; then
-    die "복구 기준 파일이 일반 파일이 아닙니다: $source"
-  fi
-  if [ -f "$source" ]; then
-    cp -- "$source" "$out/$name" || die "복구 기준 파일을 복사하지 못했습니다: $source"
-    chmod 0600 "$out/$name" || die "복구 기준 파일을 보호하지 못했습니다: $name"
-    printf '%s\n' present >"$out/$name.state"
-  else
-    printf '%s\n' absent >"$out/$name.state"
-  fi
-}
-
-installed_record() { # <preserved-ledger> <action> [paths]
-  local engine="$1" action="$2"
-  shift 2
-  python3 - "$engine" "$action" "$@" <<'PY_RECORD'
-from importlib.machinery import SourceFileLoader
-from pathlib import Path
-import sys
-sys.dont_write_bytecode = True
-ledger = SourceFileLoader("_airlock_update_ledger", sys.argv[1]).load_module()
-action, paths = sys.argv[2], sys.argv[3:]
-
-def recorded_repo(row):
-    reader = getattr(ledger, "_recorded_repo", None)
-    if reader is not None:
-        return reader(row)
-    return row.get("repo", "") if isinstance(row, dict) and isinstance(row.get("repo"), str) else ""
-
-def recorded_source(row):
-    repo = recorded_repo(row)
-    if not repo or not Path(repo).is_absolute():
-        return None
-    try:
-        return Path(repo).resolve()
-    except (OSError, ValueError, RuntimeError):
-        return None
-
-if action == "snapshot":
-    present = ledger.snapshot_installed(Path(paths[0]))
-    Path(paths[0] + ".state").write_text("present\n" if present else "absent\n")
-elif action == "restore":
-    ledger.restore_installed(Path(paths[0]) if Path(paths[0] + ".state").read_text().strip() == "present" else None)
-elif action == "rollback-core":
-    ledger.fixture_boundary(ledger.engine_boundary_paths())
-    root, previous_root, before_path, failed_path = paths
-    def rows(path):
-        p = Path(path)
-        return ledger.validate_installed_bytes(p.read_bytes()) if p.is_file() else {}
-    before = rows(before_path)
-    current = ledger.load_installed()
-    failed = rows(failed_path) if Path(failed_path).is_file() else current
-    def own(app, row):
-        source = recorded_source(row)
-        return source is not None and source.name == app and any(
-            source.parent == Path(base).resolve() / "apps" for base in (root, previous_root))
-    selected = {app for app, row in current.items()
-                if own(app, row) and row == failed.get(app)}
-    residue = ledger._remove_paths(
-        {item for app in selected for item in current[app]["artifacts"]},
-        protected_ingress=ledger._other_ingress(current, selected))
-    if residue:
-        for problem in residue: print(problem, file=sys.stderr)
-        raise SystemExit(1)
-    remaining = {app: row for app, row in current.items() if app not in selected}
-    for app, row in before.items():
-        if own(app, row) and (app not in remaining or remaining[app] == row):
-            remaining[app] = row
-    ledger.write_installed(remaining)
-elif action == "validate":
-    ledger.validate_installed_bytes(Path(paths[0]).read_bytes())
-elif action == "teardown":
-    raise SystemExit(ledger.teardown_installed(core_root=Path(paths[0])))
-elif action == "runtime-root":
-    snapshot, previous, fallback = paths
-    rows = ledger.validate_installed_bytes(Path(snapshot).read_bytes()) if Path(snapshot).is_file() else {}
-    root = Path(previous)
-    if (root.is_absolute() and (root / "bin/airlock-status").is_file()
-            and isinstance(rows, dict)
-            and any((source := recorded_source(row)) is not None
-                    and source.name == app and source.parent == root.resolve() / "apps"
-                    for app, row in rows.items())):
-        print(root)
-    else:
-        print(fallback)
-PY_RECORD
-}
-
-snapshot_remote_state() { # <preserved-ledger> <machine> <state-dir> <out>
-  local engine="$1" machine="$2" state_dir="$3" out="$4"
-  # The host's mktemp directory need not be mounted inside OrbStack. Send the
-  # preserved reader with this script and import it from a machine-local file.
-  orb -m "$machine" env "AIRLOCK_STATE_DIR=$state_dir" bash -s -- \
-    "$state_dir" <<SNAPSHOT_REMOTE \
-    | tar -C "$out" -xf - || die "OrbStack 머신의 설치 상태를 보존하지 못했습니다"
-$(declare -f installed_record)
-$(declare -f snapshot_regular)
-set -euo pipefail
-state_dir=\$1
-umask 077
-tmp=\$(mktemp -d)
-trap 'rm -rf -- "\$tmp"' EXIT
-cat >"\$tmp/airlock-ledger" <<'AIRLOCK_SNAPSHOT_LEDGER'
-$(cat -- "$engine")
-AIRLOCK_SNAPSHOT_LEDGER
-installed_record "\$tmp/airlock-ledger" snapshot "\$tmp/install-record.json"
-snapshot_regular "\$state_dir/plaintext-retirement.json" "\$tmp" plaintext-retirement.json
-rm -f -- "\$tmp/airlock-ledger"
-tar -C "\$tmp" -cf - .
-SNAPSHOT_REMOTE
-}
-
-snapshot_box_state() { # snapshot_box_state <root> <machine> <out> [state-dir]
-  local root="$1" machine="$2" out="$3" state_dir
-  if [ "$(platform)" = Darwin ]; then
-    if [ $# -ge 4 ]; then
-      state_dir="$4"
-    else
-      # shellcheck disable=SC2016 # HOME/AIRLOCK_STATE_DIR belong to the machine.
-      state_dir="$(orb -m "$machine" sh -c 'printf %s "${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}"')" \
-        || die "OrbStack 머신의 Airlock 상태 경로를 읽지 못했습니다"
-    fi
-    [ -n "$state_dir" ] || die "OrbStack 머신의 Airlock 상태 경로가 비었습니다"
-    case "$state_dir" in /*) ;; *) die "OrbStack 머신의 Airlock 상태 경로가 절대 경로가 아닙니다: $state_dir" ;; esac
-    case "$state_dir" in *$'\n'*|*$'\r'*) die "Airlock 상태 경로에 줄바꿈이 있어 안전하게 기록할 수 없습니다" ;; esac
-    printf '%s' "$state_dir" >"$out/state-dir"
-    snapshot_remote_state "$record_engine" "$machine" "$state_dir" "$out" || return 1
-  else
-    state_dir="${4-${AIRLOCK_STATE_DIR:-$HOME/.local/state/airlock}}"
-    case "$state_dir" in /*) ;; *) die "Airlock 상태 경로가 절대 경로가 아닙니다: $state_dir" ;; esac
-    case "$state_dir" in *$'\n'*|*$'\r'*) die "Airlock 상태 경로에 줄바꿈이 있어 안전하게 기록할 수 없습니다" ;; esac
-    printf '%s' "$state_dir" >"$out/state-dir"
-    AIRLOCK_STATE_DIR="$state_dir" installed_record "$record_engine" snapshot "$out/install-record.json" || return 1
-    snapshot_regular "$state_dir/plaintext-retirement.json" "$out" plaintext-retirement.json || return 1
-  fi
-}
-
-snapshot_hash() { git hash-object --stdin <"$1"; }
-
-capture_failed_state() { # <root> <machine> <recovery-dir>
-  local root="$1" machine="$2" dir="$3" state_dir name
-  local failed="$dir/failed"
-  state_dir="$(cat "$dir/state-dir")" || return 1
-  mkdir -m 0700 "$failed" || return 1
-  if ! (snapshot_box_state "$root" "$machine" "$failed" "$state_dir"); then
-    return 1
-  fi
-  for name in install-record.json plaintext-retirement.json; do
-    if [ "$(cat "$failed/$name.state")" = present ]; then
-      snapshot_hash "$failed/$name" >"$failed/$name.sha256" || return 1
-    fi
-  done
-  chmod 0600 "$failed"/* || return 1
-}
-
-arm_recovery() { # <dir> <scratch> <before> <config-path> <platform> <machine>
-  local dir="$1" scratch="$2" before="$3" config="$4" os="$5" machine="$6" files="${7:-}" runtime_root="${8:-$ROOT}" name staged
-  staged="$(mktemp -d "$dir.prepare.XXXXXX")" \
-    || die "복구 기록 준비 디렉터리를 만들지 못했습니다: $dir"
-  for name in status-before.json config.snapshot state-dir \
-              install-record.json.state plaintext-retirement.json.state \
-              airlock-update airlock-ledger; do
-    cp -- "$scratch/$name" "$staged/$name" || die "복구 기록을 보존하지 못했습니다: $name"
-  done
-  for name in install-record.json plaintext-retirement.json; do
-    if [ "$(cat "$scratch/$name.state")" = present ]; then
-      cp -- "$scratch/$name" "$staged/$name" || die "복구 기준을 보존하지 못했습니다: $name"
-      snapshot_hash "$staged/$name" >"$staged/$name.sha256"
-    fi
-  done
-  printf '%s' "$before" >"$staged/before"
-  : >"$staged/after"
-  printf '%s' "$config" >"$staged/config-path"
-  printf '%s' "$os" >"$staged/platform"
-  printf '%s' "$machine" >"$staged/machine"
-  printf '%s' "$runtime_root" >"$staged/runtime-root"
-  printf '%s' "$$" >"$staged/pid"
-  snapshot_hash "$staged/config.snapshot" >"$staged/config.snapshot.sha256"
-  for name in before config-path platform machine state-dir runtime-root; do
-    snapshot_hash "$staged/$name" >"$staged/$name.sha256"
-  done
-  printf '%s\n' checkout-pending >"$staged/phase"
-  chmod 0600 "$staged"/* || die "복구 기록 권한을 좁히지 못했습니다"
-  if [ -n "$files" ]; then
-    cp -a -- "$files" "$staged/local-files" || die "업데이트 전 파일 복구 자료를 보존하지 못했습니다"
-
-  fi
-  git update-ref refs/worktree/airlock-update-rollback "$before" \
-    || die "업데이트 전 Git 객체를 복구용으로 고정하지 못했습니다"
-  if ! mv -- "$staged" "$dir"; then
-    git update-ref -d refs/worktree/airlock-update-rollback "$before" >/dev/null 2>&1 || true
-    die "완성한 복구 기록을 제자리에 두지 못했습니다: $dir"
-  fi
-}
-
-activate_recovery() { # <dir> <after>
-  local dir="$1" after="$2" tmp
-  tmp="$dir/after.tmp.$$"
-  printf '%s' "$after" >"$tmp" || die "실패 업데이트 revision 을 복구 기록에 쓰지 못했습니다"
-  chmod 0600 "$tmp" || die "실패 업데이트 revision 기록 권한을 좁히지 못했습니다"
-  mv -f -- "$tmp" "$dir/after" || die "실패 업데이트 revision 을 원자적으로 고정하지 못했습니다"
-  snapshot_hash "$dir/after" >"$dir/after.sha256" \
-    || die "실패 업데이트 revision 해시를 고정하지 못했습니다"
-  chmod 0600 "$dir/after.sha256" || die "실패 업데이트 revision 해시 권한을 좁히지 못했습니다"
-  tmp="$dir/phase.tmp.$$"
-  printf '%s\n' installing >"$tmp" || die "복구 기록 단계를 쓰지 못했습니다"
-  chmod 0600 "$tmp" || die "복구 기록 단계 권한을 좁히지 못했습니다"
-  mv -f -- "$tmp" "$dir/phase" || die "복구 기록 단계를 원자적으로 바꾸지 못했습니다"
-}
-
-record_update_event() { # <git-dir> <event> <before> <after> <rc>
-  local git_dir="$1" event="$2" before="$3" after="$4" rc="$5"
-  printf '%s\t%s\tbefore=%s\tafter=%s\trc=%s\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$event" "$before" "$after" "$rc" \
-    >>"$git_dir/airlock-update.log"
-}
-
-validate_snapshot() { # <dir> <name>
-  local dir="$1" name="$2" state expected actual
-  if [ ! -f "$dir/$name.state" ] || [ -L "$dir/$name.state" ]; then
-    die "복구 기록이 불완전합니다: $name.state"
-  fi
-  state="$(cat "$dir/$name.state")"
-  case "$state" in
-    absent) [ ! -e "$dir/$name" ] || die "없어야 할 복구 기준 파일이 생겼습니다: $name" ;;
-    present)
-      if [ ! -f "$dir/$name" ] || [ -L "$dir/$name" ] || [ ! -f "$dir/$name.sha256" ]; then
-        die "복구 기준 파일이 불완전합니다: $name"
-      fi
-      expected="$(cat "$dir/$name.sha256")"; actual="$(snapshot_hash "$dir/$name")"
-      [ "$actual" = "$expected" ] || die "복구 기준 파일 해시가 달라졌습니다: $name" ;;
-    *) die "복구 기준 파일 상태가 잘못됐습니다: $name ($state)" ;;
-  esac
-}
-
-# Remove current recorded artifacts, then restore the preserved app record.
-teardown_and_restore_box_state() { # <root> <machine> <state-dir> <snapshot-dir> <failed-dir>
-  local root="$1" machine="$2" state_dir="$3" snapshot_dir="$4" failed_dir="$5"
-  local box_root="$root" previous_root="${runtime_root:-$root}"
-  [ "$(platform)" != Darwin ] || box_root="/mnt/mac$root"
-  local script
-  script="$(
-    declare -f installed_record
-    cat <<'ROLLBACK_BODY'
-set -euo pipefail
-root=$1; state_dir=$2; snapshot_dir=$3; failed_dir=$4; engine=$5; previous_root=$6
-if [ -f "$failed_dir/state-dir" ]; then
-  [ "$(cat "$failed_dir/state-dir")" = "$state_dir" ] || exit 43
-fi
-retirement="$state_dir/plaintext-retirement.json"
-installed_record "$engine" rollback-core "$root" "$previous_root" \
-  "$snapshot_dir/install-record.json" "$failed_dir/install-record.json"
-if [ -L "$retirement" ] || { [ -e "$retirement" ] && [ ! -f "$retirement" ]; }; then
-  exit 0
-fi
-if [ -f "$failed_dir/plaintext-retirement.json" ]; then
-  cmp -s "$failed_dir/plaintext-retirement.json" "$retirement" || exit 0
-elif [ -e "$retirement" ]; then
-  exit 0
-fi
-if [ "$(cat "$snapshot_dir/plaintext-retirement.json.state")" = absent ]; then
-  rm -f -- "$retirement"
-else
-  tmp="$retirement.airlock-rollback.$$"
-  cp -- "$snapshot_dir/plaintext-retirement.json" "$tmp"
-  chmod 0600 "$tmp"
-  mv -f -- "$tmp" "$retirement"
-fi
-ROLLBACK_BODY
-  )"
-  if [ "$(platform)" = Darwin ]; then
-    orb -m "$machine" env "AIRLOCK_STATE_DIR=$state_dir" bash -s -- \
-      "$box_root" "$state_dir" "/mnt/mac$snapshot_dir" "/mnt/mac$failed_dir" "/mnt/mac$record_engine" "/mnt/mac$previous_root" <<<"$script"
-  else
-    (cd "$root" && AIRLOCK_STATE_DIR="$state_dir" bash -s -- \
-      "$box_root" "$state_dir" "$snapshot_dir" "$failed_dir" "$record_engine" "$previous_root" <<<"$script")
-  fi
-}
-
-rollback_update() { # <root> <machine-option> <machine-marker>
-  local root="$1" requested_machine="$2" marker="$3" git_dir dir phase before after
-  local saved_platform saved_machine machine head parent config_path state_dir runtime_root="$root" rc=0
-  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" \
-    || die "git 메타데이터 경로를 읽지 못했습니다"
-  acquire_update_mutex "$git_dir"
-  dir="$git_dir/airlock-update-rollback"
-  if [ ! -d "$dir" ] || [ -L "$dir" ]; then
-    die "되돌릴 실패 업데이트 기록이 없습니다"
-  fi
-  for f in phase before before.sha256 after after.sha256 config-path config-path.sha256 \
-           platform platform.sha256 machine machine.sha256 \
-           state-dir state-dir.sha256 \
-           airlock-update airlock-ledger; do
-    if [ ! -f "$dir/$f" ] || [ -L "$dir/$f" ]; then
-      die "복구 기록이 불완전합니다: $f"
-    fi
-  done
-  record_engine="$dir/airlock-ledger"
-  phase="$(cat "$dir/phase")"; before="$(cat "$dir/before")"; after="$(cat "$dir/after")"
-  saved_platform="$(cat "$dir/platform")"; saved_machine="$(cat "$dir/machine")"
-  config_path="$(cat "$dir/config-path")"; state_dir="$(cat "$dir/state-dir")"
-  for f in before after config-path platform machine state-dir; do
-    [ "$(snapshot_hash "$dir/$f")" = "$(cat "$dir/$f.sha256")" ] \
-      || die "복구 기록의 metadata가 달라졌습니다: $f"
-  done
-  if [ -f "$dir/runtime-root" ]; then
-    [ "$(snapshot_hash "$dir/runtime-root")" = "$(cat "$dir/runtime-root.sha256")" ] \
-      || die "복구 기록의 metadata가 달라졌습니다: runtime-root"
-    runtime_root="$(cat "$dir/runtime-root")"
-  fi
-  case "$state_dir" in /*) ;; *) die "복구 기록의 설치 상태 경로가 절대 경로가 아닙니다: $state_dir" ;; esac
-  [ "$(platform)" = "$saved_platform" ] \
-    || die "업데이트한 플랫폼($saved_platform)과 지금 플랫폼($(platform))이 다릅니다"
-  machine="$saved_machine"
-  if [ "$saved_platform" = Darwin ]; then
-    [ -z "$requested_machine" ] || [ "$requested_machine" = "$saved_machine" ] \
-      || die "업데이트 기록의 머신은 '$saved_machine' 입니다. '$requested_machine' 으로 바꿔 되돌리지 않습니다"
-    machine="$(resolve_machine "$saved_machine" "$marker")" || return 1
-  elif [ -n "$requested_machine" ]; then
-    die "리눅스에서 기록하지 않은 --machine 을 붙여 되돌리지 않습니다"
-  fi
-  case "$before:$after" in
-    *[!0-9a-f:]*|:*|*:) die "복구 기록의 Git revision 이 잘못됐습니다" ;;
-  esac
-  git cat-file -e "$before^{commit}" 2>/dev/null || die "업데이트 전 Git 객체가 없습니다: $before"
-  git cat-file -e "$after^{commit}" 2>/dev/null || die "실패 업데이트 Git 객체가 없습니다: $after"
-  if [ "$before" != "$after" ]; then
-    parent="$(git rev-parse "$after^")" || die "실패 업데이트의 부모 revision 을 읽지 못했습니다"
-    [ "$parent" = "$before" ] || die "실패 업데이트가 기록된 이전 revision 바로 위에 있지 않습니다"
-  fi
-  head="$(git rev-parse HEAD)" || die "현재 revision 을 읽지 못했습니다"
-  [ "$head" = "$after" ] || [ "$head" = "$before" ] \
-    || die "현재 HEAD($head)가 복구 대상 revision과 다릅니다"
-  validate_snapshot "$dir" install-record.json
-  validate_snapshot "$dir" plaintext-retirement.json
-  if [ "$phase" != rollback-failed ] && [ "$phase" != rollback-installing ]; then
-    if [ "$phase" != tearing-down ]; then
-      printf '%s\n' resetting-checkout >"$dir/phase"
-      if [ -d "$dir/local-files" ]; then
-        local_files rollback "$root" "$dir/local-files" "$before" "$after" \
-          || die "업데이트가 덮은 로컬 파일을 복원하지 못했습니다"
-      else
-        git read-tree -u -m "$after" "$before" \
-          || die "업데이트 전 대상 파일을 복원하지 못했습니다"
-        [ "$head" = "$before" ] || git update-ref HEAD "$before" "$after" \
-          || die "업데이트 전 revision으로 돌아가지 못했습니다"
-      fi
-    fi
-    printf '%s\n' tearing-down >"$dir/phase"
-    teardown_and_restore_box_state "$root" "$machine" "$state_dir" "$dir" "$dir/failed" \
-      || die "기록된 설치 흔적 정리와 이전 앱 기록 복원을 끝내지 못했습니다"
-  fi
-
-  printf '%s' "$$" >"$dir/pid"
-  printf '%s\n' rollback-installing >"$dir/phase"
-  say "이전 설치기를 다시 적용하는 중…"
-  if [ "$saved_platform" = Darwin ]; then
-    orb -m "$machine" env "AIRLOCK_CONFIG=/mnt/mac$config_path" "AIRLOCK_STATE_DIR=$state_dir" \
-      bash "/mnt/mac$root/install/airlock-install.sh" || rc=$?
-  else
-    (cd "$runtime_root" && AIRLOCK_CONFIG="$config_path" AIRLOCK_STATE_DIR="$state_dir" \
-      bash install/airlock-install.sh) || rc=$?
-  fi
-  if [ "$rc" != 0 ]; then
-    printf '%s\n' rollback-failed >"$dir/phase"
-    record_update_event "$git_dir" rollback-install-failed "$before" "$after" "$rc"
-    say "checkout 과 상태 기록은 이전 것으로 돌렸지만 이전 설치기 재적용이 실패했습니다 (rc=$rc)."
-    say "다시 시도:  AIRLOCK_DIR=\"$root\" bash \"$dir/airlock-update\" --rollback"
-    return "$rc"
-  fi
-  box_status "$runtime_root" "$machine" "$state_dir" "$config_path" \
-    >"$dir/status-after-rollback.json" || true
-  cat "$dir/status-after-rollback.json"
-  record_update_event "$git_dir" rollback-ok "$before" "$after" 0
-  git update-ref -d refs/worktree/airlock-update-rollback "$before" \
-    || die "복구용 Git ref 를 정리하지 못했습니다"
-  rm -rf -- "$dir"
-  say "업데이트 전 checkout 과 Airlock 관리 상태로 되돌렸습니다."
-  say "범위: 앱 데이터·OS 패키지·OrbStack 머신 자체는 박스 백업 대상이며 이 롤백이 되감지 않습니다."
-  return 0
-}
-
-# Record the applied release so a failed reinstall can identify its checkout.
-# This is an operational record, not a contribution: authoring hooks and commit
-# signing cannot block it. A real Git write failure still stops before installation;
-# local edits remain available in the owner-private archive printed above.
-checkout_undo_command() { # <root> <before-revision> <local-files-bundle>
-  local root="$1" before="$2" bundle="$3" command="" restore=""
-  if [ -n "$before" ]; then
-    printf -v command 'git -C %q reset --hard %q' "$root" "$before"
-  fi
-  if [ -n "$bundle" ]; then
-    printf -v restore 'bash %q %q' "$bundle/restore.sh" "$root"
-    [ -z "$command" ] || command+=" && "
-    command+="$restore"
-  fi
-  printf '%s' "$command"
-}
-
-commit_release_or_die() {
-  local message="$1" before="$2" root="$3" bundle="$4" out
-  if ! out="$(git -c user.name=airlock -c user.email=airlock@localhost \
-                  -c commit.gpgsign=false \
-                  commit -q --no-verify -m "$message" 2>&1)"; then
-    case "$out" in *"nothing to commit"*|*"nothing added"*) return 0 ;; esac
-    die "배포본 checkout 을 Git revision 으로 기록하지 못해 설치기를 실행하지 않습니다.
-       이 revision 이 없으면 자동 롤백의 현재 지점을 증명할 수 없습니다.
-       checkout 복원: $(checkout_undo_command "$root" "$before" "$bundle")
-       git 이 한 말: ${out}"
-  fi
-}
-
-# Names, not just a count: "바뀔 파일 3 개" is not something an operator can check.
-report_list() {
-  printf '%s' "$1" | grep -c . >/dev/null || return 0
-  local total shown
-  total="$(printf '%s' "$1" | grep -c .)"
-  shown=12
-  if [ "${AIRLOCK_UPDATE_JSON:-0}" = 1 ]; then
-    awk -v shown="$shown" 'length($0) > 0 { print "         " $0; if (++count >= shown) exit }' \
-      <<<"$1" >&2
-    [ "$total" -gt "$shown" ] && printf '         … 그리고 %s 개 더\n' "$((total - shown))" >&2
-  else
-    awk -v shown="$shown" 'length($0) > 0 { print "         " $0; if (++count >= shown) exit }' \
-      <<<"$1"
-    [ "$total" -gt "$shown" ] && printf '         … 그리고 %s 개 더\n' "$((total - shown))"
-  fi
-  return 0
-}
-
-# On a Mac the install lives in an OrbStack Linux machine, and its NAME is
-# per-operator: docker/orbstack-machine-setup.sh falls back to `airlock`, but the
-# install guide has people pass their own. Running the setup script without one would
-# not update their machine — it would CREATE A SECOND ONE and install into it, which
-# looks like a successful update and leaves the box they actually use untouched.
-resolve_machine() {
-  local given="$1" marker="$2" listing rc name found="" count
-  command -v orb >/dev/null 2>&1 \
-    || die "orb 을 찾지 못했습니다. OrbStack 을 한 번 실행한 뒤 다시 시도해 주세요."
-
-  if [ -n "$given" ]; then
-    # An explicit name gets the SAME check as a detected one. It is the documented
-    # escape from every detection failure, so leaving it unchecked would put the
-    # "second machine" outcome one typo away — and the setup script creates a machine
-    # whose name it does not recognise rather than refusing.
-    if orb run -m "$given" test -d "$marker" >/dev/null 2>&1; then
-      printf '%s' "$given"; return 0
-    fi
-    die "'$given' 에서 Airlock 설치를 찾지 못했습니다.
-       이름이 정확한지 봐 주세요 — 없는 이름을 주면 설치기가 그 이름으로 새 머신을 만듭니다.
-       목록: $(orb list 2>/dev/null | sed 's/[[:cntrl:]]\[[0-9;]*m//g' | awk 'NR>0 && $1!="NAME" {printf "%s ", $1}')"
-  fi
-
-  say "Airlock 이 설치된 리눅스 머신을 찾는 중…" >&2
-  # `orb list` failing is a different problem from "no machine has Airlock", and
-  # reporting the second when it is the first sends the operator to --machine, which
-  # is the one path that can build a machine they did not ask for.
-  listing="$(orb list 2>/dev/null)"; rc=$?
-  if [ "$rc" -ne 0 ]; then
-    die "OrbStack 에 머신 목록을 물어보지 못했습니다 (orb list 가 실패). OrbStack 이 켜져 있는지 봐 주세요."
-  fi
-  # Only machines that are ALREADY RUNNING are probed. `orb run` starts a stopped
-  # machine, so probing everything would boot every OrbStack machine the operator has —
-  # including ones that have nothing to do with Airlock — as a side effect of asking a
-  # question. Stopped ones are named at the end instead, so a stopped Airlock machine is
-  # still findable, by --machine, which starts exactly the one they chose.
-  #
-  # Strip ANSI: orb prints no colour into a pipe today (measured on the Mac mini), but a
-  # coloured name would silently match nothing and end up at --machine.
-  local skipped=""
-  while IFS=$'\t' read -r name state; do
-    [ -n "$name" ] || continue
-    case "$name" in NAME) continue ;; esac
-    if [ -n "$state" ] && [ "$state" != running ]; then
-      skipped="$skipped$name ($state)"$'\n'
-      continue
-    fi
-    if orb run -m "$name" test -d "$marker" >/dev/null 2>&1; then
-      found="$found$name"$'\n'
-    fi
-  done <<EOF
-$(printf '%s\n' "$listing" | sed 's/[[:cntrl:]]\[[0-9;]*m//g' | awk '{printf "%s\t%s\n", $1, $2}')
-EOF
-  count="$(awk 'NF { count++ } END { print count + 0 }' <<<"$found")"
-  case "$count" in
-    1) name="$(awk 'NF { print; exit }' <<<"$found")"
-       say "찾았습니다: $name" >&2; printf '%s' "$name"; return 0 ;;
-    0) die "돌고 있는 머신 중에 Airlock 이 설치된 것을 찾지 못했습니다.$(
-         [ -n "$skipped" ] && printf '\n       %s' "멈춰 있어 확인하지 않은 머신: $(printf '%s' "$skipped" | tr '\n' ' ')"
-       )
-       머신 이름을 아시면 이렇게 알려 주세요:  bash bin/airlock-update --machine <이름>
-       (설치할 때 쓰신 이름입니다. 'orb list' 로 목록을 볼 수 있습니다)" ;;
-    *) die "Airlock 이 설치된 머신이 여러 개입니다:
-$(printf '%s' "$found" | grep . | sed 's/^/         /')
-       어느 것을 갱신할지 골라 주세요:  bash bin/airlock-update --machine <이름>" ;;
-  esac
-}
-
 main "$@"
 }
 airlock_update_program "$@"

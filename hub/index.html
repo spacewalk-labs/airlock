@@ -2006,7 +2006,6 @@ if (("standalone" in navigator) && navigator.standalone) {
     detailKv.textContent = "";
     kv("식별자", value.id);
     kv("경로", value.path);
-    kv("해시", value.digest);
     kv("포트", previewPorts(value));
     kv("신뢰", "이 코드를 운영자 권한으로 실행함 — 샌드박스 아님");
     detailCaps.textContent = "";
@@ -2143,7 +2142,7 @@ if (("standalone" in navigator) && navigator.standalone) {
     }
     let value = null; try { value = await response.json(); } catch (_) {}
     addSubmit.disabled = false;
-    if (!response.ok || !value || !value.id || !value.digest) {
+    if (!response.ok || !value || !value.id) {
       const messages = { bad_package_path: "경로를 확인하십시오.", config_invalid: "manifest 또는 현재 설정을 검증하지 못했습니다." };
       setAlert(messages[value && value.error] || "미리보기가 거부됐습니다 (HTTP " + response.status + ").", true);
       return;

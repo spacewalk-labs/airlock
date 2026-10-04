@@ -451,8 +451,14 @@ emit installer-start source_sha "$source_sha"
 install_log=/var/log/airlock-gui-install.log
 set_failure installer stock-installer-failed "Airlock 앱 설치를 끝내지 못했습니다." "다시 시도해 주세요. 계속 실패하면 자세히의 오류 코드와 설치 기록을 담당자에게 보여 주세요." "$install_log"
 if ! su - "$user" -c \
-  "cd '$source_root' && export AIRLOCK_CONFIG='$config' XDG_RUNTIME_DIR='/run/user/$uid' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/$uid/bus'; bash install/airlock-install.sh" \
-  >"$install_log" 2>&1; then
+  "export XDG_RUNTIME_DIR='/run/user/$uid' DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/$uid/bus'; bash -s -- '$source_root' '$config'" \
+  >"$install_log" 2>&1 <<'SH_APPLY'
+cd "$1" || exit 1
+export AIRLOCK_CONFIG="$2"
+. install/lib.sh
+airlock_install_selected
+SH_APPLY
+then
   tail -80 "$install_log" >&2
   die "stock installer failed (full log: $install_log)"
 fi

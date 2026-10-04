@@ -1425,7 +1425,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- update execution (owner gate, no message console) ----
     def _owner_update_run(self, run_id=None):
-        """Report the requested or latest update run and the checkout mutex.
+        """Report the requested or latest update run and live platform processes.
 
         `busy` is deliberately three-valued. `null` means the question could not be
         measured on this box, and answering `false` there would be the exact absence

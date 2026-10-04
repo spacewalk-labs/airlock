@@ -1074,10 +1074,12 @@ class UpdatesCollectorTest(unittest.TestCase):
 
     def test_platform_and_plan_become_the_public_contract(self):
         calls = []
+        unusual = ['Tab\tApp', 'Line\nApp', ' My App ', 'Trailing ']
         package_info = {'packages': {
             'notes': {'source_class': 'shipped'},
             'external': {'source_class': 'explicit'},
         }}
+        package_info['packages'].update({app: {'source_class': 'explicit'} for app in unusual})
         package_info_text = json.dumps(package_info)
 
         def run(argv, **kwargs):
@@ -1091,17 +1093,20 @@ class UpdatesCollectorTest(unittest.TestCase):
             if argv[1].endswith('airlock-ledger'):
                 self.assertEqual(kwargs['input_text'], package_info_text)
                 return types.SimpleNamespace(returncode=0, stderr='',
-                                             stdout='reinstall\tnotes\nupgrade-diff\tnotes\nupgrade-deactivate\texternal\n')
+                                             stdout=json.dumps([['reinstall', 'notes'],
+                                                 ['upgrade-diff', 'notes'], ['upgrade-deactivate', 'external']]
+                                                 + [['upgrade-diff', app] for app in unusual]))
             self.fail('unexpected command: %r' % (argv,))
 
         self.updates._run = run
         root = Path('/fixture')
         self.assertEqual(self.updates._platform(root),
                          {'available': True, 'changedCount': 2, 'ref': 'main'})
-        self.assertEqual(self.updates._apps(root), [
+        self.assertEqual(self.updates._apps(root), sorted([
             {'id': 'external', 'action': 'upgrade', 'sourceClass': 'explicit'},
             {'id': 'notes', 'action': 'upgrade', 'sourceClass': 'shipped'},
-        ])
+        ] + [{'id': app, 'action': 'upgrade', 'sourceClass': 'explicit'} for app in unusual],
+            key=lambda row: row['id']))
 
     def test_partial_or_malformed_snapshot_is_never_served(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1601,7 +1606,7 @@ def live_wrapper():
 
 
 class UpdateExecModuleTest(unittest.TestCase):
-    """devmon_update_exec on its own: the lock probe, liveness, argv and recovery.
+    """devmon_update_exec on its own: process observation, liveness and argv.
 
     Every assertion here is about a claim the panel makes to a person, so the ones
     that matter most are the negative ones — "nothing is running", "there is nothing
@@ -1616,50 +1621,72 @@ class UpdateExecModuleTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    # ---- the updater's mutex ------------------------------------------------
-    def _repo(self):
+    # ---- platform process observation --------------------------------------
+    def test_actual_updater_is_busy_through_its_installer_and_clears_after_exit(self):
+        release = Path(self.tmp.name) / 'release'
         root = Path(self.tmp.name) / 'checkout'
-        root.mkdir()
-        rc = subprocess.call(['git', 'init', '-q', str(root)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if rc != 0:
-            self.skipTest('git is not available')
-        return root
-
-    def test_the_lock_probe_has_a_positive_control(self):
-        """The whole point of the probe is to be able to say 'busy'. Prove it can.
-
-        Without this the free/busy answer is untestable in the direction that matters:
-        a probe that always answered False would pass every other assertion here.
-        """
-        import fcntl
-        root = self._repo()
-        self.assertIs(UPX.updater_busy(root), False)         # control: free
-        git = UPX.git_dir(root)
-        self.assertIsNotNone(git)
-        descriptor = os.open(str(git), os.O_RDONLY)
+        (release / 'bin').mkdir(parents=True)
+        (release / 'install').mkdir()
+        shutil.copyfile(Path(HERE).parents[1] / 'bin/airlock-update',
+                        release / 'bin/airlock-update')
+        ready = Path(self.tmp.name) / 'ready'
+        finish = Path(self.tmp.name) / 'finish'
+        (release / 'install/airlock-install.sh').write_text(
+            '#!/bin/bash\ntouch "$UPX_BUSY_READY"\n'
+            'while [ ! -e "$UPX_BUSY_FINISH" ]; do sleep 0.02; done\n')
+        env = {k: v for k, v in os.environ.items() if not k.startswith('AIRLOCK_')}
+        env.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
+                   GIT_AUTHOR_NAME='fixture', GIT_AUTHOR_EMAIL='fixture@invalid',
+                   GIT_COMMITTER_NAME='fixture', GIT_COMMITTER_EMAIL='fixture@invalid',
+                   AIRLOCK_DIR=str(root), AIRLOCK_RELEASE_URL=str(release),
+                   AIRLOCK_RELEASE_REF='main', AIRLOCK_SELFKILL_ESCAPED='1',
+                   UPX_BUSY_READY=str(ready),
+                   UPX_BUSY_FINISH=str(finish))
+        for argv in (['git', '-C', str(release), 'init', '-q', '-b', 'main'],
+                     ['git', '-C', str(release), 'add', '.'],
+                     ['git', '-C', str(release), 'commit', '-qm', 'fixture'],
+                     ['git', 'clone', '-q', str(release), str(root)]):
+            subprocess.run(argv, env=env, check=True, capture_output=True)
+        self.assertIs(UPX.updater_busy(root), False)
+        proc = subprocess.Popen(['bash', str(root / 'bin/airlock-update')],
+                                env=env, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertIs(UPX.updater_busy(root), True)      # the same lock airlock-update takes
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline and proc.poll() is None:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), 'actual updater did not reach its installer')
+            self.assertIs(UPX.updater_busy(root), True)
+            self.assertIs(UPX.updater_busy(release), False)
+            finish.touch()
+            self.assertEqual(proc.wait(timeout=10), 0)
+            self.assertIs(UPX.updater_busy(root), False)
         finally:
-            os.close(descriptor)
-        self.assertIs(UPX.updater_busy(root), False)         # and it clears
+            finish.touch()
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=10)
 
-    def test_the_probe_never_takes_the_lock_it_measures(self):
-        """A probe that acquired the mutex would kill a real update started one tick later."""
-        import fcntl
-        root = self._repo()
-        for _ in range(5):
-            UPX.updater_busy(root)
-        git = UPX.git_dir(root)
-        descriptor = os.open(str(git), os.O_RDONLY)
+    def test_other_process_with_updater_path_argument_is_not_busy(self):
+        root = Path(self.tmp.name)
+        path = str(root / 'bin/airlock-update')
+        proc = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)', path])
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)   # raises if we held it
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if os.fsencode(path) in Path('/proc/%d/cmdline' % proc.pid).read_bytes():
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail('could not observe the actual child argument')
+            self.assertIs(UPX.updater_busy(root), False)
         finally:
-            os.close(descriptor)
+            proc.terminate()
+            proc.wait(timeout=10)
 
-    def test_a_directory_that_is_not_a_checkout_is_not_busy(self):
-        self.assertIs(UPX.updater_busy(Path(self.tmp.name) / 'nowhere'), False)
+    def test_unreadable_process_metadata_is_unmeasured(self):
+        with unittest.mock.patch.object(Path, 'iterdir', side_effect=PermissionError):
+            self.assertIsNone(UPX.updater_busy(Path(self.tmp.name)))
 
     # ---- liveness -----------------------------------------------------------
     def test_a_record_with_no_pid_is_starting_then_interrupted(self):
@@ -1690,7 +1717,7 @@ class UpdateExecModuleTest(unittest.TestCase):
         """Both buttons run the same command; the id is provenance, not an argument."""
         plan = UPX.build_plan(Path('/opt/airlock'), self.dir, 'r1', 'app', 'notes')
         self.assertNotIn('notes', ' '.join(plan['exec'][:1]))
-        self.assertIn('--app', plan['exec'])
+        self.assertIn('--app=notes', plan['exec'])
         self.assertTrue(os.path.isabs(plan['exec'][0]))
         self.assertEqual(plan['cwd'], plan['cwd_root'])
 
@@ -1737,19 +1764,6 @@ class UpdateExecModuleTest(unittest.TestCase):
         missing = UPX.status_summary(Path(self.tmp.name) / 'absent')
         self.assertEqual(missing['rc'], 127)
 
-    def test_recovery_is_offered_only_where_the_updater_armed_it(self):
-        root = self._repo()
-        unarmed = UPX.recovery_hint(root)
-        self.assertIs(unarmed['available'], False)
-        self.assertIn('--rollback', unarmed['command'])
-        self.assertIn('reason', unarmed)
-        armed_dir = UPX.git_dir(root) / 'airlock-update-rollback'
-        armed_dir.mkdir(parents=True)
-        (armed_dir / 'airlock-update').write_text('#!/usr/bin/env bash\n')
-        armed = UPX.recovery_hint(root)
-        self.assertIs(armed['available'], True)
-        self.assertIn(str(armed_dir / 'airlock-update'), armed['command'])
-        self.assertIn('--rollback', armed['command'])
 
 
 class AppStoreProjectionTest(unittest.TestCase):
@@ -1789,7 +1803,6 @@ class AppStoreProjectionTest(unittest.TestCase):
         preview = APPSTORE.package_preview(root, str(package))
         self.assertEqual(preview['id'], 'learning')
         self.assertTrue(preview['installable'])
-        self.assertRegex(preview['digest'], r'^[0-9a-f]{64}$')
         self.assertEqual(self.config.read_bytes(), before_config)
         self.assertEqual(lock.read_bytes() if lock.exists() else None, before_lock)
 
@@ -1829,7 +1842,7 @@ class AppStoreProjectionTest(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), before_config)
         self.assertEqual(record.read_bytes(), before_record)
 
-    def test_package_preview_reports_bundle_only_capability_instead_of_mutating(self):
+    def test_package_preview_keeps_capability_metadata_without_install_denial(self):
         root = Path(HERE).parents[1]
         package = Path(self.tmp.name) / 'denied-package'
         package.mkdir()
@@ -1847,8 +1860,9 @@ class AppStoreProjectionTest(unittest.TestCase):
                 'test "$public_port" -ne "$redirect_port"\n')
         before = self.config.read_bytes()
         preview = APPSTORE.package_preview(root, str(package))
-        self.assertIn('plaintext-redirect', preview['rejected_capabilities'])
-        self.assertFalse(preview['installable'])
+        self.assertIn('plaintext-redirect', preview['requested_capabilities'])
+        self.assertEqual(preview['rejected_capabilities'], [])
+        self.assertTrue(preview['installable'])
         self.assertEqual(self.config.read_bytes(), before)
 
     def test_personal_preview_reports_grantable_capability_without_mutating(self):
@@ -1864,7 +1878,8 @@ class AppStoreProjectionTest(unittest.TestCase):
         before = self.config.read_bytes()
         preview = APPSTORE.package_preview(root, str(package))
         self.assertTrue(preview['installable'])
-        self.assertEqual(preview['grants'], ['system-unit'])
+        self.assertIn('system-unit', preview['requested_capabilities'])
+        self.assertIn('system-unit', preview['effective_capabilities'])
         self.assertEqual(self.config.read_bytes(), before)
 
     def test_store_rows_state_comes_from_the_install_record_not_the_config(self):
@@ -1951,31 +1966,35 @@ class AppStoreProjectionTest(unittest.TestCase):
     def test_only_committed_ledger_rows_count_as_installed(self):
         """10 · an intent records that an install started, not that it finished."""
         root = Path(HERE).parents[1]
-        ledger = root / 'bin' / 'airlock-ledger'
-        saved = APPSTORE.subprocess.run
+        state = Path(os.environ['AIRLOCK_STATE_DIR'])
+        state.mkdir()
+        entries = {app: {'committed': {'path': str(Path(self.tmp.name) / app)}}
+                   for app in ('alpha', 'gamma', 'delta', 'v7')}
+        entries['beta'] = {'intent': {}}
+        entries['gamma']['intent'] = {}
+        legacy = state / 'app-ledger.json'
+        legacy.write_text(json.dumps({'version': 7, 'entries': entries}))
+        before = legacy.read_bytes()
+        self.assertEqual(APPSTORE.installed_ids(root), ['alpha', 'delta', 'gamma', 'v7'])
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertFalse((state / 'installed-apps.json').exists())
 
-        class Result:
-            returncode = 0
-            stderr = ''
-            stdout = (
-                'alpha\tstate=committed\tpath=/x\n'
-                'beta\tstate=intent\n'
-                # The real ledger emits this shape for an app whose update is in
-                # flight. It is installed, and reading it as not installed hides it
-                # from its own home screen for the length of the update.
-                'gamma\tstate=committed+intent\tpath=/y\n'
-                'delta\tstate=intent+committed\n'
-                'epsilon\tpath=/z\n'
-                'v7\trepo=/source\tcommit=abc\tartifacts=2\n'
-                '\n')
-
-        APPSTORE.subprocess.run = lambda *args, **kwargs: Result()
-        try:
-            self.assertEqual(APPSTORE.installed_ids(root),
-                             ['alpha', 'gamma', 'delta', 'v7'])
-        finally:
-            APPSTORE.subprocess.run = saved
-        self.assertTrue(ledger.is_file())
+    def test_actual_list_consumers_preserve_whitespace_ids_and_revisions(self):
+        root = Path(HERE).parents[1]
+        ids = ['Tab\tApp', 'Line\nApp', ' My App ', 'Trailing ', 'Trailing\n']
+        rows = {app: {'repo': str(Path(self.tmp.name) / app),
+                      'commit': 'observed-revision', 'artifacts': []} for app in ids}
+        state = Path(os.environ['AIRLOCK_STATE_DIR'])
+        state.mkdir()
+        record = state / 'installed-apps.json'
+        record.write_text(json.dumps(rows))
+        before = record.read_bytes()
+        self.assertEqual(APPSTORE.installed_ids(root), sorted(ids))
+        for app in ids:
+            summary = UPX.app_summary(root, app)
+            self.assertEqual((summary['rc'], summary['appId'], summary['installed'], summary['revision']),
+                             (0, app, True, 'observed-revision'))
+        self.assertEqual(record.read_bytes(), before)
 
     def test_a_failing_ledger_command_is_unavailable_not_empty(self):
         """9 · an empty list would blank the home screen; this must not be one."""
@@ -2391,12 +2410,14 @@ class UpdateExecRouteTest(unittest.TestCase):
 
     def test_a_current_app_can_be_reapplied_without_a_plan(self):
         DM.UPDATES = types.SimpleNamespace(current=lambda *args: self.fail('execution read plan'))
-        status, payload = self._execute({'action': 'app', 'id': 'orca'})
+        app_id = 'Selected.App-' + 'x' * 40
+        status, payload = self._execute({'action': 'app', 'id': app_id})
         self.assertEqual(status, 200, payload)
         self.assertEqual(len(self.launched), 1)
+        self.assertEqual(UPX.read_record(self.dir)['appId'], app_id)
 
     def test_a_malformed_app_id_is_refused_before_the_snapshot_is_consulted(self):
-        for bad in ('../../etc', 'Notes', '', 'a' * 40, None, 5):
+        for bad in ('../../etc', '.', '..', '', 'a\x00b', None, 5):
             status, payload = self._execute({'action': 'app', 'id': bad})
             self.assertEqual((status, payload['error']), (400, 'bad_app_id'), bad)
         self.assertEqual(self.launched, [])
@@ -2601,7 +2622,7 @@ class UpdateExecRouteTest(unittest.TestCase):
                     installed_public = json.loads((fixture / 'state/installed-apps.json').read_text())['notepad']
                     self.assertEqual(installed_public['repo'], str(root / 'apps/notepad'))
                     for app_id in ('wire-beta', 'wire-alpha'):
-                        self.assertEqual(self._req('POST', '/api/owner/apps/' + app_id + '/install', b'{}')[0], 200)
+                        self.assertEqual(self._req('POST', '/api/owner/apps/' + app_id + '/install', b'{"source":"company"}')[0], 200)
                         # A local Company Git path remains a repository source
                         # after the first recorded row; the next GET/Install works.
                         row = json.loads((fixture / 'state/installed-apps.json').read_text())[app_id]
@@ -2728,7 +2749,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertEqual((status, value['execution']), (200, 'teardown'))
             argv = self.launched[-1][1]['exec']
             self.assertNotIn('--package-path', argv)
-            self.assertEqual(argv[argv.index('--app') + 1], 'lost-source')
+            self.assertIn('--app=lost-source', argv)
             UPX.run_path(self.dir).unlink()
             self.assertEqual(self._req('POST', '/api/owner/apps/hub/remove', b'{}')[0], 409)
             self.assertEqual(self._req('POST', '/api/owner/apps/absent/remove', b'{}')[0], 200)
@@ -2875,7 +2896,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertEqual((status, payload['execution']), (200, 'teardown'))
             status, payload = self._req('POST', '/api/owner/apps/notepad/remove', b'{}')
             self.assertEqual((status, payload['execution']), (200, 'teardown'))
-            self.assertEqual(self.launched[-1][1]['exec'][-1], 'notepad')
+            self.assertIn('--app=notepad', self.launched[-1][1]['exec'])
         finally:
             (DM.APPS.store_rows, DM.APPS.installed_ids) = saved
 
@@ -2968,7 +2989,7 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         self.seen = Path(self.tmp.name) / 'engine-argv'
         (self.root / 'bin' / 'airlock-ledger').write_text(
             'import json, pathlib, sys\n'
-            'if sys.argv[1:] == ["list"]: sys.exit(0)\n'
+            'if sys.argv[1:] == ["list", "--json"]: print("{}"); sys.exit(0)\n'
             'pathlib.Path(%r).write_text(json.dumps(sys.argv[1:]))\n'
             'pathlib.Path(%r).write_text("installed")\n'
             % (str(self.seen), str(self.counter)))
@@ -3017,16 +3038,17 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(record['action'], 'install')
         self.assertEqual(self.counter.read_text(), 'installed')
-        self.assertEqual(json.loads(self.seen.read_text()), ['apply', 'notes'])
+        self.assertEqual(json.loads(self.seen.read_text()), ['apply', '--', 'notes'])
 
     def test_personal_install_passes_exact_engine_source(self):
         """The Personal source reaches the engine directly, with exactly one app id."""
         package = '/srv/personal/moved'
+        app_id = 'Selected.App-' + 'x' * 40
         proc, record = self._run(
-            action='install', app_id='moved', package_path=package)
+            action='install', app_id=app_id, package_path=package)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(record['action'], 'install')
-        self.assertEqual(json.loads(self.seen.read_text()), ['apply', 'moved', '--source', package])
+        self.assertEqual(json.loads(self.seen.read_text()), ['apply', '--source', package, '--', app_id])
 
     def test_teardown_action_passes_only_the_validated_app_id(self):
         seen = Path(self.tmp.name) / 'teardown-argv'
@@ -3036,12 +3058,20 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         proc, record = self._run(action='teardown', app_id='notes')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(record['action'], 'teardown')
-        self.assertEqual(json.loads(self.seen.read_text()), ['remove', 'notes'])
+        self.assertEqual(json.loads(self.seen.read_text()), ['remove', '--', 'notes'])
+
+    def test_leading_hyphen_id_reaches_the_engine_as_one_value(self):
+        for action in ('install', 'app', 'teardown'):
+            with self.subTest(action=action):
+                proc, record = self._run(action=action, app_id='-sample',
+                                         package_path='/srv/personal/source')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual((record['appId'], record['status']), ('-sample', 'done'))
+                expected = (['remove'] if action == 'teardown'
+                            else ['apply', '--source', '/srv/personal/source'])
+                self.assertEqual(json.loads(self.seen.read_text()), expected + ['--', '-sample'])
 
     def test_failed_install_has_no_unrelated_update_rollback(self):
-        armed = UPX.git_dir(self.root) / 'airlock-update-rollback'
-        armed.mkdir(parents=True)
-        (armed / 'airlock-update').write_text('#!/usr/bin/env bash\n')
         started = Path(self.tmp.name) / 'installer-started'
         (self.root / 'install' / 'airlock-install.sh').write_text(
             '#!/usr/bin/env bash\nprintf started > %r\nexit 1\n' % str(started))
@@ -3076,27 +3106,14 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         self.assertIn('teardown', record['note'])
         self.assertNotIn('--rollback', record['note'])
 
-    def test_a_failing_run_carries_the_rollback_command_the_updater_armed(self):
-        """The card's second requirement: a failure has to name its recovery."""
-        armed = UPX.git_dir(self.root) / 'airlock-update-rollback'
-        armed.mkdir(parents=True)
-        (armed / 'airlock-update').write_text('#!/usr/bin/env bash\n')
-        self._updater('echo "설치가 실패했습니다" >&2\nexit 1\n')
+    def test_failed_platform_update_reports_status_and_retry_without_rollback(self):
+        self._updater('exit 23\n')
         proc, record = self._run()
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual((record['status'], record['exitCode']), ('failed', 1))
-        self.assertIs(record['recovery']['available'], True)
-        self.assertIn('--rollback', record['recovery']['command'])
-        self.assertIn(str(armed / 'airlock-update'), record['recovery']['command'])
-        # The after-status is still taken: a failed update leaves a box in some state,
-        # and "what is it now" is the first thing the panel is asked.
+        self.assertEqual(proc.returncode, 23)
+        self.assertEqual((record['status'], record['exitCode']), ('failed', 23))
+        self.assertIsNone(record['recovery'])
+        self.assertIn('다시 실행', record['note'])
         self.assertEqual(record['after']['rc'], 0)
-
-    def test_a_failure_before_the_updater_armed_recovery_says_so(self):
-        self._updater('exit 1\n')
-        _proc, record = self._run()
-        self.assertIs(record['recovery']['available'], False)
-        self.assertIn('기준점', record['recovery']['reason'])
 
     def test_an_updater_that_cannot_run_is_a_recorded_failure_not_a_traceback(self):
         proc, record = self._run()                     # no bin/airlock-update at all

@@ -29,6 +29,17 @@ to their own box. An app package staged at an arbitrary local path installs, gat
 smokes, appears on the hub, and deactivates cleanly — with zero edits to installer
 code, and with the same fail-closed config validation in-tree apps get today.
 
+> **2026-10 single-app input contract.** New apps use an explicit
+> `airlock-ledger apply <id> --source <absolute-directory|company>`; updates use
+> the installed row unless the caller supplies a source. Ledger reads current
+> configuration through `airlock-config`, without implicit stdin or inherited
+> frozen projections. Hooks receive `AIRLOCK_PKG_INFO_FILE`, a private temporary
+> JSON file valid through the hook and projection, and may use
+> `airlock_package_info` from `install/lib.sh`. The helper accepts legacy
+> `AIRLOCK_PKG_INFO` during consumer migration. Company failures reapply the
+> recorded SHA once; mutable local sources report failure without claiming a
+> reproducible restore.
+
 ## 1. Why
 
 Today the app set is enumerated by hand in ~8 central files, and three couplings
@@ -120,12 +131,11 @@ Containment applies to *staged assets*, not the package location: anything the
 platform copies out of the package (e.g. a tile icon into the webroot) must
 resolve inside the canonical package root.
 
-Packaged app ids match `^[a-z0-9][a-z0-9-]{0,31}$`. This is deliberately
-stricter than today's app-name grammar (`bin/airlock-config:45` allows case,
-`.`, `_`): env export flattens `-` and `_` to the same character
-(`bin/airlock-config:452`), so `a-b` and `a_b` would collide; the tighter
-grammar removes that class along with case/length ambiguity. All ten built-in
-ids already conform; the legacy fallback keeps the old grammar until it retires.
+Packaged app ids are one nonempty filesystem path component: `/`, NUL, `.`
+and `..` are excluded. Case, punctuation, whitespace, Unicode and length do
+not restrict an id. The executable `PACKAGE_ID_RE` parser in
+[`bin/airlock-config`](../../bin/airlock-config) is authoritative. Consumers
+preserve the original id; `_envkey` normalizes environment variable prefixes.
 Two ids are reserved and cannot be packaged: `hub` (the platform entry point) and —
 amended in child 3 — `core`, the prerequisites pseudo-owner (F11): a package
 named core could masquerade as the immutable platform rows.
@@ -1028,31 +1038,18 @@ is REQUIRED in every manifest. (The packages feature never shipped outside
 this repo's own fixtures, so there is no external manifest to stay compatible
 with; all in-repo fixtures were upgraded in the same change.)
 
-**F11 — Prerequisite merge (stage 3).** Manifest-declared prerequisites merge
-into preflight with the TSV's full semantics, enumerated: every field
-(`command`, `predicate`, `expected`, `fix`, `note`) required
-(`install/preflight.sh:93-96`); the predicate drawn from the closed allowlist
-(`present` | `major-gte`, `:107-118`), and `major-gte` only for commands that
-have a version probe (python3 and node today, `:114-116` — a manifest asking
-for a version of anything else is fatal, exactly as the TSV is); duplicate
-owner+command rejected; conflicting `fix` for the same command rejected;
-`present` + `major-gte` for the same command merge to the stricter
-requirement, and two `major-gte` to the higher version (`:132-142`); the
-mandatory core commands (python3, nginx, sudo, systemctl, tailscale, curl,
-flock — seven since child 2 added the install lock; the earlier six-command
-list here was stale) and their core-owned rows unaffected by any manifest.
-Amended in child 3 — the responsibility split is explicit: `airlock-config
-prereqs` owns ASSEMBLY (TSV rows pass through in file order; rows owned by a
-manifest-bearing id are dropped — a shadowing package replaces the built-in's
-rows; manifest rows append with owner = the package id; per-row validity,
-rc 2 on violation), and preflight keeps EVALUATION — every cross-row rule
-above runs there unchanged on the assembled inventory, captured to a temp
-file whose producer exit status is checked directly. The built-in-only path
-reads the raw TSV exactly as before. A manifest
-declaring *zero* prerequisites is valid — the manifest itself is the
-declaration the TSV-era per-app row requirement (`:157-161`) was
-approximating, and that rule retires with the TSV; the nonempty-inventory
-check (`:150-151`) continues to hold over the core TSV that remains.
+**F11 — Prerequisite merge (stage 3).** `airlock-config` owns assembly through
+`_prerequisite_rows`: core TSV rows remain in file order, rows owned by a
+manifest-bearing ID are replaced by that manifest's prerequisite rows, and a
+zero-prerequisite manifest contributes no rows. The function accepts already
+selected package-info rather than reading candidates again.
+
+`prereqs` serializes those rows as the legacy TSV view. `install/preflight.sh`
+serializes the same rows into NUL fields, preserving package keys containing
+tabs or newlines, and owns executable/version evaluation and stricter-wins
+merging. Owner sets use complete IDs; display strings are not parsed back into
+owners. A failed inventory producer remains an actual input error. Core rows
+retain their existing semantics, including lenient handling of incomplete rows.
 
 **F12 — Key inventory (stage 3).** For every app, statically scan the package
 tree for config reads — `airlock_config get apps.<id>.<key>` call sites and

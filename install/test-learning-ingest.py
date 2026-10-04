@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import tempfile
+from unittest.mock import patch
 
 
 # 워커가 띄우는 가짜 에이전트 CLI. 진짜 CLI 가 하는 일 중 이 스위트가 재는 것만 한다 —
@@ -297,6 +298,41 @@ def main(argv):
           and len(relay_argv) == 1
           and relay_argv[0][relay_argv[0].index("--model") + 1] == "freerelay-short",
           f"{relay_meta} / {relay_argv}")
+
+    # 전역 skill을 회수한 설치에서도 oEmbed 대안이 실제 소유 CLI를 실행해야 한다.
+    relay_home = os.path.join(tmp, "relay-home")
+    owner_cli = os.path.join(relay_home,
+                            "workspace/infra-owner/.claude/skills/free-relay/freerelay_call.py")
+    legacy_cli = os.path.join(relay_home, ".claude/skills/free-relay/freerelay_call.py")
+    override_cli = os.path.join(relay_home, "custom-relay.py")
+    os.makedirs(os.path.dirname(owner_cli), exist_ok=True)
+    with open(owner_cli, "w") as relay:
+        relay.write('import json, sys\n'
+                    'assert sys.argv[sys.argv.index("--model") + 1] == "freerelay-short"\n'
+                    'print(json.dumps({"title": "owned relay", "channel": "owned channel"}))\n')
+    with patch.dict(os.environ, {"HOME": relay_home, "LEARNING_FREERELAY_CALL": ""}):
+        check("전역 링크 없이 소유 repo FreeRelay CLI를 찾는다",
+              BACKEND._freerelay_script() == owner_cli)
+        with patch.object(BACKEND, "fetch_oembed_metadata", side_effect=TimeoutError):
+            owned_metadata = BACKEND.prefill_ingest_metadata(fallback_url)
+        check("전역 링크 없이 oEmbed 실패 대안의 실제 CLI 호출이 메타데이터를 반환한다",
+              owned_metadata == {"title": "owned relay", "channel": "owned channel"},
+              str(owned_metadata))
+        os.makedirs(os.path.dirname(legacy_cli), exist_ok=True)
+        shutil.copyfile(owner_cli, legacy_cli)
+        check("구형 전역 링크보다 소유 repo CLI를 우선한다",
+              BACKEND._freerelay_script() == owner_cli)
+        with patch.dict(os.environ, {"LEARNING_FREERELAY_CALL": override_cli}):
+            check("명시한 FreeRelay 실행 경로를 우선한다",
+                  BACKEND._freerelay_script() == override_cli)
+        os.unlink(owner_cli)
+        check("이전 설치의 전역 FreeRelay 실행 경로를 호환한다",
+              BACKEND._freerelay_script() == legacy_cli)
+        os.unlink(legacy_cli)
+        with patch.object(BACKEND, "fetch_oembed_metadata", side_effect=TimeoutError):
+            missing_metadata = BACKEND.prefill_ingest_metadata(fallback_url)
+        check("FreeRelay 미설치 때 기존 URL 표시 실패 계약을 유지한다",
+              missing_metadata == {"title": fallback_url})
 
     try:
         # ---- 1. 문서 경로 문법. 완료 마커가 읽는 모양과 같아야 한다 ----
@@ -1746,16 +1782,6 @@ def main(argv):
             (os.environ["AIRLOCK_LEARNING_LIBRARY"],
              os.environ["AIRLOCK_LEARNING_STATE_DIR"]) = snap_env
 
-        # 설치가 남의 스킬을 덮어쓰지 않는다.
-        with open(os.path.join(root, "apps", "learning", "install.sh"), encoding="utf-8") as handle:
-            installer = handle.read()
-        check("설치가 이미 있는 것을 덮어쓰지 않는다",
-              "이미 있는" in installer or "already exists" in installer)
-        with open(os.path.join(root, "apps", "learning", "deactivate.sh"), encoding="utf-8") as handle:
-            deactivate = handle.read()
-        check("해제가 자기 링크만 지운다",
-              "readlink" in deactivate and "$APP_DIR_LOCAL/skill" in deactivate)
-
         # ---- 6i. 취소하면 자손이 하나도 안 남는가 ----
         # 🔴 카드가 이것을 **두 번째 제공자를 지원한다고 선언하기 위한 게이트**로 걸어 뒀다.
         #    적재 본체는 자기 자식만이 아니라 손자를 낳는다(전사·서브에이전트). 리더만
@@ -2057,48 +2083,43 @@ raise SystemExit(99)
         fake_home = os.path.join(tmp, "link-home")
         share = os.path.join(fake_home, ".local", "share", "airlock-learning")
         os.makedirs(os.path.join(share, "skill"), exist_ok=True)
-        link_script = (
-            'set -u\n'
-            'log() { printf "%s\\n" "$*"; }\n'
-            f'APP_DIR_LOCAL="{share}"\n'
-            + "\n".join(
-                open(os.path.join(root, "apps", "learning", "install.sh"), encoding="utf-8")
-                .read().split("skill_link() {")[1].split("\n}")[0].join(["skill_link() {", "\n}"])
-                .split("\n"))
-            + '\nskill_link "$1"\n')
+        deactivation = os.path.join(root, "apps", "learning", "deactivate.sh")
+        def retire_links():
+            return subprocess.run(
+                ["bash", deactivation], capture_output=True, text=True, timeout=60,
+                env=dict(os.environ, HOME=fake_home))
 
-        def run_link(root_dir):
-            return subprocess.run(["bash", "-c", link_script, "bash", root_dir],
-                                  capture_output=True, text=True, timeout=60)
-
-        # ① 남의 진짜 디렉터리는 남는다
-        foreign = os.path.join(fake_home, "case-dir", "learning-ingest")
+        owned = os.path.join(fake_home, ".claude", "skills", "learning-ingest")
+        foreign = os.path.join(fake_home, ".agents", "skills", "learning-ingest")
+        os.makedirs(os.path.dirname(owned), mode=0o700, exist_ok=True)
         os.makedirs(foreign, exist_ok=True)
+        os.symlink(os.path.relpath(os.path.join(share, "skill"), os.path.dirname(owned)), owned)
         with open(os.path.join(foreign, "SKILL.md"), "w", encoding="utf-8") as handle:
             handle.write("남의 스킬")
-        run_link(os.path.dirname(foreign))
-        check("이미 있는 진짜 디렉터리를 건드리지 않는다",
-              os.path.isfile(os.path.join(foreign, "SKILL.md")))
-        # ② 0700 인 디렉터리의 모드를 넓히지 않는다
-        tight = os.path.join(fake_home, "case-mode")
-        os.makedirs(tight, exist_ok=True)
-        os.chmod(tight, 0o700)
-        run_link(tight)
+        deact = retire_links()
+        check("상대경로 앱 링크를 회수한다", deact.returncode == 0 and not os.path.lexists(owned), deact.stderr)
         check("이미 있는 디렉터리의 모드를 넓히지 않는다",
-              oct(os.stat(tight).st_mode & 0o777) == "0o700",
-              oct(os.stat(tight).st_mode & 0o777))
-        check("빈 자리에는 링크를 건다",
-              os.path.islink(os.path.join(tight, "learning-ingest")))
-        # ③ 해제는 우리 링크만 지운다
-        deact = subprocess.run(
-            ["bash", os.path.join(root, "apps", "learning", "deactivate.sh")],
-            capture_output=True, text=True, timeout=60,
-            env=dict(os.environ, HOME=fake_home))
-        check("해제가 우리 링크를 지운다",
-              not os.path.exists(os.path.join(tight, "learning-ingest"))
-              or deact.returncode == 0, deact.stderr[:200])
-        check("해제가 남의 디렉터리는 남긴다",
-              os.path.isfile(os.path.join(foreign, "SKILL.md")))
+              oct(os.stat(os.path.dirname(owned)).st_mode & 0o777) == "0o700")
+        check("남의 스킬 디렉터리를 남긴다", os.path.isfile(os.path.join(foreign, "SKILL.md")))
+        os.symlink(os.path.join(fake_home, "personal-skill"), owned)
+        retire_links()
+        check("남의 끊어진 링크를 남긴다", os.path.islink(owned))
+        os.unlink(owned)
+        os.symlink(os.path.join(share, "skill"), owned)
+        os.rmdir(os.path.join(share, "skill"))
+        retire_links()
+        check("패키지가 지워진 뒤에도 우리 링크를 회수한다", not os.path.lexists(owned))
+        with open(os.path.join(root, "apps", "learning", "install.sh"), encoding="utf-8") as handle:
+            install_source = handle.read()
+        check("설치는 글로벌 링크 생성 대신 회수 경로를 쓴다",
+              'bash "$HERE/deactivate.sh"' in install_source and 'ln -s' not in install_source)
+        prompt = RUNNER.build_prompt({"url": "https://youtu.be/testvideo01"}, state)
+        with open(os.path.join(skill_dir, "SKILL.md"), encoding="utf-8") as handle:
+            package_contract = handle.read()
+        check("프롬프트는 패키지 계약과 URL을 직접 싣는다",
+              package_contract in prompt and "https://youtu.be/testvideo01" in prompt
+              and os.path.abspath(os.path.join(skill_dir, "SKILL.md")) in prompt
+              and not prompt.startswith("/learning-ingest"))
 
         # ---- 7. 걷어낸 것이 정말 걷어졌나 ----
         # 🔴 본문 검색으로는 못 잰다 — 이 파일과 러너의 주석이 걷어낸 git 명령을 **이름으로**

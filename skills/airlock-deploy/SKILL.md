@@ -19,7 +19,8 @@ it only through `bin/airlock-config`.
 2. **`airlock.toml` exists.** If only `airlock.toml.example` is present, copy it and
    help the user fill in `[auth] owner` and the app tables
    they want. `[apps.*]` supplies inputs; `bin/airlock-ledger list` reports installed apps.
-   With no installation record, the full installer bootstraps core apps from these inputs.
+   The platform installer applies only recorded core apps from this checkout.
+   On a fresh box, explicitly apply each chosen app after installing the platform.
    fileview has no path setting: it serves **the home directory of this box's user
    account**, read and write, to the owner **and every collaborator** if its audience
    is opened. Nothing above home is served.
@@ -38,8 +39,11 @@ bash -c 'cd <repo> && python3 bin/airlock-config validate'
 # 2. Dry-run to preview every system-mutating step (no changes made).
 AIRLOCK_DRY_RUN=1 bash install/airlock-install.sh
 
-# 3. Real deploy. Needs sudo for nginx + tailscale serve steps.
+# 3. Install the platform and update recorded core apps from this checkout.
 bash install/airlock-install.sh
+
+# 4. First install of a chosen shipped app (repeat for each selected app).
+python3 bin/airlock-ledger apply <id> --source "$PWD/apps/<id>"
 ```
 
 🔴 **Do not stop any `airlock-*` unit yourself before running the installer.** The
@@ -57,22 +61,24 @@ boxes at once over ssh. Both daemons went down within four seconds of each other
 them, the installer never ran on either box, and every agent session on both was
 lost. One box stayed down for three minutes; the other for 93.
 
-The full installer validates the box config, applies and smokes core apps, and
-projects the shared ingress. Company and Personal app lifecycles stay untouched.
+The full installer applies the platform and the recorded core apps whose source
+is this checkout's `apps/` directory, then projects the shared ingress. A fresh
+box receives the platform only. Company and Personal apps use their own apply.
 
 To install or update one app, run `bin/airlock-ledger apply <id>` from the
-installed clone. Supply `--source <absolute-path>` on the first Personal install.
+installed clone. Supply `--source <absolute-app-directory>` on any first local install.
 For Company, set `[site] company_repo` to its Git URL and use `--source company`.
 Later applies use the recorded source; changing the Company URL requires explicit
 `--source company` to replace that source.
 To remove it, run `bin/airlock-ledger remove <id>`; recorded artifacts are removed
 and user data stays. Read `bin/airlock-ledger list` for installed repo/commit facts.
-A failed apply restores that app to its starting commit. Diagnose the output
-before retrying; do not widen a failed app operation into a full box install.
+A failed Company apply reapplies its recorded commit once. A failed local apply
+reports failure without retrying the current source as a restore. Diagnose the
+output before retrying; keep the operation scoped to that app.
 
 ## Verify (state what passed / what didn't)
 
-- The orchestrator runs each app's `apps/<name>/smoke.sh` after reload; a smoke
+- Run `bash apps/<name>/smoke.sh` for the app being verified after apply. A smoke
   checks the gate is real: **owner = 200/302, denied identity = 403, missing
   header = 403.** A `GATE HOLE` failure is security-critical — do not hand off.
 - `sudo nginx -t` is clean.

@@ -400,6 +400,12 @@ def mappings(cfg):
         listens.add(str(hub["https_port"]))
     if hub.get("nginx_port"):
         targets.add(str(hub["nginx_port"]))
+    if hub.get("redirect_port"):
+        for key in ("http_port", "public_port"):
+            if key in hub:
+                listens.add(str(hub[key]))
+                targets.add(str(hub["redirect_port"]))
+                break
 
     rc, out, err = config("package-info")
     if rc != 0:
@@ -416,16 +422,6 @@ def mappings(cfg):
                 if mapping.get("target"):
                     targets.add(str(mapping["target"]))
 
-    rc, out, err = config("plaintext")
-    if rc != 0:
-        why = why or f"`airlock-config plaintext` exited {rc}: {last_lines(err) or 'no output'}"
-    else:
-        for line in out.splitlines():
-            parts = [p.strip() for p in line.split("\t")]
-            if len(parts) >= 2 and parts[1]:
-                listens.add(parts[1])
-            if len(parts) >= 3 and parts[2]:
-                targets.add(parts[2])
     return {"listens": listens, "targets": targets, "why": why}
 
 
@@ -770,8 +766,7 @@ def main(argv):
     rep = Report()
     cfg = check_config(rep)
     if cfg is not None:
-        rc, out, _ = config("apps")
-        enabled = [a.strip() for a in out.splitlines() if a.strip()] if rc == 0 else None
+        enabled = list(cfg["resolved"].get("apps") or {})
         facts = mappings(cfg)
         check_install(rep, cfg, enabled)
         check_ingress(rep, cfg, facts)

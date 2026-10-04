@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { fileURLToPath } from 'node:url';
 
 class ClassList {
   constructor(node) { this.node = node; }
@@ -271,10 +272,11 @@ const storeContext = vm.createContext({
   detailCaps: new Element('section'), detailActions: storeActions,
   progressNote: new Element('p'), selected: null, runTimer: null, selectedRunId: null, selectedRequest: 0, rows: [],
   installRun: false, kv() {}, previewPorts: () => '없음',
+  addSubmit: new Element('button'),
   setAlert() {}, pollRun() {}, clearTimeout() {}, setTimeout: () => 1,
   fetch: async (path, options) => {
     storeRequests.push({path, method: options.method, body: JSON.parse(options.body)});
-    return {ok: true, json: async () => ({ok: true})};
+    return {ok: true, json: async () => path.endsWith('/package-preview') ? storeContext.preview : ({ok: true})};
   }
 });
 function shippedBlock(start, end) {
@@ -288,17 +290,35 @@ vm.runInContext(shippedBlock('  function showPersonalPreview(value) {',
                             '  async function pollRun() {') +
                 shippedBlock('  async function mutate(action, id, button) {',
                             '  async function previewPersonal(path) {') +
+                shippedBlock('  async function previewPersonal(path) {',
+                            '  open.addEventListener("click", () => setOpen(true));') +
                 shippedBlock('  body.addEventListener("click", event => {',
                             '  modal.addEventListener("keydown", event => {'), storeContext);
-storeContext.preview = {id: 'personal-probe', path: '/tmp/personal app',
-                        installable: true, requested_capabilities: []};
-vm.runInContext('showPersonalPreview(preview)', storeContext);
+storeContext.preview = JSON.parse(execFileSync('python3', ['-B', '-c', `
+import os, subprocess, sys, tempfile
+from pathlib import Path
+with tempfile.TemporaryDirectory() as raw:
+    base = Path(raw)
+    (base / 'home').mkdir()
+    (base / 'state').mkdir()
+    app = base / 'personal app'
+    app.mkdir()
+    (app / 'airlock-app.toml').write_text('contract=1\\nid="personal-probe"\\n[artifacts]\\nrooted=["payload"]\\n')
+    config = base / 'airlock.toml'
+    config.write_text('[auth]\\nowner="fixture@test"\\n[apps.hub]\\n')
+    env = {**os.environ, 'HOME': str(base / 'home'), 'AIRLOCK_CONFIG': str(config),
+           'AIRLOCK_STATE_DIR': str(base / 'state')}
+    print(subprocess.check_output([sys.argv[1], 'package-preview', str(app)], env=env, text=True), end='')
+`, fileURLToPath(new URL('../../bin/airlock-config', import.meta.url))], {encoding: 'utf8'}));
+await vm.runInContext('previewPersonal(preview.path)', storeContext);
 const personalButton = storeActions.children[0];
 personalButton.closest = () => personalButton;
 storeBody.events.click({target: personalButton});
 await tick(); await tick();
-assert.deepEqual(storeRequests, [{path: '/monitor/api/owner/apps/personal-probe/register',
-                                method: 'POST', body: {path: '/tmp/personal app'}}]);
+assert.deepEqual(storeRequests, [{path: '/monitor/api/owner/apps/package-preview',
+                                method: 'POST', body: {path: storeContext.preview.path}},
+                               {path: '/monitor/api/owner/apps/personal-probe/register',
+                                method: 'POST', body: {path: storeContext.preview.path}}]);
 storeContext.preview = {...storeContext.preview, installable: false};
 vm.runInContext('showPersonalPreview(preview)', storeContext);
 const deniedPersonalButton = storeActions.children[0];
@@ -306,8 +326,8 @@ deniedPersonalButton.closest = selector => selector.startsWith('button') ? denie
 storeContext.modal = {querySelectorAll: () => []};
 storeBody.events.click({target: deniedPersonalButton});
 await tick();
-assert.equal(storeRequests.length, 2);
-console.log('Personal preview: actual delegated click sends its id/path; capability metadata does not block installation');
+assert.equal(storeRequests.length, 3);
+console.log('Personal preview: response without digest reaches actual delegated install with its id/path; capability metadata does not block installation');
 
 // A poll for A may finish after a second click has selected B.
 let finishFirstPoll;

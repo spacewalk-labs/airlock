@@ -94,14 +94,16 @@ marker would remain unmarked and cannot be recovered by this sweep.
 ## The exit code
 
 ```
-0   installed, every gate passed, ingress checked from the box itself
-3   installed, every gate passed, ingress COULD NOT be checked from here
+0   installation and live checks passed, ingress checked from the box itself
+3   installation and live checks passed, ingress COULD NOT be checked from here
 1   something failed
 ```
 
-`3` is `bin/airlock-smoke`'s own distinction (`:9-19`) and is carried through
-rather than flattened. A caller that tests `!= 0` records unverified ingress as
-verified — which is the whole reason that exit code exists.
+These are the live runner's measurement results, not the no-argument installer's
+exit codes. Fresh installation uses the common selected-app apply function; the
+runner then measures smoke, units, and consumers separately. `3` retains
+`bin/airlock-smoke`'s distinction between a failure and ingress that this box
+cannot verify. Keep that result visible instead of calling it verified.
 
 ## What the record contains, and why each field is there
 

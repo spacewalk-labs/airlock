@@ -72,7 +72,10 @@ bash docker/orbstack-machine-setup.sh
 ```
 It creates the machine at **your Mac's own architecture** (arm64 on Apple Silicon
 — the verified path), installs prerequisites, brings up Tailscale, and runs
-`install/airlock-install.sh`. Re-run it any time after editing `airlock.toml`.
+`install/airlock-install.sh` for the platform. The setup helper then explicitly
+applies every selected `[apps.*]` entry except Hub from the machine checkout's
+`apps/<id>` directory. Re-run the helper after editing `airlock.toml`. Running the
+platform installer alone on a fresh box installs only the platform.
 The first line it prints is the architecture it chose and where that came from.
 
 ### 5. Open it
