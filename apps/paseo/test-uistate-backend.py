@@ -11,11 +11,11 @@ the sidebar. Those are the cases below.
 
 No install, no gate, no systemd. It binds an ephemeral loopback port.
 """
+import contextlib
 import http.client
 import importlib.util
 import json
 import os
-import sys
 import tempfile
 import threading
 import unittest
@@ -60,6 +60,17 @@ class UiStateTest(unittest.TestCase):
             return response.status, response.read(), response.getheader(uistate.REVISION_HEADER)
         finally:
             conn.close()
+
+    @contextlib.contextmanager
+    def captured_log(self):
+        """Collect what the backend's own `log()` printed, per request."""
+        lines = []
+        original = uistate.log
+        uistate.log = lines.append
+        try:
+            yield lines
+        finally:
+            uistate.log = original
 
     def test_absent_key_is_404_not_an_empty_success(self):
         # A device that has never synced must be able to tell "nothing stored yet"
@@ -128,6 +139,21 @@ class UiStateTest(unittest.TestCase):
         self.assertEqual(status, 413)
         status, _, _ = self.request('GET', f'/{KEY}')
         self.assertEqual(status, 404)
+
+    def test_only_the_oversized_refusal_reaches_the_journal(self):
+        # 413 used to be invisible: the request log is off and the length check runs
+        # before compare-and-swap, so a client whose accumulated sidebar order stopped
+        # fitting left nothing behind to explain the refusal. Exactly one line for it —
+        # and a normal write must not grow the journal, or the owner reads a 413 as
+        # routine.
+        with self.captured_log() as lines:
+            self.request('PUT', f'/{KEY}', '"' + 'x' * (uistate.MAX_BYTES + 16) + '"', revision=0)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(f'PUT {KEY} refused 413: {uistate.MAX_BYTES + 18} B > {uistate.MAX_BYTES} B', lines[0])
+        with self.captured_log() as lines:
+            status, _, revision = self.request('PUT', f'/{KEY}', ORDER, revision=0)
+        self.assertEqual((status, revision), (204, '1'))
+        self.assertEqual(lines, [], 'a successful write must not log')
 
     def test_non_json_body_is_refused_and_leaves_the_previous_value(self):
         self.request('PUT', f'/{KEY}', ORDER, revision=0)

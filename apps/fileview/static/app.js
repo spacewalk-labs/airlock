@@ -101,7 +101,7 @@ function toApiPath(path) {
   return p === ROOT ? '/' : p.slice(ROOT.length);
 }
 // The way back. Every path the API HANDS US is root-relative — the `path` on each
-// listing item is '/.claude', not '/home/josh/.claude' — and the UI speaks absolute
+// listing item is '/.claude', not '/home/alice/.claude' — and the UI speaks absolute
 // everywhere, so the two have to meet at a boundary. This is that boundary's other
 // half: without it a listing's own items are unusable, because feeding '/.claude'
 // back to toApiPath is exactly the "outside home" case it refuses. That is what

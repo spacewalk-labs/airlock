@@ -100,20 +100,18 @@ PLATFORM_ACCOUNTS_STATUS_BIN="$(resolve_platform_bin AIRLOCK_ACCOUNTS_STATUS_BIN
 # and the temporary fleet status probe always target the platform-owned binaries.
 CLAUDE_STATUS="$PLATFORM_ACCOUNTS_STATUS_BIN"
 
-# is app <name> enabled in airlock.toml?
-app_enabled() { airlock_config apps | grep -qx "$1"; }
 
 # --- resolve optional feature wiring ---
-# fileview file-open: on whenever [apps.fileview] is enabled. It used to also
+# fileview file-open: on when the fileview app is installed. It used to also
 # require a code_root; fileview serves the filesystem now, so there is no second
 # condition and no path to thread through.
 FILEVIEW=false
-if app_enabled fileview; then FILEVIEW=true; fi
+if airlock_app_installed fileview; then FILEVIEW=true; fi
 # Orca worktree sidebar: use the configured shim path, else the conventional one when
-# [apps.orca] is enabled, else empty (feature off). The gate checks the file at runtime.
+# the orca app is installed, else empty (feature off). The gate checks the file at runtime.
 ORCA_SHIM=""
 if [ -n "$ORCA_SHIM_CFG" ]; then ORCA_SHIM="$ORCA_SHIM_CFG"
-elif app_enabled orca; then ORCA_SHIM="~/.config/orca/linux-orca-cli-shim/orca"; fi  # gate expanduser()s the ~
+elif airlock_app_installed orca; then ORCA_SHIM="~/.config/orca/linux-orca-cli-shim/orca"; fi  # gate expanduser()s the ~
 # --- 1. provision ttyd (sha256-pinned) ---
 provision_ttyd() {
   [ -x "$TTYD_BIN" ] && { log "ttyd present: $TTYD_BIN"; return; }

@@ -95,8 +95,7 @@ server {
     #    manifest, so this line is the ONLY declaration. That is why the test that
     #    removes it and expects red is not optional decoration: it is the second half of
     #    the contract, standing in for the manifest that does not exist.
-    #    Precedent for the shape: apps/learning/render.sh, apps/notes/bin/render.py,
-    #    apps/fileview/render.sh.
+    #    Precedent for the shape: apps/learning/render.sh, apps/fileview/render.sh.
     #
     # 2. A prefix location, not one location per route. Eighteen locations would mean
     #    eighteen copies of the guard, and one omission fails OPEN. It also keeps the
@@ -135,7 +134,6 @@ server {
     # location fragments here as they are installed. They inherit the server-level
     # gate above — fragments are plain proxies, no per-location guard needed.
     # Only enabled-app ids are included; manual files outside that set stay inert.
-include TMP/confd/hub-locations.d/publish.conf;
 }
 
 # ==== Publish dedicated document-view gate ====
@@ -199,7 +197,8 @@ server {
         index .airlock-live-directory-index;
         autoindex on;
         add_header Cache-Control "no-cache" always;
-        sub_filter '</body>' '<script src="/airlock-return.js" data-mode="corner" defer></script></body>';
+        sub_filter '</head>' '<link rel="stylesheet" href="/airlock-tokens.css"><link rel="stylesheet" href="/airlock-index.css"></head>';
+        sub_filter '</body>' '<script src="/airlock-index.js" defer></script><script src="/airlock-return.js" data-mode="corner" defer></script></body>';
         sub_filter_once on;
     }
     location / {
@@ -241,10 +240,30 @@ server {
         add_header Cache-Control "no-cache" always;
         access_log off;
     }
+    # The root listing is generated live by Nginx, then progressively enhanced
+    # with the same tokens as the Airlock launcher. Exact routes keep these UI
+    # assets out of the shared directory's namespace and out of its listing.
+    location = /airlock-tokens.css {
+        alias TMP/web/assets/airlock-tokens.css;
+        default_type text/css;
+        add_header Cache-Control "no-cache" always;
+        access_log off;
+    }
+    location = /airlock-index.css {
+        alias TMP/web/assets/publish-index.css;
+        default_type text/css;
+        add_header Cache-Control "no-cache" always;
+        access_log off;
+    }
+    location = /airlock-index.js {
+        alias TMP/web/assets/publish-index.js;
+        default_type application/javascript;
+        add_header Cache-Control "no-cache" always;
+        access_log off;
+    }
 }
 # ==== End publish dedicated document-view gate ====
 
 # separate-port owner gates (devterm, code-server, orca, paseo) drop server
 # fragments here as they are installed. Only enabled-app ids are included;
 # a manual listener such as publish-doc-gate.conf is not preserved.
-include TMP/confd/servers.d/devterm.conf;

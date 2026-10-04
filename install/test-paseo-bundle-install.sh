@@ -50,12 +50,12 @@ printf 'systemctl %s\n' "$*" >>"${AIRLOCK_TEST_EVENT_LOG:?}"
 case "${1:-}" in
   show)
     case " $* " in
-      *" --property=ActiveState "*) echo inactive ;;
+      *" --property=ActiveState "*) echo "${AIRLOCK_TEST_UNIT_STATE:-inactive}" ;;
       *" --property=MainPID "*) echo 0 ;;
       *) echo "" ;;
     esac
     ;;
-  is-active) exit 3 ;;
+  is-active) [ "${AIRLOCK_TEST_UNIT_STATE:-inactive}" = active ] ;;
   whoami) exit 1 ;;
   *) exit 0 ;;
 esac
@@ -112,12 +112,18 @@ grep -q 'install paseo bundle:' "$out" && ok "the bundle path was taken (not the
 for want in \
   'depth4 search patch already applied' \
   'model prune already applied' \
+  'Codex model roster verified (GPT-6 Sol/Luna ready; GPT-5.5 retired)' \
   'OpenCode grok picker defaults already applied' \
   'pasted-image persistence already applied' \
   'schedule schema busy-pending patch already applied' \
   'schedule service busy-pending patch already applied' \
+  'schedule stale-due patch already applied' \
+  'watch recovery patch already applied' \
+  'background Git sampling patch already applied' \
+  'automatic Git reconciliation sampling patch already applied' \
   'archive/workspace consistency already applied' \
   'archive/workspace consistency behaviour check passed' \
+  'PASS workspace removal delivery' \
   'provider-subagent server filter already applied' \
   'provider-subagent selective delivery pair verified' \
   'orphan guard already applied (claude)' \
@@ -182,13 +188,19 @@ grep -q 'systemctl --user restart airlock-paseo.service' "$EVENTS" \
 # ---- 2. a re-run is idempotent: no npm, no restart ----
 : >"$EVENTS"
 out="$TMP/install-2.log"
+export AIRLOCK_TEST_UNIT_STATE=active
 if run_install "$out"; then ok "re-run exits 0"; else bad "re-run failed rc=$?"; sed 's/^/    /' "$out" | tail -8; fi
 grep -q 'present (prefix=' "$out" && ok "re-run: bundle recognised as present (no npm)" \
   || bad "re-run: bundle was reinstalled or not recognised"
-# With the shim reporting the unit inactive, the installer restarts it; what must not
-# happen is a reinstall. The daemon-restart decision on a live box is covered elsewhere.
+# The already-active daemon must survive an unchanged install, too.
 grep -q 'install paseo bundle:' "$out" && bad "re-run reinstalled the bundle" \
   || ok "re-run did not reinstall the bundle"
+if grep -q 'systemctl --user restart airlock-paseo.service' "$EVENTS"; then
+  bad "re-run restarted an unchanged active daemon"
+else
+  ok "re-run preserves the active daemon"
+fi
+unset AIRLOCK_TEST_UNIT_STATE
 
 # ---- 3. a stale nested server (registry-era leftover) is a shadow, not a match ----
 # Node resolves upward from the cli, so a nested copy would win over the verified

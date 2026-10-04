@@ -27,9 +27,23 @@ WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
 CONFD="${AIRLOCK_CONFD:-/etc/airlock/nginx}"
 IDENT="$(ident_var "$AIRLOCK_IDENTITY_HEADER")"
 
+# The app set this render is FOR. `airlock-ledger project` passes it explicitly
+# (AIRLOCK_PROJECT_IDS), because the engine's installed-apps record — not this
+# repo's config — is what "installed" means once that flow owns the box. Every
+# read below of "which apps" goes through here, so the render and the engine's
+# record cannot disagree. Unset = today's behaviour: whatever airlock-config
+# resolves from airlock.toml.
+airlock_project_apps() {
+  if [ -n "${AIRLOCK_PROJECT_IDS+x}" ]; then
+    printf '%s\n' $AIRLOCK_PROJECT_IDS
+  else
+    airlock_config apps
+  fi
+}
+
 emit_canonical_fragment_includes() {
   local sub="$1" app
-  airlock_config apps | while IFS= read -r app; do
+  airlock_project_apps | while IFS= read -r app; do
     [ -n "$app" ] || continue
     printf '%s' "$app" | grep -qE '^[a-z0-9][a-z0-9-]{0,31}$' || continue
     [ -f "$CONFD/$sub/$app.conf" ] || continue
@@ -53,7 +67,7 @@ PUBLISH_TITLE_META=false
 HUB_GATE="hub_ok"
 HUB_GATE_EXCEPTION=""
 HUB_EXACT_SCOPE=""
-if airlock_config apps | grep -qx publish; then
+if airlock_project_apps | grep -qx publish; then
   eval "$(airlock_config env publish)"
   PUBLISH_ENABLED=true
   PUBLISH_HTTPS_PORT="${AIRLOCK_PUBLISH_HTTPS_PORT:?publish https_port missing}"
@@ -113,7 +127,7 @@ fi
 # maps and proxy headers stand alone afterwards.  Keep the read in a subshell so the
 # app-specific env cannot overwrite the hub values already selected above.
 ACCOUNTS_FLEET_READ_DOMAIN=""
-if airlock_config apps | grep -qx devterm; then
+if airlock_project_apps | grep -qx devterm; then
   ACCOUNTS_FLEET_READ_DOMAIN="$({
     eval "$(airlock_config env devterm)"
     printf '%s' "${AIRLOCK_DEVTERM_FLEET_READ_DOMAIN:-}"
@@ -276,8 +290,7 @@ server {
     #    manifest, so this line is the ONLY declaration. That is why the test that
     #    removes it and expects red is not optional decoration: it is the second half of
     #    the contract, standing in for the manifest that does not exist.
-    #    Precedent for the shape: apps/learning/render.sh, apps/notes/bin/render.py,
-    #    apps/fileview/render.sh.
+    #    Precedent for the shape: apps/learning/render.sh, apps/fileview/render.sh.
     #
     # 2. A prefix location, not one location per route. Eighteen locations would mean
     #    eighteen copies of the guard, and one omission fails OPEN. It also keeps the
@@ -422,7 +435,8 @@ server {
         index .airlock-live-directory-index;
         autoindex on;
         add_header Cache-Control "no-cache" always;
-        sub_filter '</body>' '<script src="/airlock-return.js" data-mode="corner"@@BADGEATTR@@ defer></script></body>';
+        sub_filter '</head>' '<link rel="stylesheet" href="/airlock-tokens.css"><link rel="stylesheet" href="/airlock-index.css"></head>';
+        sub_filter '</body>' '<script src="/airlock-index.js" defer></script><script src="/airlock-return.js" data-mode="corner"@@BADGEATTR@@ defer></script></body>';
         sub_filter_once on;
     }
     location / {
@@ -460,6 +474,27 @@ server {
     # each serve their own copy for the same reason (see emit_owner_gate).
     location = /airlock-return.js {
         alias @@WEBROOT@@/assets/airlock-return.js;
+        default_type application/javascript;
+        add_header Cache-Control "no-cache" always;
+        access_log off;
+    }
+    # The root listing is generated live by Nginx, then progressively enhanced
+    # with the same tokens as the Airlock launcher. Exact routes keep these UI
+    # assets out of the shared directory's namespace and out of its listing.
+    location = /airlock-tokens.css {
+        alias @@WEBROOT@@/assets/airlock-tokens.css;
+        default_type text/css;
+        add_header Cache-Control "no-cache" always;
+        access_log off;
+    }
+    location = /airlock-index.css {
+        alias @@WEBROOT@@/assets/publish-index.css;
+        default_type text/css;
+        add_header Cache-Control "no-cache" always;
+        access_log off;
+    }
+    location = /airlock-index.js {
+        alias @@WEBROOT@@/assets/publish-index.js;
         default_type application/javascript;
         add_header Cache-Control "no-cache" always;
         access_log off;

@@ -2,12 +2,9 @@
 # Hermetic install/uninstall contract for the first platform-owned user timer. No live
 # user manager is contacted: HOME and systemctl are both scratch fixtures.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
-# This suite's text names a real app installer, so render-parity's paseo RAM pin gate
-# counts it among the suites that must fix the memory ceiling paseo sizes from. Pinning
-# keeps the run hermetic: without it the expected value would follow whatever RAM this
-# machine happens to have, and the suite would pass or fail by host.
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+airlock_pin_paseo_mem
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)" || exit 1
@@ -24,9 +21,7 @@ exit 0
 SH
 chmod 0755 "$BIN_DIR/systemctl"
 
-pass=0 fail=0
-ok() { printf 'ok   %s\n' "$1"; pass=$((pass + 1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail + 1)); }
+airlock_test_counters_init
 
 if env HOME="$HOME_DIR" PATH="$BIN_DIR:$PATH" AIRLOCK_SYSTEMCTL_LOG="$LOG" \
     bash "$ROOT/install/airlock-secret-timer.sh" install >/dev/null 2>&1; then

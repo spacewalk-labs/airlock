@@ -1,28 +1,19 @@
-"""Owner app-store projections and the single ``airlock.toml`` writer.
-
-The writer deliberately does not serialize TOML.  Re-serializing the operator's
-file would discard its comments and ordering. It adds app registration intent and,
-when disabling, removes both its ``[apps.<id>]`` subtree and any explicit
-``[packages.<id>]`` registration. It validates a sibling candidate with the platform's
-canonical parser, keeps one previous copy, and only then swaps the candidate into place.
-"""
+"""Owner app-store projections, package preview and personal link input."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
-import stat
 import subprocess
 import sys
 import tempfile
-import threading
-import tomllib
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
 
 APP_ID = re.compile(r"\A[a-z0-9][a-z0-9-]{0,31}\Z")
-_WRITE_LOCK = threading.Lock()
 
 
 class AppsError(RuntimeError):
@@ -34,19 +25,10 @@ class AppsError(RuntimeError):
         self.detail = detail
 
 
-def default_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def _checked_id(app_id: str) -> str:
-    if not isinstance(app_id, str) or APP_ID.fullmatch(app_id) is None:
-        raise AppsError("bad_app_id")
-    return app_id
-
-
 def _command(root: Path, args: list[str], *, config: Path | None = None,
              json_output: bool = False) -> Any:
     env = os.environ.copy()
+    env["AIRLOCK_ROOT"] = str(Path(root).resolve())
     # Snapshot authority belongs to an installer process.  It must never leak into a
     # later owner request and make airlock-config authenticate the wrong pathname.
     for name in ("AIRLOCK_CONFIG_SNAPSHOT", "AIRLOCK_CONFIG_SNAPSHOT_SHA256",
@@ -74,41 +56,6 @@ def _command(root: Path, args: list[str], *, config: Path | None = None,
     return value
 
 
-def config_path(root: Path) -> Path:
-    # The installed unit passes the exact config used by the installer.  Prefer that
-    # authority directly: package-info is deliberately lock-strict, so asking it to
-    # rediscover the same path makes the one operation that repairs a digest mismatch
-    # impossible.  The fallback keeps source-tree/test launches without the installed
-    # unit environment working as before.
-    configured = os.environ.get("AIRLOCK_CONFIG")
-    if configured:
-        path = Path(configured).expanduser()
-        if not path.is_absolute():
-            raise AppsError(
-                "config_unavailable", "AIRLOCK_CONFIG must be an absolute path")
-        return path.resolve()
-    try:
-        info = _command(root, ["package-info"], json_output=True)
-    except AppsError as exc:
-        # package-info is deliberately lock-strict, but its answer about where the
-        # operator config lives is still needed by the one action that repairs that
-        # lock. Match airlock-config's no-environment discovery from cwd=root, and do
-        # so only for its exact package-lock refusal. Every other discovery failure
-        # remains closed.
-        if (exc.code != "config_invalid"
-                or "package lock digest mismatch" not in exc.detail):
-            raise
-        for base in [root, *root.parents]:
-            candidate = base / "airlock.toml"
-            if candidate.exists():
-                return candidate.resolve()
-        raise
-    value = info.get("config_path")
-    if not isinstance(value, str) or not value:
-        raise AppsError("config_unavailable", "package-info omitted config_path")
-    return Path(value)
-
-
 def package_preview(root: Path, path: str) -> dict[str, Any]:
     """Return the canonical read-only preview for one local package path."""
     if not isinstance(path, str) or not path.strip():
@@ -124,322 +71,355 @@ def _update_map(updates: Any) -> dict[str, dict[str, Any]]:
             if isinstance(row, dict) and isinstance(row.get("id"), str)}
 
 
-def _lock_mismatch_projection(error: AppsError, updates: Any,
-                              company_ids: set[str]) -> dict[str, Any] | None:
-    """Keep the review surface reachable when the strict config reader refuses a lock.
+def installed_ids(root: Path) -> list[str]:
+    """③ — every app id the install record says is installed on this box.
 
-    ``airlock-config package-info`` intentionally fails closed after an explicit
-    package's bytes move. Its own diagnostic is the authority for the degraded row, so
-    the app sheet stays reachable before the daily update collector has produced a snapshot.
-    Never calculate another digest or turn a different config error into a partial
-    inventory.
+    One adapter over `bin/airlock-ledger list`, and the only place in the server
+    that answers "is this installed". Every row a caller can install but this box
+    has not installed reads as not installed, which is the point: a config table
+    is a decision someone wrote, not evidence that anything is on disk. Notes
+    shipped the other way round — `[apps.notes]` alone made a failed install read
+    as installed for months.
+
+    Current engine rows name their repo, commit and artifacts. Legacy rows
+    count only when their state includes `committed`; intent alone is not an
+    installation. Reading a mixed old snapshot must keep committed installs.
+
+    stdin is DEVNULL on purpose: this command reads package-info from stdin, and a
+    server request that hands it a pipe nobody writes to blocks until it times out.
     """
-    if error.code != "config_invalid" or "package lock digest mismatch" not in error.detail:
-        return None
-    rows = [row for row in _update_map(updates).values()
-            if row.get("action") == "lock-mismatch"
-            and APP_ID.fullmatch(row["id"]) is not None]
-    match = re.search(
-        r"package '([a-z0-9][a-z0-9-]{0,31})': package lock digest mismatch",
-        error.detail)
-    if match is not None and all(row["id"] != match.group(1) for row in rows):
-        rows.append({"id": match.group(1), "action": "lock-mismatch",
-                     "sourceClass": "explicit"})
-    if not rows:
-        return None
-    rows.sort(key=lambda value: value["id"])
-    update_doc = dict(updates) if isinstance(updates, dict) else {}
-    existing = update_doc.get("apps")
-    existing = existing if isinstance(existing, list) else []
-    mismatch_ids = {row["id"] for row in rows}
-    update_doc["apps"] = [row for row in existing
-                          if not (isinstance(row, dict)
-                                  and row.get("id") in mismatch_ids)] + rows
-    installed = [{
-        "id": row["id"],
-        "config": {},
-        "tile": None,
-        "source": "explicit",
-        "tier": "company" if row["id"] in company_ids else "",
-        "digest": None,
-        "capabilities": [],
-        "canRemove": False,
-        "update": row,
-    } for row in rows]
-    return {"apps": {}, "installed": installed, "public": [],
-            "updates": update_doc,
-            "degraded": "lock-mismatch"}
+    base = Path(root).resolve()
+    env = os.environ.copy()
+    for name in ("AIRLOCK_CONFIG_SNAPSHOT", "AIRLOCK_CONFIG_SNAPSHOT_SHA256",
+                 "AIRLOCK_INSTALL_PKG_INFO_SHA256"):
+        env.pop(name, None)
+    argv = [sys.executable, str(base / "bin" / "airlock-ledger"), "list"]
+    try:
+        result = subprocess.run(argv, cwd=str(base), env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AppsError("ledger_unavailable", str(exc)) from exc
+    if result.returncode:
+        raise AppsError("ledger_unavailable",
+                        result.stderr.strip() or "airlock-ledger list failed")
+    ids = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2:
+            continue
+        if not (fields[1].startswith("repo=") or
+                "committed" in fields[1].replace("state=", "").split("+")):
+            continue
+        app_id = fields[0].strip()
+        if app_id and app_id not in ids:
+            ids.append(app_id)
+    return ids
 
 
-def list_apps(root: Path, updates: Any, company_ids: set[str] | None = None) -> dict[str, Any]:
-    """Return installed apps, uninstalled shipped apps, and the update snapshot.
+def _sources(root: Path) -> dict[str, Any]:
+    """① — the candidate list. It carries no install record, by design."""
+    value = _command(root, ["sources"], json_output=True)
+    apps = value.get("apps")
+    if not isinstance(apps, dict):
+        raise AppsError("config_unavailable", "airlock-config sources omitted apps")
+    return value
 
-    Installed values come from ``airlock-config json`` rather than a second TOML
-    reader.  The public set is exactly ``known-builtins - installed``.  ``catalog``
-    contributes presentation metadata only; it cannot add an id to that set.
+
+def _platform_row(updates: Any) -> dict[str, Any]:
+    """The platform's own row, so every row in the store is one shape.
+
+    Three states and each says which one it is: measured-and-behind,
+    measured-and-current, and not-measured. The third is NOT "nothing to do" —
+    a client that cannot tell those apart is a client that shows a person an
+    empty list and calls it current.
+    """
+    value = updates.get("platform") if isinstance(updates, dict) else None
+    available = value.get("available") if isinstance(value, dict) else None
+    if available is True:
+        state, desc = "update", "새 플랫폼 버전이 있습니다"
+    elif available is False:
+        state, desc = "installed", "새 플랫폼 버전 없음"
+    else:
+        state, desc = "installed", "플랫폼 업데이트를 확인하지 못했습니다"
+    return {"id": "platform", "origin": "public", "kind": "platform",
+            "name": "Airlock 플랫폼", "desc": desc, "state": state, "detail": {}}
+
+
+def store_rows(root: Path, updates: Any, installed: list[str],
+               placed: set[str] | None = None) -> dict[str, Any]:
+    """The store's rows, one per candidate, each carrying its own single state.
+
+    `state` is decided here and nowhere else: the launcher's store draws it and
+    its detail sheet draws it, so a row and its detail cannot disagree about
+    whether something is installed. Three states, from three records:
+
+      * an app is installed when ③ says so, and has an update when the current
+        engine plan says so;
+      * a link is installed when it is placed on the home screen (④) — a link
+        has nothing to install, and "on my home screen" is the whole of it;
+      * anything else is install.
+
+    `placed` is the home order's ids. A link that has left its `links.toml`
+    keeps its place (the order file is not this function's to rewrite) but draws
+    no row, so the store never offers a link the box cannot resolve.
     """
     root = Path(root).resolve()
-    company_ids = set(company_ids or ())
-    try:
-        resolved = _command(root, ["json"], json_output=True)
-        package_info = _command(root, ["package-info"], json_output=True)
-    except AppsError as exc:
-        degraded = _lock_mismatch_projection(exc, updates, company_ids)
-        if degraded is not None:
-            return degraded
-        raise
-    apps = resolved.get("apps")
-    if not isinstance(apps, dict):
-        raise AppsError("config_unavailable", "airlock-config json omitted apps")
-    packages = package_info.get("packages")
-    packages = packages if isinstance(packages, dict) else {}
-    known = {line.strip() for line in _command(root, ["known-builtins"]).splitlines()
-             if line.strip()}
-    catalog_doc = _command(root, ["catalog"], json_output=True)
-    catalog_rows = catalog_doc.get("apps")
-    catalog = {row["id"]: row for row in catalog_rows or []
-               if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    placed = set(placed or ())
+    source = _sources(root)
     by_update = _update_map(updates)
+    # Only an upgrade row advertises an update the person can start.
+    upgradable = {app_id for app_id, row in by_update.items()
+                  if row.get("action") == "upgrade"}
+    rows: list[dict[str, Any]] = []
 
-    installed = []
-    for app_id, config in apps.items():
-        # The sheet renders one explicit Airlock platform row in hub's place. Keeping
-        # hub here as well would show ten rows for a nine-entry config.
-        if app_id == "hub":
+    def emit(candidate: dict[str, Any], origin: str) -> None:
+        app_id = str(candidate.get("id") or "")
+        if not app_id:
+            return
+        row = {"id": app_id, "origin": origin, "kind": "app",
+               "name": candidate.get("name") or app_id,
+               "desc": candidate.get("desc") or "",
+               "state": ("update" if app_id in upgradable else "installed")
+                        if app_id in installed else "install",
+               "detail": {}}
+        if candidate.get("icon"):
+            row["icon"] = candidate["icon"]
+        if candidate.get("glyph"):
+            row["glyph"] = candidate["glyph"]
+        if candidate.get("source") or candidate.get("path"):
+            row["detail"] = {"Path": candidate.get("source") or candidate["path"]}
+        rows.append(row)
+
+    for origin in ("public", "company", "personal"):
+        for candidate in source["apps"].get(origin) or []:
+            if isinstance(candidate, dict):
+                emit(candidate, origin)
+
+    seen = {row["id"] for row in rows}
+    for link in source.get("links") or []:
+        if not isinstance(link, dict):
             continue
-        package = packages.get(app_id)
-        package = package if isinstance(package, dict) else {}
-        installed.append({
-            "id": app_id,
-            "config": config,
-            "tile": package.get("tile"),
-            "source": package.get("source_class", "platform"),
-            "tier": ("company" if app_id in company_ids
-                     and package.get("source_class") == "explicit" else ""),
-            "digest": package.get("digest"),
-            "capabilities": package.get("effective_capabilities") or [],
-            "canRemove": bool((package.get("lifecycle") or {}).get("deactivate")),
-            "update": by_update.get(app_id),
-        })
+        app_id = str(link.get("id") or "")
+        if not app_id or app_id in seen:
+            continue
+        seen.add(app_id)
+        row = {"id": app_id, "origin": "company" if link.get("origin") == "company"
+               else "personal", "kind": "link", "name": link.get("name") or app_id,
+               "desc": link.get("desc") or "", "url": link.get("url"),
+               "state": "installed" if app_id in placed else "install",
+               "detail": {}}
+        if link.get("icon"):
+            row["icon"] = link["icon"]
+        if link.get("glyph"):
+            row["glyph"] = link["glyph"]
+        rows.append(row)
 
-    public = []
-    for app_id in sorted(known - set(apps)):
-        meta = catalog.get(app_id, {})
-        public.append({
-            "id": app_id,
-            "tile": meta.get("tile"),
-            "source": "builtin",
-            "digest": None,
-            "capabilities": [],
-            "canRemove": (root / "apps" / app_id / "deactivate.sh").is_file(),
-            "update": by_update.get(app_id),
-        })
-    return {"apps": apps, "installed": installed, "public": public,
+    # Nothing this box has installed may be missing from the store. A package the
+    # three source lists do not describe — an app whose origin
+    # repo is unreadable — still gets a row under its own id. A store that hides
+    # an installed app cannot update or remove it.
+    named = {row["id"] for row in rows}
+    for app_id in installed:
+        if app_id in named:
+            continue
+        # The same state calculation an ordinary candidate row gets: an app whose
+        # origin no source describes is still updatable, and a fallback row that
+        # ignored the engine plan would leave the one app with no menu unable to
+        # update itself.
+        rows.append({"id": app_id, "origin": "personal", "kind": "app",
+                     "name": app_id, "desc": "",
+                     "state": ("update" if app_id in upgradable else "installed"),
+                     "detail": {}})
+    rows.sort(key=lambda row: (row["origin"], row["id"]))
+    rows.insert(0, _platform_row(updates))
+    return {"rows": rows,
+            "links_path": source.get("links_path"),
             "updates": updates if isinstance(updates, dict) else {"apps": []}}
 
 
-def _read_config(path: Path) -> tuple[bytes, dict[str, Any]]:
+def _checked_link(name, url):
+    """The one accepted shape for a new personal link: a name, and an https url.
+
+    This is the retired shortcut validator with its label renamed to the word
+    the link file actually uses — not a new check. The url rules are
+    unchanged and load-bearing: a link leaves this origin, so plain http is the
+    mixed-content/HSTS trap, and credentials in the authority are somebody's
+    password written into a file that gets published.
+    """
+    if (not isinstance(name, str) or not name.strip()
+            or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+        raise AppsError("bad_link_name")
+    if (not isinstance(url, str) or not url
+            or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url)):
+        raise AppsError("bad_link_url")
     try:
-        data = path.read_bytes()
-        value = tomllib.loads(data.decode("utf-8"))
-    except (OSError, ValueError) as exc:
-        raise AppsError("config_unavailable", str(exc)) from exc
-    if not isinstance(value, dict):
-        raise AppsError("config_unavailable", "config is not a TOML document")
-    return data, value
+        parsed = urlsplit(url)
+        # Reading port also rejects malformed/out-of-range port values.
+        _ = parsed.port
+        if (parsed.scheme != "https" or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or "\\" in url or "%" in parsed.netloc):
+            raise ValueError("HTTPS hostname without credentials required")
+        host = parsed.hostname.encode("idna").decode("ascii")
+        if ":" not in host and any(not part or re.fullmatch(r"[a-zA-Z0-9-]+", part) is None
+                                  or part.startswith("-") or part.endswith("-")
+                                  for part in host.rstrip(".").split(".")):
+            raise ValueError("invalid hostname")
+    except (ValueError, UnicodeError) as exc:
+        raise AppsError("bad_link_url", str(exc)) from exc
+    return name.strip(), url
 
 
-def _load(path: Path) -> dict[str, Any]:
-    return _read_config(path)[1]
+def add_link(*, root: Path, webroot: Path, name=None, url=None,
+             order=None, installed: list | None = None):
+    """Add one table to the personal links.toml, then place it on the home screen.
 
+    The order is the whole design. The link file is written first and the Hub
+    projection is republished from it; only once both have succeeded is the id
+    appended to the home order. So:
 
-def registered_package_path(config: Path, app_id: str) -> Path:
-    """Return one configured explicit package path, resolved like airlock-config."""
-    app_id = _checked_id(app_id)
-    config = Path(config).resolve()
-    document = _load(config)
-    table = (document.get("packages") or {}).get(app_id)
-    raw = table.get("path") if isinstance(table, dict) else None
-    if not isinstance(raw, str) or not raw.strip():
-        raise AppsError("package_not_registered")
-    path = Path(raw.strip()).expanduser()
-    if not path.is_absolute():
-        path = config.parent / path
-    return path.resolve()
+      * a failed projection rolls the links file back and leaves the home order
+        byte-identical — a link the launcher cannot draw is not a link added;
+      * a failed home-order write is not rolled back. The link exists and the
+        store shows it as Install, which is a truthful state, and pressing
+        Install is exactly the operation that would place it.
 
-
-def _owned_header(line: str, namespace: str, app_id: str) -> bool:
-    atom = r'(?:%s|"%s"|\'%s\')' % tuple(re.escape(app_id) for _ in range(3))
-    # Match the owned table and any array/table nested below it. A similarly prefixed
-    # id (notes-old) does not match because only dot or closing bracket may follow.
-    return re.match(  # noqa: regex-anchor - table/id atoms are built at runtime
-                    r"^\s*\[\[?\s*" + re.escape(namespace) + r"\s*\.\s*" +
-                    atom + r"\s*(?:\.|\]\]?)", line) is not None
-
-
-def _drop_app_tables(text: str, app_id: str) -> str:
-    lines = text.splitlines(keepends=True)
-    output: list[str] = []
-    dropping = False
-    for line in lines:
-        if re.match(r"^\s*\[\[?", line):
-            # An explicit package table is registration intent, not reusable catalog
-            # state. Leaving it behind shadows a shipped id and, more importantly,
-            # makes a later enable/disable cycle fail validation as an orphan package.
-            dropping = (_owned_header(line, "apps", app_id) or
-                        _owned_header(line, "packages", app_id))
-        if not dropping:
-            output.append(line)
-    return "".join(output)
-
-
-def _append_tables(text: str, app_id: str,
-                   package: dict[str, Any] | None) -> str:
-    suffix = "" if not text or text.endswith("\n") else "\n"
-    if package is not None:
-        path = package.get("path")
-        grants = package.get("grant") or []
-        suffix += "[packages.%s]\npath = %s\n" % (
-            app_id, json.dumps(path, ensure_ascii=False))
-        if grants:
-            suffix += "grant = %s\n" % json.dumps(
-                grants, ensure_ascii=False, separators=(",", ":"))
-        suffix += "\n"
-    suffix += "[apps.%s]\n" % app_id
-    return text + suffix
-
-
-def _checked_package(package: dict[str, Any] | None) -> dict[str, Any] | None:
-    if package is None:
-        return None
-    if not isinstance(package, dict) or set(package) - {"path", "grant"}:
-        raise AppsError("bad_package_registration")
-    path = package.get("path")
-    grants = package.get("grant", [])
-    if not isinstance(path, str) or not path.strip():
-        raise AppsError("bad_package_path")
-    if (not isinstance(grants, list)
-            or any(not isinstance(value, str) for value in grants)
-            or len(grants) != len(set(grants))):
-        raise AppsError("bad_package_grants")
-    return {"path": path, "grant": list(grants)}
-
-
-def _write_candidate(config: Path, candidate_text: str) -> Path:
+    There is no removal counterpart. A link is removed by editing links.toml,
+    and the home order keeps its id on purpose: the same rule that keeps a
+    hidden app's place keeps a removed link's, and re-adding the file brings the
+    tile back where it was.
+    """
+    name, url = _checked_link(name, url)
+    base = Path(root).resolve()
+    source = _sources(base)
+    # The path is named in exactly one place, bin/airlock-config, and read from its
+    # output. A second copy here would be a second answer to "where do this box's
+    # personal links live", and only one of the two would ever be tested.
+    raw_path = source.get("links_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise AppsError("config_unavailable", "airlock-config sources omitted links_path")
+    path = Path(raw_path).expanduser()
+    existing = {row["id"]: row for row in source["links"]
+                if row.get("origin") == "personal"}
+    same = next((row_id for row_id, row in existing.items()
+                 if row.get("url") == url), None)
+    if same is not None:
+        return {"id": same, "changed": False, "link": True}
+    link_id = "link-" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    if APP_ID.fullmatch(link_id) is None:  # unreachable: the digest is hex
+        raise AppsError("bad_link_name")
+    if link_id in existing:
+        raise AppsError("link_id_conflict")
+    before = None
     try:
-        original_mode = stat.S_IMODE(config.stat().st_mode)
-        descriptor, temporary = tempfile.mkstemp(prefix=".%s.candidate." % config.name,
-                                                  dir=str(config.parent))
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
-            os.fchmod(handle.fileno(), original_mode)
-            handle.write(candidate_text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        return Path(temporary)
+        before = path.read_bytes()
+    except FileNotFoundError:
+        before = None
     except OSError as exc:
         raise AppsError("config_unwritable", str(exc)) from exc
-
-
-def _replace_validated(config: Path, candidate_text: str, expected: bytes,
-                       approved_package: tuple[str, str] | None = None,
-                       lifecycle_pids: list[str] | None = None) -> None:
-    root = default_root()
-    candidate = _write_candidate(config, candidate_text)
-    backup_tmp: Path | None = None
+    body = (before.decode("utf-8") if before is not None else "")
+    if body and not body.endswith("\n"):
+        body += "\n"
+    body += "\n[%s]\n" % link_id
+    body += "".join("%s = %s\n" % (key, json.dumps(value, ensure_ascii=False))
+                    for key, value in (("name", name), ("url", url)))
     try:
-        validation = (["validate"] if approved_package is None else
-                      ["package-register-validate", *approved_package])
-        _command(root, validation, config=candidate)
-        if approved_package is None and lifecycle_pids:
-            _command(root, ["package-info",
-                            "--lifecycle-targets=" + ",".join(lifecycle_pids)],
-                     config=candidate)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".links.toml.", dir=str(path.parent))
         try:
-            current = config.read_bytes()
-        except OSError as exc:
-            raise AppsError("config_unavailable", str(exc)) from exc
-        if current != expected:
-            raise AppsError("config_conflict", "airlock.toml changed during validation")
-        descriptor, temporary = tempfile.mkstemp(prefix=".%s.backup." % config.name,
-                                                  dir=str(config.parent))
-        backup_tmp = Path(temporary)
-        with os.fdopen(descriptor, "wb") as handle:
-            os.fchmod(handle.fileno(), stat.S_IMODE(config.stat().st_mode))
-            handle.write(expected)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Keep the old .bak too when an external editor won the race while the
-        # candidate or its backup was being prepared.
-        if config.read_bytes() != expected:
-            raise AppsError("config_conflict", "airlock.toml changed before replacement")
-        os.replace(backup_tmp, Path(str(config) + ".bak"))
-        backup_tmp = None
-        os.replace(candidate, config)
-    except AppsError:
-        raise
-    except OSError as exc:
-        raise AppsError("config_unwritable", str(exc)) from exc
-    finally:
-        try:
-            candidate.unlink()
-        except FileNotFoundError:
-            pass
-        if backup_tmp is not None:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception:
             try:
-                backup_tmp.unlink()
+                os.unlink(temporary)
             except FileNotFoundError:
                 pass
+            raise
+        _republish_hub(base, webroot)
+        _placed_in_projection(base, webroot, link_id)
+    except AppsError:
+        _restore(path, before)
+        raise
+    except OSError as exc:
+        _restore(path, before)
+        raise AppsError("hub_refresh_failed", str(exc)) from exc
+    if order is not None:
+        try:
+            _place_on_home(order, installed or [], link_id)
+        except (OSError, RuntimeError):
+            pass
+    return {"id": link_id, "changed": True, "link": True}
 
 
-def mutate_enabled(config: Path, app_id: str, enabled: bool) -> dict[str, Any]:
-    """Add or remove one app registration through validate -> backup -> replace."""
-    app_id = _checked_id(app_id)
-    config = Path(config).resolve()
-    with _WRITE_LOCK:
-        original, document = _read_config(config)
-        present = app_id in (document.get("apps") or {})
-        if bool(enabled) == present:
-            return {"id": app_id, "enabled": present, "changed": False}
-        text = original.decode("utf-8")
-        candidate = (_append_tables(text, app_id, None) if enabled
-                     else _drop_app_tables(text, app_id))
-        if not enabled:
-            try:
-                projected = tomllib.loads(candidate)
-            except ValueError as exc:
-                raise AppsError("config_unsupported", str(exc)) from exc
-            if app_id in (projected.get("apps") or {}) \
-                    or app_id in (projected.get("packages") or {}):
-                raise AppsError(
-                    "config_unsupported",
-                    "app/package registration is not expressed as a removable table")
-        _replace_validated(config, candidate, original)
-    return {"id": app_id, "enabled": bool(enabled), "changed": True}
+def _placed_in_projection(root: Path, webroot: Path, link_id: str) -> None:
+    """The link has to be READABLE, not merely written.
+
+    A links.toml that will not parse is skipped with one line on stderr and
+    everything else carries on — which is right for reading and wrong for
+    writing. Appending a table to a broken file produces a file that is still
+    broken, the projection that was just published does not contain the link,
+    and reporting success would put an id on the home screen that nothing can
+    draw. So the projection is read back, and a link missing from it is a
+    rollback like any other.
+    """
+    try:
+        projection = json.loads((Path(webroot) / "__airlock.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise AppsError("hub_refresh_failed", str(exc)) from exc
+    if not isinstance(projection, dict) or link_id not in (projection.get("apps") or {}):
+        raise AppsError("links_unreadable",
+                        "the personal links file did not parse, so the new link "
+                        "is not readable either — fix the file and try again")
 
 
-def register(config: Path, app_id: str,
-             package: dict[str, Any] | None = None, *,
-             approved_digest: str | None = None) -> dict[str, Any]:
-    """Register an app, optionally with an explicit package path, via the same writer."""
-    app_id = _checked_id(app_id)
-    package = _checked_package(package)
-    if approved_digest is not None:
-        if package is None or re.fullmatch(r"[0-9a-f]{64}", approved_digest) is None:
-            raise AppsError("bad_package_approval")
-    config = Path(config).resolve()
-    with _WRITE_LOCK:
-        original, document = _read_config(config)
-        apps = document.get("apps") or {}
-        packages = document.get("packages") or {}
-        if app_id in apps:
-            if package is not None and app_id not in packages:
-                raise AppsError("app_already_registered")
-            return {"id": app_id, "enabled": True, "changed": False}
-        if package is not None and app_id in packages:
-            raise AppsError("package_already_registered")
-        text = _append_tables(original.decode("utf-8"), app_id, package)
-        approval = ((app_id, approved_digest)
-                    if approved_digest is not None else None)
-        targets = [app_id] if package is not None and approved_digest is None else None
-        _replace_validated(config, text, original, approval, lifecycle_pids=targets)
-    return {"id": app_id, "enabled": True, "changed": True}
+def _restore(path: Path, before: bytes | None) -> None:
+    """Put a link file back exactly as it was. Best effort, and never raising."""
+    try:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(before)
+    except OSError:
+        pass
+
+
+def _republish_hub(root: Path, webroot: Path) -> None:
+    """Render and publish Hub's frontend config from the committed links file."""
+    webroot = Path(webroot)
+    target = webroot / "__airlock.json"
+    try:
+        previous = json.loads(target.read_text()) if target.exists() else {}
+        if not isinstance(previous, dict):
+            raise ValueError("Hub config is not an object")
+        projection = _command(root, ["webjson"], json_output=True)
+        # The installer measured this hostname; the service does not re-measure it.
+        if "fqdn" in previous:
+            projection["fqdn"] = previous["fqdn"]
+        else:
+            projection.pop("fqdn", None)
+        webroot.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(prefix=".__airlock.json.", dir=str(webroot))
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o644)
+                json.dump(projection, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except (OSError, ValueError) as exc:
+        raise AppsError("hub_refresh_failed", str(exc)) from exc
+
+
+def _place_on_home(order, installed: list, link_id: str) -> None:
+    """Append one id to the home order — the same write the launcher makes."""
+    current = order.read_order(installed)
+    order.write_order(current + [link_id], installed)

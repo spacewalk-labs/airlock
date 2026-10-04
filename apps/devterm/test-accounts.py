@@ -245,14 +245,15 @@ def platform_statuses(module, bindings: dict[str, set[str]]) -> dict[tuple[str, 
             return True
 
         def _json_body(self):
-            return {"name": "fixture", "code": "ABCD-1234", "item": "fixture"}
+            return {"name": "fixture", "code": "ABCD-1234", "item": "fixture",
+                    "email": "fixture@example.test"}
 
     replacements = {
         "_probe": lambda _args=(): (200, {}),
         "_accounts_payload": lambda: {},
         "_xai_status_payload": lambda: (200, {}),
         "_acct_alert_payload": lambda: {},
-        "_codex_usage_cached": lambda wait=False: {},
+        "_codex_usage_cached": lambda wait=False, revalidate=False: {},
         "_fetch_fleet_store": lambda: {},
         "_cli": lambda args, **_kwargs: (
             True,
@@ -645,8 +646,11 @@ def main() -> int:
     # probed 200 in fixture (the POST's patched CLI reports ok with empty
     # stdout, which the handler answers 200 with empty steps rather than
     # inventing a refusal). Advanced deliberately, not adjusted to fit.
+    # 23 -> 24 routes (and 19 -> 20 retired 404s) with AGY_SWAP's POST
+    # /agy-switch: one non-fleet route, probed 200 in fixture the same way as
+    # /muse-swap. Advanced deliberately, not adjusted to fit.
     p4a_expected = (
-        "retired_404==19 && platform_200==23 && platform_routes==23 && registered_routes==24 "
+        "retired_404==20 && platform_200==24 && platform_routes==24 && registered_routes==24 "
         "&& registered_runtime_200==25 && account_domain_routes==0 && account_domain_200==0"
     )
     p4a_observed = {

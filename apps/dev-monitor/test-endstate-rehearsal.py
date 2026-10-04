@@ -43,7 +43,7 @@ def run(copy, old_backend):
             self.send_response(200);self.end_headers()
         def log_message(self,*args): pass
     with tempfile.TemporaryDirectory(prefix='devmon-rehearsal-') as tmp, \
-            patch.dict(os.environ,{'AIRLOCK_DEV_MONITOR_MESSAGES':'false'}):
+            patch.dict(os.environ,{'AIRLOCK_DEV_MONITOR_MESSAGES':'false','AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS':'0'}):
         root=Path(tmp);dbpath=root/'messages.db'
         target=sqlite3.connect(dbpath);source.backup(target);target.close();os.chmod(dbpath,0o600)
         command=[sys.executable,str(APP/'migrate-legacy-state.py')]
@@ -84,7 +84,7 @@ def run(copy, old_backend):
         try:
             for payload in (heartbeat,normal): assert emit(str(queue),payload)=='queued'
             assert spool.scan_once(str(queue))['inserted']==2
-            assert loop.deliver_once('http://127.0.0.1:%d/hook'%server.server_port)
+            assert loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': 'http://127.0.0.1:%d/hook'%server.server_port}))
             assert len(posts)==1 and heartbeat['title'] in posts[0]['text']
             assert M.get_card(heartbeat['id'])['sent_at']
         finally:

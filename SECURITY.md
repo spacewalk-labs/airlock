@@ -22,8 +22,8 @@ boundary against an actor who can already write this file.
 
 ## Trust model (v1: Tailscale, fail-closed)
 
-Airlock v1 authenticates **only** via Tailscale identity, and derives its safety
-from three facts that must ALL hold:
+Airlock v1 authenticates interactive tools via Tailscale identity. The message-only
+dev-monitor ingest exception is described below. Its safety depends on these boundaries:
 
 1. **Single ingress.** `tailscale serve` is the only path to the gates. The
    installer verifies this and **refuses to start (fails closed)** if Tailscale
@@ -44,6 +44,24 @@ from three facts that must ALL hold:
    for — otherwise removing an app would leave its cleartext listener behind.
 
 The gate then checks the identity against the configured `owner` (+ `collaborators`).
+
+## Dev-monitor ingest port
+
+The dev-monitor ingest listener uses tailnet-only `tailscale serve` HTTPS
+on `ingest_port` (default 19926). It preserves the single-ingress and loopback
+boundaries above. Tagged infrastructure nodes do not carry a user login, so this
+listener authenticates the `X-Devmon-Ingest-Token` header against the app-specific
+`DEVMON_INGEST_TOKEN`, using a constant-time comparison instead of an identity gate.
+The hub's `$hub_ok` and tools' `$owner_ok` gates are unchanged.
+
+Only `POST /api/ingest` reaches the backend. Every other path or method, including
+GET and HEAD, returns 404. Owner/proxy-secret headers are removed. The endpoint
+accepts one message JSON within the existing 16 KiB contract and publishes it to
+the spool; it grants no read or execution access. An optional message action can
+only be run later through the existing owner console. The port remains mapped
+without a token; an unconfigured token name, missing/empty runtime value, or
+disabled message console returns 404. A wrong token returns 401. App removal
+retires the mapping through the existing artifact ledger.
 
 ## Password-gated public snapshots
 
@@ -332,44 +350,28 @@ reach a loopback gate, it obtains owner access. Therefore:
   against forged-header requests.
 
 
-## Managed release publisher trust
-
-An organisation-managed release is a separate trust class from both a shipped package and an
-operator-selected local package. Its Ed25519 signature proves that one key signed one canonical
-snapshot; it does not make the package first-party and it does not authorize the key by itself.
-Authorization comes from the operator-owned `current-membership.json`, signed by the offline
-organisation root pinned outside the release. Promotion requires the signing key to be an active
-current publisher, within its validity window and capability ceiling, on the root-authorized channel
-epoch. The receipt binds the exact membership digest used for that decision.
-The promotion store also retains the highest root-signed membership sequence and digest observed for
-each organisation, refusing older sequences and same-sequence equivocation before publisher
-authorization. Invalid root signatures cannot advance this authority floor.
-
-Publishers must not be able to write the authority directory. The generic release tool only reads
-that directory and cannot add members, rotate or revoke keys, grant capabilities, enroll a box, or
-install a release. Company identity and filesystem ownership for the authority directory are a
-private operator responsibility. A green publisher fixture is therefore not evidence that a box
-accepted or installed the release.
-
 ## Package trust (D4)
 
 Airlock does not sandbox apps. An app package's lifecycle scripts run
 arbitrary bash as the operator, including sudo. What bounds that is
 explicitness, not isolation:
 
-- **Explicit packages** — every third-party package is one operator-written
-  `[packages.X] path` line; there is no discovery, no store, no implicit
-  tap. Writing that line is trusting that code, exactly as adding a Homebrew
-  tap or installing a krew plugin is. Airlock never executes an explicit
-  package's scripts on a dry run.
+- **Explicit packages** — a local app enters through an operator-supplied
+  `airlock-ledger apply <id> --source <absolute-directory>`; Company apps
+  come from the configured repository's pinned main SHA. Applying the app trusts
+  its code. The engine records the source, and later reinstalls use that record.
+  Leftover package path/grant tables do not select or admit an app. Airlock never
+  executes an explicit package's scripts on a dry run.
 - **Shipped packages** — the nine apps in this repository resolve
   implicitly from `apps/<id>` and are first-party code, reviewed here. A dry
-  run may execute a *migrated* shipped app's lifecycle scripts — those that
-  certify full `AIRLOCK_DRY_RUN` discipline as part of their migration;
-  never an explicit package's. Shipped entitlements are immutable repository
-  policy; an explicit package instead needs an operator grant for root-owned
-  artifacts or system units. Their removal remains confined to the recorded
-  capability claim and the execution-time rooted allowlist.
+  run of an existing installed box may execute a *migrated* shipped app's
+  lifecycle scripts — those that certify full `AIRLOCK_DRY_RUN` discipline.
+  A first bootstrap preview without ③ or v7 installation state validates
+  inputs and displays the plan and projection without executing app hooks.
+  Explicit packages never receive dry-run execution. Shipped entitlements are immutable repository
+  policy. An explicit app requests root-owned artifacts or system units in its
+  manifest; applying that app is the operator admission. Removal remains confined
+  to recorded artifacts and the execution-time rooted allowlist.
 - The installed-state ledger records what every package **declares and the
   install expands** — not a byte-level provenance trail — and is the only
   thing that deletes it; removal never follows a path the record does not

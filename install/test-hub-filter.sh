@@ -20,38 +20,54 @@ command -v node >/dev/null 2>&1 \
 # The pure functions prove the LOGIC; these greps prove the WIRING — a
 # deleted call site would leave every node assertion green while rendering
 # owner-audience tiles to collaborators.
-grep -qF 'if (!airlockTileVisible(apps[name].audience, me && me.role)) continue;' \
+grep -qF 'if (!airlockTileVisible(entry.audience, me && me.role)) return' \
   "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the airlockTileVisible call site is gone from the render loop"; exit 1; }
-grep -qF 'const meta = airlockTileMeta(apps[name]);' \
+grep -qF 'const meta = airlockTileMeta(entry);' \
   "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the airlockTileMeta call site is gone from the render loop"; exit 1; }
 # The third call site. Without it the page still renders every tile, in one
-# nameless grid — no error, no blank screen, just the sections silently gone,
-# and with them the on-screen line saying which tiles leave the Airlock gate.
-grep -qF 'for (const sec of airlockTileSections(apps, names)) {' \
+# nameless grid — no error, no blank screen, just the retirement filter gone and
+# the app a collaborator must not see drawn anyway.
+# The list is one list. airlockHomeItems decides what a row survives; the render
+# loop must go through it rather than drawing the saved order directly, or the
+# order file becomes the only word on what this box has installed.
+grep -qF 'for (const row of airlockHomeItems(homeOrder, installed, apps)) {' \
   "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the airlockTileSections call site is gone from the render loop"; exit 1; }
+  || { echo "FAIL hub-filter: the home render loop no longer goes through airlockHomeItems"; exit 1; }
+grep -qF 'installed = Array.isArray(value.installed) ? value.installed : null;' \
+  "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the home screen no longer reads the install record from the order API"; exit 1; }
 echo "ok   hub-filter: all three call sites are wired into the render loop"
 
 # The app-store entrance owns the update badge now. It counts platform + app
 # updates from the owner apps contract; Codex stays in the gear's harness section.
-grep -qF 'const count = updateCount(data);' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the app-store badge no longer reads the apps snapshot"; exit 1; }
+# 🔴 One number, one rule. The badge counts the rows' own `state`, not the raw
+# snapshot: only the store rows offer a pressable update button,
+# and a badge overstating sends a person to a sheet with nothing they can act on.
+grep -qF 'const count = rows.filter(item => item.state === "update").length;' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the app-store badge no longer counts the rows' own state"; exit 1; }
+grep -qF 'return airlockUpdateCount(updates(data));' "$ROOT/hub/index.html" \
+  && { echo "FAIL hub-filter: a second update count is back beside the rows' state"; exit 1; }
 grep -qF 'badge.hidden = count === 0;' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the app-store badge is no longer hidden at zero"; exit 1; }
 grep -qF 'fetch("/monitor/api/owner/apps", { cache: "no-store" })' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: the app store no longer reads the owner apps API"; exit 1; }
-for action in enable disable remove; do
-  grep -qF "\"$action\", item.id" "$ROOT/hub/index.html" \
+for action in install update place-link; do
+  grep -qF "action: \"$action\"" "$ROOT/hub/index.html" \
     || { echo "FAIL hub-filter: the app store no longer wires $action"; exit 1; }
 done
-grep -qF 'button.disabled = !!disabled;' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: app-store actions no longer honor canRemove"; exit 1; }
-grep -qF '<li>전체 설치기 재실행</li>' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: app-store progress no longer names the full installer"; exit 1; }
-grep -qF 'function renderDots(d) { wanted = new Set(airlockUpdateAppIds(d)); paintDots(); }' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: the tile dots no longer read the same app list as the badge"; exit 1; }
+grep -qF 'button.disabled = !spec;' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: a row's one button is no longer disabled by its own state"; exit 1; }
+grep -qF '<li>선택한 앱 적용</li>' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: app-store progress no longer says it installs only that app"; exit 1; }
+# 🔴 The dot, the badge and the row must be one verdict. The dots used to read the
+# raw update snapshot while the badge and the rows read the backend's own state, so
+# an app without an update could carry a dot beside a row with no button.
+grep -qF 'window.airlockSetUpdateIds = (ids) => {' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the tile dots no longer read the rows' own state"; exit 1; }
+grep -qF 'window.airlockSetUpdateIds(rows.filter(item => item.state === "update")' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: the dot and the badge are not fed from one list"; exit 1; }
 # The update section moved to the app store. Keep the old settings renderer, hidden
 # cache DOM, run poller and execute handler out rather than maintaining a second
 # invisible update client behind the gear.
@@ -73,12 +89,12 @@ grep -qF 'if (!d || typeof d !== "object" || Array.isArray(d)) return;' "$ROOT/h
   || { echo "FAIL hub-filter: the updates poll renders payloads that are not objects"; exit 1; }
 # Taking the gear away has to take the tile dots with it, or the launcher keeps
 # showing update marks for a feature the box no longer offers.
-grep -qF 'renderDots(null);                         // and no orphaned tile dots either' "$ROOT/hub/index.html" \
+grep -qF 'window.airlockSetUpdateIds([]);           // and no orphaned tile dots either' "$ROOT/hub/index.html" \
   || { echo "FAIL hub-filter: hiding the gear on 403/404 no longer clears the tile dots"; exit 1; }
 # The poll can win the race with the launcher's own tile rendering and find no
 # tiles at all; without this the first dots would wait a full poll interval.
-grep -qF 'new MutationObserver(paintDots).observe(secs, { childList: true, subtree: true });' "$ROOT/hub/index.html" \
-  || { echo "FAIL hub-filter: tile dots are no longer re-applied to tiles that render late"; exit 1; }
+grep -qF 'new MutationObserver(paintDots).observe(home, { childList: true, subtree: true });' "$ROOT/hub/index.html" \
+  || { echo "FAIL hub-filter: tile dots are not re-applied to tiles that render late"; exit 1; }
 # /whoami returns null for a dropped connection exactly as it does for "not the
 # owner". Deciding once at load makes one bad moment cost the owner the gear
 # until reload, so only a DEFINITE non-owner answer stops the poll.
@@ -207,68 +223,137 @@ sourceCheck("recent launcher state and markup are absent",
 const settingsMarkup = (html.match(/<div class="settings"[\s\S]*?<\/header>/) || [""])[0];
 sourceCheck("settings keeps no update section or badge",
   !/id="settings-badge"|id="set-updates"|>업데이트\s*</.test(settingsMarkup));
-sourceCheck("app store exposes the four fixed tabs",
-  ["installed", "public", "company", "personal"]
-    .every(id => html.includes('data-store-tab="' + id + '"')));
-sourceCheck("company and personal tabs both have their live inputs",
-  html.includes('id="store-company"') &&
-  html.includes('const company = Array.isArray(data.company) ? data.company : [];') &&
-  html.includes('id="store-personal-path"') &&
-  html.includes('id="store-personal-preview"') &&
-  html.includes('"/monitor/api/owner/apps/package-preview"'));
-sourceCheck("an unreadable company catalog is an honest empty tab",
-  html.includes('if (!company.length) empty(companyEl, "이 박스에서 읽을 수 있는 사내 앱이 없습니다.");'));
-sourceCheck("company installability is carried into the action",
-  html.includes('item.installed === true || item.installable !== true,') &&
-  html.includes('"install-company", item.id, true,') &&
-  html.includes('"빌드 산출물이 필요함 (build_artifact)"') &&
-  html.includes('"설치 불가 · " + (companyReason(item) || "이유 없음")'));
-sourceCheck("an installed company entry cannot be installed twice",
-  html.includes('Object.assign({}, item, { installed: installedIds.has(item.id) })') &&
-  html.includes('item.installed === true ? "설치됨"') &&
-  html.includes('item.installed === true ? "이미 설치된 앱입니다."'));
-sourceCheck("company install reuses the owner app mutation route",
-  html.includes('const installs = personal || action === "install-company";') &&
-  html.includes('"/monitor/api/owner/apps/" + encodeURIComponent(id) + "/" + action'));
-sourceCheck("personal approval binds the preview path and digest",
-  html.includes('personal ? { path: selected.preview.path, digest: selected.preview.digest }') &&
-  html.includes('registered ? "재승인" : "재승인하고 설치"') &&
-  html.includes('"승인하고 설치"'));
-sourceCheck("an unregistered stale lock stays on register while requesting reapproval",
-  html.includes('const reapprove = value.requires_reapproval === true;') &&
-  html.includes('const action = registered && reapprove ? "reapprove" : "register";'));
-sourceCheck("denied personal capabilities disable approval",
-  html.includes('value.installable !== true || (registered && !reapprove)') &&
+// Three menus, one per origin — and exactly three. "설치됨" was never a menu
+// (it is a state, and every row carries its own) and "외부 서비스" was a fourth
+// menu for one kind of row that the Personal menu now carries.
+const storeTabs = (html.match(/data-store-tab="[a-z]+"/g) || [])
+  .map(m => m.slice('data-store-tab="'.length, -1));
+sourceCheck("the store exposes exactly the three origin menus",
+  JSON.stringify(storeTabs) === JSON.stringify(["public", "company", "personal"]));
+sourceCheck("no menu is named for a state or for a kind of row",
+  !/설치됨|외부 서비스/.test((html.match(/<div class="store-tabs"[\s\S]*?<\/div>/) || [""])[0]));
+sourceCheck("each menu draws from the one origin the backend named",
+  html.includes('const groups = { public: [], company: [], personal: [] };') &&
+  html.includes('for (const row of groups[origin]) target.appendChild(rowNode(row));'));
+sourceCheck("an empty origin is an honest empty menu, not an error",
+  html.includes('"이 박스에서 읽을 수 있는 사내 앱이 없습니다."') &&
+  html.includes('"개인 앱과 링크가 없습니다."'));
+sourceCheck("every menu has a live pane and its live list",
+  ["public", "company", "personal"].every(o =>
+    html.includes('id="store-pane-' + o + '"') && html.includes('id="store-' + o + '"')));
+sourceCheck("an unknown install record never replaces the manifest order",
+  html.includes('Array.isArray(value.order) && value.installed !== null')
+  && html.includes('Array.isArray(read.order) && read.installed === null')
+  && html.includes('installed = null;'));
+sourceCheck("a line spans the list rather than shrinking to its own name",
+  /\.home-line \{[^}]*justify-self: stretch;/.test(html));
+sourceCheck("the drop side the pointer chose is the side the row lands on",
+  html.includes('home.insertBefore(drag, (after ? target.nextSibling : target));'));
+// 🔴 pointermove keeps firing while the FLIP slide animates, and the box it
+// measures is the ANIMATED one — so without these two the row oscillates for as
+// long as the finger rests. A resting pointer decides nothing; a row already on
+// the requested side does not move.
+sourceCheck("a resting finger and a settled row move nothing",
+  html.includes('if (event.clientX === lastX && event.clientY === lastY) return;')
+  && html.includes('if (after ? here === there + 1 : here === there - 1) return;'));
+sourceCheck("the line editor and the save it triggers share one scope",
+  html.includes('let removeLine = () => {};') && html.includes('let renameLine = () => {};')
+  && html.includes('input.addEventListener("change", () => renameLine(node, input.value));')
+  && html.includes('removeLine = (node) => {') && html.includes('renameLine = (node, value) => {')
+  && !html.includes('input.onchange'));
+sourceCheck("a row is icon, name, one line, and one state button",
+  html.includes('"store-row-icon", brand => wrap.classList.toggle("has-brand", brand))') &&
+  html.includes('.store-row-icon { flex: none; width: 36px; height: 36px;') &&
+  /\.store-row-note \{[^}]*white-space: nowrap;[^}]*text-overflow: ellipsis;[^}]*\}/.test(html) &&
+  html.includes('const STATE_LABEL = { update: "업데이트", install: "설치", installed: "설치됨" };'));
+// 🔴 The platform row is a row but not an app id: `action: "app"` with
+// id "platform" is refused as not-pending, so an Update there has to run the
+// platform action or the button silently does nothing.
+sourceCheck("a row's button is derived from the backend state and nothing else",
+  html.includes('function actionFor(row) {') &&
+  html.includes('if (row.state === "update") {') &&
+  html.includes('{ action: "platform", primary: true } : { action: "update", primary: true };') &&
+  html.includes('if (row.state !== "install") return null;'));
+// 🔴 The client no longer re-judges anything the backend decided. Each of these
+// was a second verdict on the same fact, and each is the shape the bugs took:
+// "설치됨" came from a config table, an update from the client's own lookup, and
+// a Company row's installability from the catalogue the sheet had not read.
+sourceCheck("a tap on a tile launches unless the screen is being edited",
+  html.includes('if (editing && event.target.closest(".app")) event.preventDefault();'));
+sourceCheck("the first long press cannot be turned into a scroll",
+  html.includes('document.addEventListener("touchmove", event => {') &&
+  html.includes('if (pressTimer || drag) event.preventDefault();') &&
+  html.includes('{ passive: false })'));
+sourceCheck("the editor's own bar is shown by the edit state, not a hidden attribute",
+  html.includes(':root[data-home-edit="1"] .home-editbar {') &&
+  html.includes('visibility: visible;') &&
+  !html.includes('id="home-editbar" hidden'));
+sourceCheck("a failed icon image falls to the glyph declared beside it",
+  html.includes('airlockIconNode(Object.assign({}, entry, { icon: "" }), "")'));
+sourceCheck("placing a link re-reads the projection the home draws from",
+  html.includes('window.airlockRefreshHubTiles = async function () {') &&
+  html.includes('body: JSON.stringify({ name: name, url: value })') &&
+  html.includes('await window.airlockRefreshHubTiles();'));
+sourceCheck("the store keeps no client-side install or update verdict",
+  !/function updateFor\(|function hasUpdate\(|updateFor\(|hasUpdate\(|companyReason\(|installedIds\b/.test(html));
+// The retired names are assembled, not written out: this file is inside the
+// card's own deletion grep, and a contiguous literal here would match itself and
+// fail the very suite that exists to prove the deletion happened.
+const RETIRED = ["airlock" + "TileSections", "AIRLOCK_" + "TOOLS_SECTION",
+                 "AIRLOCK_" + "SHORTCUT_NOTE", "data-" + "sectionTitle",
+                 'class="sec-' + 'h"'];
+sourceCheck("the retired section vocabulary is gone from the launcher",
+  RETIRED.every((name) => !html.includes(name)), RETIRED.filter(n => html.includes(n)));
+sourceCheck("there is one home list and it has no headings",
+  html.includes('<div id="home" class="apps"></div>') &&
+  !html.includes('id="secs"') && !html.includes('wrap.dataset.sectionTitle'));
+const RETIRED_EDIT = ["home-edit-" + "open", "home-edit-" + "done"];
+sourceCheck("the two retired edit buttons are gone",
+  RETIRED_EDIT.every((name) => !html.includes(name))
+  && !html.includes('.' + RETIRED_EDIT[1])
+  && !html.includes('id="' + RETIRED_EDIT[0] + '"')
+  && !html.includes('id="' + RETIRED_EDIT[1] + '"'));
+sourceCheck("appearance is one button that cycles, not three",
+  html.includes('id="theme-cycle"') &&
+  html.includes('const order = ["system", "light", "dark"];') &&
+  html.includes('localStorage.setItem("markwand-theme", theme)') &&
+  !html.includes('data-theme-btn') && !html.includes('class="theme-group"'));
+sourceCheck("a personal row is added from one line that takes a link or a path",
+  html.includes('id="store-add-form"') &&
+  html.includes('if (value.startsWith("https://")) {') &&
+  html.includes('previewPersonal(value);') &&
+  html.includes('"/monitor/api/owner/apps/links/add"'));
+sourceCheck("adding a link republishes the projection the launcher draws from",
+  html.includes('await window.airlockRefreshHubTiles()') &&
+  html.includes('await pollApps();'));
+sourceCheck("placing an existing link is the launcher's own home-order write",
+  html.includes('"/monitor/api/owner/home/order"') &&
+  html.includes('body: JSON.stringify({ order: value.order.concat([id]) })'));
+sourceCheck("personal installation forwards the selected preview source",
+  html.includes('personal ? { path: selected.preview.path }') &&
+  html.includes('button.textContent = "설치";'));
+sourceCheck("a configured candidate does not block explicit Personal installation",
+  !html.includes('value.registered') &&
+  !html.includes('requires_reapproval') && !html.includes('reapprove'));
+sourceCheck("denied personal capabilities disable installation",
+  html.includes('const disabled = value.installable !== true;') &&
   html.includes('chip.dataset.denied = String(denied)') &&
   html.includes('거부된 capability를 manifest에서 빼야 합니다'));
-sourceCheck("personal tiles use only the square tier mark",
-  html.includes('kind === "company" ? "company-mark" : "personal-mark"') &&
-  html.includes('border-radius: 1px;') &&
-  !html.includes('"Added app"'));
-sourceCheck("company tiles use only a dot beside the label",
-  html.includes('.company-mark { display: inline-block; width: 6px; height: 6px; margin-left: 4px;') &&
+sourceCheck("origin marks are the two shapes, and only the origin column decides",
+  html.includes('const kind = AIRLOCK_COMPANY_IDS.has(tile.dataset.appName)') &&
+  html.includes('function airlockSetCompanyIds(rows) {') &&
+  html.includes('if (row && row.origin === "company"') &&
   html.includes('border-radius: 50%;') &&
-  html.includes('airlockApplyCompanyCatalog(company);') &&
-  html.includes('kind === "company" || AIRLOCK_COMPANY_IDS.has(item.id)') &&
-  html.includes('kind === "company" ? "사내 앱" : "개인 앱"'));
-sourceCheck("detail progress ends with the full-installer truth",
-  /<li>전체 설치기 재실행<\/li>\s*<\/ol>/.test(html));
-sourceCheck("missing digest is qualified by source class",
-  html.includes('kind === "explicit" ? "이 응답에서 airlock.lock digest 확인 불가"') &&
-  html.includes('kind === "platform" || kind === "builtin" || kind === "shipped"'));
-sourceCheck("lock mismatch routes through a fresh personal path preview",
-  html.includes('value.action === "lock-mismatch"') &&
-  html.includes('actionButton("재승인", "personal-review"') &&
-  html.includes('패키지 경로를 다시 미리보기하면 새 digest를 확인하고 재승인할 수 있습니다.'));
-sourceCheck("lock mismatch degraded inventory stays visible and honest",
-  html.includes('data.degraded === "lock-mismatch"') &&
-  html.includes('전체 설치 목록을 읽지 못했습니다'));
-sourceCheck("home edit disable is gated by the live app-store API",
-  html.includes(':root[data-home-edit="1"][data-app-store="1"] .app .app-disable') &&
-  html.includes('encodeURIComponent(disable.dataset.disableApp) + "/disable"'));
-sourceCheck("no-deactivator apps expose neither disable path",
-  html.includes('button.disabled = !item || !item.canRemove;') &&
-  html.includes('actionButton("끄기", "disable", item.id, false, !item.canRemove'));
+  !html.includes('airlockApplyCompanyCatalog'));
+sourceCheck("detail progress ends with installing only that app",
+  /<li>설치 결과 확인<\/li>\s*<\/ol>/.test(html));
+sourceCheck("the retired package digest lock left no reapproval UI behind",
+  !html.includes('personal-review') &&
+  !html.includes('needsReview') && !html.includes('airlock.lock'));
+sourceCheck("the editor's only added control is the line one",
+  html.includes('id="home-addline"') &&
+  html.includes('const AIRLOCK_HOME_LINES = 2;') &&
+  html.includes('addline.hidden = lines >= AIRLOCK_HOME_LINES;'));
 
 // Descriptions stay in the tile model and DOM path, but the home screen hides
 // them by default. The root attribute is the one-line opt-in for a future
@@ -317,15 +402,15 @@ const airlockTileVisible = eval("(" + m[0] + ")");
 const m2 = html.match(/function airlockTileMeta\([\s\S]*?\n\}/);
 if (!m2) { console.log("FAIL hub-filter: airlockTileMeta not found in hub/index.html"); process.exit(1); }
 const airlockTileMeta = eval("(" + m2[0] + ")");
-const m3 = html.match(/function airlockTileSections\([\s\S]*?\n\}/);
-if (!m3) { console.log("FAIL hub-filter: airlockTileSections not found in hub/index.html"); process.exit(1); }
-// The function closes over the default-heading constant, so it has to be
-// evaluated with it rather than around it — and reading it out of the page is
-// also the assertion that the launcher still owns exactly one heading string.
-const mC = html.match(/const AIRLOCK_TOOLS_SECTION = "[^"]*";/);
-if (!mC) { console.log("FAIL hub-filter: AIRLOCK_TOOLS_SECTION not found in hub/index.html"); process.exit(1); }
-const airlockTileSections = eval(
-  "(function(){" + mC[0] + "\n" + m3[0] + "\nreturn airlockTileSections;})()");
+const m3 = html.match(/function airlockHomeItems\([\s\S]*?\n\}/);
+if (!m3) { console.log("FAIL hub-filter: airlockHomeItems not found in hub/index.html"); process.exit(1); }
+const airlockHomeItems = eval("(" + m3[0] + ")");
+const m4 = html.match(/function airlockIcon\([\s\S]*?\n\}/);
+if (!m4) { console.log("FAIL hub-filter: airlockIcon not found in hub/index.html"); process.exit(1); }
+const airlockIcon = eval("(" + m4[0] + ")");
+const mL = html.match(/const AIRLOCK_HOME_LINES = \d+;/);
+if (!mL) { console.log("FAIL hub-filter: AIRLOCK_HOME_LINES not found in hub/index.html"); process.exit(1); }
+const AIRLOCK_HOME_LINES = eval("(function(){" + mL[0] + "\nreturn AIRLOCK_HOME_LINES;})()");
 
 function check(name, got, want) {
   if (got === want) { console.log("ok   hub-filter: " + name); }
@@ -362,34 +447,56 @@ const ti = airlockTileMeta({ tile:
       { label: "P", cat: "docs", icon: "/assets/apps/p/i.svg" } });
 check("tile icon -> brand image path", ti && ti.brand, "/assets/apps/p/i.svg");
 
-// Section grouping. `section` reaches the launcher only on a shortcut, always
-// filled in by bin/airlock-config, so a tile without one is a package.
-const SEC = {
+// What the home screen draws. One list, in the owner's saved order, with the
+// rows that no longer resolve dropped from it.
+const APPS = {
   fileview: {},
-  chat:  { shortcut: true, section: "Shared services" },
-  drive: { shortcut: true, section: "Shared services" },
-  board: { shortcut: true, section: "Shortcuts" },
+  notes:   {},                                    // a config table, not an install
+  chat:    { link: true, audience: "shared" },
+  drive:   { link: true, audience: "shared" },
 };
-const grouped = airlockTileSections(SEC, ["fileview", "chat", "drive", "board"]);
-check("sections: one group per distinct heading", grouped.length, 3);
-check("sections: packages keep the launcher's own heading", grouped[0].title, "Tools");
-check("sections: a package lands under it", grouped[0].names.join(","), "fileview");
-check("sections: shortcuts sharing a heading share a group",
-      grouped[1].title + "=" + grouped[1].names.join(","), "Shared services=chat,drive");
-check("sections: later headings follow in first-seen order", grouped[2].title, "Shortcuts");
+const HOME = ["fileview", "notes", "chat", { line: "Shared services" }, "drive"];
+check("home: an installed app and a link both survive; a config-only app does not",
+      JSON.stringify(airlockHomeItems(HOME, ["fileview"], APPS)),
+      JSON.stringify(["fileview", "chat", { line: "Shared services" }, "drive"]));
+check("home: a line survives whatever the install record says",
+      airlockHomeItems([{ line: "L" }], [], {}).length, 1);
+check("home: an empty order draws nothing, and is not an error",
+      JSON.stringify(airlockHomeItems([], ["a"], APPS)), "[]");
+check("home: a non-array order draws nothing rather than throwing",
+      JSON.stringify(airlockHomeItems("nope", ["a"], APPS)), "[]");
+// 🔴 The counterexample that motivated this: a launcher with a 500 behind it must
+// show the manifest's list, not an empty screen. A filtered-empty is the worst
+// available answer, because it looks like an answer.
+check("home: with no install record, nothing is filtered out",
+      JSON.stringify(airlockHomeItems(HOME, null, APPS)), JSON.stringify(HOME));
+check("home: with no install record, an id the manifest does not know still drops",
+      JSON.stringify(airlockHomeItems(HOME.concat(["gone"]), null, APPS)),
+      JSON.stringify(HOME));
+check("home: an id with no install and no manifest is not drawn",
+      airlockHomeItems(["ghost"], ["other"], APPS).length, 0);
+check("home: junk rows do not throw",
+      JSON.stringify(airlockHomeItems([5, null, "", { line: 3 }, { x: 1 }], ["a"], APPS)),
+      "[]");
+check("home: the line cap is two, declared once",
+      AIRLOCK_HOME_LINES, 2);
 
-// The pin. webjson is sorted by app id, so on most boxes the packages happen to
-// come first and plain first-seen order looks correct — until one shortcut id
-// sorts ahead of them and the launcher opens with the tiles that send you away.
-const pinned = airlockTileSections(SEC, ["chat", "fileview", "board"]);
-check("sections: the packages group is pinned first", pinned[0].title, "Tools");
-check("sections: pinning does not reorder the rest",
-      pinned.map(s => s.title).join(","), "Tools,Shared services,Shortcuts");
-check("sections: no packages -> no empty Tools heading",
-      airlockTileSections(SEC, ["chat", "board"]).map(s => s.title).join(","),
-      "Shared services,Shortcuts");
-check("sections: nothing to place -> nothing to draw",
-      airlockTileSections(SEC, []).length, 0);
+// The icon chain: image, else a glyph the sprite really has, else the default.
+// A file that 404s is the case this exists for — Notes shipped a tile icon whose
+// staged copy was never installed, and the screen drew a blank square with no
+// error anywhere.
+const KNOWN = new Set(["app-chat", "app-default"]);
+const has = (id) => KNOWN.has(id);
+check("icon: an image wins", JSON.stringify(airlockIcon({ icon: "https://x/i.png" }, has)),
+      JSON.stringify({ kind: "image", src: "https://x/i.png" }));
+check("icon: no image falls to the glyph", airlockIcon({ glyph: "app-chat" }, has).id, "app-chat");
+check("icon: a glyph the sprite does not have falls to the default",
+      airlockIcon({ glyph: "app-nope" }, has).id, "app-default");
+check("icon: neither falls to the default", airlockIcon({}, has).id, "app-default");
+check("icon: an empty entry is still an icon, never a blank box",
+      airlockIcon(null, has).id, "app-default");
+check("icon: blank strings are not an image",
+      airlockIcon({ icon: "   ", glyph: "app-chat" }, has).id, "app-chat");
 
 // ---- the app-store badge, against the update API's contract ----------------
 // The badge is the one number on the launcher a person acts on, and the backend
@@ -414,12 +521,12 @@ const FULL = {
   checkedAt: "2026-09-01T09:20:00Z",
   platform: { available: true, changedCount: 12, ref: "a1b2c3d" },
   apps: [{ id: "notes", action: "upgrade", sourceClass: "builtin" },
-         { id: "learning", action: "lock-mismatch", sourceClass: "explicit" }],
+         { id: "learning", action: "upgrade", sourceClass: "explicit" }],
   harness: { codex: { installed: "0.144.4", latest: "0.151.0" },
              hooksDrift: 1, skillsWired: true },
 };
 check("badge: platform and app updates only", badge.count(FULL), 3);
-check("badge: a lock-mismatch app is counted (it needs a person, not a button)",
+check("badge: both upgrade apps are counted",
       badge.ids(FULL).join(","), "notes,learning");
 
 // Nothing waiting. `platform: null` is the contract's shape when there is no
@@ -576,53 +683,6 @@ check("harness run: a failure does not block the next attempt",
       harness.run({ enabled: true, run: { status: "failed", exitCode: 1 } }).blocked, false);
 check("harness run: a null state is total", harness.run(null).blocked, false);
 
-// ---- STORE_EXPERIENCE: the platform row's three states --------------------
-// measured-and-behind, measured-and-current, and not-measured. The third used to be
-// spelled like the second, and "could not check" reading as "nothing to do" is the
-// one answer this row must never give. changedCount/ref are shown only when the
-// detector supplied them — nothing here computes a size or a base.
-const mP = html.match(/function platformSub\([\s\S]*?\n  \}/);
-if (!mP) { console.log("FAIL hub-filter: platformSub not found in hub/index.html"); process.exit(1); }
-const platformSub = eval("(" + mP[0] + ")");
-check("platform row: behind, with the size and base the detector measured",
-      platformSub({ available: true, changedCount: 12, ref: "abc1234" }),
-      "새 플랫폼 버전이 있습니다 · 파일 12개 변경 · 기준 abc1234");
-check("platform row: behind with no size measured says only what it knows",
-      platformSub({ available: true, ref: "abc1234" }), "새 플랫폼 버전이 있습니다 · 기준 abc1234");
-check("platform row: a zero count is not printed as a change",
-      platformSub({ available: true, changedCount: 0, ref: "abc1234" }),
-      "새 플랫폼 버전이 있습니다 · 기준 abc1234");
-check("platform row: measured and current",
-      platformSub({ available: false, changedCount: 0, ref: "abc1234" }),
-      "새 플랫폼 버전 없음 · 기준 abc1234");
-check("platform row: no snapshot is NOT 'nothing to do'",
-      platformSub({}), "플랫폼 업데이트를 확인하지 못했습니다");
-check("platform row: a truncated platform object is not read as current",
-      platformSub({ ref: "abc1234" }), "플랫폼 업데이트를 확인하지 못했습니다");
-check("platform row: no platform key at all",
-      platformSub(undefined), "플랫폼 업데이트를 확인하지 못했습니다");
-
-// ---- STORE_EXPERIENCE: the source grade in words -------------------------
-// Only the four values the backend emits are translated. An unknown value is shown as
-// it came: inventing a grade for it is how a local package starts reading as signed.
-// The REAL sourceLabel, not a restatement of it: an earlier draft of this block
-// rebuilt the one-line body here, so mutating the page's own function left every
-// assertion below green. Extract all three parts and run the shipped code.
-const mS = html.match(/const SOURCE_WORDS = \{[\s\S]*?\n  \}/);
-const mSrc = html.match(/  function source\(row\) \{[\s\S]*?\n  \}/);
-const mLbl = html.match(/  function sourceLabel\(row\) \{[\s\S]*?\n  \}/);
-if (!mS || !mSrc || !mLbl) { console.log("FAIL hub-filter: sourceLabel's parts not found in hub/index.html"); process.exit(1); }
-const sourceLabel = eval("(function(){" + mSrc[0] + "\n" + mS[0] + ";\n" + mLbl[0]
-  + "\nreturn sourceLabel;})()");
-check("source grade: platform", sourceLabel({ source: "platform" }), "플랫폼 릴리스");
-check("source grade: shipped", sourceLabel({ source: "shipped" }), "플랫폼 동봉");
-check("source grade: builtin", sourceLabel({ source: "builtin" }), "공개 릴리스");
-check("source grade: explicit names the local path it is", sourceLabel({ source: "explicit" }), "개인 앱 · 로컬 경로");
-check("source grade: an unknown value is passed through, not graded",
-      sourceLabel({ source: "/srv/pkg/mine" }), "/srv/pkg/mine");
-check("source grade: no source is no claim", sourceLabel({}), "");
-check("source grade: a row that never arrived is no claim", sourceLabel(null), "");
-
 // ---- ACCT_OWN: where the pill sends you ----------------------------------
 // The pill opens the PLATFORM account surface on this same origin, under the hub's
 // owner-gated /airlock-accounts/ prefix. It used to be built from
@@ -664,7 +724,7 @@ if (runStart < 0 || runEnd < runStart) {
   process.exit(1);
 }
 const runSource = html.slice(runStart, runEnd);
-const RUNNING = "전체 설치기 재실행 — 진행 중입니다. 연결이 잠시 끊길 수 있습니다.";
+const RUNNING = "앱 설치 — 진행 중입니다.";
 function runCase(kind) {
   const vm = require("node:vm");
   const progressNote = { textContent: RUNNING };
@@ -711,7 +771,7 @@ function runCase(kind) {
   check("run poll: and keeps its own 2.5s cadence", JSON.stringify(running.timers), "[2500]");
   const done = await runCase("done");
   check("run poll: a finished run still reads as finished",
-        done.text, "전체 설치기 재실행 — 완료되었습니다.");
+        done.text, "앱 설치 — 완료되었습니다.");
 
   // The card's machine verdict for this slice. Keep the predicate in the exact
   // observed-field vocabulary so accept-card can recompute it, and prove that one

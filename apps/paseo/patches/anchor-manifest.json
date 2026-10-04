@@ -65,6 +65,217 @@
           "new-browser-gate-Wo",
           "browserpane-marker"
         ]
+      },
+      {
+        "sha256": "bf04870deab659431a33a835a52f06a948f253249e4b756f25587ab34cae30a2",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web"
+        ]
+      },
+      {
+        "sha256": "a88f5185f19d419e6b9eab3cd483361920f4825d813c36d73fbcbd030556207c",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web",
+          "new-browser-gate-vo",
+          "new-browser-gate-Wo",
+          "browserpane-marker"
+        ]
+      },
+      {
+        "sha256": "4c62edfc2c4cf4937a889e029547857d268e4bc88a260c47fe295e687da8eba6",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-hover-card-touch",
+          "workspace-menu-touch-slot",
+          "workspace-menu-touch-trigger",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web"
+        ],
+        "legacy_sha256s": [
+          "7a2e7d57304b3a4cd6a34eb95c692e1d0bb3fe51cc7b07b50db4b52c1c5d0ce0"
+        ]
+      },
+      {
+        "sha256": "f5f9c309cdfb66f25b4f0ee58179efb35cdff3ddf48bb16276f29ad55190b4f3",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-hover-card-touch",
+          "workspace-menu-touch-slot",
+          "workspace-menu-touch-trigger",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web",
+          "new-browser-gate-vo",
+          "new-browser-gate-Wo",
+          "browserpane-marker"
+        ],
+        "legacy_sha256s": [
+          "b9c19255b8e400b9e312e64111ed796627bd1d37516b667aa929c9f5babfc74b"
+        ]
+      },
+      {
+        "sha256": "c3786a6f4f5eca713a5ad30ef9bc4f80d08ee8a81762b7a6c0994ef7051f6f80",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-hover-card-touch",
+          "workspace-tab-close-touch",
+          "workspace-menu-touch-slot",
+          "workspace-menu-touch-trigger",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web"
+        ]
+      },
+      {
+        "sha256": "43674343ee4b14efb9a50ca6f2e79b6894f533aa23ef5de750f904eca4e68850",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-hover-card-touch",
+          "workspace-tab-close-touch",
+          "workspace-menu-touch-slot",
+          "workspace-menu-touch-trigger",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web",
+          "new-browser-gate-vo",
+          "new-browser-gate-Wo",
+          "browserpane-marker"
+        ]
+      },
+      {
+        "sha256": "9677225d385f2d5c78461412c80f84b6358caf04986b71414a78d4fc47573c3e",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-hover-card-touch",
+          "workspace-tab-close-touch",
+          "workspace-menu-touch-slot",
+          "workspace-menu-touch-trigger",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web",
+          "sidebar-order-workspace-list-complete",
+          "sidebar-order-workspace-list-from-cache"
+        ]
+      },
+      {
+        "sha256": "d9a3cbcb25807aaccda7897504ca3433e219384ad0033944553807263f38b127",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-hover-card-touch",
+          "workspace-tab-close-touch",
+          "workspace-menu-touch-slot",
+          "workspace-menu-touch-trigger",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web",
+          "sidebar-order-workspace-list-complete",
+          "sidebar-order-workspace-list-from-cache",
+          "new-browser-gate-vo",
+          "new-browser-gate-Wo",
+          "browserpane-marker"
+        ]
+      },
+      {
+        "sha256": "5749b20a3932fd100fb4534b162a49b734517e28921b858b79ac17479a311a47",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-hover-card-touch",
+          "workspace-tab-close-touch",
+          "workspace-menu-touch-slot",
+          "workspace-menu-touch-trigger",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web",
+          "sidebar-order-workspace-list-complete",
+          "sidebar-order-workspace-list-from-cache",
+          "workspace-archive-request-timeout"
+        ]
+      },
+      {
+        "sha256": "d022d9c7f9f2a1d5478a1db3f9fc5a7492acffa2e25552837f46459e58c9ae85",
+        "edits": [
+          "sidebar-order-atomic-reconcile",
+          "sidebar-order-stable-identity",
+          "provider-subagent-visible-parent",
+          "appearance-default-font-sizes",
+          "sidebar-order-shared-storage",
+          "sidebar-order-rehydrate-on-visibility",
+          "tooltip-hover-none-is-compact",
+          "project-actions-coarse-pointer",
+          "workspace-hover-card-touch",
+          "workspace-tab-close-touch",
+          "workspace-menu-touch-slot",
+          "workspace-menu-touch-trigger",
+          "workspace-actions-coarse-pointer",
+          "sidebar-tap-not-swallowed-on-web",
+          "sidebar-order-workspace-list-complete",
+          "sidebar-order-workspace-list-from-cache",
+          "workspace-archive-request-timeout",
+          "new-browser-gate-vo",
+          "new-browser-gate-Wo",
+          "browserpane-marker"
+        ]
       }
     ]
   },
@@ -89,6 +300,14 @@
       "anchors": [
         "export const CLAUDE_MODEL_MANIFEST = [",
         "\\n];"
+      ]
+    },
+    {
+      "id": "codex-model-roster",
+      "source": "apps/paseo/patches/codex-model-roster.mjs",
+      "anchors": [
+        "const CODEX_FAST_MODE_SUPPORTED_MODELS = new Set([",
+        "const models = parsedResponse.success ? (parsedResponse.data.data ?? []) : [];"
       ]
     },
     {
@@ -168,6 +387,14 @@
       ]
     },
     {
+      "id": "acp-agy-shared-catalog",
+      "source": "apps/paseo/patches/acp-agy-shared-catalog.mjs",
+      "anchors": [
+        "    const listFeatures = inner.listFeatures?.bind(inner);",
+        "                    return new GenericACPAgentClient(acpOptions);"
+      ]
+    },
+    {
       "id": "agent-resolve-by-id",
       "source": "apps/paseo/patches/agent-resolve-by-id.mjs",
       "anchors": [
@@ -196,13 +423,95 @@
         "if(!pt||!(0,ze.getIsElectron)())return;const{browserId:t}=(0,ue.createWorkspaceBrowser)({initialUrl:e});gt(pt,{kind:\"browser\",browserId:t},Q.FOCUSED_PANE_PLACEMENT)",
         "{style:u.container,children:[v,M,k]}",
         "overed:p,isMobileBreakpoint:u,isProjectActive:k,onBeginWorkspaceSetup:b,onRemoveProject:v,removeProjectStatus:j}=e,y=p||ke.isNative||u;",
+        "e.resolveTrailingActionVisibility=function({workspace:t,trailing:o,hasArchiveAction:n,isHovered:s,isTouchPlatform:c,showShortcut:l}){const u=",
         "const R=N(E.isNative),P=10,L=21;function D(e){return e?16:_.FONT_SIZE.content}const C=D(E.isNative),v=10,j=21,B=12,w=9,M=22,k=200,U=",
         "{name:\"sidebar-project-workspace-order\",storage:(0,p.createValidatedPersistStorage)(o.default,j),partialize:",
         "partialize:e=>({projectOrder:e.projectOrder,pinnedWorkspaceOrder:e.pinnedWorkspaceOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:y}))},3813,[1587,3401,3404,3313,3553]);",
         "const[E,S]=j(C),P=(0,y.useIsCompactFormFactor)(),z=P?w:v;",
         "c[14]===Symbol.for(\"react.memo_cache_sentinel\")?(H=e=>{const t=M.current;if(!t||x.current||P.current)return;",
         "e.computeSidebarOrderUpdates=function(t){if(0===t.projects.length)return{projectOrder:null,workspaceOrders:[]};const s=K({currentOrder:t.persistedProjectOrder,visibleKeys:t.projects.map(t=>t.viewKey)}),o=s===t.persistedProjectOrder?null:s,c=[];for(const s of t.projects){const o=t.getWorkspaceOrder(s.viewKey),n=I({currentOrder:o,visibleKeys:s.workspaces.map(t=>t.workspaceKey)});n!==o&&c.push({projectViewKey:s.viewKey,order:n})}return{projectOrder:o,workspaceOrders:c}}",
-        "o.projectOrder&&t.setProjectOrder(o.projectOrder);for(const{projectViewKey:s,order:n}of o.workspaceOrders)t.setWorkspaceOrder(s,n)"
+        "o.projectOrder&&t.setProjectOrder(o.projectOrder);for(const{projectViewKey:s,order:n}of o.workspaceOrders)t.setWorkspaceOrder(s,n)",
+        "commitSnapshot(e,t){this.replace(e);const s=t.flatMap(e=>this.applyDelta(e));return o.useSessionStore.getState().setHasHydratedWorkspaces(this.serverId,!0),s}",
+        "commitCached(e){this.replace({workspaces:new Map([...e.workspaces,...this.workspaces]),projects:new Map([...e.projects,...this.projects])}),o.useSessionStore.getState().setHasWorkspaceDirectorySnapshot(this.serverId,!0)}",
+        "u=c?H.trailingActionSlotReserved:H.trailingActionSlot;",
+        "function G({hovered:e=!1}){return[V.trigger,e&&V.triggerHovered]}const V=u.StyleSheet.create(e=>({trigger:{padding:2,borderRadius:4,marginLeft:2,marginRight:-7}",
+        "f=(0,P.useIsCompactFormFactor)();if(!z.isWeb||f)return u;",
+        "const Q=Y,Z=S&&(G||y.isNative||N||C);"
+      ]
+    },
+    {
+      "id": "schedule-pending-delivery-schema",
+      "source": "apps/paseo/patches/schedule-pending-delivery-schema.mjs",
+      "anchors": [
+        "    maxRuns: z.number().int().positive().nullable(),"
+      ]
+    },
+    {
+      "id": "schedule-busy-pending-delivery",
+      "source": "apps/paseo/patches/schedule-busy-pending-delivery.mjs",
+      "requires": [
+        "schedule-pending-delivery-schema"
+      ],
+      "anchors": [
+        "            if (this.agentManager.hasInFlightRun(agent.id)) {",
+        "    async tick() {",
+        "function completeSchedule(schedule, now) {"
+      ]
+    },
+    {
+      "id": "schedule-stale-due-run",
+      "source": "apps/paseo/patches/schedule-stale-due-run.mjs",
+      "requires": [
+        "schedule-busy-pending-delivery"
+      ],
+      "anchors": [
+        "    async appendRunningRun(scheduleId, runningRun) {",
+        "        for (const schedule of await this.store.list()) {"
+      ]
+    },
+    {
+      "id": "schedule-pending-batch",
+      "source": "apps/paseo/patches/schedule-pending-batch.mjs",
+      "requires": [
+        "schedule-stale-due-run"
+      ],
+      "anchors": [
+        "    async claimPendingDelivery(scheduleId) {",
+        "                await this.runSchedule({ ...schedule, pendingAgentDelivery: false }, now);"
+      ]
+    },
+    {
+      "id": "workspace-git-watch-recovery",
+      "source": "apps/paseo/patches/workspace-git-watch-recovery.mjs",
+      "anchors": [
+        "const WATCH_RECOVERY_MAX_ATTEMPTS = 3;",
+        "    scheduleWorkingTreeWatchRecovery(target) {"
+      ]
+    },
+    {
+      "id": "workspace-remove-delivery",
+      "source": "apps/paseo/patches/workspace-remove-delivery.mjs",
+      "anchors": [
+        "return !lastEmitted && !removedProjectId;",
+        "[paseo-workspace-remove-delivery]"
+      ]
+    },
+    {
+      "id": "workspace-git-emergency-policy",
+      "source": "apps/paseo/patches/workspace-git-emergency-policy.mjs",
+      "anchors": [
+        "export class WorkspaceGitServiceImpl",
+        "    async refreshSnapshot(target, request, runRefreshGitCommand) {",
+        "    async runRepoFetch(target) {"
+      ]
+    },
+    {
+      "id": "workspace-reconciliation-emergency-policy",
+      "source": "apps/paseo/patches/workspace-reconciliation-emergency-policy.mjs",
+      "anchors": [
+        "export class WorkspaceReconciliationService",
+        "    async reconcileObservedGitMetadata(mode = \"metadata\") {",
+        "    async reconcileNow() {"
       ]
     }
   ]

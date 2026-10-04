@@ -26,6 +26,42 @@ upstream changed licence again.
 
 ## What is here
 
+- **`workspace-git-emergency-policy.mjs`** (+ `.test.mjs`, `.patcher.test.mjs`) —
+  temporary mitigation for the overload measured on an operator development box on 2026-10-04.
+  Its canonical default differs from the live emergency scale: cached watcher/self-heal Git
+  refreshes admit one in 20 requests per target; automatic repo fetch uses a
+  separate per-repository one-in-20 counter (first fetch runs, then 19 ticks skip).
+  Snapshot refreshes skip the first 19 background requests and admit the 20th.
+  Per-target counters prevent stable workspace order from starving other targets.
+  The gate is at `refreshSnapshot`, covering queued loop iterations as well as
+  newly requested refreshes, before they start any Git subprocesses.
+  Forced, initial, direct and external-state-change refreshes still run. This
+  trades automatic Git freshness for daemon responsiveness and does not reduce
+  filesystem watcher handles or expensive diff consumers outside that pipeline.
+  `PASEO_BACKGROUND_GIT_SAMPLE_SCALE=1` restores normal refreshes and fetch on
+  the next normal daemon start; invalid values use 20. Emergency settings are
+  `PASEO_BACKGROUND_GIT_SAMPLE_SCALE=100` and `PASEO_BACKGROUND_GIT_PAUSE_FETCH=1`
+  (the latter pauses automatic fetch entirely). The default 3-minute fetch timer
+  therefore admits fetch once an hour after its initial run. Installer writes checked
+  candidates without introducing a restart solely for this overlay. Both policies
+  are baked into the guarded bundle and checksum-pinned so installer re-runs see
+  `ALREADY` and retain an unchanged active daemon. The common scale/env/parser is
+  generated from `background-git-policy-source.mjs`. Remove the
+  overlay when observation demand and metadata fanout have a durable fix.
+
+- **`workspace-reconciliation-emergency-policy.mjs`** (+ `.test.mjs`) — the same
+  default scale of 20 at the automatic whole-inventory reconciliation envelope,
+  including queued iterations, with per-service counters. A 30-second live trace
+  on 2026-10-04 attributed 405 of 423 Git calls to this path: root `.git`/pathless
+  watcher events schedule all-project metadata reconciliation, which calls
+  `getCheckout` and bypasses the snapshot admission pipeline. The snapshot policy
+  alone therefore does not address this measured dominant producer. Explicit and
+  boot `reconcileNow`, direct `runOnce` and direct `reconcileGitMetadata` remain
+  unchanged, including explicit full work queued behind automatic metadata.
+  The immediate explicit exemption is cleared in `finally`; a queued explicit
+  full run retains a one-time exemption until it starts. Installer applies
+  checked candidates for the next normal start without a restart solely for it.
+
 - **`schedule-busy-pending-delivery.mjs`** (+ `.patch`, `.test.mjs`) and its schema half
   **`schedule-pending-delivery-schema.mjs`** (+ `.patch`) — when an agent-target schedule fires while
   that seat is mid-turn, upstream records a FAILED run and jumps to the next cadence: the tick is
@@ -61,6 +97,11 @@ upstream changed licence again.
   Decomposes the array into entry blocks and refuses to write unless they
   reassemble byte-for-byte, so an upstream format change skips instead of
   mangling the file. Edit `PRUNE_IDS` to change which models are hidden.
+  It also adds models released after the pin (`ADD_BLOCKS`; Opus 5.5 and
+  Sonnet 5.5, each placed before its predecessor). Added entries
+  advertise only what was measured — the CLI accepts the id — so thinking-off and
+  fast mode stay off until someone runs them. A manifest pruned by the previous
+  version (sentinel present, entry absent) still gains the addition.
 
 - **`opencode-grok-defaults.mjs`** (+ `opencode-grok-defaults.patch`, the reference copy)
   — OpenCode's catalog order treats the first variant key as the thinking default
@@ -172,6 +213,29 @@ upstream changed licence again.
   `INSTALLED_SHA256SUMS`, so this follows the existing install-time ACP overlays
   without rebaking the vendor bundle.
 
+- **`acp-agy-shared-catalog.mjs`** (+ `.test.mjs`) — a new workspace listed agy's
+  models ~10s after claude/codex. Providers already load in parallel; the gap was the
+  cache. claude/codex return catalogue key `"host"`, so every workspace shares one
+  catalogue, while a generic ACP client has no key and was re-probed per workspace cwd
+  (spawn agy-acp, `agy models` ~3s, then a real agy start for `session/new` ~7s). The
+  patch edits `agent/provider-registry.js`: `wrapClientProvider` now forwards
+  `getCatalogCacheKey` (agy is always wrapped: inner provider `acp`, id `agy`), and the
+  provider `agy` gets `"host"`. Other generic ACP providers stay per-cwd. The shared
+  catalogue is refreshed the same way claude/codex's is (provider refresh in the UI).
+
+- **`codex-model-roster.mjs`** (+ `.patch`, `.test.mjs`) — keeps the Codex picker
+  driven by the live app-server catalog while retiring the exact `gpt-5.5` row.
+  It also marks `gpt-6-sol` and `gpt-6-luna` as Fast-capable, so those controls
+  appear as soon as the signed-in ChatGPT account's `model/list` exposes the new
+  family. It does not synthesize unavailable rows: on 2026-09-23 the public API
+  catalog listed both models while this box's ChatGPT-backed Codex rejected both,
+  so availability stays with Codex and the two-file overlay is verified and
+  installed as one unit. By 2026-09-30 `gpt-6-sol` was accepted here, and
+  `gpt-6.1-sol` was accepted only after Codex CLI 0.156.1 → 0.159.2 (0.159.1 added
+  it to the bundled catalog); `paseo provider models codex` then lists it first.
+  `gpt-6.1-sol` is not in the Fast list above: whether it takes the existing Fast
+  mode was not measured, so no row is added on assumption.
+
 - **`agent-resolve-by-id.mjs`** (+ `.test.mjs`) — `paseo agent archive`, `detach` and `reload`
   resolve their target by scanning the `includeArchived` agent list, which the server caps at
   200 (`session.js` `limit ?? 200`; the CLI passes no `--page`). On a box with thousands of
@@ -217,7 +281,9 @@ instead of upstream's 16 / 12 — a device that already saved settings keeps its
 shares the sidebar order across devices, and makes touch devices usable (tooltips do
 not park over the composer; a coarse pointer gets the project row's `+` without first
 manufacturing a hover; one tap on a sidebar row navigates, instead of being eaten by
-the long-press/drag machinery web never arms); its optional `--browse` group contains
+the long-press/drag machinery web never arms), and keeps an archive request waiting
+for the daemon's answer instead of timing out at 60 s and putting the archived row
+back; its optional `--browse` group contains
 the three live-panel edits. Both share fail-loud state classification, syntax gating,
 and content-hash cache busting. Everything else under `../browse-host/` is an independent sidecar, AGPL-3.0 like the rest of the repo.
 
@@ -257,3 +323,9 @@ deployment that exposes Paseo are responsible for this.
 - [ ] Audit each patch/anchor to confirm only minimal, interoperability-necessary
       excerpts of Paseo source are reproduced (prefer install-time anchor derivation
       over shipping verbatim upstream lines where feasible).
+
+- `workspace-remove-delivery.mjs` fixes deleted workspaces remaining in the sidebar
+  after reconnect. A sequenced changes-only bootstrap does not seed unchanged
+  cached rows into `lastEmittedByWorkspaceId`; their archive must still emit a
+  removal. Repeated removals remain deduplicated. The behavior test executes the
+  installed Session delivery method. A daemon restart activates this server patch.

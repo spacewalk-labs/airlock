@@ -9,17 +9,25 @@
 //   node bin/patch-web-ui.js <web-ui-dir> <companion-js-path>  # legacy --browse
 //
 // The always-on general group (CLI flag `--subagent-stream`, kept for callers that
-// predate it carrying more than one edit) applies NINE edits every box wants: a
+// predate it carrying more than one edit) applies SEVENTEEN edits every box wants: a
 // visible provider-subagent panel subscribes to its parent agent's timeline; the
 // fresh-install font-size defaults move to 18 (ui) / 14 (code); the sidebar order
 // store points at the airlock ui-state backend so the order follows the owner across
 // devices instead of living in one browser; an already-open tab rehydrates that order
-// when it becomes visible and polls its revision while it stays visible; sidebar
-// ordering follows exact daemon placements when their view keys change; a device
-// that cannot hover is treated as
-// compact for the tooltip gate; a coarse pointer gets the project row's trailing
-// actions without having to manufacture a hover first; and a sidebar tap stops being
-// swallowed by the long-press/drag machinery web never arms. The optional browse
+// when it becomes visible and polls its revision while it stays visible; the sidebar
+// order SHRINKS as well as grows — the shared value stops the backend's 256 KiB cap
+// from rejecting every write, because upstream only ever prepends or appends — and the
+// one signal that licenses it, "this server handed us its complete workspace list", is
+// recorded where the list arrives and withdrawn where a LOCAL CACHE is committed
+// instead, rather than borrowed from a hydration flag that also fires when a single
+// project is registered; sidebar ordering follows exact daemon placements when their
+// view keys change; a device that cannot hover is treated as compact for the tooltip
+// gate; a coarse pointer gets the project row's trailing actions without having to
+// manufacture a hover first; workspace-row menus use the same touch detection, get a
+// finger-sized target, and skip hover preview cards; desktop tab close buttons also
+// appear for touch; a sidebar tap stops being swallowed by the long-press/drag
+// machinery web never arms; and an archive request waits for the daemon's answer
+// instead of timing out and putting the archived row back. The optional browse
 // group applies THREE minimal, verified-unique edits so the self-hosted web runtime
 // can open live browser panels:
 //   1+2. un-gate the "New browser" button callbacks (vo/Wo) on web;
@@ -50,7 +58,7 @@ const PINNED_SHA = "a182df940822df553fd648885dbfe2e31da3cc2f771b56a51f935d364f55
 // anchor or moves groups after this pin ships.
 //
 // Each sha256 covers the whole bundle and was re-derived from the pristine bundle by
-// applying exactly the listed edits — order-independent, the twelve sites are disjoint:
+// applying exactly the listed edits — order-independent, the twenty sites are disjoint:
 //   npm pack @getpaseo/server@0.8.0 && tar xzf getpaseo-server-0.8.0.tgz
 //   # apply the subset to package/dist/server/web-ui/_expo/static/js/web/index-*.js
 const KNOWN_BUNDLE_SHAPES = [
@@ -73,6 +81,44 @@ const KNOWN_BUNDLE_SHAPES = [
     edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web"] },
   { sha: "d040a555b98bcc8f54888fe80afea6662a4dc93725be42b9fbdea58eae6f98b5",
     edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+  // Workspace-row touch menus, with and without optional browse.
+  { sha: "bf04870deab659431a33a835a52f06a948f253249e4b756f25587ab34cae30a2",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web"] },
+  { sha: "a88f5185f19d419e6b9eab3cd483361920f4825d813c36d73fbcbd030556207c",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+
+  // Touch targets reserve the same 44px width as the workspace menu trigger.
+  { sha: "4c62edfc2c4cf4937a889e029547857d268e4bc88a260c47fe295e687da8eba6", legacyShas: ["7a2e7d57304b3a4cd6a34eb95c692e1d0bb3fe51cc7b07b50db4b52c1c5d0ce0"],
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-hover-card-touch", "workspace-menu-touch-slot", "workspace-menu-touch-trigger", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web"] },
+  { sha: "f5f9c309cdfb66f25b4f0ee58179efb35cdff3ddf48bb16276f29ad55190b4f3", legacyShas: ["b9c19255b8e400b9e312e64111ed796627bd1d37516b667aa929c9f5babfc74b"],
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-hover-card-touch", "workspace-menu-touch-slot", "workspace-menu-touch-trigger", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+  // Wide touch screens reveal the tab close overlay without a hover.
+  { sha: "c3786a6f4f5eca713a5ad30ef9bc4f80d08ee8a81762b7a6c0994ef7051f6f80",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-hover-card-touch", "workspace-tab-close-touch", "workspace-menu-touch-slot", "workspace-menu-touch-trigger", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web"] },
+  { sha: "43674343ee4b14efb9a50ca6f2e79b6894f533aa23ef5de750f904eca4e68850",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-hover-card-touch", "workspace-tab-close-touch", "workspace-menu-touch-slot", "workspace-menu-touch-trigger", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+
+  // Bounded-sidebar-order rows. The two rows above stay as they are: their sha IS the
+  // bytes a fleet bundle currently has, and that is what lets this revision upgrade such
+  // a box instead of refusing it. These two are what the boxes have AFTER the upgrade,
+  // with and without the optional browse group — without them the very next install run
+  // sees a complete group on bytes nothing accepts and dies. Derived the same way, from
+  // the pristine 0.8.0 bundle, by applying the listed edits:
+  //   npm pack @getpaseo/server@0.8.0 && tar xzf getpaseo-server-0.8.0.tgz
+  //   # apply the subset to package/dist/server/web-ui/_expo/static/js/web/index-*.js
+  { sha: "9677225d385f2d5c78461412c80f84b6358caf04986b71414a78d4fc47573c3e",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-hover-card-touch", "workspace-tab-close-touch", "workspace-menu-touch-slot", "workspace-menu-touch-trigger", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "sidebar-order-workspace-list-complete", "sidebar-order-workspace-list-from-cache"] },
+  { sha: "d9a3cbcb25807aaccda7897504ca3433e219384ad0033944553807263f38b127",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-hover-card-touch", "workspace-tab-close-touch", "workspace-menu-touch-slot", "workspace-menu-touch-trigger", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "sidebar-order-workspace-list-complete", "sidebar-order-workspace-list-from-cache", "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
+
+  // Archive-request-timeout rows: what the two bounded-sidebar-order rows above become
+  // once the archive request stops timing out at 60 s. Those rows stay as upgrade inputs
+  // for the same reason the older ones did. Derived the same way, from the pristine
+  // 0.8.0 bundle, by applying the listed edits.
+  { sha: "5749b20a3932fd100fb4534b162a49b734517e28921b858b79ac17479a311a47",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-hover-card-touch", "workspace-tab-close-touch", "workspace-menu-touch-slot", "workspace-menu-touch-trigger", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "sidebar-order-workspace-list-complete", "sidebar-order-workspace-list-from-cache", "workspace-archive-request-timeout"] },
+  { sha: "d022d9c7f9f2a1d5478a1db3f9fc5a7492acffa2e25552837f46459e58c9ae85",
+    edits: ["sidebar-order-atomic-reconcile", "sidebar-order-stable-identity", "provider-subagent-visible-parent", "appearance-default-font-sizes", "sidebar-order-shared-storage", "sidebar-order-rehydrate-on-visibility", "tooltip-hover-none-is-compact", "project-actions-coarse-pointer", "workspace-hover-card-touch", "workspace-tab-close-touch", "workspace-menu-touch-slot", "workspace-menu-touch-trigger", "workspace-actions-coarse-pointer", "sidebar-tap-not-swallowed-on-web", "sidebar-order-workspace-list-complete", "sidebar-order-workspace-list-from-cache", "workspace-archive-request-timeout", "new-browser-gate-vo", "new-browser-gate-Wo", "browserpane-marker"] },
 ];
 const PINNED_VERSION = "@getpaseo/cli@0.8.0 (index-1be98d8895969110732458bbaeac57b2)";
 
@@ -101,7 +147,113 @@ const BROWSE_PATCHES = [
     repl: '{style:u.container,dataSet:{paseoBrowserId:w,paseoWorkspaceId:f.workspaceId,paseoServerId:f.serverId},children:[v,M,k]}',
   },
 ];
-const SIDEBAR_STORAGE_LEGACY = '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e);return{getItem:async e=>{try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok)return await t.text()}catch(t){}return l.getItem(e)},setItem:async(e,t)=>{await l.setItem(e,t);try{await fetch(u(e),{method:"PUT",headers:{"content-type":"application/json"},body:t})}catch(n){}},removeItem:async e=>{await l.removeItem(e);try{await fetch(u(e),{method:"DELETE"})}catch(t){}}}})(o.default))),partialize:';
+// The one place the sidebar order is allowed to SHRINK.
+//
+// Upstream's reconcile only ever adds (`prependMissingOrderKeys` /
+// `computeSidebarOrderUpdates` prepend or append); it never subtracts. A key that
+// leaves the box — archived workspace, deleted project, host gone for good — therefore
+// stays in the persisted order forever, and because the order is shared across the
+// owner's devices it stops being written at all once the accumulated value crosses the
+// backend's 256 KiB cap: every PUT is refused with 413 before compare-and-swap even
+// runs, so the sidebar falls back to whatever local order each device happens to hold.
+// Measured 2026-10-03: 4,213 stored workspace keys for 96 live workspaces, 262 KB of a
+// 256 KB budget, and every write to the shared order refused.
+//
+// So: remove, at the point the effect writes, the keys that a server whose workspace
+// list was received IN FULL no longer has. That signal is deliberately its own thing —
+// upstream's `hasHydratedWorkspaces` is also switched on by registering a single
+// project, and the sidebar list itself renders from a cache snapshot, so trusting
+// either would delete keys on a device that simply has not received the directory yet.
+// The signal is recorded where the list arrives (`commitSnapshot`) and revoked where a
+// LOCAL CACHE is committed instead (`commitCached`), which is what makes it mean "this
+// device, right now" rather than "at some point since the page loaded": without the
+// revoke, a device that went offline holding a cached list keeps the licence and deletes
+// the order position of every workspace another device created while it was away —
+// and `prependMissingOrderKeys` then puts them back at the top, so the position is lost
+// for good rather than restored on reconnect.
+//
+// `state` is the upstream persisted shape; `live` is what this device can currently
+// see. Returns the SAME object when there is nothing to remove, which is what lets the
+// caller skip the write entirely.
+//
+// Two passes, not one: a project whose last workspace disappeared while it is still on
+// screen keeps its stale keys, because those keys are what name the server that owns
+// them. Once the project leaves the sidebar, the same pass that deletes the keys also
+// drops the projectOrder slot. Emptiness is therefore never inferred from an empty array
+// — an empty array names no server, and a record that was empty when we found it is not
+// our evidence to act on.
+//
+// `live.hosts` is EVERY server id the visible list mentions, not just the authorised
+// ones: a workspace key is `<serverId>:<workspaceId>`, so a key has to be attributed to
+// one server before it can be judged, and upstream's own decoder
+// (`resolveStructuralWorkspaceIdentity`) matches host prefixes LONGEST-FIRST for
+// exactly that reason. Judging "does any authorised server's prefix match" instead would
+// charge `a:b:w` to server `a` and delete it while server `a:b` — hidden, or not yet
+// complete — still holds it.
+const PRUNE_SIDEBAR_ORDER_SRC = `function pruneSidebarOrder(state, live) {
+  // Duck-typed on purpose: an instanceof check would be a cross-realm trap, and the shape
+  // this needs is only .size, iteration and .has.
+  const servers = live && live.servers && "number" == typeof live.servers.size ? live.servers : null;
+  const hosts = live && Array.isArray(live.hosts) ? live.hosts.slice().sort((a, b) => b.length - a.length) : null;
+  if (!servers || 0 === servers.size || !hosts || 0 === hosts.length) return state;
+  const visible = live && live.visibleProjects && "function" == typeof live.visibleProjects.has ? live.visibleProjects : new Set();
+  // The LONGEST matching host owns the key, authorised or not. A key with no matching
+  // host belongs to a server this device cannot place and is left alone; a server recorded
+  // without a list is skipped rather than read as "it has nothing", because the failure
+  // mode of guessing there is a deleted order.
+  const isStale = key => {
+    if ("string" != typeof key || 0 === key.length) return false;
+    for (const host of hosts) {
+      if (!key.startsWith(host + ":")) continue;
+      const keys = servers.get(host);
+      return !!keys && !keys.has(key);
+    }
+    return false;
+  };
+  const historyKey = "@airlock:sidebar-placement-keys:v1";
+  // Returns the SAME array when nothing was stale. That is what makes "a list that was
+  // already empty" fall out of one comparison below instead of needing a special case,
+  // and what keeps the early return at the bottom an identity check.
+  const kept = order => {
+    if (!Array.isArray(order)) return order;
+    const next = order.filter(key => !isStale(key));
+    return next.length === order.length ? order : next;
+  };
+  const byProject = state.workspaceOrderByProject && "object" == typeof state.workspaceOrderByProject ? state.workspaceOrderByProject : {};
+  const orders = {};
+  const emptied = new Set();
+  let ordersChanged = false;
+  for (const project of Object.keys(byProject)) {
+    const order = byProject[project];
+    // The history record is a placement log, not a workspace list, and it is a
+    // fixed-size one: never a candidate for the shrink, whatever a row in it looks
+    // like. The value is shared with devices running other builds, so "the rows we
+    // wrote" is an assumption, not a fact.
+    let next = project === historyKey ? order : kept(order);
+    // A record this pass would EMPTY while its project is still on screen is left as it
+    // was. Its stale keys still name the complete server that owns them, so a later pass
+    // removes them and the projectOrder slot in the SAME step; an empty array names no
+    // server and would leave nothing to act on. A record that was ALREADY empty is not
+    // evidence of anything and is never touched either way.
+    if (next !== order && 0 === next.length && visible.has(project)) next = order;
+    orders[project] = next;
+    if (next !== order) {
+      ordersChanged = true;
+      if (0 === next.length) emptied.add(project);
+    }
+  }
+  const pinned = Array.isArray(state.pinnedWorkspaceOrder) ? kept(state.pinnedWorkspaceOrder) : state.pinnedWorkspaceOrder;
+  const projectOrder = Array.isArray(state.projectOrder) ? state.projectOrder : [];
+  // A project whose order was removed, and that this device can no longer see, is gone.
+  // A VISIBLE one keeps both its slot and its record: dropping it would let the next
+  // effect append it straight back and this remove it again. A projectOrder key with NO
+  // record at all is left alone — that is a project this device has no evidence about.
+  const nextProjectOrder = projectOrder.filter(key => !emptied.has(key));
+  if (!ordersChanged && pinned === state.pinnedWorkspaceOrder && nextProjectOrder.length === projectOrder.length) return state;
+  for (const project of emptied) delete orders[project];
+  return { ...state, projectOrder: nextProjectOrder, pinnedWorkspaceOrder: pinned, workspaceOrderByProject: orders };
+}`;
+const SIDEBAR_STORAGE_LEGACY ='{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e);return{getItem:async e=>{try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok)return await t.text()}catch(t){}return l.getItem(e)},setItem:async(e,t)=>{await l.setItem(e,t);try{await fetch(u(e),{method:"PUT",headers:{"content-type":"application/json"},body:t})}catch(n){}},removeItem:async e=>{await l.removeItem(e);try{await fetch(u(e),{method:"DELETE"})}catch(t){}}}})(o.default))),partialize:';
 const SIDEBAR_STORAGE_DURABLE = '{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(l=>{const u=e=>"/airlock-ui-state/"+encodeURIComponent(e),p=e=>"@airlock-pending:"+e;let q=Promise.resolve(),r=Promise.resolve(),h=0;const v=new Map,x=e=>{const t=q.catch(()=>{}).then(e);return q=t,t},b=e=>{const t=r.catch(()=>{}).then(e);return r=t,t},y=(e,t)=>{const n={i:++h,v:t};return v.set(e,n),n},z=e=>v.get(e).v,s=async(e,t,n)=>{const o=null===t?"":t;if(n&&v.get(e)!==n||await l.getItem(p(e))!==o)return;const c=await fetch(u(e),null===t?{method:"DELETE"}:{method:"PUT",headers:{"content-type":"application/json"},body:t});if(!c.ok)throw Error("ui-state write failed: "+c.status);(n?v.get(e)===n:!v.has(e))&&(await l.getItem(p(e)))===o&&await l.removeItem(p(e))};return{getItem:e=>x(async()=>{if(v.has(e))return z(e);const t=await l.getItem(p(e));if(null!==t){const n=""===t?null:t;try{await s(e,n)}catch(o){}return v.has(e)?z(e):n}try{const t=await fetch(u(e),{cache:"no-store"});if(t.ok){const n=await t.text();if(v.has(e))return z(e);return await l.setItem(e,n),v.has(e)?z(e):n}}catch(t){}return v.has(e)?z(e):l.getItem(e)}),setItem:(e,t)=>{const n=y(e,t),o=b(async()=>{if(v.get(e)!==n)return;await l.setItem(e,t),await l.setItem(p(e),t)});return x(async()=>{await o;if(v.get(e)!==n)return;try{await s(e,t,n)}catch(c){}v.get(e)===n&&v.delete(e)})},removeItem:e=>{const t=y(e,null),n=b(async()=>{if(v.get(e)!==t)return;await l.removeItem(e),await l.setItem(p(e),"")});return x(async()=>{await n;if(v.get(e)!==t)return;try{await s(e,null,t)}catch(o){}v.get(e)===t&&v.delete(e)})}}})(o.default))),partialize:';
 const SIDEBAR_STORAGE_REVISIONED_V1 = `{name:"sidebar-project-workspace-order",storage:(0,n.createJSONStorage)(()=>g.__airlockUiState||(g.__airlockUiState=(local=>{
   const url=key=>"/airlock-ui-state/v2/"+encodeURIComponent(key);
@@ -299,11 +451,100 @@ const SIDEBAR_REHYDRATE_REVISIONED_080 = SIDEBAR_REHYDRATE_REVISIONED.replace(
 const SIDEBAR_REHYDRATE_LEGACY = 'partialize:e=>({projectOrder:e.projectOrder,workspaceOrderByProject:e.workspaceOrderByProject}),version:1,migrate:j}));"undefined"!=typeof document&&document.addEventListener("visibilitychange",()=>{"visible"===document.visibilityState&&f.persist.rehydrate()})},3544,[3368,3273,3276]);';
 const SUBAGENT_STREAM_PATCHES = [
   {
-    // Persist placement history and migrated orders in one Zustand update. A
-    // reload, failed PUT, or CAS rehydrate must never observe half a transition.
+    // Persist placement history and migrated orders in ONE Zustand update, and let the
+    // same write carry the shrink: the effect is the single place that knows both the
+    // freshly reconciled keys and the full persisted order, so pruning here is what stops
+    // the shared value from growing until every device's PUT is refused. A reload, failed
+    // PUT, or CAS rehydrate must never observe half a transition — and the prune must not
+    // become a second, independent write either. `legacyRepls` is the pre-prune form of
+    // this same edit: a fleet bundle carries those bytes, names this edit, and must still
+    // have it replaced.
     name: "sidebar-order-atomic-reconcile",
     find: 'o.projectOrder&&t.setProjectOrder(o.projectOrder);for(const{projectViewKey:s,order:n}of o.workspaceOrders)t.setWorkspaceOrder(s,n)',
-    repl: 'if(o.projectOrder||o.workspaceOrders.length)f.useSidebarOrderStore.setState({...(o.projectOrder?{projectOrder:o.projectOrder}:{}),workspaceOrderByProject:Object.assign({},t.workspaceOrderByProject,Object.fromEntries(o.workspaceOrders.map(({projectViewKey:e,order:t})=>[e,t])))})',
+    repl: `((()=>{
+  const pruneSidebarOrder = ${PRUNE_SIDEBAR_ORDER_SRC};
+  return (()=>{
+    // Only a server that handed us its COMPLETE workspace list may judge a key, and only
+    // while the sidebar can still see it: a host the list filter drops is indistinguishable
+    // from one the directory never mentioned. Attribution, though, runs against every
+    // REGISTERED host below — a key has to be pinned to its owning server before any
+    // server is allowed to claim it is gone.
+    const complete = globalThis.__airlockWorkspaceListComplete;
+    const servers = new Map(), visibleProjects = new Set(), listed = [];
+    for(const project of J){
+      visibleProjects.add(project.viewKey);
+      for(const host of project.hosts)listed.push(host.serverId);
+    }
+    // L is the unfiltered registered-id list. J is narrower than that whenever a host
+    // filter is on, and attributing against the narrow list would charge a hidden host's
+    // key to whichever registered id happens to be its prefix.
+    for(const server of listed)if(complete&&complete.has(server)&&!servers.has(server))servers.set(server,new Set());
+    // Longest first, the same order upstream's own workspace-key decoder resolves host
+    // prefixes in, so the first match below is the server that owns the key.
+    const owned = [...new Set(listed.concat(L))].sort((a, b) => b.length - a.length);
+    for(const project of J)for(const workspace of project.workspaces)for(const server of owned){
+      if(!workspace.workspaceKey.startsWith(server+":"))continue;
+      // Break even when the owning host is not authorised: its keys are not this
+      // server's to judge, and charging them to a shorter prefix would delete them.
+      servers.get(server)?.add(workspace.workspaceKey);
+      break;
+    }
+    const merged = {
+      ...t,
+      ...(o.projectOrder?{projectOrder:o.projectOrder}:{}),
+      workspaceOrderByProject: Object.assign({}, t.workspaceOrderByProject, Object.fromEntries(o.workspaceOrders.map(({projectViewKey:e,order:t})=>[e,t]))),
+    };
+    // pruneSidebarOrder returns the SAME object when nothing is stale, so this one
+    // comparison covers both halves: reconcile changed nothing AND the prune found
+    // nothing. An unchanged tab must not write — every write is a shared-state round
+    // trip against every other device's order.
+    const next = pruneSidebarOrder(merged, {hosts: owned, servers, visibleProjects});
+    if(next === merged && !o.projectOrder && 0 === o.workspaceOrders.length)return;
+    f.useSidebarOrderStore.setState({
+      projectOrder: next.projectOrder,
+      pinnedWorkspaceOrder: next.pinnedWorkspaceOrder,
+      workspaceOrderByProject: next.workspaceOrderByProject,
+    });
+  })();
+})())`,
+    legacyRepls: ['if(o.projectOrder||o.workspaceOrders.length)f.useSidebarOrderStore.setState({...(o.projectOrder?{projectOrder:o.projectOrder}:{}),workspaceOrderByProject:Object.assign({},t.workspaceOrderByProject,Object.fromEntries(o.workspaceOrders.map(({projectViewKey:e,order:t})=>[e,t])))})'],
+  },
+
+  {
+    // "The workspace list arrived" is recorded where the list actually arrives, not
+    // where a flag that also means "a project was registered" happens to be set. Without
+    // this, the sidebar-order prune (above) has no permission to remove anything and a
+    // device that has never received the directory is one tab away from deleting every
+    // key another device created.
+    name: "sidebar-order-workspace-list-complete",
+    find: 'commitSnapshot(e,t){this.replace(e);const s=t.flatMap(e=>this.applyDelta(e));return o.useSessionStore.getState().setHasHydratedWorkspaces(this.serverId,!0),s}',
+    repl: 'commitSnapshot(e,t){this.replace(e);const s=t.flatMap(e=>this.applyDelta(e));const l=globalThis.__airlockWorkspaceListComplete||(globalThis.__airlockWorkspaceListComplete=new Set);return l.add(this.serverId),this.__airlockGotFullWorkspaceList=!0,o.useSessionStore.getState().setHasHydratedWorkspaces(this.serverId,!0),s}',
+  },
+
+  {
+    // ...and withdrawn where the list came from the LOCAL CACHE instead. Restoring a
+    // checkpoint is not a directory sync: it can happen on a page load that never reaches
+    // the box at all. Left standing, the record above would mean "sometime since this page
+    // loaded" instead of "right now", and a device that went offline holding a cached
+    // list would go on deleting the order position of every workspace another device
+    // created while it was away.
+    //
+    // The revoke is skipped once THIS replica has committed a live snapshot, because
+    // `commitCached` merges the checkpoint UNDER the replica's own entries
+    // (`[...cached, ...this.workspaces]` — existing wins). It can only add, so it can only
+    // make the visible list a superset of the snapshot, and a superset is the safe
+    // direction for the prune: extra keys are kept, not deleted. Without that guard a
+    // route-driven refresh that resolved before the cache read would hand out the
+    // authority and then take it back with no further snapshot to restore it, and the
+    // prune would stay off for the rest of the page load — quietly reinstating the
+    // oversized-value failure this exists to remove.
+    //
+    // The flag is per replica instance, so a fresh runtime for the same server starts
+    // unearned and a cache restore there still withdraws. `commitCached` is memoised per
+    // server (`cacheLoad ??=`, guarded by `cacheAccepted`), so this cannot churn.
+    name: "sidebar-order-workspace-list-from-cache",
+    find: 'commitCached(e){this.replace({workspaces:new Map([...e.workspaces,...this.workspaces]),projects:new Map([...e.projects,...this.projects])}),o.useSessionStore.getState().setHasWorkspaceDirectorySnapshot(this.serverId,!0)}',
+    repl: 'commitCached(e){this.replace({workspaces:new Map([...e.workspaces,...this.workspaces]),projects:new Map([...e.projects,...this.projects])}),o.useSessionStore.getState().setHasWorkspaceDirectorySnapshot(this.serverId,!0),this.__airlockGotFullWorkspaceList||(globalThis.__airlockWorkspaceListComplete&&globalThis.__airlockWorkspaceListComplete.delete(this.serverId))}',
   },
 
   {
@@ -472,6 +713,44 @@ const SUBAGENT_STREAM_PATCHES = [
     repl: 'overed:p,isMobileBreakpoint:u,isProjectActive:k,onBeginWorkspaceSetup:b,onRemoveProject:v,removeProjectStatus:j}=e,y=p||ke.isNative||u||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches;',
   },
   {
+    // Mobile already omits this hover-only preview. iPad's wide viewport does not,
+    // and its synthesized mouseover opens the card while trying to tap the menu.
+    name: "workspace-hover-card-touch",
+    find: 'f=(0,P.useIsCompactFormFactor)();if(!z.isWeb||f)return u;',
+    repl: 'f=(0,P.useIsCompactFormFactor)()||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches;if(!z.isWeb||f)return u;',
+  },
+  {
+    // Wide touch screens cannot hover to reveal the desktop tab close overlay.
+    // Keep the tab layout's existing close-button policy and reserved space.
+    name: "workspace-tab-close-touch",
+    find: 'const Q=Y,Z=S&&(G||y.isNative||N||C);',
+    repl: 'const Q=Y,Z=S&&(G||y.isNative||N||C||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches);',
+  },
+  {
+    // hitSlop does not make the 18px desktop trigger a visible touch target.
+    // Reserve width only; an absolute trigger must not enlarge the title row.
+    name: "workspace-menu-touch-slot",
+    find: 'u=c?H.trailingActionSlotReserved:H.trailingActionSlot;',
+    repl: 'u=c?"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches?[H.trailingActionSlotReserved,{minWidth:44}]:H.trailingActionSlotReserved:H.trailingActionSlot;',
+    legacyRepls: ['u=c?"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches?[H.trailingActionSlotReserved,{minWidth:44,minHeight:44}]:H.trailingActionSlotReserved:H.trailingActionSlot;'],
+  },
+  {
+    name: "workspace-menu-touch-trigger",
+    find: 'function G({hovered:e=!1}){return[V.trigger,e&&V.triggerHovered]}const V=u.StyleSheet.create(e=>({trigger:{padding:2,borderRadius:4,marginLeft:2,marginRight:-7}',
+    repl: 'function G({hovered:e=!1}){return[V.trigger,"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches&&{position:"absolute",top:-8,right:0,width:44,height:36,padding:0,marginLeft:0,marginRight:0,alignItems:"center",justifyContent:"center"},e&&V.triggerHovered]}const V=u.StyleSheet.create(e=>({trigger:{padding:2,borderRadius:4,marginLeft:2,marginRight:-7}',
+    legacyRepls: ['function G({hovered:e=!1}){return[V.trigger,"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches&&{width:44,height:44,padding:0,marginLeft:0,marginRight:0,alignItems:"center",justifyContent:"center"},e&&V.triggerHovered]}const V=u.StyleSheet.create(e=>({trigger:{padding:2,borderRadius:4,marginLeft:2,marginRight:-7}'],
+  },
+  {
+    // Workspace rows use the compact breakpoint as their touch test, so iPad rows
+    // have no visible kebab without hover. The shared resolver covers both workspace
+    // rows listed under projects and pinned/status workspace rows. Normalize its
+    // touch flag once so the menu and its reserved width agree, using the measured
+    // project-row pointer query.
+    name: "workspace-actions-coarse-pointer",
+    find: 'e.resolveTrailingActionVisibility=function({workspace:t,trailing:o,hasArchiveAction:n,isHovered:s,isTouchPlatform:c,showShortcut:l}){const u=',
+    repl: 'e.resolveTrailingActionVisibility=function({workspace:t,trailing:o,hasArchiveAction:n,isHovered:s,isTouchPlatform:c,showShortcut:l}){c=c||"undefined"!=typeof window&&!0===window.matchMedia?.("(pointer: coarse)")?.matches;const u=',
+  },
+  {
     // A tap on a sidebar row does nothing; the SECOND tap navigates. Reported from an
     // iPad, 2026-09-05 — "the left tab needs a double click".
     // Both sidebar rows (project and workspace) wrap their press as
@@ -503,6 +782,20 @@ const SUBAGENT_STREAM_PATCHES = [
     name: "sidebar-tap-not-swallowed-on-web",
     find: 'c[14]===Symbol.for("react.memo_cache_sentinel")?(H=e=>{const t=M.current;if(!t||x.current||P.current)return;',
     repl: 'c[14]===Symbol.for("react.memo_cache_sentinel")?(H=o.isWeb?()=>{}:e=>{const t=M.current;if(!t||x.current||P.current)return;',
+  },
+  {
+    // An archived workspace comes back in the sidebar 60 seconds later. The sidebar
+    // hides the row before it asks the daemon, and puts it back if the request
+    // throws (`archiveWorkspaceOptimistically`). The request inherits the client's
+    // 60 s default, but the daemon answers only after it has also torn down and
+    // removed the worktree — the record itself is archived within seconds. Measured
+    // on a live box 2026-10-04: a human archive took 140 s (the record was archived at
+    // +9 s), the row reappeared, they archived it again, and that one timed out too.
+    // A timeout is not a failed archive, so this request waits as long as upstream's
+    // own long-running calls do (6e5, the CLI's waitForFinish budget).
+    name: "workspace-archive-request-timeout",
+    find: 'async archiveWorkspace(e,s){return this.sendCorrelatedSessionRequest({requestId:s,message:{type:"archive_workspace_request",workspaceId:e},responseType:"archive_workspace_response"})}',
+    repl: 'async archiveWorkspace(e,s){return this.sendCorrelatedSessionRequest({requestId:s,message:{type:"archive_workspace_request",workspaceId:e},responseType:"archive_workspace_response",timeout:6e5})}',
   },
 ];
 const GROUPS = {
@@ -841,6 +1134,7 @@ module.exports = {
   BROWSE_PATCHES,
   KNOWN_BUNDLE_SHAPES,
   PINNED_SHA,
+  PRUNE_SIDEBAR_ORDER_SRC,
   SIDEBAR_POLL_MS,
   SIDEBAR_REHYDRATE_REVISIONED,
   SUBAGENT_STREAM_PATCHES,

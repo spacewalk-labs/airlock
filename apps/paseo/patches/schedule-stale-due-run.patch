@@ -1,0 +1,52 @@
+--- a/@getpaseo/server/dist/server/server/schedule/service.js
++++ b/@getpaseo/server/dist/server/server/schedule/service.js
+@@
+         // [paseo-schedule-pending] pending 은 due 보다 먼저, due 여부와 무관하게 본다 — 좌석이 idle 이 된 그 순간이 배달 시점이다.
+         for (const schedule of schedules) {
+             if (schedule.pendingAgentDelivery !== true || schedule.status !== "active") {
+                 continue;
+             }
+         }
+-        for (const schedule of await this.store.list()) {
++        // [paseo-schedule-stale-due] 같은 tick 에서 전체 디렉터리를 두 번 읽지 않는다.
++        for (const schedule of schedules) {
+             if (schedule.status !== "active" || !schedule.nextRunAt) {
+                 continue;
+             }
+         }
+     }
+@@
+-        const scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun);
+-        try {
++        try {
++            let scheduleWithRun;
++            try {
++                scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun, manual);
++            }
++            catch (appendError) {
++                return;
++            }
++            if (!scheduleWithRun) {
++                return;
++            }
+             const result = await this.runner(scheduleWithRun, runId);
+         }
+     }
+@@
+-    async appendRunningRun(scheduleId, runningRun) {
+-        const updated = await this.store.update(scheduleId, (schedule) => ({
+-            ...schedule,
+-            updatedAt: runningRun.startedAt,
+-            runs: [...schedule.runs, runningRun],
+-        }));
+-        return requireSchedule(updated, scheduleId);
+-    }
++    async appendRunningRun(scheduleId, runningRun, manual) {
++        let appended = false;
++        const updated = await this.store.update(scheduleId, (schedule) => {
++            if (manual !== true) { /* stale 재검증 */ }
++            appended = true;
++            return { ...schedule, runs: [...schedule.runs, runningRun] };
++        });
++        return appended ? requireSchedule(updated, scheduleId) : null;
++    }

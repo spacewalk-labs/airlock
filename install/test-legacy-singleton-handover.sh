@@ -3,10 +3,9 @@
 # singleton resource. Everything runs under a scratch HOME with command shims;
 # no live systemd instance, sudo, network, or fixed production display is used.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
-# This test executes a real installer. Keep the platform-wide Paseo memory
-# ceiling explicit so render-parity's real-installer guard remains hermetic.
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+airlock_pin_paseo_mem
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SELF_ROOT="$(cd "$HERE/.." && pwd)"
@@ -23,9 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass + 1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail + 1)); }
+airlock_test_counters_init
 
 wait_ready() {
   local ready="$1" pid="$2"
@@ -237,11 +234,6 @@ EOF
     fi
     if [ ! -s "$log" ]; then ok "fileview: ambiguous scope fails before stop or migration"
     else bad "fileview: ambiguous scope produced mutations: $(tr '\n' ';' <"$log")"
-    fi
-    if grep -Fq 'refusing to stop a whole scope' "$out"; then
-      ok "fileview: ambiguous scope failure explains the refusal"
-    else
-      bad "fileview: ambiguous scope failure lacks actionable diagnostic"
     fi
     kill "$holder" 2>/dev/null || true
   else

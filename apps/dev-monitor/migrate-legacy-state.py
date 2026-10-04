@@ -834,25 +834,6 @@ def compensate_coalesce_open_cards(raw: str, offline: bool = False) -> int:
     return 0
 
 
-def compensate_endstate(raw: str, offline: bool = False) -> int:
-    """Restore only an unchanged conversion result; never discard later writes."""
-    if not offline:
-        raise MigrationError(
-            '--offline is required: stop all target database users before compensation')
-    target = _endstate_path(raw)
-    backup = target.with_name(target.name + '.pre-endstate')
-    counts = _counts(target)
-    if 'ledger' not in counts:
-        _integrity(target)
-        print('compensated=0 already_legacy=1')
-        return 0
-    if backup.is_symlink() or not backup.is_file():
-        raise MigrationError('database backup is not a regular file')
-    _integrity(backup)
-    _verify_target_marker(backup, target)
-    return restore(str(backup), str(target), offline=True)
-
-
 def _require_exact_canonical_schema(path: Path) -> None:
     """Accept only schemas produced by the backend, including its additive upgrade."""
     messages = _load_messages()
@@ -888,69 +869,6 @@ def _schema_rows(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
     return [(t, n, tb, ' '.join((sql or '').split())) for t, n, tb, sql in rows]
 
 
-def _require_private_file(path: Path, what: str) -> None:
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
-        raise MigrationError('%s is not a regular file' % what)
-    if info.st_uid != os.getuid() or (info.st_mode & 0o077):
-        raise MigrationError('%s has unsafe ownership or mode' % what)
-
-
-def forward_check(raw: str, offline: bool = False) -> int:
-    """Classify a refused compensation: is the converted DB a sound candidate to keep?
-
-    Prints `restorable=1` when compensation would succeed as-is, `forward=1` only when
-    every condition below holds, and refuses otherwise. It changes no data beyond the
-    WAL checkpoint the caller's offline attestation already permits.
-    """
-    if not offline:
-        raise MigrationError(
-            '--offline is required: stop all target database users before classification')
-    target = _endstate_path(raw)
-    backup = target.with_name(target.name + '.pre-endstate')
-    for path, what in ((backup, 'database backup'), (target, 'canonical database'),
-                       (_manifest_path(backup), 'database backup manifest'),
-                       (_target_marker_path(backup), 'canonical target marker')):
-        if not os.path.lexists(path):
-            raise MigrationError('%s is missing' % what)
-        _require_private_file(path, what)
-    if any(Path(str(backup) + suffix).exists() for suffix in SQLITE_SIDECARS):
-        raise MigrationError('database backup has SQLite journal state')
-    # The manifest ties the backup to this database as its source and to its bytes.
-    _verify_backup_manifest(backup, target)
-    _integrity(backup)
-    if 'ledger' in _counts(backup):
-        raise MigrationError('database backup is not a legacy snapshot')
-    marker = _target_marker_path(backup)
-    try:
-        actual = json.loads(marker.read_text(encoding='utf-8'))
-    except (OSError, ValueError) as exc:
-        raise MigrationError('canonical target marker is unreadable') from exc
-    if (not isinstance(actual, dict)
-            or set(actual) != {'version', 'backup_sha256', 'target_sha256'}
-            or actual['version'] != 1
-            or actual['backup_sha256'] != _file_sha256(backup)
-            or not isinstance(actual['target_sha256'], str)
-            or not re.fullmatch(r'[0-9a-f]{64}', actual['target_sha256'])):
-        raise MigrationError('canonical target marker does not match the backup')
-    # Fold journal state in so the hash names one consistent file, as the marker did.
-    conn = sqlite3.connect(target)
-    try:
-        if conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]:
-            raise MigrationError('database checkpoint busy; stop all database users')
-    finally:
-        conn.close()
-    _integrity(target)
-    if _file_sha256(target) == actual['target_sha256']:
-        print('restorable=1')
-        return 0
-    _require_canonical_columns(target)
-    _require_exact_canonical_schema(target)
-    print('forward=1 backup_sha256=%s target_sha256=%s'
-          % (actual['backup_sha256'], _file_sha256(target)))
-    return 0
-
-
 def endstate(raw: str, offline: bool = False) -> int:
     if not offline:
         raise MigrationError('--offline is required: stop service and mask producer timers first')
@@ -980,9 +898,7 @@ def endstate(raw: str, offline: bool = False) -> int:
     else:
         _sqlite_backup(source, backup, exclusive=True)
         _write_backup_manifest(backup, source)
-    _publish_clone(
-        backup, source, migrate=True, target_marker_backup=backup,
-        expected_counts=_expected_counts(counts))
+    _publish_clone(backup, source, migrate=True, expected_counts=_expected_counts(counts))
     print('converted=1 backup_retained=1')
     return 0
 
@@ -996,10 +912,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--verify', metavar='DB')
     result.add_argument('--schema-state', metavar='DB')
     result.add_argument('--endstate', metavar='DB')
-    result.add_argument('--compensate-endstate', metavar='DB')
     result.add_argument('--coalesce-open-cards', metavar='DB')
     result.add_argument('--compensate-coalesce-open-cards', metavar='DB')
-    result.add_argument('--forward-check', metavar='DB')
     result.add_argument('--restore-backup', metavar='DB')
     result.add_argument('--restore-to', metavar='DB')
     result.add_argument(
@@ -1017,16 +931,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.coalesce_open_cards:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.verify, args.schema_state, args.endstate,
-                    args.compensate_endstate, args.compensate_coalesce_open_cards,
-                    args.forward_check, args.restore_backup, args.restore_to, args.resume)):
+                    args.compensate_coalesce_open_cards,
+                    args.restore_backup, args.restore_to, args.resume)):
                 raise MigrationError(
                     '--coalesce-open-cards cannot be combined with other operations')
             return coalesce_open_cards(args.coalesce_open_cards, args.offline)
         if args.compensate_coalesce_open_cards:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.verify, args.schema_state, args.endstate,
-                    args.compensate_endstate, args.coalesce_open_cards,
-                    args.forward_check, args.restore_backup, args.restore_to, args.resume)):
+                    args.coalesce_open_cards,
+                    args.restore_backup, args.restore_to, args.resume)):
                 raise MigrationError(
                     '--compensate-coalesce-open-cards cannot be combined with other operations')
             return compensate_coalesce_open_cards(
@@ -1034,36 +948,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.endstate:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.verify, args.schema_state,
-                    args.compensate_endstate, args.forward_check, args.restore_backup,
-                    args.restore_to, args.resume)):
+                    args.restore_backup, args.restore_to, args.resume)):
                 raise MigrationError('--endstate cannot be combined with other operations')
             return endstate(args.endstate, args.offline)
-        if args.forward_check:
-            if any((args.legacy_root, args.canonical_root, args.db_backup,
-                    args.backup_source, args.verify, args.schema_state,
-                    args.endstate, args.compensate_endstate,
-                    args.restore_backup, args.restore_to, args.resume)):
-                raise MigrationError(
-                    '--forward-check cannot be combined with other operations')
-            return forward_check(args.forward_check, args.offline)
-        if args.compensate_endstate:
-            if any((args.legacy_root, args.canonical_root, args.db_backup,
-                    args.backup_source, args.verify, args.schema_state,
-                    args.restore_backup, args.restore_to, args.resume)):
-                raise MigrationError(
-                    '--compensate-endstate cannot be combined with other operations')
-            return compensate_endstate(args.compensate_endstate, args.offline)
         if args.schema_state:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.verify, args.endstate,
-                    args.compensate_endstate, args.forward_check, args.restore_backup,
+                    args.restore_backup,
                     args.restore_to, args.resume, args.offline)):
                 raise MigrationError('--schema-state cannot be combined with other operations')
             return schema_state(args.schema_state)
         if args.verify:
             if any((args.legacy_root, args.canonical_root, args.db_backup,
                     args.backup_source, args.schema_state,
-                    args.compensate_endstate, args.forward_check, args.restore_backup,
+                    args.restore_backup,
                     args.restore_to, args.resume, args.offline)):
                 raise MigrationError('--verify cannot be combined with migration or restore')
             return verify(args.verify)
@@ -1071,7 +969,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.db_backup:
                 raise MigrationError('--backup-source requires --db-backup')
             if any((args.legacy_root, args.canonical_root, args.restore_backup,
-                    args.restore_to, args.compensate_endstate, args.forward_check, args.resume,
+                    args.restore_to, args.resume,
                     args.offline)):
                 raise MigrationError('online backup cannot be combined with migration or restore')
             return backup_only(args.backup_source, args.db_backup)
@@ -1079,7 +977,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.restore_backup or not args.restore_to:
                 raise MigrationError('--restore-backup and --restore-to are required together')
             if any((args.legacy_root, args.canonical_root, args.db_backup,
-                    args.backup_source, args.compensate_endstate, args.forward_check,
+                    args.backup_source,
                     args.resume)):
                 raise MigrationError('restore cannot be combined with migration')
             return restore(args.restore_backup, args.restore_to, args.offline)

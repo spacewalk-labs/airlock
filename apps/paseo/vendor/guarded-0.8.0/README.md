@@ -115,6 +115,14 @@ emit `remove`, while `includeArchived=true` keeps the diagnostic/recovery
 snapshot behavior. Its behavior test covers both paths, idempotence, mixed-state
 refusal, and anchor drift.
 
+`workspace-remove-delivery` is baked into `session.js` (2026-10-02). A
+changes-only resubscription omits unchanged cached workspaces from the session's
+last-emitted map; their first archive removal must still be delivered. The
+behavior test executes the Session delivery branch and checks the real
+DirectorySyncService changes-only bootstrap and removal sequence. Baking this
+patch and updating both checksum manifests preserves installer idempotency;
+leaving it as an install-time mutation would reinstall and restart on every run.
+
 `orphan-process-guard` (claude) and `orphan-process-group` (claude-agent,
 claude-query, codex-transport) are baked in for the same reason as
 provider-subagent-stream-filter: both have their own runtime behaviour tests
@@ -146,7 +154,10 @@ orphan-process-group), `agent/providers/claude/query.js`
 (orphan-process-group), `agent/providers/claude/model-manifest.js` (model
 prune), `agent/providers/opencode-agent.js` (opencode grok defaults),
 `agent/providers/codex/app-server-transport.js` (orphan-process-group), and
-`schedule/service.js` (schedule-busy-pending-delivery) to the overlay.
+`agent/providers/codex-feature-definitions.js` plus
+`agent/providers/codex-app-server-agent.js` (codex-model-roster), and
+`schedule/service.js` (schedule-busy-pending-delivery, schedule-stale-due-run)
+to the overlay.
 Otherwise every byte in all seven tarballs, including the web UI bundle, is
 exactly what `npm pack @getpaseo/<name>@0.8.0` produces from the real
 registry. `INSTALLED_SHA256SUMS` pins every overlaid file.
@@ -168,6 +179,88 @@ baked in together (the schema half already was; leaving the service half
 install-time-only once it started actually succeeding would have repeated
 the same idempotency hazard `orphan-process-guard`/`-group` hit: a
 non-baked patch that succeeds keeps mutating a pinned file on every run).
+
+`schedule-stale-due-run` is baked in on top of it, and had to be: the tick it
+anchors on is the one `schedule-busy-pending-delivery` writes, so leaving it
+install-time-only would mutate a pinned `schedule/service.js` on every run and
+reinstall the bundle from scratch each time — exactly the idempotency hazard
+described above. It closes two defects that only show once the schedule
+directory is large. The daemon's tick is `setInterval(..., 1000)`
+fire-and-forget, so a slow tick is re-entered; `runSchedule` then receives a due
+snapshot the on-disk record has already moved past, and 0.8.0's
+`appendRunningRun` appends unconditionally — so a `maxRuns: 1` one-shot gets a
+second run, which is what makes a delivery receipt read `unavailable`. Measured
+on a pilot box 2026-09-23: 21 of 415 delivery schedules carried two succeeded
+runs. The patch revalidates inside `store.update`'s atomic section (active,
+`nextRunAt === scheduledFor`, not past expiry/maxRuns), returns null on refusal
+and never calls the runner. It also moves the append inside `try`: 0.8.0 leaves
+it outside, so a throwing append skips `finally` and strands the id in
+`runningScheduleIds` forever. Second, `tick()` called `store.list()` twice per
+second and `list()` reads and parses every JSON in the directory — 2,760 files
+was ~5,520 reads/sec; the second call now reuses the first snapshot, which is
+only safe *because* of the revalidation above, so the two ship as one patch.
+Its behaviour test drives the patched service with stub seats and the
+precursor's own test is re-run against the same candidate.
+
+`schedule-pending-batch` is baked in on top of `schedule-stale-due-run`
+(2026-10-03), for the same idempotency reason. session-delivery creates one
+one-shot schedule per message, so a seat that stays busy collects several
+pending schedules; delivering one holds the seat for the whole turn and the
+others wait a turn each. Measured on a pilot box 2026-10-03: 15 deliveries queued
+for one seat, delivery lag p50 of 1.3–2.3 h in the worst hours. The patch
+claims every pending schedule of an idle seat and delivers them in one turn,
+each schedule still getting exactly one run (the session-delivery receipt
+contract). It also puts the pending bit back when a claimed schedule's append
+is refused, instead of leaving it until the next cron hour. Only
+`dist/server/server/schedule/service.js` changed in the tarball.
+
+`claude-model-prune` was re-baked (2026-09-24) to add Opus 5.5
+(`claude-opus-5-5`, released 2026-09-22) at the top of the Claude picker and relabel
+Opus 5 as the previous release. Same reason as the other re-bakes: the sentinel is
+unchanged, so only replacing the vendored bytes ships the new roster. Only
+`model-manifest.js` differs from the previous server tarball; both checksum files
+are updated.
+
+`claude-model-prune` was re-baked again (2026-09-29) to add Sonnet 5.5
+(`claude-sonnet-5-5`) to the picker. Its 1M context and `high` default effort
+match Anthropic's model specification; Paseo's existing Claude thinking default
+already selects `high`. Sonnet 5 is labelled as the previous release. The
+server tarball and both checksum files are updated together.
+
+`codex-model-roster` is baked into the two Codex provider modules. Paseo obtains
+the picker from Codex app-server's live `model/list`, so the overlay keeps that
+availability boundary and filters only the retired exact ID `gpt-5.5`. The Fast
+capability table adds `gpt-6-sol` and `gpt-6-luna`; the rows therefore appear
+only after the signed-in ChatGPT account receives them, but arrive with the Fast
+control on the first eligible refresh. Both modules and their behavior test are
+applied as one unit, and both installed files are pinned below.
+
+`workspace-git-watch-recovery` is baked into `server/workspace-git-service.js`. It is a
+backport of upstream getpaseo/paseo `8ffe7c75d` ("Keep the daemon responsive when file
+watching fails", #3056), working-tree path only, with upstream's constant names so the
+overlay can simply be dropped when the pin moves past it. In 0.8.0 a working-tree watcher
+that misses its 10s subscribe deadline falls back to a 5s poll (four git commands per
+tick) and gives up recovering after three attempts, so one slow moment — typically a
+daemon boot with many workspaces — becomes polling that lasts until the next restart.
+Measured on a pilot box 2026-09-25: that fallback was the top git refresh source (610 per
+30s window) and the git queue peaked at 552 waiting. The patch keeps retrying (backoff
+capped at 300s) and doubles a quiet poll's interval up to 60s, returning to 5s as soon as
+a refresh changes the snapshot fingerprint. Its behaviour test drives the two patched
+methods directly and reads the delays handed to `setTimeout`.
+
+`workspace-git-emergency-policy` and `workspace-reconciliation-emergency-policy`
+are baked into their two service modules (2026-10-04). Automatic cached Git
+refreshes, repo fetches and whole-inventory reconciliation admit one in 20 per
+target/service; explicit, forced and boot work remains available. Reconciliation
+accounts for 405/423 Git calls in the measured 30-second overload trace and bypasses
+the snapshot pipeline, so both envelopes are necessary. Explicit full work queued
+behind automatic metadata retains its exemption. The two patchers generate their
+scale parsing from `patches/background-git-policy-source.mjs`.
+Both installed files are checksum-pinned; installation sees `ALREADY` and does
+not alter them, preventing checksum mismatch/reinstall/restart on every re-run.
+Only those two tar members changed; both checksum files and reference patches
+were regenerated. This is a temporary freshness tradeoff pending a durable fix
+to observation demand and metadata fanout.
 
 The web-ui patcher (`browse-host/bin/patch-web-ui.js`) is re-derived for
 0.8.0 — all 10 anchors updated (the bundle's persistence layer alone moved
@@ -196,8 +289,9 @@ dependencies) succeeds clean. A real `npm i -g` of these seven tarballs into a
 scratch prefix lands `@getpaseo/*` as siblings (no nesting under `cli`, the
 layout `install.sh` depends on), `paseo --version` reports `0.8.0`, and a real
 `bash apps/paseo/install.sh` run against that tree (the actual installer, not
-a fixture) applies all nine baked-in patches (depth4, image-attachments-
+a fixture) applies all ten baked-in patches (depth4, image-attachments-
 persist, claude-model-prune, opencode-grok-defaults,
 provider-subagent-stream-filter, orphan-process-guard, orphan-process-group,
-schedule-busy-pending-delivery, archive-consistency) idempotently, restarts the
+schedule-busy-pending-delivery, archive-consistency, codex-model-roster)
+idempotently, restarts the
 daemon, and installs successfully end to end.

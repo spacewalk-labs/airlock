@@ -33,7 +33,7 @@ webroot = ["notepad/index.html"]
 # entry this manifest replaces.
 [tile]
 label = "Clip Bridge"
-sub = "clipboard"
+sub = "클립보드"
 cat = "docs"
 path = "/notepad/"
 glyph = "app-notepad"

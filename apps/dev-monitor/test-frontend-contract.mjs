@@ -240,3 +240,71 @@ if (!process.env.DEVMON_FRONTEND_NESTED) {
   console.log(`AC-9 | expected: four_shapes==1&&actions_executed==3&&explicit_paste==1&&mobile_sheet==1 | observed: four_shapes=1,actions_executed=3,explicit_paste=1,mobile_sheet=1 | verdict: PASS | signal: fixture | evidence: apps/dev-monitor/test-frontend-contract.mjs@${revision}`);
   console.log(`TEMPLATE-RUN-SHEET | expected: existing_openRun==1&&server_chips==2&&default_note==1 | observed: existing_openRun=1,server_chips=2,default_note=1 | verdict: PASS | signal: fixture | evidence: apps/dev-monitor/test-frontend-contract.mjs@${revision}`);
 }
+
+// Source text uses the existing native disclosure, never HTML interpretation.
+for (const card of [{...neither, detail: '<img src=x onerror=alert(1)>\nraw'},
+                    {...link, detail: 'original linked report'}]) {
+  ui.openTitle(card);
+  const disclosure = descendants(latestOverlay(document)).find(node => node.tagName === 'details');
+  assert.ok(disclosure);
+  assert.equal(disclosure.attributes.open, undefined);
+  assert.equal(disclosure.children[0].textContent, '원천 메시지');
+  assert.equal(disclosure.children[1].textContent, card.detail);
+  assert.equal(disclosure.children[1].children.length, 0);
+}
+ui.openMessage(neither);
+assert.equal(descendants(latestOverlay(document)).some(node => node.tagName === 'details'), false);
+console.log('source detail: collapsed native disclosure, literal text, legacy unchanged');
+
+// Exercise the shipped Personal preview, delegated click, and HTTP writer.
+// A missing dataset id previously produced /apps/undefined/register even though
+// the backend's explicit-source install fixture passed.
+const storeRequests = [];
+const storeHtml = readFileSync(new URL('../../hub/index.html', import.meta.url), 'utf8');
+const storeBody = new Element('section');
+const storeActions = new Element('section');
+const storeContext = vm.createContext({
+  document: {createElement: tag => new Element(tag)},
+  body: storeBody, panes: [new Element('section')],
+  detail: new Element('section'), detailTitle: new Element('h2'),
+  detailNote: new Element('p'), detailKv: new Element('dl'),
+  detailCaps: new Element('section'), detailActions: storeActions,
+  progressNote: new Element('p'), selected: null, runTimer: null,
+  installRun: false, kv() {}, previewPorts: () => '없음',
+  setAlert() {}, pollRun() {}, clearTimeout() {}, setTimeout: () => 1,
+  fetch: async (path, options) => {
+    storeRequests.push({path, method: options.method, body: JSON.parse(options.body)});
+    return {ok: true, json: async () => ({ok: true})};
+  }
+});
+function shippedBlock(start, end) {
+  const at = storeHtml.indexOf(start);
+  assert.ok(at >= 0);
+  const stop = storeHtml.indexOf(end, at);
+  assert.ok(stop > at);
+  return storeHtml.slice(at, stop);
+}
+vm.runInContext(shippedBlock('  function showPersonalPreview(value) {',
+                            '  async function pollRun() {') +
+                shippedBlock('  async function mutate(action, id, button) {',
+                            '  async function previewPersonal(path) {') +
+                shippedBlock('  body.addEventListener("click", event => {',
+                            '  modal.addEventListener("keydown", event => {'), storeContext);
+storeContext.preview = {id: 'personal-probe', path: '/tmp/personal app',
+                        installable: true, requested_capabilities: []};
+vm.runInContext('showPersonalPreview(preview)', storeContext);
+const personalButton = storeActions.children[0];
+personalButton.closest = () => personalButton;
+storeBody.events.click({target: personalButton});
+await tick(); await tick();
+assert.deepEqual(storeRequests, [{path: '/monitor/api/owner/apps/personal-probe/register',
+                                method: 'POST', body: {path: '/tmp/personal app'}}]);
+storeContext.preview = {...storeContext.preview, installable: false};
+vm.runInContext('showPersonalPreview(preview)', storeContext);
+const deniedPersonalButton = storeActions.children[0];
+deniedPersonalButton.closest = selector => selector.startsWith('button') ? deniedPersonalButton : null;
+storeContext.modal = {querySelectorAll: () => []};
+storeBody.events.click({target: deniedPersonalButton});
+await tick();
+assert.equal(storeRequests.length, 1);
+console.log('Personal preview: actual delegated click sends its id/path; rejected preview launches nothing');

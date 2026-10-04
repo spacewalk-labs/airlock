@@ -4,6 +4,8 @@
 Single source of truth for the porthole marks shipped in hub/assets/:
   - apple-touch-icon.png : 512x512 full-bleed square tile (iOS masks the corners)
   - favicon.png          : 64x64 round "porthole coin" (transparent corners)
+The same favicon.png is also written to the repository root, where Paseo's
+project-icon scan finds it and shows it next to the project in the sidebar.
 
 Both show the same porthole: a dome + perspective grid seen through a hatch
 window, over a deep-space navy gradient with a hatch ring and rim glints. The
@@ -109,7 +111,9 @@ def porthole(size: int, coin: bool = False) -> Image.Image:
 def main() -> None:
     os.makedirs(OUT, exist_ok=True)
     porthole(512).save(os.path.join(OUT, "apple-touch-icon.png"))
-    porthole(64, coin=True).save(os.path.join(OUT, "favicon.png"))
+    favicon = porthole(64, coin=True)
+    favicon.save(os.path.join(OUT, "favicon.png"))
+    favicon.save(os.path.join(HERE, "..", "favicon.png"))  # Paseo sidebar icon
     print("wrote", os.path.join(OUT, "apple-touch-icon.png"))
     print("wrote", os.path.join(OUT, "favicon.png"))
 

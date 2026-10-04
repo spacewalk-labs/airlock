@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Template-unit checkpoint and teardown regressions.
+"""Template-unit teardown regressions.
 
 These tests do not put a fake ``systemctl`` executable on PATH. They hold the
 subprocess boundary to an exact command transcript and feed the parser real-format
@@ -105,18 +105,8 @@ class TemplateUnitTests(unittest.TestCase):
             Path(directory).mkdir()
         self.template = Path(self.roots["unit_user"]) / TEMPLATE
         self.template.write_text("[Unit]\nDescription=Airlock Code Server slot %i\n")
-        artifacts = {name: [] for name in ledger.ARTIFACT_CLASSES}
-        artifacts["units"] = [str(self.template)]
-        record = {
-            "path": str(self.root / "missing-package"), "digest": "f" * 64,
-            "lifecycle": {"install": False, "smoke": False, "deactivate": False},
-            "deps": [], "artifacts": artifacts, "roots": self.roots,
-            "unit_scopes": {TEMPLATE: "user"}, "serve_mappings": {}, "order": None,
-            "source_class": "explicit", "capabilities": [], "container_runtime": None,
-            "managed_authority": None,
-        }
-        self.store = {"version": ledger.LEDGER_VERSION,
-                      "entries": {"probe": {"committed": record}}, "events": []}
+        self.store = {"probe": {"repo": str(self.root / "missing-package"),
+                                "commit": "", "artifacts": [str(self.template)]}}
         env = {
             "AIRLOCK_STATE_DIR": str(self.root / "state"),
             "AIRLOCK_UNIT_DIR_USER": self.roots["unit_user"],
@@ -130,7 +120,7 @@ class TemplateUnitTests(unittest.TestCase):
         self.env = patch.dict(os.environ, env)
         self.env.start()
         self.addCleanup(self.env.stop)
-        ledger.write_store(self.store)
+        ledger.write_installed(self.store)
 
     def transcript(self, *, instances: bool) -> SystemctlTranscript:
         name = ("list-units-template-instances.txt" if instances
@@ -138,49 +128,11 @@ class TemplateUnitTests(unittest.TestCase):
         return SystemctlTranscript(ROOT / "install/fixtures/systemctl" / name,
                                    instances=instances)
 
-    def checkpoint(self, transcript: SystemctlTranscript) -> dict:
-        with patch.object(ledger.subprocess, "run", side_effect=transcript), \
-                contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(ledger.command_transaction_begin(
-                ["upgrade-deactivate:probe"]), 0)
-        return json.loads(ledger.transaction_path().read_text())["checkpoints"]["probe"]
-
     def teardown(self, transcript: SystemctlTranscript) -> int:
         with patch.object(ledger.subprocess, "run", side_effect=transcript), \
+                patch.object(ledger, "project"), \
                 contextlib.redirect_stderr(io.StringIO()):
-            return ledger.command_teardown(self.store, {"packages": {}}, "probe", None)
-
-    def test_checkpoint_records_each_concrete_instance(self):
-        transcript = self.transcript(instances=True)
-        checkpoint = self.checkpoint(transcript)
-        self.assertEqual(checkpoint["units"], {
-            TEMPLATE: {"scope": "user", "instances": {
-                INSTANCES[0]: {"active": True, "enabled": True},
-                INSTANCES[1]: {"active": False, "enabled": False},
-            }},
-        })
-        self.assertEqual(transcript.count_for("list-units"), 1)
-        self.assertEqual(transcript.names_for("is-active"), set(INSTANCES))
-        self.assertEqual(transcript.names_for("is-enabled"), set(INSTANCES))
-
-    def test_checkpoint_with_no_instances_records_not_applicable(self):
-        transcript = self.transcript(instances=False)
-        self.assertEqual(self.checkpoint(transcript)["units"], {
-            TEMPLATE: {"scope": "user", "instances": {}},
-        })
-        self.assertEqual(transcript.count_for("list-units"), 1)
-        self.assertEqual(transcript.names_for("is-active"), set())
-        self.assertEqual(transcript.names_for("is-enabled"), set())
-
-    def test_restore_replays_only_concrete_instance_states(self):
-        transcript = self.transcript(instances=True)
-        checkpoint = self.checkpoint(transcript)
-        with patch.object(ledger.subprocess, "run", side_effect=transcript):
-            self.assertTrue(ledger._restore_unit_states(checkpoint))
-        self.assertEqual(transcript.names_for("enable"), {INSTANCES[0]})
-        self.assertEqual(transcript.names_for("start"), {INSTANCES[0]})
-        self.assertEqual(transcript.names_for("disable"), {INSTANCES[1]})
-        self.assertEqual(transcript.names_for("stop"), {INSTANCES[1]})
+            return ledger.command_remove("probe")
 
     def test_teardown_stops_and_disables_each_concrete_instance(self):
         transcript = self.transcript(instances=True)

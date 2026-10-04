@@ -13,11 +13,9 @@ scan live in the vault and in box-local install environment, not in this file.
 A new key appears on the next request with no code change; a removed one
 simply stops being listed.
 
-Both readers are handed in, never guessed (see install/airlock-accounts-api.sh):
-AIRLOCK_MUSE_SECRET_BIN (team secret reader, `list` + `get <title>`) and the
-brokered single-key pair AIRLOCK_MUSE_CHO_BIN (`read <ref>`) with
-AIRLOCK_MUSE_CHO_REF (its full op:// address, provided at install time on the
-box — empty means this box holds no brokered key). Either side may be absent.
+The shared reader is handed in, never guessed (see install/airlock-accounts-api.sh):
+AIRLOCK_MUSE_SECRET_BIN supports `list` + `get <title>`. Every Muse key follows
+that one shared discovery path; there is no item-specific reader or visibility rule.
 """
 
 import json
@@ -63,32 +61,13 @@ def _value(proc):
     return text or None
 
 
-def _ref_item(ref):
-    """The item title inside a full op://vault/item/field address, or None.
-
-    Only key-shaped titles enter the map: a misconfigured address can neither
-    smuggle an arbitrary vault item into usage reads nor rename one.
-    """
-    if not isinstance(ref, str) or not ref.startswith("op://"):
-        return None
-    parts = ref[len("op://"):].split("/")
-    if len(parts) != 3 or not all(parts):
-        return None
-    return parts[1] if ITEM_RE.match(parts[1]) else None
-
-
 def main():
     secret_bin = os.environ.get("AIRLOCK_MUSE_SECRET_BIN", "").strip()
-    cho_bin = os.environ.get("AIRLOCK_MUSE_CHO_BIN", "").strip()
-    cho_ref = os.environ.get("AIRLOCK_MUSE_CHO_REF", "").strip()
     jobs = []
     if secret_bin and os.path.isfile(secret_bin):
         for line in _lines([secret_bin, "list"]):
             if ITEM_RE.match(line):
                 jobs.append((line, [secret_bin, "get", line]))
-    cho_item = _ref_item(cho_ref) if cho_bin and os.path.isfile(cho_bin) else None
-    if cho_item and cho_ref:
-        jobs.append((cho_item, [cho_bin, "read", cho_ref]))
     seen = set()
     unique = []
     for item, argv in jobs:

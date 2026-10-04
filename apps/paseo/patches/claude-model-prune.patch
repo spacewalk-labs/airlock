@@ -1,14 +1,44 @@
 --- a/model-manifest.js
 +++ b/model-manifest.js
-@@ -12,6 +12,7 @@
+@@ -13,10 +13,18 @@
  export const CLAUDE_DISABLED_THINKING_OPTION_ID = "off";
  export const CLAUDE_ULTRACODE_THINKING_OPTION_ID = "ultracode";
  export const CLAUDE_MODEL_MANIFEST = [
-+    // [airlock-model-prune] removed 6 superseded models (picker only — execution does not consult the manifest).
++    // [airlock-model-prune] picker roster: superseded models removed, claude-opus-5-5, claude-sonnet-5-5 added (picker only — execution does not consult the manifest).
++    {
++        id: "claude-opus-5-5",
++        label: "Opus 5.5",
++        description: "Opus 5.5 · Latest release",
++        contextWindowMaxTokens: 1000000,
++        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
++    },
      {
          id: "claude-opus-5",
          label: "Opus 5",
-@@ -74,58 +75,6 @@
+-        description: "Opus 5 · Latest release",
++        description: "Opus 5 · Previous release",
+         defaultPriority: 2,
+         minimumClaudeCodeVersion: "2.1.219",
+         contextWindowMaxTokens: 1000000,
+@@ -61,9 +69,16 @@
+         supportsFastMode: true,
+     },
+     {
++        id: "claude-sonnet-5-5",
++        label: "Sonnet 5.5",
++        description: "Sonnet 5.5 · Latest release",
++        contextWindowMaxTokens: 1000000,
++        effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
++    },
++    {
+         id: "claude-sonnet-5",
+         label: "Sonnet 5",
+-        description: "Sonnet 5 · Best for everyday tasks",
++        description: "Sonnet 5 · Previous release",
+         contextWindowMaxTokens: 200000,
+         effortLevels: CLAUDE_EFFORT_LEVELS.xhigh,
+         supportsThinkingDisabled: true,
+@@ -77,58 +92,6 @@
          supportsThinkingDisabled: true,
      },
      {

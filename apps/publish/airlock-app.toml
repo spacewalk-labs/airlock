@@ -128,7 +128,7 @@ https_port = "gate_port"
 # From hub/index.html's APPS table (publish row).
 [tile]
 label = "Publish"
-sub = "static publish"
+sub = "정적 사이트 발행"
 cat = "docs"
 path = "/publish/"
 glyph = "app-publish"

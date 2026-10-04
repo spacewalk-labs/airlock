@@ -189,7 +189,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, revision=revision)
 
     def do_PUT(self) -> None:  # noqa: N802 - stdlib hook
-        path = key_path(self._key())
+        key = self._key()
+        path = key_path(key)
         if path is None:
             self._send(404)
             return
@@ -199,6 +200,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400)
             return
         if length < 0 or length > MAX_BYTES:
+            # The one refusal that needs explaining: the client is doing something
+            # correct-looking that no longer fits, and nothing else says so. Every other
+            # outcome is a normal part of compare-and-swap and stays out of the journal.
+            log(f"PUT {key} refused 413: {length} B > {MAX_BYTES} B")
             self._send(413)
             return
         raw = self.rfile.read(length) if length else b""

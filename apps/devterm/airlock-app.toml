@@ -107,7 +107,7 @@ compat_https = { target = "gate_port", enabled = "compat_https_enabled" }
 # From hub/index.html's APPS table (devterm row).
 [tile]
 label = "DevTerm"
-sub = "web shell"
+sub = "웹 터미널"
 cat = "coding"
 glyph = "app-devterm"
 

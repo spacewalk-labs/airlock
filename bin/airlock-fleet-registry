@@ -27,7 +27,10 @@ import re
 
 # An op:// address names vault/item/field. Three segments, no whitespace, no empty
 # parts — anything else is not a key name and is refused rather than stored.
-_KEY_RE = re.compile(r"\Aop://[^/\s]+/[^/\s]+/[^/\s]+\Z")
+# Bare helper names (OPENCODE_*_API_KEY) are the second allowed shape: the team
+# reader yields them verbatim and the join uses them as-is. The fixed charset
+# carries no secret — same value-free guarantee, same single-writer review.
+_KEY_RE = re.compile(r"\A(?:op://[^/\s]+/[^/\s]+/[^/\s]+|OPENCODE_[A-Z0-9_]+_API_KEY)\Z")
 # A box name is a hostname-shaped identifier. Without it a pasted secret could sit in
 # the value slot and this sheet would stop being value-free. The 63-char cap is the
 # DNS label limit — a box name is a hostname, and anything longer cannot be one,

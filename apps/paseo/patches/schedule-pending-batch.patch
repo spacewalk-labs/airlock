@@ -1,0 +1,197 @@
+--- a/@getpaseo/server/dist/server/server/schedule/service.js
++++ b/@getpaseo/server/dist/server/server/schedule/service.js
+@@ -458,50 +458,187 @@
+             };
+         });
+         requireSchedule(updated, schedule.id);
+         this.logger?.info?.({ scheduleId: schedule.id }, "[paseo-schedule-pending] target busy — delivery pending until idle");
+     }
+     // 실행 직전에 비트를 지운다(claim). 다시 busy 면 catch 가 같은 비트를 되세운다.
++    // [paseo-schedule-pending-batch] claim 직후의 레코드를 돌려준다 — 실행은 tick 시작 스냅샷이 아니라 이것으로 한다.
+     async claimPendingDelivery(scheduleId) {
+-        let claimed = false;
++        let claimed = null;
+         await this.store.update(scheduleId, (current) => {
+             if (current.pendingAgentDelivery !== true || current.status !== "active") {
+                 return current;
+             }
+-            claimed = true;
+-            return { ...current, pendingAgentDelivery: false, updatedAt: this.now().toISOString() };
++            claimed = { ...current, pendingAgentDelivery: false, updatedAt: this.now().toISOString() };
++            return claimed;
+         });
+         return claimed;
+     }
++    // [paseo-schedule-pending-batch] claim 뒤 append 가 거부되면 비트를 되세운다 — 안 그러면 다음 cadence(정각)까지 선다.
++    async restorePendingDelivery(scheduleId) {
++        await this.store.update(scheduleId, (current) => current.status === "active"
++            ? { ...current, pendingAgentDelivery: true, updatedAt: this.now().toISOString() }
++            : current);
++    }
++    // [paseo-schedule-pending-batch] 한 좌석의 pending 을 한 턴에. schedule 마다 자기 run 하나는 그대로다.
++    // 한 건의 기록 오류(복원·결과 저장·실행 중 삭제)가 나머지 건의 배달·영수증·잠금 해제를 막지 않는다.
++    async runPendingBatch(claimed, now) {
++        const runs = [];
++        try {
++            for (const schedule of claimed) {
++                this.runningScheduleIds.add(schedule.id);
++                const runId = randomUUID();
++                const runningRun = {
++                    id: runId,
++                    scheduledFor: schedule.nextRunAt ?? now.toISOString(),
++                    startedAt: now.toISOString(),
++                    endedAt: null,
++                    status: "running",
++                    agentId: null,
++                    output: null,
++                    error: null,
++                };
++                let scheduleWithRun = null;
++                try {
++                    scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun, false);
++                }
++                catch (appendError) {
++                    this.logger?.warn?.({ scheduleId: schedule.id, error: appendError instanceof Error ? appendError.message : String(appendError) }, "[paseo-schedule-pending-batch] could not record run — pending kept");
++                }
++                if (scheduleWithRun) {
++                    runs.push({ schedule: scheduleWithRun, runId });
++                    continue;
++                }
++                try {
++                    await this.restorePendingDelivery(schedule.id);
++                }
++                catch (restoreError) {
++                    this.logger?.warn?.({ scheduleId: schedule.id, error: restoreError instanceof Error ? restoreError.message : String(restoreError) }, "[paseo-schedule-pending-batch] could not restore pending bit");
++                }
++            }
++            if (runs.length === 0) {
++                return;
++            }
++            const lead = runs[0];
++            const fired = runs.length === 1 ? lead.schedule : {
++                ...lead.schedule,
++                name: `${runs.length} pending deliveries`,
++                prompt: runs.map((run) => buildScheduleFireBody(run.schedule, run.runId)).join("\n\n"),
++            };
++            let result = null;
++            let runError = null;
++            try {
++                result = await this.runner(fired, lead.runId);
++            }
++            catch (error) {
++                runError = error;
++            }
++            for (const run of runs) {
++                try {
++                    if (!runError) {
++                        await this.finishRun({
++                            scheduleId: run.schedule.id,
++                            runId: run.runId,
++                            status: "succeeded",
++                            agentId: result.agentId,
++                            output: result.output,
++                            error: null,
++                            targetGone: false,
++                            manual: false,
++                        });
++                    }
++                    else if (runError.paseoScheduleTargetBusy === true) {
++                        await this.deferBusyRun(run.schedule, run.runId);
++                    }
++                    else {
++                        await this.finishRun({
++                            scheduleId: run.schedule.id,
++                            runId: run.runId,
++                            status: "failed",
++                            agentId: null,
++                            output: null,
++                            error: runError instanceof Error ? runError.message : String(runError),
++                            targetGone: runError instanceof ScheduleTargetGoneError,
++                            manual: false,
++                        });
++                    }
++                }
++                catch (recordError) {
++                    // 그 schedule 이 실행 중 삭제됐거나 저장이 실패했다 — 그 건만 남기고 나머지 결과는 계속 기록한다.
++                    this.logger?.warn?.({ scheduleId: run.schedule.id, error: recordError instanceof Error ? recordError.message : String(recordError) }, "[paseo-schedule-pending-batch] could not record run result");
++                }
++            }
++        }
++        finally {
++            for (const schedule of claimed) {
++                this.runningScheduleIds.delete(schedule.id);
++            }
++        }
++    }
+     async tick() {
+         const now = this.now();
+         const schedules = await this.store.list();
+         // [paseo-schedule-pending] pending 은 due 보다 먼저, due 여부와 무관하게 본다 — 좌석이 idle 이 된 그 순간이 배달 시점이다.
++        const pendingByAgent = new Map(); // [paseo-schedule-pending-batch]
+         for (const schedule of schedules) {
+             if (schedule.pendingAgentDelivery !== true || schedule.status !== "active") {
+                 continue;
+             }
+             if (this.runningScheduleIds.has(schedule.id) || shouldCompleteSchedule(schedule, now)) {
+                 continue;
+             }
+             if (schedule.target.type !== "agent" || this.agentManager.hasInFlightRun(schedule.target.agentId)) {
+                 continue;
+             }
+-            if (await this.claimPendingDelivery(schedule.id)) {
+-                await this.runSchedule({ ...schedule, pendingAgentDelivery: false }, now);
++            // [paseo-schedule-pending-batch] 바로 실행하지 않고 좌석별로 모은다 — 하나를 실행하면 그 턴 동안 나머지가 막힌다.
++            const group = pendingByAgent.get(schedule.target.agentId) ?? [];
++            group.push(schedule);
++            pendingByAgent.set(schedule.target.agentId, group);
++        }
++        for (const group of pendingByAgent.values()) {
++            const agentId = group[0].target.agentId;
++            // tick 은 겹쳐 돈다(setInterval fire-and-forget). 한 좌석의 묶음은 claim 부터 배달 끝까지 한 tick 이
++            // 소유한다 — 안 그러면 겹친 tick 이 남은 건을 먼저 보내 묶음이 갈리고 순서가 뒤집힌다.
++            if (this.agentManager.hasInFlightRun(agentId) || this.pendingBatchAgents?.has(agentId)) {
++                continue;
++            }
++            (this.pendingBatchAgents ??= new Set()).add(agentId);
++            try {
++            const claimed = [];
++            for (const schedule of group) {
++                // 한 건의 claim 저장 오류가 앞서 claim 한 건을 버려두지 않게 — 그 건만 건너뛴다(비트는 디스크에 남아 다음 tick).
++                try {
++                    const fresh = await this.claimPendingDelivery(schedule.id);
++                    if (fresh) {
++                        claimed.push(fresh);
++                    }
++                }
++                catch (claimError) {
++                    this.logger?.warn?.({ scheduleId: schedule.id, error: claimError instanceof Error ? claimError.message : String(claimError) }, "[paseo-schedule-pending-batch] could not claim pending delivery");
++                }
++            }
++            if (claimed.length > 0) {
++                await this.runPendingBatch(claimed, now);
++            }
++            }
++            finally {
++                this.pendingBatchAgents.delete(agentId);
+             }
+         }
+         // [paseo-schedule-stale-due] 같은 tick 에서 전체 디렉터리를 두 번 읽지 않는다. 위 pending 순회가 만든
+         // 변화는 아래 ②의 원자 재검증이 잡는다 — 그래서 이 재사용은 ②와 한 몸이다.
+         for (const schedule of schedules) {
+             if (schedule.status !== "active" || !schedule.nextRunAt) {
+                 continue;
+             }
+             if (this.runningScheduleIds.has(schedule.id)) {
+                 continue;
+             }
++            if (schedule.target.type === "agent" && this.pendingBatchAgents?.has(schedule.target.agentId)) {
++                continue; // [paseo-schedule-pending-batch]
++            }
+             if (shouldCompleteSchedule(schedule, now)) {
+                 await this.completeScheduleIfDue(schedule.id, now);
+                 continue;
+             }
+             if (new Date(schedule.nextRunAt).getTime() > now.getTime()) {
+                 continue;
+@@ precursor: schedule-stale-due-run (context only)
+         return appended ? existing : null;

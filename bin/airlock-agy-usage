@@ -27,6 +27,9 @@ def screen_text(raw):
     return ANSI.sub("", raw.decode("utf-8", "replace")).replace("\r", "\n")
 
 
+_FIVE_DISABLED = re.compile(r"Five Hour Limit Remaining\s*Disabled:")
+
+
 def parse(text, now):
     """Return the parsed usage, or None when the screen is not a complete /usage view."""
     if "Models & Quota" not in text:
@@ -42,7 +45,23 @@ def parse(text, now):
         five = re.search(r"Five Hour Limit Remaining[\s\S]*?([0-9.]+)%[\s\S]*?"
                          r"Refreshes in\s*(?:([0-9]+)h)?\s*(?:([0-9]+)m)?", block)
         for key, m in (("weekly", weekly), ("fiveHour", five)):
+            label = "Weekly" if key == "weekly" else "Five Hour"
+            full = re.search(label + r" Limit Remaining\s*(?:\[[^\]\n]*\]\s*)?([0-9.]+)%?\s*Quota available", block)
+            if full and (not m or m.start() > full.start()):
+                # An untouched window shows "Quota available" instead of a refresh
+                # time (and the percent can lose its "%" to the bar width). Nothing
+                # to wait for: remaining as shown, reset now.
+                group[key + "Remaining"] = float(full.group(1))
+                group[key + "ResetAt"] = int(now)
+                continue
             if not m:
+                # A spent weekly limit replaces the 5-hour bar with "Disabled: ...".
+                # The group is unusable until the weekly reset, so read it as spent
+                # then, rather than failing the whole screen (which froze the reading).
+                if key == "fiveHour" and weekly and _FIVE_DISABLED.search(block):
+                    group["fiveHourRemaining"] = 0.0
+                    group["fiveHourResetAt"] = group["weeklyResetAt"]
+                    continue
                 return None
             group[key + "Remaining"] = float(m.group(1))
             group[key + "ResetAt"] = int(now + int(m.group(2) or 0) * 3600
@@ -55,6 +74,27 @@ def parse(text, now):
 
 def trusted_or_known(text, trusted):
     return trusted or "Do you trust the contents of this project?" not in text
+
+
+# Allowlist metadata for diagnosing unreadable screens. Counts and stage names
+# only — never screen text, account names, paths, environment, or tokens. The
+# exact key set is pinned by install/test-agy-usage.py: adding a field fails it.
+DIAG_FIELDS = ("sent", "elapsedMs", "bytesRead", "sawUsageHeader",
+               "groupHeaderCount", "weeklyCount", "fiveHourCount",
+               "refreshCount", "trustPromptSeen", "exitReason")
+
+
+def diag_snapshot(sent, elapsedMs, bytesRead, sawUsageHeader,
+                  groupHeaderCount, weeklyCount, fiveHourCount,
+                  refreshCount, trustPromptSeen, exitReason):
+    return {"sent": bool(sent), "elapsedMs": int(elapsedMs),
+            "bytesRead": int(bytesRead),
+            "sawUsageHeader": bool(sawUsageHeader),
+            "groupHeaderCount": int(groupHeaderCount),
+            "weeklyCount": int(weeklyCount), "fiveHourCount": int(fiveHourCount),
+            "refreshCount": int(refreshCount),
+            "trustPromptSeen": bool(trustPromptSeen),
+            "exitReason": str(exitReason)}
 
 
 def main():
@@ -70,7 +110,9 @@ def main():
     # Without a window size the TUI renders for a 0x0 terminal and never shows its header.
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 160, 0, 0))
     buf, sent, trusted, result = b"", False, False, None
-    deadline = time.monotonic() + TIMEOUT
+    trust_prompt_seen, exit_reason = False, "timeout-before-send"
+    start = time.monotonic()
+    deadline = start + TIMEOUT
     try:
         while time.monotonic() < deadline:
             ready, _, _ = select.select([fd], [], [], 0.5)
@@ -84,11 +126,11 @@ def main():
                 buf += chunk
             text = screen_text(buf)
             if not trusted and "Do you trust the contents of this project?" in text:
-                os.write(fd, b"\r"); trusted = True; continue
+                os.write(fd, b"\r"); trusted = True; trust_prompt_seen = True; continue
             # "currently not signed in" is also printed for a moment while agy loads its
             # stored token, so it only counts once the prompt it leads to is on screen.
             if "Sign in with Google" in text or "not logged into Antigravity" in text:
-                result = {"ok": False, "error": "not logged in"}; break
+                result = {"ok": False, "error": "not logged in"}; exit_reason = "not-logged-in"; break
             # Ready = the input prompt's footer. The account header is drawn with cursor
             # moves, so its spacing is not stable text to match on.
             if not sent and trusted_or_known(text, trusted) and "? for shortcuts" in text:
@@ -97,9 +139,12 @@ def main():
                 continue
             if sent:
                 result = parse(text, time.time())
-                if result and len(result["groups"]) >= 1 and text.count("Refreshes in") >= 2 * len(result["groups"]):
+                if result and len(result["groups"]) >= 1 and (text.count("Refreshes in") + len(_FIVE_DISABLED.findall(text)) + text.count("Quota available")
+                                                                 >= 2 * len(result["groups"])):
+                    exit_reason = "ok"
                     break
                 result = None
+                exit_reason = "timeout-incomplete-screen"
         if result is None and os.environ.get("AIRLOCK_AGY_USAGE_DEBUG"):
             sys.stderr.write(screen_text(buf)[-3000:])
         if result is None:
@@ -122,6 +167,16 @@ def main():
             else:
                 continue
             break
+    if os.environ.get("AIRLOCK_AGY_USAGE_DIAG") == "1":
+        final = screen_text(buf)
+        snap = diag_snapshot(sent, (time.monotonic() - start) * 1000, len(buf),
+                             "Models & Quota" in final,
+                             max(0, len(re.split(r"\n\s*(?=[A-Z][A-Z &]+MODELS\s*\n)", final)) - 1),
+                             final.count("Weekly Limit Remaining"),
+                             final.count("Five Hour Limit Remaining"),
+                             final.count("Refreshes in"),
+                             trust_prompt_seen, exit_reason)
+        sys.stderr.write(json.dumps(snap) + "\n")
     print(json.dumps(result))
     return 0 if result.get("ok") else 1
 

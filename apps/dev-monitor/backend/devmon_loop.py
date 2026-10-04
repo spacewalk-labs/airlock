@@ -12,14 +12,22 @@ INTERVAL = 2
 CLEANUP_INTERVAL = 15 * 60
 
 
-def deliver_once(webhook, console_url='', after_post=None):
-    card = M.next_delivery() if webhook else None
+def deliver_once(sender, console_url='', after_post=None):
+    card = M.next_delivery() if sender else None
     if card is None:
         return False
-    ok, code, retry_after = slack.send(webhook,slack.format_text(card,console_url))
+    text = slack.format_text(card,console_url,resolved=bool(card['slack_ts']))
+    if card['slack_ts']:
+        update = getattr(sender, 'update', None)
+        # A configuration change to webhook cannot turn an update into a new POST.
+        result = update(card['slack_ts'],text) if update else (False, 'update_unavailable', None, None)
+    else:
+        result = sender(text)
+    ok, code, retry_after = result[:3]
+    ts = result[3] if len(result) == 4 else None
     if ok and after_post is not None:
         after_post()  # Deterministic process-death oracle: response received, no commit yet.
-    M.finish_delivery(card,ok,slack._retry_after_seconds(code,retry_after))
+    M.finish_delivery(card,ok,slack._retry_after_seconds(code,retry_after),slack_ts=ts)
     return True
 
 
@@ -35,9 +43,9 @@ def publish_cron_cards(verdicts_path):
     return [M.ingest(payload) for payload in cron_scan.cron_message_payloads(verdicts_path=verdicts_path)]
 
 
-def tick(directory, webhook, console_url='', cleanup=False, after_post=None, maintenance=None):
+def tick(directory, sender, console_url='', cleanup=False, after_post=None, maintenance=None):
     collected = spool.scan_once(directory)
-    deliver_once(webhook,console_url,after_post)
+    deliver_once(sender,console_url,after_post)
     if cleanup:
         if maintenance is not None:
             maintenance()
@@ -46,7 +54,7 @@ def tick(directory, webhook, console_url='', cleanup=False, after_post=None, mai
     return collected
 
 
-def run(directory, webhook, stop, console_url='', verdicts_path=None):
+def run(directory, sender, stop, console_url='', verdicts_path=None):
     cleanup_at = time.monotonic()
 
     def maintenance():
@@ -56,7 +64,7 @@ def run(directory, webhook, stop, console_url='', verdicts_path=None):
         started = time.monotonic()
         cleanup = started >= cleanup_at
         try:
-            tick(directory,webhook,console_url,cleanup,maintenance=maintenance)
+            tick(directory,sender,console_url,cleanup,maintenance=maintenance)
             if cleanup:
                 cleanup_at = started + CLEANUP_INTERVAL
         except Exception as error:

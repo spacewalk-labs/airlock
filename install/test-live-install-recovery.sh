@@ -2,23 +2,17 @@
 # Source/mock controls for the disposable R1-R3 live driver. No network, LXD,
 # key mint, service, or host database is touched by this suite.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# Repo-wide render parity requires every suite that reaches the installer path to
-# pin the machine-sized paseo share. The mock SSH stops before a real install, but
-# carrying the standard 32 GiB pin keeps this suite deterministic if that boundary
-# is extended later.
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+airlock_pin_paseo_mem
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-pass=0 fail=0
-ok() { printf 'ok   live-install-recovery: %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL live-install-recovery: %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init "live-install-recovery: "
 
 # Exercise the real config writer without crossing the host boundary. Baseline and
 # current recovery must not accidentally configure the late-failure package; the
-# failure scenario must configure both its app and package tables. The explicit
-# orphan mutation pins the F2 boundary that stopped the first live R1 run.
+# failure scenario must configure both its app and package tables.
 CONFIG_MATRIX="$TMP/config-matrix"
 mkdir -p "$CONFIG_MATRIX"
 LIVE_USER="$(id -un)"
@@ -59,23 +53,13 @@ for name, order in expected.items():
     import json
     assert json.loads(result.stdout)["order"] == order, name
 
-orphan = matrix / "baseline-orphan.toml"
-orphan.write_text(
-    (matrix / "baseline.toml").read_text()
-    + f'\n[packages.zz-install-recovery-fail]\npath = "{fail_package}"\n')
-env = dict(os.environ, AIRLOCK_CONFIG=str(orphan))
-result = subprocess.run(
-    [sys.executable, str(root / "bin/airlock-config"), "package-info"],
-    cwd=root, env=env, text=True, capture_output=True)
-assert result.returncode != 0
-assert "has no [apps.zz-install-recovery-fail] table" in result.stderr
-print("config matrix and orphan mutation ok")
+print("config matrix ok")
 PY
 if [ "$config_matrix_rc" = 0 ] \
-   && grep -q 'config matrix and orphan mutation ok' "$TMP/config-matrix.out"; then
-  ok "config writer omits inactive failure package and rejects orphan mutation"
+   && grep -q 'config matrix ok' "$TMP/config-matrix.out"; then
+  ok "config writer omits inactive failure package"
 else
-  bad "config writer matrix/orphan mutation failed"
+  bad "config writer matrix failed"
   sed 's/^/    /' "$TMP/config-matrix.out"
 fi
 

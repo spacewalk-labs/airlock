@@ -472,6 +472,48 @@ if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
   "$PY" "$HERE/normalize-native-links.py" "$PASEO_SERVER_DIR" \
     || die "Paseo native files cannot be materialized for rollback checkpoints"
 fi
+
+# Codex model roster: app-server remains the authority for which models this
+# ChatGPT account can actually use. The overlay only retires GPT-5.5 from the
+# picker and enables Fast for GPT-6 Sol/Luna when model/list begins returning
+# them. Apply both files as one verified unit so the catalog never imports a
+# helper the feature module does not yet export.
+CODEX_ROSTER_PATCHER="$HERE/patches/codex-model-roster.mjs"
+CODEX_ROSTER_TEST="$HERE/patches/codex-model-roster.test.mjs"
+CODEX_FEATURES="$PASEO_SERVER_DIR/dist/server/server/agent/providers/codex-feature-definitions.js"
+CODEX_CATALOG="$PASEO_SERVER_DIR/dist/server/server/agent/providers/codex-app-server-agent.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] align Paseo Codex picker with the Airlock model roster"
+elif [ ! -f "$CODEX_FEATURES" ] || [ ! -f "$CODEX_CATALOG" ]; then
+  log "warning: Codex provider files not found under $PASEO_SERVER_DIR (paseo dist layout changed?) — model roster skipped"
+elif [ ! -f "$CODEX_ROSTER_PATCHER" ] || [ ! -f "$CODEX_ROSTER_TEST" ]; then
+  log "warning: Codex model-roster patcher or behaviour test missing under $HERE — skipped"
+else
+  feature_rc=0 catalog_rc=0
+  feature_out="$(node "$CODEX_ROSTER_PATCHER" feature "$CODEX_FEATURES" 2>&1)" || feature_rc=$?
+  catalog_out="$(node "$CODEX_ROSTER_PATCHER" catalog "$CODEX_CATALOG" 2>&1)" || catalog_rc=$?
+  if { [ "$feature_rc" -eq 0 ] || [ "$feature_rc" -eq 10 ]; } \
+    && { [ "$catalog_rc" -eq 0 ] || [ "$catalog_rc" -eq 10 ]; }; then
+    feature_check="$CODEX_FEATURES"
+    catalog_check="$CODEX_CATALOG"
+    [ "$feature_rc" -eq 0 ] && feature_check="$CODEX_FEATURES.paseo-new.mjs"
+    [ "$catalog_rc" -eq 0 ] && catalog_check="$CODEX_CATALOG.paseo-new.mjs"
+    node --check "$feature_check" || die "Codex model-roster feature candidate is invalid JS"
+    node --check "$catalog_check" || die "Codex model-roster catalog candidate is invalid JS"
+    node "$CODEX_ROSTER_TEST" "$feature_check" "$catalog_check" \
+      || die "Codex model-roster candidate failed its behaviour check"
+    if [ "$feature_rc" -eq 0 ]; then mv "$feature_check" "$CODEX_FEATURES"; need_restart=1; fi
+    if [ "$catalog_rc" -eq 0 ]; then mv "$catalog_check" "$CODEX_CATALOG"; need_restart=1; fi
+    log "Codex model roster verified (GPT-6 Sol/Luna ready; GPT-5.5 retired)"
+  elif [ "$feature_rc" -eq 20 ] || [ "$catalog_rc" -eq 20 ]; then
+    rm -f "$CODEX_FEATURES.paseo-new.mjs" "$CODEX_CATALOG.paseo-new.mjs"
+    log "warning: Codex model-roster anchors not found (paseo version drift) — pair skipped: feature=$feature_out catalog=$catalog_out"
+  else
+    rm -f "$CODEX_FEATURES.paseo-new.mjs" "$CODEX_CATALOG.paseo-new.mjs"
+    log "warning: Codex model-roster patcher error (feature_rc=$feature_rc catalog_rc=$catalog_rc) — pair skipped: feature=$feature_out catalog=$catalog_out"
+  fi
+fi
+
 # Keep automatic cleanup reversible. Only the CLI is guarded; browser/direct RPC
 # deletion remains upstream behavior. Changing a CLI module needs no daemon restart.
 HISTORY_GUARD_CLI="$NPM_ROOT/$PASEO_PKG/dist/commands/agent/delete.js"
@@ -603,6 +645,28 @@ else
       || die "installed archive/workspace consistency behavior check failed"
     log "archive/workspace consistency behaviour check passed"
   fi
+fi
+
+# Removal of a cached row must survive an empty changes-only subscription bootstrap.
+WORKSPACE_REMOVE_PATCHER="$HERE/patches/workspace-remove-delivery.mjs"
+WORKSPACE_REMOVE_TEST="$HERE/patches/workspace-remove-delivery.test.mjs"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply cached workspace removal delivery patch to $SESSION_JS"
+else
+  wr_rc=0
+  node "$WORKSPACE_REMOVE_PATCHER" "$SESSION_JS" || wr_rc=$?
+  case "$wr_rc" in
+    0)
+      node --check "$SESSION_JS.paseo-new.mjs" \
+        && node "$WORKSPACE_REMOVE_TEST" "$SESSION_JS.paseo-new.mjs" "$PASEO_SERVER_DIR/dist/server/server/directory-sync/index.js" \
+        || die "workspace removal candidate failed verification"
+      mv "$SESSION_JS.paseo-new.mjs" "$SESSION_JS" || die "workspace removal patch install failed"
+      need_restart=1
+      ;;
+    10) node "$WORKSPACE_REMOVE_TEST" "$SESSION_JS" "$PASEO_SERVER_DIR/dist/server/server/directory-sync/index.js" || die "workspace removal installed behavior failed" ;;
+    20) log "warning: workspace removal anchor drift — skipped" ;;
+    *) die "workspace removal patcher failed (rc=$wr_rc)" ;;
+  esac
 fi
 
 # --- 2b. provider-subagent selective delivery (server + always-on web UI) ---
@@ -879,17 +943,36 @@ fi
 SCHEDPEND_SCHEMA_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-pending-delivery-schema.mjs"
 SCHEDPEND_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-busy-pending-delivery.mjs"
 SCHEDPEND_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-busy-pending-delivery.test.mjs"
+# 🔴 Third half, and it must go LAST: its anchors are the tick the busy-pending patch writes.
+# Re-entrant ticks (setInterval fire-and-forget) hand runSchedule a due snapshot that disk has
+# already moved past, so maxRuns=1 gets a second run -- which makes session-delivery's receipt
+# read "unavailable". Measured on a pilot box, 2026-09-23: 21 of 415 patrol-deliver schedules had
+# two succeeded runs. The same patch stops reading the whole schedule directory twice per tick.
+SCHEDSTALE_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-stale-due-run.mjs"
+SCHEDSTALE_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-stale-due-run.test.mjs"
+# 🔴 Fourth, after stale-due: its anchors are the pending loop busy-pending writes and it reuses
+# stale-due's revalidating append. session-delivery makes one one-shot schedule per message, so a
+# seat that was busy collects N pending schedules; delivering one holds the seat for a whole turn and
+# the rest wait a turn each. Measured on a pilot box 2026-10-03: 15 waiting for one seat, hours of lag.
+# This delivers a seat's pending schedules in ONE turn (each still gets exactly one run) and puts the
+# bit back if a claimed schedule's append is refused, instead of stranding it until the next cron hour.
+SCHEDBATCH_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-pending-batch.mjs"
+SCHEDBATCH_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-pending-batch.test.mjs"
 SCHEDULE_SERVICE_JS="$PASEO_SERVER_DIR/dist/server/server/schedule/service.js"
 SCHEDULE_TYPES_JS="$(cd "$PASEO_SERVER_DIR/../protocol/dist" 2>/dev/null && pwd || true)/schedule/types.js"
-apply_schedpend() {  # <label> <patcher> <target-js> [behaviour-test]
-  local label="$1" patcher="$2" target="$3" test_js="${4:-}" sp_rc=0 sp_out sp_tmp
+apply_schedpend() {  # <label> <patcher> <target-js> [behaviour-test] [phrase]
+  # `phrase` names the patch family in the log. test-paseo-bundle-install.sh asserts
+  # these exact lines -- every baked patch must report "already applied" against the
+  # pinned bundle -- so the wording is a contract, not decoration.
+  local label="$1" patcher="$2" target="$3" test_js="${4:-}" phrase="${5:-busy-pending patch}"
+  local sp_rc=0 sp_out sp_tmp
   if [ ! -f "$target" ]; then
-    log "warning: schedule $label target not found ($target) — busy-pending patch skipped"
+    log "warning: schedule $label target not found ($target) — $phrase skipped"
     return 0
   fi
   sp_out="$(node "$patcher" "$target")" || sp_rc=$?
   case "$sp_rc" in
-    10) log "schedule $label busy-pending patch already applied" ;;
+    10) log "schedule $label $phrase already applied" ;;
     20) log "warning: schedule $label anchors missing or ambiguous (paseo version drift) — skipped: $sp_out" ;;
     0)
       sp_tmp="${target}.paseo-new.mjs"
@@ -900,11 +983,11 @@ apply_schedpend() {  # <label> <patcher> <target-js> [behaviour-test]
         # Syntax-valid is not behaving. The check drives the candidate with stub seats:
         # busy -> pending bit and no failed run, then exactly one delivery once idle.
         rm -f "$sp_tmp"
-        log "warning: schedule $label patch failed its behaviour check — not applied (busy ticks keep being lost)"
+        log "warning: schedule $label $phrase failed its behaviour check — not applied"
       else
         mv "$sp_tmp" "$target" || die "schedule $label patch mv failed"
         need_restart=1
-        log "schedule $label busy-pending patch applied"
+        log "schedule $label $phrase applied"
       fi
       ;;
     *) log "warning: schedule $label patcher error (rc=$sp_rc): $sp_out — skipped" ;;
@@ -917,7 +1000,94 @@ elif [ ! -f "$SCHEDPEND_PATCHER" ] || [ ! -f "$SCHEDPEND_SCHEMA_PATCHER" ] || [ 
 else
   apply_schedpend schema "$SCHEDPEND_SCHEMA_PATCHER" "$SCHEDULE_TYPES_JS"
   apply_schedpend service "$SCHEDPEND_PATCHER" "$SCHEDULE_SERVICE_JS" "$SCHEDPEND_TEST"
+  # Order is load-bearing: stale-due anchors on text the service patch introduces, so if that
+  # one was skipped this exits 20 and skips too -- never half a fix. Its own behaviour check
+  # also re-runs the busy-pending scenarios, so a regression there blocks this patch as well.
+  if [ ! -f "$SCHEDSTALE_PATCHER" ] || [ ! -f "$SCHEDSTALE_TEST" ]; then
+    log "warning: schedule stale-due patcher or behaviour check missing under $HERE — skipped"
+  else
+    apply_schedpend stale-due "$SCHEDSTALE_PATCHER" "$SCHEDULE_SERVICE_JS" "$SCHEDSTALE_TEST" \
+      "patch"
+  fi
+  if [ ! -f "$SCHEDBATCH_PATCHER" ] || [ ! -f "$SCHEDBATCH_TEST" ]; then
+    log "warning: schedule pending-batch patcher or behaviour check missing under $HERE — skipped"
+  else
+    apply_schedpend pending-batch "$SCHEDBATCH_PATCHER" "$SCHEDULE_SERVICE_JS" "$SCHEDBATCH_TEST" \
+      "patch"
+  fi
 fi
+
+# --- 2e-w. working-tree watch recovery (upstream #3056 backport; idempotent) ---
+# A watcher that misses its 10s subscribe deadline drops to a 5s poll (4 git commands a tick),
+# and 0.8.0 stops trying to recover after 3 attempts -- so one slow moment (a daemon boot with
+# many workspaces) turns into polling that lasts until the next restart. Measured on a pilot
+# box 2026-09-25: the fallback poll was the top git refresh source (610 per 30s window) and the
+# git queue peaked at 552 waiting. Upstream keeps retrying (capped at 300s) and slows a quiet
+# poll (doubling, capped at 60s); this carries exactly that, working-tree path only.
+WATCHREC_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/workspace-git-watch-recovery.mjs"
+WATCHREC_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/workspace-git-watch-recovery.test.mjs"
+WORKSPACE_GIT_SERVICE_JS="$PASEO_SERVER_DIR/dist/server/server/workspace-git-service.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply working-tree watch recovery to $WORKSPACE_GIT_SERVICE_JS"
+elif [ ! -f "$WATCHREC_PATCHER" ] || [ ! -f "$WATCHREC_TEST" ]; then
+  log "warning: watch recovery patcher or behaviour check missing under $HERE — skipped"
+elif [ ! -f "$WORKSPACE_GIT_SERVICE_JS" ]; then
+  log "warning: watch recovery target not found ($WORKSPACE_GIT_SERVICE_JS) — skipped"
+else
+  wr_rc=0; wr_out="$(node "$WATCHREC_PATCHER" "$WORKSPACE_GIT_SERVICE_JS")" || wr_rc=$?
+  case "$wr_rc" in
+    10) log "watch recovery patch already applied" ;;
+    20) log "warning: watch recovery anchors missing or ambiguous (paseo version drift) — skipped: $wr_out" ;;
+    0)
+      wr_tmp="${WORKSPACE_GIT_SERVICE_JS}.paseo-new.mjs"
+      if ! node --check "$wr_tmp"; then
+        rm -f "$wr_tmp"; log "warning: watch recovery patch produced invalid JS — not applied"
+      elif ! node "$WATCHREC_TEST" "$wr_tmp" >/dev/null 2>&1; then
+        rm -f "$wr_tmp"; log "warning: watch recovery patch failed its behaviour check — not applied"
+      else
+        mv "$wr_tmp" "$WORKSPACE_GIT_SERVICE_JS" || die "watch recovery patch mv failed"
+        need_restart=1
+        log "watch recovery patch applied"
+      fi
+      ;;
+    *) log "warning: watch recovery patcher error (rc=$wr_rc): $wr_out — skipped" ;;
+  esac
+fi
+
+# --- 2e-x. temporary background Git sampling (2026-10-04 overload mitigation) ---
+# Generate fewer refreshes rather than growing a slower subprocess queue. This is
+# applied to installed bytes for the next normal restart; do not restart a running
+# daemon just to activate it. Forced/cold/direct reads keep their existing path.
+apply_background_git_policy() {  # <patch id> <target> <log label>
+  local patch_id="$1" target="$2" label="$3" rc=0 out candidate
+  local patcher="$HERE/patches/$patch_id.mjs" check="$HERE/patches/$patch_id.test.mjs"
+  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+    log "[dry] apply $label to $target"; return
+  fi
+  if [ ! -f "$patcher" ] || [ ! -f "$check" ] || [ ! -f "$target" ]; then
+    log "warning: $label patcher, behaviour check or target missing — skipped"; return
+  fi
+  out="$(node "$patcher" "$target")" || rc=$?
+  case "$rc" in
+    10)
+      node "$check" "$target" >/dev/null || die "installed $label failed its behaviour check"
+      log "$label patch already applied" ;;
+    20) log "warning: $label anchors drifted — skipped: $out" ;;
+    0)
+      candidate="$target.paseo-new.mjs"
+      if ! node --check "$candidate" || ! node "$check" "$candidate"; then
+        rm -f "$candidate"; log "warning: $label candidate failed verification — skipped"; return
+      fi
+      mv "$candidate" "$target" || die "$label patch mv failed"
+      # Baked into the guarded bundle. A fallback patch never adds a restart.
+      log "$label patch applied (next normal daemon start)" ;;
+    *) die "$label patcher failed (rc=$rc): $out" ;;
+  esac
+}
+apply_background_git_policy workspace-git-emergency-policy "$WORKSPACE_GIT_SERVICE_JS" "background Git sampling"
+# Automatic whole-inventory reconciliation bypasses the snapshot pipeline.
+WORKSPACE_RECONCILIATION_JS="$PASEO_SERVER_DIR/dist/server/server/workspace-reconciliation-service.js"
+apply_background_git_policy workspace-reconciliation-emergency-policy "$WORKSPACE_RECONCILIATION_JS" "automatic Git reconciliation sampling"
 
 # --- 2f. process-group sweep (idempotent; layers on 2e — order matters) ---
 # The one leak 2e deliberately left open: when the agent LEADER exits before we
@@ -986,7 +1156,9 @@ fi
 # config option, an ACP agent's own advertised unattended mode never reaches
 # anything downstream, and — once a generic ACP agent advertises modes — an
 # ATTENDED agent of a different provider running `paseo run --provider agy` with
-# no --mode is refused ("cannot inherit mode"). Two independent files, two patches.
+# no --mode is refused ("cannot inherit mode"). And a new workspace re-probes agy's
+# model catalogue (~10s: agy models + a real agy start) because only claude/codex
+# share one host-wide catalogue; the registry patch gives agy the same key.
 ACPGAUGE_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-context-gauge.mjs"
 ACPGAUGE_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-context-gauge.test.mjs"
 ACP_AGENT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/acp-agent.js"
@@ -995,6 +1167,9 @@ ACPMODE_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd |
 GENERIC_ACP_AGENT_JS="$PASEO_SERVER_DIR/dist/server/server/agent/providers/generic-acp-agent.js"
 ACPMODEL_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-model-rejection.mjs"
 ACPMODEL_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-model-rejection.test.mjs"
+ACPCATALOG_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-agy-shared-catalog.mjs"
+ACPCATALOG_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/acp-agy-shared-catalog.test.mjs"
+PROVIDER_REGISTRY_JS="$PASEO_SERVER_DIR/dist/server/server/agent/provider-registry.js"
 apply_acp_gap() {  # <label> <patcher> <target-js> <behaviour-test>
   local label="$1" patcher="$2" target="$3" test_js="$4" ag_rc=0 ag_out ag_tmp
   if [ ! -f "$target" ]; then
@@ -1023,13 +1198,15 @@ apply_acp_gap() {  # <label> <patcher> <target-js> <behaviour-test>
   esac
 }
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-  log "[dry] apply agy ACP gaps to $ACP_AGENT_JS and $GENERIC_ACP_AGENT_JS"
-elif [ ! -f "$ACPGAUGE_PATCHER" ] || [ ! -f "$ACPMODE_PATCHER" ] || [ ! -f "$ACPMODEL_PATCHER" ]; then
+  log "[dry] apply agy ACP gaps to $ACP_AGENT_JS, $GENERIC_ACP_AGENT_JS and $PROVIDER_REGISTRY_JS"
+elif [ ! -f "$ACPGAUGE_PATCHER" ] || [ ! -f "$ACPMODE_PATCHER" ] || [ ! -f "$ACPMODEL_PATCHER" ] \
+  || [ ! -f "$ACPCATALOG_PATCHER" ]; then
   log "warning: agy ACP gap patchers not found — skipped"
 else
   apply_acp_gap "ACP context gauge" "$ACPGAUGE_PATCHER" "$ACP_AGENT_JS" "$ACPGAUGE_TEST"
   apply_acp_gap "ACP cross-provider mode default" "$ACPMODE_PATCHER" "$GENERIC_ACP_AGENT_JS" "$ACPMODE_TEST"
   apply_acp_gap "ACP invalid model rejection" "$ACPMODEL_PATCHER" "$ACP_AGENT_JS" "$ACPMODEL_TEST"
+  apply_acp_gap "agy shared model catalogue" "$ACPCATALOG_PATCHER" "$PROVIDER_REGISTRY_JS" "$ACPCATALOG_TEST"
 fi
 
 # --- 3. tailnet FQDN (for the gate Host header + the daemon hostname allowlist) ---

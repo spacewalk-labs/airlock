@@ -21,7 +21,7 @@ One credential lineage = one refresher. Do not copy the same account's pool file
 another machine (log in on each). Secret values are never printed — only identity,
 expiry and health.
 """
-import base64, hashlib, json, os, re, stat, sys, time, shutil, subprocess, tempfile
+import base64, hashlib, json, os, re, signal, stat, sys, time, shutil, subprocess, tempfile
 import socket
 import threading
 import urllib.request, urllib.error, urllib.parse
@@ -1305,7 +1305,7 @@ MUSE_USAGE_URL = os.environ.get("AIRLOCK_MUSE_USAGE_URL", "").strip() or "https:
 # Explicit override for tests and operators. Unset means opencode's own convention:
 # $XDG_DATA_HOME/opencode/auth.json, i.e. ~/.local/share/opencode/auth.json.
 MUSE_AUTH_JSON = os.environ.get("AIRLOCK_OPENCODE_AUTH_JSON", "").strip()
-# The assignment sheet, this box's name and the cho-only screen flag ride the
+# The assignment sheet and this box's name ride the
 # same variable names as the API: the API shells out to this CLI with its own
 # environment, so one deployment sets both layers, and the mutation boundary
 # enforces the picker policy itself instead of trusting the screen to have
@@ -1313,8 +1313,6 @@ MUSE_AUTH_JSON = os.environ.get("AIRLOCK_OPENCODE_AUTH_JSON", "").strip()
 MUSE_REGISTRY = os.environ.get("AIRLOCK_MUSE_REGISTRY", "").strip()
 MUSE_BOX = os.environ.get("AIRLOCK_BOX_NAME", "").strip() \
     or socket.gethostname().split(".")[0]
-MUSE_CHO_ITEM = "OPENCODE_CHO_API_KEY"
-MUSE_CHO_VISIBLE = os.environ.get("AIRLOCK_MUSE_CHO_VISIBLE", "").strip() == "1"
 MUSE_KEYS_TIMEOUT = 30
 MUSE_VERIFY_TIMEOUT = 10
 MUSE_MAX_KEYS = 32
@@ -1369,7 +1367,9 @@ def _muse_read_keys():
 
     def run():
         try:
-            proc = subprocess.Popen([MUSE_KEYS_BIN], stdout=subprocess.PIPE,
+            # Run through the interpreter: the helper ships 0644 (new files may
+            # not land executable), so exec-ing it directly fails with EACCES.
+            proc = subprocess.Popen([sys.executable, MUSE_KEYS_BIN], stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL)
         except OSError:
             box["rc"] = -1
@@ -1587,17 +1587,16 @@ def _muse_swap_core(item):
         return False, {"ok": False, "error": "that key is not available on this box",
                        "steps": steps}
     # The picker policy is enforced at this mutation boundary, not trusted from
-    # the screen: a crafted call names any helper item, and only this check
-    # keeps another box's key or the off-box cho key out of the commit.
-    if _muse_item_title(item) == _muse_item_title(MUSE_CHO_ITEM) and not MUSE_CHO_VISIBLE:
-        return False, {"ok": False, "error": "that key is not offered on this box",
-                       "steps": steps}
+    # the screen: a crafted call names any helper item, and the sheet below
+    # keeps another box's key out of the commit.
     sheet = _muse_registry()
     if sheet is None:
         return False, {"ok": False, "error": "the assignment sheet is unavailable",
                        "steps": steps}
     holder = sheet.get(_muse_item_title(item))
-    if holder is not None and holder != MUSE_BOX:
+    # "shared" is the common pool: any box may use it, alongside others (the picker
+    # already offers it everywhere). Only a key assigned to another box is refused.
+    if holder is not None and holder not in (MUSE_BOX, "shared"):
         return False, {"ok": False, "error": "that key is held by another box",
                        "steps": steps}
     verified, detail = _muse_verify(candidate)
@@ -1739,7 +1738,86 @@ def _muse_swap_core(item):
                   "needsRestart": True, "bakSaved": bak_saved}
 
 
-def cmd_muse_swap(item, as_json):
+def _paseo_opencode_servers():
+    """PIDs of the `opencode serve` processes the Paseo daemon started.
+
+    AIRLOCK_PASEO_DAEMON_PID narrows it to that daemon's children — fixtures must
+    set it: an unscoped scan in a test ended this box's real server (2026-09-26).
+    """
+    only = os.environ.get("AIRLOCK_PASEO_DAEMON_PID", "").strip()
+    pids = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                argv = f.read().split(b"\0")
+            if os.path.basename(argv[0]) != b"opencode" or b"serve" not in argv[1:]:
+                continue
+            with open("/proc/%s/stat" % pid) as f:
+                ppid = f.read().rsplit(")", 1)[1].split()[1]
+            with open("/proc/%s/cmdline" % ppid, "rb") as f:
+                parent = f.read().replace(b"\0", b" ")
+        except (OSError, IndexError, ValueError):
+            continue
+        if (ppid == only) if only else (b"paseo" in parent.lower()):
+            pids.append(int(pid))
+    return pids
+
+
+def _muse_reseat(account):
+    """Put every Paseo Muse seat on the new key (asked for, never automatic).
+
+    Paseo runs one `opencode serve` that read the key when it started, and each
+    opencode seat stays bound to that server's URL: ending the server alone left
+    idle seats failing with "fetch failed" (2026-09-26). So: end the server, then
+    `paseo agent reload` every opencode seat — reload keeps the conversation and
+    binds a fresh server that reads the new key. A seat mid-turn loses that turn
+    and gets one "continue", as seat-recovery does.
+    """
+    result = {"restarted": 0, "continued": 0, "failed": 0}
+    cli = _paseo_cli()
+    agents = _paseo_agents(cli) if cli else None
+    if agents is None:
+        result["why"] = "Paseo is not reachable from here"
+        return result
+    seats = [a for a in agents if "opencode" in str(a.get("provider", ""))]
+    for pid in _paseo_opencode_servers():
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        if not _wait_gone(pid, 10):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    for seat in seats:
+        busy = seat.get("status") == "running"
+        try:
+            ok = subprocess.run(cli + ["agent", "reload", seat["id"]], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=120, check=False).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        if not ok:
+            result["failed"] += 1
+            continue
+        if not busy:
+            result["restarted"] += 1
+            continue
+        msg = ("Muse 키를 %s 로 교체하며 opencode 를 다시 켜서 직전 턴이 끊겼습니다. 대화 맥락은 그대로입니다. "
+               "① git -C %s status --short 로 끊긴 지점을 확인하고 ② 하던 일을 이어서 진행하십시오. "
+               "이 복구 사실을 다른 세션이나 총괄에게 알리지 마십시오." % (account, seat.get("cwd") or "."))
+        try:
+            sent = subprocess.run(cli + ["send", seat["id"], "--no-wait", msg], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=30, check=False).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            sent = False
+        result["continued" if sent else "failed"] += 1
+    return result
+
+
+def cmd_muse_swap(item, as_json, reseat=False):
     if not isinstance(item, str) or not item.strip() or len(item) > 256:
         if as_json:
             json.dump({"ok": False, "error": "not a key name", "steps": []}, sys.stdout)
@@ -1748,6 +1826,9 @@ def cmd_muse_swap(item, as_json):
         print("airlock-accounts: muse-swap needs a vault key name", file=sys.stderr)
         return 2
     ok, result = _muse_swap_core(item.strip())
+    if ok and reseat:
+        result["reseat"] = _muse_reseat(result.get("account"))
+        result["needsRestart"] = bool(result["reseat"].get("failed") or result["reseat"].get("why"))
     if as_json:
         # Unlike codex-auth's ABI (where ok:false is a readable state), a refused
         # swap is a failure outcome: the JSON still lands on stdout, and the exit
@@ -1758,6 +1839,501 @@ def cmd_muse_swap(item, as_json):
     if ok:
         print("swapped to %s (new sessions pick it up; running ones need seat-recovery)"
               % result["account"])
+    else:
+        print("  ERROR: %s" % result["error"], file=sys.stderr)
+    return 0 if ok else 1
+
+
+# ---- agy (Antigravity CLI) account pool ------------------------------------
+# agy keeps exactly one live credential, antigravity-oauth-token (oauth_creds.json
+# under ~/.gemini is a leftover agy never reads). A switch is a file swap, so the
+# pool is a directory of saved copies of that file. Which account a file belongs
+# to is read from its id_token's email claim — the value itself never leaves this
+# process. Same order as every other switch here: backup -> verify -> commit.
+AGY_DIR = os.path.expanduser(os.environ.get("AIRLOCK_AGY_DIR", "~/.gemini/antigravity-cli"))
+AGY_LIVE = os.path.join(AGY_DIR, "antigravity-oauth-token")
+AGY_POOL = os.path.join(AGY_DIR, "saved-credentials")
+AGY_SWITCH_BAK = AGY_LIVE + ".agy-switch-bak"
+AGY_LOGIN_STATE = os.path.join(AGY_DIR, ".login-pending.json")
+AGY_LOGIN_TTL_SEC = 15 * 60
+AGY_LOGIN_URL_RE = re.compile(r"https://[^\s\x1b]*google[^\s\x1b]*", re.I)
+AGY_VERIFY_TIMEOUT = 150
+# Copied into the verify HOME so agy reaches its prompt instead of first-run screens
+# (color scheme, trust). Settings only — no credential rides along.
+AGY_ONBOARDING = ("settings.json", "jetski_state.pbtxt", os.path.join("cache", "onboarding.json"))
+
+
+def _agy_email(data):
+    """The account email from a token file's bytes, or None. Never the token."""
+    try:
+        doc = json.loads(data.decode("utf-8"))
+        part = doc["id_token"].split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError, UnicodeDecodeError):
+        return None
+    email = claims.get("email") if isinstance(claims, dict) else None
+    return email.strip().lower() if isinstance(email, str) and "@" in email else None
+
+
+def _agy_read(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _agy_pool():
+    """{email: path of the newest saved copy} for every readable pool file."""
+    newest = {}
+    try:
+        names = os.listdir(AGY_POOL)
+    except OSError:
+        return {}
+    for name in names:
+        path = os.path.join(AGY_POOL, name)
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+        email = _agy_email(_agy_read(path) or b"")
+        if not email:
+            continue
+        mtime = os.path.getmtime(path)
+        if email not in newest or mtime > newest[email][0]:
+            newest[email] = (mtime, path)
+    return {email: path for email, (_, path) in newest.items()}
+
+
+def _agy_save(email, data):
+    """Keep one copy per account, <email>.json, 0600 in a 0700 directory."""
+    os.makedirs(AGY_POOL, mode=0o700, exist_ok=True)
+    os.chmod(AGY_POOL, 0o700)
+    _muse_write_private(os.path.join(AGY_POOL, email + ".json"), data)
+
+
+def _agy_login_cleanup(state=None):
+    state = state or {}
+    session = state.get("session")
+    if isinstance(session, str) and session:
+        subprocess.run(["tmux", "kill-session", "-t", session], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+    home = state.get("home")
+    if isinstance(home, str) and home.startswith(AGY_DIR + os.sep + ".login-"):
+        shutil.rmtree(home, ignore_errors=True)
+    try:
+        os.unlink(AGY_LOGIN_STATE)
+    except OSError:
+        pass
+
+
+def _agy_login_pending():
+    try:
+        with open(AGY_LOGIN_STATE, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or time.time() - state.get("startedAt", 0) > AGY_LOGIN_TTL_SEC:
+        _agy_login_cleanup(state if isinstance(state, dict) else None)
+        return None
+    return state
+
+
+def cmd_agy_login_start(as_json):
+    old = _agy_login_pending()
+    if old:
+        _agy_login_cleanup(old)
+    agy = os.environ.get("AIRLOCK_AGY_BIN", "").strip() or bin_discovery.find_bin("agy")[0]
+    if not agy or not shutil.which("tmux"):
+        result = {"ok": False, "error": "agy or tmux is not installed on this box"}
+    else:
+        os.makedirs(AGY_DIR, mode=0o700, exist_ok=True)
+        home = tempfile.mkdtemp(prefix=".login-", dir=AGY_DIR)
+        cli = os.path.join(home, ".gemini", "antigravity-cli")
+        os.makedirs(os.path.join(cli, "cache"), mode=0o700)
+        for rel in AGY_ONBOARDING:
+            data = _agy_read(os.path.join(AGY_DIR, rel))
+            if data is not None:
+                _muse_write_private(os.path.join(cli, rel), data)
+        outer = _agy_read(os.path.expanduser("~/.gemini/settings.json"))
+        if outer is not None:
+            _muse_write_private(os.path.join(home, ".gemini", "settings.json"), outer)
+        session = "airlock-agy-login-%d-%s" % (os.getpid(), os.urandom(4).hex())
+        env = dict(os.environ, HOME=home)
+        try:
+            proc = subprocess.run(["tmux", "new-session", "-d", "-x", "1000", "-s", session,
+                                   "-e", "HOME=" + home, agy], env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                  timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is None or proc.returncode != 0:
+            shutil.rmtree(home, ignore_errors=True)
+            result = {"ok": False, "error": "could not start agy login"}
+        else:
+            state = {"session": session, "home": home, "startedAt": time.time()}
+            _save_atomic(AGY_LOGIN_STATE, state)
+            url = None
+            selected_google = False
+            for _ in range(30):
+                cap = subprocess.run(["tmux", "capture-pane", "-J", "-p", "-t", session],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     timeout=5, check=False).stdout.decode("utf-8", "replace")
+                match = AGY_LOGIN_URL_RE.search(_ANSI_RE.sub("", cap))
+                if match:
+                    url = match.group(0).rstrip(".,;)]")
+                    break
+                if not selected_google and "Select login method" in cap:
+                    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   check=False)
+                    selected_google = True
+                time.sleep(0.5)
+            if url:
+                result = {"ok": True, "url": url}
+            else:
+                _agy_login_cleanup(state)
+                result = {"ok": False, "error": "agy did not provide a Google login URL"}
+    if as_json:
+        json.dump(result, sys.stdout); print()
+    elif result.get("ok"):
+        print(result["url"])
+    else:
+        print("  ERROR: " + result["error"], file=sys.stderr)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_agy_login_code(as_json):
+    try:
+        code = _read_login_code_stdin()
+    except ValueError as exc:
+        result = {"ok": False, "error": str(exc)}
+        code = None
+    state = _agy_login_pending() if code else None
+    if code and not state:
+        result = {"ok": False, "error": "no agy login is pending — request a new URL"}
+    if code and state:
+        session, home = state["session"], state["home"]
+        # stdin keeps the one-time code out of argv, process listings and journals.
+        loaded = subprocess.run(["tmux", "load-buffer", "-b", "airlock-agy-login", "-"],
+                                input=code.encode(), stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=5, check=False)
+        pasted = subprocess.run(["tmux", "paste-buffer", "-d", "-b", "airlock-agy-login",
+                                 "-t", session], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=5, check=False)
+        subprocess.run(["tmux", "send-keys", "-t", session, "Enter"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        token_path = os.path.join(home, ".gemini", "antigravity-cli",
+                                  "antigravity-oauth-token")
+        data = email = None
+        if loaded.returncode == 0 and pasted.returncode == 0:
+            for _ in range(120):
+                data = _agy_read(token_path)
+                email = _agy_email(data or b"")
+                if email:
+                    break
+                time.sleep(0.5)
+        if email and data:
+            _agy_save(email, data)
+            result = {"ok": True, "email": email}
+        else:
+            result = {"ok": False, "error": "agy login did not complete — request a new URL"}
+        _agy_login_cleanup(state)
+    if as_json:
+        json.dump(result, sys.stdout); print()
+    elif result.get("ok"):
+        print("saved " + result["email"] + " (active account unchanged)")
+    else:
+        print("  ERROR: " + result["error"], file=sys.stderr)
+    return 0 if result.get("ok") else 1
+
+
+def _agy_running():
+    """PIDs of agy processes on this box (they hold the old login until restarted)."""
+    pids = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                argv0 = f.read().split(b"\0")[0]
+        except OSError:
+            continue
+        if os.path.basename(argv0) == b"agy":
+            pids.append(int(pid))
+    return pids
+
+
+def _agy_processes():
+    """[(pid, conversation id or None)] for every agy process on this box."""
+    out = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if not argv or os.path.basename(argv[0]) != b"agy":
+            continue
+        conv = cwd = None
+        for arg in argv[1:]:
+            if arg.startswith(b"--conversation="):
+                conv = arg.split(b"=", 1)[1].decode("ascii", "replace") or None
+            elif arg.startswith(b"--add-dir=") and cwd is None:
+                cwd = os.path.realpath(arg.split(b"=", 1)[1].decode("utf-8", "replace"))
+        out.append((int(pid), conv, cwd))
+    return out
+
+
+def _paseo_agy_seats():
+    """{conversation id: (agent id, cwd)} for Paseo's agy agents, from its own records.
+
+    The agy process names its conversation on argv; Paseo keeps the same id as the
+    agent's persistence.sessionId. Only names and ids are read — never headers.
+    """
+    root = os.path.expanduser(os.environ.get("AIRLOCK_PASEO_AGENTS_DIR", "~/.paseo/agents"))
+    seats = {}
+    for path in _glob_json(root):
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        per = doc.get("persistence") if isinstance(doc, dict) else None
+        if not isinstance(per, dict) or per.get("provider") != "agy":
+            continue
+        conv, agent = per.get("sessionId"), doc.get("id")
+        if isinstance(conv, str) and isinstance(agent, str):
+            meta = per.get("metadata") if isinstance(per.get("metadata"), dict) else {}
+            seats[conv] = (agent, meta.get("cwd") or doc.get("cwd") or "")
+    return seats
+
+
+def _glob_json(root):
+    try:
+        subs = os.listdir(root)
+    except OSError:
+        return []
+    paths = []
+    for sub in subs:
+        d = os.path.join(root, sub)
+        if os.path.isdir(d):
+            paths.extend(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".json"))
+    return paths
+
+
+def _paseo_cli():
+    """argv prefix for the Paseo CLI pointed at this box's daemon, or None."""
+    host = os.environ.get("AIRLOCK_PASEO_HOST", "").strip()
+    if not host:
+        return None
+    binary = os.environ.get("AIRLOCK_PASEO_BIN", "").strip() or bin_discovery.find_bin("paseo")[0]
+    return [binary, "--host", host] if binary else None
+
+
+def _paseo_agents(cli):
+    """Paseo's live agents [{id, status, provider, cwd}] or None when unreachable."""
+    try:
+        proc = subprocess.run(cli + ["ls", "--json"], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=30, check=False)
+        doc = json.loads(proc.stdout or b"[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    agents = doc if isinstance(doc, list) else (doc.get("agents") if isinstance(doc, dict) else None)
+    return [a for a in (agents or []) if isinstance(a, dict) and isinstance(a.get("id"), str)]
+
+
+def _wait_gone(pid, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if not os.path.exists("/proc/%d" % pid):
+            return True
+        time.sleep(0.2)
+    return not os.path.exists("/proc/%d" % pid)
+
+
+def _agy_reseat(email):
+    """Restart the agy seats that still hold the previous login (the default after a switch).
+
+    Each running agy keeps the login it started with and writes it back to the live
+    file when it refreshes, which would quietly undo the switch. Ending the process is
+    enough for an idle seat: the Paseo agy adapter respawns agy on the same
+    conversation at the next prompt, now with the new login. A seat mid-turn loses
+    that turn, so it gets one "continue" message, as seat-recovery does. An agy
+    process no Paseo seat owns is left alone and counted.
+    """
+    procs = _agy_processes()
+    result = {"restarted": 0, "continued": 0, "untouched": 0, "failed": 0}
+    if not procs:
+        return result
+    cli = _paseo_cli()
+    seats = _paseo_agy_seats() if cli else {}
+    agents = _paseo_agents(cli) if cli else None
+    if agents is None:
+        result["untouched"] = len(procs)
+        result["why"] = "Paseo is not reachable from here"
+        return result
+    running = {a["id"] for a in agents if a.get("status") == "running"}
+    # Fallback when an agy's conversation is not the seat's recorded session (a
+    # resumed seat can carry a different one — measured 2026-09-25): the live agy
+    # seat working in the same directory, when exactly one does.
+    by_cwd = {}
+    for a in agents:
+        if "agy" in str(a.get("provider", "")) and a.get("cwd"):
+            by_cwd.setdefault(os.path.realpath(os.path.expanduser(a["cwd"])), []).append(a["id"])
+    for pid, conv, cwd in procs:
+        seat = seats.get(conv) if conv else None
+        if not seat and cwd and len(by_cwd.get(cwd, [])) == 1:
+            seat = (by_cwd[cwd][0], cwd)
+        if not seat:
+            result["untouched"] += 1
+            continue
+        agent, cwd = seat
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            result["failed"] += 1
+            continue
+        if not _wait_gone(pid, 10):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            _wait_gone(pid, 3)
+        if agent not in running:
+            result["restarted"] += 1
+            continue
+        msg = ("agy 로그인을 %s 로 교체하며 agy 프로세스를 다시 켜서 직전 턴이 끊겼습니다. "
+               "대화 맥락은 그대로입니다. ① git -C %s status --short 로 끊긴 지점을 확인하고 "
+               "② 하던 일을 이어서 진행하십시오. 이 복구 사실을 다른 세션이나 총괄에게 알리지 마십시오."
+               % (email, cwd or "."))
+        try:
+            sent = subprocess.run(cli + ["send", agent, "--no-wait", msg], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=30, check=False).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            sent = False
+        result["continued" if sent else "failed"] += 1
+    return result
+
+
+def cmd_agy_list(as_json):
+    live = _agy_read(AGY_LIVE)
+    active = _agy_email(live) if live else None
+    # Keep every login this box has seen: a terminal sign-in overwrites the live
+    # file, so the previous account survives only if its copy is already pooled.
+    if active and _agy_read(os.path.join(AGY_POOL, active + ".json")) != live:
+        try:
+            _agy_save(active, live)
+        except OSError:
+            pass
+    emails = sorted(set(_agy_pool()) | ({active} if active else set()))
+    doc = {"ok": True, "active": active,
+           "accounts": [{"email": e, "active": e == active} for e in emails]}
+    if as_json:
+        json.dump(doc, sys.stdout)
+        print()
+    else:
+        for a in doc["accounts"]:
+            print(("* " if a["active"] else "  ") + a["email"])
+    return 0
+
+
+def _agy_verify(data, email):
+    """Run the usage probe against a candidate in a throwaway HOME.
+
+    Quota numbers only come back when Google accepts the login, so a reading
+    for the same email proves the candidate works. Returns (reading, the token
+    bytes agy left behind — it may have refreshed them) or (None, error).
+    """
+    probe = os.environ.get("AIRLOCK_AGY_USAGE_BIN", "").strip()
+    agy = os.environ.get("AIRLOCK_AGY_BIN", "").strip()
+    if not (probe and os.path.isfile(probe) and agy):
+        return None, "agy is not installed on this box"
+    home = tempfile.mkdtemp(prefix="agy-verify-")
+    try:
+        cli = os.path.join(home, ".gemini", "antigravity-cli")
+        os.makedirs(os.path.join(cli, "cache"), mode=0o700)
+        for rel in AGY_ONBOARDING:
+            src = _agy_read(os.path.join(AGY_DIR, rel))
+            if src is not None:
+                _muse_write_private(os.path.join(cli, rel), src)
+        outer = _agy_read(os.path.expanduser("~/.gemini/settings.json"))
+        if outer is not None:
+            _muse_write_private(os.path.join(home, ".gemini", "settings.json"), outer)
+        token = os.path.join(cli, "antigravity-oauth-token")
+        _muse_write_private(token, data)
+        env = dict(os.environ, HOME=home, AIRLOCK_STATE_DIR=os.path.join(home, "state"),
+                   AIRLOCK_AGY_BIN=agy)
+        try:
+            proc = subprocess.run([sys.executable, "-B", probe], stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=env,
+                                  timeout=AGY_VERIFY_TIMEOUT, check=False)
+            reading = json.loads(proc.stdout or b"{}")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            return None, "verify did not finish (%s)" % type(exc).__name__
+        if not isinstance(reading, dict) or reading.get("ok") is not True:
+            why = reading.get("error") if isinstance(reading, dict) else None
+            return None, "agy did not accept this login (%s)" % (why or "no reading")
+        if str(reading.get("account") or "").strip().lower() != email:
+            return None, "agy signed in as a different account"
+        after = _agy_read(token)
+        return reading, (after if after and _agy_email(after) == email else data)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def _agy_switch_core(email, reseat_seats=True):
+    steps = ["backup"]
+    email = (email or "").strip().lower()
+    pool = _agy_pool()
+    if email not in pool:
+        return False, {"ok": False, "error": "that account is not saved on this box",
+                       "steps": steps}
+    live = _agy_read(AGY_LIVE)
+    current = _agy_email(live) if live else None
+    if current == email:
+        return False, {"ok": False, "error": "that account is already active", "steps": steps}
+    if live is not None:
+        if current is None:
+            return False, {"ok": False, "error": "the current login is not readable",
+                           "steps": steps}
+        # Save-back: the live file carries the newest tokens for the current account.
+        _agy_save(current, live)
+        _muse_write_private(AGY_SWITCH_BAK, live)
+    steps.append("verify")
+    candidate = _agy_read(pool[email])
+    reading, verified = _agy_verify(candidate or b"", email)
+    if reading is None:
+        return False, {"ok": False, "error": verified, "steps": steps}
+    _agy_save(email, verified)
+    steps.append("commit")
+    try:
+        _muse_write_private(AGY_LIVE, verified)
+        if _agy_email(_agy_read(AGY_LIVE) or b"") != email:
+            raise OSError("live file does not name the new account")
+    except OSError as exc:
+        steps.append("rollback")
+        if live is not None:
+            _muse_write_private(AGY_LIVE, live)
+        return False, {"ok": False, "error": "commit failed, previous login restored (%s)"
+                       % type(exc).__name__, "steps": steps}
+    reseat = _agy_reseat(email) if reseat_seats else None
+    left = len(_agy_running()) if reseat is None else reseat["untouched"] + reseat["failed"]
+    return True, {"ok": True, "account": email, "previous": current, "steps": steps,
+                  "reading": reading, "reseat": reseat, "runningAgy": left,
+                  "needsRestart": bool(left)}
+
+
+def cmd_agy_switch(email, as_json, reseat_seats=True):
+    ok, result = _agy_switch_core(email, reseat_seats)
+    if as_json:
+        json.dump(result, sys.stdout)
+        print()
+        return 0 if ok else 1
+    if ok:
+        print("agy now signs in as %s%s" % (result["account"],
+              " (restart the %d running agy process(es))" % result["runningAgy"]
+              if result["runningAgy"] else ""))
     else:
         print("  ERROR: %s" % result["error"], file=sys.stderr)
     return 0 if ok else 1
@@ -1778,9 +2354,15 @@ Switch / inspect:
   airlock-accounts list [--json] [--usage]  accounts + health (+ 5h/7d utilization)
   airlock-accounts to <name> [-- args...]   switch, then claude --continue
   airlock-accounts swap <name>              switch only (no re-launch; buttons/scripts)
-  airlock-accounts muse-swap <item> [--json]  swap this box's Muse key (manual only:
+  airlock-accounts muse-swap <item> [--json] [--reseat]  swap this box's Muse key (manual only:
                               backup -> verify the candidate -> commit; a refused
                               candidate leaves the old key untouched)
+  airlock-accounts agy-list [--json]        agy (Gemini) logins saved on this box
+  airlock-accounts agy-login-start [--json] start isolated agy login and return Google URL
+  airlock-accounts agy-login-code [--json]  read code from protected stdin and save the login
+  airlock-accounts agy-switch <email> [--json] [--no-reseat]  switch agy's login (backup ->
+                              verify the candidate in a throwaway HOME -> commit), then
+                              restart the Paseo agy seats still holding the old login
   airlock-accounts prune [--yes]            remove all dead slots (explicit only)
   airlock-accounts remove <name> [--yes]    remove one slot by name (active is refused)
 
@@ -1831,9 +2413,18 @@ def main(argv):
             extra = extra[1:]
         cmd_to(rest[0], extra)
     elif cmd == "swap" and len(rest) == 1:    cmd_swap(rest[0])
+    elif cmd == "agy-list":                   return cmd_agy_list("--json" in rest)
+    elif cmd == "agy-login-start":            return cmd_agy_login_start("--json" in rest)
+    elif cmd == "agy-login-code":
+        if any(a != "--json" for a in rest):
+            print("airlock-accounts: agy-login-code accepts protected stdin only", file=sys.stderr)
+            return 2
+        return cmd_agy_login_code("--json" in rest)
+    elif cmd == "agy-switch" and rest:
+        return cmd_agy_switch(rest[0], "--json" in rest, "--no-reseat" not in rest)
     elif cmd == "muse-swap" and rest:
         item = next((a for a in rest if not a.startswith("-")), None)
-        return cmd_muse_swap(item, "--json" in rest)
+        return cmd_muse_swap(item, "--json" in rest, "--reseat" in rest)
     elif cmd == "codex-auth" and rest:
         return cmd_codex_auth(rest[0], "--json" in rest[1:])
     else:

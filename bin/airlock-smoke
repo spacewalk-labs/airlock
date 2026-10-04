@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# airlock-smoke — run every enabled app's smoke against the LIVE install.
+# airlock-smoke — run every installed app's smoke against the LIVE install.
 # Each apps/<app>/smoke.sh verifies its gate (owner=200/302, denied=403,
 # missing-header=403) and backend. Exit non-zero if any app fails.
 #
@@ -28,25 +28,29 @@ ROOT="$(cd "$HERE/.." && pwd)"
 
 require_cmd python3 curl
 airlock_pin_state_dir
-airlock_config validate >/dev/null
+unset AIRLOCK_APP_ID AIRLOCK_APP_DIR
+airlock_config validate >/dev/null || exit 2
 
-# Packaged apps resolve from their [packages.*] dir under the D5 ABI, exactly
-# as the orchestrator's smoke loop does. Standalone smoke mutates nothing, so
+# Package-info supplies the D5 ABI and config path. Source identity below comes
+# only from ③, even if a recorded directory has disappeared. Smoke mutates nothing, so
 # it takes no ledger lock. AIRLOCK_CONFIG is pinned so an app script's own
 # airlock_config calls resolve the same config from the package cwd.
-AIRLOCK_PKG_INFO="$(airlock_config package-info)"
+AIRLOCK_PKG_INFO="$(airlock_config package-info)" || exit 2
 export AIRLOCK_PKG_INFO
-AIRLOCK_CONFIG="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print(json.load(sys.stdin)["config_path"])')"
+AIRLOCK_CONFIG="$(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c 'import sys,json; print(json.load(sys.stdin)["config_path"])')" || exit 2
 export AIRLOCK_CONFIG
 
+installed_apps="$(airlock_installed_app_ids)" || exit 2
 fail=0 ran=0
-# Child 4/P3: validate already refused any enabled app that is neither hub
-# nor a resolvable package (shipped or explicit) — pkg_dir is unconditionally
-# non-empty here, so the legacy "no smoke for '$app' (skipping)" fallback
-# (a bare apps/$app/smoke.sh with no package) is retired.
+# Installation membership and source directories come from ③. No record is
+# a bootstrap box: diagnose ingress below, without running candidate app hooks.
 while read -r app; do
+  [ -n "$app" ] || continue
   [ "$app" = hub ] && continue
-  pkg_dir="$(airlock_pkg_dir "$app")"
+  if ! pkg_dir="$(airlock_installed_app_dir "$app")"; then
+    log "FAILED '$app': recorded source directory is missing"
+    fail=1; continue
+  fi
   s="$pkg_dir/smoke.sh"
   # F6: validate proved this was a regular non-symlink file for every
   # manifest package. Absence now is a validate-then-delete race, and a
@@ -59,10 +63,10 @@ while read -r app; do
   ran=$((ran + 1))
   if (cd "$pkg_dir" && AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$pkg_dir" AIRLOCK_APP_ID="$app" bash "$s"); then :
   else log "smoke FAILED: $app"; fail=1; fi
-done < <(airlock_config apps)
+done <<<"$installed_apps"
 
 if [ "$ran" -eq 0 ]; then
-  log "no app smokes ran (only hub enabled?)"
+  log "no installed app smokes ran"
 fi
 # Everything above is loopback. Check the layer in front of it (serve mapping, TLS, a
 # live target) — and then say plainly that reachability from another device was NOT

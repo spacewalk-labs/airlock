@@ -122,7 +122,7 @@ https_port = "gate_port"
 # no [plaintext_redirect] here.
 [tile]
 label = "code-server"
-sub = "browser IDE"
+sub = "브라우저 개발 환경"
 cat = "coding"
 glyph = "app-code-server"
 

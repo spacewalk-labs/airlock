@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""Fixture contracts for cho 2aeaead5 (b): ceremonial gates are removed.
+"""Fixture contract: nginx fragment inclusion is exact, not a glob.
 
-Each KEEP/MERGE/REMOVE is a real blocking failure. This suite copies the
-checkout into scratch and never runs the live installer, updater, nginx, or hub.
+This used to also cover the explicit-package digest lock (cho 2aeaead5 (b)'s
+partial gate trim: malformed-lock handling, lifecycle-scoped confirmation,
+--approve-json, lock-finalize). That whole mechanism was deleted outright
+(docs/reports/2026-09-27_installer-gate-zero-base-revival.md, family (a)): it
+was an admission-control checkpoint, not a security boundary (SECURITY.md,
+Package trust), and caused more install failures in two weeks than it ever
+prevented. Nothing here replaces those assertions — there is nothing left to
+assert once the mechanism does not exist. What remains is the one check in
+this file that was never about the lock: render-nginx.sh must include exactly
+the fragments of enabled apps, never a directory glob or a hand-placed file.
+
+This suite copies the checkout into scratch and never runs the live
+installer, updater, nginx, or hub.
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -46,42 +56,8 @@ def write_config(path: Path, packages: dict[str, Path]) -> None:
         "[apps.hub]\n",
     ]
     for pid, package in packages.items():
-        lines.append(f"[apps.{pid}]\n[packages.{pid}]\npath = \"{package}\"\n")
+        lines.append(f"[apps.{pid}]\n")
     path.write_text("".join(lines))
-
-
-def digest_tree(ledger: Path, package: Path) -> str:
-    proc = run(
-        [sys.executable, "-c",
-         "import importlib.machinery, importlib.util, sys\n"
-         "loader = importlib.machinery.SourceFileLoader('ledger', sys.argv[1])\n"
-         "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
-         "mod = importlib.util.module_from_spec(spec)\n"
-         "loader.exec_module(mod)\n"
-         "print(mod.digest_tree(sys.argv[2]))\n",
-         str(ledger), str(package)],
-        env=os.environ.copy(),
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr)
-    return proc.stdout.strip()
-
-
-def write_lock(path: Path, entries: dict[str, str]) -> None:
-    blocks = [f'[{pid}]\ndigest = "{digest}"\n' for pid, digest in sorted(entries.items())]
-    path.write_text("\n".join(blocks))
-
-
-def config_cmd(repo: Path, cfg: Path, args: list[str], extra_env=None):
-    env = os.environ.copy()
-    env["AIRLOCK_CONFIG"] = str(cfg)
-    env["AIRLOCK_WEBROOT"] = str(repo.parent / "web")
-    env["AIRLOCK_CONFD"] = str(repo.parent / "confd")
-    env["AIRLOCK_STATE_DIR"] = str(repo.parent / "state")
-    env["AIRLOCK_TS_FQDN"] = "box.example.ts.net"
-    if extra_env:
-        env.update(extra_env)
-    return run([sys.executable, str(repo / "bin/airlock-config"), *args], env=env)
 
 
 def main() -> int:
@@ -107,158 +83,20 @@ def main() -> int:
         print("FAIL could not create scratch repository")
         shutil.rmtree(scratch)
         return 1
-    cfg_bin = repo / "bin/airlock-config"
-    ledger = repo / "bin/airlock-ledger"
-    lock = repo / "airlock.lock"
     confd = scratch / "confd"
     web = scratch / "web"
     state = scratch / "state"
     for path in (confd / "hub-locations.d", confd / "servers.d", web / "assets", state):
         path.mkdir(parents=True, exist_ok=True)
 
-    stale = make_package(scratch / "pkgs", "stale-pkg", "stale-v1\n")
-    target = make_package(scratch / "pkgs", "target-pkg", "target-v1\n")
+    kept = make_package(scratch / "pkgs", "kept-pkg", "v1\n")
     cfg = scratch / "airlock.toml"
-    write_config(cfg, {"stale-pkg": stale, "target-pkg": target})
-    stale_digest = digest_tree(ledger, stale)
-    target_digest = digest_tree(ledger, target)
-    write_lock(lock, {"stale-pkg": stale_digest, "target-pkg": target_digest})
-    write(stale / "payload.txt", "stale-v2\n")
-    stale_new = digest_tree(ledger, stale)
-    if stale_new == stale_digest:
-        print("FAIL fixture could not create a digest mismatch")
-        shutil.rmtree(scratch)
-        return 1
-
-    write_lock(lock, {"stale-pkg": "not-a-digest"})
-    malformed = config_cmd(repo, cfg, ["validate"])
-    info_malformed = config_cmd(repo, cfg, ["package-info"])
-    if malformed.returncode == 0 and info_malformed.returncode != 0 \
-            and "package lock" in info_malformed.stderr:
-        print("ok   KEEP malformed lock: lifecycle reads it, validate does not")
-    else:
-        print("FAIL KEEP malformed lock split")
-        print(malformed.stderr)
-        print(info_malformed.stderr)
-        fail += 1
-    write_lock(lock, {"stale-pkg": stale_digest, "target-pkg": target_digest})
-
-    validate = config_cmd(repo, cfg, ["validate"])
-    if validate.returncode == 0:
-        print("ok   REMOVE global lock: validate ignores unrelated digest mismatch")
-    else:
-        print("FAIL REMOVE global lock: validate still blocked")
-        print(validate.stderr)
-        fail += 1
-
-    webjson = config_cmd(repo, cfg, ["webjson"])
-    if webjson.returncode == 0:
-        print("ok   REMOVE global lock: webjson ignores unrelated digest mismatch")
-    else:
-        print("FAIL REMOVE global lock: webjson still blocked")
-        print(webjson.stderr)
-        fail += 1
-
-    info_all = config_cmd(repo, cfg, ["package-info"])
-    if info_all.returncode != 0 and "package 'stale-pkg': package lock digest mismatch" in info_all.stderr:
-        print("ok   KEEP lifecycle lock: package-info still refuses the mismatched target set")
-    else:
-        print("FAIL KEEP lifecycle lock: package-info did not refuse stale-pkg")
-        print(info_all.stderr)
-        fail += 1
-
-    info_target = config_cmd(
-        repo, cfg, ["package-info", "--lifecycle-targets=target-pkg"])
-    if info_target.returncode == 0:
-        print("ok   MERGE lifecycle targets: only the named package is confirmed")
-    else:
-        print("FAIL MERGE lifecycle targets: targeted package-info failed")
-        print(info_target.stderr)
-        fail += 1
-
-    installer = (repo / "install/airlock-install.sh").read_text(encoding="utf-8")
-    targeted_calls = installer.count(
-        'airlock_config package-info "${_airlock_package_info_args[@]}"'
-    )
-    if (targeted_calls == 2
-            and '--lifecycle-targets=$_airlock_selected_csv' in installer):
-        print("ok   MERGE selected install: package-info receives only lifecycle targets")
-    else:
-        print("FAIL MERGE selected install: lifecycle targets are not wired to both package-info reads")
-        fail += 1
-
-    info_stale = config_cmd(
-        repo, cfg, ["package-info", "--lifecycle-targets=stale-pkg"])
-    if info_stale.returncode != 0 and "package lock digest mismatch" in info_stale.stderr:
-        print("ok   KEEP lifecycle lock: the actual target still fails closed")
-    else:
-        print("FAIL KEEP lifecycle lock: targeted stale package was admitted")
-        print(info_stale.stderr)
-        fail += 1
-
-    approval = {
-        "id": "stale-pkg",
-        "path": str(stale),
-        "digest": stale_new,
-        "grants": [],
-    }
-    grant_bump = dict(approval)
-    grant_bump["grants"] = ["system-unit"]
-    bumped = config_cmd(
-        repo, cfg,
-        [f"--approve-json={json.dumps(grant_bump)}",
-         "package-info", "--lifecycle-targets=stale-pkg"],
-    )
-    if bumped.returncode != 0:
-        print("ok   KEEP grant boundary: approval cannot smuggle extra grants")
-    else:
-        print("FAIL KEEP grant boundary: extra grants were admitted")
-        fail += 1
-
-    approved = config_cmd(
-        repo, cfg,
-        [f"--approve-json={json.dumps(approval)}",
-         "package-info", "--lifecycle-targets=stale-pkg"],
-    )
-    if approved.returncode == 0:
-        print("ok   MERGE approval object: one JSON object admits the digest change")
-    else:
-        print("FAIL MERGE approval object: --approve-json did not admit stale-pkg")
-        print(approved.stderr)
-        fail += 1
-
-    preview = config_cmd(repo, cfg, ["package-preview", str(stale)])
-    if preview.returncode == 0:
-        payload = json.loads(preview.stdout)
-        if payload.get("requires_reapproval") is True and payload.get("digest") == stale_new:
-            print("ok   MERGE preview is observation, not a required prior gate")
-        else:
-            print("FAIL MERGE preview shape drifted")
-            fail += 1
-    else:
-        print("FAIL MERGE preview still blocked by sibling lock")
-        print(preview.stderr)
-        fail += 1
-
-    before_lock = lock.read_bytes()
-    finalize = config_cmd(
-        repo, cfg, [f"--approve-json={json.dumps(approval)}", "lock-finalize"])
-    if finalize.returncode == 0 and lock.read_text().find(stale_new) != -1 \
-            and "package-lock-approve" in finalize.stderr \
-            and not (repo / "airlock-live-box" / "live-box-lease.json").exists():
-        print("ok   MERGE lease: lock-finalize is box flock+audit, not lease metadata")
-    else:
-        print("FAIL MERGE lease: lock-finalize did not update under flock+audit")
-        print(finalize.stderr)
-        fail += 1
-    if before_lock == lock.read_bytes():
-        print("FAIL MERGE approval object: lock bytes were not updated")
-        fail += 1
+    write_config(cfg, {"kept-pkg": kept})
 
     write(confd / "hub-locations.d" / "hub.conf", "# canonical hub fragment\n")
     write(confd / "servers.d" / "publish-doc-gate.conf",
           "server { listen 127.0.0.1:19925; }\n")
-    write(confd / "servers.d" / "stale-pkg.conf",
+    write(confd / "servers.d" / "kept-pkg.conf",
           "server { listen 127.0.0.1:19999; }\n")
     env = os.environ.copy()
     env.update({
@@ -270,6 +108,18 @@ def main() -> int:
         "AIRLOCK_NGINX_SITE": str(scratch / "nginx-site.conf"),
         "PATH": env.get("PATH", ""),
     })
+    env.update(HOME=str(scratch / "home"), XDG_CONFIG_HOME=str(scratch / "xdg"))
+    env.pop("AIRLOCK_APP_ID", None)
+    env.pop("AIRLOCK_APP_DIR", None)
+    seeded = run([sys.executable, "-c", """
+from importlib.machinery import SourceFileLoader
+import sys
+sys.dont_write_bytecode = True
+ledger = SourceFileLoader("_gate_fixture_ledger", sys.argv[1]).load_module()
+ledger.write_installed({"kept-pkg": {"repo": sys.argv[2], "commit": "", "artifacts": []}})
+""", str(repo / "bin/airlock-ledger"), str(kept)], env=env)
+    if seeded.returncode:
+        raise RuntimeError(seeded.stderr)
     rendered = run(["bash", str(repo / "install/render-nginx.sh")], env=env)
     if rendered.returncode != 0:
         print("FAIL REMOVE fragment wall: render-nginx failed")
@@ -282,7 +132,7 @@ def main() -> int:
             print("FAIL REMOVE fragment wall: glob or manual listener still included")
             fail += 1
         elif f"include {confd}/hub-locations.d/hub.conf;" in text \
-                and f"include {confd}/servers.d/stale-pkg.conf;" in text:
+                and f"include {confd}/servers.d/kept-pkg.conf;" in text:
             print("ok   REMOVE fragment wall: only enabled-app fragments are included")
         else:
             print("FAIL REMOVE fragment wall: canonical includes missing")

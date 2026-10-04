@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="system">
+<html lang="ko" data-theme="system">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -47,22 +47,30 @@
   header { max-width: var(--airlock-page); margin: 0 auto 2rem; display: flex; align-items: center; gap: 1rem;
            flex-wrap: wrap; position: relative;   /* anchors the settings sheet */
            padding-bottom: 0.9rem; border-bottom: 1px solid var(--airlock-hairline); }
-  h1 { font-size: 1.25rem; margin: 0; letter-spacing: -0.02em; font-weight: 700; }
-  .theme-group { margin-left: auto; display: flex; align-items: center; gap: 4px; }
-  .theme-group button {
-    min-height: 44px; padding: 5px 10px; border: 1px solid var(--airlock-hairline);
-    border-radius: 999px; background: transparent; color: var(--airlock-mute);
-    font: inherit; font-size: 0.75rem; font-weight: 600; cursor: pointer;
+  h1 { font-size: 1.25rem; margin: 0; letter-spacing: -0.02em; font-weight: 700;
+       flex: 1; min-width: 0; }
+  /* One appearance control that cycles Auto -> Light -> Dark. Three buttons said
+     the same three words the icon already says, and on a phone they were the
+     widest thing in the header. The name lives in the title, so the button itself
+     is only ever an icon. */
+  .theme-cycle {
+    width: 44px; height: 44px; padding: 0; display: grid; place-items: center;
+    border: 1px solid var(--airlock-hairline); border-radius: var(--airlock-r-pill);
+    background: transparent; color: var(--airlock-mute); cursor: pointer;
   }
-  .theme-group button:hover { color: var(--airlock-ink); background: var(--airlock-surface-1); }
-  .theme-group button:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
-  .theme-group button[aria-pressed="true"] {
-    border-color: var(--airlock-primary); background: var(--airlock-primary);
-    color: var(--airlock-on-primary);
-  }
-  .who { color: var(--airlock-mute); font-size: 0.9rem; font-weight: 500;
-         padding: 4px 12px; border: 1px solid var(--airlock-hairline); border-radius: 999px; white-space: nowrap; }
+  .theme-cycle:hover { color: var(--airlock-ink); background: var(--airlock-surface-1); }
+  .theme-cycle:focus-visible { outline: none; box-shadow: var(--airlock-focus); }
+  .theme-cycle svg { width: 20px; height: 20px; display: block; fill: none; stroke: currentColor;
+                     stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .who { display: flex; align-items: center; gap: 7px; color: var(--airlock-mute);
+         font-size: 0.9rem; font-weight: 500; white-space: nowrap; }
   .who:empty { display: none; }
+  /* On a phone the address is the first thing to go: the pill keeps its initial,
+     which is still enough to say whose box this is. */
+  @media (max-width: 560px) { .who span { display: none; } }
+  .who i { display: grid; place-items: center; width: 30px; height: 30px; flex: none;
+           border-radius: 50%; background: var(--airlock-primary); color: var(--airlock-on-primary);
+           font-style: normal; font-weight: 700; font-size: 0.8rem; }
   /* The pill is the entrance to subscription accounts (owner decision, confirmed
      mockup 9: the settings sheet has no subscription row — this does, because the
      pill is already the place that says whose box this is). [data-acct] is set by
@@ -111,19 +119,52 @@
   .acct-note { padding: var(--airlock-sp-4); color: var(--airlock-body);
                font-size: 0.85rem; line-height: 1.55; word-break: break-word; }
   main { max-width: var(--airlock-page); margin: 0 auto; }
-  .sec-h { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
-           color: var(--airlock-mute); margin: 0 0 1.25rem; display: flex; align-items: center; gap: 8px; }
-  .sec-h::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--airlock-primary); }
-  /* Sections after the first are separated by space, not by a rule: the grid
-     already reads as blocks, and a divider per group turns a launcher into a
-     form. The heading keeps its own bottom margin, so this is top-only. */
-  .sec + .sec { margin-top: 2.5rem; }
-  /* The gate note rides UNDER the heading it qualifies and above the tiles it
-     describes, sized down from the heading — it is a caveat about where these
-     tiles send you, not a second heading competing with the first. Sits at the
-     heading's text, past the dot, so the two lines read as one block. */
-  .sec-note { margin: -0.85rem 0 1.25rem 14px; color: var(--airlock-mute);
-              font-size: 0.78rem; line-height: 1.45; max-width: 46ch; }
+  /* ── the named line ────────────────────────────────────────────────────
+     The one divider on the home screen, and the owner names it. It spans the
+     full column so it reads as a rule through the list rather than another
+     tile, and the green is the only non-token colour in this file — a line you
+     named is not a category, so it must not borrow the app palette. */
+  /* justify-self, not just grid-column: the grid centres its items, so a line
+     would otherwise shrink to the width of its own name — and an unnamed line to
+     almost nothing. A rule you drew is a rule through the list. */
+  .home-line { grid-column: 1 / -1; justify-self: stretch; margin: 10px 0 2px; }
+  .home-line hr { border: 0; border-top: 2px solid var(--airlock-line);
+                  margin: 0 0 6px; }
+  .home-line-label { display: flex; align-items: center; gap: 8px; min-height: 20px;
+                     color: var(--airlock-mute); font-size: 0.78rem; }
+  .home-line-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .home-line input { display: none; flex: 1; min-width: 0; max-width: 22rem;
+                     padding: 3px 9px; border: 1px solid var(--airlock-hairline);
+                     border-radius: var(--airlock-r-sm); background: var(--airlock-surface-1);
+                     color: var(--airlock-ink); font: inherit; font-size: 0.82rem; }
+  .home-line-drop { display: none; flex: none; width: 26px; height: 26px; padding: 0;
+                    border: 0; border-radius: var(--airlock-r-pill);
+                    background: var(--airlock-surface-2); color: var(--airlock-mute);
+                    font: inherit; font-size: 1rem; line-height: 1; cursor: pointer; }
+  :root[data-home-edit="1"] .home-line-name { display: none; }
+  :root[data-home-edit="1"] .home-line input { display: block; }
+  :root[data-home-edit="1"] .home-line-drop { display: block; }
+  /* The only control the edit mode adds, and it is what a person reaches for
+     when the list is finished: one more divider. It disappears at the cap
+     rather than disabling itself, so the header cannot grow a dead control. */
+  .home-editbar {
+    position: fixed; z-index: 30; left: 50%; bottom: max(env(safe-area-inset-bottom), 18px);
+    display: flex; align-items: center; gap: 12px; padding: 8px 10px 8px 14px;
+    border: 1px solid var(--airlock-hairline); border-radius: var(--airlock-r-pill);
+    background: var(--airlock-surface-1); box-shadow: var(--airlock-shadow-hover);
+    color: var(--airlock-mute); font-size: 0.82rem;
+    transform: translateX(-50%) translateY(180%);
+    visibility: hidden; transition: transform .18s ease-out, visibility 0s .18s;
+  }
+  :root[data-home-edit="1"] .home-editbar {
+    transform: translateX(-50%) translateY(0);
+    visibility: visible; transition: transform .18s ease-out;
+  }
+  .home-addline { flex: none; min-height: 36px; padding: 0 14px; border: 0;
+                  border-radius: var(--airlock-r-pill); background: var(--airlock-surface-2);
+                  color: var(--airlock-ink); font: inherit; font-size: 0.82rem;
+                  font-weight: var(--airlock-fw-semibold); cursor: pointer; }
+  .home-addline[hidden] { display: none; }
 
   /* launcher grid — category-coloured tiles + shared glyph sprite */
   /* Column count is not pinned; the tile size sets it and auto-fill does the rest
@@ -175,16 +216,18 @@
   .app .sub { display: none; color: var(--airlock-mute); font-size: 0.72rem;
               text-align: center; line-height: 1.35; }
   :root[data-tile-descriptions="visible"] .app .sub { display: block; max-width: 18ch; }
-  /* Home-order editing adds the iOS-style disable badge once the owner app API is
-     present. The badge changes configuration; it does not delete app data. */
-  .home-edit-done { min-height: 36px; padding: 0 12px; border: 1px solid var(--airlock-primary);
-                    border-radius: 999px; background: var(--airlock-primary); color: #fff;
-                    font: inherit; font-size: .82rem; font-weight: 650; cursor: pointer; }
-  .home-edit-done[hidden] { display: none; }
+  /* Home-order editing: long press, drag, tap the empty space to stop. The ×
+     badge that used to sit on each tile is gone with this card's disable path. */
   :root[data-home-order-owner="1"] .app { -webkit-touch-callout: none;
     -webkit-user-select: none; user-select: none; -webkit-user-drag: none; }
-  :root[data-home-edit="1"] .app { animation: home-icon-wiggle .16s ease-in-out infinite alternate;
-                                    cursor: grab; touch-action: none; -webkit-user-drag: none; }
+  /* touch-action is fixed at pointerdown, so the long press has to lift it before
+     the finger can move: without this the first drag of the gesture is a scroll. */
+  :root[data-home-edit="1"] .app { cursor: grab; touch-action: none; -webkit-user-drag: none; }
+  /* On .ic, never on .app: the FLIP slide animates the tile's own transform, and
+     an animation on the same element overwrites it — every non-dragged icon froze
+     mid-move while one tile was being dragged. */
+  :root[data-home-edit="1"] .app .ic { animation: home-icon-wiggle .28s ease-in-out infinite alternate; }
+  :root[data-home-edit="1"] .app:nth-child(2n) .ic { animation-direction: alternate-reverse; }
   :root[data-home-edit="1"] .app:hover .ic { transform: none; }
   .app-disable {
     display: none; position: absolute; z-index: 3; top: -8px; left: calc(50% - 48px);
@@ -372,7 +415,7 @@
   }
 
   /* App store: a modal sheet above the launcher on wide screens, and a bottom
-     sheet on phones. The four tabs stay fixed while each catalogue lands. */
+     sheet on phones. The tabs stay fixed while each catalogue lands. */
   .store-modal { position: fixed; inset: 0; z-index: 55; display: flex;
                  align-items: center; justify-content: center; padding: var(--airlock-sp-4);
                  background: rgba(0, 0, 0, .58); backdrop-filter: blur(3px); }
@@ -402,14 +445,27 @@
                      background: var(--airlock-surface-2); font-size: .7rem; }
   .store-body { min-height: 250px; overflow-y: auto; padding: var(--airlock-sp-3) var(--airlock-sp-5) var(--airlock-sp-5); }
   .store-pane[hidden], .store-detail[hidden] { display: none; }
-  .store-row { display: flex; align-items: center; gap: var(--airlock-sp-4);
-               padding: var(--airlock-sp-4) 0; border-bottom: 1px solid var(--airlock-hairline); }
+  .store-row { position: relative; display: flex; align-items: center; gap: var(--airlock-sp-4);
+               padding: var(--airlock-sp-3) var(--airlock-sp-2);
+               border-bottom: 1px solid var(--airlock-hairline); border-radius: var(--airlock-r-sm); }
   .store-row:last-child { border-bottom: 0; }
+  /* 36px, the same geometry the launcher tile uses at its smallest, so the two
+     surfaces show an app at a size a person already recognises. */
+  .store-row-icon { flex: none; width: 36px; height: 36px; border-radius: 9px;
+                    display: grid; place-items: center; overflow: hidden;
+                    background: var(--airlock-surface-2); color: var(--airlock-mute); }
+  .store-row-icon svg { width: 22px; height: 22px; display: block; }
+  .store-row.has-brand .store-row-icon { background: none; }
+  .store-row-icon img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .store-row-text { flex: 1; min-width: 0; }
   .store-row-name { font-size: .95rem; font-weight: var(--airlock-fw-semibold); }
-  .store-row-note, .store-row-source { margin-top: 2px; color: var(--airlock-mute);
-                                      font-size: .78rem; overflow-wrap: anywhere; }
-  .store-row-source { font-family: var(--airlock-font-mono); font-size: .72rem; }
+  /* Exactly one line. A second line turns a three-word row into a paragraph, and
+     the detail box below is where the long version belongs. */
+  .store-row-note { margin-top: 2px; color: var(--airlock-mute); font-size: .78rem;
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .store-row-source { margin-top: 2px; color: var(--airlock-mute);
+                      font-family: var(--airlock-font-mono); font-size: .72rem;
+                      overflow-wrap: anywhere; }
   .store-actions { flex: none; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--airlock-sp-2); }
   .store-action { min-height: 34px; padding: 0 var(--airlock-sp-4); border-radius: var(--airlock-r-pill);
                   border: 1px solid var(--airlock-hairline); background: transparent;
@@ -418,9 +474,23 @@
   .store-action-primary { border-color: transparent; background: var(--airlock-primary); color: var(--airlock-on-primary); }
   .store-action-danger { border-color: var(--airlock-danger); color: var(--airlock-danger); }
   .store-action:disabled { opacity: .45; cursor: default; }
-  .store-personal-note { margin: var(--airlock-sp-2) 0 var(--airlock-sp-4); color: var(--airlock-body);
-                         font-size: .82rem; line-height: 1.55; }
+  /* Where a row's origin, digest and path live. Off the row until it is asked
+     for — hover on a pointer, a tap on a finger — because the row's own job is
+     name, one line, and a state you can press. */
+  .store-detail-pop { display: none; position: absolute; z-index: 5; left: 56px;
+                      top: calc(100% - 6px); min-width: 240px; max-width: 340px;
+                      padding: var(--airlock-sp-3) var(--airlock-sp-4);
+                      border: 1px solid var(--airlock-hairline);
+                      border-radius: var(--airlock-r-sm); background: var(--airlock-canvas);
+                      box-shadow: var(--airlock-shadow-hover); font-size: .75rem; }
+  .store-row.pinned .store-detail-pop { display: block; }
+  .store-detail-pop dl { display: grid; grid-template-columns: auto 1fr; gap: 3px var(--airlock-sp-3);
+                         margin: 0; }
+  .store-detail-pop dt { color: var(--airlock-mute); }
+  .store-detail-pop dd { margin: 0; overflow-wrap: anywhere;
+                         font-family: var(--airlock-font-mono); }
   .store-personal-form { display: grid; gap: var(--airlock-sp-3); padding: var(--airlock-sp-4);
+                          margin-top: var(--airlock-sp-4);
                          border: 1px solid var(--airlock-hairline); border-radius: var(--airlock-r-sm);
                          background: var(--airlock-surface-2); }
   .store-personal-form label { font-size: .82rem; font-weight: var(--airlock-fw-semibold); }
@@ -485,7 +555,7 @@
   .fb-open:hover { color: var(--airlock-ink); border-color: var(--airlock-mute); background: var(--airlock-surface-1); }
   .fb-panel { position: relative; }        /* anchors the dismiss button */
   .fb-panel[hidden] { display: none; }
-  .fb-panel .sec-h { margin-bottom: 0.75rem; padding-right: 2.75rem; }
+  .fb-panel .set-h { margin-bottom: 0.75rem; padding-right: 2.75rem; }
   .feedback textarea {
     width: 100%; min-height: 84px; resize: vertical; box-sizing: border-box;
     padding: 12px 14px; border: 1px solid var(--airlock-hairline); border-radius: 12px;
@@ -539,12 +609,12 @@
   <symbol id="app-notepad" viewBox="0 0 24 24"><rect x="4.8" y="4.4" width="14.4" height="17.2" rx="2.8" fill="currentColor"/><rect x="8.4" y="2.4" width="7.2" height="4.4" rx="1.5" fill="currentColor"/><rect x="8.4" y="2.4" width="7.2" height="4.4" rx="1.5" fill="#000" opacity=".15"/><g fill="var(--app-tile,#fff)"><rect x="8.2" y="11" width="7.6" height="1.6" rx=".8"/><rect x="8.2" y="14.6" width="5.2" height="1.6" rx=".8"/></g></symbol>
   <symbol id="app-monitor" viewBox="0 0 24 24"><path d="M2.4 13.2h4.2l2.2-6.4 3 11 2.4-7.8 1.8 3.2h5.6" fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="app-silverbullet" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2.4c-2 0-3.5 2.7-3.5 6.4v2.3h7V8.8c0-3.7-1.5-6.4-3.5-6.4z"/><rect x="8.5" y="11.8" width="7" height="8.4" rx="1.5" fill="currentColor" opacity=".5"/><rect x="8.5" y="13.6" width="7" height="1.6" fill="currentColor"/></symbol>
+  <symbol id="app-folio" viewBox="0 0 24 24"><rect x="4.2" y="3.4" width="15.6" height="17.2" rx="3.2" fill="#f4f6f9"/><rect x="16.6" y="3.4" width="3.2" height="17.2" rx="1.35" fill="#263b59"/><rect x="7.3" y="6.5" width="7.1" height="4.6" rx="1.35" fill="#e2e7ee"/><path d="M9.2 8.2h3.4M9.2 9.5h3.4" fill="none" stroke="#9ba8b8" stroke-width=".72" stroke-linecap="round"/><path d="M7 18.8c1.3-3.8 2.9-6.3 5.1-8.1" fill="none" stroke="#426964" stroke-width="1.05" stroke-linecap="round"/><path d="M8.9 15.1c-2.3.1-3.8-1.1-4.5-3.6 2.4-.1 3.9 1.1 4.5 3.6Z" fill="#557c76"/><path d="M9.8 13c-.5-2.4.4-4.1 2.8-5.2.5 2.4-.4 4.1-2.8 5.2Z" fill="#6f918c"/><path d="M7.7 17.2c-2.1.8-3.8.2-5-1.9 2.1-.8 3.8-.2 5 1.9Z" fill="#789793"/></symbol>
   <symbol id="app-chat" viewBox="0 0 24 24"><path fill="currentColor" d="M4 3.5h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9.6l-4.3 3.4A.8.8 0 0 1 4 19.3V5.5a2 2 0 0 1 2-2Z"/><g fill="#fff" opacity=".82"><circle cx="8.5" cy="10" r="1.2"/><circle cx="12" cy="10" r="1.2"/><circle cx="15.5" cy="10" r="1.2"/></g></symbol>
   <symbol id="app-drive" viewBox="0 0 24 24"><path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/><rect x="4.4" y="10.6" width="15.2" height="1.6" rx=".8" fill="#fff" opacity=".82"/></symbol>
   <symbol id="app-tektdojo" viewBox="0 0 24 24"><g stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"><path d="M5.625 9V7.125a1.5 1.5 0 0 1 1.5-1.5H9"/><path d="M18.375 9V7.125a1.5 1.5 0 0 0-1.5-1.5H15"/><path d="M5.625 15v1.875a1.5 1.5 0 0 0 1.5 1.5H9"/><path d="M18.375 15v1.875a1.5 1.5 0 0 1-1.5 1.5H15"/></g><rect x="9" y="9.375" width="6" height="5.25" rx="1.125" fill="#0a84ff"/></symbol>
   <symbol id="app-wiki" viewBox="0 0 24 24"><g stroke="currentColor" stroke-width="1.5" fill="none" opacity=".8"><path d="M7.4 8 12 12.4M7.6 17 12 12.4M16.8 16.4 12 12.4M16.4 7.2 12 12.4"/></g><g fill="currentColor"><circle cx="12" cy="12.4" r="2.7"/><circle cx="7.4" cy="8" r="1.85"/><circle cx="7.6" cy="17" r="1.85"/><circle cx="16.8" cy="16.4" r="1.85"/></g><path fill="currentColor" d="M16.6 4.5l.7 1.95 1.95.7-1.95.7-.7 1.95-.7-1.95-1.95-.7 1.95-.7z"/></symbol>
   <symbol id="app-taskboard" viewBox="0 0 24 24"><g fill="currentColor"><rect x="4.2" y="8.4" width="3.9" height="9" rx="1.35"/><rect x="10.05" y="4.9" width="3.9" height="12.5" rx="1.35"/><rect x="15.9" y="11.3" width="3.9" height="6.1" rx="1.35"/><rect x="3.2" y="19.6" width="17.6" height="1.8" rx=".9" opacity=".34"/><rect x="3.2" y="19.6" width="9.8" height="1.8" rx=".9"/></g></symbol>
-  <symbol id="app-learning" viewBox="0 0 24 24"><g fill="currentColor"><rect x="5.44" y="6.19" width="13.13" height="2.63" rx=".94" opacity=".55"/><rect x="5.44" y="10.31" width="13.13" height="2.63" rx=".94" opacity=".78"/><rect x="5.44" y="14.44" width="13.13" height="3.38" rx="1.13"/></g></symbol>
   <symbol id="app-slides" viewBox="0 0 24 24"><rect x="3.6" y="6.6" width="16.8" height="10.8" rx="2.4" fill="none" stroke="currentColor" stroke-width="2.6"/></symbol>
   <symbol id="app-vm" viewBox="0 0 24 24"><g fill="currentColor" transform="translate(2.8 .5) skewX(-8)"><rect x="3.2" y="3.7" width="7" height="7" rx=".9"/><rect x="11.4" y="3.7" width="7" height="7" rx=".9"/><rect x="3.2" y="11.8" width="7" height="7" rx=".9"/><rect x="11.4" y="11.8" width="7" height="7" rx=".9"/></g></symbol>
   <symbol id="app-dirviewer" viewBox="0 0 24 24"><path fill="currentColor" d="M3 6.6a2 2 0 0 1 2-2h3.7a2 2 0 0 1 1.5.7l1.2 1.4H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"></path><path fill="#fff" opacity=".25" d="M3 9.2h18v1.3H3Z"></path></symbol>
@@ -555,17 +625,16 @@
 
 <header>
   <h1 id="product">Airlock</h1>
-  <div class="theme-group" role="group" aria-label="Theme">
-    <button type="button" data-theme-btn="system" aria-pressed="true">Auto</button>
-    <button type="button" data-theme-btn="light" aria-pressed="false">Light</button>
-    <button type="button" data-theme-btn="dark" aria-pressed="false">Dark</button>
-  </div>
+  <button type="button" class="find-open" id="find-open" aria-label="앱 검색"
+          aria-expanded="false" aria-controls="launcher-find" hidden>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.3"></circle><path d="m16 16 4.2 4.2"></path></svg>
+  </button>
   <!-- Owner-only entrances. App lifecycle and updates live in the store; the gear
        keeps only agent and harness settings. Both stay absent when dev-monitor's
        owner APIs are not offered on this box. -->
   <button type="button" class="store-open" id="store-open" aria-label="앱스토어"
           aria-expanded="false" aria-controls="store-modal" hidden>
-    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.2"></rect><rect x="13.5" y="3.5" width="7" height="7" rx="1.2"></rect><rect x="3.5" y="13.5" width="7" height="7" rx="1.2"></rect><rect x="13.5" y="13.5" width="7" height="7" rx="1.2"></rect></svg>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8h14l-1 12H6z"></path><path d="M9 8a3 3 0 0 1 6 0"></path></svg>
     <span class="store-badge" id="store-badge" hidden></span>
   </button>
   <button type="button" class="gear" id="settings-open" aria-label="Airlock 설정"
@@ -576,13 +645,8 @@
        account panel opens from here and an expiring login shows as this pill's
        ring. data-account-entry is what the poller at the foot of this file binds;
        it stays a plain label unless there is a panel to open. -->
-  <span class="who" id="who" data-account-entry></span>
-  <button type="button" class="find-open" id="find-open" aria-label="Find an app"
-          aria-expanded="false" aria-controls="launcher-find" hidden>
-    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.3"></circle><path d="m16 16 4.2 4.2"></path></svg>
-  </button>
-  <button type="button" class="home-edit-done" id="home-edit-open" aria-controls="secs" hidden>편집</button>
-  <button type="button" class="home-edit-done" id="home-edit-done" hidden>완료</button>
+  <button type="button" class="theme-cycle" id="theme-cycle" aria-label="화면 모드: 자동"></button>
+  <span class="who" id="who" data-account-entry><i aria-hidden="true"></i><span></span></span>
   <!-- Settings sheet. The two section shells are static so their order is
        readable here rather than assembled in script; harness rows are drawn from
        the existing owner snapshot poller at the foot of this file.
@@ -627,15 +691,16 @@
       <div class="store-title" id="store-title">앱스토어</div>
       <button type="button" class="store-close" id="store-close" aria-label="앱스토어 닫기">✕</button>
     </div>
-    <div class="store-tabs" role="tablist" aria-label="앱스토어 분류">
-      <button type="button" class="store-tab" id="store-tab-installed" role="tab"
-              aria-selected="true" aria-controls="store-pane-installed" data-store-tab="installed">설치됨 <span class="store-tab-count" id="store-installed-count">0</span></button>
+    <!-- Three menus, one per origin. "설치됨" was never a menu: it is a state,
+         and a state has its own button on every row. "외부 서비스" was a fourth
+         menu for one kind of row, which the Personal menu now carries. -->
+    <div class="store-tabs" role="tablist" aria-label="앱스토어 항목">
       <button type="button" class="store-tab" id="store-tab-public" role="tab"
-              aria-selected="false" aria-controls="store-pane-public" data-store-tab="public" tabindex="-1">공개 앱</button>
+              aria-selected="true" aria-controls="store-pane-public" data-store-tab="public">Public</button>
       <button type="button" class="store-tab" id="store-tab-company" role="tab"
-              aria-selected="false" aria-controls="store-pane-company" data-store-tab="company" tabindex="-1">사내 앱</button>
+              aria-selected="false" aria-controls="store-pane-company" data-store-tab="company" tabindex="-1">Company</button>
       <button type="button" class="store-tab" id="store-tab-personal" role="tab"
-              aria-selected="false" aria-controls="store-pane-personal" data-store-tab="personal" tabindex="-1">개인 앱</button>
+              aria-selected="false" aria-controls="store-pane-personal" data-store-tab="personal" tabindex="-1">Personal</button>
     </div>
     <div class="store-body" id="store-body">
       <!-- When the numbers below were measured. The badge on the entrance counts the
@@ -643,23 +708,25 @@
            than left to look current. -->
       <div class="store-progress-note" id="store-checked"></div>
       <div class="store-alert" id="store-alert" role="status" hidden></div>
-      <section class="store-pane" id="store-pane-installed" role="tabpanel" aria-labelledby="store-tab-installed">
-        <div id="store-installed"></div>
-      </section>
-      <section class="store-pane" id="store-pane-public" role="tabpanel" aria-labelledby="store-tab-public" hidden>
+      <section class="store-pane" id="store-pane-public" role="tabpanel" aria-labelledby="store-tab-public">
         <div id="store-public"></div>
       </section>
       <section class="store-pane" id="store-pane-company" role="tabpanel" aria-labelledby="store-tab-company" hidden>
         <div id="store-company"></div>
       </section>
+      <!-- Personal: links the owner added, and one line that adds another. A
+           value starting with https:// is a link; anything else is a local app
+           path and takes the existing package-preview -> engine install route. -->
       <section class="store-pane" id="store-pane-personal" role="tabpanel" aria-labelledby="store-tab-personal" hidden>
-        <p class="store-personal-note">카탈로그나 업로드는 없습니다. 이 박스의 로컬 패키지 경로를 읽어 manifest·권한·포트를 먼저 보여 드립니다.</p>
-        <form class="store-personal-form" id="store-personal-form">
-          <label for="store-personal-path">패키지 경로 <span class="store-personal-hint">(airlock-app.toml이 있는 폴더)</span></label>
-          <input type="text" id="store-personal-path" name="path" autocomplete="off" autocapitalize="none" spellcheck="false"
-                 placeholder="/home/me/apps/my-app" required>
-          <button type="submit" class="store-action store-action-primary store-personal-submit" id="store-personal-preview">미리보기</button>
-          <div class="store-personal-hint">미리보기는 설정을 바꾸지 않습니다. 승인하면 [packages.X] path와 [apps.X]를 쓰고 전체 설치기를 실행합니다. airlock.toml을 손으로 고쳐도 같은 경로를 탑니다.</div>
+        <div id="store-personal"></div>
+        <form class="store-personal-form" id="store-add-form">
+          <label for="store-add-name">이름</label>
+          <input type="text" id="store-add-name" name="name" maxlength="80" autocomplete="off" required>
+          <label for="store-add-value">https 주소 또는 로컬 앱 경로</label>
+          <input type="text" id="store-add-value" name="value" autocomplete="off" autocapitalize="none" spellcheck="false"
+                 placeholder="https://example.com" required>
+          <button type="submit" class="store-action store-action-primary store-personal-submit" id="store-add-submit">추가</button>
+          <div class="store-personal-hint" id="store-add-hint">링크는 나만 봅니다. 로컬 앱 경로는 앱 명세와 권한을 먼저 보여 드리고 설치를 누르면 그 앱만 설치합니다.</div>
         </form>
       </section>
       <section class="store-detail" id="store-detail" aria-live="polite" hidden>
@@ -670,12 +737,12 @@
         <dl class="store-kv" id="store-detail-kv"></dl>
         <div class="store-caps" id="store-detail-caps"></div>
         <div class="store-actions" id="store-detail-actions"></div>
-        <div class="store-progress-note" id="store-progress-note">앱별 transaction 전까지 모든 변경은 전체 설치기를 다시 실행합니다.</div>
+        <div class="store-progress-note" id="store-progress-note">선택한 앱만 설치하거나 제거합니다. 다른 앱은 건드리지 않습니다.</div>
         <ol class="store-progress" id="store-progress">
-          <li>설정 후보 작성</li>
-          <li>airlock-config validate</li>
-          <li>설정 원자 치환</li>
-          <li>전체 설치기 재실행</li>
+          <li>앱 명세 확인</li>
+          <li>설치 기록 확인</li>
+          <li>선택한 앱 적용</li>
+          <li>설치 결과 확인</li>
         </ol>
       </section>
     </div>
@@ -684,18 +751,23 @@
 <main>
   <div class="msgstrip" id="msgstrip" hidden></div>
   <div class="launcher-find" id="launcher-find" hidden>
-    <input type="search" id="app-find" aria-label="Find an app"
-           placeholder="Find an app" autocomplete="off" autocapitalize="none" spellcheck="false">
-    <button type="button" class="find-close" id="find-close" aria-label="Close app search">
+    <input type="search" id="app-find" aria-label="앱 검색"
+           placeholder="앱 검색" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <button type="button" class="find-close" id="find-close" aria-label="앱 검색 닫기">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>
     </button>
   </div>
-  <!-- One headed section per tile group; the headings and their order come from
-       airlockTileSections below, not from this markup, because a box names its
-       own shortcut sections in airlock.toml. -->
-  <div id="secs"></div>
-  <p class="empty" id="empty" hidden>No apps enabled. Add app tables to <code>airlock.toml</code>.</p>
-  <p class="empty" id="no-matches" hidden>No apps match.</p>
+  <!-- One list, no headings. The order comes from the owner's saved home order
+       and the owner names the one or two lines they want in it. -->
+  <div id="home" class="apps"></div>
+  <!-- The edit mode's only control. It appears with the mode, names what the
+       mode is, and disappears at the line cap rather than disabling itself. -->
+  <div class="home-editbar" id="home-editbar">
+    <span>빈 곳을 누르면 끝</span>
+    <button type="button" class="home-addline" id="home-addline">+ 선 추가</button>
+  </div>
+  <p class="empty" id="empty" hidden>설치된 앱이 없습니다. 앱스토어에서 앱을 설치하세요.</p>
+  <p class="empty" id="no-matches" hidden>검색 결과가 없습니다.</p>
 </main>
 
 <!-- suggestion box — same-origin; the owner identity is attached server-side by the
@@ -704,21 +776,21 @@
      Collapsed: only the small trigger shows until it is clicked. -->
 <section class="feedback" id="feedback" hidden>
   <button type="button" class="fb-open" id="fb-open"
-          aria-expanded="false" aria-controls="fb-panel">Feedback</button>
+          aria-expanded="false" aria-controls="fb-panel">의견 보내기</button>
   <div class="fb-panel" id="fb-panel" role="region" aria-labelledby="fb-title" hidden>
-    <div class="sec-h" id="fb-title">Feedback</div>
-    <button type="button" class="fb-close" id="fb-close" aria-label="Close feedback">
+    <div class="set-h" id="fb-title">의견 보내기</div>
+    <button type="button" class="fb-close" id="fb-close" aria-label="의견 보내기 닫기">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/></svg>
     </button>
-    <textarea id="fb-text" aria-label="Feedback" placeholder="Share a suggestion"></textarea>
+    <textarea id="fb-text" aria-label="의견 보내기" placeholder="제안이나 의견을 적어 주세요"></textarea>
     <div class="fb-row">
-      <button type="button" class="fb-send" id="fb-send">Send</button>
+      <button type="button" class="fb-send" id="fb-send">보내기</button>
       <span class="fb-status" id="fb-status" role="status" aria-live="polite"></span>
     </div>
   </div>
 </section>
 
-<footer>Airlock · self-hosted developer workspace · open source (<a href="https://www.gnu.org/licenses/agpl-3.0.html" rel="license noopener" target="_blank">AGPL-3.0</a>) · <a href="https://github.com/spacewalk-labs/airlock" rel="noopener" target="_blank">source</a> · © 2026 Sunghyeon Cho</footer>
+<footer>Airlock · 직접 운영하는 개발 작업 공간 · 오픈 소스 (<a href="https://www.gnu.org/licenses/agpl-3.0.html" rel="license noopener" target="_blank">AGPL-3.0</a>) · <a href="https://github.com/spacewalk-labs/airlock" rel="noopener" target="_blank">소스 코드</a> · © 2026 Sunghyeon Cho</footer>
 
 <script>
 async function j(url) { const r = await fetch(url, { cache: "no-store" }); return r.ok ? r.json() : null; }
@@ -749,38 +821,84 @@ function airlockTileMeta(entry) {
            path: t.path, glyph: t.glyph || null, brand: t.icon || null };
 }
 
-// The heading for tiles that name no section — the packages, i.e. what this box
-// actually runs. Shortcuts name their own heading in airlock.toml (bin/airlock-
-// config defaults it to "Shortcuts" and always emits it), so this constant is
-// the ONLY heading text the launcher owns.
-const AIRLOCK_TOOLS_SECTION = "Tools";
+// How many named lines the home screen carries. Two is the whole rule, and it
+// lives here and nowhere else: the hub is the only place a line is created, so
+// the cap is a product decision made where the decision happens. The server
+// normalises the SHAPE of a line and never counts them.
+const AIRLOCK_HOME_LINES = 2;
 
-// Said on screen under any section that holds a shortcut. The gate is the one
-// thing a shortcut tile cannot inherit: it looks like every other tile, and the
-// difference — a different origin, a different sign-in, nobody checking the
-// Airlock identity — is invisible until you have already clicked.
-const AIRLOCK_SHORTCUT_NOTE =
-  "These leave Airlock: each opens on another host in a new tab and does its own sign-in. The Airlock gate does not cover them.";
-
-// Group tiles into the headed sections the launcher draws, in draw order.
-// Pure — takes the webjson apps map and the names to place, returns
-// [{ title, names }] — so install/test-hub-sections.sh can exercise it in node
-// without a browser.
+// What the home screen draws, in order. Pure, so install/test-hub-filter.sh can
+// hold it against fixtures in node.
 //
-// Order is first-seen, with one exception: the unnamed group (what runs here)
-// is pinned first. First-seen means webjson's key order, and webjson is sorted
-// by app id — so without the pin, a single shortcut whose id sorts ahead of
-// every package id would open the launcher with the tiles that send you away.
-function airlockTileSections(apps, names) {
-  const order = [], by = new Map();
-  for (const name of names) {
-    const title = apps[name].section || AIRLOCK_TOOLS_SECTION;
-    if (!by.has(title)) { by.set(title, []); order.push(title); }
-    by.get(title).push(name);
+// An app row survives when the install record (③) names it — not when a config
+// table does. A link row survives on its own, because a link has no install
+// record; what a link needs is to be on the home order at all.
+//
+// `installed` is null when the owner API could not be read, and then nothing is
+// filtered at all: an unreadable order must leave the manifest's list intact
+// rather than replace it with an empty launcher. That is the whole reason this
+// function filters against an argument instead of counting tiles itself.
+function airlockHomeItems(order, installed, apps) {
+  const catalogue = (apps && typeof apps === "object") ? apps : {};
+  const rows = Array.isArray(order) ? order : [];
+  const have = (installed == null) ? null
+    : new Set(Array.isArray(installed) ? installed : []);
+  return rows.filter(row => {
+    if (row !== null && typeof row === "object")
+      return typeof row.line === "string";
+    if (typeof row !== "string" || !row) return false;
+    const entry = catalogue[row];
+    if (have === null) return !!entry;
+    if (entry && entry.link) return true;
+    return have.has(row);
+  });
+}
+
+// Which of the three icons a row draws: the image, else a glyph the sprite really
+// has, else the default. Decided before anything touches the DOM so both the
+// launcher tile and the store row go through the same answer — the earlier split
+// is what shipped a blank square for a file that was never staged.
+//
+// `hasGlyph` is injectable so node can hold this without a document. An unknown
+// glyph name renders as an empty tile with no error anywhere, which is exactly
+// the failure this check exists to prevent.
+function airlockIcon(entry, hasGlyph) {
+  const known = typeof hasGlyph === "function" ? hasGlyph
+    : (id) => typeof document !== "undefined" && !!document.getElementById(id);
+  const image = entry && typeof entry.icon === "string" ? entry.icon.trim() : "";
+  const glyph = entry && typeof entry.glyph === "string" ? entry.glyph.trim() : "";
+  if (image) return { kind: "image", src: image };
+  if (glyph && known(glyph)) return { kind: "glyph", id: glyph };
+  return { kind: "glyph", id: "app-default" };
+}
+
+// The DOM half of airlockIcon, shared by the home tile and the store row. One
+// image failing is not a blank tile: the row falls to the glyph declared beside
+// it in the same entry, and to the default glyph if there is none.
+function airlockIconNode(entry, className, onBrand) {
+  const box = document.createElement("span");
+  box.className = className;
+  const icon = airlockIcon(entry);
+  if (icon.kind !== "image") {
+    box.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><use href="#'
+      + icon.id + '"/></svg>';
+    return box;
   }
-  const first = order.indexOf(AIRLOCK_TOOLS_SECTION);
-  if (first > 0) order.splice(0, 0, order.splice(first, 1)[0]);
-  return order.map(title => ({ title: title, names: by.get(title) }));
+  const img = document.createElement("img");
+  img.src = icon.src; img.alt = ""; img.draggable = false;
+  img.addEventListener("error", () => {
+    // Same entry, image dropped: airlockIcon then decides between the glyph the
+    // source declared and the default. Passing its previous RESULT back in would
+    // read {kind, id} as an entry and skip the declared glyph entirely.
+    box.textContent = "";
+    box.classList.remove("has-brand");
+    box.appendChild(airlockIconNode(Object.assign({}, entry, { icon: "" }), "").firstChild);
+    if (onBrand) onBrand(false);
+  }, { once: true });
+  box.appendChild(img);
+  box.classList.add("has-brand");
+  if (onBrand) onBrand(true);
+  return box;
 }
 
 function airlockPersonalTier(entry) {
@@ -788,7 +906,6 @@ function airlockPersonalTier(entry) {
 }
 
 const AIRLOCK_COMPANY_IDS = new Set();
-const AIRLOCK_INSTALLED_COMPANY_IDS = new Set();
 
 function airlockTierMark(kind) {
   const mark = document.createElement("span");
@@ -798,25 +915,21 @@ function airlockTierMark(kind) {
   return mark;
 }
 
-// Company packages use the same explicit package table as personal packages.
-// Keep the installed, locally-persisted origin apart from readable catalog rows:
-// it restores an approved tile's dot after Git credentials disappear but cannot
-// create a company tab row or an install action.
-function airlockSetInstalledCompanyIds(installed) {
-  AIRLOCK_INSTALLED_COMPANY_IDS.clear();
-  for (const row of Array.isArray(installed) ? installed : []) {
-    if (row && row.tier === "company" && typeof row.id === "string") {
-      AIRLOCK_INSTALLED_COMPANY_IDS.add(row.id);
-    }
-  }
-}
-
-function airlockApplyCompanyCatalog(rows) {
+// Which tiles are Company packages. The answer is the store's own `origin`
+// column, so the dot on a launcher tile and the menu its row sits in cannot
+// disagree — the projection a tile used to be marked from is gone, and a second
+// place to answer "is this company" would be exactly that place again.
+function airlockSetCompanyIds(rows) {
   AIRLOCK_COMPANY_IDS.clear();
   for (const row of Array.isArray(rows) ? rows : []) {
-    if (row && typeof row.id === "string") AIRLOCK_COMPANY_IDS.add(row.id);
+    if (row && row.origin === "company" && typeof row.id === "string") {
+      AIRLOCK_COMPANY_IDS.add(row.id);
+    }
   }
-  for (const id of AIRLOCK_INSTALLED_COMPANY_IDS) AIRLOCK_COMPANY_IDS.add(id);
+  reflectCompanyMarks();
+}
+
+function reflectCompanyMarks() {
   for (const tile of document.querySelectorAll(".app[data-app-name]")) {
     const label = tile.querySelector(".lb");
     if (!label) continue;
@@ -1006,16 +1119,30 @@ function airlockHarnessRunLine(state) {
 }
 
 (function () {
-  const themes = new Set(["system", "light", "dark"]);
+  // Auto -> Light -> Dark, then Auto again. One button, because that is one
+  // decision with three answers; three buttons made the header wider than the
+  // search control on a phone and asked the same question three times.
+  const order = ["system", "light", "dark"];
+  const themes = new Set(order);
+  const names = { system: "자동", light: "밝게", dark: "어둡게" };
+  const glyphs = {
+    system: '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/>',
+    light: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+    dark: '<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/>',
+  };
   const root = document.documentElement;
-  const buttons = document.querySelectorAll(".theme-group [data-theme-btn]");
+  const button = document.getElementById("theme-cycle");
   const themeColor = document.querySelector('meta[name="theme-color"]');
   const lightPreference = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
 
   function reflect(theme) {
-    buttons.forEach(button => {
-      button.setAttribute("aria-pressed", String(button.dataset.themeBtn === theme));
-    });
+    if (button) {
+      button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true">'
+        + glyphs[theme] + "</svg>";
+      const label = "화면 모드: " + names[theme];
+      button.title = label;
+      button.setAttribute("aria-label", label);
+    }
     const light = theme === "light" || (theme === "system" && lightPreference && lightPreference.matches);
     if (themeColor) themeColor.content = light ? "#f5f5f7" : "#0a0f1e";
   }
@@ -1023,11 +1150,18 @@ function airlockHarnessRunLine(state) {
   function setTheme(theme) {
     if (!themes.has(theme)) theme = "system";
     root.dataset.theme = theme;
+    // The same key the launcher's first paint already reads, so a reload cannot
+    // disagree with what the button last showed.
     try { localStorage.setItem("markwand-theme", theme); } catch (_) {}
     reflect(theme);
   }
 
-  buttons.forEach(button => button.addEventListener("click", () => setTheme(button.dataset.themeBtn)));
+  if (button) {
+    button.addEventListener("click", () => {
+      const next = order[(order.indexOf(root.dataset.theme) + 1) % order.length];
+      setTheme(themes.has(next) ? next : "system");
+    });
+  }
   if (lightPreference && lightPreference.addEventListener) {
     lightPreference.addEventListener("change", () => {
       if (root.dataset.theme === "system") reflect("system");
@@ -1037,130 +1171,153 @@ function airlockHarnessRunLine(state) {
 })();
 
 (async () => {
-  const [cfg, me] = [await j("/__airlock.json"), await j("/whoami")];
+  let cfg = await j("/__airlock.json");
+  const me = await j("/whoami");
   if (cfg && cfg.product) {
     document.getElementById("product").textContent = cfg.product;
     document.title = cfg.product;
   }
-  if (me && me.login) document.getElementById("who").textContent = me.login;
+  const who = document.getElementById("who");
+  if (who && me && me.login) {
+    // The pill keeps the address and its initial; the narrow header drops the
+    // address (see the .who rule) and keeps the initial.
+    who.querySelector("i").textContent = String(me.login).trim().charAt(0).toUpperCase();
+    who.querySelector("span").textContent = me.login;
+  }
 
-  const secs = document.getElementById("secs");
-  const apps = (cfg && cfg.apps) || {};
-  // Canonical host for cross-port links (see the href below). Only accept a
-  // dotted name — a short hostname has no certificate.
-  const HOST = (cfg && cfg.fqdn && cfg.fqdn.indexOf(".") > 0) ? cfg.fqdn : location.hostname;
-  // "feedback" is not a launcher tile — it's the suggestion box below the grid.
-  const names = Object.keys(apps).filter(n => n !== "hub" && n !== "feedback");
-  if (!names.length) { document.getElementById("empty").hidden = false; return; }
-  const tiles = new Map();
+  const home = document.getElementById("home");
+  let apps = (cfg && cfg.apps) || {};
+  const manifestNames = () => Object.keys(apps).filter(n => n !== "hub" && n !== "feedback");
 
-  // The server is the shared source of the order.  A missing optional owner API
-  // leaves the manifest order untouched; it never turns a failed read into an empty
-  // launcher.  The server itself discards retired ids and appends new ids.
-  let homeOrder = names.slice();
+  // The saved home order, and what the install record says is on this box.
+  // `installed` is null until an owner read answers, and null means "do not
+  // filter" — an unreadable owner API must leave the manifest's list intact
+  // rather than replace the launcher with nothing.
+  let homeOrder = manifestNames();
+  let installed = null;
   if (me && me.role === "owner") {
     try {
       const response = await fetch("/monitor/api/owner/home/order", { cache: "no-store" });
       const value = response.ok ? await response.json() : null;
-      if (value && Array.isArray(value.order)) homeOrder = value.order;
+      // `installed: null` means this box could not name its install record. An
+      // empty `order` next to it is the server's honest "I know nothing", not a
+      // request to blank the launcher — so the manifest order stands.
+      if (value && Array.isArray(value.order) && value.installed !== null) {
+        homeOrder = value.order;
+        installed = Array.isArray(value.installed) ? value.installed : null;
+      }
     } catch (_) {}
   }
-  const homeRank = new Map(homeOrder.map((id, index) => [id, index]));
-  names.sort((left, right) =>
-    (homeRank.has(left) ? homeRank.get(left) : Number.MAX_SAFE_INTEGER) -
-    (homeRank.has(right) ? homeRank.get(right) : Number.MAX_SAFE_INTEGER));
 
-  for (const sec of airlockTileSections(apps, names)) {
-    // The grid is filled first and the section is attached only if a tile landed
-    // in it. Whether a tile renders is decided per tile below (owner audience, no
-    // [tile] at all), so a heading built up front is a heading that can end up
-    // standing over nothing.
-    const grid = document.createElement("div");
-    grid.className = "apps";
-    let anyShortcut = false;
-
-    for (const name of sec.names) {
-      if (!airlockTileVisible(apps[name].audience, me && me.role)) continue;
-      const meta = airlockTileMeta(apps[name]);
-      if (!meta) continue;
-      if (apps[name].shortcut) anyShortcut = true;
-      const port = apps[name].port;
-      // Ported same-box tools navigate IN PLACE (one-app feel — the return widget
-      // brings you back). Only a genuinely third-party service (external=true in
-      // airlock.toml) opens a new tab. A separate-port tool is reached via the
-      // deployment FQDN so its URL matches the Tailscale cert — that cert covers
-      // the FQDN ONLY, so a short hostname or an IP would give the browser a link
-      // it cannot verify. Prefer the FQDN the installer measured (cfg.fqdn) over
-      // location.hostname: then the tiles are correct no matter which origin this
-      // page was opened from.
-      const external = !!(apps[name].external || meta.external);
-      const href = port ? `https://${HOST}:${port}/` : (meta.path || `/${name}/`);
-
-      const a = document.createElement("a");
-      a.className = "app";
-      a.href = href;
-      a.dataset.appName = name;
-      a.dataset.baseTier = airlockPersonalTier(apps[name]);
-      if (meta.cat) a.dataset.cat = meta.cat;
-      if (external) { a.target = "_blank"; a.rel = "noopener"; }
-
-      const ic = document.createElement("span");
-      ic.className = "ic";
-      if (meta.brand) {                    // real brand icon (full-bleed image)
-        a.classList.add("has-brand");
-        const img = document.createElement("img");
-        img.src = meta.brand; img.alt = "";
-        ic.appendChild(img);
-      } else if (meta.glyph) {
-        ic.innerHTML = '<svg viewBox="0 0 24 24"><use href="#' + meta.glyph + '"/></svg>';
-      }
-      const lb = document.createElement("span");
-      lb.className = "lb";
-      lb.textContent = meta.label;
-      const tier = AIRLOCK_COMPANY_IDS.has(name) ? "company" : a.dataset.baseTier;
-      if (tier) lb.appendChild(airlockTierMark(tier));
-
-      a.append(ic, lb);
-      if (me && me.role === "owner") {
-        const disable = document.createElement("button");
-        disable.type = "button";
-        disable.className = "app-disable";
-        disable.dataset.disableApp = name;
-        disable.setAttribute("aria-label", meta.label + " 끄기");
-        disable.title = "앱 끄기";
-        disable.textContent = "×";
-        a.appendChild(disable);
-      }
-      if (meta.sub) {
-        const sub = document.createElement("span");
-        sub.className = "sub";
-        sub.textContent = meta.sub;
-        a.appendChild(sub);
-      }
-      grid.appendChild(a);
-      tiles.set(name, a);
+  function renderHubTiles(nextCfg) {
+    cfg = nextCfg;
+    apps = (cfg && cfg.apps) || {};
+    if (cfg && cfg.product) {
+      document.getElementById("product").textContent = cfg.product;
+      document.title = cfg.product;
     }
-
-    if (!grid.children.length) continue;
-    const wrap = document.createElement("section");
-    wrap.className = "sec";
-    const h = document.createElement("div");
-    h.className = "sec-h";
-    h.textContent = sec.title;
-    wrap.appendChild(h);
-    // Keyed off the tiles that actually rendered, not off the section's declared
-    // membership: the note has to be true of what a viewer can see.
-    if (anyShortcut) {
-      const note = document.createElement("p");
-      note.className = "sec-note";
-      note.textContent = AIRLOCK_SHORTCUT_NOTE;
-      wrap.appendChild(note);
+    // Only use a dotted canonical name for external port links. A short hostname
+    // has no certificate, so location.hostname is only a fallback.
+    const host = (cfg && cfg.fqdn && cfg.fqdn.indexOf(".") > 0) ? cfg.fqdn : location.hostname;
+    home.textContent = "";
+    for (const row of airlockHomeItems(homeOrder, installed, apps)) {
+      home.appendChild(row !== null && typeof row === "object"
+        ? lineNode(row)
+        : tileNode(String(row), host));
     }
-    wrap.appendChild(grid);
-    secs.appendChild(wrap);
+    reflectCompanyMarks();
+    reflectLines();
+    filterApps();
   }
 
-  if (!tiles.size) { document.getElementById("empty").hidden = false; return; }
+  function tileNode(name, host) {
+    const entry = apps[name] || {};
+    if (!airlockTileVisible(entry.audience, me && me.role)) return document.createComment("hidden");
+    const meta = airlockTileMeta(entry);
+    if (!meta) return document.createComment("no tile");
+
+    const a = document.createElement("a");
+    a.className = "app";
+    // An <a> carries the platform's own long-press drag on touch, and the
+    // gesture this screen owns is a long press. Not negotiable.
+    a.draggable = false;
+    a.href = entry.port ? `https://${host}:${entry.port}/` : (meta.path || `/${name}/`);
+    a.dataset.appName = name;
+    a.dataset.appLabel = meta.label;
+    a.dataset.baseTier = airlockPersonalTier(entry);
+    a.dataset.homeRow = "1";
+    if (meta.cat) a.dataset.cat = meta.cat;
+    if (entry.external || meta.external) { a.target = "_blank"; a.rel = "noopener"; }
+
+    a.appendChild(airlockIconNode(
+      { icon: meta.brand, glyph: meta.glyph }, "ic",
+      brand => a.classList.toggle("has-brand", brand)));
+    const lb = document.createElement("span");
+    lb.className = "lb";
+    lb.textContent = meta.label;
+    const tier = AIRLOCK_COMPANY_IDS.has(name) ? "company" : a.dataset.baseTier;
+    if (tier) lb.appendChild(airlockTierMark(tier));
+    a.appendChild(lb);
+    if (meta.sub) {
+      const sub = document.createElement("span");
+      sub.className = "sub";
+      sub.textContent = meta.sub;
+      a.appendChild(sub);
+    }
+    return a;
+  }
+
+  // Two hooks the editor installs, declared where a line node can reach them. A
+  // line is drawn for every viewer but only the owner may rename or drop one, so
+  // both default to doing nothing and the owner block replaces them.
+  let removeLine = () => {};
+  let renameLine = () => {};
+
+  // A named line. In edit mode the label becomes an input and a × appears; the
+  // name is saved on change rather than on every keystroke, so typing a name is
+  // one write instead of one per letter.
+  function lineNode(row) {
+    const node = document.createElement("div");
+    node.className = "home-line";
+    node.dataset.homeRow = "1";
+    node.dataset.homeLine = row.line || "";
+    // Assigned once the node exists, so a name typed and then Tab-ed away is
+    // saved without the person having to click the row first.
+    node.__line = row;
+    const rule = document.createElement("hr");
+    const label = document.createElement("div");
+    label.className = "home-line-label";
+    const name = document.createElement("span");
+    name.className = "home-line-name";
+    name.textContent = row.line || "";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 40;
+    input.value = row.line || "";
+    input.placeholder = "이 선의 이름";
+    input.setAttribute("aria-label", "선 이름");
+    // change, not input: one write per finished name, not one per keystroke.
+    input.addEventListener("change", () => renameLine(node, input.value));
+    const drop = document.createElement("button");
+    drop.type = "button";
+    drop.className = "home-line-drop";
+    drop.dataset.homeDropLine = "1";
+    drop.setAttribute("aria-label", "선 지우기");
+    drop.textContent = "×";
+    label.append(name, input, drop);
+    node.append(rule, label);
+    node.addEventListener("click", event => {
+      if (event.target.closest("[data-home-drop-line]")) {
+        event.preventDefault(); event.stopPropagation();
+        removeLine(node);
+      }
+    });
+    node.__rename = (value) => {
+      name.textContent = value;
+      node.dataset.homeLine = value;
+    };
+    return node;
+  }
 
   const findWrap = document.getElementById("launcher-find");
   const find = document.getElementById("app-find");
@@ -1171,18 +1328,16 @@ function airlockHarnessRunLine(state) {
   function filterApps() {
     const query = find.value;
     let matches = 0;
-    for (const section of secs.querySelectorAll(".sec")) {
-      let sectionMatches = 0;
-      for (const tile of section.querySelectorAll(".app")) {
-        const meta = airlockTileMeta(apps[tile.dataset.appName]);
-        const visible = airlockMatchesApp(tile.dataset.appName, meta.label, query);
-        tile.hidden = !visible;
-        if (visible) { sectionMatches += 1; matches += 1; }
-      }
-      section.hidden = !sectionMatches;
+    // Lines are structure, not content: searching for an app must not hide the
+    // dividers, or the results read as one unrelated list.
+    for (const node of home.querySelectorAll("[data-home-row]")) {
+      if (node.dataset.homeLine !== undefined) continue;
+      const meta = airlockTileMeta(apps[node.dataset.appName]);
+      const visible = airlockMatchesApp(node.dataset.appName, meta && meta.label, query);
+      node.hidden = !visible;
+      if (visible) matches += 1;
     }
-    const searching = !!String(query).trim();
-    noMatches.hidden = !searching || !!matches;
+    noMatches.hidden = !String(query).trim() || !!matches;
   }
 
   function closeFind() {
@@ -1207,34 +1362,141 @@ function airlockHarnessRunLine(state) {
     else filterApps();
   });
 
-  // Long press and the owner edit button enter edit mode. Pointer events give mouse and
-  // touch one implementation, while FLIP keeps the non-dragged icons moving into
-  // their new slots instead of jumping. The × badge calls the app-store disable
-  // API; it never turns a configuration change into an in-page DOM-only deletion.
+  // Re-read both halves of what the launcher draws and redraw. The store calls
+  // this after adding or placing a link, because the server republished
+  // /__airlock.json and moved the id inside the home order — neither of which
+  // this page can see without asking again. A failure keeps the last render: an
+  // unreadable projection must not blank a home screen somebody is using.
+  window.airlockRefreshHubTiles = async function () {
+    let value;
+    try {
+      const response = await fetch("/__airlock.json", { cache: "no-store" });
+      if (!response.ok) return false;
+      value = await response.json();
+    } catch (_) { return false; }
+    if (!value || typeof value !== "object" || Array.isArray(value)
+        || !value.apps || typeof value.apps !== "object" || Array.isArray(value.apps)) {
+      return false;
+    }
+    if (me && me.role === "owner") {
+      try {
+        const response = await fetch("/monitor/api/owner/home/order", { cache: "no-store" });
+        const read = response.ok ? await response.json() : null;
+        if (read && Array.isArray(read.order) && read.installed !== null) {
+          homeOrder = read.order;
+          installed = Array.isArray(read.installed) ? read.installed : installed;
+        } else if (read && Array.isArray(read.order) && read.installed === null) {
+          // This box cannot name its install record. Keeping the previous filter
+          // would keep hiding the apps it can no longer vouch for, so the filter
+          // comes off and the manifest's own order stands. A read that FAILED is
+          // a different thing and keeps the last render.
+          installed = null;
+          homeOrder = Object.keys(value.apps).filter(n => n !== "hub" && n !== "feedback");
+        }
+      } catch (_) {}
+    }
+    renderHubTiles(value);
+    filterApps();
+    return true;
+  };
+
+  // The DOM is the order. Every write this screen makes — a drop, a new line, a
+  // renamed line, a removed one — is "ask the list what it now says, save that",
+  // so there is no second copy to fall out of step with what is on screen. Hidden
+  // ids are the server's to preserve: it re-attaches every id the saved file
+  // holds, which is exactly what the client cannot see.
+  function visibleOrder() {
+    return Array.from(home.querySelectorAll("[data-home-row]"), node =>
+      node.dataset.homeLine !== undefined ? { line: node.dataset.homeLine }
+                                          : node.dataset.appName);
+  }
+
+  async function persist() {
+    if (!(me && me.role === "owner")) return;
+    const order = visibleOrder();
+    try {
+      const response = await fetch("/monitor/api/owner/home/order", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ order }),
+      });
+      const value = response.ok ? await response.json() : null;
+      if (value && Array.isArray(value.order)) homeOrder = value.order;
+    } catch (_) {}
+  }
+
+  function reflectLines() {
+    const addline = document.getElementById("home-addline");
+    if (!addline) return;
+    const lines = airlockHomeItems(homeOrder, installed, apps)
+      .filter(row => row !== null && typeof row === "object").length;
+    addline.hidden = lines >= AIRLOCK_HOME_LINES;
+  }
+
+  // Long press edits: one gesture from press to drag. Pointer events give mouse
+  // and touch the same implementation; FLIP keeps the icons that are not being
+  // dragged moving into their new slots instead of jumping.
   if (me && me.role === "owner") {
-    const done = document.getElementById("home-edit-done");
-    const edit = document.getElementById("home-edit-open");
     const root = document.documentElement;
     root.dataset.homeOrderOwner = "1";
-    edit.hidden = false;
     let editing = false;
     let drag = null, ghost = null, pressTimer = null, pointerId = null;
     let pressPointerId = null, pressX = 0, pressY = 0, pressSlop = 6;
+    let justDragged = false, lastX = NaN, lastY = NaN;
 
     function setEditing(on) {
       editing = on;
       root.dataset.homeEdit = on ? "1" : "0";
-      done.hidden = !on;
-      edit.hidden = on;
+      if (!on && document.activeElement && document.activeElement.blur) {
+        document.activeElement.blur();
+      }
+      reflectLines();
     }
-    function appsIn(grid) { return Array.from(grid.querySelectorAll(":scope > .app")); }
-    function moveTo(target) {
-      if (!drag || !target || target === drag || target.parentElement !== drag.parentElement) return;
-      const grid = drag.parentElement;
-      const nodes = appsIn(grid);
+
+    function rowsIn() {
+      return Array.from(home.querySelectorAll("[data-home-row]"));
+    }
+
+    // Remove exactly the line that was pressed, and ask the DOM for the result.
+    // Filtering by name took every line with that name — including two unnamed
+    // ones — and re-rendering before the removal rebuilt the row that was being
+    // removed, so the DOM and the saved array stopped being the same thing.
+    removeLine = (node) => {
+      setEditing(true);
+      node.remove();
+      homeOrder = visibleOrder();
+      renderHubTiles(cfg);
+      const input = home.querySelector(".home-line input");
+      if (input) input.focus();
+      persist();
+    };
+
+    renameLine = (node, value) => {
+      if (node.__rename) node.__rename(value);
+      homeOrder = visibleOrder();
+      persist();
+    };
+
+    // `after` is the caller's read of the pointer against the target's midpoint:
+    // a line spans the whole column so it is read vertically, a tile horizontally.
+    function moveTo(target, after) {
+      if (!drag || !target || target === drag
+          || target.parentElement !== drag.parentElement) return;
+      const nodes = rowsIn();
+      const here = nodes.indexOf(drag), there = nodes.indexOf(target);
+      // 🔴 Settle before moving. The FLIP slide animates the tiles for 160ms after
+      // each insert, and getBoundingClientRect reports the ANIMATED box — so the
+      // next pointermove reads a target that is still sliding and can compute the
+      // other side of it. Without this check the row shuffles back and forth for as
+      // long as the finger rests. Adjacency is the whole test: a row already
+      // immediately on the requested side of the target is where it belongs.
+      if (after ? here === there + 1 : here === there - 1) return;
       const before = new Map(nodes.map(node => [node, node.getBoundingClientRect()]));
-      grid.insertBefore(drag, nodes.indexOf(drag) < nodes.indexOf(target) ? target.nextSibling : target);
-      for (const node of appsIn(grid)) {
+      // `after` is the pointer's side of the target's midpoint, and it decides the
+      // insert position on its own. A dragged row also swaps sides when it passes
+      // the target, so a plain "is the drag before or after" test alone puts a
+      // drop on the far side of a full-width line.
+      home.insertBefore(drag, (after ? target.nextSibling : target));
+      for (const node of rowsIn()) {
         if (node === drag) continue;
         const from = before.get(node), to = node.getBoundingClientRect();
         const dx = from.left - to.left, dy = from.top - to.top;
@@ -1244,21 +1506,7 @@ function airlockHarnessRunLine(state) {
         requestAnimationFrame(() => { node.classList.add("home-slide"); node.style.transform = ""; });
       }
     }
-    async function persist() {
-      const visible = Array.from(secs.querySelectorAll(".app")).map(node => node.dataset.appName);
-      const visibleSet = new Set(visible);
-      let cursor = 0;
-      const order = homeOrder.map(id => visibleSet.has(id) ? visible[cursor++] : id);
-      for (const id of visible) if (!order.includes(id)) order.push(id);
-      try {
-        const response = await fetch("/monitor/api/owner/home/order", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ order }),
-        });
-        const value = response.ok ? await response.json() : null;
-        if (value && Array.isArray(value.order)) homeOrder = value.order;
-      } catch (_) {}
-    }
+
     function stop(event) {
       if (event && event.pointerId !== (drag ? pointerId : pressPointerId)) return;
       if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
@@ -1266,11 +1514,15 @@ function airlockHarnessRunLine(state) {
       if (!drag) return;
       if (ghost) ghost.remove();
       drag.classList.remove("home-dragging");
-      if (drag.hasPointerCapture(pointerId)) drag.releasePointerCapture(pointerId);
+      lastX = NaN; lastY = NaN;
+      if (drag.hasPointerCapture && drag.hasPointerCapture(pointerId)) {
+        drag.releasePointerCapture(pointerId);
+      }
       drag = ghost = null;
       pointerId = null;
       persist();
     }
+
     function start(node, event) {
       drag = node;
       pointerId = event.pointerId;
@@ -1280,24 +1532,37 @@ function airlockHarnessRunLine(state) {
       ghost.style.top = event.clientY + "px";
       document.body.appendChild(ghost);
       node.classList.add("home-dragging");
-      node.setPointerCapture(event.pointerId);
+      if (node.setPointerCapture) node.setPointerCapture(event.pointerId);
     }
-    secs.addEventListener("pointerdown", event => {
+
+    home.addEventListener("pointerdown", event => {
       if (!event.isPrimary || event.button !== 0 || drag || pressTimer) return;
-      if (event.target.closest(".app-disable")) return;
-      const node = event.target.closest(".app");
-      if (!node || !secs.contains(node)) return;
+      const node = event.target.closest("[data-home-row]");
+      if (!node || node.dataset.homeLine !== undefined || !home.contains(node)) return;
       if (editing) { event.preventDefault(); start(node, event); return; }
       pressPointerId = event.pointerId;
       pressX = event.clientX; pressY = event.clientY;
       pressSlop = event.pointerType === "mouse" ? 6 : 16;
       pressTimer = setTimeout(() => {
         pressTimer = null;
-        // touch-action is fixed at pointerdown. Lift before dragging so the next
-        // gesture starts with edit-mode touch-action:none and cannot become a scroll.
+        // touch-action is fixed at pointerdown, so it is lifted HERE and the same
+        // pointerId starts the drag. Lifting it after the press, or on a later
+        // press, is what made the old code require letting go and pressing again.
         setEditing(true);
+        start(node, event);
       }, 500);
     });
+
+    // 🔴 The first gesture is the hard one. `touch-action` is read at pointerdown
+    // and cannot be raised afterwards, and a `pointermove` preventDefault arrives
+    // too late: the browser has already committed to a scroll and answers with
+    // pointercancel. A non-passive `touchmove` is the only signal that arrives
+    // while the scroll is still cancelable, so it is bound for the whole press —
+    // pending or dragging — not only for the drag.
+    document.addEventListener("touchmove", event => {
+      if (pressTimer || drag) event.preventDefault();
+    }, { passive: false });
+
     document.addEventListener("pointermove", event => {
       if (!drag) {
         if (pressTimer && event.pointerId === pressPointerId
@@ -1307,53 +1572,87 @@ function airlockHarnessRunLine(state) {
         return;
       }
       if (event.pointerId !== pointerId) return;
+      // 🔴 A resting finger is not a new drop decision. pointermove keeps firing
+      // while the FLIP slide animates the tiles, and the box it measures against
+      // is the ANIMATED one — so a settled row gets read as being on the wrong
+      // side and shuffled back, and the row oscillates for as long as the finger
+      // rests. The pointer is the only input here, so an unmoved pointer means
+      // there is nothing new to decide.
+      if (event.clientX === lastX && event.clientY === lastY) return;
+      lastX = event.clientX; lastY = event.clientY;
       ghost.style.left = event.clientX + "px";
       ghost.style.top = event.clientY + "px";
       const target = document.elementFromPoint(event.clientX, event.clientY);
-      moveTo(target && target.closest(".app"));
+      const over = target && target.closest("[data-home-row]");
+      if (!over || over === drag) return;
+      const box = over.getBoundingClientRect();
+      const after = over.dataset.homeLine !== undefined
+        ? event.clientY > box.top + box.height / 2
+        : event.clientX > box.left + box.width / 2;
+      moveTo(over, after);
+    }, { passive: false });
+
+    document.addEventListener("pointerup", () => {
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+      pressPointerId = null;
+      if (drag) { stop(); justDragged = true; setTimeout(() => { justDragged = false; }, 0); }
     });
-    document.addEventListener("pointerup", stop);
     document.addEventListener("pointercancel", stop);
-    secs.addEventListener("lostpointercapture", stop);
+    home.addEventListener("lostpointercapture", stop);
     window.addEventListener("blur", () => stop());
     document.addEventListener("visibilitychange", () => { if (document.hidden) stop(); });
-    secs.addEventListener("pointerleave", event => {
+    home.addEventListener("pointerleave", event => {
       if (!drag && pressTimer && event.pointerId === pressPointerId && event.buttons) {
         clearTimeout(pressTimer); pressTimer = null; pressPointerId = null;
       }
     });
-    secs.addEventListener("click", async event => {
-      const disable = event.target.closest("button[data-disable-app]");
-      if (disable) {
-        event.preventDefault(); event.stopPropagation();
-        if (!editing || disable.disabled) return;
-        disable.disabled = true;
-        try {
-          const response = await fetch("/monitor/api/owner/apps/" + encodeURIComponent(disable.dataset.disableApp) + "/disable", {
-            method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
-          });
-          if (response.ok) {
-            const tile = disable.closest(".app");
-            if (tile) tile.remove();
-            window.dispatchEvent(new CustomEvent("airlock-apps-changed"));
-          } else disable.disabled = false;
-        } catch (_) { disable.disabled = false; }
-        return;
-      }
+
+    // The empty space ends the edit, and Esc ends it. There is no edit button and
+    // no done button: the gesture that started it is the one you already know how
+    // to finish.
+    // A tap on a tile is a launch, unless the screen is in edit mode — where the
+    // same tap would otherwise navigate away from the list you are rearranging.
+    home.addEventListener("click", event => {
       if (editing && event.target.closest(".app")) event.preventDefault();
     }, true);
-    secs.addEventListener("contextmenu", event => {
+    document.addEventListener("click", event => {
+      // The click a drop produces must not also end the edit: the finger can lift
+      // over empty space, and that is the same gesture, not a second one. Swallow
+      // exactly that click rather than a timer — a dropped click that leaks into
+      // the next one would close the mode the person is still using.
+      const dropped = justDragged;
+      justDragged = false;
+      if (!editing || dropped) return;
+      if (event.target.closest("[data-home-row], header, .home-editbar")) return;
+      stop(); setEditing(false);
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && editing) { stop(); setEditing(false); }
+    });
+    home.addEventListener("contextmenu", event => {
       if (event.target.closest(".app")) { event.preventDefault(); stop(); }
     });
-    secs.addEventListener("dragstart", event => { if (event.target.closest(".app")) event.preventDefault(); });
-    edit.addEventListener("click", () => { stop(); setEditing(true); done.focus(); });
-    done.addEventListener("click", () => { stop(); setEditing(false); edit.focus(); });
-    document.addEventListener("keydown", event => {
-      if (event.key === "Escape" && editing) { stop(); setEditing(false); edit.focus(); }
+    home.addEventListener("dragstart", event => {
+      if (event.target.closest("[data-home-row]")) event.preventDefault();
     });
+    const addline = document.getElementById("home-addline");
+    if (addline) {
+      addline.addEventListener("click", event => {
+        event.stopPropagation();
+        if (homeOrder.filter(row => row !== null && typeof row === "object").length
+            >= AIRLOCK_HOME_LINES) return;
+        homeOrder = homeOrder.concat([{ line: "" }]);
+        setEditing(true);
+        renderHubTiles(cfg);
+        const inputs = home.querySelectorAll(".home-line input");
+        if (inputs.length) inputs[inputs.length - 1].focus();
+        persist();
+      });
+    }
+    reflectLines();
   }
+  renderHubTiles(cfg);
 })();
-
 // iOS home-screen standalone: a plain same-origin <a> can bounce out to Safari.
 // Force same-origin navigations through location.href so they stay in the app.
 // Cross-origin links (separate-port tools, external=true) are left alone.
@@ -1382,9 +1681,10 @@ if (("standalone" in navigator) && navigator.standalone) {
 
 <script>
 // Owner app store — one modal sheet over the launcher. The backend owns app facts
-// and mutation validation; this page only renders the single GET contract and POSTs
-// named lifecycle actions. Company pins and personal packages both converge on the
-// backend's ordinary config writer and full-installer path.
+// and mutation validation; this page renders the GET contract and POSTs named
+// actions. Three menus, one per origin: a row's state is the backend's word for
+// it and this file never re-judges it. Installing an app uses the full-installer
+// path; adding a link writes the link file and republishes the projection.
 (async () => {
   const open = document.getElementById("store-open");
   const modal = document.getElementById("store-modal");
@@ -1399,82 +1699,34 @@ if (("standalone" in navigator) && navigator.standalone) {
   const detailCaps = document.getElementById("store-detail-caps");
   const detailActions = document.getElementById("store-detail-actions");
   const progressNote = document.getElementById("store-progress-note");
-  const installedEl = document.getElementById("store-installed");
   const publicEl = document.getElementById("store-public");
   const companyEl = document.getElementById("store-company");
-  const personalForm = document.getElementById("store-personal-form");
-  const personalPath = document.getElementById("store-personal-path");
-  const personalPreviewButton = document.getElementById("store-personal-preview");
-  const installedCount = document.getElementById("store-installed-count");
+  const personalEl = document.getElementById("store-personal");
+  const addForm = document.getElementById("store-add-form");
+  const addName = document.getElementById("store-add-name");
+  const addValue = document.getElementById("store-add-value");
+  const addSubmit = document.getElementById("store-add-submit");
   const tabs = Array.from(modal.querySelectorAll("[data-store-tab]"));
   const panes = Array.from(modal.querySelectorAll(".store-pane"));
   const badge = document.getElementById("store-badge");
   const checkedEl = document.getElementById("store-checked");
   if (!open || !modal || !close || !body) return;
 
+  // The three words a row can say, and nothing else. Every row's state comes
+  // from the backend's single `state` field, so a row and its detail can never
+  // tell two different stories about whether something is installed.
+  const STATE_LABEL = { update: "업데이트", install: "설치", installed: "설치됨" };
+  const ORIGIN_WORD = { public: "Public", company: "Company", personal: "Personal" };
+
   let snapshot = null;
+  let rows = [];
   let selected = null;
   let lastFocus = null;
   let runTimer = null;
   let installRun = false;
 
-  function label(row) {
-    return String(row && row.tile && row.tile.label || row && row.label || row && row.id || "앱");
-  }
-  function note(row) {
-    return String(row && row.tile && (row.tile.sub || row.tile.description) || "");
-  }
-  function source(row) {
-    const value = row && row.source;
-    if (!value) return "";
-    if (typeof value === "string") return value;
-    return String(value.path || value.repo || value.kind || "");
-  }
-  // The source class the projection reports, in words. It is the difference between
-  // "the platform release vouches for these bytes" and "this box's owner pointed at a
-  // local path", which is the whole reason the digest line below reads differently for
-  // each. Only the four values the backend actually emits are translated; anything else
-  // (a path, a repo) is shown as it came, because inventing a grade for an unknown
-  // value is how a personal package starts looking platform-signed.
-  const SOURCE_WORDS = { platform: "플랫폼 릴리스", builtin: "공개 릴리스",
-                         shipped: "플랫폼 동봉", explicit: "개인 앱 · 로컬 경로" };
-  function sourceLabel(row) {
-    const value = source(row);
-    return value ? (SOURCE_WORDS[value] || value) : "";
-  }
-  function digest(row) {
-    if (row && (row.digest || row.tree_digest)) return String(row.digest || row.tree_digest);
-    const kind = source(row);
-    if (kind === "platform" || kind === "builtin" || kind === "shipped") {
-      return "플랫폼 릴리스가 보증";
-    }
-    return kind === "explicit" ? "이 응답에서 airlock.lock digest 확인 불가" : "확인 불가";
-  }
-  function caps(row) {
-    const value = row && row.capabilities;
-    if (Array.isArray(value)) return value.map(String);
-    if (value && typeof value === "object") return Object.keys(value).filter(key => value[key]);
-    return [];
-  }
   function updates(data) {
     return data && data.updates && typeof data.updates === "object" ? data.updates : {};
-  }
-  function updateRows(data) { return airlockUpdateApps(updates(data)); }
-  function updateCount(data) {
-    return airlockUpdateCount(updates(data));
-  }
-  function updateFor(row) {
-    if (row && row.update && typeof row.update === "object") return row.update;
-    return updateRows(snapshot).find(item => item.id === row.id) || null;
-  }
-  function hasUpdate(row) {
-    return !!updateFor(row);
-  }
-  function needsReview(row) { const value = updateFor(row); return !!(value && value.action === "lock-mismatch"); }
-  function companyReason(row) {
-    const reason = String(row && row.reason || "");
-    if (!reason) return "";
-    return reason === "build_artifact" ? "빌드 산출물이 필요함 (build_artifact)" : reason;
   }
   function setAlert(text, bad) {
     alert.textContent = text || "";
@@ -1500,135 +1752,131 @@ if (("standalone" in navigator) && navigator.standalone) {
     if (on) {
       lastFocus = document.activeElement;
       setAlert("", false);
-      tabs.find(tab => tab.getAttribute("aria-selected") === "true").focus();
+      const current = tabs.find(tab => tab.getAttribute("aria-selected") === "true");
+      (current || tabs[0]).focus();
       pollApps();
     } else if (lastFocus && lastFocus.focus) lastFocus.focus();
   }
-  function actionButton(text, action, id, primary, disabled, title) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "store-action" + (primary ? " store-action-primary" : "")
-      + (action === "remove" ? " store-action-danger" : "");
-    button.textContent = text;
-    button.dataset.storeAction = action;
-    if (id) button.dataset.appId = id;
-    button.disabled = !!disabled;
-    if (title) button.title = title;
-    return button;
+  function empty(target, text) {
+    const el = document.createElement("div");
+    el.className = "store-empty";
+    el.textContent = text;
+    target.appendChild(el);
   }
-  function row(item, kind) {
+
+  // What pressing this row's one button does. Derived from `state` and nothing
+  // else — no client-side re-judging of what is installed, which is what let the
+  // old sheet and its detail disagree.
+  function actionFor(row) {
+    if (row.kind === "link") {
+      return row.state === "install" ? { action: "place-link", primary: false } : null;
+    }
+    // The platform is a row, but it is not an app id: `action: "app"` with
+    // id "platform" is refused as not-pending, so the two must be told apart.
+    if (row.state === "update") {
+      return row.kind === "platform"
+        ? { action: "platform", primary: true } : { action: "update", primary: true };
+    }
+    if (row.state !== "install") return null;
+    if (row.kind === "platform") return null;
+    return { action: "install", primary: true };
+  }
+
+  function rowNode(row) {
     const wrap = document.createElement("div");
     wrap.className = "store-row";
+    wrap.dataset.storeRow = row.id;
+    wrap.appendChild(airlockIconNode({ icon: row.icon, glyph: row.glyph },
+      "store-row-icon", brand => wrap.classList.toggle("has-brand", brand)));
     const text = document.createElement("div");
     text.className = "store-row-text";
     const name = document.createElement("div");
-    name.className = "store-row-name"; name.textContent = label(item);
-    if (kind === "company" || AIRLOCK_COMPANY_IDS.has(item.id)) name.appendChild(airlockTierMark("company"));
-    else if (source(item) === "explicit") name.appendChild(airlockTierMark("personal"));
-    const sub = document.createElement("div");
-    sub.className = "store-row-note";
-    sub.textContent = kind === "company" && item.installed === true
-      ? "설치됨 · 사내 카탈로그"
-      : kind === "company" && item.installable !== true
-      ? "설치 불가 · " + (companyReason(item) || "이유 없음")
-      : needsReview(item)
-      ? "설치된 바이트가 airlock.lock 과 다릅니다 — 개인 앱 탭에서 재승인이 필요합니다"
-      : note(item) || (kind === "public" ? "Airlock 공개 릴리스에 포함된 앱"
-        : kind === "company" ? "사내 카탈로그" : "설치됨");
-    text.append(name, sub);
-    if (sourceLabel(item)) {
-      const src = document.createElement("div");
-      src.className = "store-row-source"; src.textContent = sourceLabel(item);
-      text.appendChild(src);
+    name.className = "store-row-name";
+    name.textContent = row.name || row.id;
+    if (row.origin === "company" || row.origin === "personal") {
+      name.appendChild(airlockTierMark(row.origin === "company" ? "company" : "personal"));
     }
-    const actions = document.createElement("div");
-    actions.className = "store-actions";
-    if (kind === "public") actions.appendChild(actionButton("설치", "enable", item.id, true));
-    else if (kind === "company") actions.appendChild(actionButton(item.installed === true ? "설치됨"
-      : item.installable === true ? "설치" : "설치 불가", "install-company", item.id, true,
-      item.installed === true || item.installable !== true,
-      item.installed === true ? "이미 설치된 앱입니다." : companyReason(item)));
-    else actions.appendChild(actionButton(needsReview(item) ? "검토" : hasUpdate(item) ? "업데이트" : "관리",
-      "detail", item.id, hasUpdate(item) && !needsReview(item)));
-    wrap.append(text, actions);
+    const note = document.createElement("div");
+    note.className = "store-row-note";
+    note.textContent = row.desc || "";
+    note.title = row.desc || "";
+    text.append(name, note);
+    wrap.appendChild(text);
+
+    const spec = actionFor(row);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "store-action" + (spec && spec.primary ? " store-action-primary" : "");
+    button.textContent = STATE_LABEL[row.state] || row.state;
+    button.disabled = !spec;
+    if (spec) {
+      button.dataset.storeAction = spec.action;
+      button.dataset.appId = row.id;
+      if (!spec.primary) button.title = "홈 화면에 놓기";
+    } else if (row.state === "installed") {
+      button.title = "이미 이 박스에 있습니다.";
+    }
+    wrap.appendChild(button);
+
+    // Where a row's origin, address and icon came from. Off the row until it is
+    // asked for: hover on a pointer, a tap on a finger. A second pinned row closes
+    // the first, so the sheet never grows a stack of open boxes.
+    const pop = document.createElement("div");
+    pop.className = "store-detail-pop";
+    const list = document.createElement("dl");
+    const pairs = [["출처", ORIGIN_WORD[row.origin] || row.origin],
+                   ["식별자", row.id], ["상태", STATE_LABEL[row.state] || row.state]];
+    if (row.url) pairs.push(["링크", row.url]);
+    // The backend's own detail pairs (a package's served path today; the digest
+    // and source grade arrive with P3_ENGINE's unified repository). Rendered as
+    // with a Korean path label; other fields keep their supplied name.
+    for (const [key, value] of Object.entries(row.detail || {})) pairs.push([key === "Path" ? "경로" : key, value]);
+    for (const [key, value] of pairs) {
+      const dt = document.createElement("dt"); dt.textContent = key;
+      const dd = document.createElement("dd"); dd.textContent = String(value);
+      list.append(dt, dd);
+    }
+    pop.appendChild(list);
+    wrap.appendChild(pop);
     return wrap;
   }
-  // What the platform row says, in three states that must stay distinguishable:
-  // measured-and-behind, measured-and-current, and not-measured. The third one used to
-  // read like the second — an absent snapshot fell into the "manage" wording — and
-  // "we could not check" showing as "nothing to do" is the one reading this row must
-  // never produce. `changedCount` and `ref` are shown only when the detector supplied
-  // them; neither is computed here.
-  function platformSub(value) {
-    if (!value || typeof value !== "object" || typeof value.available !== "boolean") {
-      return "플랫폼 업데이트를 확인하지 못했습니다";
-    }
-    const where = value.ref ? " · 기준 " + value.ref : "";
-    if (!value.available) return "새 플랫폼 버전 없음" + where;
-    const size = typeof value.changedCount === "number" && value.changedCount > 0
-      ? " · 파일 " + value.changedCount + "개 변경" : "";
-    return "새 플랫폼 버전이 있습니다" + size + where;
-  }
-  function platformRow() {
-    const value = updates(snapshot).platform || {};
-    const item = { id: "platform", tile: { label: "Airlock 플랫폼", sub: platformSub(value) },
-      source: "platform" };
-    const wrap = row(item, "installed");
-    const button = wrap.querySelector("button");
-    button.dataset.storeAction = "platform-detail";
-    button.textContent = value.available ? "업데이트" : "상세";
-    return wrap;
-  }
-  function empty(target, text) {
-    const el = document.createElement("div"); el.className = "store-empty"; el.textContent = text;
-    target.appendChild(el);
-  }
+
   function render(data) {
     snapshot = data;
-    const installed = Array.isArray(data.installed) ? data.installed : [];
-    const available = Array.isArray(data.public) ? data.public : [];
-    const company = Array.isArray(data.company) ? data.company : [];
-    airlockSetInstalledCompanyIds(installed);
-    airlockApplyCompanyCatalog(company);
-    installedEl.textContent = "";
+    rows = Array.isArray(data.rows) ? data.rows.filter(r => r && r.id) : [];
+    airlockSetCompanyIds(rows);
     publicEl.textContent = "";
     companyEl.textContent = "";
-    installedEl.appendChild(platformRow());
-    for (const item of installed) installedEl.appendChild(row(item, "installed"));
-    for (const item of available) publicEl.appendChild(row(item, "public"));
-    const installedIds = new Set(installed.map(item => item.id));
-    for (const item of company) companyEl.appendChild(row(
-      Object.assign({}, item, { installed: installedIds.has(item.id) }), "company"));
-    if (!available.length) empty(publicEl, "설치할 공개 앱이 없습니다.");
-    if (!company.length) empty(companyEl, "이 박스에서 읽을 수 있는 사내 앱이 없습니다.");
-    // `installed` omits hub because the platform row represents it; the tab count
-    // still equals the canonical `airlock-config json` apps count. A lock mismatch
-    // makes that strict projection unavailable, so do not turn the review-only rows
-    // into a false inventory count.
-    installedCount.textContent = data.degraded === "lock-mismatch"
-      ? "확인 필요" : String(installed.length + 1);
-    if (data.degraded === "lock-mismatch") {
-      setAlert("외부 앱 바이트가 잠금과 달라 전체 설치 목록을 읽지 못했습니다. 개인 앱 탭에서 경로를 다시 읽고 재승인하십시오.", true);
+    personalEl.textContent = "";
+    const groups = { public: [], company: [], personal: [] };
+    for (const row of rows) (groups[row.origin] || groups.public).push(row);
+    const byState = { update: 0, installed: 1, install: 2 };
+    for (const origin of Object.keys(groups)) {
+      const target = origin === "public" ? publicEl : origin === "company" ? companyEl : personalEl;
+      groups[origin].sort((a, b) => (byState[a.state] - byState[b.state])
+        || String(a.name).localeCompare(String(b.name)));
+      for (const row of groups[origin]) target.appendChild(rowNode(row));
+      if (!groups[origin].length) {
+        empty(target, origin === "company"
+          ? "이 박스에서 읽을 수 있는 사내 앱이 없습니다."
+          : origin === "personal" ? "개인 앱과 링크가 없습니다." : "설치할 공개 앱이 없습니다.");
+      }
     }
-    const byInstalledId = new Map(installed.map(item => [item.id, item]));
-    for (const button of document.querySelectorAll("button[data-disable-app]")) {
-      const item = byInstalledId.get(button.dataset.disableApp);
-      button.disabled = !item || !item.canRemove;
-      button.title = button.disabled
-        ? "deactivate.sh가 없어 끌 수 없습니다."
-        : "앱 끄기";
-    }
-    // One object, two readings: the count on the entrance and the time on this line
-    // come from the same `updates(data)`, so the badge can never advertise a number
-    // from one collection while the sheet dates it to another. An absent or unusable
-    // `checkedAt` says so — a number with no time behind it is not fresh, it is
-    // undated, and the store's own reading of it must not round that up.
+    // One object, two readings: the count on the entrance and the time on this
+    // line come from the same `updates(data)`, so the badge can never advertise a
+    // number from one collection while the sheet dates it to another. An absent or
+    // unusable `checkedAt` says so — a number with no time behind it is not fresh.
     const snap = updates(data);
     const when = airlockWhen(snap.checkedAt);
     checkedEl.textContent = when
       ? "마지막 확인 " + when
       : "확인 기록 없음 — 아래 숫자가 언제 측정된 것인지 알 수 없습니다";
-    const count = updateCount(data);
+    // The badge counts the rows that offer an update button.
+    if (typeof window.airlockSetUpdateIds === "function") {
+      window.airlockSetUpdateIds(rows.filter(item => item.state === "update")
+        .map(item => item.id));
+    }
+    const count = rows.filter(item => item.state === "update").length;
     badge.hidden = count === 0;
     badge.textContent = String(count);
     open.setAttribute("aria-label", count ? "앱스토어 — 업데이트 " + count + "건" : "앱스토어");
@@ -1636,58 +1884,113 @@ if (("standalone" in navigator) && navigator.standalone) {
     document.documentElement.dataset.appStore = "1";
     if (selected && selected.kind === "personal" && selected.preview) {
       showPersonalPreview(selected.preview);
-    } else if (selected) {
-      const installedItem = installed.find(item => item.id === selected.id);
-      const publicItem = available.find(item => item.id === selected.id);
-      const current = selected.id === "platform"
-        ? { id: "platform", tile: { label: "Airlock 플랫폼" }, source: "platform" }
-        : installedItem || publicItem;
-      if (current) showDetail(current, publicItem ? "public" : "installed");
-      else setTab("installed", false);
     }
   }
+
+  async function pollApps() {
+    let response;
+    try {
+      response = await fetch("/monitor/api/owner/apps", { cache: "no-store" });
+    } catch (_) { return false; }
+    if (response.status === 403 || response.status === 404) {
+      setOpen(false); open.hidden = true; delete document.documentElement.dataset.appStore;
+      return false;
+    }
+    if (!response.ok) return false;
+    let value; try { value = await response.json(); } catch (_) { return false; }
+    if (!value || typeof value !== "object" || Array.isArray(value)
+        || !Array.isArray(value.rows)) return false;
+    render(value);
+    return true;
+  }
+
+  // Adding one thing to Personal. An https value is a link; anything else is a
+  // local package path and takes the same preview -> engine install route, so the two kinds of personal thing share one line instead of two menus.
+  async function addPersonal(event) {
+    event.preventDefault();
+    const name = addName.value.trim();
+    const value = addValue.value.trim();
+    if (!name || !value) return;
+    if (value.startsWith("https://")) {
+      addSubmit.disabled = true;
+      setAlert("링크를 추가합니다…", false);
+      // Two different things share the word "value" here: what a person typed and
+      // what the server answered. They must not share a binding, or the request
+      // posts the second one's initial null.
+      let response, answer = null;
+      try {
+        response = await fetch("/monitor/api/owner/apps/links/add", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: name, url: value }),
+        });
+        try { answer = await response.json(); } catch (_) {}
+      } catch (_) {
+        addSubmit.disabled = false;
+        setAlert("응답을 받지 못했습니다. 연결을 확인하고 다시 시도하십시오.", true);
+        return;
+      }
+      addSubmit.disabled = false;
+      if (!response.ok || !answer || answer.ok !== true) {
+        const reason = answer && (answer.error || answer.reason);
+        setAlert(reason === "bad_link_url" ? "HTTPS 주소를 확인하십시오."
+          : reason === "bad_link_name" ? "이름을 확인하십시오."
+          : reason === "config_conflict" ? "설정이 바뀌었습니다. 다시 읽고 추가하십시오."
+          : reason === "hub_refresh_failed" ? "홈 화면을 새로 고치지 못했습니다. 잠시 후 다시 시도하십시오."
+          : reason === "run_active" || reason === "updater_busy"
+            ? "지금은 설치기가 실행 중입니다. 끝난 뒤 다시 시도하십시오."
+          : "추가하지 못했습니다. 입력을 확인하고 다시 시도하십시오.", true);
+        return;
+      }
+      addForm.reset();
+      await refreshLinkViews();
+      setAlert(answer.changed === false ? "이미 있는 링크입니다." : "링크를 추가했습니다.", false);
+      return;
+    }
+    previewPersonal(value);
+  }
+
+  async function refreshLinkViews() {
+    // The launcher draws links from the manifest projection, so a link edit
+    // refreshes the launcher in place and then re-reads the store. The store's
+    // own sheet stays mounted and open.
+    const hubRefreshed = typeof window.airlockRefreshHubTiles === "function"
+      ? await window.airlockRefreshHubTiles() : false;
+    const appsRefreshed = await pollApps();
+    return hubRefreshed && appsRefreshed;
+  }
+
+  // Placing an existing link on the home screen is the same write the launcher
+  // makes: read the order, append this id, post it back. No second endpoint for
+  // one append.
+  async function placeLink(id, button) {
+    button.disabled = true;
+    setAlert("홈 화면에 놓습니다…", false);
+    let response, value = null;
+    try {
+      response = await fetch("/monitor/api/owner/home/order", { cache: "no-store" });
+      value = response.ok ? await response.json() : null;
+      if (!value || !Array.isArray(value.order)) throw new Error("order unavailable");
+      response = await fetch("/monitor/api/owner/home/order", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ order: value.order.concat([id]) }),
+      });
+      const written = response.ok ? await response.json() : null;
+      if (!response.ok || !written || !Array.isArray(written.order)) throw new Error("write failed");
+    } catch (_) {
+      if (button.isConnected) button.disabled = false;
+      setAlert("홈 화면에 놓지 못했습니다. 다시 시도하십시오.", true);
+      return;
+    }
+    const refreshed = await window.airlockRefreshHubTiles();
+    await pollApps();
+    setAlert(refreshed ? "홈 화면에 놓았습니다." : "홈 화면에 놓았지만 새로 읽지 못했습니다. 다시 열어 확인하십시오.",
+      !refreshed);
+  }
+
   function kv(name, value) {
     const dt = document.createElement("dt"); dt.textContent = name;
     const dd = document.createElement("dd"); dd.textContent = value || "-";
     detailKv.append(dt, dd);
-  }
-  function showDetail(item, kind) {
-    selected = { id: item.id, kind };
-    for (const pane of panes) pane.hidden = true;
-    detail.hidden = false;
-    detailTitle.textContent = label(item);
-    detailNote.textContent = item.id === "platform" ? "Airlock 플랫폼 업데이트" : note(item);
-    detailKv.textContent = "";
-    kv("ID", item.id);
-    kv("소스", sourceLabel(item));
-    kv("digest", digest(item));
-    detailCaps.textContent = "";
-    const values = caps(item);
-    for (const value of values) {
-      const chip = document.createElement("span"); chip.className = "store-cap"; chip.textContent = value;
-      detailCaps.appendChild(chip);
-    }
-    if (!values.length) {
-      const chip = document.createElement("span"); chip.className = "store-cap"; chip.textContent = "추가 권한 없음";
-      detailCaps.appendChild(chip);
-    }
-    const actions = detailActions;
-    actions.textContent = "";
-    if (item.id === "platform") {
-      const available = !!(updates(snapshot).platform && updates(snapshot).platform.available);
-      actions.appendChild(actionButton("플랫폼 업데이트 실행", "platform", "", true, !available,
-        available ? "" : "새 플랫폼 버전이 없습니다."));
-    } else if (kind === "public") {
-      actions.appendChild(actionButton("설치", "enable", item.id, true));
-    } else {
-      if (needsReview(item)) actions.appendChild(actionButton("재승인", "personal-review", item.id, true, false,
-        "개인 앱 탭에서 경로와 새 digest를 확인합니다."));
-      else if (hasUpdate(item)) actions.appendChild(actionButton("업데이트", "update", item.id, true));
-      actions.appendChild(actionButton("끄기", "disable", item.id, false, !item.canRemove,
-        item.canRemove ? "" : "deactivate.sh가 없어 끌 수 없습니다."));
-      actions.appendChild(actionButton("삭제", "remove", item.id, false, !item.canRemove,
-        item.canRemove ? "앱 데이터는 남습니다." : "deactivate.sh가 없어 삭제할 수 없습니다."));
-    }
   }
   function previewPorts(value) {
     const ports = value && value.package && value.package.serve_port_values;
@@ -1698,12 +2001,12 @@ if (("standalone" in navigator) && navigator.standalone) {
     selected = { id: value.id, kind: "personal", preview: value };
     for (const pane of panes) pane.hidden = true;
     detail.hidden = false;
-    detailTitle.textContent = value.package && value.package.tile ? label(value.package) : value.id;
+    detailTitle.textContent = value.package && value.package.tile ? value.package.tile.label : value.id;
     detailNote.textContent = "개인 앱 · 로컬 경로";
     detailKv.textContent = "";
-    kv("ID", value.id);
+    kv("식별자", value.id);
     kv("경로", value.path);
-    kv("digest", value.digest);
+    kv("해시", value.digest);
     kv("포트", previewPorts(value));
     kv("신뢰", "이 코드를 운영자 권한으로 실행함 — 샌드박스 아님");
     detailCaps.textContent = "";
@@ -1715,7 +2018,7 @@ if (("standalone" in navigator) && navigator.standalone) {
       const denied = rejected.has(capability);
       chip.className = "store-cap";
       chip.dataset.denied = String(denied);
-      chip.textContent = capability + (denied ? " · 거부" : granted.has(capability) ? " · 승인" : "");
+      chip.textContent = capability + (denied ? " · 거부" : granted.has(capability) ? " · 허용" : "");
       detailCaps.appendChild(chip);
     }
     if (!requested.length) {
@@ -1723,34 +2026,29 @@ if (("standalone" in navigator) && navigator.standalone) {
       chip.textContent = "추가 권한 없음"; detailCaps.appendChild(chip);
     }
     detailActions.textContent = "";
-    const conflict = value.conflict ? "설정 충돌: " + value.conflict : "";
     const deniedText = rejected.size ? "거부된 capability를 manifest에서 빼야 합니다: " + Array.from(rejected).join(", ") : "";
-    const registered = value.registered === true;
-    const reapprove = value.requires_reapproval === true;
-    const action = registered && reapprove ? "reapprove" : "register";
-    const title = deniedText || conflict || (registered && !reapprove ? "현재 digest가 이미 승인되어 있습니다." : "");
-    const disabled = value.installable !== true || (registered && !reapprove);
-    detailActions.appendChild(actionButton(reapprove ? (registered ? "재승인" : "재승인하고 설치") : registered ? "이미 승인됨" : "승인하고 설치",
-      action, value.id, true, disabled, title));
-    progressNote.textContent = reapprove
-      ? "digest가 바뀌었습니다. 재승인하면 airlock.lock을 갱신하고 전체 설치기를 다시 실행합니다."
-      : "승인하면 설정을 원자 치환하고 전체 설치기를 다시 실행합니다.";
+    const title = deniedText;
+    const disabled = value.installable !== true;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "store-action store-action-primary";
+    button.textContent = "설치";
+    button.dataset.storeAction = "register";
+    button.dataset.appId = value.id;
+    button.disabled = disabled;
+    if (title) button.title = title;
+    detailActions.appendChild(button);
+    progressNote.textContent = "선택한 경로에서 이 앱만 설치합니다.";
   }
   async function pollRun() {
     let response;
     try { response = await fetch("/monitor/api/owner/updates/run", { cache: "no-store" }); }
     catch (_) {
-      // A dropped request is not a finished run. The retry below is unchanged — this
-      // line only stops the previous "진행 중입니다" from standing as the last word
-      // while nothing is being read, which is the same rule the two branches below
-      // already follow and the one this branch was missing.
+      // A dropped request is not a finished run.
       progressNote.textContent = "실행 상태를 읽지 못했습니다 (연결 끊김) — 끝났는지 아직 알 수 없습니다.";
       runTimer = setTimeout(pollRun, 4000);
       return;
     }
-    // A failed read is not a finished run. Leaving the previous line up would let
-    // "진행 중입니다" stand as the last word after the answer stopped coming, which
-    // reads as an install still going or, worse, one that finished.
     if (!response.ok) {
       progressNote.textContent = "실행 상태를 읽지 못했습니다 (HTTP " + response.status +
         ") — 끝났는지 아직 알 수 없습니다.";
@@ -1766,17 +2064,14 @@ if (("standalone" in navigator) && navigator.standalone) {
     }
     const run = value && value.run;
     if (run && (run.status === "starting" || run.status === "running")) {
-      progressNote.textContent = "전체 설치기 재실행 — 진행 중입니다. 연결이 잠시 끊길 수 있습니다.";
+      progressNote.textContent = "앱 설치 — 진행 중입니다.";
       runTimer = setTimeout(pollRun, 2500);
       return;
     }
     progressNote.textContent = run && run.status === "done"
-      ? "전체 설치기 재실행 — 완료되었습니다."
-      : run ? "전체 설치기 재실행 — 끝맺지 못했습니다." : "앱별 transaction 전까지 모든 변경은 전체 설치기를 다시 실행합니다.";
-    if (installRun) {
-      installRun = false;
-      setTab("installed", false);
-    }
+      ? "앱 설치 — 완료되었습니다."
+      : run ? "앱 설치 — 끝맺지 못했습니다." : "선택한 앱만 설치하거나 제거합니다. 다른 앱은 건드리지 않습니다.";
+    if (installRun) { installRun = false; setTab("public", false); }
     pollApps();
   }
   async function mutate(action, id, button) {
@@ -1785,11 +2080,11 @@ if (("standalone" in navigator) && navigator.standalone) {
     const path = action === "platform" || action === "update"
       ? "/monitor/api/owner/updates/execute"
       : "/monitor/api/owner/apps/" + encodeURIComponent(id) + "/" + action;
-    const personal = (action === "register" || action === "reapprove") && selected && selected.preview;
-    const installs = personal || action === "install-company";
+    const personal = action === "register" && selected && selected.preview;
+    const installs = personal || action === "install";
     const payload = action === "platform" ? { action: "platform" }
       : action === "update" ? { action: "app", id }
-      : personal ? { path: selected.preview.path, digest: selected.preview.digest } : {};
+      : personal ? { path: selected.preview.path } : {};
     let response;
     try {
       response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -1802,23 +2097,19 @@ if (("standalone" in navigator) && navigator.standalone) {
     let value = null; try { value = await response.json(); } catch (_) {}
     if (!response.ok) {
       button.disabled = false;
-      const messages = { remove_unavailable: "deactivate.sh가 없어 삭제할 수 없습니다.",
-        disable_unavailable: "deactivate.sh가 없어 끌 수 없습니다.",
-        app_not_installed: "이미 꺼진 앱입니다.", app_already_enabled: "이미 설치된 앱입니다.",
+      const messages = { app_not_installed: "설치되지 않은 앱입니다.",
         bad_app_id: "앱 이름을 알아보지 못했습니다.", run_active: "이미 설치기가 실행 중입니다.",
         // Measured against the handlers, not guessed: airlock-dev-monitor.py answers
-        // these three on this very path and the map had no words for any of them, so
-        // each arrived as a bare HTTP number.
+        // these on this very path and the map had no words for any of them, so each
+        // arrived as a bare HTTP number.
         app_not_pending: "이 앱은 지금 업데이트 대상이 아닙니다. 목록을 새로 읽어 주십시오.",
         bad_action: "이 동작을 알아보지 못했습니다.",
         bad_package_path: "패키지 경로를 알아보지 못했습니다.",
-        package_preview_changed: "미리보기 뒤 패키지 내용이 바뀌었습니다. 다시 미리보기 하십시오.",
-        package_not_installable: "거부된 capability나 설정 충돌을 먼저 해결해야 합니다.",
-        package_already_registered: "이미 등록된 개인 앱입니다.",
-        package_path_changed: "등록된 경로와 다릅니다.", reapproval_not_required: "재승인이 필요하지 않습니다.",
-        catalog_not_installable: "이 항목은 현재 설치할 수 없습니다.",
-        digest_mismatch: "핀 소스의 digest가 카탈로그와 다릅니다.",
-        catalog_unavailable: "사내 카탈로그를 읽지 못했습니다." };
+        package_preview_changed: "선택한 경로의 앱 이름이 바뀌었습니다. 다시 미리보기 하십시오.",
+        package_not_installable: "앱 명세와 요청 권한의 거부 항목을 확인하십시오.",
+        app_not_found: "이 박스에서 읽을 수 없는 앱입니다.",
+        app_locked: "이 앱은 제거할 수 없습니다.",
+        app_plan_unavailable: "현재 앱 상태를 읽지 못했습니다. 다시 시도하십시오." };
       const reason = value && value.reason ? " (" + value.reason + ")" : "";
       // The two "not enabled" answers are sentences, not codes, and they mean the
       // feature is off on this box rather than the request being wrong.
@@ -1828,51 +2119,33 @@ if (("standalone" in navigator) && navigator.standalone) {
       setAlert((messages[raw] || off || "요청이 거부됐습니다 (HTTP " + response.status + ").") + reason, true);
       return;
     }
-    setAlert("요청을 시작했습니다. 전체 설치기 재실행 상태를 확인합니다.", false);
-    if (installs) {
-      installRun = true;
-      button.textContent = "진행 중…";
-    }
+    setAlert("요청을 시작했습니다. 앱 설치 상태를 확인합니다.", false);
+    if (installs) { installRun = true; button.textContent = "진행 중…"; }
     if (runTimer) clearTimeout(runTimer);
     runTimer = setTimeout(pollRun, 1000);
   }
-  async function pollApps() {
-    let response;
-    try { response = await fetch("/monitor/api/owner/apps", { cache: "no-store" }); }
-    catch (_) { return; }
-    if (response.status === 403 || response.status === 404) {
-      setOpen(false); open.hidden = true; delete document.documentElement.dataset.appStore; return;
-    }
-    if (!response.ok) return;
-    let value; try { value = await response.json(); } catch (_) { return; }
-    if (!value || typeof value !== "object" || Array.isArray(value)
-        || !Array.isArray(value.installed) || !Array.isArray(value.public)
-        || !Array.isArray(value.company)) return;
-    render(value);
-  }
-  async function previewPersonal() {
-    const path = personalPath.value.trim();
-    if (!path) { personalPath.focus(); return; }
-    personalPreviewButton.disabled = true;
+  async function previewPersonal(path) {
+    addSubmit.disabled = true;
     setAlert("manifest와 capability를 확인합니다…", false);
     let response;
     try {
       response = await fetch("/monitor/api/owner/apps/package-preview", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path })
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path })
       });
     } catch (_) {
-      personalPreviewButton.disabled = false;
+      addSubmit.disabled = false;
       setAlert("미리보기 응답을 받지 못했습니다.", true);
       return;
     }
     let value = null; try { value = await response.json(); } catch (_) {}
-    personalPreviewButton.disabled = false;
+    addSubmit.disabled = false;
     if (!response.ok || !value || !value.id || !value.digest) {
       const messages = { bad_package_path: "경로를 확인하십시오.", config_invalid: "manifest 또는 현재 설정을 검증하지 못했습니다." };
       setAlert(messages[value && value.error] || "미리보기가 거부됐습니다 (HTTP " + response.status + ").", true);
       return;
     }
-    setAlert(value.installable === true ? "설정은 아직 바뀌지 않았습니다. 아래 내용을 확인하고 승인하십시오."
+    setAlert(value.installable === true ? "아래 앱 명세와 요청 권한을 확인하고 설치하십시오."
       : "설치할 수 없는 manifest입니다. 거부 항목을 확인하십시오.", value.installable !== true);
     showPersonalPreview(value);
   }
@@ -1880,9 +2153,8 @@ if (("standalone" in navigator) && navigator.standalone) {
   open.addEventListener("click", () => setOpen(true));
   close.addEventListener("click", () => setOpen(false));
   modal.addEventListener("click", event => { if (event.target === modal) setOpen(false); });
-  back.addEventListener("click", () => setTab(selected && selected.kind === "public" ? "public"
-    : selected && selected.kind === "personal" ? "personal" : "installed", true));
-  personalForm.addEventListener("submit", event => { event.preventDefault(); previewPersonal(); });
+  back.addEventListener("click", () => setTab("public", true));
+  if (addForm) addForm.addEventListener("submit", addPersonal);
   tabs.forEach((tab, index) => {
     tab.addEventListener("click", () => setTab(tab.dataset.storeTab, false));
     tab.addEventListener("keydown", event => {
@@ -1892,31 +2164,37 @@ if (("standalone" in navigator) && navigator.standalone) {
       setTab(tabs[next].dataset.storeTab, true);
     });
   });
+  // A row's detail box: hover on a pointer, one tap on a finger. Both go through
+  // the same handler, and only one row is ever open.
+  modal.addEventListener("mouseover", event => {
+    if (!window.matchMedia || !window.matchMedia("(hover: hover)").matches) return;
+    const host = event.target.closest(".store-row");
+    if (!host) return;
+    for (const pinned of modal.querySelectorAll(".store-row.pinned")) {
+      if (pinned !== host) pinned.classList.remove("pinned");
+    }
+    host.classList.add("pinned");
+  });
   body.addEventListener("click", event => {
     const button = event.target.closest("button[data-store-action]");
-    if (!button || button.disabled) return;
-    const action = button.dataset.storeAction;
-    const id = button.dataset.appId;
-    if (action === "personal-review") {
-      setTab("personal", false);
-      setAlert("패키지 경로를 다시 미리보기하면 새 digest를 확인하고 재승인할 수 있습니다.", false);
-      personalPath.focus();
+    if (button && !button.disabled) {
+      const action = button.dataset.storeAction;
+      if (action === "place-link") placeLink(button.dataset.appId, button);
+      else mutate(action, button.dataset.appId, button);
       return;
     }
-    if (action === "detail" || action === "platform-detail") {
-      const installed = snapshot && snapshot.installed || [];
-      const available = snapshot && snapshot.public || [];
-      const item = action === "platform-detail" ? { id: "platform", tile: { label: "Airlock 플랫폼" }, source: "platform" }
-        : installed.concat(available).find(value => value.id === id);
-      if (item) showDetail(item, available.includes(item) ? "public" : "installed");
-      return;
+    const host = event.target.closest(".store-row");
+    for (const pinned of modal.querySelectorAll(".store-row.pinned")) {
+      if (pinned !== host) pinned.classList.remove("pinned");
     }
-    mutate(action, id, button);
+    if (host && window.matchMedia && !window.matchMedia("(hover: hover)").matches) {
+      host.classList.toggle("pinned");
+    }
   });
   modal.addEventListener("keydown", event => {
     if (event.key === "Escape") { event.preventDefault(); setOpen(false); return; }
     if (event.key !== "Tab") return;
-    const focusable = Array.from(modal.querySelectorAll("button:not([disabled]):not([hidden])"))
+    const focusable = Array.from(modal.querySelectorAll("button:not([disabled]):not([hidden]), input:not([disabled]), select:not([disabled]), a[href]"))
       .filter(node => node.offsetParent !== null);
     if (!focusable.length) return;
     const first = focusable[0], last = focusable[focusable.length - 1];
@@ -2239,7 +2517,10 @@ if (("standalone" in navigator) && navigator.standalone) {
   // land before /__airlock.json resolves, find no tiles, and mark nothing for
   // five minutes. The observer below re-applies the last answer to tiles as
   // they appear, so the dots do not depend on which fetch finished first.
-  let wanted = new Set();
+  // 🔴 One answer to "which apps have an update": the store rows' own `state`.
+  // Before the store answers, no dot is drawn.
+  const AIRLOCK_UPDATE_IDS = { set: new Set(), known: false };
+  let wanted = AIRLOCK_UPDATE_IDS.set;
   function paintDots() {
     for (const tile of document.querySelectorAll(".app[data-app-name]")) {
       const has = tile.querySelector(":scope > .dot");
@@ -2255,11 +2536,20 @@ if (("standalone" in navigator) && navigator.standalone) {
       }
     }
   }
-  function renderDots(d) { wanted = new Set(airlockUpdateAppIds(d)); paintDots(); }
-  const secs = document.getElementById("secs");
-  if (secs && window.MutationObserver) {
-    new MutationObserver(paintDots).observe(secs, { childList: true, subtree: true });
+  function renderDots() { paintDots(); }
+  const home = document.getElementById("home");
+  if (home && window.MutationObserver) {
+    // The list this page actually draws. A tile rendered after the last snapshot
+    // — which is every tile after a link is added — has to get the remembered dot
+    // put back on it, or the launcher silently disagrees with the store.
+    new MutationObserver(paintDots).observe(home, { childList: true, subtree: true });
   }
+  window.airlockSetUpdateIds = (ids) => {
+    AIRLOCK_UPDATE_IDS.known = true;
+    AIRLOCK_UPDATE_IDS.set = new Set(Array.isArray(ids) ? ids : []);
+    wanted = AIRLOCK_UPDATE_IDS.set;
+    paintDots();
+  };
 
   function render(d) {
     const checked =
@@ -2269,7 +2559,7 @@ if (("standalone" in navigator) && navigator.standalone) {
     checkedEl.textContent = checked;
     renderHarness(d);
     renderDots(d);
-    footEl.textContent = "구독 계정 관리는 헤더 신원 pill 로 들어갑니다";
+    footEl.textContent = "구독 계정 관리는 상단 사용자 표시에서 들어갑니다";
   }
 
   // Identity is resolved inside the poll, not once before it. `j()` returns null
@@ -2301,7 +2591,7 @@ if (("standalone" in navigator) && navigator.standalone) {
     if (r.status === 403 || r.status === 404) { // not offered here — no gear at all
       setOpen(false);
       gear.hidden = true;
-      renderDots(null);                         // and no orphaned tile dots either
+      window.airlockSetUpdateIds([]);           // and no orphaned tile dots either
       return;
     }
     if (!r.ok) return;                          // unexpected status — keep the last render
@@ -2363,9 +2653,9 @@ if (("standalone" in navigator) && navigator.standalone) {
 
   btn.addEventListener("click", async () => {
     const text = (ta.value || "").trim();
-    if (!text) { status.textContent = "Enter a message."; return; }
+    if (!text) { status.textContent = "내용을 입력해 주세요."; return; }
     btn.disabled = true;
-    status.textContent = "Sending…";
+    status.textContent = "보내는 중…";
     try {
       const r = await fetch("/feedback/api/submit", {
         method: "POST",
@@ -2377,19 +2667,19 @@ if (("standalone" in navigator) && navigator.standalone) {
         ta.value = "";
         status.textContent = "";
         if (d.issue_url) {
-          status.append("Sent · ");
+          status.append("보냈습니다 · ");
           const a = document.createElement("a");
           a.href = d.issue_url; a.target = "_blank"; a.rel = "noopener";
-          a.textContent = "open";
+          a.textContent = "열기";
           status.append(a);
         } else {
-          status.textContent = "Sent, thanks!";
+          status.textContent = "보냈습니다. 감사합니다!";
         }
       } else {
-        status.textContent = "Failed: " + ((d && d.error) || r.status);
+        status.textContent = "보내기 실패: " + ((d && d.error) || r.status);
       }
     } catch (e) {
-      status.textContent = "Failed: " + e;
+      status.textContent = "보내기 실패: " + e;
     } finally {
       btn.disabled = false;
     }

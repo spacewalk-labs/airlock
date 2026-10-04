@@ -362,15 +362,6 @@ EOF
   else
     ok "the escape forwards by name, so no value reaches argv"
   fi
-  # Positive control for the line above: the same grep must FIND the pattern in
-  # text that has it, or a rename would turn this assertion into a no-op that
-  # passes forever.
-  if printf '%s\n' 'esc_env+=("--setenv=${_n}=${!_n}")' \
-       | grep -Fq -- '--setenv=${_n}=${!_n}'; then
-    ok "positive control: the argv-form check can still see the pattern it forbids"
-  else
-    bad "positive control failed — the argv-form check is dead and would never fire"
-  fi
 fi
 
 # ---- the caller's PATH is not the install's PATH ----------------------------

@@ -21,7 +21,7 @@ left.
 
 | App | What it is | Upstream |
 |---|---|---|
-| **hub** | The way in: launcher, PWA, return widget, icon system | (ours) |
+| **hub** | The way in: launcher, PWA, Porthole (return widget), icon system | (ours) |
 | **devterm** | Browser web terminal (mobile-friendly) | ttyd (MIT) |
 | **fileview** | Directory viewer + editor | filebrowser (API only) |
 | **publish** | Static-file publish manager (+ optional pluggable external target) | (ours) |
@@ -86,6 +86,32 @@ spelling and a full SHA.
 ## Write an external app package
 
 [Copy the runnable external package example and read the short author guide.](examples/app-package/README.md)
+
+For a web service already running elsewhere, open the Hub's **앱스토어 → Personal**
+menu and add its name and HTTPS address in the one line at the foot of that menu.
+The link is written to `~/.config/airlock/links.toml`, appears on the home screen,
+and neither runs an installer nor restarts a service. It is visible to the owner
+only; a Company link is shared, and lives in the Company repository's own
+`links.toml` next to its apps.
+
+To change or remove a link, edit the `links.toml` it is in — one table per link:
+
+```toml
+[team-chat]
+name = "Team Chat"                                   # required
+desc = "team chat — runs elsewhere"                  # optional, one line
+url  = "https://chat.example.com/"                   # required, https only
+icon = "https://example.com/chat.png"                # optional; falls back to:
+glyph = "app-chat"                                   # optional
+```
+
+A link keeps its place on the home screen when its table is removed and comes back
+in the same spot if the table returns, because the home order is not rewritten by
+anything but a drag. The destination handles its own sign-in and permissions.
+
+`[shortcuts.*]` in `airlock.toml` is retired: it validates at `rc=0` and projects
+nothing. Move each table into the right `links.toml` — Company links to the
+Company repository, box-local ones to `~/.config/airlock/links.toml`.
 
 `bash bin/airlock-smoke` re-runs every enabled app's gate check on demand. It exits
 `0` when the gates passed **and** the serve frontend was checked, `3` when the gates

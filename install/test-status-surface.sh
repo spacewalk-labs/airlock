@@ -23,6 +23,7 @@
 # tailscale/systemctl/curl, and real loopback listeners on scratch ports. It
 # needs no root, no network, and never touches the live box.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_ROOT="$(cd "$HERE/.." && pwd)"
@@ -37,9 +38,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 note(){ printf '     %s\n' "$1"; }
 
 # ---- scratch checkout -------------------------------------------------------
@@ -212,18 +211,21 @@ printf '[Unit]\n' >"$UU/airlock-devterm-gate.service"
 # hand: airlock-config validate reads the store and rejects a malformed one, so
 # a hand-rolled fixture would be testing the fixture. `""` writes an empty but
 # valid store — a box that has recorded nothing.
-write_ledger() {   # write_ledger [<app id to commit>]
-  local app="${1:-}"
-  rm -f "$STATE/app-ledger.json"
-  printf '{"version": 6, "entries": {}, "events": []}\n' >"$STATE/app-ledger.json"
-  [ -n "$app" ] || return 0
-  AIRLOCK_CONFIG="$CFG" python3 "$ROOT/bin/airlock-config" package-info >"$TMP/pkg-info.json" \
-    || { echo "FAIL fixture: package-info" >&2; return 1; }
-  AIRLOCK_CONFIG="$CFG" python3 "$ROOT/bin/airlock-ledger" intent "$app" \
-    <"$TMP/pkg-info.json" >/dev/null 2>&1 || { echo "FAIL fixture: ledger intent" >&2; return 1; }
-  AIRLOCK_CONFIG="$CFG" python3 "$ROOT/bin/airlock-ledger" commit "$app" \
-    <"$TMP/pkg-info.json" >/dev/null 2>&1 || { echo "FAIL fixture: ledger commit" >&2; return 1; }
+write_ledger() {   # write_ledger [<app id to record>]
+  python3 - "$ROOT/bin/airlock-ledger" "${1:-}" "$UU" "$ROOT" <<'PY_LEDGER'
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+import sys
+sys.dont_write_bytecode = True
+ledger = SourceFileLoader("_status_test_ledger", sys.argv[1]).load_module()
+app, unit_dir, root = sys.argv[2:]
+store = {app: {"repo": str(Path(root) / "apps" / app), "commit": "",
+               "artifacts": [str(Path(unit_dir) / "airlock-devterm.service"),
+                             str(Path(unit_dir) / "airlock-devterm-gate.service")]}} if app else {}
+ledger.write_installed(store)
+PY_LEDGER
 }
+
 export AIRLOCK_STATE_DIR="$STATE"
 write_ledger devterm || exit 1
 
@@ -379,7 +381,7 @@ run_status --json
 if [ "$rc" = 0 ]; then ok "B --json on a healthy box exits 0"
 else bad "B --json on a healthy box exited $rc"; fi
 
-EXPECTED_IDS='config.validate config.owner install.ledger install.transaction install.drift install.revision ingress.backend ingress.serve ingress.entrance gate.owner gate.stranger gate.anonymous units.active apps.enabled apps.backends'
+EXPECTED_IDS='config.validate config.owner install.ledger install.drift install.revision ingress.backend ingress.serve ingress.entrance gate.owner gate.stranger gate.anonymous units.active apps.enabled apps.backends'
 got="$(q "' '.join(c['id'] for c in d['checks'])")"
 if [ "$got" = "$EXPECTED_IDS" ]; then ok "B the check roster and its order are exactly as pinned"
 else bad "B roster drifted"; note "want: $EXPECTED_IDS"; note "got : $got"; fi
@@ -436,7 +438,7 @@ if [ "$got" = "['unchecked']" ]; then
   ok "D nothing downstream of a broken config claims to have passed"
 else bad "D downstream checks reported $got, not only 'unchecked'"; fi
 got="$(q "len(d['checks'])")"
-if [ "$got" = 15 ]; then ok "D a failed run still emits the whole roster"
+if [ "$got" = 14 ]; then ok "D a failed run still emits the whole roster"
 else bad "D the roster shrank to $got checks on failure"; fi
 smoke_out="$(cd "$ROOT" && bash "$SMOKE" 2>&1)"; smoke_rc=$?
 note "for the record, on this same input — bin/airlock-smoke exits $smoke_rc, airlock-status exits 1"
@@ -531,16 +533,14 @@ else bad "F2 activating/dead contradiction gave rc=$rc units.active=$got"; fi
 # one service artifact with that timer shape to prove inactive/not-found timers
 # are not excused by the successful-oneshot rule.
 replace_committed_unit() {
-  python3 - "$STATE/app-ledger.json" "$1" "$2" <<'PY'
+  python3 - "$STATE/installed-apps.json" "$1" "$2" <<'PY'
 import json, os, sys
 path, old, new = sys.argv[1:]
 with open(path) as f:
     store = json.load(f)
-record = store["entries"]["devterm"]["committed"]
-units = record["artifacts"]["units"]
+record = store["devterm"]
+units = record["artifacts"]
 units[units.index(old)] = new
-scopes = record["unit_scopes"]
-scopes[os.path.basename(new)] = scopes.pop(os.path.basename(old))
 with open(path, "w") as f:
     json.dump(store, f)
 PY
@@ -666,7 +666,7 @@ case "$got" in
 esac
 
 reset_box
-rm -f "$STATE/app-ledger.json"
+rm -f "$STATE/installed-apps.json"
 run_status --json
 got="$(q "[c['status'] for c in d['checks'] if c['id']=='install.ledger'][0]")"
 if [ "$rc" = 1 ] && [ "$got" = fail ]; then ok "J a box with no install record at all is red"
@@ -686,7 +686,7 @@ if [ "$got" = True ]; then ok "L every value has the pinned type"
 else bad "L a value changed type ($got)"; fi
 
 got="$(q "' '.join(c['section'] for c in d['checks'])")"
-want='config config install install install install ingress ingress ingress gate gate gate units apps apps'
+want='config config install install install ingress ingress ingress gate gate gate units apps apps'
 if [ "$got" = "$want" ]; then ok "L each check keeps its section"
 else bad "L sections drifted"; note "want: $want"; note "got : $got"; fi
 
@@ -746,49 +746,6 @@ got="$(q "' '.join(c['status'] for c in d['checks'] if c['id'] in ('ingress.serv
 if [ "$got" = "unchecked unchecked" ]; then
   ok "O ingress.serve and apps.backends refuse to judge an incomplete list"
 else bad "O got '$got', expected 'unchecked unchecked'"; fi
-
-# ---- Q. durable installer transaction state is never invisible -------------
-write_transaction() { # phase [failed-app]
-  python3 - "$STATE/install-transaction.json" "$1" "${2:-}" <<'PY'
-import json, sys
-path, phase, failed = sys.argv[1:]
-result = {failed: {"status": "failed", "error": "fixture restore failure"}} if failed else {}
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump({"id": "a" * 32, "phase": phase, "restore_results": result}, fh)
-PY
-}
-
-reset_box
-write_transaction installing
-run_status --json
-got="$(q "[c['status'] for c in d['checks'] if c['id']=='install.transaction'][0]")"
-if [ "$rc" = 3 ] && [ "$got" = unchecked ]; then
-  ok "Q an in-progress transaction makes status incomplete, never green"
-else bad "Q installing transaction gave rc=$rc status=$got"; fi
-
-reset_box
-write_transaction degraded paseo
-run_status --json
-got="$(q "[c['detail'] for c in d['checks'] if c['id']=='install.transaction'][0]")"
-if [ "$rc" = 1 ] && [[ "$got" == *degraded*"paseo"* ]] && [[ "$got" != *checkpoint* ]]; then
-  ok "Q degraded names the transaction/app without exposing checkpoint paths"
-else bad "Q degraded transaction was not safely visible (rc=$rc detail=$got)"; fi
-
-reset_box
-write_transaction rolled_back
-run_status --json
-got="$(q "[c['status'] for c in d['checks'] if c['id']=='install.transaction'][0]")"
-if [ "$rc" = 0 ] && [ "$got" = warn ]; then
-  ok "Q rolled_back is a visible warning with a non-failing box verdict"
-else bad "Q rolled_back transaction gave rc=$rc status=$got"; fi
-
-reset_box
-ln -s "$TMP/missing-transaction-target" "$STATE/install-transaction.json"
-run_status --json
-got="$(q "[c['status'] for c in d['checks'] if c['id']=='install.transaction'][0]")"
-if [ "$rc" = 1 ] && [ "$got" = fail ]; then
-  ok "Q a dangling transaction symlink fails closed instead of looking absent"
-else bad "Q dangling transaction symlink gave rc=$rc status=$got"; fi
 
 # ---- K. a loopback target with nothing on it is red -------------------------
 # Last, because it takes a held port away for good. Without this case, an

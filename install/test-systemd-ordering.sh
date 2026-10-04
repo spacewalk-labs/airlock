@@ -52,11 +52,10 @@
 # (see extract_browse_host_unit below), for the same "re-derive every run"
 # reason.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/.." && pwd)"
 
-pass=0 fail=0
-ok(){ echo "ok   $1"; pass=$((pass+1)); }
-bad(){ echo "FAIL $1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 # ===========================================================================
 # Graph model

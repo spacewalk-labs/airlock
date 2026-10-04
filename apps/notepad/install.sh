@@ -25,10 +25,10 @@ AIRLOCK_APP_ID="${AIRLOCK_APP_ID:-notepad}"
 . "$ROOT/install/lib.sh"
 
 # notepad's uploads use the publish backend — refuse to install a broken card.
-airlock_config apps | grep -qx publish \
-  || die "notepad requires [apps.publish] (it uses the publish backend for uploads). Add [apps.publish] to airlock.toml."
+airlock_app_installed publish \
+  || die "notepad requires the installed publish app (it uses its backend for uploads). Install publish first."
 
-airlock_load notepad   # (no per-app keys today; validates the app is enabled)
+airlock_load notepad   # (no per-app keys today; resolves this hook's manifest defaults)
 WEBROOT="${AIRLOCK_WEBROOT:-/opt/airlock/hub}"
 
 # --- manager UI into the hub webroot (served by the hub's static location /) ---

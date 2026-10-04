@@ -1,0 +1,40 @@
+--- a/codex-feature-definitions.js
++++ b/codex-feature-definitions.js
+@@
+-const CODEX_FAST_MODE_SUPPORTED_MODELS = new Set([
++// [airlock-codex-model-roster] availability still comes from Codex model/list.
++const RETIRED_CODEX_MODEL_IDS = new Set(["gpt-5.5"]);
++const CODEX_FAST_MODE_SUPPORTED_MODELS = new Set([
+     "gpt-6-astra",
++    "gpt-6-sol",
++    "gpt-6-luna",
+     "gpt-5.6",
+     "gpt-5.6-sol",
+     "gpt-5.6-terra",
+     "gpt-5.6-luna",
+-    "gpt-5.5",
+     "gpt-5.4",
+ ]);
++export function filterCodexModelsForPicker(models) {
++    return models.filter((model) => !RETIRED_CODEX_MODEL_IDS.has(model?.id));
++}
+ function normalizeCodexModelId(modelId) {
+     const normalized = typeof modelId === "string" ? modelId.trim() : "";
+     return normalized.length > 0 ? normalized : null;
+ }
+ export function codexModelSupportsFastMode(modelId) {
+     const normalizedModelId = normalizeCodexModelId(modelId);
+     if (!normalizedModelId) {
+         return false;
+     }
+     return CODEX_FAST_MODE_SUPPORTED_MODELS.has(normalizedModelId);
+ }
+--- a/codex-app-server-agent.js
++++ b/codex-app-server-agent.js
+@@
+-import { buildCodexFeatures, codexModelSupportsFastMode } from "./codex-feature-definitions.js";
++import { buildCodexFeatures, codexModelSupportsFastMode, filterCodexModelsForPicker } from "./codex-feature-definitions.js";
+@@
+-            const models = parsedResponse.success ? (parsedResponse.data.data ?? []) : [];
++            // [airlock-codex-model-roster] keep retired rows out; live availability remains app-server-owned.
++            const models = filterCodexModelsForPicker(parsedResponse.success ? (parsedResponse.data.data ?? []) : []);

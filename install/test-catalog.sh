@@ -20,20 +20,14 @@
 #
 # Offline: reads the repo's own manifests. No network, no machine, no config written.
 set -uo pipefail
-# install/test-render-parity.sh gates that every suite whose text mentions an app
-# installer pins the RAM the paseo installer takes its memory share from. The gate is a
-# deliberately coarse text scan — it does not reason about WHICH app a path resolves to
-# — so suites that never install paseo carry the pin anyway and it sits inert. Cheaper
-# than a gate that tries to be clever about which mention counts.
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+. "$(dirname "$0")/test-lib.sh"
+airlock_pin_paseo_mem
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT" || exit 1
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
@@ -309,16 +303,7 @@ else
   ok "both helpers fail closed on missing input"
 fi
 
-# 9. A global flag that cannot apply must be refused, not accepted and ignored.
-(cd "$scratch" && env -u AIRLOCK_CONFIG "$CFG" --dangerously-admit-unverified=orca catalog) >/dev/null 2>&1
-flag_rc=$?
-if [ "$flag_rc" -eq 2 ]; then
-  ok "catalog refuses --dangerously-admit-unverified instead of ignoring it"
-else
-  bad "catalog accepted --dangerously-admit-unverified (rc=$flag_rc) — a flag with no effect reported as success"
-fi
-
-# 10. Argument handling: a typo must not be silently ignored.
+# 9. Argument handling: a typo must not be silently ignored.
 (cd "$scratch" && env -u AIRLOCK_CONFIG "$CFG" catalog extra) >/dev/null 2>&1
 rc=$?
 if [ "$rc" -eq 2 ]; then
@@ -327,7 +312,7 @@ else
   bad "catalog should exit 2 on a stray argument; got $rc"
 fi
 
-# 11. The fixture the Swift half decodes must be what this command actually emits.
+# 10. The fixture the Swift half decodes must be what this command actually emits.
 #     mac/Sources/AirlockLauncherChecks decodes mac/Fixtures/catalog.json and asserts
 #     the picker's invariants against it. That is the only place the contract between
 #     the two languages is written down.

@@ -99,7 +99,7 @@ https_port = "gate_port"
 # [plaintext_redirect] here.
 [tile]
 label = "Orca"
-sub = "agent IDE"
+sub = "에이전트 개발 환경"
 cat = "coding"
 icon = "orca.png"
 

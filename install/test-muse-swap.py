@@ -43,6 +43,8 @@ DEAD_ITEM = "OPENCODE_DEAD_API_KEY"
 HELD_ITEM = "OPENCODE_FIELD_API_KEY"
 CHO_ITEM = "OPENCODE_CHO_API_KEY"
 SPENT_ITEM = "OPENCODE_SPENT_API_KEY"
+# A shared-pool key: the sheet holds it under "shared", so every box offers it.
+SHARED_ITEM = "OPENCODE_SHARED_API_KEY"
 # An op://-shaped helper key: the sheet join and the display name both run
 # through the item segment, so this lands on account "op", unheld, eligible.
 OP_ITEM = "op://fixture-vault/OPENCODE_OP_API_KEY/password"
@@ -75,9 +77,12 @@ def write_helper(path):
                 '    "%s": "SENTINEL-HELD-KEY-VALUE",\n'
                 '    "%s": "SENTINEL-CHO-KEY-VALUE",\n'
                 '    "%s": "SENTINEL-SPENT-KEY-VALUE",\n'
+                '    "%s": "SENTINEL-SHARED-KEY-VALUE",\n'
                 '    "%s": "SENTINEL-OP-KEY-VALUE",\n'
-                "}))\n" % (OLD_ITEM, NEW_ITEM, DEAD_ITEM, HELD_ITEM, CHO_ITEM, SPENT_ITEM, OP_ITEM))
-    os.chmod(path, 0o755)
+                "}))\n" % (OLD_ITEM, NEW_ITEM, DEAD_ITEM, HELD_ITEM, CHO_ITEM, SPENT_ITEM, SHARED_ITEM, OP_ITEM))
+    # 0644 like the shipped bin/airlock-muse-keys: a 0755 fixture hid the
+    # swap core exec-ing the helper directly (EACCES on every real box).
+    os.chmod(path, 0o644)
 
 
 ZEN_PY = """#!/usr/bin/env python3
@@ -106,6 +111,7 @@ class H(BaseHTTPRequestHandler):
         elif auth in ("Bearer SENTINEL-OLD-KEY-VALUE",
                     "Bearer SENTINEL-HELD-KEY-VALUE",
                     "Bearer SENTINEL-CHO-KEY-VALUE",
+                    "Bearer SENTINEL-SHARED-KEY-VALUE",
                     "Bearer SENTINEL-OP-KEY-VALUE"):
             body = json.dumps({"usage": {"rolling": dict(GOOD),
                                           "weekly": dict(GOOD),
@@ -158,7 +164,8 @@ class World:
             f.write(ZEN_PY)
         self.sheet = os.path.join(self.tmp, "sheet.json")
         with open(self.sheet, "w") as f:
-            json.dump({HELD_ITEM: "peer-box", OLD_ITEM: "test-box"}, f)
+            json.dump({HELD_ITEM: "peer-box", OLD_ITEM: "test-box",
+                       SHARED_ITEM: "shared"}, f)
         self.zen_pid = None
         self.srv_pid = None
 
@@ -403,8 +410,16 @@ def mode_manual_success():
               spent)
         check("manual-success: a key another box holds is not offered",
               "field" not in by, sorted(by))
-        check("manual-success: the cho-only key is hidden on other boxes",
-              "cho" not in by, sorted(by))
+        shared = by.get("shared", {})
+        check("manual-success: a shared-pool key is offered on any box",
+              shared.get("eligible") is True
+              and [w["window"] for w in shared.get("limits", [])] == ["rolling", "weekly", "monthly"],
+              shared)
+        cho = by.get("cho", {})
+        check("manual-success: the shared cho key is offered on every box",
+              cho.get("eligible") is True
+              and [w["window"] for w in cho.get("limits", [])] == ["rolling", "weekly", "monthly"],
+              cho)
         check("manual-success: the active key is identified without exposing values",
               candidates.get("active") == "apps"
               and "SENTINEL-" not in json.dumps(candidates),
@@ -436,6 +451,15 @@ def mode_manual_success():
               and (os.stat(bak_path).st_mode & 0o777) == 0o600, bak_path)
         check("manual-success: no key value reaches the service log",
               "SENTINEL-" not in open(log, errors="replace").read(), log)
+        # A shared-pool key is usable by every box at once — the picker offers it
+        # and the commit boundary must accept it (it refused "shared" as "held by
+        # another box" until 2026-09-26).
+        status, shared = api_post(world, "/muse-swap", {"item": SHARED_ITEM})
+        live = json.load(open(world.auth_path))
+        check("manual-success: a shared-pool key swaps in",
+              status == 200 and shared.get("ok") is True
+              and live.get("opencode-go", {}).get("key") == "SENTINEL-SHARED-KEY-VALUE",
+              (status, shared))
         stop_api(world)
         # Without a sheet nothing is offered, however readable the keys are.
         ok, _ = start_api(world, extra={"AIRLOCK_MUSE_REGISTRY": ""})
@@ -452,15 +476,6 @@ def mode_manual_success():
             check("manual-success: an unreadable sheet offers nothing",
                   status == 200 and bad_sheet.get("sheet") == "unavailable"
                   and bad_sheet.get("candidates") == [], bad_sheet)
-            stop_api(world)
-        # The cho flag opens exactly the cho row, nowhere else.
-        ok, _ = start_api(world, extra={"AIRLOCK_MUSE_CHO_VISIBLE": "1"})
-        if ok:
-            status, cho = api_get(world, "/muse-swap-candidates")
-            cho_rows = {e.get("account"): e for e in cho.get("candidates", [])}
-            check("manual-success: the cho key appears only where flagged",
-                  status == 200 and cho.get("choVisible") is True
-                  and cho_rows.get("cho", {}).get("eligible") is True, cho_rows)
             stop_api(world)
         ok = (not failures)
         ac("AC-MUSE-SWAP-SUCCESS", "200 on the new key, old entries preserved",
@@ -495,11 +510,6 @@ def mode_manual_rollback():
               and held.get("steps") == ["backup", "verify"]
               and "another box" in (held.get("error") or "")
               and sha_file(world.auth_path) == before, (status, held))
-        status, cho = api_post(world, "/muse-swap", {"item": CHO_ITEM})
-        check("manual-rollback: the off-box cho key is refused at the boundary",
-              status != 200 and cho.get("ok") is False
-              and "not offered" in (cho.get("error") or "")
-              and sha_file(world.auth_path) == before, (status, cho))
         status, swapped = api_post(world, "/muse-swap", {"item": DEAD_ITEM})
         check("manual-rollback: the 401 candidate is refused",
               status != 200 and swapped.get("ok") is False, (status, swapped))

@@ -70,6 +70,7 @@ opencode_agent="$(tar -xOf "$server_archive" package/dist/server/server/agent/pr
 grep -qF 'maxDepth: searchesWorkspace ? undefined : 4' <<<"$session_info"
 grep -qF '[paseo-attachments-persist]' <<<"$claude_agent"
 grep -qF '[airlock-model-prune]' <<<"$model_manifest"
+grep -qF 'id: "claude-opus-5-5",' <<<"$model_manifest"
 grep -qF '[airlock-opencode-grok-defaults]' <<<"$opencode_agent"
 grep -qF 'const preferred = ["opencode-go/muse-spark-1.3-contributor", "xai/grok-4.6", "xai/grok-build-0.1"];' <<<"$opencode_agent"
 grep -qF 'rawVariants.includes("xhigh")' <<<"$opencode_agent"
@@ -78,6 +79,7 @@ grep -qF 'rawVariants.includes("xhigh")' <<<"$opencode_agent"
 # sentinel is present) — baked in because that test passes cleanly against the
 # 0.8.0-derived candidate.
 grep -qF '[paseo-provider-subagent-stream-filter]' <<<"$session_info"
+grep -qF '[paseo-workspace-remove-delivery]' <<<"$session_info"
 
 # schedule-busy-pending-delivery also has its own runtime behaviour test
 # (schedule-busy-pending-delivery.test.mjs). The stub agentManager it drives was
@@ -103,6 +105,14 @@ grep -qF '[paseo-orphan-guard]' <<<"$claude_agent"
 grep -qF '[paseo-process-group]' <<<"$claude_agent"
 grep -qF '[paseo-process-group]' <<<"$claude_query"
 grep -qF '[paseo-process-group]' <<<"$codex_transport"
+
+# Both automatic Git envelopes are baked, so re-running install never mutates
+# checksum-pinned files and re-installs/restarts an unchanged active daemon.
+workspace_git="$(tar -xOf "$server_archive" package/dist/server/server/workspace-git-service.js)"
+workspace_reconciliation="$(tar -xOf "$server_archive" package/dist/server/server/workspace-reconciliation-service.js)"
+grep -qF '[paseo-emergency-git-policy]' <<<"$workspace_git"
+grep -qF '[paseo-reconciliation-emergency-policy]' <<<"$workspace_reconciliation"
+grep -qF 'emergencyReconciliationPendingExplicitFull' <<<"$workspace_reconciliation"
 
 grep -qF "$EXPECTED_SOURCE" "$BUNDLE/README.md"
 verify_line="$(grep -nF 'sha256sum -c SHA256SUMS >/dev/null' "$ROOT/apps/paseo/install.sh" | cut -d: -f1)"

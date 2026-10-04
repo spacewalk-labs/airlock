@@ -10,13 +10,18 @@ runtime_env = [
   "AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN",
   "AIRLOCK_DEV_MONITOR_CORS_ORIGINS",
   "AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT",
+  "AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS",
 ]
 
 [config.defaults]
 backend_port = 19923
+ingest_port = 19926
 messages = false
 # The single urgent webhook selector; values are names, never credentials.
 slack_webhook_urgent_env = ""
+# Bot credentials use a name in the app secret file; a complete pair takes priority.
+slack_bot_token_env = ""
+slack_channel = ""
 exec_cwd_root = ""
 exec_session = "devmon-exec"
 # Untrusted spool producers run under this system identity. The installer resolves the
@@ -35,12 +40,6 @@ token_freshness_warn_hours = 24
 # Codex: warn once tokens.last_refresh is this old. There is no expiry field to read, so
 # age is the only evidence the session is still alive.
 token_freshness_stale_hours = 24
-# Optional company catalog. Empty is the public/default posture: the owner API returns an
-# empty company list with 200. Private fleet configuration supplies the Git repository;
-# the long-lived backend reads these values through the already-pinned AIRLOCK_CONFIG.
-company_catalog_repository = ""
-company_catalog_ref = "main"
-company_catalog_stage = ""
 
 # Installer and smoke command prerequisites.
 [[prerequisites]]
@@ -127,27 +126,32 @@ expected = "-"
 fix = "sudo apt-get update && sudo apt-get install -y passwd"
 note = "Writer account provisioning"
 
-# Appendix: one user unit, one hub-locations fragment, the dashboard webroot
+# Appendix: units, hub/ingest nginx fragments, the dashboard webroot
 # page, and the env file the unit's EnvironmentFile= line reads. The spool
 # (~/.local/state/airlock/dev-monitor/) is retained operator data — never
-# declared. backend_port is proxied by the hub's own nginx, never
-# tailscale-served directly, so it is NOT a serve_ports entry.
+# declared. backend_port stays internal; ingest_port is a separate loopback
+# nginx listener exposed through tailscale serve HTTPS. The backend refuses
+# publication with 404 when the token or message console is unconfigured.
 [artifacts]
 # Stop the activation source before its oneshot and the collecting backend.
 # The platform ledger owns stop/verify/delete, including older recorded order.
 units = ["airlock-devmon-heartbeat.timer", "airlock-devmon-heartbeat.service",
          "airlock-dev-monitor.service",
          { name = "airlock-dev-monitor-spool-firewall.service", scope = "system" }]
-fragments = ["hub-locations.d/dev-monitor.conf"]
+fragments = ["hub-locations.d/dev-monitor.conf", "servers.d/dev-monitor.conf"]
+serve_ports = ["ingest_port"]
 webroot = ["monitor/index.html"]
 files = ["~/.config/airlock/dev-monitor.env"]
 rooted = ["/etc/airlock/dev-monitor-spool.nft",
           "/opt/airlock/libexec/airlock-dev-monitor-spool-firewall"]
 
+[serve.https]
+ingest_port = "ingest_port"
+
 # From hub/index.html's APPS table (dev-monitor row).
 [tile]
 label = "Dev Monitor"
-sub = "system status"
+sub = "시스템 상태"
 cat = "system"
 path = "/monitor/"
 glyph = "app-monitor"

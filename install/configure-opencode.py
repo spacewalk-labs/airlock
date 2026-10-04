@@ -320,6 +320,9 @@ def configure(home: Path) -> None:
     config = read_config(path)
     config["model"] = MODEL
     config["agent"] = AGENTS
+    # Off: every step re-writes the turn's full patch text into the append-only
+    # event table (opencode.db 49GB, 2026-10-03). Seats work in git worktrees.
+    config["snapshot"] = False
     apply_enabled_providers(config)
     apply_provider_whitelists(config)
     apply_grok_limits(config)

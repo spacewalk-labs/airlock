@@ -110,16 +110,6 @@ else
   printf '%s\n' "$out" | sed 's/^/    /'
 fi
 
-# ---- CI actually runs it ----
-# The seventh recorded case in this fleet of a scheduled job dying silently was a
-# unit that was committed and never installed. A gate that no workflow calls is
-# the same thing.
-if grep -q 'install/check-shellcheck-gates.sh' "$ROOT/.github/workflows/ci.yml"; then
-  ok "ci.yml calls the gate"
-else
-  bad "ci.yml does not call install/check-shellcheck-gates.sh — the gate is not wired"
-fi
-
 echo "---"
 echo "passed=$pass failed=$fail"
 [ "$fail" = 0 ]

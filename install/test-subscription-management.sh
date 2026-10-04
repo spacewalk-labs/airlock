@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # install/test-subscription-management.sh — verdicts for the subscription-accounts
-# campaign (docs/tasks/active/subscription-accounts.md): muse-usage · agy-swap · popup-6.
+# campaign (docs/tasks/active/subscription-accounts.md): muse-usage · agy login/swap · popup-6.
 #
-# agy-swap owns the AGY_SWAP gate card: ① RED (2026-09-23, agy 1.2.8) —
-# agy offers no non-interactive credential acquisition, so the campaign's agy goal
-# is read-only + manual login guidance and no switch UI may be opened. This case
-# guards that verdict: it passes while RED holds and fails the moment an agy
-# login/switch path appears, so a human re-measures before any UI is opened.
+# agy-swap owns the AGY_SWAP gate card. ① RED (2026-09-23, agy 1.2.8): agy offers
+# no login subcommand. The 2026-09-27 owner decision keeps agy's measured interactive
+# first-run flow but drives it in an isolated HOME: show its Google URL, paste the
+# returned code through protected stdin, then save the new credential without changing
+# the active account. Saved-account switching remains backup -> verify -> commit.
 # Live credentials are never read here — presence checks are stat-only.
 set -uo pipefail
 
@@ -35,25 +35,26 @@ $("$agy_bin" "$sub" --help 2>&1)"
   else
     ok "agy-swap: agy CLI surface has no auth/login path (① RED holds)"
   fi
-  # ①-b: the accounts API exposes agy read-only — /agy-usage and nothing else.
+  # ①-b: the API exposes the decided login pair plus usage and saved-login switch.
   local routes
-  routes="$(grep -oE '"/agy-[a-z-]*"' "$ROOT/bin/airlock-accounts-api" | sort -u)"
-  if [ "$routes" = '"/agy-usage"' ]; then
-    ok "agy-swap: accounts API exposes only /agy-usage"
+  routes="$(grep -oE '"/agy-[a-z-]*"' "$ROOT/bin/airlock-accounts-api" | sort -u | tr '\n' ' ')"
+  if [ "$routes" = '"/agy-login-code" "/agy-login-start" "/agy-switch" "/agy-usage" ' ]; then
+    ok "agy-swap: accounts API exposes the decided login/switch routes"
   else
     bad "agy-swap: unexpected agy routes in accounts API: $routes"
   fi
-  # ①-c: the panel's agy section carries manual-login guidance, not a switch UI.
-  if grep -q 'Manual login only' "$ROOT/hub/assets/accounts/accounts.js"; then
-    ok "agy-swap: panel agy section carries manual-login guidance"
+  # ①-c: the panel starts the URL + protected-code flow; it has no logout route.
+  if grep -q "agy-login-start" "$ROOT/hub/assets/accounts/accounts.js" \
+    && grep -q "agy-login-code" "$ROOT/hub/assets/accounts/accounts.js"; then
+    ok "agy-swap: panel carries the URL + code login flow"
   else
-    bad "agy-swap: panel agy section lost its manual-login guidance"
+    bad "agy-swap: panel lost the agy URL + code login flow"
   fi
-  if grep -qE 'agy-(switch|login|logout)' "$ROOT/hub/assets/accounts/accounts.js" \
-    || grep -qE '"/agy-(switch|login|logout)"' "$ROOT/bin/airlock-accounts-api"; then
-    bad "agy-swap: an agy switch/login path exists — ① must be re-measured first"
+  if grep -qE 'agy-logout' "$ROOT/hub/assets/accounts/accounts.js" \
+    || grep -qE '"/agy-logout"' "$ROOT/bin/airlock-accounts-api"; then
+    bad "agy-swap: an unrequested agy logout path exists"
   else
-    ok "agy-swap: no agy switch/login path in panel or API"
+    ok "agy-swap: no agy logout path exists"
   fi
   # ①-d: live A is still on disk (presence only — values are never read).
   if [ -f "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" ]; then
@@ -328,8 +329,7 @@ grep -q 'SENTINEL-TAIL' "$TMP/catcher.log" \
   || mu_ok "T-MU6: no credential reached the redirect target"
 
 # ---- T-MU7: the vault helper maps discovered items, nothing else ----
-# Fake readers speak the same argv contract as the real ones (list/get,
-# read <ref>); the helper under test is the repository file, run with an
+# The fake shared reader speaks the real list/get contract; the helper is run with an
 # explicit interpreter exactly like the service runs it.
 cat > "$TMP/fake-secret" <<'EOF'
 #!/bin/sh
@@ -340,42 +340,19 @@ elif [ "$1" = get ]; then
 fi
 EOF
 chmod 0755 "$TMP/fake-secret"
-cat > "$TMP/fake-cho" <<'EOF'
-#!/bin/sh
-if [ "$1" = read ]; then
-  printf 'SENTINEL-MU-CHO-VALUE'
-fi
-EOF
-chmod 0755 "$TMP/fake-cho"
 HELPER_OUT="$(AIRLOCK_MUSE_SECRET_BIN="$TMP/fake-secret" \
-  AIRLOCK_MUSE_CHO_BIN="$TMP/fake-cho" \
-  AIRLOCK_MUSE_CHO_REF='op://fixture-vault/OPENCODE_MU_B_API_KEY/password' \
   python3 "$ROOT/bin/airlock-muse-keys" 2>"$TMP/helper.err")"
 printf '%s' "$HELPER_OUT" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 assert d == {"OPENCODE_MU_A_API_KEY": "SENTINEL-MU-OPENCODE_MU_A_API_KEY-VALUE",
-             "OPENCODE_MU_C_API_KEY": "SENTINEL-MU-OPENCODE_MU_C_API_KEY-VALUE",
-             "OPENCODE_MU_B_API_KEY": "SENTINEL-MU-CHO-VALUE"}, d
+             "OPENCODE_MU_C_API_KEY": "SENTINEL-MU-OPENCODE_MU_C_API_KEY-VALUE"}, d
 ' 2>/dev/null \
-  && mu_ok "T-MU7: the helper maps discovered items and the brokered ref" \
+  && mu_ok "T-MU7: the helper maps every shared discovered item" \
   || mu_bad "T-MU7: unexpected helper map: $HELPER_OUT"
 [ -s "$TMP/helper.err" ] \
   && mu_bad "T-MU7: the helper spoke on stderr" \
   || mu_ok "T-MU7: the helper is silent on stderr"
-# A misaddressed brokered ref must not smuggle an arbitrary item into the map.
-HELPER_OUT2="$(AIRLOCK_MUSE_SECRET_BIN="$TMP/fake-secret" \
-  AIRLOCK_MUSE_CHO_BIN="$TMP/fake-cho" \
-  AIRLOCK_MUSE_CHO_REF='op://fixture-vault/NOT_A_KEY/password' \
-  python3 "$ROOT/bin/airlock-muse-keys" 2>/dev/null)"
-printf '%s' "$HELPER_OUT2" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-assert "NOT_A_KEY" not in d and len(d) == 2, d
-' 2>/dev/null \
-  && mu_ok "T-MU7: a non-key ref is refused, not mapped" \
-  || mu_bad "T-MU7: misaddressed ref leaked into the map: $HELPER_OUT2"
-
 if [ "$mu_fails" -gt 0 ]; then
   printf '\n%d muse-usage check(s) failed\n' "$mu_fails" >&2
   return 1
@@ -465,17 +442,17 @@ const FIX = {
     enabled: true, thresholds: TH,
     accounts: [
       { name: 'a1', email: 'me@example.test', kind: 'personal', sub: 'Max', active: true,
-        usage: { use5h: 4, use7d: 22, reset5h: '2026-09-23T05:20:00Z', reset7d: '2026-09-28T05:20:00Z' },
+        usage: { use5h: 4, use7d: 22, reset5h: '2026-09-23T05:20:00Z', reset7d: '2026-09-28T05:20:00Z', age: 367 },
         rtExpiry: Date.now() + 28 * 86400000, holders: [] },
       { name: 'a2', email: 'team@example.test', kind: 'team', sub: 'Max', active: false,
         usage: {}, rtExpiry: Date.now() + 11 * 86400000, holders: [] },
       { name: 'a3', email: 'gone@example.test', kind: 'personal', sub: 'Max', active: false,
-        health: { state: 'dead', reason: '로그인 만료' }, usage: {},
+        health: { state: 'dead', reason: 'Login expired' }, usage: {},
         rtExpiry: null, holders: [] },
     ],
   },
   'acct-usage-now': { email: 'me@example.test', kind: 'personal',
-    usage: { use5h: 4, use7d: 22, reset5h: '2026-09-23T05:20:00Z', reset7d: '2026-09-28T05:20:00Z' } },
+    usage: { use5h: 4, use7d: 22, reset5h: '2026-09-23T05:20:00Z', reset7d: '2026-09-28T05:20:00Z', age: 367 } },
   'codex-status': { state: 'none' },
   'codex-usage': null,                       // 로그인 없음 → 호출되지 않아야 한다
   // xAI 섹션 제거 (POPUP_SHELL 재작업): 셸이 xai-* 를 호출하면 실패로 —
@@ -483,13 +460,13 @@ const FIX = {
   'agy-usage': { enabled: true, account: 'me@example.test', age: 30, refreshing: false,
     groups: [{ name: 'GEMINI MODELS', fiveHourRemaining: 69, weeklyRemaining: 82,
       fiveHourResetAt: 1758600000, weeklyResetAt: 1759000000 }] },
-  'muse-swap-candidates': { enabled: true, box: 'test-box', active: 'apps', choVisible: false,
+  'muse-swap-candidates': { enabled: true, box: 'test-box', active: 'apps',
     sheet: 'ok', candidates: [
       { account: 'apps', item: 'OPENCODE_APPS_API_KEY', eligible: true, err: null,
         limits: [{ window: 'rolling', percent: 12 }, { window: 'weekly', percent: 12 },
                  { window: 'monthly', percent: 12 }] },
       { account: 'finance', item: 'OPENCODE_FINANCE_API_KEY', eligible: true, err: null,
-        limits: [{ window: 'rolling', percent: 34 }, { window: 'weekly', percent: 34 },
+        limits: [{ window: 'rolling', percent: 56 }, { window: 'weekly', percent: 34 },
                  { window: 'monthly', percent: 34 }] },
     ] },
   'acct-alert': { level: 'ok', thresholds: TH },
@@ -497,18 +474,21 @@ const FIX = {
   'acct-login-url': { ok: true, url: 'https://claude.ai/approve-mock' },
   'acct-login-code': { ok: true, msg: '등록됐습니다' },
   'acct-switch': { ok: true },
+  'muse-swap': { ok: false, error: 'candidate rejected' },
   'acct-remove': { ok: true },
   'codex-login-start': { ok: true, code: 'KXPD-7QMB', url: 'https://chatgpt.com/auth-mock' },
   'codex-login-cancel': { ok: true, restored: true },
   'codex-logout': { ok: true },
 };
 const calls = [];
+const requestBodies = [];
 function route(url, body) {
   const key = Object.keys(FIX).find(k => url.endsWith(k));
   calls.push(key || url);
   if (key === 'codex-usage') throw new Error('codex-usage must not be called while logged out');
   if (/xai-status|xai-login|xai-logout/.test(url)) throw new Error('xai route must not be called: xAI section removed from popup');
   const v = key ? FIX[key] : { ok: false, error: 'no route' };
+  if (key === 'muse-swap' && v && v.ok) FIX['muse-swap-candidates'].active = v.account;
   if (v instanceof Error) throw v;
   if (v === null) throw new Error('no fixture for ' + url);
   return v;
@@ -547,7 +527,10 @@ function sandbox() {
   ctx.window.location = ctx.location;
   ctx.__deps = {
     flash() {},
-    postJson: (path, body) => ctx.fetch(path, {}).then(r => r.json()),
+    postJson: (path, body) => {
+      requestBodies.push({ path, body });
+      return ctx.fetch(path, {}).then(r => r.json());
+    },
     mkFocus() {}, closeTabPops() {}, placePop() {},
   };
   vm.createContext(ctx);
@@ -572,30 +555,26 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
     const heads = queryAll(host, '.sec-head').map(textOf);
     // 5 -> 4 sections with the POPUP_SHELL rework (사람 결정 9dac31a6 팝업에서
     // 제거): xAI is gone, not passing — assert its absence outright. Muse keeps
-    // its header as current-key-only (사람 결정 5a5e34fe 후보 숨기기): no 교체 count.
+    // Muse keeps its compact current-key header; the candidate picker is in the body.
     const cond = secs.length === 4 && bodies.length === 1 &&
       heads.some(h => h.includes('Claude') && h.includes('me@example') && h.includes('%')) &&
       heads.some(h => h.includes('Codex')) &&
       heads.some(h => h.includes('Gemini') || h.includes('agy')) &&
-      heads.some(h => h.includes('Muse') && h.includes('apps') && h.includes('사용 중') && !h.includes('교체')) &&
+      heads.some(h => h.includes('Muse') && h.includes('apps') && h.includes('Active') && !h.includes('Switch')) &&
       !heads.some(h => /xai/i.test(h));
     const observed = `sec=${secs.length},open=${bodies.length},heads=[${heads.map(h => JSON.stringify(h.slice(0, 40))).join('|')}]`;
-    if (cond) ok('P1 네 섹션 접힘 + 헤더 한 줄(누구·얼마·리셋, xAI 없음·Muse 현재 키만)', 'AC-SUB-POPUP-1',
-      'sec==4 && open==1(Claude) && 각 헤더에 제공자+누구+잔여 && xAI 헤더 없음 && Muse 헤더에 교체 없음', observed);
-    else bad('P1 네 섹션 접힘 + 헤더 한 줄(누구·얼마·리셋, xAI 없음·Muse 현재 키만)', 'AC-SUB-POPUP-1',
-      'sec==4 && open==1(Claude) && 각 헤더에 제공자+누구+잔여 && xAI 헤더 없음 && Muse 헤더에 교체 없음', observed);
+    if (cond) ok('P1 four collapsed sections + one-line headers', 'AC-SUB-POPUP-1',
+      'sec==4 && open==1(Claude) && provider/account/usage headers && no xAI header or Muse switch count', observed);
+    else bad('P1 four collapsed sections + one-line headers', 'AC-SUB-POPUP-1',
+      'sec==4 && open==1(Claude) && provider/account/usage headers && no xAI header or Muse switch count', observed);
   }
 
-  // ---------- P1b: Muse 섹션은 현재 키만 (후보 목록·교체 버튼 없음) ----------
+  // ---------- P1b: Muse 후보는 직접 고르고, 실패 후 기존 키를 보존 ----------
   {
     const { ctx, doc, api } = sandbox();
     const host = doc.createElement('div'); doc.body.appendChild(host);
     api.renderAcctPanel(host);
     await drain();
-    // fixture offers apps(active) + finance(eligible): the old shell rendered a
-    // 교체 button for finance. Open the Muse section and prove it is gone.
-    // calls[] is shared across blocks, so only calls made in this block count;
-    // the candidates GET (numbers stay) is fine, a swap POST is not.
     const n0 = calls.length;
     const museHead = queryAll(host, '.sec-head').find(h => textOf(h).includes('Muse'));
     let cond = false, note = '';
@@ -606,20 +585,47 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
         const h = queryFirst(s, '.sec-head');
         return h && textOf(h).includes('Muse');
       });
-      const t = museSec ? textOf(museSec) : '';
-      const noSwapBtn = !(museSec && btnByText(museSec, '교체'));
-      const noFinance = !t.includes('finance');
-      const curOk = t.includes('현재 키') && t.includes('apps') && t.includes('rolling');
-      const fresh = calls.slice(n0);
-      const noSwapCall = !fresh.some(c => String(c).includes('muse-swap') && !String(c).includes('candidates'));
-      if (museSec && noSwapBtn && noFinance && curOk && noSwapCall) cond = true;
-      else note = `swapBtn=${!noSwapBtn},finance=${!noFinance},cur=${curOk},swapCall=${!noSwapCall};`;
+      // One key = one row (Claude-list grammar): tap the row, the inline strip
+      // offers Switch / Cancel. ✓ marks the current key.
+      const row = () => museSec && queryAll(museSec, 'button').find(b => b.className.includes('acctrow') && textOf(b).includes('finance'));
+      const strip = (label) => museSec && btnByText(museSec, label);
+      const before = museSec && textOf(museSec).includes('✓ apps') &&
+        textOf(museSec).includes('Weekly 34%') && textOf(museSec).includes('5h 56%');
+      if (row()) fire(row(), 'click');
+      await drain(2);
+      if (strip('Cancel')) fire(strip('Cancel'), 'click');
+      await drain(2);
+      const cancelled = !calls.slice(n0).includes('muse-swap');
+      if (row()) fire(row(), 'click');
+      await drain(2);
+      if (strip('Switch only')) fire(strip('Switch only'), 'click');
+      await drain(4);
+      const refused = museSec && textOf(museSec).includes('candidate rejected') &&
+        textOf(museSec).includes('previous key unchanged') &&
+        textOf(museSec).includes('✓ apps');
+      // Backend truth for "Switch only": the swap commits, running sessions still hold the old key.
+      FIX['muse-swap'] = { ok: true, account: 'finance', needsRestart: true };
+      if (strip('Close')) fire(strip('Close'), 'click');
+      await drain(2);
+      if (row()) fire(row(), 'click');
+      await drain(2);
+      if (strip('Switch only')) fire(strip('Switch only'), 'click');
+      await drain(6);
+      const switched = museSec && textOf(museSec).includes('✓ finance') &&
+        textOf(museSec).includes('seat-recovery');
+      const posts = calls.slice(n0).filter(c => c === 'muse-swap').length;
+      const chosen = requestBodies.filter(r => r.path.endsWith('/muse-swap'));
+      cond = !!(before && cancelled && refused && switched && posts === 2 &&
+        chosen.length === 2 && chosen.every(r => r.body.item === 'OPENCODE_FINANCE_API_KEY' && r.body.reseat === false));
+      if (!cond) note = `before=${before},cancelled=${cancelled},refused=${refused},switched=${switched},posts=${posts},chosen=${JSON.stringify(chosen)};`;
+      FIX['muse-swap'] = { ok: false, error: 'candidate rejected' };
+      FIX['muse-swap-candidates'].active = 'apps';
     }
-    const observed = cond ? '현재 키+사용량만, 후보·교체 버튼·swap 호출 없음' : note;
-    if (cond) ok('P1b Muse 현재 키만 (후보 숨기기)', 'AC-SUB-POPUP-1B',
-      'Muse 섹션에 현재 키+사용량만 && 교체 버튼 없음 && finance 미표시 && muse-swap 미호출', observed);
-    else bad('P1b Muse 현재 키만 (후보 숨기기)', 'AC-SUB-POPUP-1B',
-      'Muse 섹션에 현재 키+사용량만 && 교체 버튼 없음 && finance 미표시 && muse-swap 미호출', observed);
+    const observed = cond ? 'candidate refused with old key; successful retry refreshes active key' : note;
+    if (cond) ok('P1b Muse manual switch', 'AC-SUB-POPUP-1B',
+      'candidate selectable; refusal preserves current key; success refreshes key and shows recovery', observed);
+    else bad('P1b Muse manual switch', 'AC-SUB-POPUP-1B',
+      'candidate selectable; refusal preserves current key; success refreshes key and shows recovery', observed);
   }
 
   // ---------- P2: 조치 필요 요약 줄 ----------
@@ -631,18 +637,18 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
     const needs = queryFirst(host, '.needs');
     const t = needs ? textOf(needs) : '';
     // fixture: codex 미로그인 + Claude 로그인 만료 1건 → 요약 2건. 링크를 누르면 해당 섹션이 열린다.
-    // 팝업이 교체 UI를 갖지 않으므로 Muse pill이 뜨면 안 된다 (교체는 플릿 몫).
+    // Muse 후보 선택은 별도 수동 동작이므로 조치 필요 요약에는 넣지 않는다.
     let opened = false;
     if (needs) {
       const link = queryAll(needs, 'a').find(a => (a.dataset.go || '') === 'codex');
       if (link) { fire(link, 'click'); await drain(4); opened = queryAll(host, '.sec-body').filter(b => b.style.display !== 'none').length === 2; }
     }
-    const cond = !!needs && t.includes('조치 필요 2건') && !t.includes('Muse') && opened;
-    if (cond) ok('P2 조치 필요 요약 줄 + 이동', 'AC-SUB-POPUP-2',
-      '".needs"에 조치 필요 2건 + Muse pill 없음 + 링크 클릭에 Codex 섹션 열림',
+    const cond = !!needs && t.includes('2 actions required') && !t.includes('Muse') && opened;
+    if (cond) ok('P2 action-required summary + navigation', 'AC-SUB-POPUP-2',
+      '".needs" shows 2 actions, no Muse pill, and its link opens Codex',
       `needs=${JSON.stringify(t.slice(0, 60))},opened=${opened}`);
-    else bad('P2 조치 필요 요약 줄 + 이동', 'AC-SUB-POPUP-2',
-      '".needs"에 조치 필요 2건 + Muse pill 없음 + 링크 클릭에 Codex 섹션 열림',
+    else bad('P2 action-required summary + navigation', 'AC-SUB-POPUP-2',
+      '".needs" shows 2 actions, no Muse pill, and its link opens Codex',
       `needs=${JSON.stringify(t.slice(0, 60))},opened=${opened}`);
   }
 
@@ -661,14 +667,14 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
       fire(target, 'click'); await drain(4);
       const strip = queryFirst(host, '.confirm-strip');
       const noEarlySwitch = calls.filter(c => c === 'acct-switch').length === before;
-      const confirmBtn = strip && btnByText(strip, '전환');
-      const cancelBtn = strip && btnByText(strip, '취소');
+      const confirmBtn = strip && btnByText(strip, 'Switch');
+      const cancelBtn = strip && btnByText(strip, 'Cancel');
       if (!strip || !confirmBtn || !cancelBtn || !noEarlySwitch) {
         cond = false; note += `strip=${!!strip},confirm=${!!confirmBtn},cancel=${!!cancelBtn},noEarly=${noEarlySwitch};`;
       } else {
         fire(confirmBtn, 'click');
         const prog = queryFirst(host, '.prog');   // fetch가 닿기 전 동기 상태
-        const progOk = !!prog && textOf(prog).includes('전환 중');
+        const progOk = !!prog && textOf(prog).includes('Switching');
         await sleep(1600); await drain();
         const done = queryFirst(host, '.flow-done');
         const doneOk = !!done && textOf(done).includes('✓');
@@ -684,7 +690,7 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
           const n0 = calls.filter(c => c === 'acct-switch').length;
           fire(t2, 'click'); await drain(4);
           const s2 = queryFirst(host, '.confirm-strip');
-          const c2 = s2 && btnByText(s2, '취소');
+          const c2 = s2 && btnByText(s2, 'Cancel');
           if (!c2) { cond = false; note += 'cancel-missing;'; }
           else {
             fire(c2, 'click'); await drain(4);
@@ -694,10 +700,10 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
         }
       }
     }
-    const observed = cond ? 'confirm→prog(전환 중)→done(✓ 이동), 패널 유지, 취소 무호출' : note;
-    if (cond) ok('P3 전환 확인 띠 → 진행 → ✓ (닫지 않음)', 'AC-SUB-POPUP-3', observed, observed);
-    else bad('P3 전환 확인 띠 → 진행 → ✓ (닫지 않음)', 'AC-SUB-POPUP-3',
-      'confirm→prog(전환 중)→done(✓ 이동), 패널 유지, 취소 무호출', observed);
+    const observed = cond ? 'confirm→progress(Switching)→done(✓ moved), panel stays open, cancel makes no call' : note;
+    if (cond) ok('P3 switch confirm → progress → ✓ without closing', 'AC-SUB-POPUP-3', observed, observed);
+    else bad('P3 switch confirm → progress → ✓ without closing', 'AC-SUB-POPUP-3',
+      'confirm→progress(Switching)→done(✓ moved), panel stays open, cancel makes no call', observed);
   }
 
   // ---------- P4: 코드 라벨 방향 ----------
@@ -707,19 +713,19 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
     api.renderAcctPanel(host);
     await drain();
     let claudeOk = false, codexOk = false, claudeSeen = '', codexSeen = '';
-    const add = btnByText(host, '계정 추가');
+    const add = btnByText(host, 'Add account');
     if (add) {
       fire(add, 'click'); await drain(4);
-      const open = btnByText(host, '승인 페이지 열기');
+      const open = btnByText(host, 'Open Claude approval page');
       if (open) {
         fire(open, 'click'); await drain(4);
         claudeSeen = textOf(host);
-        claudeOk = claudeSeen.includes('승인 페이지에서 받은') && claudeSeen.includes('여기에 붙여넣기');
+        claudeOk = claudeSeen.includes('code from the approval page') && claudeSeen.includes('paste it here');
       }
     }
     // Codex 섹션 안에서 로그인 버튼을 찾는다 (Claude 만료 행도 '로그인'을 품고 있어서 전역 탐색은 오답).
     // 흐름은 한 번에 하나라 Claude 흐름을 먼저 닫는다.
-    const cancelClaude = btnByText(host, '취소');
+    const cancelClaude = btnByText(host, 'Cancel');
     if (cancelClaude) { fire(cancelClaude, 'click'); await drain(4); }
     const codexHead = queryAll(host, '.sec-head').find(h => textOf(h).includes('Codex'));
     let codexSec = null;
@@ -730,52 +736,46 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
         return h && textOf(h).includes('Codex');
       });
     }
-    const login = codexSec && btnByText(codexSec, '로그인');
+    const login = codexSec && btnByText(codexSec, 'Log in');
     if (login) {
       fire(login, 'click'); await drain(4);
-      const start = btnByText(host, '재로그인 시작');
+      const start = btnByText(host, 'Start login');
       if (start) {
         fire(start, 'click'); await drain(4);
         codexSeen = textOf(host);
-        codexOk = codexSeen.includes('Airlock') && codexSeen.includes('만든 코드') && codexSeen.includes('브라우저에 입력');
+        codexOk = codexSeen.includes('Airlock generated this code') && codexSeen.includes('enter it in your browser');
       }
     }
-    if (claudeOk && codexOk) ok('P4 코드 라벨 방향(Claude 붙여넣기/Codex 입력)', 'AC-SUB-POPUP-4',
-      'Claude=승인 페이지에서 받은 코드→여기에 붙여넣기 && Codex=Airlock이 만든 코드→브라우저에 입력', 'both found');
-    else bad('P4 코드 라벨 방향(Claude 붙여넣기/Codex 입력)', 'AC-SUB-POPUP-4',
-      'Claude=승인 페이지에서 받은 코드→여기에 붙여넣기 && Codex=Airlock이 만든 코드→브라우저에 입력',
+    if (claudeOk && codexOk) ok('P4 code direction labels', 'AC-SUB-POPUP-4',
+      'Claude=code from approval page→paste here && Codex=Airlock-generated code→enter in browser', 'both found');
+    else bad('P4 code direction labels', 'AC-SUB-POPUP-4',
+      'Claude=code from approval page→paste here && Codex=Airlock-generated code→enter in browser',
       `claude=${claudeOk} codex=${codexOk}`);
   }
 
-  // ---------- P5: 확인 중 + 한국어 ----------
+  // ---------- P5: Checking + English ----------
   {
     const { ctx, doc, api } = sandbox();
     const host = doc.createElement('div'); doc.body.appendChild(host);
     api.renderAcctPanel(host);
     await drain();
-    // 미판독 슬롯(a2, usage {})은 확인 중.
+    // 미판독 슬롯(a2, usage {})은 Checking.
     const a2 = queryAll(host, '.acctrow').find(r => textOf(r).includes('team@example'));
-    const unknownOk = !!a2 && textOf(a2).includes('확인 중');
+    const unknownOk = !!a2 && textOf(a2).includes('Checking');
     // 모든 흐름의 문구를 렌더해 모은다.
-    const add = btnByText(host, '계정 추가'); if (add) { fire(add, 'click'); await drain(4); }
-    const open = btnByText(host, '승인 페이지 열기'); if (open) { fire(open, 'click'); await drain(4); }
-    const full = textOf(host);
-    const banned = ['Loading', 'reading', 'Re-login', 'Log in', 'Log out', 'Switch account',
-      'Not logged in', 'Register', 'Cancel', 'Check', 'Approve', 'paste the code', 'Open in',
-      'Enter this', 'click to copy', 'After logging', 'Copied', 'Signed in', 'Not signed in',
-      'Credential', 'revoked', 'Collecting', 'No usage', 'Query failed', 'Remove', 'Switch failed',
-      'Switched to', 'Already using', 'Code from the', 'resets', 'credits', 'Expires', 'Expired',
-      'expires', '5h', '7d', 'usage', ' days', 'min ago', 'just now', 'refreshing'];
-    const hits = banned.filter(w => full.includes(w));
+    const add = btnByText(host, 'Add account'); if (add) { fire(add, 'click'); await drain(4); }
+    const open = btnByText(host, 'Open Claude approval page'); if (open) { fire(open, 'click'); await drain(4); }
+    const koreanLiteral = /['"`][^'"`\n]*[가-힣][^'"`\n]*['"`]/;
+    const literalsOk = !koreanLiteral.test(src);
     const panelHtml = fs.readFileSync(path.join(path.dirname(srcFile), 'panel.html'), 'utf8');
-    const chromeOk = panelHtml.includes('구독 계정') && panelHtml.includes('닫기') &&
-      !panelHtml.includes('Subscription accounts');
-    const cond = unknownOk && hits.length === 0 && chromeOk;
-    if (cond) ok('P5 미판독=확인 중 + 한국어 통일', 'AC-SUB-POPUP-5',
-      '미판독 슬롯에 확인 중 && 영어 UI 잔재 0 && 패널 크롬 한국어', 'clean');
-    else bad('P5 미판독=확인 중 + 한국어 통일', 'AC-SUB-POPUP-5',
-      '미판독 슬롯에 확인 중 && 영어 UI 잔재 0 && 패널 크롬 한국어',
-      `unknown=${unknownOk},hits=[${hits.join(',')}],chrome=${chromeOk}`);
+    const chromeOk = panelHtml.includes('<html lang="en">') &&
+      panelHtml.includes('Subscription accounts') && panelHtml.includes('Close');
+    const cond = unknownOk && literalsOk && chromeOk;
+    if (cond) ok('P5 unread=Checking + English UI', 'AC-SUB-POPUP-5',
+      'unread slot says Checking && Korean string literals 0 && panel chrome is English', 'clean');
+    else bad('P5 unread=Checking + English UI', 'AC-SUB-POPUP-5',
+      'unread slot says Checking && Korean string literals 0 && panel chrome is English',
+      `unknown=${unknownOk},literals=${literalsOk},chrome=${chromeOk}`);
   }
 
   // ---------- P6: 콘솔 오류 0 (실패 fixture 포함) ----------
@@ -806,6 +806,34 @@ async function drain(n) { for (let i = 0; i < (n || 12); i++) await sleep(25); }
       `errors=${JSON.stringify(errorLog.slice(0, 3))},rendered=${rendered}`);
   }
 
+  // ---------- P7: recorded age stays visible when the live read is rate-limited ----------
+  {
+    const keep = FIX['acct-usage-now'];
+    const waiting = FIX.accounts.accounts[1].usage;
+    FIX.accounts.accounts[1].usage = { err: 'no data' };
+    FIX['acct-usage-now'] = { email: 'me@example.test', kind: 'personal',
+      usage: { err: 'http-429' } };
+    const { doc, api } = sandbox();
+    const host = doc.createElement('div'); doc.body.appendChild(host);
+    api.renderAcctPanel(host);
+    await drain();
+    const active = queryAll(host, '.acctrow').find(r => textOf(r).includes('me@example.test'));
+    const rendered = active ? textOf(active) : '';
+    const ageOk = rendered.includes('6 min ago');
+    const errorOk = rendered.includes('unavailable now (http-429)');
+    const valuesKept = rendered.includes('5h 4%') && rendered.includes('Weekly 22%');
+    const pending = queryAll(host, '.acctrow').find(r => textOf(r).includes('team@example.test'));
+    const cadenceOk = !!pending && textOf(pending).includes('Every 3-40 min');
+    FIX['acct-usage-now'] = keep;
+    FIX.accounts.accounts[1].usage = waiting;
+    const cond = ageOk && errorOk && valuesKept && cadenceOk;
+    if (cond) ok('P7 Claude usage age + honest 429 state', 'AC-SUB-POPUP-7',
+      'recorded age visible && current 429 visible && last values preserved && cadence says 3-40 min', rendered);
+    else bad('P7 Claude usage age + honest 429 state', 'AC-SUB-POPUP-7',
+      'recorded age visible && current 429 visible && last values preserved && cadence says 3-40 min',
+      rendered + ` cadence=${cadenceOk}`);
+  }
+
   console.log('---');
   AC.forEach(a => console.log(
     `${a.ac} | expected: ${a.expected} | observed: ${a.observed} | verdict: ${a.verdict} | signal: fixture | evidence: install/test-subscription-management.sh@${rev}`));
@@ -818,7 +846,7 @@ NODE
 case "${1:-}" in
   agy-swap) agy_swap ;;
   muse-usage) if muse_usage; then ok "muse-usage: verdict green (T-MU0..7)"; else bad "muse-usage: verdict red"; fi ;;
-  popup-6) if popup_6; then ok "popup-6: verdict green (P1,P1b,P2..6)"; else bad "popup-6: verdict red"; fi ;;
+  popup-6) if popup_6; then ok "popup-6: verdict green (P1,P1b,P2..7)"; else bad "popup-6: verdict red"; fi ;;
   *) echo "usage: $0 {muse-usage|agy-swap|popup-6}" >&2; exit 2 ;;
 esac
 

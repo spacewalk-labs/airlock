@@ -52,6 +52,10 @@ docker/_code/
 wt/
 
 # 선택 스킬 배선 산출물 — 이름만 skills.conf 에 커밋한다
-.claude/skills/
+# Repo-owned /deploy is source; the other entries remain generated wiring.
+.claude/skills/*
+!.claude/skills/deploy/
+# Codex mirror is generated locally; the repo-owned skill above is the source.
+.agents/skills/deploy
 # browser-driven verification runs (playwright MCP) drop artifacts here
 .playwright-mcp/

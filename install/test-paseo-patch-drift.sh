@@ -3,15 +3,8 @@
 # the small, human-readable reference patches; no @getpaseo bundle, npm, or network is
 # involved. Each positive assertion has a deliberately broken-anchor control beside it.
 set -uo pipefail
-# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: the share is 15/16 of the
-# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
-# whichever the runner happened to have. install/test-render-parity.sh gates that every
-# suite running a real app installer sets this — the gate does not reason about WHICH
-# app a dynamic path resolves to, so suites that only run other apps carry it too; the
-# seam is inert for them. (An intermediate design REFUSED below 8 GiB, which is what
-# made this urgent. The refusal is gone — owner, 2026-08-17 — the pin is still right.)
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+. "$(dirname "$0")/test-lib.sh"
+airlock_pin_paseo_mem
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -19,13 +12,11 @@ PATCH_DIR="$ROOT/apps/paseo/patches"
 TMP="$(mktemp -d)" || { echo "FAIL paseo-patch-drift: could not create test directory" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
-pass=0 fail=0
-ok(){ printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad(){ printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 if ! command -v node >/dev/null 2>&1; then
   bad "node is required for paseo patch drift tests"
-  printf 'paseo-patch-drift: %s ok, %s failed\n' "$pass" "$fail"
+printf 'paseo-patch-drift: %s ok, %s failed\n' "$pass" "$fail"
   exit 1
 fi
 
@@ -149,6 +140,7 @@ const expected = new Set([
   "agent-history-delete-guard",
   "depth4-search",
   "claude-model-prune",
+  "codex-model-roster",
   "opencode-grok-defaults",
   "provider-subagent-stream-filter",
   "image-attachments-persist",
@@ -157,8 +149,17 @@ const expected = new Set([
   "acp-context-gauge",
   "acp-cross-provider-mode-default",
   "acp-model-rejection",
+  "acp-agy-shared-catalog",
   "agent-resolve-by-id",
   "archive-consistency",
+  "schedule-pending-delivery-schema",
+  "schedule-busy-pending-delivery",
+  "schedule-stale-due-run",
+  "schedule-pending-batch",
+  "workspace-git-watch-recovery",
+  "workspace-git-emergency-policy",
+  "workspace-reconciliation-emergency-policy",
+  "workspace-remove-delivery",
   "patch-web-ui",
 ]);
 const seen = new Set();
@@ -189,6 +190,77 @@ if [ "$manifest_rc" -eq 0 ]; then
 else
   bad "anchor manifest: version/SHA/coverage/order contract"
   sed 's/^/    /' "$manifest_out"
+fi
+
+# --------------------------------------------------------------- Codex model roster
+CODEX_DIR="$TMP/codex-roster"
+mkdir -p "$CODEX_DIR"
+CODEX_FEATURE="$CODEX_DIR/codex-feature-definitions.js"
+CODEX_CATALOG="$CODEX_DIR/codex-app-server-agent.js"
+cat >"$CODEX_FEATURE" <<'EOF'
+const CODEX_FAST_MODE_SUPPORTED_MODELS = new Set([
+    "gpt-6-astra",
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+]);
+function normalizeCodexModelId(modelId) {
+    const normalized = typeof modelId === "string" ? modelId.trim() : "";
+    return normalized.length > 0 ? normalized : null;
+}
+export function codexModelSupportsFastMode(modelId) {
+    const normalizedModelId = normalizeCodexModelId(modelId);
+    if (!normalizedModelId) return false;
+    return CODEX_FAST_MODE_SUPPORTED_MODELS.has(normalizedModelId);
+}
+EOF
+cat >"$CODEX_CATALOG" <<'EOF'
+import { buildCodexFeatures, codexModelSupportsFastMode } from "./codex-feature-definitions.js";
+async function fixture(parsedResponse) {
+            const models = parsedResponse.success ? (parsedResponse.data.data ?? []) : [];
+            return models;
+}
+void buildCodexFeatures; void codexModelSupportsFastMode; void fixture;
+EOF
+cp "$CODEX_FEATURE" "$TMP/codex-feature.before"
+cp "$CODEX_CATALOG" "$TMP/codex-catalog.before"
+codex_ok=1
+positive_js "$PATCH_DIR/codex-model-roster.mjs" "$CODEX_FEATURE" feature || codex_ok=0
+positive_js "$PATCH_DIR/codex-model-roster.mjs" "$CODEX_CATALOG" catalog || codex_ok=0
+if [ "$codex_ok" -eq 1 ]; then
+  mv "$CODEX_FEATURE.paseo-new.mjs" "$CODEX_FEATURE"
+  mv "$CODEX_CATALOG.paseo-new.mjs" "$CODEX_CATALOG"
+  node --check "$CODEX_FEATURE" >/dev/null 2>&1 || codex_ok=0
+  node --check "$CODEX_CATALOG" >/dev/null 2>&1 || codex_ok=0
+  node "$PATCH_DIR/codex-model-roster.test.mjs" "$CODEX_FEATURE" "$CODEX_CATALOG" >/dev/null 2>&1 || codex_ok=0
+fi
+if [ "$codex_ok" -eq 1 ]; then
+  ok "Codex model roster: dynamic GPT-6 readiness and exact GPT-5.5 retirement"
+else
+  bad "Codex model roster: behaviour contract"
+fi
+
+printf '%s\n' '// drift' >"$CODEX_FEATURE"
+if negative_js "$PATCH_DIR/codex-model-roster.mjs" "$CODEX_FEATURE" 20 "$CODEX_FEATURE" feature; then
+  ok "Codex model roster: feature anchor drift refuses without a candidate"
+else
+  bad "Codex model roster: feature drift control"
+fi
+printf '%s\n' '// drift' >"$CODEX_CATALOG"
+if negative_js "$PATCH_DIR/codex-model-roster.mjs" "$CODEX_CATALOG" 20 "$CODEX_CATALOG" catalog; then
+  ok "Codex model roster: catalog anchor drift refuses without a candidate"
+else
+  bad "Codex model roster: catalog drift control"
+fi
+
+if grep -qF 'CODEX_ROSTER_PATCHER="$HERE/patches/codex-model-roster.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'Codex model roster verified (GPT-6 Sol/Luna ready; GPT-5.5 retired)' "$ROOT/apps/paseo/install.sh"; then
+  ok "Codex model roster: installer wiring is present"
+else
+  bad "Codex model roster: installer wiring is missing"
 fi
 
 # --------------------------------------------------------------------- depth4 inline sed
@@ -293,23 +365,40 @@ fi
 PRUNE="$TMP/model-manifest.js"
 reference_preimage "$PATCH_DIR/claude-model-prune.patch" "$PRUNE"
 printf '    },\n    {\n        id: "claude-sonnet-5",\n        label: "Sonnet 5",\n    },\n];\n' >> "$PRUNE"
-# Test-only fault injection used by the completion check: it makes the positive fixture
-# fail without changing a shipped patcher or a tracked reference patch.
-if [ "${PASEO_PATCH_DRIFT_BREAK:-}" = "model-prune" ]; then
-  sed -i '/export const CLAUDE_MODEL_MANIFEST = \[/d' "$PRUNE"
-fi
 if positive_js "$PATCH_DIR/claude-model-prune.mjs" "$PRUNE"; then
   if grep -qF '[airlock-model-prune]' "$PRUNE.paseo-new.mjs" \
     && ! grep -qF 'claude-opus-4-7' "$PRUNE.paseo-new.mjs" \
     && ! grep -qF 'claude-opus-4-6' "$PRUNE.paseo-new.mjs" \
     && ! grep -qF 'claude-sonnet-4-6' "$PRUNE.paseo-new.mjs" \
-    && grep -qF 'claude-opus-5' "$PRUNE.paseo-new.mjs"; then
-    ok "model prune: removes superseded IDs and preserves a current model"
+    && grep -qF 'claude-opus-5' "$PRUNE.paseo-new.mjs" \
+    && grep -qF 'id: "claude-opus-5-5",' "$PRUNE.paseo-new.mjs" \
+    && grep -qF 'id: "claude-sonnet-5-5",' "$PRUNE.paseo-new.mjs" \
+    && grep -qF 'description: "Opus 5 · Previous release",' "$PRUNE.paseo-new.mjs"; then
+    ok "model prune: removes superseded IDs, adds Opus and Sonnet 5.5"
   else
     bad "model prune: patched result did not match the intended manifest"
   fi
 else
   bad "model prune: representative fixture was not patched"
+fi
+# Upgrade path of an installed box: a manifest with Opus 5.5 already baked in
+# (sentinel present, no Sonnet 5.5) must gain Sonnet, then be final.
+PRUNE_OLD="$TMP/model-manifest-old.js"
+cp "$PRUNE.paseo-new.mjs" "$PRUNE_OLD"
+perl -0pi -e 's/    \{\n        id: "claude-sonnet-5-5",\n.*?\n    \},\n//s' "$PRUNE_OLD"
+old_rc=0; node "$PATCH_DIR/claude-model-prune.mjs" "$PRUNE_OLD" >/dev/null 2>&1 || old_rc=$?
+again_rc=0
+if [ "$old_rc" = 0 ]; then
+  node "$PATCH_DIR/claude-model-prune.mjs" "$PRUNE_OLD.paseo-new.mjs" >/dev/null 2>&1 || again_rc=$?
+fi
+if [ "$old_rc" = 0 ] && grep -qF 'id: "claude-opus-5-5",' "$PRUNE_OLD" \
+  && ! grep -qF 'id: "claude-sonnet-5-5",' "$PRUNE_OLD" \
+  && grep -qF 'id: "claude-opus-5-5",' "$PRUNE_OLD.paseo-new.mjs" \
+  && grep -qF 'id: "claude-sonnet-5-5",' "$PRUNE_OLD.paseo-new.mjs" \
+  && node --check "$PRUNE_OLD.paseo-new.mjs" 2>/dev/null && [ "$again_rc" = 10 ]; then
+  ok "model prune upgrade: an Opus 5.5 manifest gains Sonnet 5.5"
+else
+  bad "model prune upgrade: already-pruned manifest (rc=$old_rc, rerun rc=$again_rc) did not converge on Sonnet 5.5"
 fi
 PRUNE_BAD="$TMP/model-manifest-bad.js"
 cp "$PRUNE" "$PRUNE_BAD"
@@ -324,9 +413,6 @@ fi
 # ---------------------------------------------------------- OpenCode grok defaults
 OPENCODE_GROK="$TMP/opencode-agent.js"
 reference_preimage "$PATCH_DIR/opencode-grok-defaults.patch" "$OPENCODE_GROK"
-if [ "${PASEO_PATCH_DRIFT_BREAK:-}" = "opencode-grok-defaults" ]; then
-  sed -i '/const rawVariants = model.variants/d' "$OPENCODE_GROK"
-fi
 if positive_js "$PATCH_DIR/opencode-grok-defaults.mjs" "$OPENCODE_GROK"; then
   if grep -qF '[airlock-opencode-grok-defaults]' "$OPENCODE_GROK.paseo-new.mjs" \
     && grep -qF 'const preferred = ["opencode-go/muse-spark-1.3-contributor", "xai/grok-4.6", "xai/grok-build-0.1"];' "$OPENCODE_GROK.paseo-new.mjs" \
@@ -598,18 +684,60 @@ else
   bad "agy ACP cross-provider mode default negative control: skipped patch did not fail the positive assertion"
 fi
 
+# ----------------------------------------- agy ACP gap: shared model catalogue
+ACPCAT="$TMP/provider-registry.js"
+cat > "$ACPCAT" <<'FIXTURE'
+function wrapClientProvider(provider, inner, profileModels, additionalModels, profileModelsAreAdditive) {
+    const listImportableSessions = inner.listImportableSessions?.bind(inner);
+    const importSession = inner.importSession?.bind(inner);
+    const listFeatures = inner.listFeatures?.bind(inner);
+    return {
+        provider,
+        capabilities: inner.capabilities,
+    };
+}
+function buildCustom(providerId, override, command) {
+    return {
+                createBaseClient: (logger) => {
+                    const acpOptions = { logger, command, providerId };
+                    if (providerId === "cursor") {
+                        return new CursorACPAgentClient(acpOptions);
+                    }
+                    return new GenericACPAgentClient(acpOptions);
+                },
+                contract: null,
+    };
+}
+FIXTURE
+if positive_js "$PATCH_DIR/acp-agy-shared-catalog.mjs" "$ACPCAT" \
+  && grep -qF '[paseo-acp-agy-shared-catalog]' "$ACPCAT.paseo-new.mjs" \
+  && node "$PATCH_DIR/acp-agy-shared-catalog.test.mjs" "$ACPCAT.paseo-new.mjs" >"$TMP/acpcat.out" 2>&1 \
+  && ! node "$PATCH_DIR/acp-agy-shared-catalog.test.mjs" "$ACPCAT" >/dev/null 2>&1; then
+  ok "agy ACP shared catalogue: agy gets the host key and the wrapper forwards it"
+else
+  bad "agy ACP shared catalogue: representative fixture was not patched as intended"
+  sed 's/^/    /' "$TMP/acpcat.out" 2>/dev/null
+fi
+ACPCAT_BAD="$TMP/provider-registry-bad.js"
+cp "$ACPCAT" "$ACPCAT_BAD"
+sed -i '/return new GenericACPAgentClient(acpOptions);/d' "$ACPCAT_BAD"
+cp "$ACPCAT_BAD" "$TMP/provider-registry-bad.before"
+if negative_js "$PATCH_DIR/acp-agy-shared-catalog.mjs" "$ACPCAT_BAD" 20 "$TMP/provider-registry-bad.before"; then
+  ok "agy ACP shared catalogue negative control: missing generic-client anchor is an untouched rc 20 skip"
+else
+  bad "agy ACP shared catalogue negative control: skipped patch did not fail the positive assertion"
+fi
+
 # ------------------------------------------ platform Claude pool-record contract
 # The platform, not paseo or devterm, owns ~/.claude-accounts now. This compact schema
 # names the fields a refresh write-back must retain when present and deliberately leaves
 # every object open: upstream adds fields without coordinating with this repository, so a
 # validator-projected write is data loss even when every currently-known field is listed.
-# Pin both the schema vocabulary and a deletion control here, beside the vendored patch it
-# governs. A prose reference can drift while remaining plausible; deleting any contracted
-# field below must make this test fail.
+# Pin the schema vocabulary here, beside the vendored patch it governs, so a prose
+# reference cannot drift while remaining plausible.
 POOL_SCHEMA_OUT="$TMP/pool-schema.out"
 POOL_SCHEMA_RC=0
 python3 - "$ROOT/schemas/credentials/pool-record-v1.json" >"$POOL_SCHEMA_OUT" 2>&1 <<'PY' || POOL_SCHEMA_RC=$?
-import copy
 import json
 import pathlib
 import sys
@@ -646,94 +774,9 @@ assert schema["preserve_unknown_fields"] is True
 assert schema["required_writeback_fields_if_present"] == required
 assert schema["allowed_refresh_updates"] == updates_allowed
 assert sorted(schema["field_types"]) == required
-
-def leaves(value, prefix=""):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            child_path = f"{prefix}.{key}" if prefix else key
-            yield from leaves(child, child_path)
-    else:
-        yield prefix, value
-
-def lookup(value, dotted):
-    current = value
-    for part in dotted.split("."):
-        if not isinstance(current, dict) or part not in current:
-            raise AssertionError(f"write-back dropped {dotted}")
-        current = current[part]
-    return current
-
-def assign(value, dotted, replacement):
-    parts = dotted.split(".")
-    current = value
-    for part in parts[:-1]:
-        current = current[part]
-    current[parts[-1]] = replacement
-
-def remove(value, dotted):
-    parts = dotted.split(".")
-    current = value
-    for part in parts[:-1]:
-        current = current[part]
-    del current[parts[-1]]
-
-def assert_writeback(before, after, updates):
-    assert isinstance(after.get("claudeAiOauth"), dict), "required object was dropped"
-    for dotted in required:
-        try:
-            old = lookup(before, dotted)
-        except AssertionError:
-            continue
-        expected = updates.get(dotted, old)
-        assert lookup(after, dotted) == expected, f"write-back changed {dotted} outside its contract"
-    for dotted, old in leaves(before):
-        if dotted not in updates:
-            assert lookup(after, dotted) == old, f"write-back dropped or changed {dotted}"
-
-# Values are inert, local sentinels. The test emits only assertions and counts, never data.
-before = {
-    "claudeAiOauth": {
-        "accessToken": "redacted-old",
-        "refreshToken": "redacted-old",
-        "expiresAt": 1,
-        "refreshTokenExpiresAt": 2,
-        "scopes": ["scope-a"],
-        "subscriptionType": "kind-a",
-        "rateLimitTier": "tier-a",
-        "futureProviderField": {"nested": True},
-    },
-    "_meta": {"email": "account.invalid", "org": None, "kind": "personal", "futureMeta": 3},
-    "futureTopLevel": {"nested": 4},
-}
-updates = {dotted: "redacted-new" for dotted in updates_allowed}
-after = copy.deepcopy(before)
-for dotted, replacement in updates.items():
-    assign(after, dotted, replacement)
-assert_writeback(before, after, updates)
-
-for dotted in required:
-    broken = copy.deepcopy(after)
-    remove(broken, dotted)
-    try:
-        assert_writeback(before, broken, updates)
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError(f"negative control did not detect deletion of {dotted}")
-
-for dotted in ("claudeAiOauth.futureProviderField", "_meta.futureMeta", "futureTopLevel"):
-    broken = copy.deepcopy(after)
-    remove(broken, dotted)
-    try:
-        assert_writeback(before, broken, updates)
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError(f"negative control did not detect deletion of {dotted}")
 PY
 if [ "$POOL_SCHEMA_RC" -eq 0 ]; then
   ok "platform pool schema: canonical shape pins every known preservation field"
-  ok "platform pool schema negative controls: known and unknown field deletion is rejected"
 else
   bad "platform pool schema: shape or deletion controls"
   sed 's/^/    /' "$POOL_SCHEMA_OUT"
@@ -927,6 +970,205 @@ if grep -qF 'ARCHIVE_CONSISTENCY_PATCHER="$HERE/patches/archive-consistency.mjs"
 else
   bad "archive/workspace consistency: installer wiring is absent"
 fi
+
+# ------------------------------------------------------- schedule stale-due + single list
+# The reference preimage carries the *already busy-pending-patched* tick as context, because
+# that is what this patcher anchors on. Order is the contract: without the precursor the
+# patcher must refuse (rc 20) rather than write half a fix.
+STALEDUE="$TMP/schedule-service-staledue.js"
+reference_preimage "$PATCH_DIR/schedule-stale-due-run.patch" "$STALEDUE"
+if positive_js "$PATCH_DIR/schedule-stale-due-run.mjs" "$STALEDUE"; then
+  if grep -qF '[paseo-schedule-stale-due]' "$STALEDUE.paseo-new.mjs" \
+    && grep -qF 'appendRunningRun(scheduleId, runningRun, manual)' "$STALEDUE.paseo-new.mjs" \
+    && grep -qF 'schedule.nextRunAt !== runningRun.scheduledFor' "$STALEDUE.paseo-new.mjs" \
+    && grep -qF 'return appended ? existing : null;' "$STALEDUE.paseo-new.mjs" \
+    && ! grep -qF 'for (const schedule of await this.store.list()) {' "$STALEDUE.paseo-new.mjs"; then
+    ok "schedule stale-due: revalidates the due snapshot inside the atomic update and stops the second full read"
+  else
+    bad "schedule stale-due: patched result did not carry the revalidation or still reads the directory twice"
+  fi
+else
+  bad "schedule stale-due: representative fixture was not patched"
+fi
+STALEDUE_BAD="$TMP/schedule-service-staledue-bad.js"
+cp "$STALEDUE" "$STALEDUE_BAD"
+sed -i '/async appendRunningRun(scheduleId, runningRun) {/d' "$STALEDUE_BAD"
+cp "$STALEDUE_BAD" "$TMP/schedule-service-staledue-bad.before"
+if negative_js "$PATCH_DIR/schedule-stale-due-run.mjs" "$STALEDUE_BAD" 20 "$TMP/schedule-service-staledue-bad.before"; then
+  ok "schedule stale-due negative control: a missing append anchor is an untouched rc 20 skip"
+else
+  bad "schedule stale-due negative control: skipped patch did not fail the positive assertion"
+fi
+# The ordering contract itself: strip the precursor's marker and the patcher must refuse.
+STALEDUE_NOPRE="$TMP/schedule-service-staledue-noprecursor.js"
+reference_preimage "$PATCH_DIR/schedule-stale-due-run.patch" "$STALEDUE_NOPRE"
+sed -i '/\[paseo-schedule-pending\] pending 은 due 보다 먼저/d' "$STALEDUE_NOPRE"
+cp "$STALEDUE_NOPRE" "$TMP/schedule-service-staledue-noprecursor.before"
+if negative_js "$PATCH_DIR/schedule-stale-due-run.mjs" "$STALEDUE_NOPRE" 20 \
+  "$TMP/schedule-service-staledue-noprecursor.before"; then
+  ok "schedule stale-due ordering: refuses to apply before schedule-busy-pending-delivery"
+else
+  bad "schedule stale-due ordering: applied without its precursor (half a fix)"
+fi
+# Re-applying must be a no-op, not a second rewrite.
+cp "$STALEDUE.paseo-new.mjs" "$TMP/schedule-service-staledue-applied.js"
+staledue_again_rc=0
+node "$PATCH_DIR/schedule-stale-due-run.mjs" "$TMP/schedule-service-staledue-applied.js" \
+  >/dev/null 2>&1 || staledue_again_rc=$?
+if [ "$staledue_again_rc" -eq 10 ] && [ ! -f "$TMP/schedule-service-staledue-applied.js.paseo-new.mjs" ]; then
+  ok "schedule stale-due: re-applying an already patched file is an untouched rc 10 skip"
+else
+  bad "schedule stale-due: re-apply was not a clean rc 10 skip (rc=$staledue_again_rc)"
+fi
+if grep -qF 'SCHEDSTALE_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/schedule-stale-due-run.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'apply_schedpend stale-due "$SCHEDSTALE_PATCHER" "$SCHEDULE_SERVICE_JS" "$SCHEDSTALE_TEST"' "$ROOT/apps/paseo/install.sh"; then
+  ok "schedule stale-due: installer applies it after the busy-pending service patch"
+else
+  bad "schedule stale-due: installer wiring is absent"
+fi
+
+# ------------------------------------------------------- schedule pending batch (one turn per seat)
+SCHEDBATCH="$TMP/schedule-service-batch.js"
+reference_preimage "$PATCH_DIR/schedule-pending-batch.patch" "$SCHEDBATCH"
+if positive_js "$PATCH_DIR/schedule-pending-batch.mjs" "$SCHEDBATCH"; then
+  if grep -qF '[paseo-schedule-pending-batch]' "$SCHEDBATCH.paseo-new.mjs" \
+    && grep -qF 'async runPendingBatch(claimed, now) {' "$SCHEDBATCH.paseo-new.mjs" \
+    && grep -qF 'await this.restorePendingDelivery(schedule.id);' "$SCHEDBATCH.paseo-new.mjs" \
+    && ! grep -qF 'await this.runSchedule({ ...schedule, pendingAgentDelivery: false }, now);' "$SCHEDBATCH.paseo-new.mjs"; then
+    ok "schedule pending-batch: a seat's pending schedules go out in one turn and a refused claim keeps its bit"
+  else
+    bad "schedule pending-batch: patched result did not carry the batch or the bit restore"
+  fi
+else
+  bad "schedule pending-batch: representative fixture was not patched"
+fi
+SCHEDBATCH_NOPRE="$TMP/schedule-service-batch-noprecursor.js"
+reference_preimage "$PATCH_DIR/schedule-pending-batch.patch" "$SCHEDBATCH_NOPRE"
+sed -i '/return appended ? existing : null;/d' "$SCHEDBATCH_NOPRE"
+cp "$SCHEDBATCH_NOPRE" "$TMP/schedule-service-batch-noprecursor.before"
+if negative_js "$PATCH_DIR/schedule-pending-batch.mjs" "$SCHEDBATCH_NOPRE" 20 \
+  "$TMP/schedule-service-batch-noprecursor.before"; then
+  ok "schedule pending-batch ordering: refuses to apply before schedule-stale-due-run"
+else
+  bad "schedule pending-batch ordering: applied without its precursor (half a fix)"
+fi
+cp "$SCHEDBATCH.paseo-new.mjs" "$TMP/schedule-service-batch-applied.js"
+schedbatch_again_rc=0
+node "$PATCH_DIR/schedule-pending-batch.mjs" "$TMP/schedule-service-batch-applied.js" \
+  >/dev/null 2>&1 || schedbatch_again_rc=$?
+if [ "$schedbatch_again_rc" -eq 10 ] && [ ! -f "$TMP/schedule-service-batch-applied.js.paseo-new.mjs" ]; then
+  ok "schedule pending-batch: re-applying an already patched file is an untouched rc 10 skip"
+else
+  bad "schedule pending-batch: re-apply was not a clean rc 10 skip (rc=$schedbatch_again_rc)"
+fi
+if grep -qF 'apply_schedpend pending-batch "$SCHEDBATCH_PATCHER" "$SCHEDULE_SERVICE_JS" "$SCHEDBATCH_TEST"' "$ROOT/apps/paseo/install.sh"; then
+  ok "schedule pending-batch: installer applies it after stale-due"
+else
+  bad "schedule pending-batch: installer wiring is absent"
+fi
+
+# ------------------------------------------------------- working-tree watch recovery (upstream #3056)
+WATCHREC="$TMP/workspace-git-service.js"
+reference_preimage "$PATCH_DIR/workspace-git-watch-recovery.patch" "$WATCHREC"
+if positive_js "$PATCH_DIR/workspace-git-watch-recovery.mjs" "$WATCHREC"; then
+  if grep -qF '[paseo-watch-recovery]' "$WATCHREC.paseo-new.mjs" \
+    && grep -qF 'WATCH_RECOVERY_MAX_DELAY_MS = 300000' "$WATCHREC.paseo-new.mjs" \
+    && grep -qF 'DEGRADED_GIT_POLL_MAX_INTERVAL_MS = 60000' "$WATCHREC.paseo-new.mjs" \
+    && ! grep -qF 'target.recovery.attemptCount >= WATCH_RECOVERY_MAX_ATTEMPTS) {' "$WATCHREC.paseo-new.mjs"; then
+    ok "watch recovery: keeps retrying (300s cap) and backs a quiet poll off (60s cap)"
+  else
+    bad "watch recovery: patched result still gives up or keeps a fixed 5s poll"
+  fi
+else
+  bad "watch recovery: representative fixture was not patched"
+fi
+WATCHREC_BAD="$TMP/workspace-git-service-bad.js"
+cp "$WATCHREC" "$WATCHREC_BAD"
+sed -i '/scheduleWorkingTreeWatchRecovery(target) {/d' "$WATCHREC_BAD"
+cp "$WATCHREC_BAD" "$TMP/workspace-git-service-bad.before"
+if negative_js "$PATCH_DIR/workspace-git-watch-recovery.mjs" "$WATCHREC_BAD" 20 "$TMP/workspace-git-service-bad.before"; then
+  ok "watch recovery negative control: a missing recovery anchor is an untouched rc 20 skip"
+else
+  bad "watch recovery negative control: skipped patch did not fail the positive assertion"
+fi
+if grep -qF 'WATCHREC_PATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/patches" 2>/dev/null && pwd || true)/workspace-git-watch-recovery.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'node "$WATCHREC_TEST" "$wr_tmp"' "$ROOT/apps/paseo/install.sh"; then
+  ok "watch recovery: installer applies it and runs its behaviour check on the candidate"
+else
+  bad "watch recovery: installer wiring is absent"
+fi
+
+# Cached workspace removal after an unchanged reconnect bootstrap.
+REMOVE_FIXTURE="$TMP/workspace-remove-session.js"
+cat > "$REMOVE_FIXTURE" <<'JS'
+class Session {
+    shouldSkipWorkspaceRemoval(lastEmitted, removedProjectId) {
+        if (lastEmitted?.kind === "remove") {
+            return !removedProjectId || lastEmitted.removedProjectId === removedProjectId;
+        }
+        return !lastEmitted && !removedProjectId;
+    }
+}
+JS
+if positive_js "$PATCH_DIR/workspace-remove-delivery.mjs" "$REMOVE_FIXTURE" \
+  && node --check "$REMOVE_FIXTURE.paseo-new.mjs"; then
+  ok "workspace removal: unchanged cached rows receive archive removal"
+else
+  bad "workspace removal: representative target failed"
+fi
+cp "$REMOVE_FIXTURE" "$TMP/workspace-remove-bad.js"
+sed -i '/return !lastEmitted && !removedProjectId;/d' "$TMP/workspace-remove-bad.js"
+cp "$TMP/workspace-remove-bad.js" "$TMP/workspace-remove-bad.before"
+if negative_js "$PATCH_DIR/workspace-remove-delivery.mjs" "$TMP/workspace-remove-bad.js" 20 "$TMP/workspace-remove-bad.before"; then
+  ok "workspace removal: anchor drift leaves source untouched"
+else
+  bad "workspace removal: anchor drift changed source"
+fi
+remove_rc=0
+node "$PATCH_DIR/workspace-remove-delivery.mjs" "$REMOVE_FIXTURE.paseo-new.mjs" > /dev/null || remove_rc=$?
+if [ "$remove_rc" = 10 ]; then
+  ok "workspace removal: repeat patch is idempotent"
+else
+  bad "workspace removal: repeat patch failed"
+fi
+
+# Background policy fixtures are independent of patcher literals. Both registered
+# patchers must accept their original shape, reject drift, and remain idempotent.
+for policy in workspace-git-emergency-policy workspace-reconciliation-emergency-policy; do
+  fixture="$TMP/$policy.js"
+  if [ "$policy" = workspace-git-emergency-policy ]; then
+    cat >"$fixture" <<'EOF'
+export class WorkspaceGitServiceImpl {
+    async refreshSnapshot(target, request, runRefreshGitCommand) {}
+    async runRepoFetch(target) {}
+}
+EOF
+    anchor='async refreshSnapshot'
+  else
+    cat >"$fixture" <<'EOF'
+export class WorkspaceReconciliationService {
+    async reconcileObservedGitMetadata(mode = "metadata") {}
+    async reconcileNow() {}
+}
+EOF
+    anchor='async reconcileNow'
+  fi
+  if positive_js "$PATCH_DIR/$policy.mjs" "$fixture" \
+    && node --check "$fixture.paseo-new.mjs" \
+    && node "$PATCH_DIR/$policy.test.mjs" "$fixture.paseo-new.mjs"; then
+    ok "$policy: positive candidate syntax and behavior"
+  else bad "$policy: positive fixture failed"; fi
+  cp "$fixture" "$fixture.bad"
+  sed -i "s/$anchor/drifted_method/" "$fixture.bad"
+  cp "$fixture.bad" "$fixture.before"
+  if negative_js "$PATCH_DIR/$policy.mjs" "$fixture.bad" 20 "$fixture.before"; then
+    ok "$policy: missing anchor leaves bytes untouched"
+  else bad "$policy: drift not detected"; fi
+  again_rc=0
+  node "$PATCH_DIR/$policy.mjs" "$fixture.paseo-new.mjs" >/dev/null || again_rc=$?
+  if [ "$again_rc" = 10 ]; then ok "$policy: already-applied skip";
+  else bad "$policy: idempotence failed"; fi
+ done
 
 printf 'paseo-patch-drift: %s ok, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

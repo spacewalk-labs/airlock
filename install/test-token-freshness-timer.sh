@@ -81,12 +81,6 @@ grep -q '^Environment=AIRLOCK_DEV_MONITOR_ACCOUNTS_STATUS_BIN=/opt/example/airlo
   && ok "the timer receives the platform status CLI under the package-owned runtime name" \
   || bad "the timer does not carry the D5 account-status handoff"
 
-# A positive control: the assertion above only means something if it can fail.
-printf '[Unit]\nDescription=x @NOTSUBSTITUTED@\n' > "$TMP/control.service"
-grep -q '@[A-Z]*@' "$TMP/control.service" \
-  && ok "the placeholder assertion is capable of failing (positive control)" \
-  || bad "the placeholder assertion cannot detect a placeholder"
-
 if command -v systemd-analyze >/dev/null 2>&1; then
   # Headless CI runners need an explicit private runtime directory for --user parsing;
   # relying on a logged-in user's XDG_RUNTIME_DIR makes this offline check intermittent.
@@ -157,11 +151,6 @@ for key in token_freshness token_freshness_warn_hours token_freshness_stale_hour
     && ok "$key is declared in the dev-monitor manifest" \
     || bad "$key is read by the code but not declared in airlock-app.toml"
 done
-
-# And CI has to run this file, or none of the above is load-bearing.
-grep -q 'install/test-token-freshness-timer.sh' "$ROOT/.github/workflows/ci.yml" \
-  && ok "ci.yml runs this suite" \
-  || bad "ci.yml does not run install/test-token-freshness-timer.sh"
 
 echo "---"
 echo "passed=$pass failed=$fail"

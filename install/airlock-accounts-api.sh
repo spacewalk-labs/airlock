@@ -78,31 +78,37 @@ if [ "${AIRLOCK_HUB_XAI:-false}" = true ]; then
 fi
 # agy is optional and per box: found = the panel shows its quota, absent = the row says
 # so. The unit gets an absolute path because a user unit's PATH does not include
-# ~/.local/bin, where the agy installer puts it.
-AGY_BIN="$(PATH="$HOME/.local/bin:$PATH" command -v agy || true)"
+# ~/.local/bin or ~/.gemini/bin — the agy installer puts it in either (a box with
+# only ~/.gemini/bin/agy rendered it empty and its agy row stayed off).
+AGY_BIN="$(PATH="$HOME/.local/bin:$HOME/.gemini/bin:$PATH" command -v agy || true)"
+# Paseo backend for the agy switch's seat restart. Same single-read rule as the port:
+# the orchestrator's env when it ran us, else the config; empty = Paseo off here.
+PASEO_PORT="${AIRLOCK_PASEO_BACKEND_PORT-}"
+if [ -z "$PASEO_PORT" ]; then
+  PASEO_PORT="$( (airlock_config env paseo 2>/dev/null || true) | sed -n 's/^AIRLOCK_PASEO_BACKEND_PORT=//p' | tr -d "\"'" | head -1)"
+fi
+PASEO_HOST=""
+case "$PASEO_PORT" in ''|*[!0-9]*) ;; *) PASEO_HOST="127.0.0.1:$PASEO_PORT" ;; esac
 # Muse vault-key reader (MUSE_USAGE body): the helper prints the {item: key} map
-# the route reads. Both reader paths and the brokered key's full address arrive
-# via box-local install environment, never a default or a resolution here:
+# the route reads. The shared reader path arrives via box-local install environment:
 # reader binary names and vault names do not ship in this repository. No reader
 # on this box means no Muse keys here, so the helper path stays empty and
 # /muse-usage answers disabled rather than broken.
-MUSE_SECRET_BIN="${AIRLOCK_MUSE_SECRET_BIN-}"
-MUSE_CHO_BIN="${AIRLOCK_MUSE_CHO_BIN-}"
+# Explicit AIRLOCK_MUSE_* (an operator or fixture) win; otherwise the box's own
+# [apps.hub] muse_* keys, so a later install that is handed nothing keeps them.
+MUSE_SECRET_BIN="${AIRLOCK_MUSE_SECRET_BIN:-${AIRLOCK_HUB_MUSE_SECRET_BIN-}}"
 MUSE_KEYS_BIN=""
 # Executability is checked here, not hoped for in the unit: a handed-in path
 # that does not exist would otherwise render an enabled-looking route that
 # answers enabled:true with no entries. No usable reader means disabled.
-if [ -x "$MUSE_SECRET_BIN" ] || [ -x "$MUSE_CHO_BIN" ]; then
+if [ -x "$MUSE_SECRET_BIN" ]; then
   MUSE_KEYS_BIN="$ROOT/bin/airlock-muse-keys"
 fi
-MUSE_CHO_REF="${AIRLOCK_MUSE_CHO_REF-}"
-# Muse manual swap (MUSE_ROTATE): the assignment sheet pointer, this box's name
-# and the cho-only screen flag. All empty by default — the picker then offers
-# nothing (sheet), falls back to the short hostname (box) and hides the cho key
-# (screen). The cho reader box's deployment sets the registry URL and the cho flag to 1.
-MUSE_REGISTRY="${AIRLOCK_MUSE_REGISTRY-}"
+# Muse manual swap (MUSE_ROTATE): the assignment sheet pointer and this box's name.
+# Both are empty by default — the picker then offers nothing (sheet) and falls
+# back to the short hostname (box).
+MUSE_REGISTRY="${AIRLOCK_MUSE_REGISTRY:-${AIRLOCK_HUB_MUSE_REGISTRY-}}"
 BOX_NAME="${AIRLOCK_BOX_NAME-}"
-MUSE_CHO_VISIBLE="${AIRLOCK_MUSE_CHO_VISIBLE-}"
 
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] render platform account surface unit into $UNIT_DIR (port $ACCOUNTS_PORT)"
@@ -150,14 +156,12 @@ if ! sed -e "s|@AIRLOCK_ROOT@|$(escape "$ROOT")|g" \
           -e "s|@FLEET_STORE_URL@|$(escape "$FLEET_STORE_URL")|g" \
           -e "s|@OPENCODE_BIN@|$(escape "$OPENCODE_BIN")|g" \
            -e "s|@AGY_BIN@|$(escape "$AGY_BIN")|g" \
+           -e "s|@PASEO_HOST@|$(escape "$PASEO_HOST")|g" \
            -e "s|@AGY_USAGE_BIN@|$(escape "$ROOT/bin/airlock-agy-usage")|g" \
            -e "s|@MUSE_KEYS_BIN@|$(escape "$MUSE_KEYS_BIN")|g" \
            -e "s|@MUSE_REGISTRY@|$(escape "$MUSE_REGISTRY")|g" \
            -e "s|@BOX_NAME@|$(escape "$BOX_NAME")|g" \
-           -e "s|@MUSE_CHO_VISIBLE@|$(escape "$MUSE_CHO_VISIBLE")|g" \
            -e "s|@MUSE_SECRET_BIN@|$(escape "$MUSE_SECRET_BIN")|g" \
-           -e "s|@MUSE_CHO_BIN@|$(escape "$MUSE_CHO_BIN")|g" \
-           -e "s|@MUSE_CHO_REF@|$(escape "$MUSE_CHO_REF")|g" \
            "$HERE/systemd/$SERVICE.in" > "$tmp"; then
   rm -f "$tmp"
   die "could not render $SERVICE"

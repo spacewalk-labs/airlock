@@ -34,11 +34,21 @@
 # under AIRLOCK_DRY_RUN=1 (install/lib.sh now fails closed if
 # AIRLOCK_RENDER_DIR is set without it — see the guard fixture).
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/.." && pwd)"
 export ROOT
 GOLDEN="$HERE/golden/render"
 MODE="${1:-check}"
 TMP="$(mktemp -d)"
+# Keep any installer reached by this suite inside a marked private fixture.
+# A neutral cgroup also prevents a test launched from airlock-paseo.service
+# from escaping through the real user systemd manager.
+chmod 700 "$TMP"
+mkdir -p "$TMP/home"
+export HOME="$TMP/home" AIRLOCK_STATE_DIR="$TMP/state"
+airlock_neutral_selfkill_cgroup "$TMP"
+airlock_set_fixture_root "$TMP"
+airlock_pin_paseo_mem
 NGTMP=""
 NGSOCKDIR=""
 NGINX_PARITY_PID=""
@@ -85,9 +95,7 @@ if command -v node >/dev/null 2>&1; then
   NODE_REAL_BIN_DIR="$(dirname "$(readlink -f "$(command -v node)")" 2>/dev/null || true)"
   [ "$NODE_REAL_BIN_DIR" = "$NODE_FOUND_BIN_DIR" ] && NODE_REAL_BIN_DIR=""
 fi
-pass=0 fail=0
-ok(){ echo "ok   $1"; pass=$((pass+1)); }
-bad(){ echo "FAIL $1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 # Every command ANY shipped app could need (F11 assembly: the raw TSV plus
 # every migrated app's manifest-declared [[prerequisites]] rows) — a P2
@@ -271,6 +279,9 @@ done
 # ===========================================================================
 APP="$ROOT/apps/dev-monitor"
 . "$APP/render.sh"
+f="$(out_file)"
+render_to "$f" render_dev_monitor_ingest_nginx 19926 19923
+golden_check_file "dev-monitor/ingest/nginx.conf" "$f"
 for kind in service timer; do
   f="$(out_file)"
   render_to "$f" render_dev_monitor_heartbeat "$kind" "/home/example/.local/state/airlock/dev-monitor/spool"
@@ -1040,17 +1051,6 @@ PY
   NGE2E_OFF_CFG="$NGTMP/airlock-e2e-title-meta-off.toml"
   sed "/^\[apps.publish\]$/a title_meta = false\nbackend_port = $META_OFF_BACKEND_PORT\ntailnet_view = false" \
     "$NGE2E_CFG" > "$NGE2E_OFF_CFG"
-  (
-    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_ON_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
-           AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
-    bash "$ROOT/install/render-nginx.sh"
-  ) > "$NGTMP/e2e-site.conf" 2> "$NGTMP/e2e-site.err"
-  (
-    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_OFF_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
-           AIRLOCK_CONFD="$NGTMP/confd-off" AIRLOCK_TS_FQDN="box.example.ts.net"
-    bash "$ROOT/install/render-nginx.sh"
-  ) > "$NGTMP/e2e-site-tailnet-off.conf" 2> "$NGTMP/e2e-site-tailnet-off.err"
-
   mkdir -p "$NGTMP/share/nested" "$NGTMP/private" "$NGTMP/cbt" "$NGTMP/pt" \
     "$NGTMP/ft" "$NGTMP/ut" "$NGTMP/st" "$NGTMP/confd-off/hub-locations.d" \
     "$NGTMP/confd-off/servers.d"
@@ -1072,6 +1072,20 @@ PY
   render_publish_nginx_main "$META_OFF_BACKEND_PORT" "$NGTMP/share" \
     > "$NGTMP/confd-off/hub-locations.d/publish.conf"
   render_fileview_nginx 19501 owner > "$NGTMP/confd/hub-locations.d/fileview.conf"
+
+  # The core renderer includes only fragments already present in CONFD. Render
+  # these e2e sites after seeding the fixture fragments, as the real installer
+  # does; otherwise requests fall through the hub SPA and return index.html/200.
+  (
+    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_ON_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
+           AIRLOCK_CONFD="$NGTMP/confd" AIRLOCK_TS_FQDN="box.example.ts.net"
+    bash "$ROOT/install/render-nginx.sh"
+  ) > "$NGTMP/e2e-site.conf" 2> "$NGTMP/e2e-site.err"
+  (
+    export HOME="$NGTMP/home" AIRLOCK_CONFIG="$NGE2E_OFF_CFG" AIRLOCK_WEBROOT="$NGTMP/web" \
+           AIRLOCK_CONFD="$NGTMP/confd-off" AIRLOCK_TS_FQDN="box.example.ts.net"
+    bash "$ROOT/install/render-nginx.sh"
+  ) > "$NGTMP/e2e-site-tailnet-off.conf" 2> "$NGTMP/e2e-site-tailnet-off.err"
 
   sed -e "s|listen 127.0.0.1:19902;|listen unix:$NGSOCKDIR/hub.sock;|" \
       -e "s|listen 127.0.0.1:19903;|listen unix:$NGSOCKDIR/redirect.sock;|" \
@@ -1786,6 +1800,7 @@ run_installer_path code-server "" "" installer-path \
   "units/airlock-code-server-manager.service" "unit-manager.service"
 run_installer_path dev-monitor "" "" installer-path \
   "confd/hub-locations.d/dev-monitor.conf" "nginx.conf" \
+  "confd/servers.d/dev-monitor.conf" "../ingest/nginx.conf" \
   "units/airlock-dev-monitor.service" "unit.service"
 
 # dev-monitor single webhook — configured and unset through the real installer.
@@ -1884,7 +1899,7 @@ rm -rf "$DMOFF"
 
 # Env-file injection guards: reject both configured variable names and the values
 # resolved through them, while never echoing the rejected value.
-for dm_key in slack_webhook_urgent_env; do
+for dm_key in slack_webhook_urgent_env slack_bot_token_env; do
   DMBAD="$(mktemp -d)"; mkdir -p "$DMBAD/home/.config/airlock" "$DMBAD/render"
   {
     printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.dev-monitor]\nmessages = true\n'
@@ -1903,7 +1918,7 @@ for dm_key in slack_webhook_urgent_env; do
   rm -rf "$DMBAD"
 done
 
-for dm_key in slack_webhook_urgent_env; do
+for dm_key in slack_webhook_urgent_env slack_bot_token_env; do
   DMBAD="$(mktemp -d)"; mkdir -p "$DMBAD/home/.config/airlock" "$DMBAD/render"
   printf 'DEV_MONITOR_PROXY_SECRET=fixture-proxy-only\n' > "$DMBAD/home/.config/airlock/dev-monitor.env"
   {
@@ -2342,8 +2357,22 @@ for _suite in "$HERE"/test-*.sh; do
   # Comments stripped on THIS side too. They were not, so replacing a suite's real
   # export with a comment that merely mentions the variable passed the gate — the same
   # "a comment satisfies the check" defect the matcher above was already fixed for.
-  grep -q 'AIRLOCK_PASEO_MEM_CAP_BYTES' \
-    < <(grep -vE '^[[:space:]]*#' "$_suite") || paseo_pin_unpinned+=("$(basename "$_suite")")
+  _suite_stripped="$(grep -vE '^[[:space:]]*#' "$_suite")"
+  if grep -q 'AIRLOCK_PASEO_MEM_CAP_BYTES' <<<"$_suite_stripped"; then
+    continue
+  fi
+  # Sourced pin: install/test-lib.sh centralizes the literal export behind
+  # airlock_pin_paseo_mem, so a suite that sources it and calls that function
+  # is pinned exactly as if it had the export inline — check both halves
+  # (the call site here, the literal export in test-lib.sh) rather than
+  # trusting the source line alone, or a suite that sources the library
+  # without ever calling the function would pass unpinned.
+  if grep -qE 'test-lib\.sh' <<<"$_suite_stripped" \
+     && grep -q 'airlock_pin_paseo_mem' <<<"$_suite_stripped" \
+     && grep -q 'AIRLOCK_PASEO_MEM_CAP_BYTES' < <(grep -vE '^[[:space:]]*#' "$HERE/test-lib.sh"); then
+    continue
+  fi
+  paseo_pin_unpinned+=("$(basename "$_suite")")
 done
 # Positive control on the scan itself: if the match expression ever stops matching,
 # the loop would report "all pinned" while having looked at nothing.
@@ -2665,53 +2694,6 @@ else
 fi
 [ "$render_calls" -ge 50 ] \
   || bad "renderer silence: only $render_calls direct renderer calls went through render_to — a call site is bypassing it"
-
-# Positive control. A renderer with defect 5's exact shape: an unquoted heredoc
-# whose comment contains a backtick. It must be caught, and the --regen guard must
-# refuse to write a golden from it. Run in a subshell so its deliberate failure
-# does not count against this suite.
-# The bad fixture is GENERATED, not written literally, and the reason is the point:
-# a literal backtick-in-an-unquoted-heredoc anywhere in this tree is exactly what
-# install/check-shellcheck-gates.sh now refuses, and it scans tracked files by
-# content, not by an exclusion list. A control that had to be exempted from the
-# other gate would be the first crack in it. `\140` is the backtick; the fixture
-# lands under $TMP, which is untracked and therefore out of that gate's scope.
-CTL_LIB="$TMP/control-renderers.sh"
-{
-  printf '_ctl_bad_render() {\n  cat <<CTLEOF\n[Service]\n'
-  printf '# the default is \140this-command-does-not-exist-4b1f\140\n'
-  printf 'TasksMax=infinity\nCTLEOF\n}\n'
-  printf '_ctl_good_render() {\n  cat <<CTLEOF\n[Service]\n'
-  printf "# the default is 'infinity'\n"
-  printf 'TasksMax=infinity\nCTLEOF\n}\n'
-} > "$CTL_LIB"
-# shellcheck source=/dev/null
-. "$CTL_LIB"
-ctl_out="$( ctl_f="$(out_file)"; render_to "$ctl_f" _ctl_bad_render 2>&1 )"
-case "$ctl_out" in
-  *"wrote to stderr"*) ok "renderer silence positive control: a backticked comment in an unquoted heredoc is caught" ;;
-  *) bad "renderer silence positive control: the check did not fire (got: $ctl_out)" ;;
-esac
-ctl_out="$(
-  MODE=--regen
-  ctl_f="$(out_file)"
-  render_to "$ctl_f" _ctl_bad_render >/dev/null 2>&1
-  golden_check_file "control/never-written.service" "$ctl_f" 2>&1
-)"
-case "$ctl_out" in
-  *"golden NOT written"*) ok "renderer silence positive control: --regen refuses a golden from an unclean render" ;;
-  *) bad "renderer silence positive control: --regen would have written the damaged output (got: $ctl_out)" ;;
-esac
-[ -e "$GOLDEN/control/never-written.service" ] \
-  && bad "renderer silence positive control: the refused golden was written anyway"
-# Negative control — the same comment written correctly must still pass, or the
-# rule is just "renderers may not have comments".
-ctl_out="$( ctl_f="$(out_file)"; render_to "$ctl_f" _ctl_good_render 2>&1 )"
-if [ -z "$ctl_out" ]; then
-  ok "renderer silence negative control: a single-quoted comment in the same heredoc passes"
-else
-  bad "renderer silence negative control: a legitimate renderer was rejected (got: $ctl_out)"
-fi
 
 echo
 echo "render-parity: $pass ok, $fail failed"

@@ -4,6 +4,9 @@
 No live manager, sudo, network or app lifecycle. The shim models reactivation,
 linked-fragment removal and injected failures; assertions inspect files, the
 persisted ledger and the command trace, not helper return values alone.
+
+The installed-state engine reports residue with a failing exit status while
+preserving its recorded-path-only removal boundary.
 """
 import contextlib
 import importlib.machinery
@@ -28,6 +31,15 @@ import json, os, sys
 from pathlib import Path
 root = Path(os.environ['LEDGER_TEST_TMP'])
 args = sys.argv[1:]
+if Path(sys.argv[0]).name == 'tailscale':
+    with (root / 'ingress-trace.jsonl').open('a') as f:
+        f.write(json.dumps(args) + '\n')
+    mappings = json.loads((root / 'serve.json').read_text())
+    assert args[0] == 'serve' and args[-1] == 'off', args
+    mode, port = args[1][2:].split('=')
+    mappings.pop(mode + ':' + port, None)
+    (root / 'serve.json').write_text(json.dumps(mappings))
+    sys.exit(0)
 if Path(sys.argv[0]).name == 'sudo':
     with (root / 'sudo.log').open('a') as f:
         f.write(json.dumps(args) + '\n')
@@ -70,6 +82,8 @@ elif action == 'stop':
         next(u for k, u in s['units'].items() if k.endswith('.timer'))['active'] = 'active'
 elif action == 'show':
     u = unit or dict(load='not-found', active='inactive', pid='0', control='0')
+    if fault == 'reactivate':
+        u.update(active='active', pid='42')
     if fault != 'empty':
         print('LoadState=' + ('error' if fault == 'bad-load' else u['load']))
         print('ActiveState=' + ('activating' if fault == 'unstable' else u['active']))
@@ -112,10 +126,16 @@ class TeardownTests(unittest.TestCase):
             Path(directory).mkdir()
         shim = self.root / 'shim'
         shim.mkdir()
-        for name in ('sudo', 'systemctl'):
+        for name in ('sudo', 'systemctl', 'tailscale'):
             (shim / name).write_text(SHIM)
             (shim / name).chmod(0o755)
+        (shim / 'nginx').write_text('#!/bin/sh\nexit 0\n')
+        (shim / 'nginx').chmod(0o755)
+        (self.root / 'serve.json').write_text('{}')
         env = dict(AIRLOCK_STATE_DIR=str(self.root / 'state'),
+                   AIRLOCK_FIXTURE_ROOT=str(self.root),
+                   AIRLOCK_DATA_DIR=str(self.root / 'data'),
+                   AIRLOCK_NGINX_SITE=str(self.root / 'site/airlock.conf'),
                    AIRLOCK_UNIT_DIR_USER=self.roots['unit_user'],
                    AIRLOCK_UNIT_DIR_SYSTEM=self.roots['unit_system'],
                    AIRLOCK_CONFD=self.roots['confd'], AIRLOCK_WEBROOT=self.roots['webroot'],
@@ -150,15 +170,10 @@ class TeardownTests(unittest.TestCase):
         marker.write_text('keep until all units stop\n')
         self.artifacts['files'] = [str(marker)]
         self.caps = ['system-unit'] if scope == 'system' else []
-        record = dict(path=str(self.root / 'missing-package'), digest='f' * 64,
-                      lifecycle=dict(install=False, smoke=False, deactivate=False), deps=[],
-                      artifacts=self.artifacts, roots=self.roots,
-                      unit_scopes={Path(p).name: scope for p in paths},
-                      serve_mappings={}, order=None, source_class='explicit', capabilities=self.caps)
-        # Deliberately use an old record and service-first artifact order.
-        self.store = dict(version=4, entries={'probe': {'committed': record}})
-        ledger.write_store(self.store)
-        self.before = ledger.ledger_path().read_bytes()
+        self.store = {'probe': {'repo': str(self.root / 'missing-package'),
+                                'commit': '', 'artifacts': paths + [str(marker)]}}
+        ledger.write_installed(self.store)
+        self.before = ledger.installed_path().read_bytes()
         return paths
 
     def save_manager(self):
@@ -173,27 +188,18 @@ class TeardownTests(unittest.TestCase):
         path = self.root / 'trace.jsonl'
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def teardown(self, *, remove=False):
+    def teardown(self, *, api='remove'):
         output = io.StringIO()
-        with contextlib.redirect_stderr(output):
+        with contextlib.redirect_stderr(output), patch.object(ledger, 'project') as project:
             try:
-                if remove:
-                    result = ledger.command_remove(self.store, {'packages': {}}, 'probe', False, None)
-                else:
-                    result = ledger.command_teardown(self.store, {'packages': {}}, 'probe', None)
+                result = (ledger.command_remove('probe') if api == 'remove'
+                          else ledger.teardown_installed())
             except ledger.LedgerError as exc:
                 output.write(str(exc))
                 result = 1
+        self.project_calls = project.call_count
         self.output = output.getvalue()
         return result
-
-    def assert_preserved(self, paths):
-        self.assertEqual(self.teardown(), 1)
-        self.assertEqual(ledger.ledger_path().read_bytes(), self.before)
-        self.assertTrue(all(os.path.lexists(p) for p in paths))
-        self.assertTrue(Path(self.artifacts['files'][0]).exists())
-        self.assertFalse(any(e['action'] in ('disable', 'daemon-reload') for e in self.trace()))
-        self.assertIn('kept', self.output)
 
     def test_old_service_first_record_race_and_reinstall_round_trip(self):
         for cycle in range(2):
@@ -201,7 +207,7 @@ class TeardownTests(unittest.TestCase):
                 paths = self.fixture()
                 self.assertEqual(self.teardown(), 0, self.output)
                 self.assertFalse(any(os.path.lexists(p) for p in paths))
-                self.assertNotIn('probe', json.loads(ledger.ledger_path().read_text())['entries'])
+                self.assertNotIn('probe', json.loads(ledger.installed_path().read_text()))
                 events = self.trace()
                 stops = [e['name'] for e in events if e['action'] == 'stop']
                 self.assertEqual(stops[-4:], ['probe.path', 'probe.socket', 'probe.timer', 'probe.service'])
@@ -214,69 +220,39 @@ class TeardownTests(unittest.TestCase):
                 first_disable = next(i for i, e in enumerate(events) if e['action'] == 'disable')
                 self.assertEqual(len([e for e in events[:first_disable] if e['action'] == 'show']), 8)
 
-    def test_each_stop_error_preserves_all_fragments_and_record(self):
-        for suffix in ('timer', 'socket', 'path', 'service'):
-            with self.subTest(suffix=suffix):
-                paths = self.fixture()
-                (self.root / 'trace.jsonl').unlink(missing_ok=True)
-                self.fault('stop', suffix)
-                self.assert_preserved(paths)
-                self.assertIn('failed with exit 7', self.output)
-
-    def test_each_lying_stop_preserves_all_fragments_and_record(self):
-        for suffix in ('timer', 'socket', 'path', 'service'):
-            with self.subTest(suffix=suffix):
-                paths = self.fixture()
-                (self.root / 'trace.jsonl').unlink(missing_ok=True)
-                self.fault('stop', suffix, 'lie')
-                self.assert_preserved(paths)
-                self.assertIn('not proven stopped', self.output)
-
-    def test_query_faults_after_stop_and_at_final_barrier(self):
-        for suffix in ('timer', 'socket', 'path', 'service'):
-            for nth in (1, 2):
-                for effect in ('error', 'empty', 'bad-load', 'unstable'):
-                    with self.subTest(suffix=suffix, nth=nth, effect=effect):
-                        paths = self.fixture()
-                        (self.root / 'trace.jsonl').unlink(missing_ok=True)
-                        self.fault('show', suffix, effect, nth)
-                        self.assert_preserved(paths)
-
-    def test_service_pid_and_control_process_must_be_zero(self):
-        for effect in ('pid', 'control'):
-            with self.subTest(effect=effect):
-                paths = self.fixture()
-                (self.root / 'trace.jsonl').unlink(missing_ok=True)
-                self.fault('stop', effect=effect)
-                self.assert_preserved(paths)
-        paths = self.fixture()
-        (self.root / 'trace.jsonl').unlink(missing_ok=True)
-        self.fault('show', effect='missing-pid')
-        self.assert_preserved(paths)
-
-    def test_failed_service_requires_explicitly_empty_control_group(self):
-        for cgroup, allowed in (('', True),
-                                ('/user.slice/residual.service', False),
-                                (None, False)):
-            with self.subTest(cgroup=cgroup, allowed=allowed):
-                paths = self.fixture(suffixes=('service',))
-                (self.root / 'trace.jsonl').unlink(missing_ok=True)
-                unit = self.manager['units']['user:probe.service']
-                unit.update(active='failed', pid='0', control='0')
-                if cgroup is not None:
-                    unit['cgroup'] = cgroup
-                self.fault('stop', effect='lie')
-                self.save_manager()
-                if allowed:
-                    self.assertEqual(self.teardown(), 0, self.output)
-                    self.assertFalse(os.path.lexists(paths[0]))
-                else:
-                    self.assert_preserved(paths)
-
-    def test_final_barrier_detects_reactivated_trigger(self):
-        paths = self.fixture()
-        self.fault('stop', effect='reactivate')
-        self.assert_preserved(paths)
+    def test_stop_failure_keeps_ownership_until_retry_completes(self):
+        for api in ('remove', 'teardown'):
+            for action, effect in (('stop', 'error'), ('show', 'reactivate'), ('show', 'empty')):
+                with self.subTest(api=api, action=action, effect=effect):
+                    paths = self.fixture()
+                    self.store['probe']['artifacts'].append('http:45678')
+                    ledger.write_installed(self.store)
+                    self.before = ledger.installed_path().read_bytes()
+                    before_files = {p: Path(p).read_bytes() for p in
+                                    paths + self.artifacts['files']}
+                    mappings = {'http:45678': 'probe', 'http:9999': 'operator'}
+                    (self.root / 'serve.json').write_text(json.dumps(mappings))
+                    for name in ('trace.jsonl', 'ingress-trace.jsonl', 'sudo.log'):
+                        (self.root / name).unlink(missing_ok=True)
+                    self.fault(action, 'service', effect=effect)
+                    self.assertEqual(self.teardown(api=api), 1, self.output)
+                    self.assertEqual(self.project_calls, 0)
+                    self.assertEqual(ledger.installed_path().read_bytes(), self.before)
+                    for path, content in before_files.items():
+                        self.assertTrue(Path(path).exists(), path)
+                        self.assertEqual(Path(path).read_bytes(), content)
+                    self.assertEqual(json.loads((self.root / 'serve.json').read_text()), mappings)
+                    self.assertFalse(any(e['action'] in ('disable', 'daemon-reload')
+                                         for e in self.trace()))
+                    self.assertFalse((self.root / 'ingress-trace.jsonl').exists())
+                    if action == 'stop':
+                        self.assertIn('failed with exit 7', self.output)
+                    # Faults fire once; the same API must finish its retry.
+                    self.assertEqual(self.teardown(api=api), 0, self.output)
+                    self.assertNotIn('probe', ledger.load_installed())
+                    self.assertFalse(any(Path(p).exists() for p in before_files))
+                    self.assertEqual(json.loads((self.root / 'serve.json').read_text()),
+                                     {'http:9999': 'operator'})
 
     def test_disabled_existing_and_absent_units(self):
         for absent in (False, True):
@@ -295,71 +271,19 @@ class TeardownTests(unittest.TestCase):
         self.assertEqual(self.teardown(), 0, self.output)
         self.assertTrue(any(e['action'] == 'stop' for e in self.trace()))
 
-    def test_absent_unit_query_failure_preserves_record(self):
-        self.fixture(absent=True)
-        self.fault('show', 'path')
-        self.assert_preserved([])
-
-    def test_linked_fragments_survive_stop_failure_and_cleanup_succeeds(self):
+    def test_linked_fragments_removed_after_stop(self):
         paths = self.fixture(linked=True)
-        self.fault('stop')
-        self.assert_preserved(paths)
-        self.manager = json.loads((self.root / 'manager.json').read_text())
-        self.manager['faults'] = []
-        self.save_manager()
         self.assertEqual(self.teardown(), 0, self.output)
         self.assertFalse(any(os.path.lexists(p) for p in paths))
         self.assertTrue(all((self.root / ('source.' + suffix)).exists()
                             for suffix in ('service', 'timer', 'socket', 'path')))
 
-    def test_disable_failure_retains_failed_fragment_and_record_then_retries(self):
-        paths = self.fixture()
-        self.fault('disable')
-        self.assertEqual(self.teardown(), 1)
-        self.assertTrue(Path(paths[0]).exists())
-        self.assertFalse(any(os.path.lexists(p) for p in paths[1:]))
-        self.assertEqual(ledger.ledger_path().read_bytes(), self.before)
-        self.assertIn('no explicit fragment removal attempted', self.output)
-        self.manager = json.loads((self.root / 'manager.json').read_text())
-        self.manager['faults'] = []
-        self.save_manager()
-        self.assertEqual(self.teardown(), 0, self.output)
-
-    def test_partial_linked_disable_failure_keeps_record_and_retries(self):
-        paths = self.fixture(linked=True)
-        self.fault('disable', effect='unlink-error')
-        self.assertEqual(self.teardown(), 1)
-        self.assertFalse(os.path.lexists(paths[0]))
-        self.assertEqual(ledger.ledger_path().read_bytes(), self.before)
-        self.assertIn('may already have removed links', self.output)
-        self.manager = json.loads((self.root / 'manager.json').read_text())
-        self.manager['faults'] = []
-        self.save_manager()
-        self.assertEqual(self.teardown(), 0, self.output)
-
-    def test_system_scope_uses_sudo_and_claim_refusal_precedes_commands(self):
+    def test_system_scope_uses_sudo(self):
         paths = self.fixture(scope='system')
         self.assertEqual(self.teardown(), 0, self.output)
         sudo = [json.loads(line) for line in (self.root / 'sudo.log').read_text().splitlines()]
         self.assertTrue(any(a[:2] == ['systemctl', 'stop'] for a in sudo))
         self.assertTrue(any(a[0] == 'rm' for a in sudo))
-        self.fixture(scope='system')
-        (self.root / 'trace.jsonl').unlink()
-        self.store['entries']['probe']['committed']['capabilities'] = []
-        self.assertEqual(self.teardown(), 1)
-        self.assertTrue(all(Path(p).exists() for p in paths))
-        self.assertEqual(self.trace(), [])
-
-    def test_system_remove_false_success_keeps_fragment_and_record(self):
-        paths = self.fixture(suffixes=('service',), scope='system')
-        marker = self.root / 'rm-false-success'
-        marker.touch()
-        self.assertEqual(self.teardown(), 1)
-        self.assertTrue(Path(paths[0]).exists())
-        self.assertEqual(ledger.ledger_path().read_bytes(), self.before)
-        self.assertIn('still exists after removal', self.output)
-        marker.unlink()
-        self.assertEqual(self.teardown(), 0, self.output)
 
     def test_no_units_and_dry_run_do_not_call_systemctl(self):
         self.fixture(suffixes=())
@@ -368,93 +292,19 @@ class TeardownTests(unittest.TestCase):
         paths = self.fixture()
         with patch.dict(os.environ, AIRLOCK_DRY_RUN='1'):
             self.assertEqual(self.teardown(), 0, self.output)
-        self.assertEqual(ledger.ledger_path().read_bytes(), self.before)
+        self.assertEqual(ledger.installed_path().read_bytes(), self.before)
         self.assertTrue(all(Path(p).exists() for p in paths))
         self.assertEqual(self.trace(), [])
 
-    def split_intent(self, *, system=False, duplicate=False):
-        committed = self.store['entries']['probe']['committed']
-        paths = list(committed['artifacts']['units'])
-        committed['artifacts']['units'] = paths[:1]
-        committed['unit_scopes'] = {Path(paths[0]).name: 'user'}
-        timer = Path(paths[1])
-        if system:
-            replacement = Path(self.roots['unit_system']) / timer.name
-            timer.rename(replacement)
-            unit = self.manager['units'].pop('user:' + timer.name)
-            unit['path'] = str(replacement)
-            self.manager['units']['system:' + timer.name] = unit
-            self.manager['paths'][1] = str(replacement)
-            timer = replacement
-        if duplicate:
-            committed['artifacts']['units'].append(str(timer))
-            committed['unit_scopes'][timer.name] = 'user'
-        declared = {name: [] for name in ledger.ARTIFACT_CLASSES}
-        declared['units'] = [timer.name]
-        intent = {key: value for key, value in committed.items()
-                  if key not in ('artifacts', 'unit_scopes')}
-        intent.update(artifacts_declared=declared, serve_port_values={}, anchors={},
-                      capabilities=['system-unit'] if system else [],
-                      unit_scopes={timer.name: 'system' if system else 'user'})
-        self.store['entries']['probe']['intent'] = intent
-        ledger.write_store(self.store)
-        self.before = ledger.ledger_path().read_bytes()
-        self.save_manager()
-        return [paths[0], str(timer)]
-
-    def test_committed_intent_union_stops_before_either_record_deletes(self):
-        for remove in (False, True):
-            with self.subTest(remove=remove):
-                self.fixture(suffixes=('service', 'timer'))
-                (self.root / 'trace.jsonl').unlink(missing_ok=True)
-                paths = self.split_intent(system=True)
-                # Missing package forces generic recorded teardown in remove too.
-                self.store['entries']['probe']['committed']['lifecycle']['deactivate'] = True
-                self.assertEqual(self.teardown(remove=remove), 0, self.output)
-                stops = [(e['scope'], e['name']) for e in self.trace() if e['action'] == 'stop']
-                self.assertEqual(stops, [('system', 'probe.timer'), ('user', 'probe.service')])
-                self.assertFalse(any(os.path.lexists(p) for p in paths))
-                reloads = [e['scope'] for e in self.trace() if e['action'] == 'daemon-reload']
-                self.assertEqual(sorted(reloads), ['system', 'user'])
-
-    def test_either_records_missing_claim_prevents_all_commands(self):
-        for bad_record in ('committed', 'intent'):
-            for remove in (False, True):
-                with self.subTest(bad_record=bad_record, remove=remove):
-                    self.fixture(suffixes=('service', 'timer'))
-                    (self.root / 'trace.jsonl').unlink(missing_ok=True)
-                    paths = self.split_intent(system=True)
-                    entry = self.store['entries']['probe']
-                    if bad_record == 'committed':
-                        entry['committed']['artifacts']['units'] = [paths[1]]
-                        entry['committed']['unit_scopes'] = {'probe.timer': 'system'}
-                    else:
-                        entry['intent']['capabilities'] = []
-                    entry['committed']['lifecycle']['deactivate'] = True
-                    self.assertEqual(self.teardown(remove=remove), 1)
-                    self.assertEqual(self.trace(), [])
-                    self.assertTrue(all(Path(p).exists() for p in paths))
-                    self.assertEqual(ledger.ledger_path().read_bytes(), self.before)
-
-    def test_duplicate_unit_stops_and_disables_once(self):
-        self.fixture(suffixes=('service', 'timer'))
-        self.split_intent(duplicate=True)
-        self.assertEqual(self.teardown(), 0, self.output)
-        for action in ('stop', 'disable'):
-            self.assertEqual(sum(e['action'] == action and e['name'] == 'probe.timer'
-                                 for e in self.trace()), 1)
-
     def test_same_basename_in_two_scopes_remains_distinct(self):
         self.fixture(suffixes=('service', 'timer'))
-        self.split_intent(system=True)
-        user_timer = Path(self.roots['unit_user']) / 'probe.timer'
-        user_timer.write_text('[Unit]\nDescription=user timer\n')
-        committed = self.store['entries']['probe']['committed']
-        committed['artifacts']['units'].append(str(user_timer))
-        committed['unit_scopes']['probe.timer'] = 'user'
-        self.manager['paths'].append(str(user_timer))
-        self.manager['units']['user:probe.timer'] = dict(
-            path=str(user_timer), load='loaded', active='active', pid='0', control='0')
+        system_timer = Path(self.roots['unit_system']) / 'probe.timer'
+        system_timer.write_text('[Unit]\nDescription=system timer\n')
+        self.store['probe']['artifacts'].append(str(system_timer))
+        ledger.write_installed(self.store)
+        self.manager['paths'].append(str(system_timer))
+        self.manager['units']['system:probe.timer'] = dict(
+            path=str(system_timer), load='loaded', active='active', pid='0', control='0')
         self.save_manager()
         self.assertEqual(self.teardown(), 0, self.output)
         for action in ('stop', 'disable'):
@@ -462,36 +312,105 @@ class TeardownTests(unittest.TestCase):
                       if e['action'] == action and e['name'] == 'probe.timer']
             self.assertEqual(sorted(scopes), ['system', 'user'])
 
-    def test_split_record_stop_failure_preserves_both_records_and_fragments(self):
-        self.fixture(suffixes=('service', 'timer'))
-        paths = self.split_intent(system=True)
-        self.fault('stop', 'timer', scope='system')
-        self.assert_preserved(paths)
-
-    def test_reload_failure_after_removal_keeps_record_and_retries(self):
-        paths = self.fixture()
-        self.manager['faults'] = [dict(action='daemon-reload', key='user:', effect='error')]
-        self.save_manager()
-        self.assertEqual(self.teardown(), 1)
-        self.assertFalse(any(os.path.lexists(p) for p in paths))
-        self.assertEqual(ledger.ledger_path().read_bytes(), self.before)
-        self.assertIn('daemon-reload failed with exit 7', self.output)
-        # The absent fragments must not suppress the retry's scope reload.
-        (self.root / 'trace.jsonl').unlink()
-        self.assertEqual(self.teardown(), 0, self.output)
-        self.assertEqual(sum(e['action'] == 'daemon-reload' for e in self.trace()), 1)
-
-    def test_other_artifact_errors_are_aggregated_after_units_stop(self):
+    def test_other_artifact_errors_keep_ownership_until_retry_completes(self):
         self.fixture(suffixes=())
         called = []
         def remove(path, dry):
             called.append(path)
             return False
-        self.artifacts['fragments'] = [str(self.root / 'fragment')]
-        with patch.object(ledger, '_remove_artifact_path', side_effect=remove):
+        self.store['probe']['artifacts'].append(str(self.root / 'fragment'))
+        ledger.write_installed(self.store)
+        before = ledger.installed_path().read_bytes()
+        with patch.object(ledger, '_remove_artifact_path', side_effect=remove), \
+                patch.object(ledger, '_remove_rooted_artifact_path', side_effect=remove):
             self.assertEqual(self.teardown(), 1)
-        self.assertEqual(set(called), {self.artifacts['files'][0], self.artifacts['fragments'][0]})
-        self.assertEqual(ledger.ledger_path().read_bytes(), self.before)
+        self.assertIn("residue probe:", self.output)
+        self.assertEqual(set(called), set(self.store['probe']['artifacts']))
+        self.assertEqual(ledger.installed_path().read_bytes(), before)
+        self.assertEqual(self.teardown(), 0, self.output)
+        self.assertNotIn('probe', ledger.load_installed())
+
+
+class InstalledRecordTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='installed-record-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.state = self.root / 'state'
+        self.state.mkdir()
+        self.row = {'probe': {'repo': str(self.root / 'app'), 'commit': '', 'artifacts': []}}
+        self.env = patch.dict(os.environ, AIRLOCK_STATE_DIR=str(self.state))
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_snapshot_and_restore_preserve_new_record_bytes(self):
+        raw = json.dumps(self.row, separators=(',', ':')).encode()
+        ledger.installed_path().write_bytes(raw)
+        snapshot = self.root / 'record.json'
+        self.assertTrue(ledger.snapshot_installed(snapshot))
+        ledger.write_installed({})
+        ledger.restore_installed(snapshot)
+        self.assertEqual(ledger.read_installed_bytes(), raw)
+        self.assertEqual(ledger.load_installed(), self.row)
+        ledger.restore_installed(None)
+        self.assertIsNone(ledger.read_installed_bytes())
+
+    def test_v7_read_only_conversion_and_exact_restore(self):
+        legacy = {'version': 7, 'entries': {
+            'probe': {'committed': {'path': self.row['probe']['repo'],
+                                   'artifacts': {'files': [], 'serve_ports': [8448]},
+                                   'serve_mappings': {'port': {'mode': 'https', 'listen': 8448,
+                                                              'target': 9000}}}},
+            'unfinished': {'intent': {'path': '/unused'}},
+        }, 'events': []}
+        raw = json.dumps(legacy).encode()
+        ledger.legacy_ledger_path().write_bytes(raw)
+        before = {p.name: p.read_bytes() for p in self.state.iterdir()}
+        self.assertEqual(ledger.load_installed()['probe']['artifacts'], ['https:8448'])
+        self.assertNotIn('unfinished', ledger.load_installed())
+        self.assertEqual({p.name: p.read_bytes() for p in self.state.iterdir()}, before)
+        snapshot = self.root / 'record.json'
+        ledger.snapshot_installed(snapshot)
+        ledger.write_installed(ledger.load_installed())
+        self.assertTrue(ledger.legacy_archive_path().exists())
+        self.assertFalse(ledger.legacy_ledger_path().exists())
+        ledger.restore_installed(snapshot)
+        self.assertFalse(ledger.installed_path().exists())
+        self.assertEqual(ledger.legacy_ledger_path().read_bytes(), raw)
+
+    def test_version_six_refused_without_mutation(self):
+        raw = b'{"version":6,"entries":{},"events":[]}'
+        ledger.legacy_ledger_path().write_bytes(raw)
+        with self.assertRaises(ledger.LedgerError):
+            ledger.load_installed()
+        self.assertEqual(ledger.legacy_ledger_path().read_bytes(), raw)
+        self.assertFalse(ledger.installed_path().exists())
+
+    def test_leaf_symlink_and_directory_are_refused(self):
+        outside = self.root / 'outside.json'
+        outside.write_text(json.dumps(self.row))
+        path = ledger.installed_path()
+        path.symlink_to(outside)
+        with self.assertRaises(ledger.LedgerError):
+            ledger.read_installed_bytes()
+        with self.assertRaises(ledger.LedgerError):
+            ledger.restore_installed(None)
+        self.assertTrue(path.is_symlink())
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(ledger.LedgerError):
+            ledger.load_installed()
+
+    def test_semantic_helpers_keep_modes_and_unit_scopes(self):
+        user = str(self.root / 'user')
+        system = str(self.root / 'system')
+        with patch.dict(os.environ, AIRLOCK_UNIT_DIR_USER=user, AIRLOCK_UNIT_DIR_SYSTEM=system):
+            self.row['probe']['artifacts'] = ['https:8448', 'http:8000',
+                                            user + '/probe.service', system + '/probe.timer']
+            self.assertEqual(ledger.recorded_active_ports(self.row, mode='http'), {8000})
+            self.assertEqual(ledger.recorded_active_ports(self.row, skip_id='probe'), set())
+            self.assertEqual(ledger.installed_units(self.row),
+                             [('probe.service', 'user'), ('probe.timer', 'system')])
 
 
 if __name__ == '__main__':

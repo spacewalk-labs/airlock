@@ -14,115 +14,95 @@
 #   1. an existing state directory keeps its mode across a run
 #   2. a state directory the run CREATES is still 0700
 #
-# Offline: a scratch HOME and a scratch state directory. The orchestrator is expected to
-# fail further down (there is no box to install onto) — that is fine and deliberate,
-# because the line under test runs early and the assertion is about the filesystem, not
-# about the exit code. What would NOT be fine is asserting a mode after a run that never
-# reached the line, so each case proves the line ran by checking its own side effect.
+# Offline: call the engine's state-directory helper and actual atomic writer
+# with scratch paths. Each writer case proves the helper ran and reads back the
+# stored row, so an untouched directory cannot produce a vacuous pass.
 set -uo pipefail
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+. "$(dirname "$0")/test-lib.sh"
+airlock_pin_paseo_mem
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 scratch="$(mktemp -d)"
 trap 'chmod -R u+rwX "$scratch" 2>/dev/null; rm -rf "$scratch"' EXIT
 chmod 700 "$scratch"
-printf '%s\n' 'airlock.live-box-fixture/v1' > "$scratch/.airlock-live-box-fixture-v1"
-chmod 600 "$scratch/.airlock-live-box-fixture-v1"
 
-# This test reaches the early state-directory branch but never has authority
-# to run a box installer.  The installer fixture boundary requires all four
-# mutation shims and paths to stay below this marked scratch root.
-shim="$scratch/shim"
-mkdir -p "$shim" "$scratch/unit-user" "$scratch/unit-system"
-for command in sudo systemctl systemd-run tailscale; do
-  cat > "$shim/$command" <<'SHIM'
-#!/usr/bin/env bash
-exit 0
-SHIM
-  chmod +x "$shim/$command"
-done
-printf '0::/fixture.scope\n' > "$scratch/cgroup"
-export AIRLOCK_FIXTURE_LIVE_BOX_LEASE_DIR="$scratch/airlock-live-box"
-export AIRLOCK_SELFKILL_CGROUP_FILE="$scratch/cgroup"
-PATH="$shim:$PATH"; export PATH
+run_engine_case() {
+  AIRLOCK_STATE_DIR="$2" python3 - "$ROOT/bin/airlock-ledger" "$1" <<'PY'
+import importlib.machinery, importlib.util, os, stat, sys
+from pathlib import Path
 
-cfg="$scratch/airlock.toml"
-cat > "$cfg" <<'TOML'
-[airlock]
-config_version = 2
-[site]
-name = "Mode Test"
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-[paths]
-[apps.hub]
-TOML
+loader = importlib.machinery.SourceFileLoader("_airlock_ledger", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+engine = importlib.util.module_from_spec(spec)
+sys.dont_write_bytecode = True
+loader.exec_module(engine)
+state = Path(os.environ["AIRLOCK_STATE_DIR"])
+case = sys.argv[2]
 
-run_orchestrator() {   # run_orchestrator <state-dir> <log>
-  AIRLOCK_CONFIG="$cfg" \
-  AIRLOCK_TS_FQDN=test.example.ts.net \
-  AIRLOCK_STATE_DIR="$1" \
-  AIRLOCK_CONFD="$scratch/confd" \
-  AIRLOCK_WEBROOT="$scratch/webroot" \
-  AIRLOCK_NGINX_SITE="$scratch/nginx-site" \
-  AIRLOCK_UNIT_DIR_USER="$scratch/unit-user" \
-  AIRLOCK_UNIT_DIR_SYSTEM="$scratch/unit-system" \
-  HOME="$scratch/home" \
-  timeout 120 bash "$ROOT/install/airlock-install.sh" >"$2" 2>&1
-  return 0
+if case == "read":
+    before = state.stat().st_mode
+    assert engine.load_installed() == {}
+    assert state.stat().st_mode == before
+    assert list(state.iterdir()) == []
+elif case == "ensure":
+    before = state.stat().st_mode
+    assert engine._ensure_state_dir() == state
+    assert state.stat().st_mode == before
+    assert list(state.iterdir()) == []
+else:
+    expected_mode = 0o701 if case == "existing-write" else 0o700
+    if case == "fresh-write":
+        assert not state.exists()
+    original = engine._ensure_state_dir
+    calls = []
+    def observed_ensure():
+        calls.append(True)
+        return original()
+    engine._ensure_state_dir = observed_ensure
+    row = {"mode-probe": {"repo": str(state.parent / "app"),
+                          "commit": "", "artifacts": []}}
+    engine.write_installed(row)
+    assert calls, "write_installed never called the state-directory helper"
+    assert engine.installed_path().exists(), "the atomic writer never wrote its record"
+    assert engine.load_installed() == row
+    assert stat.S_IMODE(state.stat().st_mode) == expected_mode
+PY
 }
-show_orchestrator_log() { # <log>
-  printf '%s\n' '--- orchestrator log (fixture retained in CI output) ---' >&2
-  sed -n '1,200p' "$1" >&2
-}
-mkdir -p "$scratch/home" "$scratch/confd" "$scratch/webroot" "$scratch/nginx-site"
 
-# ---- 1) an existing directory keeps its mode
+# ---- 1) reads and directory preparation preserve an existing mode and write nothing
 state="$scratch/state-existing"
 install -d -m 0701 "$state"
-# A ledger file is what makes the orchestrator reach the line at all (see the guard
-# above it): without one, and with no packages, it never touches the state directory.
-printf '{"version": 5, "entries": {}, "events": []}\n' > "$state/app-ledger.json"
-existing_log="$scratch/run-existing.log"
-run_orchestrator "$state" "$existing_log"
-if [ ! -e "$state/app-ledger.lock" ]; then
-  bad "the orchestrator never reached the state-directory step — this case proves nothing"
-  show_orchestrator_log "$existing_log"
+if run_engine_case read "$state"; then
+  ok "load_installed preserves existing 0701 and writes nothing"
 else
-  ok "positive control: the run really did reach the state-directory step"
-  got="$(stat -c %a "$state")"
-  [ "$got" = 701 ] && ok "an existing state directory keeps its mode (0701)" \
-                   || bad "the run reset an existing state directory to 0$got — dev-monitor's writer loses traversal"
+  bad "read changed state-directory permissions or created state"
+fi
+if run_engine_case ensure "$state"; then
+  ok "_ensure_state_dir preserves existing 0701 and creates no state record"
+else
+  bad "directory preparation narrowed existing permissions or wrote a state record"
 fi
 
-# ---- 2) a directory it creates is still private
-fresh="$scratch/state-fresh"
-printf '' > /dev/null
-mkdir -p "$(dirname "$fresh")"
-# No directory, but a package set is what makes the guard fire on a fresh box; hub is
-# enabled in the config above, so the run creates it.
-fresh_log="$scratch/run-fresh.log"
-run_orchestrator "$fresh" "$fresh_log"
-if [ ! -d "$fresh" ]; then
-  bad "the orchestrator did not create the state directory — case 2 proves nothing"
-  show_orchestrator_log "$fresh_log"
+# ---- 2) the real writer keeps existing mode and creates a fresh private directory
+if run_engine_case existing-write "$state"; then
+  ok "write_installed invokes the helper, persists its row, and preserves existing 0701"
 else
-  got2="$(stat -c %a "$fresh")"
-  [ "$got2" = 700 ] && ok "a state directory the run creates is 0700" \
-                    || bad "a freshly created state directory is 0$got2, not 0700"
+  bad "writing an engine row narrowed existing permissions or skipped the helper"
+fi
+fresh="$scratch/state-fresh"
+if run_engine_case fresh-write "$fresh"; then
+  ok "write_installed invokes the helper, persists its row, and creates fresh 0700"
+else
+  bad "the engine writer did not create a private state directory with a readable row"
 fi
 
 # ---- 3) no shipped app may narrow the SHARED state directory
 #
-# Case 1 only exercises the orchestrator, because the fixture enables `hub` and nothing
-# else. That is not enough: publish also pointed its STATE_DIR at the shared directory
+# The engine writer is not the only consumer: publish also pointed its STATE_DIR at the shared directory
 # and chmod'ed it 0700 on every install, which closed it again after dev-monitor opened
 # it — and the failure was at RUNTIME (the spool writer could not write), not at install
 # time, so no install-time assertion would have seen it.

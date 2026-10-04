@@ -1,6 +1,6 @@
 ---
 name: airlock-deploy
-description: Install or re-deploy Airlock on this box from airlock.toml — validate config, run the orchestrator, and verify the gate + each enabled app. Use when setting up a new Airlock, enabling/disabling an app, or applying config changes.
+description: Install or re-deploy Airlock on this box from airlock.toml — validate config, run the orchestrator, and verify the gate + installed apps. Use when setting up a new Airlock, applying or removing one app, or applying config changes.
 ---
 
 # airlock-deploy
@@ -18,7 +18,8 @@ it only through `bin/airlock-config`.
    run Airlock behind another proxy — that is insecure-by-default (see SECURITY.md).
 2. **`airlock.toml` exists.** If only `airlock.toml.example` is present, copy it and
    help the user fill in `[auth] owner` and the app tables
-   they want. A table's mere presence under `[apps.*]` enables that app.
+   they want. `[apps.*]` supplies inputs; `bin/airlock-ledger list` reports installed apps.
+   With no installation record, the full installer bootstraps core apps from these inputs.
    fileview has no path setting: it serves **the home directory of this box's user
    account**, read and write, to the owner **and every collaborator** if its audience
    is opened. Nothing above home is served.
@@ -56,10 +57,18 @@ boxes at once over ssh. Both daemons went down within four seconds of each other
 them, the installer never ran on either box, and every agent session on both was
 lost. One box stayed down for three minutes; the other for 93.
 
-The orchestrator is **idempotent** — re-run it after any `airlock.toml` edit. It
-validates config → runs each enabled app's installer (which drops an nginx
-fragment) → renders the site → `nginx -t` + reload → `tailscale serve` for the hub
-and the separate-port apps → smokes every enabled app.
+The full installer validates the box config, applies and smokes core apps, and
+projects the shared ingress. Company and Personal app lifecycles stay untouched.
+
+To install or update one app, run `bin/airlock-ledger apply <id>` from the
+installed clone. Supply `--source <absolute-path>` on the first Personal install.
+For Company, set `[site] company_repo` to its Git URL and use `--source company`.
+Later applies use the recorded source; changing the Company URL requires explicit
+`--source company` to replace that source.
+To remove it, run `bin/airlock-ledger remove <id>`; recorded artifacts are removed
+and user data stays. Read `bin/airlock-ledger list` for installed repo/commit facts.
+A failed apply restores that app to its starting commit. Diagnose the output
+before retrying; do not widen a failed app operation into a full box install.
 
 ## Verify (state what passed / what didn't)
 
@@ -67,10 +76,10 @@ and the separate-port apps → smokes every enabled app.
   checks the gate is real: **owner = 200/302, denied identity = 403, missing
   header = 403.** A `GATE HOLE` failure is security-critical — do not hand off.
 - `sudo nginx -t` is clean.
-- `systemctl --user status 'airlock-*'` — enabled app backends are active.
+- `systemctl --user status 'airlock-*'` — installed app backends are active.
 - `sudo tailscale serve status` — the hub (443 + http port) and each separate-port
   app (devterm/code-server/orca/paseo) are mapped to their loopback gate.
-- Open: `https://<this-box>.<tailnet>/` — the hub launcher lists the enabled apps.
+- Open: `https://<this-box>.<tailnet>/` — the hub launcher lists installed apps.
 
 ## Notes
 

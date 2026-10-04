@@ -220,6 +220,42 @@ class Labels(unittest.TestCase):
     def test_fallback_to_first_token(self):
         self.assertEqual(cs.cron_job_label("echo hi", "crontab"), "echo")
 
+    def test_hostname_guard_and_home_path_extracts_script(self):
+        self.assertEqual(
+            cs.cron_job_label('[ "$(hostname)" = test-box ] && "$HOME/workspace/infra/scripts/atlas-survey-cron.sh"',
+                              "crontab"), "atlas-survey-cron.sh")
+
+    def test_interpreter_prefixed_script_wins_over_interpreter(self):
+        self.assertEqual(
+            cs.cron_job_label('python3 "$HOME/workspace/vault/00_System/hooks/codex-read-reap.py"',
+                              "crontab"), "codex-read-reap.py")
+
+    def test_sourced_env_guard_skips_env_and_extracts_script(self):
+        self.assertEqual(
+            cs.cron_job_label('[ -f "$HOME/.config/app-canon.env" ] && . "$HOME/.config/app-canon.env"; '
+                              'bash "/home/alice/workspace/vault/00_System/hooks/canonical-clone-sweep.sh"',
+                              "crontab"), "canonical-clone-sweep.sh")
+
+    def test_directory_guard_skips_guard_path_and_extracts_script(self):
+        self.assertEqual(
+            cs.cron_job_label('[ -d "$HOME/workspace/infra" ] && "$HOME/bin/real-job.sh"',
+                              "crontab"), "real-job.sh")
+
+    def test_test_executable_guard_skips_helper_and_extracts_script(self):
+        self.assertEqual(
+            cs.cron_job_label('test -x /usr/local/bin/helper && "$HOME/bin/real-job.sh"',
+                              "crontab"), "real-job.sh")
+
+    def test_env_python_wrapper_unwraps_to_script(self):
+        self.assertEqual(
+            cs.cron_job_label('/usr/bin/env python3 "$HOME/bin/real-job.py"',
+                              "crontab"), "real-job.py")
+
+    def test_flock_lockfile_skipped_for_worker_script(self):
+        self.assertEqual(
+            cs.cron_job_label('flock -n /tmp/lock.lck timeout 300 /home/alice/bin/my-worker.sh',
+                              "crontab"), "my-worker.sh")
+
 
 class OriginCandidates(unittest.TestCase):
     def test_python_interpreter_loses_to_script(self):
@@ -232,6 +268,15 @@ class OriginCandidates(unittest.TestCase):
                 candidates, {candidate["path"]: None for candidate in candidates})
         self.assertEqual(selected["path"], script)
         self.assertFalse(selected["interpreter"])
+
+    def test_home_env_path_candidate_is_resolved(self):
+        with tempfile.TemporaryDirectory() as root:
+            script = os.path.join(root, "my-cron.sh")
+            with open(script, "w", encoding="utf-8"):
+                pass
+            with patch.object(cs, "_owner_home", return_value=root):
+                candidates = cs.execution_path_candidates('[ "$(hostname)" = box ] && "$HOME/my-cron.sh"')
+            self.assertEqual([c["path"] for c in candidates], [script])
 
     def test_redirect_target_is_excluded_and_which_resolves_command(self):
         with tempfile.TemporaryDirectory() as root:
@@ -904,6 +949,31 @@ class OriginAttribution(unittest.TestCase):
         self.assertIn("FragmentPath", cs.TIMER_PROPS)
         self.assertIn("FragmentPath", cs.SERVICE_PROPS)
 
+    def test_activating_oneshot_is_not_collected_as_success(self):
+        def fake_run(argv, timeout=15):
+            if "list-timers" in argv:
+                return 0, "taskboard-box-runtime-patrol.timer\n", ""
+            if cs.TIMER_PROPS in argv:
+                return 0, (
+                    "Id=taskboard-box-runtime-patrol.timer\n"
+                    "Unit=taskboard-box-runtime-patrol.service\n"
+                    "UnitFileState=enabled\nActiveState=active\n"
+                    "LastTriggerUSec=Thu 2026-09-24 09:00:00 KST\n"
+                ), ""
+            self.assertIn(cs.SERVICE_PROPS, argv)
+            return 0, (
+                "Id=taskboard-box-runtime-patrol.service\n"
+                "Result=success\nExecMainStatus=0\nActiveState=activating\n"
+                "ExecMainStartTimestamp=Thu 2026-09-24 09:00:00 KST\n"
+                "ExecMainExitTimestamp=\n"
+            ), ""
+
+        with patch.object(cs, "run_cmd", side_effect=fake_run):
+            jobs, source = cs.collect_systemd("user", None, ep("2026-09-24 09:09:51"))
+        self.assertTrue(source["ok"])
+        self.assertEqual(jobs[0]["lastResult"], "unknown")
+        self.assertTrue(jobs[0]["serviceRunning"])
+
     def test_git_marker_file_is_a_worktree_root(self):
         with tempfile.TemporaryDirectory() as root:
             repo = os.path.join(root, "worktree")
@@ -925,6 +995,9 @@ class ServiceResult(unittest.TestCase):
 
     def test_real_failure(self):
         self.assertEqual(cs.service_result("exit-code", self.RAN), "failed")
+
+    def test_running_service_has_no_completed_result(self):
+        self.assertEqual(cs.service_result("success", self.RAN, completed=False), "unknown")
 
     def test_never_ran_is_not_failure(self):
         self.assertEqual(cs.service_result("", None), "none")
@@ -1854,9 +1927,43 @@ class CronCards(unittest.TestCase):
         self.assertEqual(first[0]["level"], "urgent")
         self.assertEqual(len(second), 1)
         self.assertEqual(second[0]["level"], "normal")
+        self.assertEqual(second[0]["resolves"], first[0]["group"])
         self.assertEqual(second[0]["title"], "nightly backup 다시 정상")
         self.assertEqual(second[0]["id"], "cron:%s:ok:2023-11-14T23:13:20Z" % key)
         self.assertEqual(third, [])  # 회복 뒤 계속 정상 — 조용
+
+    def test_running_next_invocation_does_not_resolve_prior_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
+            job_id = "user:taskboard-box-runtime-patrol.timer"
+            failed = self.job(job_id, kind="systemd", lastResult="failed", lastRun=1_700_000_000)
+            running = self.job(job_id, kind="systemd", lastResult="unknown", serviceRunning=True,
+                               lastRun=1_700_003_600)
+            success = self.job(job_id, kind="systemd", lastResult="success", serviceRunning=False,
+                               lastRun=1_700_003_600)
+            first = cs.cron_message_payloads(self.snapshot(1_700_000_000, [failed]), verdicts_path=path)
+            middle = cs.cron_message_payloads(self.snapshot(1_700_003_900, [running]), verdicts_path=path)
+            self.assertEqual(middle, [])
+            unobserved = self.job(job_id, kind="systemd", lastResult="unknown",
+                                  serviceRunning=False, lastRun=1_700_003_600)
+            self.assertEqual(cs.cron_message_payloads(
+                self.snapshot(1_700_003_950, [unobserved]), verdicts_path=path), [])
+            with open(path) as saved:
+                self.assertEqual(json.load(saved)[cs.cron_job_key(job_id)]["state"], "bad")
+            final = cs.cron_message_payloads(self.snapshot(1_700_004_000, [success]), verdicts_path=path)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(len(final), 1)
+            self.assertEqual(final[0]["resolves"], first[0]["group"])
+
+    def test_reset_result_without_new_run_does_not_resolve_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
+            job_id = "user:taskboard-box-runtime-patrol.timer"
+            failed = self.job(job_id, kind="systemd", lastResult="failed", lastRun=1_700_000_000)
+            reset = self.job(job_id, kind="systemd", lastResult="success", lastRun=1_700_000_000)
+            cs.cron_message_payloads(self.snapshot(1_700_000_000, [failed]), verdicts_path=path)
+            self.assertEqual(cs.cron_message_payloads(
+                self.snapshot(1_700_000_100, [reset]), verdicts_path=path), [])
 
     def test_corrupted_verdicts_file_replays_one_more_transition(self):
         with tempfile.TemporaryDirectory() as root:

@@ -28,8 +28,14 @@ import unittest
 
 import unittest.mock
 
+import sys
+from pathlib import Path
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
+
 from datetime import timedelta
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import devmon_messages as MSG
 
 import devmon_spool
@@ -65,8 +71,185 @@ def msg(event_id='resource-1', group_key='resource:disk', kind='action',
     p.update(extra)
     return p
 
+class TestIngest(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            'devmon_ingest_test_backend', Path(__file__).with_name('airlock-dev-monitor.py'))
+        self.backend = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.backend)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.spool = Path(tmp.name)
+        devmon_spool.ensure_dirs(str(self.spool))
+        self.backend.OWNER_CONFIG = {'spool': str(self.spool)}
+        env = unittest.mock.patch.dict(os.environ, {
+            'DEVMON_INGEST_TOKEN_NAME': 'TEST_INGEST_TOKEN',
+            'TEST_INGEST_TOKEN': 'synthetic-ingest-token',
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), self.backend.Handler)
+        worker = threading.Thread(target=self.server.serve_forever, daemon=True)
+        worker.start()
+        self.addCleanup(worker.join)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post(self, payload=None, token='synthetic-ingest-token', raw=None):
+        conn = HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        try:
+            conn.request('POST', '/api/ingest',
+                         body=raw if raw is not None else json.dumps(payload or msg()).encode(),
+                         headers={'X-Devmon-Ingest-Token': token,
+                                  'Content-Type': 'application/json'})
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            conn.close()
+
+    def assert_empty_spool(self):
+        self.assertEqual(list((self.spool / 'new').iterdir()), [])
+        self.assertEqual(list((self.spool / 'tmp').iterdir()), [])
+
+    def test_ingest_unconfigured_404(self):
+        for key in ('DEVMON_INGEST_TOKEN_NAME', 'TEST_INGEST_TOKEN'):
+            with self.subTest(key=key), unittest.mock.patch.dict(os.environ, {key: ''}):
+                self.assertEqual(self.post()[0], 404)
+        self.backend.OWNER_CONFIG = None
+        self.assertEqual(self.post()[0], 404)
+        self.assert_empty_spool()
+
+    def test_ingest_wrong_token_401(self):
+        for token in ('wrong', '', '\u00e9'):
+            with self.subTest(token=token):
+                self.assertEqual(self.post(token=token)[0], 401)
+        self.assert_empty_spool()
+
+    def test_ingest_valid_token_202_queued(self):
+        payload = msg(title='Remote backup needs attention')
+        self.assertEqual(self.post(payload), (202, {'status': 'queued'}))
+        target = self.spool / 'new' / (payload['id'] + '.json')
+        self.assertEqual(json.loads(target.read_bytes()), payload)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+        self.assertEqual(list((self.spool / 'tmp').iterdir()), [])
+        # The unchanged collector must accept the actual file produced by HTTP.
+        MSG._local = threading.local()
+        MSG.init_db(str(self.spool / 'messages.db'))
+        self.assertEqual(devmon_spool.scan_once(str(self.spool))['inserted'], 1)
+        self.assertEqual(MSG.get_card(payload['id'])['title'], payload['title'])
+
+    def test_ingest_same_id_202_duplicate(self):
+        payload = msg()
+        self.assertEqual(self.post(payload), (202, {'status': 'queued'}))
+        self.assertEqual(self.post(msg(title='Do not overwrite')),
+                         (202, {'status': 'duplicate'}))
+        self.assertEqual(json.loads((self.spool / 'new' / 'resource-1.json').read_bytes()), payload)
+        self.assertEqual(list((self.spool / 'tmp').iterdir()), [])
+
+    def test_ingest_validation_failure_400(self):
+        for payload in (msg(title=''), msg(event_id='../escape'), msg(level='invalid'), ['invalid']):
+            with self.subTest(payload=payload):
+                self.assertEqual(self.post(payload)[0], 400)
+        self.assertEqual(self.post(raw=b'{')[0], 400)
+        self.assert_empty_spool()
+
+    def test_ingest_over_16_kib_400(self):
+        raw = json.dumps(msg()).encode()
+        boundary = raw + b' ' * (MSG.MAX_PAYLOAD - len(raw))
+        self.assertEqual(self.post(raw=boundary + b' ')[0], 400)
+        self.assert_empty_spool()
+        self.assertEqual(self.post(raw=boundary), (202, {'status': 'queued'}))
+
+    def test_ingest_dedicated_nginx_scope(self):
+        import shutil
+        import socket
+        import time
+        nginx = shutil.which('nginx') or '/usr/sbin/nginx'
+        self.assertTrue(Path(nginx).is_file(), 'nginx required for ingress regression')
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            ingest_port = sock.getsockname()[1]
+        renderer = Path(__file__).resolve().parents[1] / 'render.sh'
+        fragment = subprocess.check_output([
+            'bash', '-c', '. "$1"; render_dev_monitor_ingest_nginx "$2" "$3"',
+            'render', str(renderer), str(ingest_port), str(self.server.server_port)], text=True)
+        config = self.spool / 'nginx.conf'
+        config.write_text(f'''daemon off;
+master_process off;
+pid {self.spool}/nginx.pid;
+error_log {self.spool}/nginx.log;
+events {{}}
+http {{
+    access_log off;
+    client_body_temp_path {self.spool}/client-body;
+    proxy_temp_path {self.spool}/proxy;
+    {fragment}
+}}
+''')
+        proc = subprocess.Popen([nginx, '-c', str(config), '-p', str(self.spool)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        def stop():
+            if proc.poll() is None:
+                proc.terminate()
+            proc.communicate(timeout=5)
+        self.addCleanup(stop)
+        for _ in range(100):
+            if proc.poll() is not None:
+                self.fail(proc.communicate()[1].decode())
+            try:
+                with socket.create_connection(('127.0.0.1', ingest_port), timeout=.1):
+                    break
+            except OSError:
+                time.sleep(.02)
+        else:
+            self.fail('scratch ingest nginx did not start')
+        def request(method, path, token='synthetic-ingest-token'):
+            conn = HTTPConnection('127.0.0.1', ingest_port, timeout=5)
+            try:
+                conn.request(method, path, body=json.dumps(msg()), headers={
+                    'X-Devmon-Ingest-Token': token,
+                    'X-Devmon-Owner': 'forged', 'X-Devmon-Proxy-Secret': 'forged'})
+                response = conn.getresponse()
+                return response.status, response.read()
+            finally:
+                conn.close()
+        original_post = self.backend.Handler.do_POST
+        received = []
+        def record_post(handler):
+            received.append(dict(handler.headers))
+            original_post(handler)
+        with unittest.mock.patch.object(self.backend.Handler, 'do_POST', record_post):
+            self.assertEqual(request('POST', '/api/ingest', 'wrong')[0], 401)
+            status, body = request('POST', '/api/ingest')
+            self.assertEqual((status, json.loads(body)), (202, {'status': 'queued'}))
+            self.assertEqual(len(received), 2)
+            for headers in received:
+                self.assertNotIn('X-Devmon-Owner', headers)
+                self.assertNotIn('X-Devmon-Proxy-Secret', headers)
+                self.assertNotIn('Tailscale-User-Login', headers)
+            for method, path in (('GET', '/api/ingest'), ('HEAD', '/api/ingest'),
+                                 ('PUT', '/api/ingest'), ('POST', '/api/owner/run'),
+                                 ('GET', '/api/health'), ('GET', '/api/owner/messages'),
+                                 ('POST', '/monitor/api/ingest')):
+                with self.subTest(method=method, path=path):
+                    self.assertEqual(request(method, path)[0], 404)
+            self.assertEqual(len(received), 2, 'nginx must not proxy rejected routes')
+            with unittest.mock.patch.dict(os.environ, {'DEVMON_INGEST_TOKEN_NAME': ''}):
+                self.assertEqual(request('POST', '/api/ingest')[0], 404)
+        # The old hub-prefixed alias is also retired at the backend.
+        conn = HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
+        try:
+            conn.request('POST', '/monitor/api/ingest')
+            response = conn.getresponse()
+            self.assertEqual(response.status, 404)
+            response.read()
+        finally:
+            conn.close()
+
+
 class TestSpool(unittest.TestCase):
     def setUp(self):
+        self.enterContext(unittest.mock.patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS': '0'}))
         fresh_db()
         self.spool = tempfile.mkdtemp()
         devmon_spool.ensure_dirs(self.spool)
@@ -191,7 +374,7 @@ class TestSpool(unittest.TestCase):
         worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
         try:
             self.assertEqual(devmon_spool.scan_once(self.spool)['inserted'],1)
-            self.assertTrue(devmon_loop.deliver_once('http://127.0.0.1:%d/hook'%server.server_port))
+            self.assertTrue(devmon_loop.deliver_once(devmon_loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': 'http://127.0.0.1:%d/hook'%server.server_port})))
             self.assertEqual(len(posts),1)
             self.assertIsNotNone(MSG.get_card('next')['sent_at'])
             self.assertTrue(MSG.has_receipt('kept'))
@@ -230,7 +413,105 @@ class TestStateDirectoryModes(unittest.TestCase):
 
 class TestSlack(unittest.TestCase):
     def setUp(self):
+        self.enterContext(unittest.mock.patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS': '0'}))
         fresh_db()
+
+    def bot_response(self, body, status=200, retry_after=None):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = status
+        response.headers = {'Retry-After': retry_after}
+        response.read.return_value = json.dumps(body).encode()
+        return response
+
+    def test_bot_success_request_and_api_failure(self):
+        for body, expected in (({'ok': True, 'ts': '123.456'}, (True, 200, None, '123.456')),
+                               ({'ok': False, 'error': 'channel_not_found'},
+                                (False, 'channel_not_found', None, None)),
+                               ({'ok': 'true'}, (False, 'invalid_response', None, None)),
+                               ([], (False, 'invalid_response', None, None))):
+            with self.subTest(body=body), unittest.mock.patch.object(
+                    devmon_slack.urllib.request, 'urlopen',
+                    return_value=self.bot_response(body)) as post:
+                self.assertEqual(devmon_slack.post_message('synthetic-token', 'C_TEST', 'hello'), expected)
+                request = post.call_args.args[0]
+                self.assertEqual(request.full_url, 'https://slack.com/api/chat.postMessage')
+                self.assertEqual(request.get_method(), 'POST')
+                self.assertEqual(request.get_header('Authorization'), 'Bearer synthetic-token')
+                self.assertEqual(request.get_header('Content-type'), 'application/json; charset=utf-8')
+                self.assertEqual(json.loads(request.data), {'channel': 'C_TEST', 'text': 'hello'})
+                self.assertEqual(post.call_args.kwargs, {'timeout': 2})
+
+    def test_bot_rate_limit_preserves_error_and_retry_header(self):
+        with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen',
+                return_value=self.bot_response({'ok': False, 'error': 'ratelimited'}, retry_after='17')):
+            ok, code, retry, ts = devmon_slack.post_message('synthetic-token', 'rate', 'hello')
+        self.assertEqual((ok, code, retry), (False, 'ratelimited', '17'))
+        for value in ('17', '0', '99999', 'bad', '-1', None):
+            self.assertEqual(devmon_slack._retry_after_seconds(code, value),
+                             devmon_slack._retry_after_seconds(429, value))
+
+    def test_bot_http_network_and_json_errors_do_not_disclose_inputs(self):
+        secret = 'synthetic-token https://channel.example.test/private'
+        failures = [(devmon_slack.urllib.error.HTTPError('https://slack.com/api/chat.postMessage', code,
+                     secret, {'Retry-After': '9'}, io.BytesIO(secret.encode())), (False, code, '9'))
+                    for code in (400, 401, 429, 500, 503)]
+        failures += [(devmon_slack.urllib.error.URLError(secret), (False, 'URLError', None)),
+                     (TimeoutError(secret), (False, 'TimeoutError', None))]
+        for failure, expected in failures:
+            with self.subTest(error=type(failure).__name__), unittest.mock.patch.object(
+                    devmon_slack.urllib.request, 'urlopen', side_effect=failure), \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout:
+                result = devmon_slack.post_message('synthetic-token', 'https://channel.example.test/private', 'hello')
+                self.assertEqual(result, expected + (None,))
+                self.assertEqual(stderr.getvalue() + stdout.getvalue(), '')
+        response = self.bot_response({})
+        response.read.return_value = secret.encode()
+        with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen', return_value=response):
+            self.assertEqual(devmon_slack.post_message('synthetic-token', 'C_TEST', 'hello'),
+                             (False, 'JSONDecodeError', None, None))
+        for error in (secret, 'synthetic_token', 'https://channel.example.test/private', {'token': secret}):
+            with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen',
+                    return_value=self.bot_response({'ok': False, 'error': error})):
+                self.assertEqual(devmon_slack.post_message('synthetic_token', 'private_channel', 'hello'),
+                                 (False, 'invalid_response', None, None))
+
+    def test_sender_precedence_and_incomplete_bot_fallback(self):
+        for token, channel in (('synthetic-token', 'C_TEST'), ('', 'C_TEST'),
+                               ('synthetic-token', ''), ('', '')):
+            for webhook in ('https://hook.example.test/synthetic', ''):
+                env = {'DEVMON_SLACK_BOT_TOKEN_NAME': 'BOT', 'BOT': token,
+                       'DEVMON_SLACK_CHANNEL': channel,
+                       'DEVMON_SLACK_WEBHOOK_NAME': 'HOOK', 'HOOK': webhook}
+                with self.subTest(token=bool(token), channel=bool(channel), hook=bool(webhook)), \
+                        unittest.mock.patch.object(devmon_slack, 'post_message', return_value=(True, 200, None)) as bot, \
+                        unittest.mock.patch.object(devmon_slack, 'send', return_value=(True, 200, None)) as hook:
+                    sender = devmon_slack.make_sender(env)
+                    if token and channel:
+                        self.assertEqual(sender('hello'), (True, 200, None))
+                        bot.assert_called_once_with(token, channel, 'hello')
+                        hook.assert_not_called()
+                    elif webhook:
+                        sender('hello')
+                        hook.assert_called_once_with(webhook, 'hello')
+                        bot.assert_not_called()
+                    else:
+                        self.assertIsNone(sender)
+        self.assertIsNone(devmon_slack.make_sender({}))
+
+    def test_bot_api_failure_is_not_committed_as_sent(self):
+        import devmon_loop
+        MSG.ingest(msg(urgency='urgent'))
+        sender = devmon_slack.make_sender({'DEVMON_SLACK_BOT_TOKEN_NAME': 'BOT',
+                                          'BOT': 'synthetic-token', 'DEVMON_SLACK_CHANNEL': 'C_TEST'})
+        with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen',
+                return_value=self.bot_response({'ok': False, 'error': 'channel_not_found'})):
+            self.assertTrue(devmon_loop.deliver_once(sender))
+        card = MSG.get_card('resource-1')
+        self.assertIsNone(card['sent_at'])
+        self.assertEqual(card['send_attempts'], 1)
+        self.assertIsNotNone(card['send_next_at'])
 
     def test_send_returns_raw_http_contract_without_body_or_url(self):
         response = unittest.mock.MagicMock()
@@ -711,7 +992,71 @@ class TestOwnerGate(unittest.TestCase):
 
 class TestCards(unittest.TestCase):
     def setUp(self):
+        self.enterContext(unittest.mock.patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS': '0'}))
         fresh_db()
+
+    def test_detail_is_verbatim_console_only_and_not_a_coalescing_key(self):
+        original = '  <script>alert(1)</script>\nraw & text  '
+        first = msg(kind='info', detail=original)
+        MSG.ingest(first)
+        MSG.mark_read(first['id'])
+        second = dict(first, id='detail-2', detail='different raw text')
+        self.assertEqual(MSG.ingest(second), 'coalesced')
+        card = MSG.get_card(first['id'])
+        self.assertEqual(card['count'], 2)
+        self.assertEqual(card['detail'], second['detail'])
+        self.assertIsNotNone(card['read_at'])
+        receipt = MSG._conn().execute('SELECT payload FROM ledger WHERE id=?', (first['id'],)).fetchone()[0]
+        self.assertEqual(json.loads(receipt), first)
+        self.assertNotIn(second['detail'], devmon_slack.format_text(card))
+        # A receipt without source text does not erase what is already stored: the
+        # card is what a person clicks to read. Latest PRESENT value wins, not latest.
+        MSG.ingest(msg(event_id='detail-3', kind='info'))
+        self.assertEqual(MSG.get_card(first['id'])['detail'], second['detail'])
+        for detail in (None, 1, [], {}):
+            with self.assertRaises(MSG.ValidationError):
+                MSG.validate_payload(dict(first, detail=detail))
+
+    def test_resolution_without_detail_keeps_the_incident_source_text(self):
+        """Measured on a live box 2026-09-23: a flap resolved inside the grace window
+        closed the card with detail=NULL, losing the source text at the exact moment
+        someone would open the card to read it."""
+        self.enterContext(unittest.mock.patch.dict(
+            os.environ, {'AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS': '300'}))
+
+        def stored(card_id):
+            return MSG._conn().execute(
+                'SELECT detail,archived_at,sent_at,send_next_at FROM cards WHERE card_id=?',
+                (card_id,)).fetchone()
+
+        down = msg(event_id='flap-down', group_key='flap', kind='info',
+                   urgency='urgent', detail='HTTP code=000, 2 consecutive failures')
+        MSG.ingest(down)
+        MSG.ingest(msg(event_id='flap-up', group_key='flap-ok', kind='info',
+                       resolves='flap'))
+        row = stored('flap-down')
+        self.assertIsNotNone(row['archived_at'])          # closed
+        self.assertIsNone(row['sent_at'])                 # never reached Slack
+        self.assertIsNone(row['send_next_at'])            # delivery cancelled
+        self.assertEqual(row['detail'], down['detail'])   # source text kept
+
+        # A resolution carrying its own source text still replaces it.
+        MSG.ingest(msg(event_id='flap-down-2', group_key='flap', kind='info',
+                       urgency='urgent', detail='first'))
+        MSG.ingest(msg(event_id='flap-up-2', group_key='flap-ok', kind='info',
+                       resolves='flap', detail='closing text'))
+        self.assertEqual(stored('flap-down-2')['detail'], 'closing text')
+
+    def test_preview_carries_boolean_peek_without_changing_counts(self):
+        MSG.ingest(msg(event_id='quiet-urgent', group_key='quiet', kind='info', urgency='urgent'))
+        MSG.ingest(msg(event_id='peek-normal', group_key='normal', kind='info', peek=True))
+        MSG.ingest(msg(event_id='peek-urgent', group_key='urgent', kind='info', urgency='urgent', peek=True))
+        preview = MSG.preview()
+        self.assertEqual(preview['unread_count'], 3)
+        self.assertEqual({c['card_id']: c['peek'] for c in preview['messages']},
+                         {'quiet-urgent': False, 'peek-normal': True, 'peek-urgent': True})
+        self.assertTrue(all(type(c['peek']) is bool for c in preview['messages']))
+        self.assertEqual(preview['top'], preview['messages'])
 
     def test_level_alias_and_idempotence(self):
         payload = msg(kind='info', urgency='urgent')
@@ -736,6 +1081,54 @@ class TestCards(unittest.TestCase):
         card = MSG.feed()['messages'][0]
         self.assertEqual((card['level'],card['count'],card['read_at']),('urgent',3,None))
         self.assertEqual(MSG._conn().execute('SELECT count(*) FROM cards WHERE send_next_at IS NOT NULL').fetchone()[0],1)
+
+    def test_slack_urgent_never_queues_a_slack_send(self):
+        """A mention that arrived over Slack must not be announced back into Slack."""
+        def queued():
+            return MSG._conn().execute(
+                'SELECT count(*) FROM cards WHERE send_next_at IS NOT NULL').fetchone()[0]
+        MSG.ingest(msg(event_id='slack-sos', group_key='slack:mentions', kind='info',
+                       source='slack', urgency='urgent', peek=True))
+        self.assertEqual(MSG.get_card('slack-sos')['level'], 'urgent')
+        self.assertEqual(queued(), 0)
+        # Promotion on coalesce is the other way in, and it is closed too.
+        MSG.ingest(msg(event_id='slack-normal', group_key='slack:calm', kind='info',
+                       source='slack', peek=True))
+        MSG.ingest(msg(event_id='slack-rise', group_key='slack:calm', kind='info',
+                       source='slack', urgency='urgent', title='새 멘션', peek=True))
+        self.assertEqual(MSG.get_card('slack-normal')['level'], 'urgent')
+        self.assertEqual(queued(), 0)
+        # A machine alarm at the same urgency still queues — only Slack is excluded.
+        MSG.ingest(msg(event_id='disk-sos', group_key='resource:disk', kind='info',
+                       urgency='urgent'))
+        self.assertEqual(queued(), 1)
+
+    def test_read_slack_card_starts_over_at_the_new_level(self):
+        """Reading is 'seen up to here', so dismissed urgency is not inherited."""
+        MSG.ingest(msg(event_id='m1', group_key='slack:mentions', kind='info',
+                       source='slack', urgency='urgent', title='#infra · 지수', peek=True))
+        MSG.mark_read('m1')
+        MSG.ingest(msg(event_id='m2', group_key='slack:mentions', kind='info',
+                       source='slack', title='#infra · 현우', body='로그 좀', peek=True))
+        card = MSG.get_card('m1')
+        self.assertEqual(card['level'], 'normal')
+        self.assertIsNone(card['read_at'])
+        self.assertEqual(card['count'], 2)
+
+    def test_unread_slack_card_still_rises_to_urgent(self):
+        """Only a read card starts over; an unread one keeps the ordinary climb."""
+        MSG.ingest(msg(event_id='u1', group_key='slack:mentions', kind='info',
+                       source='slack', urgency='urgent', title='#infra · 지수', peek=True))
+        MSG.ingest(msg(event_id='u2', group_key='slack:mentions', kind='info',
+                       source='slack', title='#infra · 현우', body='로그 좀', peek=True))
+        self.assertEqual(MSG.get_card('u1')['level'], 'urgent')
+
+    def test_read_machine_card_keeps_its_urgency(self):
+        """Severity that climbs down by itself would hide a machine fault."""
+        MSG.ingest(msg(event_id='d1', kind='info', urgency='urgent'))
+        MSG.mark_read('d1')
+        MSG.ingest(msg(event_id='d2', kind='info', title='Disk 93%'))
+        self.assertEqual(MSG.get_card('d1')['level'], 'urgent')
 
     def test_coalescing_body_change_revives_read_card(self):
         MSG.ingest(msg(kind='info'))
@@ -770,7 +1163,7 @@ class TestCards(unittest.TestCase):
         MSG.ingest(msg(event_id='urgent',group_key='other',kind='info',urgency='urgent'))
         self.assertEqual(MSG.delivery_health()['pending_count'],1)
         import devmon_loop
-        self.assertFalse(devmon_loop.deliver_once(''))
+        self.assertFalse(devmon_loop.deliver_once(None))
         self.assertEqual(MSG.counts()['active'],2)
 
     def test_open_card_coalesces_after_40_days(self):
@@ -886,6 +1279,213 @@ class TestCards(unittest.TestCase):
         self.assertEqual(MSG.ingest(old), 'inserted')
         self.assertEqual(MSG.get_card('old-shape')['run'], old['run'])
         AC['15']['legacy_valid'] = 1
+
+
+
+class TestResolve(unittest.TestCase):
+    bot_response = TestSlack.bot_response
+
+    def setUp(self):
+        fresh_db()
+        self.enterContext(unittest.mock.patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS': '300'}))
+        self.now = MSG.now_utc()
+        self.enterContext(unittest.mock.patch.object(MSG, 'now_utc', side_effect=lambda: self.now))
+        import devmon_loop
+        self.loop = devmon_loop
+        self.sender = devmon_slack.make_sender({'DEVMON_SLACK_BOT_TOKEN_NAME': 'BOT',
+            'BOT': 'synthetic-token', 'DEVMON_SLACK_CHANNEL': 'C_TEST'})
+
+    def alarm(self, **extra):
+        return msg(kind='info', urgency='urgent', detail='RAW DOWN', **extra)
+
+    def recovery(self, **extra):
+        payload = msg(event_id='recovery', group_key='recovery', kind='info',
+                      title='Recovered', body='Service is healthy.\nChecks pass.',
+                      detail='RAW RECOVERY', resolves='resource:disk')
+        payload.update(extra)
+        if 'group_key' in extra:
+            payload['group'] = payload.pop('group_key')
+        if 'urgency' in extra:
+            payload['level'] = payload.pop('urgency')
+        return payload
+
+    def send_alarm(self):
+        MSG.ingest(self.alarm())
+        self.now += timedelta(seconds=300)
+        with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen',
+                return_value=self.bot_response({'ok': True, 'ts': '123.456'})) as request:
+            self.assertTrue(self.loop.deliver_once(self.sender))
+        self.assertEqual(MSG.get_card('resource-1')['slack_ts'], '123.456')
+        self.assertNotIn('RAW DOWN', json.loads(request.call_args.args[0].data)['text'])
+
+    def test_default_grace_promotion_and_coalescing_do_not_extend_window(self):
+        with unittest.mock.patch.dict(os.environ):
+            os.environ.pop('AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS')
+            self.assertEqual(MSG.grace_seconds(), 300)
+        MSG.ingest(msg(kind='info'))
+        self.assertIsNone(MSG.next_delivery())
+        MSG.ingest(self.alarm(event_id='promotion'))
+        due = MSG.get_card('resource-1')['send_next_at']
+        self.assertEqual(MSG.parse_rfc3339(due), self.now + timedelta(seconds=300))
+        self.now += timedelta(seconds=299)
+        MSG.ingest(self.alarm(event_id='repeat'))
+        self.assertIsNone(MSG.next_delivery())
+        self.assertEqual(MSG.get_card('resource-1')['send_next_at'], due)
+        self.now += timedelta(seconds=1)
+        self.assertEqual(MSG.next_delivery()['card_id'], 'resource-1')
+
+    def test_two_minute_flap_retains_receipts_and_resolved_card_without_post(self):
+        MSG.ingest(self.alarm())
+        self.now += timedelta(seconds=120)
+        receipt = self.recovery()
+        self.assertEqual(MSG.ingest(receipt), 'coalesced')
+        self.assertEqual(MSG.ingest(receipt), 'duplicate')
+        with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen') as request:
+            self.now += timedelta(minutes=10)
+            self.assertFalse(self.loop.deliver_once(self.sender))
+            request.assert_not_called()
+        card = MSG.get_card('resource-1')
+        self.assertTrue(card['archived'])
+        self.assertTrue(card['title'].startswith('✅ '))
+        self.assertEqual(card['body'], 'Service is healthy. Checks pass.')
+        self.assertEqual(card['detail'], receipt['detail'])
+        self.assertEqual(len(MSG.feed('all')['messages']), 1)
+        self.assertEqual(MSG.delivery_health()['pending_count'], 0)
+        self.assertEqual(json.loads(MSG._conn().execute(
+            'SELECT payload FROM ledger WHERE id=?', (receipt['id'],)).fetchone()[0]), receipt)
+        self.assertEqual(MSG._conn().execute('SELECT COUNT(*) FROM ledger').fetchone()[0], 2)
+        # A later incident in the same group must get its own grace and Slack post.
+        self.assertEqual(MSG.ingest(self.alarm(event_id='down-again')), 'inserted')
+        self.assertFalse(MSG.get_card('down-again')['archived'])
+
+    def test_sent_resolution_updates_original_after_restart_without_new_post(self):
+        self.send_alarm()
+        self.assertEqual(MSG.ingest(self.recovery()), 'coalesced')
+        MSG._conn().close()
+        MSG._local = threading.local()
+        MSG.init_db(MSG._DB_PATH)
+        with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen',
+                return_value=self.bot_response({'ok': True, 'ts': '123.456'})) as request:
+            self.assertTrue(self.loop.deliver_once(self.sender))
+            self.assertFalse(self.loop.deliver_once(self.sender))
+        req = request.call_args.args[0]
+        self.assertEqual(req.full_url, 'https://slack.com/api/chat.update')
+        body = json.loads(req.data)
+        self.assertEqual(body['ts'], '123.456')
+        self.assertEqual(body['channel'], 'C_TEST')
+        self.assertTrue(body['text'].startswith('✅'))
+        self.assertIn('Service is healthy. Checks pass.', body['text'])
+        self.assertNotIn('RAW', body['text'])
+        self.assertEqual(len(MSG.feed('all')['messages']), 1)
+
+    def test_update_api_failure_retries_six_times_and_remains_visible(self):
+        self.send_alarm()
+        MSG.ingest(self.recovery())
+        with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen',
+                return_value=self.bot_response({'ok': False, 'error': 'ratelimited'}, retry_after='90')) as request:
+            for attempt in range(6):
+                self.assertTrue(self.loop.deliver_once(self.sender))
+                card = MSG.get_card('resource-1')
+                self.assertIsNone(card['sent_at'])
+                self.assertEqual(card['slack_ts'], '123.456')
+                self.assertEqual(card['send_attempts'], attempt + 1)
+                if attempt < 5:
+                    due = MSG.parse_rfc3339(card['send_next_at'])
+                    self.assertGreaterEqual((due - self.now).total_seconds(), 90)
+                    self.now = due
+            self.assertFalse(self.loop.deliver_once(self.sender))
+            self.assertEqual(request.call_count, 6)
+            self.assertTrue(all(call.args[0].full_url.endswith('/chat.update') for call in request.call_args_list))
+        self.assertEqual(card['delivery'], 'failed')
+        self.assertEqual(MSG.delivery_health()['failed_count'], 1)
+
+    def test_resolution_without_update_target_falls_back_to_new_card(self):
+        for mode in ('missing', 'normal', 'webhook', 'expired-grace', 'failed'):
+            with self.subTest(mode=mode):
+                fresh_db()
+                if mode != 'missing':
+                    payload = self.alarm()
+                    if mode == 'normal':
+                        payload['level'] = 'normal'
+                    MSG.ingest(payload)
+                    self.now += timedelta(seconds=300)
+                    if mode in ('webhook', 'failed'):
+                        MSG.finish_delivery(MSG.next_delivery(), mode == 'webhook')
+                recovery = self.recovery(urgency='urgent')
+                self.assertEqual(MSG.ingest(recovery), 'inserted')
+                self.assertIsNotNone(MSG.get_card('recovery'))
+                self.assertEqual(MSG.get_card('recovery')['title'], 'Recovered')
+                self.assertIsNotNone(MSG.get_card('recovery')['send_next_at'])
+
+    def test_fallback_keeps_existing_coalescing_key_across_repeated_flaps(self):
+        for mode in ('normal', 'webhook', 'failed'):
+            with self.subTest(mode=mode):
+                fresh_db()
+                for index in range(3):
+                    alarm = self.alarm(event_id='alarm-%d' % index)
+                    if mode == 'normal':
+                        alarm['level'] = 'normal'
+                    MSG.ingest(alarm)
+                    if index == 0 and mode != 'normal':
+                        self.now += timedelta(seconds=300)
+                        MSG.finish_delivery(MSG.next_delivery(), mode == 'webhook')
+                    recovery = self.recovery(id='recovery-%d' % index, group='resource:disk')
+                    self.assertEqual(MSG.ingest(recovery), 'coalesced')
+                cards = MSG.feed('all')['messages']
+                self.assertEqual(len(cards), 1)
+                self.assertEqual(cards[0]['count'], 6)
+                self.assertEqual(cards[0]['title'], 'Recovered')
+                self.assertEqual(MSG._conn().execute('SELECT COUNT(*) FROM ledger').fetchone()[0], 6)
+
+    def test_titles_never_resolve_and_field_is_validated(self):
+        MSG.ingest(self.alarm())
+        ordinary = self.recovery()
+        del ordinary['resolves']
+        self.assertEqual(MSG.ingest(ordinary), 'inserted')
+        self.assertFalse(MSG.get_card('resource-1')['archived'])
+        for value in (None, '', 'bad group', 'dev-monitor:internal', 1, [], {}):
+            with self.assertRaises(MSG.ValidationError):
+                MSG.validate_payload(dict(ordinary, resolves=value))
+
+    def test_optional_fields_apply_to_heartbeat_and_resolution_reason_stays_one_line(self):
+        from devmon_heartbeat import heartbeat_payload
+        heartbeat = dict(heartbeat_payload(self.now), detail='original heartbeat',
+                         resolves='missing')
+        MSG.ingest(heartbeat)
+        card = MSG.get_card(heartbeat['id'])
+        self.assertEqual(card['detail'], heartbeat['detail'])
+        self.assertEqual(MSG.parse_rfc3339(card['send_next_at']), self.now + timedelta(seconds=300))
+        fresh_db()
+        self.send_alarm()
+        MSG.ingest(self.recovery(body='Recovered • all checks pass.'))
+        card = MSG.next_delivery()
+        text = devmon_slack.format_text(card, resolved=True)
+        self.assertEqual(text.splitlines()[-1], 'Recovered • all checks pass.')
+
+    def test_group_resolution_preserves_separate_run_and_link_cards(self):
+        MSG.ingest(self.alarm())
+        MSG.ingest(self.alarm(event_id='linked', link='https://example.test/job'))
+        self.assertEqual(MSG.ingest(self.recovery()), 'coalesced')
+        self.assertEqual(len(MSG.feed('archived')['messages']), 2)
+        self.assertIsNone(MSG.next_delivery())
+
+    def test_update_transport_cannot_fall_back_to_webhook(self):
+        self.send_alarm()
+        MSG.ingest(self.recovery())
+        hook = unittest.mock.Mock(return_value=(True, 200, None), spec=lambda text: None)
+        self.assertTrue(self.loop.deliver_once(hook))
+        hook.assert_not_called()
+        self.assertEqual(MSG.get_card('resource-1')['delivery'], 'pending')
+
+    def test_bot_requires_ts_and_update_checks_http_and_json(self):
+        for body in ({'ok': True}, {'ok': True, 'ts': 'secret text'}, [], {'ok': False, 'error': 'cant_update_message'}):
+            with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen',
+                    return_value=self.bot_response(body)):
+                self.assertFalse(devmon_slack.update_message('synthetic-token', 'C_TEST', '123.456', 'ok')[0])
+        for code in (429, 500):
+            error = devmon_slack.urllib.error.HTTPError('https://slack.com/api/chat.update', code, 'synthetic', {'Retry-After': '90'}, None)
+            with unittest.mock.patch.object(devmon_slack.urllib.request, 'urlopen', side_effect=error):
+                self.assertEqual(devmon_slack.update_message('synthetic-token', 'C_TEST', '123.456', 'ok'), (False, code, '90', None))
 
 
 if __name__ == "__main__":

@@ -542,7 +542,11 @@ def _origin_wrapper(path: str) -> bool:
 
 def _origin_path(raw: str) -> str | None:
     """경로를 realpath로 해소하고, 존재하며 안전한 경로만 반환한다."""
-    if raw.startswith("~/"):
+    if raw.startswith(("$HOME/", "${HOME}/")):
+        owner_home = _owner_home()
+        prefix_len = 6 if raw.startswith("$HOME/") else 8
+        raw = os.path.join(owner_home, raw[prefix_len:]) if owner_home else os.path.expanduser("~" + raw[prefix_len - 1:])
+    elif raw.startswith("~/"):
         owner_home = _owner_home()
         raw = os.path.join(owner_home, raw[2:]) if owner_home else os.path.expanduser(raw)
     if not raw.startswith("/"):
@@ -583,7 +587,7 @@ def execution_path_candidates(command: str, *, fragment_path: str | None = None,
             continue
         if _ORIGIN_REDIRECT_RE.match(token):
             continue
-        raw = token if token.startswith(("/", "~/")) else None
+        raw = token if token.startswith(("/", "~/", "$HOME/", "${HOME}/")) else None
         if raw is None:
             continue
         path = _origin_path(raw)
@@ -894,19 +898,66 @@ def cron_job_label(command: str, source: str) -> str:
     ② cron.d 파일명 — 패키지가 잡 이름으로 지은 것이라 명령 파싱보다 정확하다. 명령 앞의
        가드 절에 나오는 경로(`test -e /run/systemd/system`·`> /dev/null`)는 실행 대상이 아니라
        거기서 이름을 뽑으면 'system'·'null' 같은 헛이름이 나온다.
-    ③ 명령 안 첫 절대경로의 파일명 — 개인 crontab(파일 하나에 여러 잡)은 이 경로가 곧 정체다.
-    ④ 첫 토큰
+    ③ 명령 안 첫 실행 스크립트/경로의 파일명 ($HOME, ~, / 지원 및 .env/가드/wrapper/lock 제외)
+    ④ 첫 의미 있는 토큰
     """
     m = _RUN_PARTS_RE.search(command)
     if m:
         return os.path.basename(m.group(1))
     if source.startswith("/") and source != CRONTAB_FILE:
         return os.path.basename(source)
-    for tok in command.split():
-        tok = tok.strip("'\"[](){};&|")
-        if tok.startswith("/") and len(tok) > 1:
-            return os.path.basename(tok.rstrip("/"))
-    return command.split()[0] if command.split() else "?"
+
+    tokens = _origin_tokens(command)
+    if not tokens:
+        return "?"
+
+    # 1. 가드 절 분리: ';' 또는 '&&' 로 토큰 세그먼트를 나누고, '[', 'test' 로 시작하는 순수 가드 세그먼트 배제
+    segments = []
+    current_seg = []
+    for tok in tokens:
+        if tok in (";", "&&"):
+            if current_seg:
+                segments.append(current_seg)
+                current_seg = []
+        else:
+            current_seg.append(tok)
+    if current_seg:
+        segments.append(current_seg)
+
+    exec_segments = [s for s in segments if s and s[0] not in ("[", "test")]
+    search_tokens = [tok for seg in exec_segments for tok in seg] if exec_segments else tokens
+
+    non_script_exts = (".env", ".conf", ".cfg", ".log", ".err", ".out", ".lock", ".lck", ".pid", ".sock")
+    script_candidates = []
+    for tok in search_tokens:
+        clean = tok.strip("'\"[](){};&|")
+        if not clean:
+            continue
+        normalized = clean
+        if normalized.startswith("$HOME/"):
+            normalized = "/" + normalized[6:]
+        elif normalized.startswith("${HOME}/"):
+            normalized = "/" + normalized[8:]
+        elif normalized.startswith("~/"):
+            normalized = "/" + normalized[2:]
+        if normalized.startswith("/") and len(normalized) > 1:
+            base = os.path.basename(normalized.rstrip("/"))
+            if base not in ("null", "true", "false", "system", "stdout", "stderr") and not base.endswith(non_script_exts):
+                script_candidates.append(base)
+
+    if script_candidates:
+        # wrapper(_ORIGIN_WRAPPER_NAMES, python regex)가 아닌 첫 번째 실제 스크립트 선택
+        for cand in script_candidates:
+            if not _origin_wrapper(cand) and cand not in ("env", "sh", "bash", "python", "python3"):
+                return cand
+        return script_candidates[-1]
+
+    for tok in search_tokens:
+        clean = tok.strip("'\"[](){};&|")
+        if clean and clean not in _ORIGIN_SHELL_WORDS and not _origin_wrapper(clean) and clean not in ("[", "]", "test", "cd"):
+            return clean
+
+    return search_tokens[0] if search_tokens else "?"
 
 
 def _day_matches(d: date, m: dict) -> bool:
@@ -965,7 +1016,7 @@ def cron_prev_epoch(expr: str, now_epoch: float) -> float | None:
 # ---------------------------------------------------------------------------
 
 
-def service_result(result: str, last_run: float | None) -> str:
+def service_result(result: str, last_run: float | None, *, completed: bool = True) -> str:
     """서비스의 마지막 결과 → ``success`` | ``failed`` | ``unknown`` | ``none``.
 
     판정 권위는 systemd 의 `Result` 다. `ExecMainStatus`(종료코드)는 참고값일 뿐 —
@@ -978,7 +1029,7 @@ def service_result(result: str, last_run: float | None) -> str:
     if last_run is None:
         return "none"
     if result == "success":
-        return "success"
+        return "success" if completed else "unknown"
     if not result or result in ("n/a", "none", "unknown"):
         return "unknown"
     return "failed"
@@ -1326,13 +1377,15 @@ def collect_systemd(scope: str, boot: float | None, now: float) -> tuple[list[di
                 next_run = boot + mono
 
         exit_status = first(s, "ExecMainStatus")
-        last_result = service_result(first(s, "Result"), last_run)
+        started = parse_timestamp(first(s, "ExecMainStartTimestamp"))
+        exited = parse_timestamp(first(s, "ExecMainExitTimestamp"))
+        completed = started is not None and exited is not None and exited >= started
+        running = first(s, "ActiveState") in {"activating", "active"} and not completed
+        last_result = service_result(first(s, "Result"), last_run, completed=completed)
         # 조건(ConditionPathExists 등) 미충족으로 건너뛴 실행도 systemd 는 성공으로 친다.
         # 결과 축은 systemd Result를 따르되, 건너뛴 사실은 별도 필드에 남긴다.
         condition_met = first(s, "ConditionResult") != "no"
 
-        started = parse_timestamp(first(s, "ExecMainStartTimestamp"))
-        exited = parse_timestamp(first(s, "ExecMainExitTimestamp"))
         duration = (exited - started) if (started is not None and exited is not None
                                          and exited >= started) else None
 
@@ -1356,6 +1409,7 @@ def collect_systemd(scope: str, boot: float | None, now: float) -> tuple[list[di
             "unitFileState": unit_file_state,
             "activeState": first(t, "ActiveState"),
             "serviceActiveState": first(s, "ActiveState"),
+            "serviceRunning": running,
             "lastRun": last_run,
             "nextRun": next_run,
             "lastResult": last_result,
@@ -2036,7 +2090,16 @@ def cron_message_payloads(measured: dict | None = None, verdicts_path: str | Non
         prior_bad = bool(prior and prior.get("state") == "bad")
         # 상태 파일이 없거나 깨졌으면 첫 스캔 한 번은 전이로 본다 — 청사진 결정 01, 허용.
         transitioned_bad = bad and (not prior_bad or not verdicts_ok)
-        transitioned_ok = (not bad) and prior_bad
+        # A timer's new activation resets Result to success before the service exits.
+        # Only a completed successful systemd run can clear a failed verdict.
+        prior_run = prior.get("lastRun") if prior_bad else None
+        if not isinstance(prior_run, str):
+            prior_run = None
+        new_run = run_token != "unknown" and (
+            prior_run in (None, "unknown") or run_token > prior_run)
+        completed_ok = job.get("kind") != "systemd" or (
+            job.get("lastResult") == "success" and new_run)
+        transitioned_ok = (not bad) and prior_bad and completed_ok and not job.get("serviceRunning", False)
 
         if transitioned_bad:
             about = _job_about(job)
@@ -2057,6 +2120,7 @@ def cron_message_payloads(measured: dict | None = None, verdicts_path: str | Non
                 "group": "cron:" + key,
                 "source": "cron",
                 "level": "normal",
+                "resolves": "cron:" + key,
                 "title": "%s 다시 정상" % name,
                 "body": _cron_body(about, [], job.get("nextRun")),
                 "created_at": created_at,
@@ -2064,6 +2128,8 @@ def cron_message_payloads(measured: dict | None = None, verdicts_path: str | Non
 
         if bad:
             next_verdicts[key] = {"state": "bad", "lastRun": run_token}
+        elif prior_bad and not transitioned_ok:
+            next_verdicts[key] = prior
 
     _save_cron_verdicts(verdicts_path, next_verdicts)
     return payloads

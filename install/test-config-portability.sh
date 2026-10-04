@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# Proves the private release contract at the consumer boundary: airlock.toml
-# and packages/<id> move as one byte-identical bundle, while a partial copy is
-# rejected once, before validate or hub installation can mutate a clean box.
+# Relocated external payloads resolve only through explicit installed records.
+# Missing recorded sources fail before hooks, and dry apply has no file effects.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT" || exit 1
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 CFG="$ROOT/bin/airlock-config"
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+export HOME="$scratch/home" AIRLOCK_STATE_DIR="$scratch/state" XDG_CONFIG_HOME="$scratch/xdg"
+mkdir -p "$HOME"
+airlock_set_fixture_root "$scratch"
+airlock_pin_paseo_mem
 
 make_package() {
   local dir="$1" id="$2"
@@ -72,6 +73,19 @@ fi
 empty_shipped="$scratch/no-shipped-apps"
 foreign_cwd="$scratch/foreign-cwd"
 mkdir -p "$empty_shipped" "$foreign_cwd"
+seed_bundle() {
+  env -u AIRLOCK_APP_ID -u AIRLOCK_APP_DIR python3 - "$ROOT/bin/airlock-ledger" "$1" <<'PY_SEED'
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+import sys
+sys.dont_write_bytecode = True
+ledger = SourceFileLoader("_portable_fixture_ledger", sys.argv[1]).load_module()
+bundle = Path(sys.argv[2]).resolve()
+ledger.write_installed({pid: {"repo": str(bundle / "packages" / pid), "commit": "", "artifacts": []}
+                       for pid in ("alpha", "mu", "zed")})
+PY_SEED
+}
+seed_bundle "$relocated_bundle"
 pkginfo="$(cd "$foreign_cwd" && HOME="$scratch/positive-home" \
   AIRLOCK_CONFIG="$relocated_bundle/airlock.toml" \
   AIRLOCK_SHIPPED_APPS_ROOT="$empty_shipped" \
@@ -96,123 +110,50 @@ for package_id, package in doc["packages"].items():
         raise SystemExit(f"{package_id}: package path escaped the relocated bundle")
 PY
 then
-  ok "package-info resolves every relative package under the relocated config"
+  ok "package-info uses the recorded absolute directories after relocation"
 else
   bad "relocated package-info failed (rc=$pkginfo_rc): $(head -1 "$scratch/positive-package-info.err")"
 fi
 
-# Keep the real orchestrator and preflight, but make command availability
-# independent of the host image. AIRLOCK_DRY_RUN means none of these shims is
-# invoked for a mutation; they only satisfy core prerequisite discovery.
+# Selected dry ingress preserves recorded sources and never executes exit-97 hooks.
+positive_before="$(find "$scratch/state" -type f -exec sha256sum {} + | sort)"
+positive_out="$(AIRLOCK_CONFIG="$relocated_bundle/airlock.toml" AIRLOCK_DRY_RUN=1 \
+  "$ROOT/bin/airlock-ledger" apply alpha 2>&1)"; positive_rc=$?
+if [ "$positive_rc" = 0 ] && grep -Fq '[dry]' <<<"$positive_out" \
+   && [ "$positive_before" = "$(find "$scratch/state" -type f -exec sha256sum {} + | sort)" ]; then
+  ok "recorded relocated app reaches selected dry apply without hook or record changes"
+else
+  bad "recorded source dry apply failed or changed records (rc=$positive_rc): $positive_out"
+fi
+
+# Mutation commands remain scratch shims even when source resolution fails early.
 shim="$scratch/shim"
 mkdir -p "$shim"
-for cmd in nginx sudo systemctl tailscale curl; do
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$shim/$cmd"
-  chmod +x "$shim/$cmd"
+for command in sudo systemctl tailscale nginx curl; do
+  printf '#!/usr/bin/env bash\nexit 97\n' >"$shim/$command"
+  chmod +x "$shim/$command"
 done
+export PATH="$shim:$PATH"
 
-positive_root="$scratch/positive-box"
-mkdir -p "$positive_root/home" "$positive_root/state" "$positive_root/web" \
-  "$positive_root/confd" "$positive_root/user-units" "$positive_root/system-units"
-positive_out="$(HOME="$positive_root/home" \
-  AIRLOCK_CONFIG="$relocated_bundle/airlock.toml" \
-  AIRLOCK_SHIPPED_APPS_ROOT="$empty_shipped" \
-  AIRLOCK_STATE_DIR="$positive_root/state" \
-  AIRLOCK_WEBROOT="$positive_root/web" \
-  AIRLOCK_CONFD="$positive_root/confd" \
-  AIRLOCK_NGINX_SITE="$positive_root/nginx-site.conf" \
-  AIRLOCK_UNIT_DIR_USER="$positive_root/user-units" \
-  AIRLOCK_UNIT_DIR_SYSTEM="$positive_root/system-units" \
-  AIRLOCK_TS_FQDN="clean-box.example.ts.net" \
-  AIRLOCK_DRY_RUN=1 PATH="$shim:$PATH" \
-  bash "$ROOT/install/airlock-install.sh" 2>&1)"
-positive_rc=$?
-if [ "$positive_rc" -eq 0 ] \
-   && grep -Fq "done (dry run — nothing was changed)" <<<"$positive_out" \
-   && grep -Fq "would install packaged app: alpha from $relocated_bundle/packages/alpha" <<<"$positive_out" \
-   && grep -Fq "would install packaged app: mu from $relocated_bundle/packages/mu" <<<"$positive_out" \
-   && grep -Fq "would install packaged app: zed from $relocated_bundle/packages/zed" <<<"$positive_out"; then
-  ok "relocated bundle reaches the real dry orchestrator's final marker"
-else
-  bad "relocated dry orchestrator failed (rc=$positive_rc): $(tail -5 <<<"$positive_out" | tr '\n' ' ')"
-fi
-
-# A structural error still wins immediately, even when an earlier sorted id
-# has a missing directory. Aggregation applies only to otherwise-valid paths.
-sed 's|path = "packages/mu"|path = 17|' \
-  "$broken_bundle/airlock.toml" >"$broken_bundle/structural.toml"
-structural_out="$(HOME="$scratch/structural-home" \
-  AIRLOCK_CONFIG="$broken_bundle/structural.toml" \
-  AIRLOCK_SHIPPED_APPS_ROOT="$empty_shipped" \
-  python3 "$CFG" package-info 2>&1)"
-structural_rc=$?
-if [ "$structural_rc" -ne 0 ] \
-   && grep -Fq "[packages.mu].path must be a non-empty path string" <<<"$structural_out" \
-   && ! grep -Fq "one or more packages" <<<"$structural_out"; then
-  ok "structural package errors remain fail-fast ahead of path aggregation"
-else
-  bad "structural error did not remain fail-fast (rc=$structural_rc): $structural_out"
-fi
-
-# The broken bundle is the same config bytes with all three payload directories
-# absent. Run the actual dry orchestrator to prove package-info stops it before
-# the validate/hub boundary and leaves a clean-box filesystem unchanged.
+# Missing candidate paths are inert; record a missing source to test actual failure.
 negative_root="$scratch/negative-box"
-mkdir -p "$negative_root/home" "$negative_root/state" "$negative_root/web" \
-  "$negative_root/confd" "$negative_root/user-units" "$negative_root/system-units" \
-  "$negative_root/tmp"
+mkdir -p "$negative_root/home" "$negative_root/state" "$negative_root/tmp"
 printf 'canary\n' >"$negative_root/home/canary"
+AIRLOCK_STATE_DIR="$negative_root/state" seed_bundle "$broken_bundle"
 find "$negative_root" -type f -exec sha256sum {} + | sort >"$scratch/negative-before.sums"
 negative_out="$(HOME="$negative_root/home" TMPDIR="$negative_root/tmp" \
   AIRLOCK_CONFIG="$broken_bundle/airlock.toml" \
-  AIRLOCK_SHIPPED_APPS_ROOT="$empty_shipped" \
   AIRLOCK_STATE_DIR="$negative_root/state" \
-  AIRLOCK_WEBROOT="$negative_root/web" \
-  AIRLOCK_CONFD="$negative_root/confd" \
+  AIRLOCK_WEBROOT="$negative_root/web" AIRLOCK_CONFD="$negative_root/confd" \
+  AIRLOCK_UNIT_DIR_USER="$negative_root/units-user" AIRLOCK_UNIT_DIR_SYSTEM="$negative_root/units-system" \
   AIRLOCK_NGINX_SITE="$negative_root/nginx-site.conf" \
-  AIRLOCK_UNIT_DIR_USER="$negative_root/user-units" \
-  AIRLOCK_UNIT_DIR_SYSTEM="$negative_root/system-units" \
-  AIRLOCK_TS_FQDN="clean-box.example.ts.net" \
-  AIRLOCK_DRY_RUN=1 PATH="$shim:$PATH" \
-  bash "$ROOT/install/airlock-install.sh" 2>&1)"
-negative_rc=$?
+  "$ROOT/bin/airlock-ledger" apply alpha 2>&1)"; negative_rc=$?
 find "$negative_root" -type f -exec sha256sum {} + | sort >"$scratch/negative-after.sums"
-
-if [ "$negative_rc" -eq 2 ] && python3 - "$broken_bundle" "$negative_out" <<'PY'
-import pathlib
-import sys
-
-bundle = pathlib.Path(sys.argv[1]).resolve()
-text = sys.argv[2]
-header = "[packages.*].path does not resolve to a directory for one or more packages:"
-if text.count(header) != 1:
-    raise SystemExit("missing-path header was absent or repeated")
-expected = [
-    f"  - id={package_id!r} raw={'packages/' + package_id!r} "
-    f"resolved={str(bundle / 'packages' / package_id)!r}"
-    for package_id in ("alpha", "mu", "zed")
-]
-try:
-    positions = [text.index(line) for line in expected]
-except ValueError as exc:
-    raise SystemExit("a missing package coordinate was not reported") from exc
-if positions != sorted(positions):
-    raise SystemExit("missing package coordinates were not sorted by id")
-if any(text.count(line) != 1 for line in expected):
-    raise SystemExit("a missing package coordinate was repeated")
-PY
-then
-  ok "three missing paths are reported once with sorted id/raw/resolved coordinates"
+if [ "$negative_rc" -ne 0 ] && grep -Fq 'recorded source for alpha is missing' <<<"$negative_out" \
+   && cmp -s "$scratch/negative-before.sums" "$scratch/negative-after.sums"; then
+  ok "missing recorded source fails before its hook and leaves clean-box files unchanged"
 else
-  bad "missing-path report was incomplete or unstable (rc=$negative_rc): $negative_out"
-fi
-
-if cmp -s "$scratch/negative-before.sums" "$scratch/negative-after.sums" \
-   && ! grep -Fq "validating airlock.toml" <<<"$negative_out" \
-   && ! grep -Fq "installing hub" <<<"$negative_out"; then
-  ok "missing paths stop before validate/hub and leave clean-box files unchanged"
-else
-  bad "missing paths reached mutation boundary or changed clean-box files"
+  bad "missing recorded source failure or filesystem isolation failed: $negative_out"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

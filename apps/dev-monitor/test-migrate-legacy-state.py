@@ -342,7 +342,6 @@ class MigrationTests(unittest.TestCase):
         backup = self.legacy / 'messages.db.pre-endstate'
         self.assertTrue(backup.is_file())
         self.assertTrue(Path(str(backup) + '.manifest.json').is_file())
-        self.assertTrue(Path(str(backup) + '.target.json').is_file())
 
         classified = self.run_script('--schema-state', source)
         self.assertEqual(0, classified.returncode, classified.stderr)
@@ -408,7 +407,6 @@ class MigrationTests(unittest.TestCase):
             '--schema-state', source).stdout.strip())
         backup = self.legacy / 'messages.db.pre-endstate'
         self.assertTrue(backup.is_file())
-        self.assertFalse(Path(str(backup) + '.target.json').exists())
         resumed = self.run_script('--endstate', source, '--offline')
         self.assertEqual(0, resumed.returncode, resumed.stderr)
         self.assertEqual('canonical', self.run_script(
@@ -445,47 +443,19 @@ class MigrationTests(unittest.TestCase):
         self.assertIn('regular non-symlink', result.stderr)
         self.assertFalse(self.root.joinpath('messages-link.db.pre-endstate').exists())
 
-    def test_compensate_endstate_restores_once_and_is_idempotent(self):
+    def test_endstate_backup_survives_a_restore_via_plain_restore(self):
         conn = make_legacy(self.legacy)
         conn.close()
         source = self.legacy / 'messages.db'
         converted = self.run_script('--endstate', source, '--offline')
         self.assertEqual(0, converted.returncode, converted.stderr)
 
-        restored = self.run_script('--compensate-endstate', source, '--offline')
+        backup = self.legacy / 'messages.db.pre-endstate'
+        restored = self.run_script('--restore-backup', backup, '--restore-to', source, '--offline')
         self.assertEqual(0, restored.returncode, restored.stderr)
         self.assertEqual('restore=ok backup_retained=1', restored.stdout.strip())
         self.assertEqual('legacy', self.run_script('--schema-state', source).stdout.strip())
-        self.assertTrue(self.legacy.joinpath('messages.db.pre-endstate').is_file())
-
-        repeated = self.run_script('--compensate-endstate', source, '--offline')
-        self.assertEqual(0, repeated.returncode, repeated.stderr)
-        self.assertEqual('compensated=0 already_legacy=1', repeated.stdout.strip())
-
-    def test_compensate_endstate_refuses_to_discard_later_writes(self):
-        conn = make_legacy(self.legacy)
-        conn.close()
-        source = self.legacy / 'messages.db'
-        converted = self.run_script('--endstate', source, '--offline')
-        self.assertEqual(0, converted.returncode, converted.stderr)
-        live = sqlite3.connect(source)
-        live.execute("UPDATE cards SET title='later-write' WHERE card_id='card-safe'")
-        live.commit()
-        live.close()
-
-        refused = self.run_script('--compensate-endstate', source, '--offline')
-        self.assertEqual(2, refused.returncode)
-        self.assertIn('does not match the backup', refused.stderr)
-        current = sqlite3.connect(source)
-        try:
-            self.assertEqual(
-                'later-write',
-                current.execute(
-                    "SELECT title FROM cards WHERE card_id='card-safe'").fetchone()[0])
-        finally:
-            current.close()
-        self.assertEqual('legacy', self.run_script(
-            '--schema-state', self.legacy / 'messages.db.pre-endstate').stdout.strip())
+        self.assertTrue(backup.is_file())
 
     def test_online_backup_captures_committed_wal_without_mutating_source(self):
         conn = make_legacy(self.legacy)
@@ -685,8 +655,8 @@ class MigrationTests(unittest.TestCase):
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         try:
             hook='http://127.0.0.1:%d/hook'%server.server_port
-            self.assertTrue(loop.deliver_once(hook));self.assertTrue(loop.deliver_once(hook))
-            self.assertFalse(loop.deliver_once(hook))
+            self.assertTrue(loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': hook})));self.assertTrue(loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': hook})))
+            self.assertFalse(loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': hook})))
             self.assertEqual(len(posts),2)
             self.assertEqual(messages.delivery_health()['pending_count'],0)
             self.assertEqual(messages.delivery_health()['failed_count'],1)

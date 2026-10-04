@@ -40,7 +40,8 @@ write surface is absent rather than gated.
 
 A producer publishes a JSON file. The collector records the receipt and creates or
 updates a daily card in one SQLite transaction. Normal cards stay in the console;
-urgent cards are sent to the configured Slack webhook. The owner can read, archive
+urgent cards are sent to the configured Slack bot (or legacy webhook) after a grace
+window. The owner can read, archive
 or run a card. Reading and delivery are independent: Slack delivery does not mark
 something read, and reading does not cancel a queued delivery.
 
@@ -57,7 +58,7 @@ and the two existing observation samplers. HTTP requests may briefly add a threa
 
 ### Message format
 
-The current message has eight fields, with no schema version:
+The current message has eight base fields, with no schema version:
 
 ```json
 {
@@ -78,6 +79,54 @@ The current message has eight fields, with no schema version:
   }
 }
 ```
+
+`detail` is optional source text, preserved verbatim in the ledger and shown in a
+collapsed “원천 메시지” section in the console. The card carries the latest receipt's
+detail; older originals remain in the ledger. Only the refined `title`/`body`
+go to Slack: `detail` never does. It does not participate in coalescing or unread
+decisions. Existing producers may omit it. `emit_message.py --detail` sets it.
+
+`resolves` is an optional target `group` string (the same syntax and reserved-prefix
+rule as `group`). Only this explicit field resolves an incident; titles such as
+“recovered” have no special meaning. `emit_message.py --resolves backup` sets it.
+
+Every new urgent card, including heartbeat and a normal-to-urgent promotion, waits
+**300 seconds** before its first Slack attempt. Set the single backend environment
+variable `AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS` to another number of seconds (`0` sends
+immediately), for example in a service environment override. Repeat receipts do not
+extend that deadline; collection, ledger storage and console visibility stay immediate.
+
+A resolution received during that initial window cancels delivery. After a bot post,
+the card's nullable `slack_ts` identifies the original message for `chat.update`;
+no new Slack message is posted. The closed card has a `✅` title and one-line
+resolution reason and is available in the existing **Archived** view. A subsequent
+incident creates a new active card. When several open cards share the target group,
+each eligible card is closed without changing the group/run/link coalescing key.
+
+If no open target exists, or a target has no `slack_ts` outside the initial grace
+window (for example a webhook delivery, a normal card, or an unsuccessful post),
+the resolution follows ordinary card creation/coalescing with its own declared
+level and unchanged group/run/link key. It remains in the ledger in every case. A failed update uses the existing six-attempt retry path and
+appears in delivery health even though the closed card is archived. Switching back
+to webhook while an update is pending does not turn that update into a new post.
+Both bot methods check Slack's JSON `ok` and require a valid response `ts`.
+
+`peek` is an optional boolean (default `false`): `true` also shows the card in Porthole's
+Peek bubble (normal: 15s; urgent: up to 90s with a progress line), on top of the badge and
+inbox every card already gets. Whether it appears is decided by `peek` alone and how it
+appears by `level` alone. Like urgency it only rises on coalescing, it is returned by
+feed/preview, and closing a Peek does not mark the card read. The bubble truncates by
+width, not character count: budget about 20 Korean (31 Latin) characters of title and 45
+(74) of body for the narrowest phone. `emit_message.py --peek` sets it.
+
+`source: "slack"` marks a card that arrived over Slack, and two rules key on it. Such a
+card is never queued for the outbound Slack notifier — that notifier exists to reach the
+owner away from the console, and the card already reached them there; without the rule an
+urgent mention echoes back into the channel it came from. And on coalescing into a Slack
+card the owner has already read, the level follows the incoming message instead of rising:
+reading means "seen up to here", so dismissed urgency is not inherited. Every other source
+keeps the ordinary climb, where severity that fell on its own would hide a fault.
+See `docs/design/slack-porthole.md` (private).
 
 `id`, `group`, `source`, `level` and a nonempty `title` are required. `body` is text
 and defaults to empty; `link` and `run` are optional. IDs/groups/sources use 1–128
@@ -112,11 +161,44 @@ python3 apps/dev-monitor/examples/emit_message.py \
   --spool "$DEV_MONITOR_SPOOL" --source backup --group-key backup \
   --level urgent --title 'Backup has not completed' \
   --body 'Inspect the current backup state.' \
-  --cwd /path/to/project --prompt 'Inspect and recover the backup if needed.'
+  --cwd /path/to/project --prompt 'Inspect and recover the backup if needed.' \
+  --peek
 ```
 
 The emitter writes to `tmp/` and hard-links a complete file into `new/`; it does
 not create a missing spool. “Queued” means published, not accepted or delivered.
+
+### HTTP ingest from remote producers
+
+With messages enabled, remote producers can send the same JSON to
+`POST https://<tailnet-host>:19926/api/ingest`, with the token in
+`X-Devmon-Ingest-Token`. Configure `ingest_port` to change the HTTPS port.
+This dedicated tailscale serve listener admits tagged nodes without a user-login
+header; the app token authenticates publication. It exposes only this POST route,
+clears owner/proxy headers, and returns 404 for all other paths and methods,
+including GET and HEAD. The hub and its identity gate remain separate;
+`/monitor/api/ingest` is not a supported route. Publishing a message does not
+authorize reading cards or running their actions.
+
+Declare `DEVMON_INGEST_TOKEN` in the mode-0600 app-specific
+`~/.config/airlock/dev-monitor-secrets.env`. The installer checks the assignment
+name only, without loading its value, and writes
+`DEVMON_INGEST_TOKEN_NAME=DEVMON_INGEST_TOKEN` to the generated message environment.
+If the name is absent, installation continues with a warning. The HTTPS port stays
+mapped, but the backend returns 404 and accepts no messages. App removal retires
+the mapping through the existing artifact ledger.
+The backend resolves the named value from its systemd-loaded environment and
+compares tokens with `hmac.compare_digest`. An unset/empty token or disabled message
+console returns 404; a missing or mismatched header returns 401.
+
+The existing message validator and 16 KiB request limit apply. Invalid JSON,
+invalid messages and oversized bodies return 400. A complete file is fsynced in
+`tmp/` and atomically hard-linked into `new/<id>.json` without overwriting:
+success is `202 {"status":"queued"}`; an existing filename is
+`202 {"status":"duplicate"}`. After the collector moves that file, a retry may
+return `queued` again; the existing receipt ledger still deduplicates its ID.
+A spool write failure returns 503. A 202 acknowledges publication only; card
+creation and urgent delivery remain the existing loop's responsibility.
 
 ### Tap Run
 
@@ -160,7 +242,7 @@ route. Publishing a spool message does not authorize execution.
 | Table | Columns |
 |---|---|
 | `ledger` | `id` PK, `group`, `source`, `received_at`, `payload` |
-| `cards` | `card_id`, `group`, `level`, `title`, `body`, `link`, `run`, `count`, `first_at`, `last_at`, `read_at`, `archived_at`, `ran_at`, `sent_at`, `send_attempts`, `send_next_at` |
+| `cards` | `card_id`, `group`, `level`, `title`, `body`, `link`, `run`, `count`, `first_at`, `last_at`, `read_at`, `archived_at`, `ran_at`, `sent_at`, `send_attempts`, `send_next_at`, `detail`, `slack_ts` |
 
 The ledger is append-only within its retention period. Owner actions mutate only
 cards. Receipt files and ledger rows expire after 180 days; cards expire when
@@ -178,7 +260,9 @@ last send time and failed count.
 Delivery is at least once. The loop POSTs before committing `sent_at`. If it dies
 after the remote response but before that commit, restarting sends again. The
 ledger ID still prevents a second receipt/card. There is no delivery claim table
-or separate sender thread.
+or separate sender thread. A crash during an update retries the same Slack timestamp.
+Startup adds nullable `detail` and `slack_ts` columns to existing canonical databases;
+existing receipts, cards and delivery schedules are preserved.
 
 ### Spool and heartbeat
 
@@ -231,7 +315,7 @@ slack_webhook_urgent_env = "DEVMON_SLACK_WEBHOOK" # a name, never the URL
 The installer creates the spool and generated `dev-monitor.env`, including the
 owner/proxy gate. Turning messages off removes that generated environment file.
 The only webhook configuration key is `slack_webhook_urgent_env`; an empty value
-leaves it unconfigured. The retired routine, roster, compatibility-path and old
+leaves it unconfigured. Retired webhook, roster, compatibility-path and old
 `slack_webhook_env` alias keys are rejected by configuration validation.
 
 Put the selected credential in `~/.config/airlock/dev-monitor-secrets.env`, a

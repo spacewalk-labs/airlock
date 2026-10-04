@@ -95,18 +95,11 @@ MUSE_USAGE_URL = os.environ.get("AIRLOCK_MUSE_USAGE_URL", "").strip() or "https:
 # store. Empty means no sheet: the picker offers nothing rather than risking two
 # boxes on one key, and says the sheet is why.
 MUSE_REGISTRY = os.environ.get("AIRLOCK_MUSE_REGISTRY", "").strip()
-# This box's name for the held-by-other filter and the cho-only screen rule.
+# This box's name for the held-by-other filter.
 # Deployment state, not source: the installer may export it, otherwise the box's
 # own short hostname — a machine fact, not a guessed path.
 MUSE_BOX = os.environ.get("AIRLOCK_BOX_NAME", "").strip() \
     or socket.gethostname().split(".")[0]
-# The cho-only vault item, by the title both merged fixtures already use
-# (OPENCODE_CHO_API_KEY in MUSE_USAGE's and MUSE_ROTATE's tests). Shown only
-# where AIRLOCK_MUSE_CHO_VISIBLE=1 — set by the installer on the cho reader
-# box alone —
-# and swappable only where the local helper actually holds its value.
-MUSE_CHO_ITEM = "OPENCODE_CHO_API_KEY"
-MUSE_CHO_VISIBLE = os.environ.get("AIRLOCK_MUSE_CHO_VISIBLE", "").strip() == "1"
 # A window read at 100% used is exhausted, not a candidate. Same constant as
 # bin/airlock-accounts' MUSE_SWAP_MAX_USED; install/test-muse-swap.py pins both.
 MUSE_SWAP_MAX_USED = 100
@@ -370,6 +363,8 @@ def _xai_startup_sweep():
 FLEET_STORE = os.path.expanduser(os.environ["AIRLOCK_HUB_FLEET_STORE"]) \
     if os.environ.get("AIRLOCK_HUB_FLEET_STORE") else ""
 FLEET_STORE_URL = os.environ.get("AIRLOCK_HUB_FLEET_STORE_URL", "")
+AGY_FLEET_STORE = os.path.join(os.path.dirname(FLEET_STORE), ".fleet-agy-usage.json") \
+    if FLEET_STORE else ""
 
 # The warning thresholds, shipped to the frontend with the account list. USAGE_TH is the
 # ONLY source: a frontend holding its own copy would drift from the verdict the alert
@@ -908,10 +903,15 @@ def _codex_login_cancel():
 # self-heals on the next probe, so nothing migrates.
 CODEX_USAGE_STATE = os.path.join(ACCOUNTS_STATE_DIR, "codex-usage.json")
 AGY_USAGE_STATE = os.path.join(ACCOUNTS_STATE_DIR, "agy-usage.json")
+# The last reading of every agy login this box has held, so a saved login shows its
+# numbers too (only the live one can be re-read; the others keep their last reading).
+AGY_USAGE_BY_ACCOUNT = os.path.join(ACCOUNTS_STATE_DIR, "agy-usage-accounts.json")
 # Reading agy quota means opening its interactive CLI for a few seconds, so it is done
 # only when someone opens the panel and the last reading is older than this.
 AGY_USAGE_FRESH = 20 * 60
 AGY_USAGE_TIMEOUT = 90
+# A switch runs one verify probe (agy start + /usage) before it commits.
+AGY_SWITCH_TIMEOUT = 200
 CLAUDE_USAGE_STATE = os.path.join(ACCOUNTS_STATE_DIR, "claude-usage.json")
 CODEX_AUTH = os.path.expanduser(os.environ.get("AIRLOCK_CODEX_AUTH", "~/.codex/auth.json"))
 _CODEX_AUTH_GENERATION_UNAVAILABLE = object()
@@ -1314,11 +1314,16 @@ def _codex_usage_due(now, force=False):
     return now - c["valueAt"] > CODEX_USAGE_TTL
 
 
-def _codex_usage_cached(wait=False):
+def _codex_usage_cached(wait=False, revalidate=False):
     """The remembered Codex reading, refreshed in the background when it is due.
 
     A remembered value is useful immediately; only a value-less cache needs the bounded
     wait that keeps the first paint from being blank.
+    revalidate = the caller sent `X-Airlock-Revalidate: wait` (the central fleet
+    collector): an expired value is not useful to it, so it waits for the refresh too.
+    🔴 Without this a poller slower than the TTL gets `stale: true` on every call — it
+    starts the refresh and leaves before it lands. A service box with no panel keeping
+    the cache warm answered stale on every fleet poll for over a day.
     """
     with _cache_lock:
         auth_mtime = _codex_auth_mtime()
@@ -1337,10 +1342,11 @@ def _codex_usage_cached(wait=False):
                              daemon=True, name="codex-usage-refresh").start()
 
         have_value = _codex_has_usage_value(_codex_usage_cache.get("payload"))
-        if wait and _codex_usage_cache["refreshing"] and not have_value:
+        if wait and _codex_usage_cache["refreshing"] and (revalidate or not have_value):
             if not _codex_refresh_done.wait_for(
                     lambda: not _codex_usage_cache["refreshing"], timeout=CODEX_USAGE_WAIT):
-                return _codex_timeout_payload()
+                if not have_value:
+                    return _codex_timeout_payload()
         payload = _codex_usage_cache.get("payload")
         if not _codex_has_usage_value(payload):
             return _codex_pending_payload("no-reading-yet")
@@ -1364,6 +1370,34 @@ def _agy_usage_read():
     return record
 
 
+def _agy_remember(record):
+    """Keep this reading under its account in the per-account store."""
+    account = record.get("account") if isinstance(record, dict) else None
+    if not (isinstance(account, str) and account):
+        return
+    try:
+        with open(AGY_USAGE_BY_ACCOUNT, encoding="utf-8") as f:
+            store = json.load(f)
+        store = store if isinstance(store, dict) else {}
+    except (OSError, ValueError):
+        store = {}
+    prev = store.get(account.strip().lower())
+    prev_at = _finite_number(prev.get("observedAt")) if isinstance(prev, dict) else None
+    at = _finite_number(record.get("observedAt"))
+    if at is None or (prev_at is not None and prev_at >= at):
+        return
+    store[account.strip().lower()] = {"groups": record.get("groups") or [],
+                                      "observedAt": record.get("observedAt")}
+    try:
+        os.makedirs(ACCOUNTS_STATE_DIR, exist_ok=True)
+        tmp = AGY_USAGE_BY_ACCOUNT + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store, f)
+        os.replace(tmp, AGY_USAGE_BY_ACCOUNT)
+    except OSError:
+        return
+
+
 def _agy_usage_refresh():
     """One probe in a worker thread. A failed reading keeps the last good one on disk."""
     err = None
@@ -1379,6 +1413,7 @@ def _agy_usage_refresh():
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(record, f)
             os.replace(tmp, AGY_USAGE_STATE)
+            _agy_remember(record)
         else:
             err = str((record or {}).get("error") or "probe failed")[:200]
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -1400,11 +1435,77 @@ def _agy_usage_payload():
             threading.Thread(target=_agy_usage_refresh, daemon=True,
                              name="agy-usage-refresh").start()
         state = dict(_agy_usage)
-    out = {"enabled": True, "refreshing": state["refreshing"], "lastErr": state["lastErr"]}
+    if record is not None:
+        _agy_remember(record)
+    out = {"enabled": True, "refreshing": state["refreshing"], "lastErr": state["lastErr"],
+           "accounts": _agy_accounts()}
     if record is not None:
         out.update(account=record.get("account"), groups=record.get("groups") or [],
                    observedAt=record["observedAt"], age=int(now - record["observedAt"]))
     return out
+
+
+def _agy_accounts():
+    """Saved agy logins [{email, active}] from the account CLI; [] when unreadable."""
+    ok, out, _ = _cli(["agy-list", "--json"], timeout=15)
+    try:
+        doc = json.loads(out) if ok and out else {}
+    except ValueError:
+        return []
+    accounts = doc.get("accounts") if isinstance(doc, dict) else None
+    try:
+        with open(AGY_USAGE_BY_ACCOUNT, encoding="utf-8") as f:
+            seen = json.load(f)
+        seen = seen if isinstance(seen, dict) else {}
+    except (OSError, ValueError):
+        seen = {}
+    fleet = {}
+    if AGY_FLEET_STORE:
+        try:
+            with open(AGY_FLEET_STORE, encoding="utf-8") as f:
+                raw_fleet = json.load(f)
+            fleet = raw_fleet if isinstance(raw_fleet, dict) else {}
+        except (OSError, ValueError):
+            fleet = {}
+    now = time.time()
+    out = []
+    for a in (accounts if isinstance(accounts, list) else []):
+        if not (isinstance(a, dict) and isinstance(a.get("email"), str)):
+            continue
+        row = {"email": a["email"], "active": a.get("active") is True}
+        key = a["email"].strip().lower()
+        last_local = seen.get(key)
+        local_at = _finite_number(last_local.get("observedAt")) if isinstance(last_local, dict) else None
+
+        last_fleet = fleet.get(key)
+        fleet_at = _finite_number(last_fleet.get("observedAt")) if isinstance(last_fleet, dict) else None
+
+        if local_at is not None and (fleet_at is None or local_at >= fleet_at):
+            row["groups"] = last_local.get("groups") or []
+            row["age"] = int(now - local_at)
+        elif fleet_at is not None:
+            row["groups"] = last_fleet.get("groups") or []
+            row["age"] = int(now - fleet_at)
+        out.append(row)
+    return out
+
+
+def _agy_store_reading(reading):
+    """A switch already read the new account's quota — show it, not the old account."""
+    if not (isinstance(reading, dict) and reading.get("ok") is True
+            and _finite_number(reading.get("observedAt")) is not None):
+        return
+    try:
+        os.makedirs(ACCOUNTS_STATE_DIR, exist_ok=True)
+        tmp = AGY_USAGE_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(reading, f)
+        os.replace(tmp, AGY_USAGE_STATE)
+    except OSError:
+        return
+    _agy_remember(reading)
+    with _cache_lock:
+        _agy_usage.update(lastErr=None)
 
 
 # ---- Muse Spark usage ------------------------------------------------------
@@ -1417,8 +1518,7 @@ def _agy_usage_payload():
 MUSE_TIMEOUT = 10
 MUSE_MAX_KEYS = 32
 MUSE_WINDOWS = ("rolling", "weekly", "monthly")
-# A sequential vault read of six keys measured ~13s on the reference box
-# (2026-09-23: five secret reads ~1.8s each plus one brokered read ~3.5s), so the helper gets a generous ceiling.
+# A sequential vault read of six keys can take long enough that the helper gets a generous ceiling.
 # The helper itself should read in parallel; this bound is only the fail-closed.
 MUSE_KEYS_TIMEOUT = 30
 
@@ -1673,20 +1773,78 @@ def _muse_live_key():
     return key if isinstance(key, str) and key else None
 
 
+MUSE_CANDIDATES_STATE = os.path.join(ACCOUNTS_STATE_DIR, "muse-candidates.json")
+# Reading the picker costs a vault read plus one provider call per key (~4 s), so
+# the panel gets the last reading at once and a re-read starts behind it once the
+# reading is older than this. Names and percents only are stored — never a key.
+MUSE_CANDIDATES_FRESH = 120
+_muse_cand = {"refreshing": False}
+
+
+def _muse_candidates_config():
+    """What a stored reading was computed under; a different config is no cache hit."""
+    return "|".join((MUSE_BOX, MUSE_REGISTRY, MUSE_KEYS_BIN))
+
+
+def _muse_candidates_refresh():
+    """Read the picker now and remember it. Always returns the fresh document."""
+    try:
+        doc = _muse_swap_candidates()
+    finally:
+        with _cache_lock:
+            _muse_cand["refreshing"] = False
+    if doc.get("enabled") is True:
+        try:
+            os.makedirs(ACCOUNTS_STATE_DIR, exist_ok=True)
+            tmp = MUSE_CANDIDATES_STATE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(doc, observedAt=time.time(), config=_muse_candidates_config()), f)
+            os.replace(tmp, MUSE_CANDIDATES_STATE)
+        except OSError:
+            pass
+    return doc
+
+
+def _muse_candidates_cached():
+    """`GET /muse-swap-candidates` — the last reading at once, re-read behind it."""
+    if not (MUSE_KEYS_BIN and os.path.isfile(MUSE_KEYS_BIN)):
+        return _muse_swap_candidates()
+    try:
+        with open(MUSE_CANDIDATES_STATE, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        record = None
+    at = _finite_number(record.get("observedAt")) if isinstance(record, dict) else None
+    if at is None or record.get("config") != _muse_candidates_config():
+        with _cache_lock:
+            _muse_cand["refreshing"] = True
+        doc = _muse_candidates_refresh()
+        return dict(doc, age=0, refreshing=False)
+    age = time.time() - at
+    with _cache_lock:
+        if age > MUSE_CANDIDATES_FRESH and not _muse_cand["refreshing"]:
+            _muse_cand["refreshing"] = True
+            threading.Thread(target=_muse_candidates_refresh, daemon=True,
+                             name="muse-candidates-refresh").start()
+        refreshing = _muse_cand["refreshing"]
+    out = {k: v for k, v in record.items() if k not in ("observedAt", "config")}
+    out.update(age=int(age), refreshing=refreshing)
+    return out
+
+
 def _muse_swap_candidates():
     """`GET /muse-swap-candidates` — what the manual picker may offer.
 
     Always 200: an unconfigured helper, an unreadable sheet and an unreadable
     key are picker states (disabled/hidden/blocked pill), never transport
-    failures. Held-by-other keys and the cho-only key (off its box) are
-    omitted, not disabled — offering them as clickable-then-refused would be a
+    failures. Held-by-other keys are omitted, not disabled — offering them as clickable-then-refused would be a
     trap, and the fleet matrix already shows the whole pool. Key values never
     leave this process: eligibility is computed on them, only names and numbers
     cross HTTP.
     """
     if not (MUSE_KEYS_BIN and os.path.isfile(MUSE_KEYS_BIN)):
         return {"enabled": False, "box": MUSE_BOX, "active": None,
-                "choVisible": False, "sheet": "not-configured", "candidates": []}
+                "sheet": "not-configured", "candidates": []}
     keys = _muse_keys()
     sheet = _muse_registry()
     sheet_state = ("ok" if sheet is not None
@@ -1696,8 +1854,7 @@ def _muse_swap_candidates():
         # one else, so nothing is offered. The picker words the sheet state as
         # the blocked reason rather than an empty screen.
         return {"enabled": True, "box": MUSE_BOX, "active": None,
-                "choVisible": MUSE_CHO_VISIBLE, "sheet": sheet_state,
-                "candidates": []}
+                "sheet": sheet_state, "candidates": []}
     live = _muse_live_key()
     active = None
     if live is not None:
@@ -1708,7 +1865,6 @@ def _muse_swap_candidates():
                 # while _muse_account below only knows bare helper names).
                 active = _muse_account(_muse_item_title(item) or item)
                 break
-    cho_title = _muse_item_title(MUSE_CHO_ITEM)
     observed_at = int(time.time())
     fetched = {}
     lock = threading.Lock()
@@ -1734,10 +1890,11 @@ def _muse_swap_candidates():
     candidates = []
     with lock:
         for item in keys:
-            if _muse_item_title(item) == cho_title and not MUSE_CHO_VISIBLE:
-                continue
             holder = sheet.get(_muse_item_title(item))
-            if holder is not None and holder != MUSE_BOX:
+            # "shared" keys are the common pool: no box holds them exclusively,
+            # so every box may offer them. Anything else another box holds is
+            # refused (assigning it would steal a live key).
+            if holder is not None and holder not in (MUSE_BOX, "shared"):
                 continue
             entry = fetched.get(item, _muse_entry(_muse_item_title(item) or item,
                                                   None, observed_at))
@@ -1752,8 +1909,7 @@ def _muse_swap_candidates():
                                "limits": entry["limits"], "err": entry["err"],
                                "eligible": eligible, "reason": reason})
     return {"enabled": True, "box": MUSE_BOX, "active": active,
-            "choVisible": MUSE_CHO_VISIBLE, "sheet": sheet_state,
-            "candidates": candidates}
+            "sheet": sheet_state, "candidates": candidates}
 
 
 def _live_usage_cached():
@@ -2087,7 +2243,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, _acct_alert_payload(), self._account_alert_cors_origin())
             return
         if self.path == "/codex-usage":
-            self._send(200, _codex_usage_cached(wait=True))
+            self._send(200, _codex_usage_cached(
+                wait=True,
+                revalidate=self.headers.get("X-Airlock-Revalidate", "").strip().lower() == "wait"))
             return
         if self.path == "/agy-usage":
             self._send(200, _agy_usage_payload())
@@ -2096,7 +2254,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, _muse_usage_payload())
             return
         if self.path == "/muse-swap-candidates":
-            self._send(200, _muse_swap_candidates())
+            self._send(200, _muse_candidates_cached())
             return
         if self.path == "/claude-usage-store":
             self._send(200, _fetch_fleet_store() if FLEET_STORE else {})
@@ -2206,7 +2364,12 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(item, str) or not item.strip() or len(item) > 256:
             self._send(400, {"ok": False, "error": "not a key name", "steps": []})
             return
-        ok, out, err = _cli(["muse-swap", item.strip(), "--json"])
+        # Restarting the Muse seats is the person's choice in the confirm strip
+        # (absent = no restart: the fleet console and older panels never ask).
+        args = ["muse-swap", item.strip(), "--json"]
+        if body.get("reseat") is True:
+            args.append("--reseat")
+        ok, out, err = _cli(args, timeout=AGY_SWITCH_TIMEOUT)
         result = {}
         if out:
             try:
@@ -2218,14 +2381,106 @@ class Handler(BaseHTTPRequestHandler):
         steps = steps if isinstance(steps, list) else []
         if ok:
             account = result.get("account")
+            # The picker must not show the old key as current after a swap.
+            with _cache_lock:
+                _muse_cand["refreshing"] = True
+            _muse_candidates_refresh()
+            reseat = result.get("reseat")
+            counts = ({k: reseat[k] for k in ("restarted", "continued", "failed")
+                       if isinstance(reseat.get(k), int)} if isinstance(reseat, dict) else None)
             self._send(200, {"ok": True,
                              "account": account if isinstance(account, str) else None,
-                             "steps": steps, "needsRestart": True})
+                             "steps": steps, "reseat": counts,
+                             "needsRestart": result.get("needsRestart", True) is not False})
             return
         detail = result.get("error")
         error = (detail[:200] if isinstance(detail, str) and detail
                  else (err or out or "the swap failed")[:200])
         self._send(400, {"ok": False, "error": error, "steps": steps})
+
+    def _serve_agy_switch(self):
+        """POST /agy-switch — switch agy to a login saved on this box.
+
+        Only the account email crosses HTTP. The CLI keeps the current login,
+        proves the candidate in a throwaway HOME (a quota reading only comes back
+        when Google accepts it) and only then replaces the live file.
+        """
+        if not self._guarded():
+            return
+        body = self._json_body() or {}
+        email = body.get("email")
+        if not isinstance(email, str) or "@" not in email or len(email) > 254:
+            self._send(400, {"ok": False, "error": "not an account", "steps": []})
+            return
+        # The person chooses in the confirm strip whether the seats holding the old
+        # login restart now; absent means yes (the earlier default).
+        args = ["agy-switch", email.strip(), "--json"]
+        if body.get("reseat") is False:
+            args.append("--no-reseat")
+        ok, out, err = _cli(args, timeout=AGY_SWITCH_TIMEOUT)
+        try:
+            result = json.loads(out) if out else {}
+        except ValueError:
+            result = {}
+        result = result if isinstance(result, dict) else {}
+        steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+        if ok:
+            _agy_store_reading(result.get("reading"))
+            running = result.get("runningAgy")
+            reseat = result.get("reseat")
+            counts = ({k: reseat[k] for k in ("restarted", "continued", "untouched", "failed")
+                       if isinstance(reseat.get(k), int)} if isinstance(reseat, dict) else None)
+            self._send(200, {"ok": True, "account": result.get("account"), "steps": steps,
+                             "reseat": counts,
+                             "runningAgy": running if isinstance(running, int) else 0,
+                             "needsRestart": result.get("needsRestart") is True})
+            return
+        detail = result.get("error")
+        error = (detail[:200] if isinstance(detail, str) and detail
+                 else (err or out or "the switch failed")[:200])
+        self._send(400, {"ok": False, "error": error, "steps": steps})
+
+    def _serve_agy_login_start(self):
+        """Start agy in an isolated HOME and return only its Google approval URL."""
+        if not self._guarded():
+            return
+        ok, out, _err = _cli(["agy-login-start", "--json"], timeout=30)
+        try:
+            result = json.loads(out) if out else {}
+        except ValueError:
+            result = {}
+        if ok and isinstance(result.get("url"), str):
+            self._send(200, {"ok": True, "url": result["url"]})
+        else:
+            self._send(400, {"ok": False, "error": str(result.get("error") or
+                       "could not start agy login")[:200]})
+
+    def _serve_agy_login_code(self):
+        """Finish the isolated login without ever putting the one-time code in argv/logs."""
+        if not self._guarded():
+            return
+        body = self._json_body() or {}
+        code = body.get("code")
+        if not isinstance(code, str):
+            code = ""
+        code = code.strip()
+        try:
+            raw = code.encode("utf-8")
+        except UnicodeEncodeError:
+            raw = b""
+        if not raw or len(raw) > LOGIN_CODE_BODY_MAX or any(ch.isspace() for ch in code):
+            self._send(400, {"ok": False, "error": "not a code"})
+            return
+        ok, out, _err = _cli(["agy-login-code", "--json"], stdin_bytes=raw, timeout=90)
+        try:
+            result = json.loads(out) if out else {}
+        except ValueError:
+            result = {}
+        if ok and isinstance(result.get("email"), str):
+            self._send(200, {"ok": True, "email": result["email"]})
+        else:
+            self._send(400, {"ok": False, "error": str(result.get("error") or
+                       "agy login failed — request a new URL")[:200]})
 
     def do_POST(self):  # noqa: N802
         if not self._platform_ingress_allowed():
@@ -2343,6 +2598,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/muse-swap":
             self._serve_muse_swap()
+            return
+        if self.path == "/agy-login-start":
+            self._serve_agy_login_start()
+            return
+        if self.path == "/agy-login-code":
+            self._serve_agy_login_code()
+            return
+        if self.path == "/agy-switch":
+            self._serve_agy_switch()
             return
         self._not_found()
 

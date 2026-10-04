@@ -1,5 +1,5 @@
 Sun 2026-08-30 16:12:21 UTC   15s Sun 2026-08-30 16:11:21 UTC      44s ago airlock-secret-sweep.timer        airlock-secret-sweep.service
-Sun 2026-08-30 16:19:01 UTC  6min Sun 2026-08-30 16:04:01 UTC     8min ago devhub-vault-sync@josh-note.timer devhub-vault-sync@josh-note.service
+Sun 2026-08-30 16:19:01 UTC  6min Sun 2026-08-30 16:04:01 UTC     8min ago devhub-vault-sync@example-vault.timer devhub-vault-sync@example-vault.service
 Sun 2026-08-30 17:09:51 UTC 57min Sun 2026-08-30 16:09:51 UTC 2min 14s ago airlock-publish-cleanup.timer     airlock-publish-cleanup.service
 Sun 2026-08-30 23:03:11 UTC    6h Sat 2026-08-29 23:03:11 UTC      17h ago launchpadlib-cache-clean.timer    launchpadlib-cache-clean.service
 Mon 2026-08-31 00:00:00 UTC    7h Mon 2026-08-24 11:44:45 UTC            - wiki-secret-audit.timer           wiki-secret-audit.service

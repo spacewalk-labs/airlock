@@ -61,8 +61,7 @@ The archive has one fixed scope:
   and document both say `rc=0`/`ok`;
 - the absolute installed-state directory path;
 - installed-state `app-ledger.json` and, when present,
-  `plaintext-retirement.json`;
-- repository-root `airlock.lock`, when present.
+  `plaintext-retirement.json`.
 
 The path-to-member contract is exact; no directory is recursively copied:
 
@@ -71,9 +70,13 @@ The path-to-member contract is exact; no directory is recursively copied:
 | the path selected by `AIRLOCK_CONFIG`, otherwise `<checkout>/airlock.toml` | `config.toml` | exact bytes, restored to the new operator-selected config path |
 | `$AIRLOCK_STATE_DIR/app-ledger.json`, otherwise `~/.local/state/airlock/app-ledger.json` | `records/app-ledger.json` | source install record and app-set authority; never installed as the new box's live ledger |
 | the same state directory's `plaintext-retirement.json`, if present | `records/plaintext-retirement.json` | exact committed retirement record |
-| `<checkout>/airlock.lock`, if present | `records/airlock.lock` | exact external-package digest grants |
 | one successful `bin/airlock-status --json` run | `status.json` | source evidence; process rc and document must both be `0`/`ok` |
 | generated metadata | `manifest.json` | source config/state paths, Git revision/tree, app set, hashes, and exclusions |
+
+An archive created before 2026-09-27 may still carry a `records/airlock.lock`
+member (the explicit-package digest lock this tool used to write). That
+member is read and ignored, never restored — the lock itself was retired
+outright as an admission-control checkpoint, not a security boundary.
 
 `$AIRLOCK_STATE_DIR/app-ledger.lock` is synchronization machinery, not an
 installation record, and is not archived. `~/.config/airlock/**` is not copied:

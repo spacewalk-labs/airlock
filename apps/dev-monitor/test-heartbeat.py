@@ -177,7 +177,7 @@ def check_calendar(timer, scratch):
     spool = scratch / 'calendar-spool'
     for name in ('new', 'tmp'):
         (spool / name).mkdir(parents=True)
-    with patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_MESSAGES': 'false', 'TZ': 'America/Santiago'}), \
+    with patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_MESSAGES': 'false', 'AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS': '0', 'TZ': 'America/Santiago'}), \
             patch.object(messages, '_local', threading.local()), patch.object(messages, '_DB_PATH', None):
         messages.init_db(str(scratch / 'calendar.db'))
         for now in scheduled:
@@ -209,9 +209,9 @@ def check_date_boundary(scratch, webhook, posts):
     import devmon_loop as loop
     from devmon_heartbeat import heartbeat_payload
     def drain():
-        loop.deliver_once(webhook)
+        loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': webhook}))
     dbpath = str(scratch / 'date-boundary.db')
-    with patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_MESSAGES': 'false'}):
+    with patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_MESSAGES': 'false', 'AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS': '0'}):
         messages.init_db(dbpath)
         first = datetime(2026, 9, 10, 0, 0, 20, tzinfo=timezone.utc)
         second = first + timedelta(hours=23, minutes=59, seconds=50)
@@ -330,7 +330,7 @@ def check_content_contract(scratch, webhook, posts):
                  for missing in canonical]
     dbpath = str(scratch / 'contract.db')
     start_posts = len(posts)
-    with patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_MESSAGES': 'false'}), \
+    with patch.dict(os.environ, {'AIRLOCK_DEV_MONITOR_MESSAGES': 'false', 'AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS': '0'}), \
             patch.object(messages, '_local', threading.local()), patch.object(messages, '_DB_PATH', None):
         messages.init_db(dbpath)
         for attempted in variants:
@@ -342,11 +342,11 @@ def check_content_contract(scratch, webhook, posts):
             assert counts.get('bad') == 1, (attempted, counts)
             for table in ('ledger', 'cards'):
                 assert messages._conn().execute('SELECT count(*) FROM ' + table).fetchone()[0] == 0
-        loop.deliver_once(webhook)
+        loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': webhook}))
         assert len(posts) == start_posts
         assert emit(str(queue), canonical) == 'queued'
         assert spool.scan_once(str(queue)).get('inserted') == 1
-        loop.deliver_once(webhook)
+        loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': webhook}))
         assert len(posts) == start_posts + 1
         assert canonical['title'] in json.dumps(posts[-1], ensure_ascii=False)
         assert messages._conn().execute('SELECT title FROM cards').fetchone()[0] == canonical['title']
@@ -355,7 +355,7 @@ def check_content_contract(scratch, webhook, posts):
         messages.init_db(dbpath)
         assert emit(str(queue), canonical) == 'queued'
         assert spool.scan_once(str(queue)).get('duplicate') == 1
-        loop.deliver_once(webhook)
+        loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': webhook}))
         assert len(posts) == start_posts + 1
         for table in ('ledger', 'cards'):
             assert messages._conn().execute('SELECT count(*) FROM ' + table).fetchone()[0] == 1
@@ -450,7 +450,8 @@ def main():
                 if line and not line.startswith('#'):
                     key, value = line.split('=', 1)
                     runtime[key] = value
-        runtime.update(AIRLOCK_DEV_MONITOR_MESSAGES='true', AIRLOCK_DEV_MONITOR_BACKEND_PORT=str(port))
+        runtime.update(AIRLOCK_DEV_MONITOR_MESSAGES='true', AIRLOCK_DEV_MONITOR_BACKEND_PORT=str(port),
+                       AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS='0')
         linked = []
         log = scratch / 'backend.log'
         with log.open('wb') as stream:

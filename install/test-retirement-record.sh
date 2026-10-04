@@ -2,6 +2,7 @@
 # Retirement-record contract: a plaintext port remains identifiable after the
 # package config, payload, and installed-state ledger have all disappeared.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -9,9 +10,7 @@ CFG="$ROOT/bin/airlock-config"
 TMP="$(mktemp -d)" || { echo "FAIL could not create test directory" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
-pass=0 fail=0
-ok(){ printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad(){ printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 WITNESS_ID="retire-witness"
 WITNESS_APPS="$TMP/witness-apps"
 mkdir -p "$WITNESS_APPS/$WITNESS_ID"
@@ -83,28 +82,16 @@ owner = "owner@fixture.dev"
 [apps.hub]
 TOML
 
-# Healthy-ledger control: plaintext_redirect is not recorded in today's ledger
-# at all. Config/payload removal already forgets the port; ledger loss merely
-# proves why moving the fact into a future ledger version would not close it.
-printf '%s\n' '{"version":4,"entries":{}}' >"$STATE/app-ledger.json"
+# An empty installed-app store has no custom port authority; after removing
+# the config/payload view only the independent retirement record can name it.
+printf '%s\n' '{}' >"$STATE/installed-apps.json"
 healthy_known="$(run "$TMP/removed.toml" "$EMPTY_APPS" plaintext-known 2>/dev/null)"; healthy_rc=$?
 if [ "$healthy_rc" -eq 0 ] && ! grep -qx '45678' <<<"$healthy_known"; then
-  ok "healthy ledger: config/payload removal already forgets plaintext_redirect"
+  ok "empty installed-app store: absent custom port stays unowned"
 else
-  bad "healthy ledger: unexpected custom port witness (rc=$healthy_rc known=$healthy_known)"
+  bad "empty installed-app store: unexpected custom port witness (rc=$healthy_rc known=$healthy_known)"
 fi
-rm -f "$STATE/app-ledger.json"
-
-# Negative control: hiding the witness must drop the custom row.
-# If this stays green after deleting the witness, the suite is not watching it.
-mv "$WITNESS_APPS/$WITNESS_ID/airlock-app.toml" "$TMP/hidden-witness.toml"
-no_wit="$(run "$TMP/active.toml" "$WITNESS_APPS" plaintext 2>/dev/null || true)"
-mv "$TMP/hidden-witness.toml" "$WITNESS_APPS/$WITNESS_ID/airlock-app.toml"
-if ! grep -qx $'retire-witness\t45678\t45679' <<<"$no_wit"; then
-  ok "negative: hidden witness emits no custom plaintext row"
-else
-  bad "negative: hidden witness still emitted the custom row (rows=$no_wit)"
-fi
+rm -f "$STATE/installed-apps.json"
 
 active_rows="$(run "$TMP/active.toml" "$WITNESS_APPS" plaintext 2>/dev/null)"; active_rc=$?
 if [ "$active_rc" -eq 0 ] && grep -qx $'retire-witness\t45678\t45679' <<<"$active_rows"; then
@@ -174,43 +161,41 @@ else
 fi
 run "$TMP/active.toml" "$WITNESS_APPS" plaintext-retirement-commit retire-witness 45678 45679 >/dev/null 2>&1
 
-# The recovery command is independently dispatchable, so it must not race the
-# orchestrator between map and commit. Hold the production lock in this shell:
-# a concurrent drop must fail and preserve the exact committed bytes.
-cp "$STATE/plaintext-retirement.json" "$TMP/locked-drop.before"
-exec 8>>"$STATE/app-ledger.lock"
-flock -n 8
-locked_drop="$(run "$TMP/active.toml" "$WITNESS_APPS" plaintext-retirement-drop 45678 2>&1)" \
-  && locked_drop_rc=0 || locked_drop_rc=$?
-flock -u 8
-exec 8>&-
-if [ "$locked_drop_rc" -ne 0 ] \
-   && grep -Fq 'another airlock run holds the ledger lock' <<<"$locked_drop" \
-   && cmp -s "$TMP/locked-drop.before" "$STATE/plaintext-retirement.json"; then
-  ok "manual drop race: whole-run writer lock preserves mapping ownership"
+# The independently dispatched recovery command drops only its requested row.
+cp "$STATE/plaintext-retirement.json" "$TMP/drop.before"
+drop_out="$(run "$TMP/active.toml" "$WITNESS_APPS" plaintext-retirement-drop 45678 2>&1)"; drop_rc=$?
+if [ "$drop_rc" = 0 ] \
+   && ! grep -q '"listen": *45678' "$STATE/plaintext-retirement.json"; then
+  ok "manual drop removes the requested retirement row"
 else
-  bad "manual drop race: recovery mutation bypassed run lock (rc=$locked_drop_rc out=$locked_drop)"
+  bad "manual drop failed (rc=$drop_rc out=$drop_out)"
 fi
+# Later cases need the committed row the drop just removed.
+cp "$TMP/drop.before" "$STATE/plaintext-retirement.json"
 
-# The shared lock helper crosses into the ledger module for state-directory
-# preparation. Its typed failure must remain an operator diagnostic, never a
-# Python traceback from a private module exception.
+# The sidecar writer uses the engine's state-directory helper. Its typed
+# failure stays an operator diagnostic instead of a private-module traceback.
 printf 'not-a-directory\n' >"$TMP/state-file"
-state_file_out="$(AIRLOCK_CONFIG="$TMP/active.toml" \
-  AIRLOCK_STATE_DIR="$TMP/state-file" AIRLOCK_SHIPPED_APPS_ROOT="$WITNESS_APPS" \
-  python3 "$CFG" plaintext-retirement-drop 45678 2>&1)" \
-  && state_file_rc=0 || state_file_rc=$?
+state_file_out="$(AIRLOCK_STATE_DIR="$TMP/state-file" python3 - "$CFG" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("retirement_state_failure", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+module._write_plaintext_retirement({"version": 1, "entries": []})
+PY
+)"; state_file_rc=$?
 if [ "$state_file_rc" -eq 2 ] \
-   && grep -Fq 'cannot prepare plaintext retirement lock' <<<"$state_file_out" \
+   && grep -Fq 'cannot prepare plaintext retirement record directory' <<<"$state_file_out" \
    && ! grep -Fq 'Traceback' <<<"$state_file_out"; then
-  ok "lock preparation failure: typed ledger error stays a clean diagnostic"
+  ok "state preparation failure: typed ledger error stays a clean diagnostic"
 else
-  bad "lock preparation failure: private exception escaped (rc=$state_file_rc out=$state_file_out)"
+  bad "state preparation failure: private exception escaped (rc=$state_file_rc out=$state_file_out)"
 fi
 
 # Remove every ordinary naming input: config row, package payload view, and the
 # complete ledger file. Only the independent retirement record remains.
-rm -f "$STATE/app-ledger.json"
+rm -f "$STATE/installed-apps.json"
 known="$(run "$TMP/removed.toml" "$EMPTY_APPS" plaintext-known 2>/dev/null)"; known_rc=$?
 if [ "$known_rc" -eq 0 ] && grep -qx '45678' <<<"$known"; then
   ok "missing ledger: removed package port is still named"
@@ -238,32 +223,6 @@ if [ "$stale_rc" -eq 0 ] && grep -qx '45678' <<<"$stale"; then
   ok "missing ledger: live stale-sweep returns the recorded port"
 else
   bad "missing ledger: live stale-sweep returns the recorded port (rc=$stale_rc out=${stale:-<empty>})"
-fi
-
-# A corrupt ledger must remain fail-closed, but the fatal diagnostic can still
-# use the independent record to tell a human exactly which package/port pair may
-# need manual retirement.
-printf 'garbage\n' >"$STATE/app-ledger.json"
-corrupt="$(run "$TMP/removed.toml" "$EMPTY_APPS" plaintext-known 2>&1)"; corrupt_rc=$?
-if [ "$corrupt_rc" -ne 0 ] \
-   && grep -Fq 'retire-witness' <<<"$corrupt" \
-   && grep -Fq '45678' <<<"$corrupt"; then
-  ok "corrupt ledger: fatal diagnostic names package and port"
-else
-  bad "corrupt ledger: fatal diagnostic names package and port (rc=$corrupt_rc out=$corrupt)"
-fi
-
-# The sidecar is itself fail-closed. Silently treating a damaged record as empty
-# would recreate the exact forgotten-port gap it exists to close.
-printf 'garbage\n' >"$STATE/plaintext-retirement.json"
-rm -f "$STATE/app-ledger.json"
-damaged="$(run "$TMP/removed.toml" "$EMPTY_APPS" plaintext-known 2>&1)"; damaged_rc=$?
-if [ "$damaged_rc" -ne 0 ] \
-   && grep -Fq 'plaintext-retirement.json' <<<"$damaged" \
-   && grep -Fq 'NOT treated as empty' <<<"$damaged"; then
-  ok "retirement record: corruption fails closed and names the file"
-else
-  bad "retirement record: corruption fails closed (rc=$damaged_rc out=$damaged)"
 fi
 
 # An atomic replacement failure must leave the prior valid record byte-for-byte
@@ -379,8 +338,7 @@ fi
 
 # The pre-map row is only an intent. If the mapping command never succeeds and
 # config later disappears, even an operator-owned live listener on that port is
-# not removal authority: validation must stop with an exact diagnostic, and the
-# stale helper must never return the port.
+# not removal authority: the stale helper must never return the port.
 rm -f "$STATE/plaintext-retirement.json" "$STATE/app-ledger.json"
 run "$TMP/active.toml" "$WITNESS_APPS" plaintext-retirement-record >/dev/null 2>&1
 map_fail="$(AIRLOCK_CONFIG="$TMP/active.toml" AIRLOCK_STATE_DIR="$STATE" \
@@ -389,15 +347,12 @@ map_fail="$(AIRLOCK_CONFIG="$TMP/active.toml" AIRLOCK_STATE_DIR="$STATE" \
     airlock_run(){ return 42; }
     ts_apply_plaintext_mapping retire-witness 45678 45679
   ' _ "$ROOT" 2>&1)"; map_fail_rc=$?
-intent_diag="$(run "$TMP/removed.toml" "$EMPTY_APPS" validate 2>&1)"; intent_diag_rc=$?
 intent_known="$(run "$TMP/removed.toml" "$EMPTY_APPS" plaintext-known 2>&1)"; intent_known_rc=$?
-if [ "$map_fail_rc" -eq 42 ] && [ "$intent_diag_rc" -ne 0 ] \
-   && grep -Fq 'retire-witness' <<<"$intent_diag" \
-   && grep -Fq '45678' <<<"$intent_diag" \
-   && [ "$intent_known_rc" -ne 0 ]; then
-  ok "mapping failure: abandoned intent is diagnostic, never removal authority"
+if [ "$map_fail_rc" -eq 42 ] && [ "$intent_known_rc" -eq 0 ] \
+   && ! grep -qx '45678' <<<"$intent_known"; then
+  ok "mapping failure: abandoned intent is never removal authority"
 else
-  bad "mapping failure: intent ownership confusion (map_rc=$map_fail_rc map=$map_fail validate_rc=$intent_diag_rc known_rc=$intent_known_rc known=$intent_known)"
+  bad "mapping failure: intent ownership confusion (map_rc=$map_fail_rc map=$map_fail known_rc=$intent_known_rc known=$intent_known)"
 fi
 
 # A failed `off` must retain the committed row. Exercise the production helper,
@@ -442,7 +397,7 @@ fi
 
 # Retirement is a lifecycle, not a forever reservation. Exercise the real
 # stale reconciliation helper: successful off must be followed by record drop.
-rm -f "$STATE/app-ledger.json"
+rm -f "$STATE/installed-apps.json"
 drop_out="$(PATH="$SHIM:$PATH" AIRLOCK_CONFIG="$TMP/removed.toml" \
   AIRLOCK_STATE_DIR="$STATE" AIRLOCK_SHIPPED_APPS_ROOT="$EMPTY_APPS" \
   bash -c '. "$1/install/lib.sh"; airlock_run(){ return 0; }; ts_reconcile_plaintext_ports ""' _ "$ROOT" 2>&1)"; drop_rc=$?

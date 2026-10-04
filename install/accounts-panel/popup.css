@@ -103,7 +103,7 @@
  * Four provider sections. Only Claude starts expanded; the rest are one-line
  * headers (who · how much · next reset) until opened. A guided flow (login-type
  * work) or a switch confirm strip renders inline in its own section — the list
- * never closes underneath. Unread slots read 확인 중.
+ * never closes underneath. Unread slots read Checking.
  * These classes are emitted by hub/assets/accounts/accounts.js; devterm's own
  * apps/devterm/web/popup.css carries the same block for the anchored popup until
  * phase 4 retires the duplicate. */

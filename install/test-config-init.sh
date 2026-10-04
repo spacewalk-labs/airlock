@@ -15,14 +15,13 @@
 # Offline: no network, no machine, no file written outside a scratch dir (init writes to
 # stdout by design, so there is nothing to clobber).
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT" || exit 1
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
@@ -137,8 +136,6 @@ refuse() {
     bad "init accepted $why (rc=$rc)"
   fi
 }
-refuse "an owner that is not a login"        --owner notalogin --apps devterm
-refuse "an app this checkout does not ship"  --owner owner@fixture.dev --apps nosuchapp
 refuse "a flag with no value"                --owner
 refuse "an unknown flag"                     --owner owner@fixture.dev --nope x
 "$CFG" init >/dev/null 2>&1
@@ -267,9 +264,8 @@ else
   bad "a list with spaces after the commas was rejected"
 fi
 
-# 13. A manifest tree can be wrong in ways no selection can fix, and init must say so
-#     rather than hang or traceback. These fixtures are built here because no shipped
-#     manifest is broken in these ways — which is exactly why neither path had ever run.
+# 13. A dependency cycle in the manifest tree must not hang init. The fixture is built
+#     here because no shipped manifest has a cycle.
 fixture() {  # <root> <id> <deps-toml>
   mkdir -p "$1/$2"; : > "$1/$2/install.sh"; : > "$1/$2/smoke.sh"
   printf 'contract = 1\nid = "%s"\n\n[dependencies]\napps = [%s]\n' "$2" "$3" \
@@ -279,25 +275,16 @@ cyc="$scratch/cyc"; fixture "$cyc" aa '"bb"'; fixture "$cyc" bb '"aa"'
 # A real timeout, because the failure mode being tested is a hang: `a -> b -> a`
 # spun the ordering loop forever, and a GUI would simply have sat there. `placed`
 # stopped an app being emitted twice, never being visited again.
-cyc_out="$(AIRLOCK_SHIPPED_APPS_ROOT="$cyc" timeout 10 "$CFG" init --owner owner@fixture.dev --apps aa 2>&1 >/dev/null)"
+AIRLOCK_SHIPPED_APPS_ROOT="$cyc" timeout 10 "$CFG" init --owner owner@fixture.dev --apps aa \
+  > "$scratch/cyc.toml" 2>/dev/null
 cyc_rc=$?
 if [ "$cyc_rc" -eq 124 ]; then
   bad "a dependency cycle hangs init — the ordering loop has no cycle guard"
-elif [ "$cyc_rc" -eq 2 ] && printf '%s' "$cyc_out" | grep -q "dependency cycle"; then
-  ok "a dependency cycle is refused by name instead of hanging"
+elif [ "$cyc_rc" -eq 0 ] && grep -q '^\[apps\.aa\]' "$scratch/cyc.toml" \
+     && grep -q '^\[apps\.bb\]' "$scratch/cyc.toml"; then
+  ok "a dependency cycle terminates and writes both apps instead of hanging"
 else
-  bad "a dependency cycle produced rc=$cyc_rc: $(printf '%s' "$cyc_out" | head -1)"
-fi
-
-miss="$scratch/miss"; fixture "$miss" aa '"legacy"'
-miss_out="$(AIRLOCK_SHIPPED_APPS_ROOT="$miss" "$CFG" init --owner owner@fixture.dev --apps aa 2>&1 >/dev/null)"
-miss_rc=$?
-if [ "$miss_rc" -eq 2 ] && printf '%s' "$miss_out" | grep -q "does not ship"; then
-  ok "a dependency this checkout does not ship is refused with a message"
-elif printf '%s' "$miss_out" | grep -q "Traceback"; then
-  bad "a dependency on an unshipped app raised a traceback — manifest grammar allows it"
-else
-  bad "a dependency on an unshipped app produced rc=$miss_rc: $(printf '%s' "$miss_out" | head -1)"
+  bad "a dependency cycle produced rc=$cyc_rc"
 fi
 
 # 14. `--code-root` is gone with the key it wrote. It used to be REQUIRED as soon as

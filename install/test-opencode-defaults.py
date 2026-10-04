@@ -40,6 +40,7 @@ class OpenCodeDefaultsTest(unittest.TestCase):
             config = self.load(home)
             self.assertEqual(config["model"], module.MODEL)
             self.assertEqual(config["agent"], module.AGENTS)
+            self.assertIs(config["snapshot"], False)
             self.assertEqual(set(config["agent"]), {
                 "muse-spark-1.3-contributor",
                 "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "grok-4.6",

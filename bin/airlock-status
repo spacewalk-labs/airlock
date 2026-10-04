@@ -54,6 +54,8 @@ This tool is READ-ONLY. It mutates nothing, takes no ledger lock, and needs no
 privilege beyond what the probes themselves need.
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -78,7 +80,6 @@ CHECKS = (
     ("config.validate",  "config",  "airlock.toml parses and passes validate"),
     ("config.owner",     "config",  "the gate has an owner identity to compare against"),
     ("install.ledger",   "install", "the install ledger is readable"),
-    ("install.transaction", "install", "the last install transaction reached a safe state"),
     ("install.drift",    "install", "every enabled app is committed in the ledger"),
     ("install.revision", "install", "the checkout revision this box is running"),
     ("ingress.backend",  "ingress", "tailscaled is up"),
@@ -98,9 +99,9 @@ SECTIONS = {c[0]: c[1] for c in CHECKS}
 # There is NO key-name rule for "this port is a loopback listener". `*_port` is
 # the config layer's grammar for "a port number", not for "a socket Airlock
 # binds": apps/dev-monitor/airlock-app.toml:42 declares `smtp_port = 587`, a
-# REMOTE submission port, and apps/notes/airlock-app.toml:15 declares
-# `editor_port_base`, the anchor of a span rather than one listener. Probing
-# either on 127.0.0.1 would fail a healthy box.
+# REMOTE submission port, and apps/code-server/airlock-app.toml:24 declares a
+# `[[config.port_spans]]` whose `base = "backend_port"` is an anchor for a span
+# rather than one listener. Probing either on 127.0.0.1 would fail a healthy box.
 #
 # So apps.backends probes only the ports the PLATFORM binds on loopback, each of
 # which some install path names as a target: the hub's own nginx port
@@ -298,118 +299,33 @@ def state_dir():
     return Path.home() / ".local" / "state" / "airlock"
 
 
-def _devmon_activation_owed():
-    """The transaction id whose committed dev-monitor still awaits conversion+start.
-
-    apps/dev-monitor/activation-record.py owns the record; the installer deletes it
-    once activation finished, so its presence past a terminal phase means "owed".
-    """
-    path = state_dir() / "dev-monitor-activation.json"
-    if not os.path.lexists(path):
-        return None
+def ledger_module():
+    loader = importlib.machinery.SourceFileLoader("airlock_status_ledger", str(ROOT / "bin" / "airlock-ledger"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
-        record = json.loads(path.read_text())
-        tx = record["transaction_id"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError):
-        return "unreadable"
-    return tx[:12] if isinstance(tx, str) else "unreadable"
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
 
 
 def check_install(rep, cfg, enabled):
-    ledger_path = state_dir() / "app-ledger.json"
-    transaction_path = state_dir() / "install-transaction.json"
-    owed = _devmon_activation_owed()
-    owed_detail = (f"dev-monitor activation for committed transaction {owed} is still owed: "
-                   "converting its messages database and starting its backend have not finished")
-    owed_fix = "Re-run install/airlock-install.sh; it resumes the activation before anything else."
-    if not os.path.lexists(transaction_path):
-        if owed:
-            rep.record("install.transaction", FAIL, owed_detail, owed_fix)
-        else:
-            rep.record("install.transaction", OK, "no install transaction is pending")
-    else:
-        try:
-            if transaction_path.is_symlink():
-                raise ValueError("transaction record is a symlink")
-            transaction = json.loads(transaction_path.read_text())
-            phase = transaction.get("phase")
-            transaction_id = transaction.get("id")
-            if (not isinstance(transaction_id, str) or len(transaction_id) != 32
-                    or any(ch not in "0123456789abcdef" for ch in transaction_id)):
-                raise ValueError("invalid or missing transaction id")
-        except (OSError, json.JSONDecodeError, ValueError, AttributeError) as exc:
-            rep.record("install.transaction", FAIL,
-                       f"transaction record is unreadable: {exc}",
-                       "Preserve the state directory and repair the transaction record before installing.")
-        else:
-            short_id = transaction_id[:12]
-            if phase in ("committed", "rolled_back") and owed:
-                rep.record("install.transaction", FAIL,
-                           f"transaction {short_id} {phase}; {owed_detail}", owed_fix)
-            elif phase == "committed":
-                rep.record("install.transaction", OK,
-                           f"transaction {short_id} committed")
-            elif phase == "rolled_back":
-                results = transaction.get("restore_results") or {}
-                kept = sorted(name for name, result in results.items()
-                              if isinstance(result, dict)
-                              and str(result.get("status", "")).startswith("kept-forward"))
-                down = sorted(name for name in kept
-                              if results[name].get("status") == "kept-forward-inactive")
-                if down:
-                    rep.record("install.transaction", FAIL,
-                               f"transaction {short_id} rolled back; {', '.join(down)} was kept on the converted "
-                               "database but its candidate did not start",
-                               "Re-run install/airlock-install.sh; the kept candidate is an uncommitted intent it will finish.")
-                elif kept:
-                    rep.record("install.transaction", WARN,
-                               f"transaction {short_id} rolled back; {', '.join(kept)} kept its candidate on the "
-                               "converted database instead of restoring the previous package",
-                               "Re-run install/airlock-install.sh to finish the kept candidate; the old package "
-                               "was not brought back because its compatibility with the converted database is unproven.")
-                else:
-                    rep.record("install.transaction", WARN,
-                               f"transaction {short_id} rolled back; the previous committed apps were restored",
-                               "Review the installer error before retrying the candidate.")
-            elif phase == "degraded":
-                failed = {name for name, result in
-                          (transaction.get("restore_results") or {}).items()
-                          if isinstance(result, dict) and result.get("status") == "failed"}
-                error = transaction.get("error") or {}
-                if isinstance(error, dict) and isinstance(error.get("app"), str):
-                    failed.add(error["app"])
-                failed = sorted(failed)
-                suffix = f"; restore failed for {', '.join(failed)}" if failed else ""
-                rep.record("install.transaction", FAIL,
-                           f"transaction {short_id} is degraded{suffix}",
-                           "Do not run a new candidate; preserve checkpoints and repair the named app first.")
-            elif phase in ("prepared", "installing", "rolling_back"):
-                rep.record("install.transaction", UNCHECKED,
-                           f"transaction {short_id} is {phase}; final availability is not established",
-                           "Let the installer finish, or re-run it so recovery runs before a new plan.")
-            else:
-                rep.record("install.transaction", FAIL,
-                           f"transaction {short_id} has unknown phase {phase!r}",
-                           "Preserve the state directory and repair the transaction record before installing.")
     committed = None
-    if not ledger_path.exists():
+    try:
+        ledger = ledger_module()
+        if ledger.read_installed_bytes() is None:
+            raise ValueError("no installed app record")
+        committed = ledger.load_installed()
+    except Exception as exc:
         rep.record("install.ledger", FAIL,
-                   f"no ledger at {ledger_path} — nothing records what is installed here",
-                   "Run install/airlock-install.sh; a box with apps and no ledger is unmanaged.")
+                   f"installed app record is unreadable: {exc}",
+                   "Restore the record or run install/airlock-install.sh before installing again.")
     else:
-        try:
-            store = json.loads(ledger_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            rep.record("install.ledger", FAIL,
-                       f"{ledger_path} is unreadable: {exc}",
-                       "The ledger is the record of what to remove; restore it before installing again.")
-        else:
-            entries = store.get("entries") or {}
-            committed = {app: rec for app, rec in entries.items()
-                         if isinstance(rec, dict) and rec.get("committed")}
-            rep.record("install.ledger", OK,
-                       f"ledger v{store.get('version')} at {ledger_path}, "
-                       f"{len(committed)} committed, {len(entries)} tracked")
+        rep.record("install.ledger", OK,
+                   f"installed app record is readable, {len(committed)} installed")
 
     if committed is None:
         rep.record("install.drift", UNCHECKED,
@@ -418,9 +334,8 @@ def check_install(rep, cfg, enabled):
         rep.record("install.drift", UNCHECKED,
                    "the enabled app list could not be read, so drift cannot be measured")
     else:
-        # hub is the platform itself, never a ledger package.
-        want = {a for a in enabled if a != "hub"}
-        have = set(committed)
+        want = set(enabled) - {"hub"}
+        have = set(committed) - {"hub"}
         missing = sorted(want - have)
         extra = sorted(have - want)
         if missing:
@@ -446,8 +361,7 @@ def check_install(rep, cfg, enabled):
                    f"git could not read the revision: {last_lines(err) or rc}")
         return
     head = out.strip()
-    # The ledger records package digests, not a revision or a date
-    # (bin/airlock-ledger:62-66) — the checkout is the only revision record there is.
+    # This revision names the core checkout; apps also record their own source revision.
     rc_d, dirty, err_d = run(["git", "-C", str(ROOT), "status", "--porcelain"], timeout=30)
     if rc_d != 0:
         rep.record("install.revision", UNCHECKED,
@@ -689,32 +603,22 @@ def unit_health(unit, props):
 
 
 def check_units(rep):
-    ledger_path = state_dir() / "app-ledger.json"
     try:
-        store = json.loads(ledger_path.read_text())
-    except (OSError, json.JSONDecodeError):
+        ledger = ledger_module()
+        if ledger.read_installed_bytes() is None:
+            raise ValueError("no installed app record")
+        units = ledger.installed_units()
+    except Exception:
         rep.record("units.active", UNCHECKED,
                    "the ledger could not be read, so there is no list of units to check")
         return
-    wanted = set()       # (unit name, scope)
+    wanted = set()
     templates = set()
-    for app, rec in (store.get("entries") or {}).items():
-        record = (rec or {}).get("committed") or {}
-        # artifacts.units holds the PATHS the installer placed; unit_scopes is
-        # keyed by the bare name (bin/airlock-ledger commit writes both).
-        scopes = record.get("unit_scopes") or {}
-        for path in ((record.get("artifacts") or {}).get("units") or []):
-            unit = os.path.basename(path)
-            if unit.endswith("@.service"):
-                # A template is not an instance. Which instances the installer
-                # started is not in the ledger (apps/code-server/install.sh:140
-                # starts airlock-code-server@1.service and records the template),
-                # so this cannot be checked from here — and is named rather than
-                # dropped, because a silently narrowed check is the whole defect
-                # class this tool exists to remove.
-                templates.add(unit)
-                continue
-            wanted.add((unit, scopes.get(unit, "user")))
+    for unit, scope in units:
+        if unit.endswith("@.service"):
+            templates.add(unit)
+        else:
+            wanted.add((unit, scope))
     if not wanted and not templates:
         rep.record("units.active", UNCHECKED,
                    "the ledger commits no units, so there is nothing to check")

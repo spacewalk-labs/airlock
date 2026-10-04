@@ -65,20 +65,9 @@ def _source_classes(package_info: dict[str, Any]) -> dict[str, str]:
             for app_id, raw in packages.items() if isinstance(raw, dict)}
 
 
-def _lock_mismatches(stderr: str) -> list[dict[str, str]]:
-    # airlock-config is the lock authority.  Do not calculate a second digest here:
-    # this only turns its explicit refusal into the UI's display-only action.
-    ids = sorted(set(re.findall(r"package '([a-z0-9][a-z0-9-]{0,31})': package lock digest mismatch", stderr)))
-    return [{"id": app_id, "action": "lock-mismatch", "sourceClass": "explicit"}
-            for app_id in ids]
-
-
 def _apps(root: Path) -> list[dict[str, str]]:
     config = _run([sys.executable, str(root / "bin" / "airlock-config"), "package-info"])
     if config.returncode:
-        mismatches = _lock_mismatches(config.stderr)
-        if mismatches:
-            return mismatches
         raise RuntimeError("airlock-config package-info failed: " + config.stderr.strip())
     try:
         package_info = json.loads(config.stdout)
@@ -97,6 +86,18 @@ def _apps(root: Path) -> list[dict[str, str]]:
         result.append({"id": app_id, "action": "upgrade",
                        "sourceClass": classes.get(app_id, "explicit")})
     return sorted(result, key=lambda item: item["id"])
+
+
+def current(root: Path) -> dict[str, Any]:
+    """Read platform/harness observation, replacing apps with the engine's current plan.
+
+    This never rewrites the older snapshot. A failed plan is an unavailable
+    observation, never a fabricated empty app update list.
+    """
+    snapshot = read_snapshot() or {"checkedAt": None, "platform": None,
+                                  "harness": None}
+    return {**snapshot, "apps": _apps(root),
+            "appsCheckedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
 
 
 def _first_line(argv: list[str], timeout: int = 20) -> str | None:
@@ -290,6 +291,9 @@ def read_snapshot(path: Path | None = None) -> dict[str, Any] | None:
         return None
     if not _snapshot_shape(value):
         return None
+    # A complete older observation can include actions this UI does not offer.
+    # Keep its platform/harness and upgrade rows while discarding those offers.
+    value["apps"] = [app for app in value["apps"] if app["action"] == "upgrade"]
     return value
 
 
@@ -308,7 +312,7 @@ def _snapshot_shape(value: Any) -> bool:
         return False
     for app in apps:
         if (not isinstance(app, dict) or not isinstance(app.get("id"), str)
-                or app.get("action") not in ("upgrade", "lock-mismatch")
+                or not isinstance(app.get("action"), str)
                 or app.get("sourceClass") not in ("shipped", "explicit")):
             return False
     harness = value.get("harness")

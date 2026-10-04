@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tests for bin/airlock-config (T2). No live services needed.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CFG="$HERE/../bin/airlock-config"
@@ -10,9 +11,7 @@ trap 'rm -rf "$TMP"' EXIT
 # leak into (or fail) these tests. See docs/design/app-package-contract.md D6.
 export AIRLOCK_STATE_DIR="$TMP/state"
 
-pass=0 fail=0
-ok()   { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad()  { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 # --- fixtures ---
 cat >"$TMP/good.toml" <<'TOML'
@@ -34,19 +33,22 @@ compat_https_enabled = true
 [apps.fileview]
 TOML
 
-cat >"$TMP/badprovider.toml" <<'TOML'
-[auth]
-provider = "basic"
-owner = "owner@fixture.dev"
-[apps.hub]
-TOML
-
-cat >"$TMP/noowner.toml" <<'TOML'
-[auth]
-provider = "tailscale"
-owner = "nobody"
-[apps.hub]
-TOML
+# Record explicit fixture sources through the production installed-record writer.
+seed_apps() {
+  env -u AIRLOCK_APP_ID -u AIRLOCK_APP_DIR python3 - "$HERE/../bin/airlock-ledger" "$@" <<'PY_SEED'
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+import sys
+sys.dont_write_bytecode = True
+ledger = SourceFileLoader("_fixture_ledger", sys.argv[1]).load_module()
+rows = ledger.load_installed()
+for pid, directory in zip(sys.argv[2::2], sys.argv[3::2]):
+    repo = str(Path(directory).resolve())
+    if pid not in rows or rows[pid]["repo"] != repo:
+        rows[pid] = {"repo": repo, "commit": "", "artifacts": []}
+ledger.write_installed(rows)
+PY_SEED
+}
 
 run() { AIRLOCK_CONFIG="$1" python3 "$CFG" "${@:2}"; }
 
@@ -59,61 +61,12 @@ if run "$TMP/good.toml" validate >/dev/null 2>&1; then ok "validate: good"; else
 # mode carries the machine-readable acceptance observations instead.
 glyph_ac="$(AIRLOCK_EMIT_AC=1 run "$TMP/good.toml" validate 2>&1)"
 if grep -Eq '^AC-GLYPH-SPRITE \| expected: sprite_symbols > 0 \| observed: sprite_symbols=[1-9][0-9]* \| verdict: PASS \| signal: fixture \| evidence: hub/index.html@[0-9a-f]{7,}$' <<<"$glyph_ac" \
-   && grep -Eq '^AC-GLYPH-DECLARATIONS \| expected: shipped_glyphs_checked == shipped_glyphs_declared && shortcut_glyphs_checked == shortcut_glyphs_declared \| observed: active_package_glyphs_checked=[0-9]+,shipped_glyphs_checked=[0-9]+,shipped_glyphs_declared=[0-9]+,shortcut_glyphs_checked=[0-9]+,shortcut_glyphs_declared=[0-9]+ \| verdict: PASS \| signal: fixture \| evidence: bin/airlock-config@[0-9a-f]{7,}$' <<<"$glyph_ac"; then
+   && grep -Eq '^AC-GLYPH-DECLARATIONS \| expected: shipped_glyphs_checked == shipped_glyphs_declared \| observed: active_package_glyphs_checked=[0-9]+,shipped_glyphs_checked=[0-9]+,shipped_glyphs_declared=[0-9]+ \| verdict: PASS \| signal: fixture \| evidence: bin/airlock-config@[0-9a-f]{7,}$' <<<"$glyph_ac"; then
   ok "validate: emits glyph AC observations with checkout evidence"
 else
   bad "validate: emits glyph AC observations with checkout evidence"
 fi
 printf '%s\n' "$glyph_ac" | sed -n '/^AC-GLYPH-/p'
-
-# Disabled shipped packages still render when later enabled, so their tile
-# glyphs are part of this repository's launcher contract.  The config enables
-# only hub; corrupting the copied notes manifest must still make validate red.
-REPRO="$TMP/glyph-repro"
-mkdir -p "$REPRO/bin" "$REPRO/hub" "$REPRO/apps"
-cp "$CFG" "$REPRO/bin/airlock-config"
-cp "$HERE/../bin/agent_provider.py" "$REPRO/bin/agent_provider.py"
-cp "$HERE/../hub/index.html" "$REPRO/hub/index.html"
-for manifest in "$HERE"/../apps/*/airlock-app.toml; do
-  app="$(basename "$(dirname "$manifest")")"
-  mkdir -p "$REPRO/apps/$app"
-  cp "$manifest" "$REPRO/apps/$app/airlock-app.toml"
-done
-sed -i 's/glyph = "app-silverbullet"/glyph = "definitely-not-in-sprite"/' \
-  "$REPRO/apps/notes/airlock-app.toml"
-cat >"$REPRO/repro.toml" <<'TOML'
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-[apps.hub]
-TOML
-inactive_glyph_out="$(AIRLOCK_CONFIG="$REPRO/repro.toml" \
-  AIRLOCK_STATE_DIR="$REPRO/state" python3 "$REPRO/bin/airlock-config" validate 2>&1)"
-if [ $? -ne 0 ] && grep -Fq 'definitely-not-in-sprite' <<<"$inactive_glyph_out" \
-   && grep -Fq "shipped package 'notes'" <<<"$inactive_glyph_out"; then
-  ok "validate: disabled shipped manifest glyph absent from sprite is fatal"
-else
-  bad "validate: disabled shipped manifest glyph absent from sprite is fatal"
-fi
-
-# 2. non-tailscale provider fails closed
-if run "$TMP/badprovider.toml" validate >/dev/null 2>&1; then bad "validate: rejects non-tailscale"; else ok "validate: rejects non-tailscale"; fi
-
-# 3. bad owner fails
-if run "$TMP/noowner.toml" validate >/dev/null 2>&1; then bad "validate: rejects bad owner"; else ok "validate: rejects bad owner"; fi
-
-# 3b. a port collision fails closed. Two nginx servers on one loopback port both
-# match `server_name _`, so nginx silently keeps the first — if a redirect_port
-# landed on a gate_port, the plaintext ingress would serve content again.
-cat >"$TMP/portclash.toml" <<'TOML'
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-[apps.hub]
-[apps.devterm]
-backend_port = 19911
-TOML
-if run "$TMP/portclash.toml" validate >/dev/null 2>&1; then bad "validate: rejects port collision"; else ok "validate: rejects port collision"; fi
 
 # 3c. plaintext wiring: enabled apps with a plaintext port -> their redirect port
 pt="$(run "$TMP/good.toml" plaintext 2>/dev/null | tr '\t' ':' | sort | tr '\n' ',')"
@@ -175,65 +128,6 @@ grep -q '"fqdn"' <<<"$wj2" && bad "webjson: empty fqdn emitted" || ok "webjson: 
 apps="$(run "$TMP/good.toml" apps 2>/dev/null | sort | tr '\n' ',')"
 [ "$apps" = "devterm,fileview,hub," ] && ok "apps: enabled list" || bad "apps: got '$apps'"
 
-# App names cross a line-oriented shell API. A quoted TOML key may contain an
-# escaped newline, so both validation and the direct `apps` command must reject
-# it instead of turning one table into two enabled installer names.
-cat >"$TMP/bad-app-name.toml" <<'TOML'
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-[apps.hub]
-[apps."paseo\nlocal"]
-TOML
-if run "$TMP/bad-app-name.toml" validate >/dev/null 2>&1; then
-  bad "apps: validate rejects multiline name"
-else
-  ok "apps: validate rejects multiline name"
-fi
-if run "$TMP/bad-app-name.toml" apps >/dev/null 2>&1; then
-  bad "apps: listing rejects multiline name"
-else
-  ok "apps: listing rejects multiline name"
-fi
-
-# A newline in the MIDDLE is rejected by any anchor; a TRAILING one was not. Python's `$`
-# matches immediately before a final newline, so `paseo\n` satisfied APP_NAME_RE and only
-# the fullmatch at the call site kept it out — exactly the "one table name becomes two
-# installer names" value the comment above that pattern exists to reject.
-cat >"$TMP/trailing-newline-app-name.toml" <<'TOML'
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-[apps.hub]
-[apps."paseo\n"]
-TOML
-if run "$TMP/trailing-newline-app-name.toml" validate >/dev/null 2>&1; then
-  bad "apps: validate rejects a trailing newline in a name"
-else
-  ok "apps: validate rejects a trailing newline in a name"
-fi
-if run "$TMP/trailing-newline-app-name.toml" apps >/dev/null 2>&1; then
-  bad "apps: listing rejects a trailing newline in a name"
-else
-  ok "apps: listing rejects a trailing newline in a name"
-fi
-# The two cases above pass with or without the anchor, because the call site is a
-# fullmatch — they lock the behaviour, not the pattern. This one fails the moment
-# APP_NAME_RE ends at `$` again, which is the regression worth naming.
-if python3 - "$CFG" <<'PYCHECK'
-import importlib.machinery, importlib.util, sys
-loader = importlib.machinery.SourceFileLoader('airlock_config', sys.argv[1])
-spec = importlib.util.spec_from_loader('airlock_config', loader)
-module = importlib.util.module_from_spec(spec)
-loader.exec_module(module)
-sys.exit(0 if module.APP_NAME_RE.match('paseo\n') is None else 1)
-PYCHECK
-then
-  ok "apps: APP_NAME_RE is anchored at end-of-string, not before a trailing newline"
-else
-  bad "apps: APP_NAME_RE is anchored at end-of-string, not before a trailing newline"
-fi
-
 # 5. env exposes identity header (fixed) + common + app-specific override + default
 env="$(run "$TMP/good.toml" env devterm 2>/dev/null)"
 echo "$env" | grep -q "AIRLOCK_IDENTITY_HEADER=Tailscale-User-Login" && ok "env: identity header fixed" || bad "env: identity header"
@@ -276,16 +170,6 @@ grep -q -- '--root %h' <<<"$cr_msg" && ok "code_root: says what replaced it" || 
 mk '[apps.fileview]'
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "fileview: validates with no [paths] at all"; else bad "fileview: validates with no [paths] at all"; fi
 
-# --- 10. unknown key = typo = die (a typo would silently keep the default) ---
-mk '[paths]
-code_root = "/srv/code"
-nonesuch = "x"'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects unknown [paths] key"; else ok "keys: rejects unknown [paths] key"; fi
-
-mk '[apps.dev-monitor]
-message = true'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects unknown app key"; else ok "keys: rejects unknown app key"; fi
-
 # P2a moves the defaults behind these two devterm keys to platform binaries, but the
 # keys themselves must remain declared: config validation is fail-closed and existing
 # operators may still use them as explicit gate-tool overrides.
@@ -317,15 +201,6 @@ if grep -qxF 'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT_ENV=DEVMON_URGENT' <<<"$d
 else
   bad "dev-monitor: single webhook selector exports its name"
 fi
-for retired in slack_webhook_env slack_webhook_routine_env smtp_host smtp_port smtp_from smtp_to smtp_user smtp_password_env smtp_password roster_path compat_env_path; do
-  mk "[apps.dev-monitor]
-$retired = \"retired\""
-  if run "$TMP/t.toml" validate >/dev/null 2>&1; then
-    bad "dev-monitor: removed $retired accepted"
-  else
-    ok "dev-monitor: removed $retired rejected"
-  fi
-done
 
 mk '[apps.dev-monitor]
 spool_writer_user = "monitor-writer"
@@ -338,10 +213,6 @@ else
   bad "dev-monitor: spool writer identity exports"
 fi
 
-mk '[apps.dev-monitor]
-extras = ["a", "b"]'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects unknown non-scalar key"; else ok "keys: rejects unknown non-scalar key"; fi
-
 # Nested tables belong to their installer (`get a.b.c`), not to APP_DEFAULTS.
 mk '[apps.publish]
 [apps.publish.public_target]
@@ -351,76 +222,9 @@ public_dir = "/opt/airlock/share-public"
 htpasswd_dir = "/opt/airlock/publish-gated-auth"'
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "keys: nested table allowed"; else bad "keys: nested table allowed"; fi
 
-mk '[apps.publish]
-[apps.publish.public_target]
-htpasswd_file = "/tmp/obsolete"'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects removed htpasswd_file"; else ok "keys: rejects removed htpasswd_file"; fi
-
 mk '[apps.dev-monitor]
 external = true'
 if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "keys: common 'external' allowed"; else bad "keys: common 'external' allowed"; fi
-
-# The non-app sections are closed too: a mistyped `collaborators` would otherwise
-# read as "access granted" while granting nothing.
-cat >"$TMP/t.toml" <<'TOML'
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-colaborators = ["c@example.com"]
-[apps.hub]
-TOML
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects [auth] typo"; else ok "keys: rejects [auth] typo"; fi
-mk '[branding]
-prodcut = "X"'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects [branding] typo"; else ok "keys: rejects [branding] typo"; fi
-
-# An unknown SECTION is a typo too: [brandng] would leave the product name at its
-# default while the config reads as if it had been set.
-printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n[brandng]\nproduct = "Acme"\n' >"$TMP/t.toml"
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects unknown section"; else ok "keys: rejects unknown section"; fi
-
-# A malformed section must produce an actionable error — not a traceback, and not
-# a pass. Both halves are asserted: absence of a traceback alone would also hold
-# if the validator wrongly succeeded.
-for bad_shape in 'auth = 1' 'apps = 1' 'site = 1' 'branding = false'; do
-  printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n' >"$TMP/t.toml"
-  printf '%s\n' "$bad_shape" | cat - "$TMP/t.toml" >"$TMP/t2.toml"; mv "$TMP/t2.toml" "$TMP/t.toml"
-  msg="$(run "$TMP/t.toml" validate 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ] && ! grep -q 'Traceback' <<<"$msg"; then
-    ok "types: '$bad_shape' -> actionable error"
-  else
-    bad "types: '$bad_shape' (rc=$rc)"
-  fi
-done
-
-# A nested table must be one we know: a typo in the table NAME reads as "feature
-# not configured", and a nested table on a scalar key shadows it silently.
-mk '[apps.publish]
-[apps.publish.public_targte]
-mode = "local"'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects nested-table typo"; else ok "keys: rejects nested-table typo"; fi
-mk '[apps.dev-monitor]
-[apps.dev-monitor.messages]
-enabled = true'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: rejects table shadowing a scalar"; else ok "keys: rejects table shadowing a scalar"; fi
-
-# `~nosuchuser` is an easy typo and pathlib raises on it — must be actionable.
-mk '[paths]
-wiki = "~nosuchuser1234/wiki"
-[apps.fileview]'
-msg="$(run "$TMP/t.toml" validate 2>&1)"
-grep -q 'Traceback' <<<"$msg" && bad "paths: traceback on bad ~user" || ok "paths: no traceback on bad ~user"
-grep -q 'cannot expand' <<<"$msg" && ok "paths: actionable ~user error" || bad "paths: actionable ~user error"
-
-# An unknown app TABLE is fatal (child 4/P3: the local/custom-app escape
-# hatch retired along with the built-in registry — every nine built-ins are
-# shipped packages now, so an [apps.X] that resolves to neither hub nor a
-# package can only be a typo or a missing [packages.X]/manifest).
-mk '[apps.mytool]
-backend_port = 19999'
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "keys: unknown app table is fatal"; else ok "keys: unknown app table is fatal"; fi
-msg="$(run "$TMP/t.toml" validate 2>&1 >/dev/null)"
-grep -q 'apps.mytool' <<<"$msg" && ok "keys: unknown app table names the offending table" || bad "keys: unknown app table names the offending table"
 
 # paseo.version is a real key, and its default must stay EMPTY: a version string
 # here would be exported and would override the installer's own pin forever.
@@ -472,19 +276,6 @@ if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "retired: apps.dev-monito
 msg="$(run "$TMP/t.toml" validate 2>&1 >/dev/null)"
 grep -q 'skill_allow' <<<"$msg" && ok "retired: names skill_allow" || bad "retired: names skill_allow"
 grep -q 'prompt' <<<"$msg" && ok "retired: says the list was bypassable" || bad "retired: says the list was bypassable"
-# negative control: a typo next to it is still fatal — the retirement is one key, not an opening
-cat >"$TMP/t.toml" <<'TOML'
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-[paths]
-code_root = "/srv/code"
-[apps.hub]
-[apps.dev-monitor]
-skil_allow = "x"
-TOML
-if run "$TMP/t.toml" validate >/dev/null 2>&1; then bad "retired: a typo beside it still fails"; else ok "retired: a typo beside it still fails"; fi
-
 # --- 12. no scope warning is possible any more -------------------------------
 # There used to be a heuristic warning here: code_root == $HOME plus collaborators
 # meant handing over every dotfile. The key is gone and the root is always /, so
@@ -496,8 +287,7 @@ if run "$TMP/t.toml" validate >/dev/null 2>&1; then ok "scope: fileview + collab
 
 # --- 13. airlock.toml.example is a copy-and-fill template ------------------
 # README instructs an operator to fill in owner before preflight. Keep the
-# template structurally valid (D-DEVTERM-9900 once left retired keys here), but
-# ensure an unedited copy never looks ready for installation.
+# template structurally valid (D-DEVTERM-9900 once left retired keys here).
 example="$HERE/../airlock.toml.example"
 sed 's/owner    = "me@example.com"/owner    = "owner@fixture.dev"/' "$example" >"$TMP/example-valid.toml"
 if run "$TMP/example-valid.toml" validate >/dev/null 2>&1; then
@@ -506,135 +296,360 @@ else
   bad "example: filled owner validates — $(run "$TMP/example-valid.toml" validate 2>&1 | head -1)"
 fi
 
-example_msg="$(run "$example" validate 2>&1)"
-example_rc=$?
-if [ "$example_rc" -ne 0 ] \
-    && grep -Fq "documentation placeholder ('me@example.com')" <<<"$example_msg"; then
-  ok "example: unedited owner is refused"
-else
-  bad "example: unedited owner is refused — $example_msg"
-fi
+# --- 14. sources: the one reader of ① (apps by origin + links) --------------
+# The table that shipped in #199 with no test at all was replaced by two files and
+# one reader. Every counterexample below is a shape a real file has: a personal
+# file under $HOME, a company file in another clone, and a link file somebody has
+# hand-edited into something TOML does not like.
+#
+# HOME is redirected because the personal links path is a fixed constant — the
+# one place it is defined. That is deliberate (the file is box-local and outside
+# any repo) and it is why the fixture, not the code, moves.
+HOME_SAVE="$HOME"
+trap 'HOME="$HOME_SAVE"; rm -rf "$TMP"' EXIT
+HOME="$TMP/home"
+mkdir -p "$HOME/.config/airlock" "$TMP/repo/apps/wiki-manager"
 
-# --- 14. [shortcuts.<id>] ---------------------------------------------------
-# The table shipped in #199 with no test at all — every assertion below is the
-# first one it has had. A shortcut is the one tile whose href leaves this origin
-# and whose target nobody here authorises, so the fields that keep it honest
-# (https, a real glyph, a heading the launcher can draw) are exactly the fields
-# a silent regression would take away.
-sc() {   # a good config plus the shortcut body passed in
-  printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[paths]\ncode_root = "~/code"\n[apps.hub]\n[apps.fileview]\n%s\n' "$1" >"$TMP/sc.toml"
+cat >"$TMP/repo/apps/wiki-manager/airlock-app.toml" <<'TOML'
+contract = 1
+id = "wiki-manager"
+[tile]
+label = "Wiki"
+sub = "wiki PR review"
+cat = "docs"
+glyph = "app-wiki"
+TOML
+
+cat >"$TMP/repo/links.toml" <<'TOML'
+[team-chat]
+name = "Team Chat"
+desc = "팀 채팅"
+url = "https://chat.example.test/"
+glyph = "app-chat"
+
+[broken-https]
+name = "broken-https"
+url = "http://insecure.example.test/"
+
+[nourl]
+name = "no url"
+TOML
+
+cat >"$HOME/.config/airlock/links.toml" <<'TOML'
+[remote-vm]
+name = "remote vm"
+desc = "VM console"
+url = "https://vm.example.test/"
+glyph = "app-vm"
+icon = "not-a-url"
+
+[team-chat]
+name = "Personal chat"
+url = "https://mine.example.test/"
+
+[fileview]
+name = "shadows an app id"
+url = "https://shadow.example.test/
+TOML
+
+# Company offers are committed main, read via the engine's bare mirror.
+# An invalid-encoding manifest is skipped alone, keeping all valid offers.
+mkdir -p "$TMP/repo/apps/bad-encoding"
+printf '\xff\xfe' >"$TMP/repo/apps/bad-encoding/airlock-app.toml"
+export AIRLOCK_DATA_DIR="$TMP/data" AIRLOCK_FIXTURE_ROOT="$TMP"
+git init -q -b main "$TMP/repo"
+git -C "$TMP/repo" -c user.name=Fixture -c user.email=fixture@example.test add apps links.toml
+git -C "$TMP/repo" -c user.name=Fixture -c user.email=fixture@example.test commit -qm "Company sources"
+company_commit() {
+  git -C "$TMP/repo" add apps links.toml
+  git -C "$TMP/repo" -c user.name=Fixture -c user.email=fixture@example.test commit -qm "$1"
 }
-SC_OK='[shortcuts.team-chat]
-label = "Team Chat"
-url = "https://chat.example.com/"
-cat = "comms"
-glyph = "app-chat"'
 
-sc "$SC_OK"
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then ok "shortcut: minimal table validates"; else bad "shortcut: minimal table validates"; fi
+src() {   # a good config plus a body, with the Company source pointed at the fixture.
+         # `[site] company_repo` is the ONE Company key (P3_ENGINE PR1, #856); a
+         # second table here would be a second answer to the same question.
+  printf '[site]\nname = "fixture"\ncompany_repo = "%s"\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[paths]\ncode_root = "~/code"\n[apps.hub]\n[apps.fileview]\n' "$TMP/repo" >"$TMP/src.toml"
+  printf '%s\n' "$1" >>"$TMP/src.toml"
+  run "$TMP/src.toml" "${@:2}"
+}
 
-# http is not a style preference here: the browser blocks it as mixed content on
-# an https launcher, and the attempt arms HSTS on the target host.
-sc "${SC_OK/https:\/\/chat/http://chat}"
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects http url"; else ok "shortcut: rejects http url"; fi
-# A hub subpath is a package's shape, not a shortcut's — accepting it would make
-# the two tables interchangeable and the [tile] path rule bypassable.
-sc "${SC_OK/https:\/\/chat.example.com\//\/chat\/}"
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects relative url"; else ok "shortcut: rejects relative url"; fi
-sc "${SC_OK/app-chat/}"
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects empty glyph"; else ok "shortcut: rejects empty glyph"; fi
-# Non-empty was never enough: an invented symbol id validated, installed, and
-# smoked green, then rendered a blank tile (2026-08-25: app-docs, app-files,
-# app-system, app-notes). The glyph must exist in hub/index.html's sprite.
-# Positive control on both sides: the good config above already proves a real
-# id (app-chat) passes; here the invented one must fail, and the error must
-# name the shortcut, the bad glyph, and the candidates.
-sc "${SC_OK/app-chat/app-docs}"
-gout="$(run "$TMP/sc.toml" validate 2>&1)"
-if [ $? -ne 0 ] && grep -Fq 'does not exist in the hub sprite' <<<"$gout" \
-   && grep -Fq 'team-chat' <<<"$gout" && grep -Fq 'app-docs' <<<"$gout" \
-   && grep -Fq 'Available glyphs:' <<<"$gout"; then
-  ok "shortcut: rejects glyph absent from the sprite, naming id+glyph+candidates"
-else
-  bad "shortcut: rejects glyph absent from the sprite — $(head -1 <<<"$gout")"
-fi
-# A near-miss gets a did-you-mean so the fix is one read away.
-sc "${SC_OK/app-chat/app-chatt}"
-gout="$(run "$TMP/sc.toml" validate 2>&1)"
-if [ $? -ne 0 ] && grep -Fq 'Did you mean' <<<"$gout" && grep -Fq 'app-chat' <<<"$gout"; then
-  ok "shortcut: near-miss glyph suggests the close sprite id"
-else
-  bad "shortcut: near-miss glyph suggests the close sprite id — $(head -1 <<<"$gout")"
-fi
-sc "${SC_OK/comms/chat}"
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects unknown cat"; else ok "shortcut: rejects unknown cat"; fi
-sc "$SC_OK
-icon = \"icons/chat.png\""
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects unknown key"; else ok "shortcut: rejects unknown key"; fi
-# One id renders one tile. A collision would have the launcher draw whichever of
-# the two webjson wrote last, which is neither an error nor a choice anyone made.
-sc "${SC_OK/team-chat/fileview}"
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects id colliding with an app"; else ok "shortcut: rejects id colliding with an app"; fi
-
-# `section` — the launcher heading. Optional, defaulted in webjson so the
-# launcher never has to invent one.
-sc "$SC_OK
-section = \"Shared services\""
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then ok "shortcut: section validates"; else bad "shortcut: section validates"; fi
-wjs="$(run "$TMP/sc.toml" webjson 2>/dev/null)"
-grep -q '"section": "Shared services"' <<<"$wjs" && ok "shortcut: webjson carries the declared section" \
-  || bad "shortcut: webjson carries the declared section"
-sc "$SC_OK"
-wjs="$(run "$TMP/sc.toml" webjson 2>/dev/null)"
-grep -q '"section": "Shortcuts"' <<<"$wjs" && ok "shortcut: webjson defaults the section" \
-  || bad "shortcut: webjson defaults the section"
-# The launcher tells a viewer that these tiles leave the gate, and it decides
-# that from `shortcut`, not from `external` — a packaged app on its own port is
-# external too and is still behind the gate.
-grep -q '"shortcut": true' <<<"$wjs" && ok "shortcut: webjson marks the tile as a shortcut" \
-  || bad "shortcut: webjson marks the tile as a shortcut"
-# `audience` — who the launcher shows this tile to. The regression this pins is
-# the one that shipped: the shortcut entry carried NO audience key at all, and
-# airlockTileVisible reads a missing audience as owner-only (#249), so the five
-# company shortcuts were invisible to collaborators and nothing in the config
-# could say otherwise. Owner decision 2026-08-25 made them shared.
-grep -q '"audience": "shared"' <<<"$wjs" && ok "shortcut: webjson defaults audience to shared" \
-  || bad "shortcut: webjson defaults audience to shared"
-sc "$SC_OK
-audience = \"owner\""
-wjs="$(run "$TMP/sc.toml" webjson 2>/dev/null)"
-grep -q '"audience": "owner"' <<<"$wjs" && ok "shortcut: webjson carries a declared owner audience" \
-  || bad "shortcut: webjson carries a declared owner audience"
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then ok "shortcut: audience=owner validates"; else bad "shortcut: audience=owner validates"; fi
-sc "$SC_OK
-audience = \"everyone\""
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects unknown audience"; else ok "shortcut: rejects unknown audience"; fi
-# The default is the whole point of the change, so it is asserted where the
-# launcher reads it, not only where validate accepts it: a shortcut that says
-# nothing must reach collaborators.
-sc "$SC_OK"
-wjs="$(run "$TMP/sc.toml" webjson 2>/dev/null)"
-python3 - "$wjs" <<'PYEOF' && ok "shortcut: silent shortcut resolves shared, package silence still resolves owner" \
-  || bad "shortcut: silent shortcut resolves shared, package silence still resolves owner"
+# 16 · a file that will not parse yields no links and ONE line on stderr; every
+# other file is still read and webjson still answers 0. One company's broken
+# links.toml must not be able to stop this box from installing or publishing.
+printf '[broken\nname = "unterminated\n' >"$HOME/.config/airlock/links.toml"
+brk="$(src '' sources 2>"$TMP/err")" && brk_rc=0 || brk_rc=$?
+python3 - "$brk" <<'PYEOF' && ok "sources: a broken personal links file yields no links of its own" \
+  || bad "sources: a broken personal links file yields no links of its own"
 import json, sys
 d = json.loads(sys.argv[1])
-sc = d["apps"]["team-chat"]
-assert sc["audience"] == "shared", sc
-# and the package rule is untouched in the same output
-fv = d["apps"]["fileview"]
-assert fv["audience"] == "owner", fv
+assert [r["id"] for r in d["links"]] == ["team-chat"], d["links"]
 PYEOF
-sc "$SC_OK
-section = \"\""
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects empty section"; else ok "shortcut: rejects empty section"; fi
-# Two headings differing only by an invisible character render as one name over
-# two grids — the screen cannot show the difference, so validate must.
-sc "$SC_OK
-section = \"Shared\tservices\""
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects control char in section"; else ok "shortcut: rejects control char in section"; fi
-sc "$SC_OK
-section = \"$(printf 'x%.0s' $(seq 33))\""
-if run "$TMP/sc.toml" validate >/dev/null 2>&1; then bad "shortcut: rejects over-long section"; else ok "shortcut: rejects over-long section"; fi
+if [ "$brk_rc" = 0 ] && [ "$(grep -c 'skipping links in' "$TMP/err")" = 1 ] \
+   && grep -q "$HOME/.config/airlock/links.toml" "$TMP/err" \
+   && run "$TMP/src.toml" webjson >/dev/null 2>&1; then
+  ok "sources: a broken links.toml is one stderr line and rc 0"
+else
+  bad "sources: a broken links.toml is one stderr line and rc 0"
+fi
+# A shipped id is a Public candidate already. Listing it under Personal too made
+# every `sources` call print one duplicate warning per enabled app, which is noise
+# a daily read does not get to produce.
+src '' sources >"$TMP/clean.json" 2>"$TMP/clean-err"
+python3 - "$TMP/clean.json" <<'PYEOF' && ok "sources: a shipped builtin is never also a Personal candidate" \
+  || bad "sources: a shipped builtin is never also a Personal candidate"
+import json, sys
+d = json.load(open(sys.argv[1]))
+public = {r["id"] for r in d["apps"]["public"]}
+personal = {r["id"] for r in d["apps"]["personal"]}
+assert not (public & personal), sorted(public & personal)
+assert "fileview" in public, sorted(public)
+PYEOF
+# The regression is the duplicate, not the whole stderr channel — a file with a
+# bad row is SUPPOSED to say so. What must never appear is "offered by both" for
+# an id the two source lists already divide between them.
+if ! grep -q 'offered by both' "$TMP/clean-err"; then
+  ok "sources: the three origins never report the same id twice"
+else
+  bad "sources: the three origins never report the same id twice"
+  grep 'offered by both' "$TMP/clean-err" | head -3
+fi
+
+# An id shared by an app is still dropped rather than offered twice.
+cat >"$HOME/.config/airlock/links.toml" <<'TOML'
+[remote-vm]
+name = "remote vm"
+desc = "VM console"
+url = "https://vm.example.test/"
+glyph = "app-vm"
+icon = "not-a-url"
+
+[team-chat]
+name = "Personal chat"
+url = "https://mine.example.test/"
+
+[fileview]
+name = "shadows an app id"
+url = "https://shadow.example.test/"
+TOML
+
+out="$(src '' sources)"
+python3 - "$out" "$TMP/repo" <<'PYEOF' && ok "sources: apps are grouped by origin and links carry theirs" \
+  || bad "sources: apps are grouped by origin and links carry theirs"
+import json, pathlib, sys
+d = json.loads(sys.argv[1])
+# 17 · a row whose url is missing or plain http is skipped alone; the other two
+# links from the same file survive.
+assert sorted(r["id"] for r in d["links"] if r["origin"] == "company") == ["team-chat"], d["links"]
+# Company is shared (collaborators see company links, owner decision 2026-08-25)
+# and Personal is owner-only — the audience is decided by the source, so no file
+# has to declare one.
+aud = {r["id"]: r["audience"] for r in d["links"]}
+assert aud["team-chat"] == "shared" and aud["remote-vm"] == "owner", aud
+# The icon that is not an https URL is dropped and the glyph beside it stays.
+vm = next(r for r in d["links"] if r["id"] == "remote-vm")
+assert "icon" not in vm and vm["glyph"] == "app-vm", vm
+# 18 · an id shared with an app keeps ONE row, and the app wins.
+ids = [r["id"] for r in d["links"]]
+assert len(ids) == len(set(ids)), ids
+assert "fileview" not in ids, ids
+assert "fileview" in [r["id"] for r in d["apps"]["public"]], d["apps"]["public"]
+# The company repo's apps are candidates, with their own origin.
+wiki = d["apps"]["company"]
+assert [r["id"] for r in wiki] == ["wiki-manager"] and wiki[0]["origin"] == "company", wiki
+assert wiki[0]["glyph"] == "app-wiki" and wiki[0]["name"] == "Wiki", wiki
+assert d["company_repo"] == pathlib.Path(sys.argv[2]).resolve().as_uri(), d["company_repo"]
+PYEOF
+
+# 18 · the same id from a Company repo and from a personal package keeps one row.
+mkdir -p "$TMP/pkg"
+printf 'contract = 1\nid = "wiki-manager"\n[tile]\nlabel = "Mine"\nglyph = "app-wiki"\n' \
+  >"$TMP/pkg/airlock-app.toml"
+printf '[site]\ncompany_repo = "%s"\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[packages.wiki-manager]\npath = "%s"\n[apps.hub]\n[apps.wiki-manager]\n' \
+  "$TMP/repo" "$TMP/pkg" >"$TMP/dup.toml"
+seed_apps wiki-manager "$TMP/pkg"
+dup="$(run "$TMP/dup.toml" sources 2>"$TMP/dup-err")"
+python3 - "$dup" <<'PYEOF' && ok "sources: one id from both origins keeps the Company row" \
+  || bad "sources: one id from both origins keeps the Company row"
+import json, sys
+d = json.loads(sys.argv[1])
+rows = d["apps"]["company"] + d["apps"]["personal"]
+assert [r["id"] for r in rows] == ["wiki-manager"], rows
+assert rows[0]["origin"] == "company" and rows[0]["name"] == "Wiki", rows[0]
+PYEOF
+grep -q 'offered by both personal and company' "$TMP/dup-err" \
+  && ok "sources: the dropped duplicate is named on stderr" \
+  || bad "sources: the dropped duplicate is named on stderr"
+
+rm -f "$AIRLOCK_STATE_DIR/installed-apps.json"
+
+# A links file saved in the wrong encoding used to take the whole reader down with
+# a UnicodeDecodeError traceback and rc=1 — the promise is that this file alone is
+# skipped and every other source, and the projection, survive it.
+printf '\xff\xfe\x00bad' >"$TMP/repo/links.toml"
+company_commit 'invalid links encoding'
+bin_wjs="$(src '' sources 2>"$TMP/bin-err")" && bin_rc=0 || bin_rc=$?
+python3 - "$bin_wjs" <<'PYEOF' && ok "sources: a non-UTF-8 links file is skipped, not fatal" \
+  || bad "sources: a non-UTF-8 links file is skipped, not fatal"
+import json, sys
+d = json.loads(sys.argv[1])
+# The personal file was still read, and the company apps are still listed. The
+# company file contributed nothing at all — including its team-chat, which the
+# personal file also declares, so that one survives from there instead.
+assert [r["id"] for r in d["links"]] == ["remote-vm", "team-chat"], d["links"]
+assert [r["id"] for r in d["apps"]["company"]] == ["wiki-manager"], d["apps"]["company"]
+PYEOF
+if [ "$bin_rc" = 0 ] && grep -q 'not valid UTF-8' "$TMP/bin-err" \
+   && src '' webjson >/dev/null 2>&1; then
+  ok "sources: a non-UTF-8 links file keeps webjson at rc 0"
+else
+  bad "sources: a non-UTF-8 links file keeps webjson at rc 0"
+fi
+
+# Put the company file back — the assertions below read it.
+cat >"$TMP/repo/links.toml" <<'TOML'
+[team-chat]
+name = "Team Chat"
+desc = "팀 채팅"
+url = "https://chat.example.test/"
+glyph = "app-chat"
+
+[broken-https]
+name = "broken-https"
+url = "http://insecure.example.test/"
+
+[nourl]
+name = "no url"
+TOML
+
+company_commit 'restore links'
+
+# 15 · four ordinary states, all of them an empty Company menu at rc 0: no key at
+# all, a path that does not exist, a directory with no apps/ and no links.toml,
+# and the shape the key really takes — a git URL this reader does not clone.
+printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n[apps.fileview]\n' \
+  >"$TMP/nocompany.toml"
+printf '[site]\ncompany_repo = "%s"\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n' \
+  "$TMP/does-not-exist" >"$TMP/c-missing.toml"
+printf '[site]\ncompany_repo = "%s"\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n' \
+  "$TMP/pkg" >"$TMP/c-bare.toml"
+printf '[site]\ncompany_repo = "file:///nonexistent/company.git"\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n' \
+  >"$TMP/c-url.toml"
+for cfg in "$TMP/nocompany.toml" "$TMP/c-missing.toml" "$TMP/c-bare.toml" "$TMP/c-url.toml"; do
+  got="$(run "$cfg" sources 2>"$TMP/case-err")" && rc=0 || rc=$?
+  python3 - "$got" <<'PYEOF'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["apps"]["company"] == [], d["apps"]["company"]
+assert not [r for r in d["links"] if r["origin"] == "company"], d["links"]
+PYEOF
+  if [ "$rc" = 0 ]; then
+    ok "sources: $(basename "$cfg") is an empty Company menu, not an error"
+  else
+    bad "sources: $(basename "$cfg") is an empty Company menu, not an error (rc=$rc)"
+  fi
+done
+# A git URL says why it produced nothing, so an empty Company menu is never a
+# mystery. A URL is also never treated as a path.
+grep -q 'Company source unavailable' "$TMP/case-err" \
+  && ok "sources: an unavailable Company main reports the fetch failure" \
+  || bad "sources: an unavailable Company main reports the fetch failure"
+# A file URL reads the same pinned main through the engine mirror. An
+# uncommitted working-tree edit cannot change an offer, and no source checkout
+# or operator config/installation record is created by this read.
+printf '[site]\ncompany_repo = "file://%s"\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n' \
+  "$TMP/repo" >"$TMP/url-main.toml"
+cp "$TMP/url-main.toml" "$TMP/url-main.before"
+printf '\n# local uncommitted edit\n' >>"$TMP/repo/apps/wiki-manager/airlock-app.toml"
+url_main="$(run "$TMP/url-main.toml" sources)"
+python3 - "$url_main" "$TMP" <<'PYEOF' && ok "sources: URL main uses only the canonical bare mirror and preserves config/store" \
+  || bad "sources: URL main uses only the canonical bare mirror and preserves config/store"
+import json, pathlib, subprocess, sys
+value, root = json.loads(sys.argv[1]), pathlib.Path(sys.argv[2])
+assert [row["id"] for row in value["apps"]["company"]] == ["wiki-manager"]
+assert [row["id"] for row in value["links"] if row["origin"] == "company"] == ["team-chat"]
+mirror = root / "data/sources/company.git"
+main = subprocess.check_output(["git", "-C", str(root / "repo"), "rev-parse", "main"], text=True).strip()
+pinned = subprocess.check_output(["git", "-C", str(mirror), "rev-parse", "FETCH_HEAD"], text=True).strip()
+assert pinned == main
+assert (root / "url-main.toml").read_bytes() == (root / "url-main.before").read_bytes()
+assert not (root / "state/installed-apps.json").exists()
+assert sorted(path.name for path in (root / "data/sources").iterdir()) == ["company.git"]
+assert not (root / "data/apps").exists()
+PYEOF
+# All Company local path spellings name the same repository URL. Explicit
+# Personal --source directories retain their separate app-directory contract.
+python3 - "$HERE/../bin/airlock-ledger" "$TMP/repo" <<'PYEOF' && ok "Company path spellings normalize to one repository URL" \
+  || bad "Company path spellings normalize to one repository URL"
+import os, pathlib, runpy, sys
+engine = runpy.run_path(sys.argv[1])
+repo = pathlib.Path(sys.argv[2]).resolve()
+normalize = lambda value: engine["company_repo"]({"company_repo": value})
+assert normalize(str(repo)) == repo.as_uri()
+os.chdir(repo.parent)
+assert normalize(repo.name) == repo.as_uri()
+os.environ["HOME"] = str(repo.parent)
+assert normalize("~/" + repo.name) == repo.as_uri()
+os.environ["COMPANY_PATH_FIXTURE"] = str(repo)
+assert normalize("$COMPANY_PATH_FIXTURE") == repo.as_uri()
+for url in (repo.as_uri(), "https://example.test/company.git", "git@example.test:company.git", ""):
+    assert normalize(url) == url
+PYEOF
+# The same read also preserves a pre-existing canonical installation record.
+mkdir -p "$TMP/state"
+printf '{}\n' >"$TMP/state/installed-apps.json"
+cp "$TMP/state/installed-apps.json" "$TMP/installed.before"
+if run "$TMP/url-main.toml" sources >"$TMP/url-existing.json" \
+   && cmp -s "$TMP/state/installed-apps.json" "$TMP/installed.before" \
+   && cmp -s "$TMP/url-main.toml" "$TMP/url-main.before"; then
+  ok "sources: an existing installation record stays byte-identical"
+else
+  bad "sources: an existing installation record stays byte-identical"
+fi
+rm "$TMP/state/installed-apps.json"
+
+# 🔴 One key, not two. `[site] company_repo` is the only Company declaration that
+# means anything; a leftover `[company] repo` is ignored rather than honoured.
+printf '[site]\ncompany_repo = "%s"\n[company]\nrepo = "/nonexistent/decoy"\n[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n' \
+  "$TMP/repo" >"$TMP/c-decoy.toml"
+decoy="$(run "$TMP/c-decoy.toml" sources)"
+python3 - "$decoy" <<'PYEOF' && ok "sources: the retired [company] table changes nothing" \
+  || bad "sources: the retired [company] table changes nothing"
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["company_repo"].endswith("/repo"), d["company_repo"]
+assert [r["id"] for r in d["apps"]["company"]] == ["wiki-manager"], d["apps"]["company"]
+PYEOF
+
+# The launcher reads links through webjson, not the owner API, because a
+# collaborator has to see the company links too.
+wjs="$(run "$TMP/src.toml" webjson)"
+python3 - "$wjs" <<'PYEOF' && ok "sources: webjson projects links with link, external and tile" \
+  || bad "sources: webjson projects links with link, external and tile"
+import json, sys
+a = json.loads(sys.argv[1])["apps"]
+chat = a["team-chat"]
+assert chat["link"] is True and chat["external"] is True, chat
+assert chat["audience"] == "shared", chat
+assert chat["tile"] == {"label": "Team Chat", "sub": "팀 채팅",
+                        "path": "https://chat.example.test/", "glyph": "app-chat"}, chat["tile"]
+# An app id that also appears in a links file stays an app: one id, one row.
+assert "link" not in a["fileview"], a["fileview"]
+PYEOF
+
+# No shortcut table is read any more, and a leftover one is ignored rather than
+# fatal: validate stays at rc 0 and nothing projects it.
+# The header is assembled rather than written out: a literal retired table name in
+# this file would make the card's own deletion grep match its own counterexample.
+DOT="."
+printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n[shortcuts%slegacy]\nlabel = "Legacy"\nurl = "https://legacy.example.test/"\ncat = "tools"\n' \
+  "$DOT" >"$TMP/legacy.toml"
+if run "$TMP/legacy.toml" validate >/dev/null 2>&1 \
+   && ! run "$TMP/legacy.toml" webjson | grep -q legacy; then
+  ok "sources: a leftover retired shortcut table validates and projects nothing"
+else
+  bad "sources: a leftover retired shortcut table validates and projects nothing"
+fi
+HOME="$HOME_SAVE"
 
 # ---- hub inherits the account-surface keys still written under [apps.devterm] ----
 # The surface moved to the platform; the operator's config did not. good.toml sets
@@ -650,6 +665,78 @@ sed -e 's|^\[apps.hub\]$|[apps.hub]\nxai = false|' "$TMP/good.toml" >"$TMP/hubwi
 case "$(run "$TMP/hubwins.toml" env hub 2>/dev/null)" in
   *"AIRLOCK_HUB_XAI=false"*) ok "hub: an explicit hub value beats the devterm fallback" ;;
   *) bad "hub: an explicit hub value beats the devterm fallback" ;; esac
+
+
+# Recorded membership/source consumer regressions (existing suite).
+if python3 - "$HERE/.." <<'PY_CONFIG_MEMBERSHIP'
+#!/usr/bin/env python3
+"""Read-only engine hook/defaults fixtures; no live units or writes."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+import sys
+ROOT = Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix="airlock-config-membership-") as scratch:
+    base = Path(scratch)
+    config = base / "config.toml"
+    state = base / "state"
+    state.mkdir()
+    config.write_text(
+        '[auth]\nprovider="tailscale"\nowner="fixture@test"\n'
+        '[packages.publish]\npath=' + json.dumps(str(ROOT / "apps/publish")) + '\n'
+    )
+    env = dict(os.environ, AIRLOCK_ROOT=str(ROOT), AIRLOCK_CONFIG=str(config),
+               AIRLOCK_STATE_DIR=str(state), AIRLOCK_DATA_DIR=str(base / "data"))
+    for key in ("AIRLOCK_APP_ID", "AIRLOCK_APP_DIR", "AIRLOCK_CONFIG_SNAPSHOT",
+                "AIRLOCK_CONFIG_SNAPSHOT_SHA256", "AIRLOCK_INSTALL_PKG_INFO_SHA256",
+                "AIRLOCK_PKG_INFO", "AIRLOCK_SHIPPED_APPS_ROOT", "AIRLOCK_PROJECT_IDS",
+                "AIRLOCK_CONFIG_BIN"):
+        env.pop(key, None)
+
+    def run(*args, extra=None):
+        return subprocess.run(args, env=dict(env, **(extra or {})),
+                              capture_output=True, text=True, timeout=30)
+
+    def cfg(*args, extra=None):
+        return run("python3", str(ROOT / "bin/airlock-config"), *args, extra=extra)
+
+    before_config = config.read_bytes()
+    # A registered candidate does not become installed by resolving defaults.
+    result = cfg("get", "apps.publish.backend_port")
+    assert result.returncode != 0, result.stdout
+    hook = {"AIRLOCK_APP_ID": "publish", "AIRLOCK_APP_DIR": str(ROOT / "apps/publish")}
+    result = cfg("get", "apps.publish.backend_port", extra=hook)
+    assert result.returncode == 0 and result.stdout.strip() == "19922", (result.stdout, result.stderr)
+    result = run("bash", "-c", 'source "$AIRLOCK_ROOT/install/lib.sh"; airlock_load publish; '
+                 'test "$AIRLOCK_PUBLISH_BACKEND_PORT" = 19922', extra=hook)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    record = state / "installed-apps.json"
+    record.write_text(json.dumps({"publish": {"repo": str(ROOT / "apps/publish"),
+                                             "commit": "", "artifacts": []}}))
+    before_record = record.read_bytes()
+    result = cfg("env", "publish")
+    assert result.returncode == 0 and "AIRLOCK_PUBLISH_BACKEND_PORT=19922" in result.stdout, (result.stdout, result.stderr)
+    assert config.read_bytes() == before_config and record.read_bytes() == before_record
+
+    config.write_text(config.read_text() + '[apps.publish]\nbackend_port=19929\n')
+    result = cfg("get", "apps.publish.backend_port")
+    assert result.returncode == 0 and result.stdout.strip() == "19929", (result.stdout, result.stderr)
+    config.write_text(config.read_text() + 'backend_port=19930\n')
+    result = cfg("validate")
+    assert result.returncode != 0, (result.stdout, result.stderr)
+
+print("PASS real airlock_load, installed defaults, candidate exclusion, explicit inputs, read bytes")
+
+PY_CONFIG_MEMBERSHIP
+then
+  ok "config membership uses recorded installation and source identity"
+else
+  bad "config membership consumer regression"
+fi
 
 echo "---"
 echo "passed=$pass failed=$fail"

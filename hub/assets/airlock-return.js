@@ -1,4 +1,7 @@
-/* airlock-return.js — a "return to Airlock" button + unread badge (shared widget).
+/* airlock-return.js — Porthole: return button, unread badge and Peek bubbles.
+ * Peek uses the existing preview poll; only unread peek:true cards opt in.
+ * data-peek-normal-ms (15000) / data-peek-urgent-ms (90000, capped at 90000)
+ * override display time. Tap opens Inbox; dismissing never marks a card read.
  *
  * Why: when an Airlock tool is used as a home-screen standalone web app there is
  * no browser chrome (no back button), so there is no way back to the Airlock
@@ -113,6 +116,7 @@
   // rejection quietter. Everywhere else (hub-served subpaths, devterm/code-server/
   // orca/paseo) the visitor is always the owner, so the poll stays on by default.
   var wantBadge = true;
+  var peekNormalMs = 15000, peekUrgentMs = 90000;
   try {
     var self = document.currentScript ||
       document.querySelector('script[src^="/airlock-return.js"]');
@@ -130,6 +134,8 @@
       if (!accountBase && self.dataset.panel) accountBase = baseUrl(self.dataset.panel);
       if (self.dataset.panel) legacyBase = baseUrl(self.dataset.panel);
       if (self.dataset.badge === "0") wantBadge = false;
+      peekNormalMs = airlockPeekDuration(self.dataset.peekNormalMs, 15000);
+      peekUrgentMs = airlockPeekDuration(self.dataset.peekUrgentMs, 90000, 90000);
     }
   } catch (e) {}
   var useMenu = wantMenu && !!(accountBase || secretBase);
@@ -173,6 +179,33 @@
   function airlockIsCloseMessage(data) {
     return data === "airlock-panel-close" || data === "swk-panel-close";
   }
+  function airlockPeekDuration(value, fallback, cap) {
+    var ms = Number(value);
+    return Number.isFinite(ms) && ms > 0 ? Math.min(ms, cap || Infinity) : fallback;
+  }
+  function airlockPeekCompare(a, b) {
+    if (a.last_at !== b.last_at) return a.last_at < b.last_at ? -1 : 1;
+    return a.card_id === b.card_id ? 0 : a.card_id < b.card_id ? -1 : 1;
+  }
+  function airlockSelectPeeks(messages, seen, pending) {
+    // First visit seeds from the whole response, including read/non-Peek cards.
+    if (!seen) {
+      seen = { last_at: "", card_id: "" };
+      messages.forEach(function (card) {
+        if (airlockPeekCompare(card, seen) > 0) seen = { last_at: card.last_at, card_id: card.card_id };
+      });
+      return { seen: seen, cards: [] };
+    }
+    var cards = pending.slice();
+    messages.forEach(function (card) {
+      if (card.peek !== true || card.read_at || airlockPeekCompare(card, seen) <= 0) return;
+      if (!cards.some(function (queued) { return airlockPeekCompare(card, queued) === 0; })) cards.push(card);
+    });
+    cards.sort(function (a, b) {
+      return Number(b.level === "urgent") - Number(a.level === "urgent") || airlockPeekCompare(a, b);
+    });
+    return { seen: seen, cards: cards };
+  }
   var FLOAT_SIZE = 44, CORNER_SIZE = 40, NATIVE_SIZE = 30, EDGE = 8, DRAG = 6;
   // The badge protrudes above/right of the button. Keep the whole control, not just
   // the button's box, outside phone notches and system gesture/status-bar areas.
@@ -188,8 +221,8 @@
   var btn = document.createElement("button");
   btn.id = ID;
   btn.type = "button";
-  btn.title = "Airlock (dev-hub home)";
-  btn.setAttribute("aria-label", "Return to Airlock");
+  btn.title = "Porthole — your way back into Airlock";
+  btn.setAttribute("aria-label", "Porthole — return to Airlock");
   var S = btn.style;                                 // inline styles = isolated from app CSS
   S.position = "fixed";
   S.zIndex = "2147483000";
@@ -259,6 +292,7 @@
     S.left = clamp(x, minX, maxX) + "px";
     S.top = clamp(y, minY, maxY) + "px";
     S.right = S.bottom = "auto";
+    positionPeek();
   }
   function anchorCorner() {                            // corner = top-left (respect safe-area)
     S.left = "calc(env(safe-area-inset-left, 0px) + 12px)";
@@ -334,10 +368,10 @@
     if (n > 0) {
       badge.textContent = n > 99 ? "99+" : String(n);
       badge.style.display = "block";
-      btn.setAttribute("aria-label", "Return to Airlock — " + n + " needs action");
+      btn.setAttribute("aria-label", "Porthole — return to Airlock, " + n + " needs action");
     } else {
       badge.style.display = "none";
-      btn.setAttribute("aria-label", "Return to Airlock");
+      btn.setAttribute("aria-label", "Porthole — return to Airlock");
     }
   }
   function pollUnread() {
@@ -354,9 +388,106 @@
         if (d === undefined) return;                  // unexpected status — keep last known
         setUnread((d && d.needs_action_count != null) ? d.needs_action_count
           : (d && d.unread_count) || 0);
+        if (d && Array.isArray(d.messages)) receivePeeks(d.messages);
       })
       .catch(function () {});                          // network / bad JSON — keep last known
   }
+
+  // ---- Peek: one bubble, one queue, one origin-local high-water mark ----
+  var PEEK_KEY = "airlock:peek-seen-v1";
+  var PEEK_WIDTH = 420;                               // desktop width; max-width shrinks it on phones
+  var peekSeen = null, peekQueue = [], peekEl = null, peekTimer = null;
+  try {
+    var savedPeek = JSON.parse(localStorage.getItem(PEEK_KEY));
+    if (savedPeek && typeof savedPeek.last_at === "string" && typeof savedPeek.card_id === "string") peekSeen = savedPeek;
+  } catch (e) {}
+  function savePeekSeen(seen) {
+    peekSeen = { last_at: seen.last_at, card_id: seen.card_id };
+    try { localStorage.setItem(PEEK_KEY, JSON.stringify(peekSeen)); } catch (e) {}
+  }
+  function receivePeeks(messages) {
+    var next = airlockSelectPeeks(messages, peekSeen, peekQueue);
+    if (!peekSeen) savePeekSeen(next.seen);
+    peekQueue = next.cards;
+    showNextPeek();
+  }
+  function positionPeek() {
+    if (!peekEl) return;
+    var r = btn.getBoundingClientRect();
+    var minX = safeArea.left + EDGE, minY = safeArea.top + EDGE;
+    var maxX = window.innerWidth - safeArea.right - EDGE - peekEl.offsetWidth;
+    var maxY = window.innerHeight - safeArea.bottom - EDGE - peekEl.offsetHeight;
+    var top = r.top - peekEl.offsetHeight - EDGE;
+    if (top < minY) top = r.bottom + EDGE;
+    peekEl.style.left = clamp(r.left, minX, maxX) + "px";
+    peekEl.style.top = clamp(top, minY, maxY) + "px";
+  }
+  function closePeek() {
+    clearTimeout(peekTimer);
+    peekTimer = null;
+    if (peekEl) { peekEl.remove(); peekEl = null; }
+    showNextPeek();
+  }
+  function showNextPeek() {
+    if (peekEl || !peekQueue.length) return;
+    var card = peekQueue.shift(), urgent = card.level === "urgent";
+    var duration = urgent ? peekUrgentMs : peekNormalMs;
+    var bubble = document.createElement("div");
+    bubble.setAttribute("aria-label", urgent ? "Urgent Peek" : "Peek");
+    // Width: ask for PEEK_WIDTH, then let max-width shrink it to the viewport. A phone
+    // gets whatever fits inside its safe area; a desktop gets the full width, because
+    // there the constraint is the reader's patience, not the glass. Measured capacity
+    // at 420px (Korean / Latin): title 25 / 40 chars, body 2 lines 60 / 94.
+    bubble.style.cssText = "position:fixed;z-index:2147483050;display:flex;align-items:center;" +
+      "box-sizing:border-box;width:" + PEEK_WIDTH + "px;max-width:calc(100vw - 16px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));" +
+      "background:#202431;border:1px solid #3a4254;border-radius:10px;overflow:hidden;" +
+      "box-shadow:0 8px 24px rgba(0,0,0,.4);" + (urgent ? "border-left:4px solid #e05a5a;" : "");
+    var content = menuRow(String(card.title || "").split(/\r?\n/)[0],
+      String(card.body || "").replace(/\s+/g, " ").trim(), function () { closePeek(); openInbox(); });
+    content.style.flex = "1";
+    content.style.minWidth = "0";
+    content.style.width = "auto";
+    // Title is one line: it names the card and a wrapped title reads as two cards.
+    // Body gets two, the same shape as a phone's own notification banner — one line
+    // truncated mid-sentence is usually not enough to decide whether to open it.
+    if (content.children[0]) {
+      content.children[0].style.cssText += ";white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+    }
+    if (content.children[1]) {
+      // menuRow's sub-line is amber because in the MENU it carries an alert reason.
+      // A Peek body is ordinary card text, so it takes the muted tone instead.
+      content.children[1].style.cssText += ";color:#c3c9d4;display:-webkit-box;-webkit-box-orient:vertical;" +
+        "-webkit-line-clamp:2;line-clamp:2;overflow:hidden;";
+    }
+    var x = document.createElement("button");
+    x.type = "button"; x.textContent = "✕"; x.setAttribute("aria-label", "Close Peek");
+    x.style.cssText = "flex:0 0 36px;height:36px;margin:4px;border:0;border-radius:8px;" +
+      "background:#3a4254;color:#fff;font:16px/1 system-ui,sans-serif;cursor:pointer;";
+    x.addEventListener("click", function (e) { e.preventDefault(); e.stopPropagation(); closePeek(); });
+    bubble.appendChild(content); bubble.appendChild(x);
+    var progress = null;
+    if (urgent) {
+      progress = document.createElement("div");
+      progress.setAttribute("aria-hidden", "true");
+      progress.style.cssText = "position:absolute;bottom:0;left:0;right:0;height:3px;background:#e05a5a;transform-origin:left;";
+      bubble.appendChild(progress);
+    }
+    (document.body || document.documentElement).appendChild(bubble);
+    peekEl = bubble;
+    positionPeek();
+    // Priority may show a newer urgent card before an older queued normal card.
+    // Never move the single persisted watermark backwards when that normal is shown.
+    if (airlockPeekCompare(card, peekSeen) > 0) savePeekSeen(card);
+    // Arm the close timer BEFORE the optional animation. Element.animate is the one
+    // call here that a browser may not have, and this runs inside the poll's promise
+    // chain, whose .catch swallows the throw — ordering it first would leave an urgent
+    // bubble on screen forever with nothing left to close it.
+    peekTimer = setTimeout(closePeek, duration);
+    if (progress && progress.animate) progress.animate([{ transform: "scaleX(1)" }, { transform: "scaleX(0)" }],
+      { duration: duration, fill: "forwards" });
+  }
+  window.addEventListener("resize", function () { readSafeArea(); positionPeek(); });
+  window.addEventListener("scroll", positionPeek, true);
 
   // ---- subscription warning ring ----
   // amber = warn, red + blink = critical. Blinking only at critical on purpose: a
@@ -521,6 +652,13 @@
     m.style.cssText = "position:fixed;z-index:2147483100;min-width:236px;background:#202431;" +
       "border:1px solid #3a4254;border-radius:10px;box-shadow:0 14px 36px rgba(0,0,0,.45);" +
       "padding:5px 0;overflow:hidden;";
+    // The menu names the control. Someone meeting this button for the first time
+    // otherwise has no way to learn what it is called or what it is for.
+    var cap = document.createElement("div");
+    cap.textContent = "Porthole";
+    cap.style.cssText = "padding:8px 14px 6px;color:#8a93a6;font:600 11px/1.2 -apple-system,system-ui,sans-serif;" +
+      "letter-spacing:.06em;text-transform:uppercase;border-bottom:1px solid #2c3240;margin-bottom:4px;";
+    m.appendChild(cap);
     m.appendChild(menuRow("Go to Airlock", "", function () { closeMenu(); go(); }));
     m.appendChild(menuRow("Inbox · " + unreadCount + " unread", "", openInbox));
     if (accountBase) {

@@ -73,29 +73,9 @@ if [ -n "${AIRLOCK_RENDER_DIR:-}" ] && [ "${AIRLOCK_DRY_RUN:-0}" != 1 ]; then
 fi
 
 require_cmd() {
-  local c resolved receipt_row receipt_path predicate expected owners version
+  local c
   for c in "$@"; do
-    resolved="$(airlock_find_cmd "$c")" || die "required command not found: $c"
-    # Only an orchestrated lifecycle child has both markers. A directly invoked
-    # app uses the same resolver locally; an ambient receipt cannot become an
-    # admission switch.
-    if [ -n "${AIRLOCK_INSTALL_PKG_INFO_SHA256:-}" ] \
-      && [ -n "${AIRLOCK_PREREQ_RECEIPT:-}" ]; then
-      receipt_row="$(airlock_prerequisite_receipt_lookup "$c")" \
-        || die "required command was not approved by preflight receipt: $c"
-      IFS=$'\t' read -r receipt_path predicate expected owners <<< "$receipt_row"
-      [ "$resolved" = "$receipt_path" ] && [ -x "$receipt_path" ] \
-        || die "required command changed after preflight: $c (was $receipt_path, now $resolved)"
-      if [ "$predicate" = major-gte ]; then
-        version="$("$receipt_path" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || version=""
-        if [ "$c" != python3 ]; then
-          version="$("$receipt_path" -p 'process.versions.node.split(".")[0]' 2>/dev/null)" || version=""
-        fi
-        [[ "$version" =~ ^[0-9]+([.][0-9]+)?$ ]] || version=""
-        airlock_preflight_version_ge "${version:-0}" "$expected" \
-          || die "required command version changed after preflight: $c"
-      fi
-    fi
+    airlock_find_cmd "$c" >/dev/null || die "required command not found: $c"
   done
 }
 
@@ -215,7 +195,7 @@ airlock_handover_user_resource() {
   local kind="${1:?resource kind required}" resource="${2:?resource required}" \
         label="${3:?resource label required}"
   shift 3
-  local include_required_by=0 expected_service_environment="" service_exec_prefix=""
+  local include_required_by=0 expected_service_environment="" expected_service_exec_prefix=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --required-by) include_required_by=1; shift ;;
@@ -225,7 +205,7 @@ airlock_handover_user_resource() {
         ;;
       --service-exec-prefix)
         [ "$#" -ge 2 ] || die "--service-exec-prefix requires a value"
-        service_exec_prefix="$2"; shift 2
+        expected_service_exec_prefix="$2"; shift 2
         ;;
       *) break ;;
     esac
@@ -234,20 +214,11 @@ airlock_handover_user_resource() {
   local -a probe_args=("$kind" "$resource")
   local pids pid unit main_pid own seen required required_unit unit_environment unit_exec
 
-  if [ -n "$expected_service_environment" ]; then
-    [ "$kind" = pidfile ] \
-      || die "--service-environment is supported only for pidfile resources"
-    [ -n "$service_exec_prefix" ] \
-      || die "pidfile service handover requires --service-exec-prefix"
-    probe_args+=("$expected_service_environment")
-  elif [ -n "$service_exec_prefix" ]; then
-    die "--service-exec-prefix requires --service-environment"
-  fi
+  [ -z "$expected_service_environment" ] || probe_args+=("$expected_service_environment")
 
   require_cmd python3 systemctl
-  if ! pids="$(python3 "$AIRLOCK_ROOT/install/resource-holder-pids.py" "${probe_args[@]}")"; then
-    die "cannot inspect holders of $label — no service was stopped"
-  fi
+  pids="$(python3 "$AIRLOCK_ROOT/install/resource-holder-pids.py" "${probe_args[@]}")" \
+    || die "cannot inspect holders of $label — no service was stopped"
 
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
@@ -255,14 +226,13 @@ airlock_handover_user_resource() {
       [ -e "/proc/$pid" ] || continue  # holder exited between the two measurements
       die "$label is held by PID $pid outside a loaded user unit — no service was stopped"
     fi
+    # A resource this mechanism cannot safely release: killing a whole scope or a
+    # unit type other than a plain service on the strength of one member PID is
+    # not a narrower version of stopping the measured holder, it is a different,
+    # broader operation this call never asked for.
     case "$unit" in
       *.service) ;;
-      *.scope)
-        die "$label is held by PID $pid in scope '$unit' — refusing to stop a whole scope from one member PID"
-        ;;
-      *)
-        die "$label is held by PID $pid in non-stoppable user unit '$unit' — no service was stopped"
-        ;;
+      *) die "$label is held by PID $pid in non-stoppable user unit '$unit' — no service was stopped" ;;
     esac
 
     own=0
@@ -271,16 +241,24 @@ airlock_handover_user_resource() {
     done
     [ "$own" = 0 ] || continue
 
+    # A child PID inside a broader service authorizes stopping the whole unit
+    # only when the caller's declared environment and exec-prefix both match
+    # the unit that PID actually belongs to (pidfile daemons) — matching
+    # environment alone would let an unrelated process holding the same env
+    # var impersonate the declared app (install/test-legacy-singleton-handover.sh
+    # exercises exactly that).
     if [ -n "$expected_service_environment" ]; then
       if ! unit_environment="$(systemctl --user show "$unit" --property=Environment --value 2>/dev/null)" \
          || ! python3 -c 'import shlex,sys; raise SystemExit(0 if sys.argv[1] in shlex.split(sys.argv[2]) else 1)' \
               "$expected_service_environment" "$unit_environment"; then
         die "$label PID $pid belongs to '$unit', but that service does not declare $expected_service_environment — refusing to stop it"
       fi
-      if ! unit_exec="$(systemctl --user show "$unit" --property=ExecStart --value 2>/dev/null)" \
-         || ! python3 -c 'import re,shlex,sys; m=re.search(r"(?:^|; )argv\[\]=(.*?)(?: ;|$)",sys.argv[2]); want=shlex.split(sys.argv[1]); got=shlex.split(m.group(1)) if m else []; raise SystemExit(0 if want and got[:len(want)]==want else 1)' \
-              "$service_exec_prefix" "$unit_exec"; then
-        die "$label PID $pid belongs to '$unit', but that service ExecStart does not match the declared application signature — refusing to stop it"
+      if [ -n "$expected_service_exec_prefix" ]; then
+        if ! unit_exec="$(systemctl --user show "$unit" --property=ExecStart --value 2>/dev/null)" \
+           || ! python3 -c 'import re,shlex,sys; m=re.search(r"(?:^|; )argv\[\]=(.*?)(?: ;|$)",sys.argv[2]); want=shlex.split(sys.argv[1]); got=shlex.split(m.group(1)) if m else []; raise SystemExit(0 if want and got[:len(want)]==want else 1)' \
+                "$expected_service_exec_prefix" "$unit_exec"; then
+          die "$label PID $pid belongs to '$unit', but that service ExecStart does not match the declared application signature — refusing to stop it"
+        fi
       fi
     fi
 
@@ -290,7 +268,6 @@ airlock_handover_user_resource() {
         || die "$label is held by child PID $pid in broad service '$unit' (MainPID ${main_pid:-unknown}) — refusing to stop the whole service"
       python3 "$AIRLOCK_ROOT/install/resource-holder-pids.py" process-descendant "$pid" "$main_pid" \
         || die "$label PID $pid is not a descendant of '$unit' MainPID ${main_pid:-unknown} — refusing to stop the whole service"
-      log "handover $label: child PID $pid has matching record, exact service ExecStart, MainPID ancestry, and process+service environment $expected_service_environment"
     fi
 
     seen=0
@@ -300,9 +277,8 @@ airlock_handover_user_resource() {
     [ "$seen" = 1 ] || stop_units+=("$unit")
 
     if [ "$include_required_by" = 1 ]; then
-      if ! required="$(systemctl --user show "$unit" --property=RequiredBy --value 2>/dev/null)"; then
-        die "cannot inspect services requiring measured holder unit '$unit' for $label"
-      fi
+      required="$(systemctl --user show "$unit" --property=RequiredBy --value 2>/dev/null)" \
+        || die "cannot inspect services requiring measured holder unit '$unit' for $label"
       for required_unit in $required; do
         case "$required_unit" in
           *.service) ;;
@@ -327,22 +303,6 @@ airlock_handover_user_resource() {
     systemctl --user stop "${stop_units[@]}" \
       || die "failed to stop holder unit(s) for $label: ${stop_units[*]}"
   fi
-
-  if ! pids="$(python3 "$AIRLOCK_ROOT/install/resource-holder-pids.py" "${probe_args[@]}")"; then
-    die "cannot verify release of $label after handover"
-  fi
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    if ! unit="$(systemctl --user whoami "$pid" 2>/dev/null)"; then
-      [ -e "/proc/$pid" ] || continue
-      die "$label is still held by PID $pid after handover"
-    fi
-    own=0
-    for seen in "${own_units[@]}"; do
-      [ "$unit" = "$seen" ] && own=1
-    done
-    [ "$own" = 1 ] || die "$label is still held by PID $pid in $unit after handover"
-  done <<<"$pids"
 }
 
 # airlock_quiet <cmd...> — quiet while it works, talkative when it does not.
@@ -399,31 +359,7 @@ airlock_pin_state_dir() {
   export AIRLOCK_STATE_DIR
 }
 
-# Every process that can change an installed box enters through one expiring,
-# metadata-bearing lease.  The ledger command owns the kernel flock and runs the
-# mutator as its child. A nested updater -> installer joins only when it inherited
-# the actual flock fd; an ambient id without that fd is refused.
-airlock_require_live_box_lease() {
-  "$AIRLOCK_ROOT/bin/airlock-ledger" live-box-lease-require
-}
-
-airlock_enter_live_box_lease() { # <reason> <command> [arguments]
-  local reason="${1:?live-box lease reason required}"; shift
-  if [ -n "${AIRLOCK_LIVE_BOX_LEASE_ID:-}" ]; then
-    airlock_require_live_box_lease \
-      || die "live-box lease identity is stale, forged, or no longer held"
-    return 0
-  fi
-  local agent_id="${PASEO_AGENT_ID:-operator:$(id -u)}"
-  local card="${AIRLOCK_LIVE_BOX_CARD:-manual/live-box}"
-  local ttl="${AIRLOCK_LIVE_BOX_TTL_SECONDS:-3600}"
-  exec "$AIRLOCK_ROOT/bin/airlock-ledger" live-box-lease-run \
-    --agent-id="$agent_id" --card="$card" --reason="$reason" --ttl-seconds="$ttl" \
-    -- "$@"
-}
-
-# airlock_pkg_dir <app> — canonical package dir for a [packages.*] app, or
-# nothing for a built-in. Callers set AIRLOCK_PKG_INFO once (the output of
+# airlock_pkg_dir <app> — the directory from config's engine-backed package projection. Callers set AIRLOCK_PKG_INFO once (the output of
 # `airlock_config package-info`) so N apps cost one config run, not N.
 airlock_pkg_dir() {
   local app="${1:?airlock_pkg_dir: app required}"
@@ -443,44 +379,46 @@ airlock_doc_assets_dir() {
   printf '%s\n' "$AIRLOCK_ROOT/docker/student-harness/skills/share-docs/assets"
 }
 
-# airlock_render_serve_https <app> — the platform's rendering of a packaged
-# app's `[serve.https]` manifest surface (docs/design/app-package-contract.md
-# D2 "Amended in child 4"; child-4 P2b STEP 0 infra). Reads AIRLOCK_PKG_INFO's
-# serve_mappings (mode == "https" entries only) for <app> and runs the exact
-# command devterm/code-server/orca/paseo used to call directly, inline, from
-# their own install.sh — byte-identical, per install/test-serve-https-parity.sh:
-#
-#   sudo tailscale serve --bg --https=<listen> http://127.0.0.1:<target>
-#
-# Callers set AIRLOCK_PKG_INFO once (same convention as airlock_pkg_dir), and
-# get airlock_run's dry-run gate for free (this is the same helper every real
-# mutation in this file already goes through). A no-op for a built-in or a
-# package with no https-mode serve mapping.
-airlock_render_serve_https() {
-  local app="${1:?airlock_render_serve_https: app required}"
-  [ -n "${AIRLOCK_PKG_INFO:-}" ] || return 0
-  local listen target
-  while IFS=$'\t' read -r listen target; do
-    [ -n "$listen" ] || continue
-    airlock_run sudo tailscale serve --bg --https="$listen" "http://127.0.0.1:${target}"
-  done < <(printf '%s' "$AIRLOCK_PKG_INFO" | python3 -c '
-import json, sys
-d = (json.load(sys.stdin).get("packages") or {}).get(sys.argv[1])
-if d:
-    for _key, m in sorted(d.get("serve_mappings", {}).items()):
-        if m.get("mode") == "https":
-            print(str(m["listen"]) + "\t" + str(m["target"]))
-' "$app")
+# Installation membership is ③, regardless of retained app input tables.
+# Consume the complete list so a matching id cannot SIGPIPE the producer.
+airlock_installed_app_ids() {
+  local installed
+  installed="$("$AIRLOCK_ROOT/bin/airlock-ledger" list)" || return "$?"
+  printf '%s\n' "$installed" | awk -F '\t' 'NF { print $1 }'
+}
+
+# Recorded source only: absent directories must never fall back to candidates.
+airlock_installed_app_dir() {
+  python3 - "$AIRLOCK_ROOT/bin/airlock-ledger" "$1" <<'PY_INSTALLED_DIR'
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+sys.dont_write_bytecode = True
+ledger = SourceFileLoader("installed_source_ledger", sys.argv[1]).load_module()
+directory = ledger.app_dirs({}).get(sys.argv[2])
+if not directory or not os.path.isdir(directory):
+    sys.exit(2)
+print(directory)
+PY_INSTALLED_DIR
+}
+
+airlock_app_installed() {
+  local installed
+  installed="$(airlock_installed_app_ids)" || return "$?"
+  printf '%s\n' "$installed" | awk -v app="$1" '
+    $0 == app { found = 1 }
+    END { exit !found }
+  '
 }
 
 # airlock_panel_url — base URL of devterm's account panel for the return widget, or
-# empty when devterm is not enabled. The widget is injected into tools that run on their
+# empty when devterm is not installed. The widget is injected into tools that run on their
 # own ports (orca, paseo); it can only offer the "subscription accounts" entry if there
 # is a devterm to open, and only devterm knows the accounts. Empty => the widget keeps
 # its plain behaviour (a tap returns to the hub) instead of showing a dead menu entry.
 airlock_panel_url() {
   local port fqdn
-  airlock_config apps | grep -qx devterm || return 0
+  airlock_app_installed devterm || return 0
   port="$(airlock_config get apps.devterm.https_port 2>/dev/null)" || return 0
   [ -n "$port" ] || return 0
   # The orchestrator measures the FQDN once and exports it (an operator override is what
@@ -541,98 +479,6 @@ airlock_publish_doc_url() {
   if [ "$port" = 443 ]; then printf 'https://%s' "$fqdn"; else printf 'https://%s:%s' "$fqdn" "$port"; fi
 }
 
-# airlock_require_nginx_publish_continuity <current-site> <candidate-site>
-#                                           <publish-enabled> <gate-port> <selector>
-#
-# Last gate before the installer replaces the live Airlock nginx site. nginx
-# syntax validation cannot detect a valid render that silently dropped a whole
-# listener or its identity gate. Preserve every listener owned by the current
-# site and, when publish is desired or already live, require one marked dedicated
-# block whose loopback port and fail-closed selector match the frozen candidate.
-airlock_require_nginx_publish_continuity() {
-  local current="$1" candidate="$2" publish_enabled="$3" gate_port="$4" selector="$5"
-  python3 - "$current" "$candidate" "$publish_enabled" "$gate_port" "$selector" <<'PY'
-import pathlib
-import re
-import stat
-import sys
-
-current_raw, candidate_raw, publish_enabled, gate_port, selector = sys.argv[1:]
-start_marker = "# ==== Publish dedicated document-view gate ===="
-end_marker = "# ==== End publish dedicated document-view gate ===="
-listen_re = re.compile(r"^\s*listen\s+([^;]+?)\s*;\s*$", re.MULTILINE)
-
-def read_regular(raw, *, required):
-    path = pathlib.Path(raw)
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        if required:
-            raise SystemExit(f"nginx continuity: missing candidate site: {path}")
-        return ""
-    except OSError as exc:
-        raise SystemExit(f"nginx continuity: cannot inspect {path}: {exc}")
-    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
-        raise SystemExit(f"nginx continuity: site must be a regular non-symlink file: {path}")
-    try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise SystemExit(f"nginx continuity: cannot read {path}: {exc}")
-
-def listens(value):
-    return {" ".join(match.split()) for match in listen_re.findall(value)}
-
-def publish_block(value):
-    if value.count(start_marker) != 1 or value.count(end_marker) != 1:
-        return None
-    start = value.index(start_marker)
-    end = value.index(end_marker, start)
-    return value[start:end + len(end_marker)]
-
-current = read_regular(current_raw, required=False)
-candidate = read_regular(candidate_raw, required=True)
-current_listens = listens(current)
-candidate_listens = listens(candidate)
-missing = sorted(current_listens - candidate_listens)
-if missing:
-    raise SystemExit(
-        "nginx continuity: candidate dropped live listen directives; "
-        f"current={sorted(current_listens)} candidate={sorted(candidate_listens)} "
-        f"missing={missing}"
-    )
-
-current_block = publish_block(current)
-candidate_block = publish_block(candidate)
-current_requires_publish = current_block is not None or "127.0.0.1:19925" in current_listens
-candidate_mentions_publish = candidate_block is not None or "127.0.0.1:19925" in candidate_listens
-if publish_enabled not in {"0", "1"}:
-    raise SystemExit("nginx continuity: invalid publish-enabled input")
-if publish_enabled == "1":
-    if not gate_port.isdigit() or not 1 <= int(gate_port) <= 65535:
-        raise SystemExit("nginx continuity: invalid candidate publish gate port")
-    if selector not in {"hub_ok", "tailnet_ok"}:
-        raise SystemExit("nginx continuity: invalid candidate publish selector")
-if current_requires_publish or publish_enabled == "1" or candidate_mentions_publish:
-    if candidate_block is None:
-        raise SystemExit("nginx continuity: candidate dropped the dedicated publish gate")
-    if publish_enabled != "1":
-        raise SystemExit("nginx continuity: candidate publish gate lacks frozen config authority")
-    expected_listen = f"listen 127.0.0.1:{gate_port};"
-    expected_gate = f"if (${selector} = 0) {{ return 403; }}"
-    if candidate_block.count(expected_listen) != 1:
-        raise SystemExit(
-            f"nginx continuity: dedicated publish gate must contain exactly one {expected_listen}"
-        )
-    # At least one, not exactly one: render-nginx.sh repeats the selector gate in every
-    # /publish/api location since #441, so a real candidate carries it more than once.
-    # A candidate with none still fails closed (F3, 2026-09-16).
-    if candidate_block.count(expected_gate) < 1:
-        raise SystemExit(
-            f"nginx continuity: dedicated publish gate must contain at least one {expected_gate}"
-        )
-PY
-}
-
 airlock_emit_owner_v1_map() { # <owner>
   local owner="${1:?owner-v1 map requires an owner}"
   # shellcheck disable=SC2016 # nginx runtime variables are emitted literally
@@ -646,135 +492,6 @@ airlock_emit_owner_v1_unit() { # <owner>
   local owner="${1:?owner-v1 unit requires an owner}"
   printf '# airlock-owner-v1 owner=%s\n' "$owner"
   airlock_emit_owner_v1_map "$owner"
-}
-
-# airlock_require_nginx_owner_continuity <current-site-snapshot> <current-present>
-#                                         <snapshot-owner> <transfer-from>
-#                                         [candidate-site]
-#
-# Pure decision boundary for the owner gate. The caller snapshots the current
-# site (with privilege when needed) so this helper neither reads mutable live
-# state nor writes anything. A v1 site binds its owner sentinel to one adjacent,
-# byte-exact canonical owner_ok map. A sentinel-free legacy site gets one
-# upgrade admission only for the previous renderer's exact map bytes. An owner
-# change is admitted only when argv named the exact previous owner; the
-# destination is always the validated config snapshot. Supplying candidate-site
-# requires the just-rendered replacement to be v1 and snapshot-owner exact.
-airlock_require_nginx_owner_continuity() {
-  local current="$1" current_present="$2" snapshot_owner="$3" transfer_from="$4"
-  local candidate="${5:-}"
-  python3 - "$current" "$current_present" "$snapshot_owner" "$transfer_from" \
-    "$candidate" <<'PY'
-import pathlib
-import stat
-import sys
-
-current_raw, current_present, snapshot_owner, transfer_from, candidate_raw = sys.argv[1:]
-
-SENTINEL_PREFIX = "# airlock-owner-v1 owner="
-SENTINEL_TOKEN = "# airlock-owner-v1"
-OWNER_MAP_HEADER = "map $http_tailscale_user_login $owner_ok {"
-
-def safe_owner(value):
-    local, separator, domain = value.partition("@")
-    return (
-        bool(local and separator and domain)
-        and '"' not in value
-        and "\\" not in value
-        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
-    )
-
-def require_owner_value(value, label, *, empty_ok=False):
-    if empty_ok and not value:
-        return
-    if not safe_owner(value):
-        raise SystemExit(f"nginx owner continuity: invalid {label}")
-
-def read_regular(raw, label):
-    path = pathlib.Path(raw)
-    try:
-        info = path.lstat()
-    except OSError as exc:
-        raise SystemExit(f"nginx owner continuity: cannot inspect {label}: {exc}")
-    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
-        raise SystemExit(f"nginx owner continuity: {label} must be a regular non-symlink file")
-    try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise SystemExit(f"nginx owner continuity: cannot read {label}: {exc}")
-
-def exact_count(value, expected):
-    return value.count(expected + "\n")
-
-def require_unique_owner_header(value, label):
-    if value.count(OWNER_MAP_HEADER) != 1:
-        raise SystemExit(
-            f"nginx owner continuity: {label} requires exactly one canonical owner-map header"
-        )
-
-def canonical_map(owner):
-    return (
-        "map $http_tailscale_user_login $owner_ok {\n"
-        "    default 0;\n"
-        f'    "{owner}" 1;\n'
-        "}"
-    )
-
-def canonical_unit(owner):
-    return f"{SENTINEL_PREFIX}{owner}\n{canonical_map(owner)}"
-
-def require_v1(value, label):
-    require_unique_owner_header(value, label)
-    if value.count(SENTINEL_TOKEN) != 1:
-        raise SystemExit(f"nginx owner continuity: {label} requires exactly one owner-v1 sentinel")
-    sentinel_lines = [
-        line for line in value.splitlines() if line.startswith(SENTINEL_PREFIX)
-    ]
-    if len(sentinel_lines) != 1:
-        raise SystemExit(f"nginx owner continuity: {label} owner-v1 sentinel is malformed")
-    owner = sentinel_lines[0][len(SENTINEL_PREFIX):]
-    require_owner_value(owner, f"{label} sentinel owner")
-    if exact_count(value, canonical_unit(owner)) != 1 \
-            or exact_count(value, canonical_map(owner)) != 1:
-        raise SystemExit(
-            f"nginx owner continuity: {label} owner-v1 unit is not byte-exact and unique"
-        )
-    return owner
-
-require_owner_value(snapshot_owner, "snapshot owner")
-require_owner_value(transfer_from, "transfer previous owner", empty_ok=True)
-if current_present not in {"0", "1"}:
-    raise SystemExit("nginx owner continuity: invalid current-site presence input")
-
-if current_present == "0":
-    if transfer_from:
-        raise SystemExit("nginx owner continuity: owner transfer cannot target a first install")
-else:
-    current_value = read_regular(current_raw, "current site snapshot")
-    if SENTINEL_TOKEN in current_value:
-        current_owner = require_v1(current_value, "current site")
-    else:
-        current_owner = transfer_from or snapshot_owner
-        require_unique_owner_header(current_value, "legacy current site")
-        if exact_count(current_value, canonical_map(current_owner)) != 1:
-            raise SystemExit(
-                "nginx owner continuity: legacy current site lacks one byte-exact canonical owner map"
-            )
-    if current_owner == snapshot_owner:
-        if transfer_from:
-            raise SystemExit("nginx owner continuity: stale owner-transfer authority on same-owner install")
-    elif transfer_from != current_owner:
-        raise SystemExit(
-            "nginx owner continuity: snapshot owner differs from current owner; "
-            "use --transfer-owner-from=<exact-current-owner> for the intended transition"
-        )
-
-if candidate_raw:
-    candidate_value = read_regular(candidate_raw, "candidate site")
-    candidate_owner = require_v1(candidate_value, "candidate site")
-    if candidate_owner != snapshot_owner:
-        raise SystemExit("nginx owner continuity: rendered candidate owner differs from snapshot owner")
-PY
 }
 
 # airlock_escape_selfkill_cgroup SCRIPT [ARGS...] — survive stopping our own host.
@@ -952,49 +669,6 @@ ts_fqdn() {
   tailscale status --json 2>/dev/null \
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' \
     || die "could not determine tailnet FQDN (is tailscale up?)"
-}
-
-# ts_require_tailscale — fail-closed precondition checked before install.
-# Airlock v1's trust model relies on `tailscale serve` as the sole, identity-
-# injecting ingress (serve strips client-supplied identity headers and injects
-# authenticated ones). The app installers CONFIGURE serve; this only requires that
-# Tailscale is up and authenticated so serve can be that ingress. See SECURITY.md.
-ts_require_tailscale() {
-  require_cmd tailscale python3
-  local state
-  state="$(tailscale status --json 2>/dev/null \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)"
-  if [ "$state" != "Running" ]; then
-    die "Tailscale is not up/authenticated (BackendState='${state:-unknown}'). Airlock \
-v1 requires Tailscale as the ingress — run 'tailscale up' first. Running behind another \
-proxy that forwards client identity headers is insecure-by-default. See SECURITY.md."
-  fi
-}
-
-# ts_require_https — fail-closed precondition: the tailnet must issue TLS certs.
-# Airlock serves content over https ONLY (the plaintext ports just 301). Without
-# "HTTPS Certificates" enabled tailnet-wide, `tailscale serve --https` accepts the
-# config but every handshake fails, so the box would come up unreachable. Catch it
-# here with an actionable message instead of after the install.
-ts_require_https() {
-  require_cmd tailscale python3
-  local domains
-  domains="$(tailscale status --json 2>/dev/null \
-    | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("CertDomains") or []))' 2>/dev/null || true)"
-  # Distinguish "asked and got no cert domains" from "could not ask". Reporting a
-  # transient LocalAPI hiccup as "HTTPS is disabled" would send the operator to the
-  # admin console to fix something that is not broken.
-  if [ -z "$domains" ]; then
-    die "could not read the Tailscale status to confirm https is available \
-('tailscale status --json' returned nothing usable). Is tailscaled running? Re-run \
-once it is up."
-  fi
-  if [ "$domains" = 0 ]; then
-    die "this tailnet does not issue TLS certificates, so https ingress cannot work. \
-Enable it once at https://login.tailscale.com/admin/dns (HTTPS Certificates), then re-run. \
-Airlock deliberately has no plaintext fallback — the identity header that every gate \
-trusts must not cross the network in the clear. See SECURITY.md."
-  fi
 }
 
 # airlock_enable_linger <user> — arm --user units to survive a reboot, idempotently.
@@ -1378,9 +1052,12 @@ install_if_changed() {
 # is in that position today.
 airlock_sweep_platform_units() {
   local owner="${1:?airlock_sweep_platform_units: owner required}"; shift
-  # An empty declared set would make every marked unit an orphan. A caller bug must not
-  # become a wipe, so this is fatal rather than a no-op sweep.
-  [ "$#" -gt 0 ] || die "airlock_sweep_platform_units: refusing to sweep with an empty declared set (owner=$owner)"
+  # An empty declared set would make every marked unit an orphan, so an empty
+  # call is treated as nothing to sweep rather than a wipe.
+  if [ "$#" -eq 0 ]; then
+    log "WARN: airlock_sweep_platform_units: empty declared set (owner=$owner) — skipping the sweep"
+    return 0
+  fi
 
   local unit_dir="${AIRLOCK_UNIT_DIR_USER:-$HOME/.config/systemd/user}"
   [ -d "$unit_dir" ] || return 0

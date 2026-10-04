@@ -34,6 +34,7 @@ TOKENS = ROOT / "hub" / "assets" / "airlock-tokens.css"
 CONSUMERS = [
     ROOT / "hub" / "index.html",
     ROOT / "hub" / "wrong-owner.html",
+    ROOT / "hub" / "assets" / "publish-index.css",
 ]
 
 AA_NORMAL = 4.5   # body text

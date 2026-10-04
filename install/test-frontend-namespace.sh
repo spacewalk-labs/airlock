@@ -100,6 +100,21 @@ grep -qF 'raw = localStorage.getItem(LEGACY_POS_KEY);' "$JS" \
   || bad "the position key migration does not read the legacy key"
 [ "$fail" = 0 ] && ok "both compatibility rules are wired into the widget"
 
+# Peek consumes the existing preview response; publish's badge opt-out gates that poll.
+grep -qF 'if (d && Array.isArray(d.messages)) receivePeeks(d.messages);' "$JS" \
+  || bad "Peek is not wired to the existing preview response"
+grep -qF 'var next = airlockSelectPeeks(messages, peekSeen, peekQueue);' "$JS" \
+  || bad "Peek selection is not used by the widget"
+grep -qF 'var PEEK_KEY = "airlock:peek-seen-v1";' "$JS" \
+  || bad "Peek watermark key changed"
+# The two durations are a product decision (normal 10s, urgent 60s), not a detail:
+# they are what the design record and the producer guidance promise.
+grep -qF 'var peekNormalMs = 15000, peekUrgentMs = 90000;' "$JS" \
+  || bad "shipped Peek durations are not the documented 15s / 90s"
+# The control has to name itself somewhere a first-time reader will meet it.
+grep -qF 'btn.title = "Porthole' "$JS" || bad "the button does not name Porthole"
+grep -qF 'cap.textContent = "Porthole";' "$JS" || bad "the menu does not name Porthole"
+
 # ---- the rules themselves, in node ----
 node - "$JS" <<'JS' || fail=1
 const fs = require("fs");
@@ -110,6 +125,7 @@ function lift(name) {
   return m[0];
 }
 eval(lift("airlockResolveSlot") + lift("airlockIsCloseMessage"));
+eval(lift("airlockPeekDuration") + lift("airlockPeekCompare") + lift("airlockSelectPeeks"));
 
 let bad = 0;
 const t = (name, got, want) => {
@@ -139,8 +155,58 @@ t("unrelated message ignored", airlockIsCloseMessage("panel-close"), false);
 t("a structured-clone payload is not a close", airlockIsCloseMessage({ type: "airlock-panel-close" }), false);
 t("undefined is not a close", airlockIsCloseMessage(undefined), false);
 
+// Peek's pure rules: first visit, strict opt-in, total ordering and poll overlap.
+const card = (id, at, extra = {}) => ({card_id: id, last_at: at, level: "normal", peek: true, read_at: null, ...extra});
+const seen = {last_at: "2026-09-23T00:00:00.000000Z", card_id: "a"};
+const at1 = "2026-09-23T00:00:01.000000Z", at2 = "2026-09-23T00:00:02.000000Z";
+const ids = result => result.cards.map(c => c.card_id).join(",");
+const cards = [card("normal", at1), card("urgent", at2, {level: "urgent"}),
+  card("quiet", at2, {level: "urgent", peek: false}), card("read", at2, {read_at: at2})];
+const first = airlockSelectPeeks(cards, null, []);
+t("first visit does not replay existing cards", ids(first), "");
+t("first watermark includes all cards", JSON.stringify(first.seen), JSON.stringify({last_at: at2, card_id: "urgent"}));
+t("read and non-Peek cards seed the watermark too", airlockSelectPeeks([
+  card("read", at1, {read_at: at1}), card("quiet", at2, {peek: false})], null, []).seen.card_id, "quiet");
+const empty = airlockSelectPeeks([], null, []);
+t("empty first visit still initializes", empty.seen.last_at, "");
+t("first later arrival is shown", ids(airlockSelectPeeks([cards[0]], empty.seen, [])), "normal");
+t("urgent before older normal; read and opt-out skipped", ids(airlockSelectPeeks(cards, seen, [])), "urgent,normal");
+for (const level of ["normal", "urgent"]) {
+  for (const peek of [undefined, false, "yes", 1]) {
+    t(`${level} rejects peek=${peek}`, ids(airlockSelectPeeks([card("x", at1, {level, peek})], seen, [])), "");
+  }
+}
+t("same timestamp uses card_id tie breaker", ids(airlockSelectPeeks([
+  card("a", seen.last_at), card("b", seen.last_at), card("0", seen.last_at)], seen, [])), "b");
+t("equal urgency is chronological with deterministic ties", ids(airlockSelectPeeks([
+  card("z", at2), card("b", at1), card("a", at1)], seen, [])), "a,b,z");
+const restored = JSON.parse(JSON.stringify({last_at: at2, card_id: "urgent"}));
+t("refresh does not replay a shown card", ids(airlockSelectPeeks(cards, restored, [])), "");
+t("coalescing can Peek again when unread and last_at advances", ids(airlockSelectPeeks([
+  card("a", at1)], seen, [])), "a");
+const pending = [cards[0]];
+t("next poll retains older queued normal after urgent advanced watermark",
+  ids(airlockSelectPeeks(cards, restored, pending)), "normal");
+t("poll overlap does not duplicate pending cards",
+  ids(airlockSelectPeeks([cards[0], cards[0]], seen, pending)), "normal");
+t("selection leaves the supplied queue unchanged", pending.length, 1);
+t("all five preview candidates are kept", airlockSelectPeeks(
+  [1,2,3,4,5].map(n => card(String(n), at1)), seen, []).cards.length, 5);
+for (const badValue of [undefined, "", "no", "0", "-1", "Infinity"]) {
+  t("invalid duration keeps default: " + badValue, airlockPeekDuration(badValue, 15000), 15000);
+}
+t("normal duration override", airlockPeekDuration("1200", 15000), 1200);
+t("urgent default", airlockPeekDuration(undefined, 90000, 90000), 90000);
+t("urgent shorter override", airlockPeekDuration("8000", 90000, 90000), 8000);
+t("urgent 90s ceiling", airlockPeekDuration("120000", 90000, 90000), 90000);
+// Check the request boundary without simulating a browser DOM.
+t("badge opt-out stays wired", src.includes('if (self.dataset.badge === "0") wantBadge = false;'), true);
+t("preview polling remains badge-gated", /if \(wantBadge\) \{\s*pollUnread\(\);\s*setInterval\(pollUnread, POLL_MS\);\s*\}/.test(lift("mount")), true);
+t("one preview fetch call site", (src.match(/fetch\(UNREAD_URL/g) || []).length, 1);
+t("preview poll interval stays 30 seconds", src.includes("var POLL_MS = 30000;"), true);
+
 if (bad) process.exit(1);
-console.log("ok   frontend-namespace: 11 rule cases");
+console.log("ok   frontend-namespace: compatibility + Peek selection/duration/poll rules");
 JS
 
 if [ "$fail" != 0 ]; then echo "---"; echo "frontend-namespace: FAILED"; exit 1; fi

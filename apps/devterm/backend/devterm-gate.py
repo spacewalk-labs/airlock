@@ -50,7 +50,7 @@ import signal
 import sys
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 ALLOW = {s.strip().lower() for s in os.environ.get("AIRLOCK_OWNER", "").split(",") if s.strip()}
@@ -1322,8 +1322,29 @@ async def _serve_upload_file(cr, headers, leftover, cw):
 # Fleet compatibility remains until the external collector no longer uses DevTerm.
 # It is deliberately a fresh probe: account-owned caches and background sweepers live
 # only in the platform account service.
+# Same rule as bin/airlock-accounts-api's CODEX_USAGE_TTL: a value older than this is
+# stale. The fleet collector refuses a /codex-usage answer without `stale` (it cannot
+# tell a fresh reading from a remembered one), and this route never sent it — every
+# box's Codex cell froze on its last accepted value from 2026-09-15 to 09-25.
+CODEX_USAGE_TTL = 300
+
+
+def _codex_value_stale(observed_at):
+    try:
+        at = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if at.tzinfo is None:
+        return True
+    age = (datetime.now(timezone.utc) - at).total_seconds()
+    return age > CODEX_USAGE_TTL
+
+
 async def _serve_codex_usage(cw):
-    await _run_probe(cw, ["--codex-usage"])
+    status, payload = await _run_probe_result(["--codex-usage"])
+    if status == b"200 OK" and isinstance(payload, dict) and "stale" not in payload:
+        payload["stale"] = _codex_value_stale(payload.get("observedAt"))
+    await _send_json(cw, status, payload)
 
 
 async def _run_probe_result(args=()):

@@ -222,7 +222,10 @@ function loadWidget(dataset) {
     rows() {
       const menu = body.children.find((c) => c !== btn && /min-width:236px/.test(c.style.cssText));
       if (!menu) return null;
-      return menu.children.map((b) => ({ label: b.children[0].textContent, click: () => b.listeners.click.forEach((fn) => fn(ev)) }));
+      // Only the actionable rows are buttons; the menu also carries a non-interactive
+      // caption naming the control, which has no inner label node.
+      return menu.children.filter((b) => b.tagName === "BUTTON")
+        .map((b) => ({ label: b.children[0].textContent, click: () => b.listeners.click.forEach((fn) => fn(ev)) }));
     },
     frameSrc() {
       const f = walk(body).find((n) => n.tagName === 'IFRAME');

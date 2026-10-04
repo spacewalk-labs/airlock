@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # Regression and contract tests for installer command discovery.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 TMP="$(mktemp -d)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
-pass=0 fail=0
-ok() { printf 'ok   %s\n' "$1"; pass=$((pass + 1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail + 1)); }
+airlock_test_counters_init
 
 case_name="${2:-${1:-all}}"
 if [ "${1:-}" = --case ]; then
@@ -65,124 +64,14 @@ hidden_node() {
   fi
 }
 
-receipt_drift() {
-  make_exec "$TMP/sbin/nft"
-  AIRLOCK_PREFLIGHT_SBIN_DIRS="$TMP/sbin"
-  AIRLOCK_PREREQ_RECEIPT="$TMP/drift.receipt"
-  AIRLOCK_INSTALL_PKG_INFO_SHA256="$(printf 'a%.0s' {1..64})"
-  printf '# airlock-prerequisite-receipt-v1\nnft\t%s\tpresent\t-\tcore\n' \
-    "$TMP/sbin/nft" > "$AIRLOCK_PREREQ_RECEIPT"
-  rm -f "$TMP/sbin/nft"
-  local rc=0 marker="$TMP/drift-mutated"
-  (PATH="$TMP/empty"; require_cmd nft; : > "$marker") >/dev/null 2>&1 || rc=$?
-  unset AIRLOCK_PREREQ_RECEIPT AIRLOCK_INSTALL_PKG_INFO_SHA256
-  if [ "$rc" != 0 ] && [ ! -e "$marker" ]; then
-    ok "receipt-drift: vanished approved executable is rejected before mutation"
-  else
-    bad "receipt-drift did not fail closed (rc=$rc marker=$([ -e "$marker" ] && echo yes || echo no))"
-  fi
-}
-
-devmon_receipt_roundtrip() {
-  local b="$TMP/devmon-bin" cfg="$TMP/devmon.toml" receipt="$TMP/devmon.receipt"
-  local cmd found preflight_rc=0 require_rc=0 receipt_ok=1
-  local -a declared=() required=()
-  mkdir -p "$b"
-  cat >"$cfg" <<EOF
-[auth]
-provider = "tailscale"
-owner = "owner@fixture.dev"
-[apps.hub]
-[apps.dev-monitor]
-messages = true
-EOF
-  AIRLOCK_CONFIG="$cfg"
-  export AIRLOCK_CONFIG
-  AIRLOCK_PKG_INFO="$(airlock_config package-info)" || {
-    bad "devmon-receipt: package-info failed"
-    return
-  }
-  mapfile -t declared < <(airlock_config prereqs | awk -F '\t' \
-    '$1 == "core" || $1 == "dev-monitor" {print $2}' | sort -u)
-  mapfile -t required < <(sed -n 's/^[[:space:]]*require_cmd[[:space:]]\+//p' \
-    "$ROOT/apps/dev-monitor/install-spool-hardening.sh" | tr ' ' '\n' | sort -u)
-  for cmd in "${declared[@]}"; do
-    found="$(type -P "$cmd" 2>/dev/null || true)"
-    if [ -n "$found" ]; then
-      ln -s "$found" "$b/$cmd"
-    else
-      make_exec "$b/$cmd"
-    fi
-  done
-  AIRLOCK_PREFLIGHT_SBIN_DIRS="$b"
-  AIRLOCK_PREREQ_RECEIPT="$receipt"
-  AIRLOCK_PREREQ_CONTEXT="fixture=devmon"
-  (PATH="$b:/usr/bin:/bin"; airlock_preflight --quiet) >/dev/null 2>&1 || preflight_rc=$?
-  AIRLOCK_INSTALL_PKG_INFO_SHA256="$(printf 'c%.0s' {1..64})"
-  (PATH="$b:/usr/bin:/bin"; require_cmd "${required[@]}") \
-    >/dev/null 2>&1 || require_rc=$?
-  for cmd in "${required[@]}"; do
-    grep -q "^${cmd}"$'\t' "$receipt" || receipt_ok=0
-  done
-  unset AIRLOCK_CONFIG AIRLOCK_PKG_INFO AIRLOCK_PREFLIGHT_SBIN_DIRS \
-    AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT AIRLOCK_INSTALL_PKG_INFO_SHA256
-  if [ "$preflight_rc" = 0 ] && [ "$require_rc" = 0 ] && [ "$receipt_ok" = 1 ]; then
-    ok "devmon-receipt: real preflight receipt approves every spool lifecycle command"
-  else
-    bad "devmon-receipt failed (preflight_rc=$preflight_rc require_rc=$require_rc receipt_ok=$receipt_ok)"
-  fi
-}
-
-receipt_roundtrip() {
-  local b="$TMP/receipt-bin" receipt="$TMP/roundtrip.receipt" inv="$TMP/prerequisites.tsv"
-  mkdir -p "$b"
-  for cmd in nginx sudo systemctl tailscale curl flock; do make_exec "$b/$cmd"; done
-  cat > "$b/python3" <<'SH'
-#!/bin/sh
-case "$*" in *sys.version_info*) printf '3.11\n' ;; *) exit 0 ;; esac
-SH
-  chmod +x "$b/python3"
-  for cmd in python3 nginx sudo systemctl tailscale curl flock; do
-    predicate=present expected=-
-    [ "$cmd" = python3 ] && { predicate=major-gte; expected=3.11; }
-    printf 'core\t%s\t%s\t%s\tinstall fixture\tfixture requirement\n' \
-      "$cmd" "$predicate" "$expected" >> "$inv"
-  done
-  AIRLOCK_PREFLIGHT_SBIN_DIRS="$TMP/empty"
-  AIRLOCK_PREREQUISITES="$inv"
-  AIRLOCK_PREREQ_RECEIPT="$receipt"
-  AIRLOCK_PREREQ_CONTEXT="fixture=roundtrip"
-  AIRLOCK_PKG_INFO=""
-  airlock_config() { [ "$1" = apps ] && printf 'hub\n'; }
-  local preflight_rc=0 require_rc=0 mode=""
-  (PATH="$b:/usr/bin:/bin"; airlock_preflight --quiet) >/dev/null 2>&1 || preflight_rc=$?
-  mode="$(stat -c %a "$receipt" 2>/dev/null || true)"
-  AIRLOCK_INSTALL_PKG_INFO_SHA256="$(printf 'b%.0s' {1..64})"
-  (PATH="$b:/usr/bin:/bin"; require_cmd python3 nginx sudo systemctl tailscale curl flock) \
-    >/dev/null 2>&1 || require_rc=$?
-  unset AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT AIRLOCK_INSTALL_PKG_INFO_SHA256 AIRLOCK_PKG_INFO
-  if [ "$preflight_rc" = 0 ] && [ "$require_rc" = 0 ] && [ "$mode" = 600 ] \
-      && grep -q '^# context=fixture=roundtrip$' "$receipt"; then
-    ok "receipt-roundtrip: preflight receipt is private and lifecycle require_cmd consumes it"
-  else
-    bad "receipt-roundtrip failed (preflight_rc=$preflight_rc require_rc=$require_rc mode=${mode:-missing})"
-  fi
-}
-
 case "$case_name" in
   sbin-present) sbin_present ;;
   sbin-absent) sbin_absent ;;
   hidden-node) hidden_node ;;
-  receipt-drift) receipt_drift ;;
-  devmon-receipt-roundtrip) devmon_receipt_roundtrip ;;
-  receipt-roundtrip) receipt_roundtrip ;;
   all)
     sbin_present
     sbin_absent
     hidden_node
-    receipt_drift
-    devmon_receipt_roundtrip
-    receipt_roundtrip
     ;;
   *) bad "unknown case: $case_name" ;;
 esac

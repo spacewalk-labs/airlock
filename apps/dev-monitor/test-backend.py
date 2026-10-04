@@ -23,6 +23,7 @@ import subprocess
 import time
 import types
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ BACKEND = os.path.join(HERE, 'backend')
 sys.path.insert(0, BACKEND)
 import action_runner
 import devmon_apps as APPSTORE
+import devmon_home_order as HOME_ORDER
 import devmon_cron
 import devmon_update_exec as UPX
 import devmon_harness as HARNESS
@@ -50,25 +52,6 @@ DM = _load_backend()
 MSG = DM.MSG
 AC7 = {'archived_filtered': 0, 'active_counted': 0}
 AC7_SELECTED = {'value': False}
-AST_REREG_SELECTED = set()
-AST_REREG = {
-    'same_bytes': 0,
-    'changed_bytes': 0,
-    'disable_remove': 0,
-    'registered_reapproval': 0,
-    'personal_remove_reregister': 0,
-    'company_remove_reregister': 0,
-    'company_noop_remove_rejected': 0,
-    'company_noop_register_rejected': 0,
-    'digest_rejected_no_mutation': 0,
-    'capability_rejected_no_mutation': 0,
-    'drift_no_execution': 0,
-    'committed_config_preserved': 0,
-    'preinstall_digest_rechecked': 0,
-    'failure_execution_started': 0,
-    'failure_visible': 0,
-    'unrelated_rollback_rejected': 0,
-}
 
 # The platform CLI has no .py extension. Importing it runs no command because main()
 # is guarded; tests can point its whitelisted raw extractor at scratch credentials.
@@ -245,24 +228,6 @@ class TmuxProbeTest(unittest.TestCase):
             DM.shutil.which = saved_which
         self.assertIsNone(got)
         self.assertEqual(called, [])
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 class ServiceHealthTest(unittest.TestCase):
@@ -718,6 +683,26 @@ class OwnerRouteTest(unittest.TestCase):
     """Drives the real HTTP handler. This is the layer the module tests never reach — and
     it is where card ids arrive percent-encoded by the browser."""
 
+    def test_health_reports_complete_bot_or_webhook_without_sending(self):
+        from unittest.mock import patch
+        for token, channel, hook, expected in (
+                ('synthetic-bot', 'C_TEST', '', 'configured'),
+                ('synthetic-bot', '', '', 'not configured'),
+                ('', 'C_TEST', '', 'not configured'),
+                ('', 'C_TEST', 'synthetic-hook', 'configured'),
+                ('', '', '', 'not configured')):
+            with self.subTest(channel=channel, expected=expected), patch.dict(os.environ, {
+                    'DEVMON_SLACK_BOT_TOKEN_NAME': 'BOT', 'BOT': token,
+                    'DEVMON_SLACK_CHANNEL': channel,
+                    'DEVMON_SLACK_WEBHOOK_NAME': 'HOOK', 'HOOK': hook}, clear=True), \
+                    patch.object(DM.devmon_slack, 'post_message') as bot, \
+                    patch.object(DM.devmon_slack, 'send') as webhook:
+                status, health = self._get('/api/health')
+                self.assertEqual(status, 200)
+                self.assertEqual(health['slack'], expected)
+                bot.assert_not_called()
+                webhook.assert_not_called()
+
     @classmethod
     def setUpClass(cls):
         import http.server, threading
@@ -906,7 +891,7 @@ class OwnerRouteTest(unittest.TestCase):
         try:
             class Snapshot:
                 @staticmethod
-                def read_snapshot():
+                def current(root):
                     return {
                         'checkedAt': '2026-09-01T00:00:00Z',
                         'platform': {'available': True, 'changedCount': 2, 'ref': 'main'},
@@ -930,7 +915,7 @@ class OwnerRouteTest(unittest.TestCase):
         try:
             class Snapshot:
                 @staticmethod
-                def read_snapshot():
+                def current(root):
                     return {
                         'checkedAt': '2026-09-01T00:00:00Z',
                         'platform': None, 'apps': [],
@@ -951,13 +936,13 @@ class OwnerRouteTest(unittest.TestCase):
         try:
             class Empty:
                 @staticmethod
-                def read_snapshot():
-                    return None
+                def current(root):
+                    raise RuntimeError('engine plan unavailable')
 
             DM.UPDATES = Empty
             status, payload = self._owner_get('/api/owner/updates')
-            self.assertEqual(status, 404, payload)
-            self.assertIn('snapshot', payload['error'])
+            self.assertEqual(status, 503, payload)
+            self.assertEqual(payload['error'], 'app_plan_unavailable')
         finally:
             DM.UPDATES = saved
 
@@ -1116,13 +1101,6 @@ class UpdatesCollectorTest(unittest.TestCase):
         self.assertEqual(self.updates._apps(root), [
             {'id': 'external', 'action': 'upgrade', 'sourceClass': 'explicit'},
             {'id': 'notes', 'action': 'upgrade', 'sourceClass': 'shipped'},
-        ])
-
-    def test_explicit_lock_refusal_is_display_only_lock_mismatch(self):
-        self.updates._run = lambda _argv, **_kwargs: types.SimpleNamespace(
-            returncode=2, stdout='', stderr="package 'third-party': package lock digest mismatch\n")
-        self.assertEqual(self.updates._apps(Path('/fixture')), [
-            {'id': 'third-party', 'action': 'lock-mismatch', 'sourceClass': 'explicit'},
         ])
 
     def test_partial_or_malformed_snapshot_is_never_served(self):
@@ -1774,8 +1752,8 @@ class UpdateExecModuleTest(unittest.TestCase):
         self.assertIn('--rollback', armed['command'])
 
 
-class AppConfigMutationTest(unittest.TestCase):
-    """The operator file changes only after the platform parser accepts a sibling."""
+class AppStoreProjectionTest(unittest.TestCase):
+    """Store state and previews read inputs without changing operator configuration."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1783,87 +1761,73 @@ class AppConfigMutationTest(unittest.TestCase):
         shutil.copy2(Path(HERE).parents[1] / 'airlock.toml.example', self.config)
         self.config.write_text(self.config.read_text().replace(
             'owner    = "me@example.com"', 'owner    = "owner@example.test"'))
+        self.saved_fixture_env = {key: os.environ.get(key) for key in ('AIRLOCK_DATA_DIR', 'AIRLOCK_STATE_DIR')}
+        os.environ['AIRLOCK_DATA_DIR'] = str(Path(self.tmp.name) / 'data')
+        os.environ['AIRLOCK_STATE_DIR'] = str(Path(self.tmp.name) / 'state')
         self.saved_config = os.environ.get('AIRLOCK_CONFIG')
         os.environ['AIRLOCK_CONFIG'] = str(self.config)
 
     def tearDown(self):
+        for key, value in self.saved_fixture_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         if self.saved_config is None:
             os.environ.pop('AIRLOCK_CONFIG', None)
         else:
             os.environ['AIRLOCK_CONFIG'] = self.saved_config
         self.tmp.cleanup()
 
-    def test_enable_validates_then_keeps_one_exact_previous_copy(self):
-        before = self.config.read_bytes()
-        result = APPSTORE.register(self.config, 'notes')
-        self.assertTrue(result['changed'])
-        self.assertEqual(Path(str(self.config) + '.bak').read_bytes(), before)
-        parsed = APPSTORE._load(self.config)
-        self.assertIn('notes', parsed['apps'])
-        env = dict(os.environ, AIRLOCK_CONFIG=str(self.config))
-        checked = subprocess.run([sys.executable, str(Path(HERE).parents[1] / 'bin' /
-                                                       'airlock-config'), 'validate'],
-                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.assertEqual(checked.returncode, 0, checked.stderr)
 
-    def test_disable_removes_only_the_named_table_and_backup_is_the_previous_version(self):
-        before = self.config.read_bytes()
-        result = APPSTORE.mutate_enabled(self.config, 'devterm', False)
-        self.assertTrue(result['changed'])
-        parsed = APPSTORE._load(self.config)
-        self.assertNotIn('devterm', parsed['apps'])
-        self.assertIn('fileview', parsed['apps'])
-        self.assertEqual(Path(str(self.config) + '.bak').read_bytes(), before)
-
-    def test_enable_disable_round_trip_restores_the_original_bytes(self):
-        before = self.config.read_bytes()
-        self.assertTrue(APPSTORE.register(self.config, 'notes')['changed'])
-        self.assertTrue(APPSTORE.mutate_enabled(self.config, 'notes', False)['changed'])
-        self.assertEqual(self.config.read_bytes(), before)
-
-    def test_runtime_config_path_does_not_reparse_a_lock_mismatch(self):
-        saved = APPSTORE._command
-        APPSTORE._command = lambda *args, **kwargs: (_ for _ in ()).throw(
-            APPSTORE.AppsError('config_invalid', 'package lock digest mismatch'))
-        try:
-            self.assertEqual(
-                APPSTORE.config_path(Path(HERE).parents[1]), self.config.resolve())
-        finally:
-            APPSTORE._command = saved
-
-    def test_explicit_registration_then_disable_removes_app_and_package_together(self):
-        package = Path(HERE).parents[1] / 'apps' / 'notes'
-        APPSTORE.register(self.config, 'notes', {'path': str(package)})
-        registered = self.config.read_bytes()
-        parsed = APPSTORE._load(self.config)
-        self.assertIn('notes', parsed['apps'])
-        self.assertIn('notes', parsed['packages'])
-
-        result = APPSTORE.mutate_enabled(self.config, 'notes', False)
-        self.assertTrue(result['changed'])
-        parsed = APPSTORE._load(self.config)
-        self.assertNotIn('notes', parsed.get('apps', {}))
-        self.assertNotIn('notes', parsed.get('packages', {}))
-        self.assertEqual(Path(str(self.config) + '.bak').read_bytes(), registered)
-
-    def test_package_preview_is_read_only_and_matches_registered_package_info(self):
+    def test_package_preview_is_read_only(self):
         root = Path(HERE).parents[1]
-        package = root / 'apps' / 'notes'
+        package = root / 'apps' / 'learning'
         before_config = self.config.read_bytes()
         lock = root / 'airlock.lock'
         before_lock = lock.read_bytes() if lock.exists() else None
         preview = APPSTORE.package_preview(root, str(package))
-        self.assertEqual(preview['id'], 'notes')
+        self.assertEqual(preview['id'], 'learning')
         self.assertTrue(preview['installable'])
         self.assertRegex(preview['digest'], r'^[0-9a-f]{64}$')
         self.assertEqual(self.config.read_bytes(), before_config)
         self.assertEqual(lock.read_bytes() if lock.exists() else None, before_lock)
 
-        APPSTORE.register(self.config, 'notes', {
-            'path': preview['path'], 'grant': preview['grants']})
-        info = APPSTORE._command(root, ['package-info'], config=self.config,
-                                 json_output=True)
-        self.assertEqual(preview['package'], info['packages']['notes'])
+
+    def test_personal_preview_allows_retained_input_with_empty_installed_record(self):
+        root = Path(HERE).parents[1]
+        package = Path(self.tmp.name) / 'candidate'
+        package.mkdir()
+        (package / 'airlock-app.toml').write_text('contract=1\nid="retained-candidate"\n')
+        self.config.write_text(self.config.read_text() + '\n[packages.retained-candidate]\npath=' +
+                               json.dumps(str(package)) + '\n[apps.retained-candidate]\n')
+        state = Path(os.environ['AIRLOCK_STATE_DIR'])
+        state.mkdir()
+        record = state / 'installed-apps.json'
+        record.write_text('{}\n')
+        before_config, before_record = self.config.read_bytes(), record.read_bytes()
+        preview = APPSTORE.package_preview(root, str(package))
+        self.assertTrue(preview['installable'], preview)
+        self.assertEqual(preview['path'], str(package))
+        self.assertNotIn('registered', preview)
+        self.assertEqual(APPSTORE.installed_ids(root), [])
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(record.read_bytes(), before_record)
+
+    def test_personal_preview_accepts_installed_dependency_without_input_table(self):
+        root = Path(HERE).parents[1]
+        self.config.write_text('[auth]\nprovider="tailscale"\nowner="fixture@test"\n[apps.hub]\n')
+        state = Path(os.environ['AIRLOCK_STATE_DIR'])
+        state.mkdir()
+        record = state / 'installed-apps.json'
+        record.write_text(json.dumps({'publish': {'repo': str(root / 'apps/publish'),
+                                                  'commit': '', 'artifacts': []}}))
+        before_config, before_record = self.config.read_bytes(), record.read_bytes()
+        preview = APPSTORE.package_preview(root, str(root / 'apps/notepad'))
+        self.assertTrue(preview['installable'], preview)
+        self.assertEqual(preview['id'], 'notepad')
+        self.assertEqual(self.config.read_bytes(), before_config)
+        self.assertEqual(record.read_bytes(), before_record)
 
     def test_package_preview_reports_bundle_only_capability_instead_of_mutating(self):
         root = Path(HERE).parents[1]
@@ -1887,7 +1851,7 @@ class AppConfigMutationTest(unittest.TestCase):
         self.assertFalse(preview['installable'])
         self.assertEqual(self.config.read_bytes(), before)
 
-    def test_personal_approval_writes_the_grantable_capability_into_same_candidate(self):
+    def test_personal_preview_reports_grantable_capability_without_mutating(self):
         root = Path(HERE).parents[1]
         package = Path(self.tmp.name) / 'privileged-package'
         package.mkdir()
@@ -1897,333 +1861,358 @@ class AppConfigMutationTest(unittest.TestCase):
             'scope="system"}]\n')
         for script in ('install.sh', 'smoke.sh'):
             (package / script).write_text('#!/usr/bin/env bash\nexit 0\n')
+        before = self.config.read_bytes()
         preview = APPSTORE.package_preview(root, str(package))
         self.assertTrue(preview['installable'])
         self.assertEqual(preview['grants'], ['system-unit'])
-        APPSTORE.register(self.config, preview['id'], {
-            'path': preview['path'], 'grant': preview['grants']})
-        parsed = APPSTORE._load(self.config)
-        self.assertEqual(parsed['packages']['privileged-preview']['grant'],
-                         ['system-unit'])
-        APPSTORE._command(root, ['validate'], config=self.config)
-
-    def test_inline_app_expression_is_refused_without_touching_live_or_backup(self):
-        self.config.write_text(
-            '[airlock]\nconfig_version=2\n[auth]\nprovider="tailscale"\n'
-            'owner="owner@example.test"\n[apps]\nhub={}\nnotes={}\n')
-        before = self.config.read_bytes()
-        backup = Path(str(self.config) + '.bak')
-        backup.write_bytes(b'older-backup')
-        with self.assertRaises(APPSTORE.AppsError) as raised:
-            APPSTORE.mutate_enabled(self.config, 'notes', False)
-        self.assertEqual(raised.exception.code, 'config_unsupported')
         self.assertEqual(self.config.read_bytes(), before)
-        self.assertEqual(backup.read_bytes(), b'older-backup')
 
-    def test_external_edit_during_validation_wins_without_overwriting_live_or_backup(self):
-        before = self.config.read_bytes()
-        backup = Path(str(self.config) + '.bak')
-        backup.write_bytes(b'older-backup')
+    def test_store_rows_state_comes_from_the_install_record_not_the_config(self):
+        """12 + 13 · the three states, and where each one is decided.
+
+        A shipped app that has a config table but no install record is the
+        regression this whole shape exists for: the table said it was installed
+        for months while nothing was on disk. So a candidate the record does not
+        name reads Install, however many tables mention it. (`code-server` is the
+        stand-in; it is a shipped builtin with a tile that this box has never
+        installed. `notes` used to play this part until P4_FOLIO deleted it.)
+        """
+        root = Path(HERE).parents[1]
+        snapshot = {'apps': [{'id': 'devterm', 'action': 'upgrade'},
+                             {'id': 'code-server', 'action': 'reinstall'}],
+                    'platform': {'available': True}}
+        rows = {row['id']: row
+                for row in APPSTORE.store_rows(root, snapshot, ['devterm'])['rows']}
+        # 12 · in the config, absent from the record, a shipped builtin.
+        self.assertEqual(rows['code-server']['state'], 'install')
+        self.assertEqual(rows['code-server']['origin'], 'public')
+        self.assertEqual(rows['code-server']['kind'], 'app')
+        # 13 · in the record and upgradable -> update; in the record only ->
+        # installed; in neither -> install. A reinstall row is not an update:
+        # it has no source change to offer.
+        self.assertEqual(rows['devterm']['state'], 'update')
+        installed_only = {row['id']: row for row in
+                          APPSTORE.store_rows(root, {'apps': []}, ['fileview'])['rows']}
+        self.assertEqual(installed_only['fileview']['state'], 'installed')
+        self.assertEqual(installed_only['code-server']['state'], 'install')
+        # The platform is a row like any other, with a state of its own.
+        self.assertEqual(rows['platform']['state'], 'update')
+        self.assertEqual(rows['platform']['origin'], 'public')
+        # Every row carries the four things the screen draws, and nothing else.
+        for row in APPSTORE.store_rows(root, snapshot, ['devterm'])['rows']:
+            self.assertEqual(set(row) & {'id', 'origin', 'kind', 'name', 'desc',
+                                         'state'}, {'id', 'origin', 'kind', 'name',
+                                                    'desc', 'state'})
+            self.assertIn(row['state'], ('install', 'update', 'installed'))
+
+    def test_platform_row_never_reads_uncould_not_check_as_nothing_to_do(self):
+        rows = {row['id']: row for row in APPSTORE.store_rows(
+            Path(HERE).parents[1], {'apps': [], 'platform': {}}, [])['rows']}
+        self.assertEqual(rows['platform']['state'], 'installed')
+        self.assertIn('확인하지 못했', rows['platform']['desc'])
+        rows = {row['id']: row for row in APPSTORE.store_rows(
+            Path(HERE).parents[1], {'apps': [], 'platform': None}, [])['rows']}
+        self.assertIn('확인하지 못했', rows['platform']['desc'])
+
+    def test_a_missing_company_repo_is_an_empty_menu_not_an_error(self):
+        """15 · three absent states, all of them ordinary."""
         saved = APPSTORE._command
+        real = APPSTORE._command
 
-        def edit_during_validation(root, args, **kwargs):
-            result = saved(root, args, **kwargs)
-            self.config.write_bytes(before + b'\n# external edit\n')
-            return result
+        def without_company(root, args, **kwargs):
+            if args == ['sources']:
+                value = real(root, args, **kwargs)
+                value['apps']['company'] = []
+                value['links'] = [row for row in value['links']
+                                  if row['origin'] != 'company']
+                return value
+            return real(root, args, **kwargs)
 
-        APPSTORE._command = edit_during_validation
+        APPSTORE._command = without_company
         try:
-            with self.assertRaises(APPSTORE.AppsError) as raised:
-                APPSTORE.register(self.config, 'notes')
+            rows = APPSTORE.store_rows(Path(HERE).parents[1], {'apps': []},
+                                       [])['rows']
         finally:
             APPSTORE._command = saved
-        self.assertEqual(raised.exception.code, 'config_conflict')
-        self.assertEqual(self.config.read_bytes(), before + b'\n# external edit\n')
-        self.assertEqual(backup.read_bytes(), b'older-backup')
-
-    def test_a_candidate_rejected_by_airlock_config_never_replaces_the_live_file(self):
-        before = self.config.read_bytes()
-        with self.assertRaisesRegex(APPSTORE.AppsError, 'unknown app'):
-            APPSTORE.register(self.config, 'not-a-builtin')
-        self.assertEqual(self.config.read_bytes(), before)
-        self.assertFalse(Path(str(self.config) + '.bak').exists())
-        self.assertEqual(list(self.config.parent.glob('.airlock.toml.candidate.*')), [])
-
-    def test_listing_is_the_config_projection_plus_exact_builtin_difference(self):
-        snapshot = {'apps': [{'id': 'devterm', 'action': 'upgrade'}]}
-        result = APPSTORE.list_apps(Path(HERE).parents[1], snapshot)
-        self.assertEqual(set(result['apps']) - {'hub'},
-                         {row['id'] for row in result['installed']})
-        self.assertNotIn('devterm', {row['id'] for row in result['public']})
-        self.assertEqual(next(row for row in result['installed']
-                              if row['id'] == 'devterm')['update']['action'], 'upgrade')
-        self.assertTrue(all('canRemove' in row for row in result['installed']))
-
-    def test_lock_mismatch_keeps_a_review_only_projection_reachable(self):
-        saved = APPSTORE._command
-        snapshot = {'apps': [
-            {'id': 'moved-app', 'action': 'lock-mismatch', 'sourceClass': 'explicit'},
-            {'id': 'notes', 'action': 'upgrade', 'sourceClass': 'shipped'},
-        ]}
-
-        def mismatch(root, args, **kwargs):
-            if args == ['json']:
-                raise APPSTORE.AppsError(
-                    'config_invalid', 'package lock digest mismatch for moved-app')
-            return saved(root, args, **kwargs)
-
-        APPSTORE._command = mismatch
-        try:
-            result = APPSTORE.list_apps(Path(HERE).parents[1], snapshot)
-        finally:
-            APPSTORE._command = saved
-        self.assertEqual(result['degraded'], 'lock-mismatch')
-        self.assertEqual([row['id'] for row in result['installed']], ['moved-app'])
-        self.assertEqual(result['public'], [])
-        self.assertFalse(result['installed'][0]['canRemove'])
-        self.assertEqual(result['installed'][0]['update']['action'], 'lock-mismatch')
+        self.assertTrue([row for row in rows if row['origin'] == 'public'])
+        self.assertFalse([row for row in rows if row['origin'] == 'company'])
 
     def test_an_unrelated_config_error_is_never_downgraded_by_a_stale_snapshot(self):
         saved = APPSTORE._command
-        snapshot = {'apps': [
-            {'id': 'moved-app', 'action': 'lock-mismatch', 'sourceClass': 'explicit'}]}
         APPSTORE._command = lambda *args, **kwargs: (_ for _ in ()).throw(
             APPSTORE.AppsError('config_invalid', 'unknown app [apps.typo]'))
         try:
             with self.assertRaises(APPSTORE.AppsError) as raised:
-                APPSTORE.list_apps(Path(HERE).parents[1], snapshot)
+                APPSTORE.store_rows(Path(HERE).parents[1], {'apps': []}, [])
         finally:
             APPSTORE._command = saved
         self.assertEqual(raised.exception.code, 'config_invalid')
 
+    def test_only_committed_ledger_rows_count_as_installed(self):
+        """10 · an intent records that an install started, not that it finished."""
+        root = Path(HERE).parents[1]
+        ledger = root / 'bin' / 'airlock-ledger'
+        saved = APPSTORE.subprocess.run
 
-class PackageReregistrationTest(unittest.TestCase):
-    """A stale trust record is retained and explicitly approved, never erased."""
+        class Result:
+            returncode = 0
+            stderr = ''
+            stdout = (
+                'alpha\tstate=committed\tpath=/x\n'
+                'beta\tstate=intent\n'
+                # The real ledger emits this shape for an app whose update is in
+                # flight. It is installed, and reading it as not installed hides it
+                # from its own home screen for the length of the update.
+                'gamma\tstate=committed+intent\tpath=/y\n'
+                'delta\tstate=intent+committed\n'
+                'epsilon\tpath=/z\n'
+                'v7\trepo=/source\tcommit=abc\tartifacts=2\n'
+                '\n')
+
+        APPSTORE.subprocess.run = lambda *args, **kwargs: Result()
+        try:
+            self.assertEqual(APPSTORE.installed_ids(root),
+                             ['alpha', 'gamma', 'delta', 'v7'])
+        finally:
+            APPSTORE.subprocess.run = saved
+        self.assertTrue(ledger.is_file())
+
+    def test_a_failing_ledger_command_is_unavailable_not_empty(self):
+        """9 · an empty list would blank the home screen; this must not be one."""
+        root = Path(HERE).parents[1]
+        saved = APPSTORE.subprocess.run
+
+        class Result:
+            returncode = 1
+            stderr = 'ledger broken'
+            stdout = ''
+
+        APPSTORE.subprocess.run = lambda *args, **kwargs: Result()
+        try:
+            with self.assertRaises(APPSTORE.AppsError) as raised:
+                APPSTORE.installed_ids(root)
+        finally:
+            APPSTORE.subprocess.run = saved
+        self.assertEqual(raised.exception.code, 'ledger_unavailable')
+
+
+class LinkMutationTest(unittest.TestCase):
+    """Both halves of ①'s link surface: the file a person edits, and the row the
+    store draws from it. The links path is a fixed constant by design (the file is
+    box-local and outside any repo), so the fixture moves $HOME instead."""
+
+    setUp = AppStoreProjectionTest.setUp
+    tearDown = AppStoreProjectionTest.tearDown
 
     def setUp(self):
-        AST_REREG_SELECTED.add('package-suite')
-        self.tmp = tempfile.TemporaryDirectory()
-        case = Path(self.tmp.name)
-        source = Path(HERE).parents[1]
-        self.root = case / 'checkout'
-        self.package = case / 'personal-package'
-        self.data = case / 'data' / 'db.sqlite'
-        (self.root / 'apps').mkdir(parents=True)
-        shutil.copytree(source / 'bin', self.root / 'bin')
-        # airlock-config 는 glyph 이름을 hub 스프라이트(hub/index.html)에서 대조한다 —
-        # 체크아웃에 그 파일이 없으면 validate 가 fail-closed 로 죽는다(c8370f4).
-        (self.root / 'hub').mkdir()
-        shutil.copy2(source / 'hub' / 'index.html', self.root / 'hub' / 'index.html')
-        for manifest in sorted((source / 'apps').glob('*/airlock-app.toml')):
-            target = self.root / 'apps' / manifest.parent.name
-            target.mkdir()
-            shutil.copy2(manifest, target / manifest.name)
-        self.package.mkdir()
-        (self.package / 'airlock-app.toml').write_text(
-            'contract = 1\nid = "retained-app"\n')
-        for script in ('install.sh', 'smoke.sh', 'deactivate.sh'):
-            path = self.package / script
-            path.write_text('#!/usr/bin/env bash\nset -euo pipefail\n')
-            path.chmod(0o755)
-        (self.package / 'payload.txt').write_text('approved bytes\n')
-        self.data.parent.mkdir()
-        self.data.write_text('operator data\n')
-        self.config = self.root / 'airlock.toml'
-        self.config.write_text(
-            '[airlock]\nconfig_version = 2\n'
-            '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n'
-            '[apps.hub]\n')
-        self.saved_env = {name: os.environ.get(name) for name in (
-            'AIRLOCK_CONFIG', 'AIRLOCK_STATE_DIR', 'AIRLOCK_CONFIG_SNAPSHOT',
-            'AIRLOCK_CONFIG_SNAPSHOT_SHA256', 'AIRLOCK_INSTALL_PKG_INFO_SHA256')}
-        os.environ['AIRLOCK_CONFIG'] = str(self.config)
-        os.environ['AIRLOCK_STATE_DIR'] = str(case / 'state')
-        for name in ('AIRLOCK_CONFIG_SNAPSHOT', 'AIRLOCK_CONFIG_SNAPSHOT_SHA256',
-                     'AIRLOCK_INSTALL_PKG_INFO_SHA256'):
-            os.environ.pop(name, None)
-        self.saved_root = APPSTORE.default_root
-        APPSTORE.default_root = lambda: self.root
+        AppStoreProjectionTest.setUp(self)
+        self.home = Path(self.tmp.name) / 'home'
+        (self.home / '.config' / 'airlock').mkdir(parents=True)
+        self.saved_home = os.environ.get('HOME')
+        os.environ['HOME'] = str(self.home)
+        self.links = self.home / '.config' / 'airlock' / 'links.toml'
+        self.saved_state = HOME_ORDER.default_state
+        self.state = Path(self.tmp.name) / 'home-order.json'
+        HOME_ORDER.default_state = lambda: self.state
 
     def tearDown(self):
-        APPSTORE.default_root = self.saved_root
-        for name, value in self.saved_env.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-        self.tmp.cleanup()
+        HOME_ORDER.default_state = self.saved_state
+        if self.saved_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = self.saved_home
+        AppStoreProjectionTest.tearDown(self)
 
-    def _config(self, *args):
-        return subprocess.run(
-            [sys.executable, str(self.root / 'bin' / 'airlock-config'), *args],
-            cwd=self.root, env=os.environ.copy(), text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    def add(self, **kwargs):
+        webroot = Path(self.tmp.name) / 'hub'
+        webroot.mkdir(exist_ok=True)
+        return APPSTORE.add_link(root=Path(HERE).parents[1], webroot=webroot,
+                                 order=HOME_ORDER, installed=[], **kwargs)
 
-    def _establish_lock_then_disable(self):
-        APPSTORE.register(self.config, 'retained-app', {'path': str(self.package)})
-        finalized = self._config('lock-finalize')
-        self.assertEqual(finalized.returncode, 0, finalized.stderr)
-        lock = self.root / 'airlock.lock'
-        lock_before = lock.read_bytes()
-        APPSTORE.mutate_enabled(self.config, 'retained-app', False)
-        disabled = self.config.read_bytes()
-        self.assertNotIn('retained-app', APPSTORE._load(self.config).get('apps', {}))
-        self.assertEqual(lock.read_bytes(), lock_before)
-        self.assertEqual(self.data.read_text(), 'operator data\n')
-        return lock, lock_before, disabled
+    def test_a_link_is_installed_when_it_is_on_the_home_screen(self):
+        """14 · a link has no install record; its whole state is its placement."""
+        root = Path(HERE).parents[1]
+        self.links.write_text('[team-chat]\nname = "Team Chat"\n'
+                              'url = "https://chat.example.test/"\n')
+        rows = {row['id']: row for row in
+                APPSTORE.store_rows(root, {'apps': []}, [], {'team-chat'})['rows']}
+        self.assertEqual(rows['team-chat']['state'], 'installed')
+        self.assertEqual(rows['team-chat']['kind'], 'link')
+        self.assertEqual(rows['team-chat']['origin'], 'personal')
+        self.assertEqual(rows['team-chat']['url'], 'https://chat.example.test/')
+        # The same link, not placed, is an Install the store offers — and adding it
+        # is the launcher's own home-order write, so nothing else decides this.
+        unplaced = {row['id']: row for row in
+                    APPSTORE.store_rows(root, {'apps': []}, [])['rows']}
+        self.assertEqual(unplaced['team-chat']['state'], 'install')
 
-    def test_same_bytes_register_after_disable_without_rewriting_trust_or_data(self):
-        lock, lock_before, _disabled = self._establish_lock_then_disable()
-        preview = APPSTORE.package_preview(self.root, str(self.package))
-        self.assertFalse(preview['registered'])
-        self.assertFalse(preview['requires_reapproval'])
+    def test_adding_into_a_broken_links_file_is_a_failure_not_a_link(self):
+        """The reader skips a file it cannot parse — so appending to one produces
+        a file that is still broken, a projection without the link, and an id on
+        the home screen nothing can draw. All three must not happen."""
+        self.links.write_text('[broken\nname = "unterminated\n')
+        before = self.links.read_bytes()
+        with self.assertRaises(APPSTORE.AppsError) as caught:
+            self.add(name='service', url='https://service.example.test/')
+        self.assertEqual(caught.exception.code, 'links_unreadable')
+        self.assertEqual(self.links.read_bytes(), before)
+        self.assertEqual(HOME_ORDER.read_order([]), [])
 
-        result = APPSTORE.register(
-            self.config, 'retained-app', {'path': preview['path'],
-                                          'grant': preview['grants']})
+    def test_a_candidate_less_installed_app_gets_the_same_state_calculation(self):
+        """It is updatable like any other app. A fallback row that ignored the
+        snapshot would leave the one app with no menu unable to update itself."""
+        root = Path(HERE).parents[1]
+        rows = {row['id']: row for row in APPSTORE.store_rows(
+            root, {'apps': [{'id': 'missing-origin', 'action': 'upgrade'},
+                            {'id': 'quiet', 'action': 'reinstall'}]},
+            ['missing-origin', 'quiet'])['rows']}
+        self.assertEqual(rows['missing-origin']['state'], 'update')
+        # A reinstall row offers no update.
+        self.assertEqual(rows['quiet']['state'], 'installed')
+
+    def test_an_installed_app_no_source_describes_still_has_a_row(self):
+        """An app whose origin repo cannot be read, is on this
+        box and must be in the store: a sheet that hides an installed app cannot
+        update or remove it."""
+        root = Path(HERE).parents[1]
+        rows = {row['id']: row for row in
+                APPSTORE.store_rows(root, {'apps': []}, ['unlisted-app'])['rows']}
+        self.assertEqual(rows['unlisted-app']['origin'], 'personal')
+        self.assertEqual(rows['unlisted-app']['kind'], 'app')
+        self.assertEqual(rows['unlisted-app']['state'], 'installed')
+        self.assertEqual(rows['unlisted-app']['name'], 'unlisted-app')
+        # The platform row is still first, and the ids are grouped by origin.
+        self.assertEqual(APPSTORE.store_rows(root, {'apps': []}, [])['rows'][0]['id'],
+                         'platform')
+
+    def test_a_tileless_app_keeps_its_store_row(self):
+        """feedback declares no [tile]: it draws no launcher tile, and it is still
+        an app this box installs, updates and shows in the store."""
+        root = Path(HERE).parents[1]
+        rows = {row['id']: row for row in
+                APPSTORE.store_rows(root, {'apps': []}, ['feedback'])['rows']}
+        self.assertIn('feedback', rows)
+        self.assertEqual(rows['feedback']['state'], 'installed')
+        self.assertEqual(rows['feedback']['name'], 'feedback')
+
+    def test_a_link_whose_file_is_gone_keeps_its_place_and_its_row_disappears(self):
+        """14 · the store never offers a link the box cannot resolve."""
+        root = Path(HERE).parents[1]
+        self.links.write_text('[team-chat]\nname = "Team Chat"\n'
+                              'url = "https://chat.example.test/"\n')
+        self.state.write_text(json.dumps({'order': ['team-chat', {'line': 'L'}]}))
+        rows = {row['id'] for row in
+                APPSTORE.store_rows(root, {'apps': []}, [], {'team-chat'})['rows']}
+        self.assertIn('team-chat', rows)
+        self.links.unlink()
+        rows = {row['id'] for row in
+                APPSTORE.store_rows(root, {'apps': []}, [], {'team-chat'})['rows']}
+        self.assertNotIn('team-chat', rows)
+        # The order still holds the id, because only the order's own write may
+        # change it and the launcher does that, not the store.
+        self.assertEqual(HOME_ORDER.read_order([]), ['team-chat', {'line': 'L'}])
+
+    def test_a_new_link_is_written_published_and_placed_in_that_order(self):
+        """20 · the three steps, and the order they are allowed to happen in."""
+        hub = Path(self.tmp.name) / 'hub'
+        hub.mkdir()
+        target = hub / '__airlock.json'
+        target.write_text(json.dumps({'fqdn': 'measured.example.test'}))
+        result = self.add(name='외부 서비스', url='https://service.example.test/a')
         self.assertTrue(result['changed'])
-        self.assertEqual(self._config('validate').returncode, 0)
-        self.assertEqual(lock.read_bytes(), lock_before)
-        self.assertEqual(self.data.read_text(), 'operator data\n')
-        AST_REREG['same_bytes'] = 1
+        # 1 · one table in the personal links file
+        self.assertIn('name = "외부 서비스"', self.links.read_text())
+        # 2 · the projection the launcher draws from carries it, fqdn intact
+        row = json.loads(target.read_text())['apps'][result['id']]
+        self.assertTrue(row['link'])
+        self.assertEqual(row['audience'], 'owner')
+        self.assertEqual(row['tile']['path'], 'https://service.example.test/a')
+        self.assertEqual(json.loads(target.read_text())['fqdn'], 'measured.example.test')
+        # 3 · and only then is it on the home screen
+        order = HOME_ORDER.read_order([])
+        self.assertEqual(order, [result['id']])
+        # The same url twice is the same link, not a second one.
+        again = self.add(name='different', url='https://service.example.test/a')
+        self.assertFalse(again['changed'])
+        self.assertEqual(again['id'], result['id'])
+        self.assertEqual(self.links.read_text().count('service.example.test'), 1)
 
-    def test_changed_bytes_require_exact_digest_and_preserve_failed_state(self):
-        lock, lock_before, disabled = self._establish_lock_then_disable()
-        (self.package / 'payload.txt').write_text('changed bytes\n')
-        preview = APPSTORE.package_preview(self.root, str(self.package))
-        self.assertFalse(preview['registered'])
-        self.assertTrue(preview['requires_reapproval'])
-        backup = Path(str(self.config) + '.bak')
-        backup_before = backup.read_bytes()
+    def test_bad_inputs_leave_the_links_file_and_hub_untouched(self):
+        """19 · the retired validator, unchanged, on its new nouns."""
+        before = self.links.read_bytes() if self.links.exists() else b''
+        for url in ('http://example.test', 'https://user:pass@example.test',
+                    'https:///path', 'https://example.test/\npath',
+                    'javascript:alert(1)', 'https://example.test:bad', 'https://bad%20host'):
+            with self.subTest(url=url), self.assertRaises(APPSTORE.AppsError) as caught:
+                self.add(name='service', url=url)
+            self.assertTrue(caught.exception.code.startswith('bad_link'))
+            self.assertEqual(self.links.read_bytes() if self.links.exists() else b'',
+                             before)
+        for name in ('', None, 'bad\x00name'):
+            with self.subTest(name=name), self.assertRaises(APPSTORE.AppsError) as caught:
+                self.add(name=name, url='https://example.test')
+            self.assertTrue(caught.exception.code.startswith('bad_link'))
+        self.assertFalse((Path(self.tmp.name) / 'hub' / '__airlock.json').exists())
 
-        with self.assertRaises(APPSTORE.AppsError) as strict:
-            APPSTORE.register(self.config, 'retained-app', {
-                'path': preview['path'], 'grant': preview['grants']})
-        self.assertEqual(strict.exception.code, 'config_invalid')
-        with self.assertRaises(APPSTORE.AppsError) as changed:
-            APPSTORE.register(self.config, 'retained-app', {
-                'path': preview['path'], 'grant': preview['grants']},
-                approved_digest='0' * 64)
-        self.assertEqual(changed.exception.code, 'config_invalid')
-        self.assertEqual(self.config.read_bytes(), disabled)
-        self.assertEqual(backup.read_bytes(), backup_before)
-        self.assertEqual(lock.read_bytes(), lock_before)
+    def test_a_failed_publication_restores_the_links_file_and_leaves_the_order_alone(self):
+        """20 · the rollback half: no half-added link anywhere."""
+        hub = Path(self.tmp.name) / 'hub'
+        hub.mkdir()
+        target = hub / '__airlock.json'
+        target.write_text('{"fqdn":"measured"}')
+        previous = target.read_bytes()
+        replace = APPSTORE.os.replace
 
-        result = APPSTORE.register(self.config, 'retained-app', {
-            'path': preview['path'], 'grant': preview['grants']},
-            approved_digest=preview['digest'])
-        self.assertTrue(result['changed'])
-        self.assertNotEqual(self.config.read_bytes(), disabled)
-        self.assertEqual(backup.read_bytes(), disabled)
-        self.assertEqual(lock.read_bytes(), lock_before)
-        self.assertEqual(self.data.read_text(), 'operator data\n')
-        self.assertEqual(self._config('validate').returncode, 0)
-        self.assertNotEqual(self._config('package-info').returncode, 0)
-        approved = self._config(
-            'package-register-validate', 'retained-app', preview['digest'])
-        self.assertEqual(approved.returncode, 0, approved.stderr)
-        AST_REREG['changed_bytes'] = 1
-        AST_REREG['digest_rejected_no_mutation'] = 1
+        def fail_hub(source, destination):
+            if Path(destination) == target:
+                raise OSError('Hub rename failed')
+            return replace(source, destination)
 
-    def test_capability_change_is_rejected_until_its_grant_is_in_the_candidate(self):
-        lock, lock_before, disabled = self._establish_lock_then_disable()
-        (self.package / 'airlock-app.toml').write_text(
-            'contract = 1\nid = "retained-app"\n'
-            '[artifacts]\nunits = [{name = "retained-app.service", scope = "system"}]\n')
-        preview = APPSTORE.package_preview(self.root, str(self.package))
-        self.assertEqual(preview['grants'], ['system-unit'])
-        with self.assertRaises(APPSTORE.AppsError) as missing_grant:
-            APPSTORE.register(self.config, 'retained-app', {
-                'path': preview['path'], 'grant': []},
-                approved_digest=preview['digest'])
-        self.assertEqual(missing_grant.exception.code, 'config_invalid')
-        self.assertEqual(self.config.read_bytes(), disabled)
-        self.assertEqual(lock.read_bytes(), lock_before)
+        APPSTORE.os.replace = fail_hub
+        try:
+            with self.assertRaises(APPSTORE.AppsError) as caught:
+                self.add(name='service', url='https://example.test')
+        finally:
+            APPSTORE.os.replace = replace
+        self.assertEqual(caught.exception.code, 'hub_refresh_failed')
+        self.assertFalse(self.links.exists())
+        self.assertEqual(target.read_bytes(), previous)
+        self.assertEqual(list(hub.glob('.__airlock.json.*')), [])
+        self.assertEqual(list(self.links.parent.glob('.links.toml.*')) if self.links.parent.exists()
+                         else [], [])
+        self.assertEqual(HOME_ORDER.read_order([]), [])
 
-        APPSTORE.register(self.config, 'retained-app', {
-            'path': preview['path'], 'grant': preview['grants']},
-            approved_digest=preview['digest'])
-        self.assertEqual(
-            APPSTORE._load(self.config)['packages']['retained-app']['grant'],
-            ['system-unit'])
-        self.assertEqual(lock.read_bytes(), lock_before)
-        self.assertEqual(self.data.read_text(), 'operator data\n')
-        AST_REREG['capability_rejected_no_mutation'] = 1
+    def test_a_webjson_failure_also_restores_the_links_file(self):
+        hub = Path(self.tmp.name) / 'hub'
+        hub.mkdir()
+        target = hub / '__airlock.json'
+        target.write_text('{"fqdn":"measured"}')
+        previous = target.read_bytes()
+        command = APPSTORE._command
+        real = command
 
-    def test_remove_then_reregister_is_one_measured_personal_transition(self):
-        lock, lock_before, removed = self._establish_lock_then_disable()
-        self.assertNotIn('retained-app', APPSTORE._load(self.config).get('packages', {}))
-        preview = APPSTORE.package_preview(self.root, str(self.package))
-        result = APPSTORE.register(
-            self.config, 'retained-app', {'path': preview['path'],
-                                          'grant': preview['grants']})
-        self.assertTrue(result['changed'])
-        self.assertNotEqual(self.config.read_bytes(), removed)
-        self.assertIn('retained-app', APPSTORE._load(self.config)['packages'])
-        self.assertEqual(lock.read_bytes(), lock_before)
-        self.assertEqual(self.data.read_text(), 'operator data\n')
-        AST_REREG['disable_remove'] = 1
-        AST_REREG['personal_remove_reregister'] = 1
+        def fail(root, args, **kwargs):
+            if args == ['webjson']:
+                raise APPSTORE.AppsError('config_invalid', 'render failed')
+            return real(root, args, **kwargs)
 
-    def test_company_remove_then_reregister_uses_the_real_writer_with_noop_controls(self):
-        # Company staging ends before the shared package writer. Exercise the exact
-        # staged path/digest handoff with the production mutation functions here.
-        company_package = Path(self.tmp.name) / 'company-stage' / 'retained-app'
-        company_package.parent.mkdir()
-        shutil.copytree(self.package, company_package)
-        APPSTORE.register(
-            self.config, 'retained-app', {'path': str(company_package), 'grant': []})
-        finalized = self._config('lock-finalize')
-        self.assertEqual(finalized.returncode, 0, finalized.stderr)
-        lock = self.root / 'airlock.lock'
+        APPSTORE._command = fail
+        try:
+            with self.assertRaises(APPSTORE.AppsError):
+                self.add(name='service', url='https://example.test')
+        finally:
+            APPSTORE._command = command
+        self.assertFalse(self.links.exists())
+        self.assertEqual(target.read_bytes(), previous)
 
-        def snapshot():
-            document = APPSTORE._load(self.config)
-            return {
-                'config': self.config.read_bytes(),
-                'app': 'retained-app' in (document.get('apps') or {}),
-                'package': 'retained-app' in (document.get('packages') or {}),
-                'lock': lock.read_bytes(),
-                'data': self.data.read_bytes(),
-            }
-
-        def complete_transition(before, removed, restored):
-            return bool(
-                before['app'] and before['package']
-                and not removed['app'] and not removed['package']
-                and restored['app'] and restored['package']
-                and before['config'] != removed['config']
-                and removed['config'] != restored['config']
-                and before['lock'] == removed['lock'] == restored['lock']
-                and before['data'] == removed['data'] == restored['data'])
-
-        before = snapshot()
-        removed_result = APPSTORE.mutate_enabled(
-            self.config, 'retained-app', False)
-        self.assertTrue(removed_result['changed'])
-        removed = snapshot()
-
-        (company_package / 'payload.txt').write_text('company changed bytes\n')
-        preview = APPSTORE.package_preview(self.root, str(company_package))
-        self.assertFalse(preview['registered'])
-        self.assertTrue(preview['requires_reapproval'])
-        registered_result = APPSTORE.register(
-            self.config, 'retained-app', {
-                'path': preview['path'], 'grant': preview['grants']},
-            approved_digest=preview['digest'])
-        self.assertTrue(registered_result['changed'])
-        restored = snapshot()
-
-        self.assertTrue(complete_transition(before, removed, restored))
-        self.assertFalse(
-            complete_transition(before, before, restored),
-            'a no-op remove must not satisfy the transition')
-        self.assertFalse(
-            complete_transition(before, removed, removed),
-            'a no-op register must not satisfy the transition')
-        AST_REREG['company_remove_reregister'] = 1
-        AST_REREG['company_noop_remove_rejected'] = 1
-        AST_REREG['company_noop_register_rejected'] = 1
+    def test_an_existing_links_file_keeps_its_bytes_and_comments(self):
+        self.links.write_text('# my links\n[remote-vm]\nname = "remote vm"\n'
+                              'url = "https://vm.example.test/"\n')
+        self.add(name='service', url='https://service.example.test/')
+        text = self.links.read_text()
+        self.assertTrue(text.startswith('# my links\n'))
+        self.assertIn('[remote-vm]', text)
+        self.assertIn('[link-', text)
 
 
 class UpdateExecRouteTest(unittest.TestCase):
@@ -2266,7 +2255,7 @@ class UpdateExecRouteTest(unittest.TestCase):
         self._updates = DM.UPDATES
         DM.UPDATES = self._snapshot([{'id': 'notes', 'action': 'upgrade',
                                       'sourceClass': 'shipped'},
-                                     {'id': 'orca', 'action': 'lock-mismatch',
+                                     {'id': 'orca', 'action': 'reinstall',
                                       'sourceClass': 'explicit'}])
         try:
             UPX.run_path(self.dir).unlink()
@@ -2281,7 +2270,7 @@ class UpdateExecRouteTest(unittest.TestCase):
     def _snapshot(apps):
         class Snapshot:
             @staticmethod
-            def read_snapshot():
+            def current(root):
                 return {'checkedAt': '2026-09-01T00:00:00Z', 'platform': None,
                         'apps': apps,
                         'harness': {'codex': None, 'hooksDrift': False, 'skillsWired': 0}}
@@ -2291,13 +2280,14 @@ class UpdateExecRouteTest(unittest.TestCase):
     def _missing_snapshot():
         class Snapshot:
             @staticmethod
-            def read_snapshot():
-                return None
+            def current(root):
+                return {'apps': []}
         return Snapshot
 
     def _req(self, method, path, body=None, owner=True, origin=True):
         import http.client
-        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        conn = http.client.HTTPConnection('127.0.0.1', self.port,
+                                          timeout=getattr(self, 'request_timeout', 5))
         headers = {'Content-Type': 'application/json'}
         if owner:
             headers['X-Devmon-Owner'] = 'me@example.test'
@@ -2315,81 +2305,6 @@ class UpdateExecRouteTest(unittest.TestCase):
                          body=json.dumps(payload).encode(), **kw)
 
     @contextlib.contextmanager
-    def _actual_lock_mismatch(self, *, installed_env):
-        """Build a mismatch with the real platform CLI, never a command double."""
-        source = Path(HERE).parents[1]
-        with tempfile.TemporaryDirectory(dir=self.tmp.name) as temporary:
-            case = Path(temporary)
-            root = case / 'checkout'
-            package = case / 'moved-app'
-            steady_package = case / 'steady-app'
-            (root / 'apps').mkdir(parents=True)
-            shutil.copytree(source / 'bin', root / 'bin')
-            (root / 'hub').mkdir()
-            shutil.copy2(source / 'hub' / 'index.html', root / 'hub' / 'index.html')
-            for manifest in sorted((source / 'apps').glob('*/airlock-app.toml')):
-                target = root / 'apps' / manifest.parent.name
-                target.mkdir()
-                shutil.copy2(manifest, target / manifest.name)
-
-            for package_dir, app_id in ((package, 'moved-app'),
-                                        (steady_package, 'steady-app')):
-                package_dir.mkdir()
-                (package_dir / 'airlock-app.toml').write_text(
-                    'contract = 1\nid = %s\n' % json.dumps(app_id))
-                for script in ('install.sh', 'smoke.sh', 'deactivate.sh'):
-                    path = package_dir / script
-                    path.write_text('#!/usr/bin/env bash\nset -euo pipefail\n')
-                    path.chmod(0o755)
-                (package_dir / 'payload.txt').write_text('approved\n')
-            payload_file = package / 'payload.txt'
-            config = root / 'airlock.toml'
-            config.write_text(
-                '[airlock]\nconfig_version = 2\n'
-                '[auth]\nprovider = "tailscale"\nowner = "me@example.test"\n'
-                '[apps.hub]\n[apps.steady-app]\n[apps.moved-app]\n'
-                '[packages.steady-app]\npath = %s\n'
-                '[packages.moved-app]\npath = %s\n'
-                % (json.dumps(str(steady_package)), json.dumps(str(package))))
-
-            saved_config = os.environ.get('AIRLOCK_CONFIG')
-            saved_state = os.environ.get('AIRLOCK_HOME_ORDER_STATE')
-            saved_exec = DM.UPDATE_EXEC_CONFIG
-            clean_env = os.environ.copy()
-            for name in ('AIRLOCK_CONFIG_SNAPSHOT', 'AIRLOCK_CONFIG_SNAPSHOT_SHA256',
-                         'AIRLOCK_INSTALL_PKG_INFO_SHA256'):
-                clean_env.pop(name, None)
-            clean_env['AIRLOCK_CONFIG'] = str(config)
-            finalized = subprocess.run(
-                [sys.executable, str(root / 'bin' / 'airlock-config'), 'lock-finalize'],
-                cwd=root, env=clean_env, text=True, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, check=False)
-            self.assertEqual(finalized.returncode, 0, finalized.stderr)
-            payload_file.write_text('changed after approval\n')
-
-            DM.UPDATE_EXEC_CONFIG = dict(
-                saved_exec, root=root, cwd_root=str(root))
-            os.environ['AIRLOCK_HOME_ORDER_STATE'] = str(case / 'home-order.json')
-            if installed_env:
-                os.environ['AIRLOCK_CONFIG'] = str(config)
-            else:
-                os.environ.pop('AIRLOCK_CONFIG', None)
-            try:
-                preview = APPSTORE.package_preview(root, str(package))
-                self.assertTrue(preview['requires_reapproval'], preview)
-                yield root, config, package, preview
-            finally:
-                DM.UPDATE_EXEC_CONFIG = saved_exec
-                if saved_config is None:
-                    os.environ.pop('AIRLOCK_CONFIG', None)
-                else:
-                    os.environ['AIRLOCK_CONFIG'] = saved_config
-                if saved_state is None:
-                    os.environ.pop('AIRLOCK_HOME_ORDER_STATE', None)
-                else:
-                    os.environ['AIRLOCK_HOME_ORDER_STATE'] = saved_state
-
-    # ---- the gate -----------------------------------------------------------
     def test_execution_is_reachable_on_a_box_with_the_message_console_off(self):
         """The reason this route exists at all — `messages = false` is the default.
 
@@ -2434,15 +2349,47 @@ class UpdateExecRouteTest(unittest.TestCase):
         self.assertTrue(plan['exec'][1].endswith('devmon_update_exec.py'))
         self.assertEqual(UPX.read_record(self.dir)['runId'], run_id)
 
+    def test_mixed_old_snapshot_keeps_normal_updates_visible_and_executable(self):
+        path = self.dir / 'mixed-updates.json'
+        platform = {'available': True, 'changedCount': 2, 'ref': 'main'}
+        harness = {'hooksDrift': False, 'skillsWired': 2}
+        normal = {'id': 'notes', 'action': 'upgrade', 'sourceClass': 'shipped'}
+        # Historical fixture only: the runtime has no named retired action.
+        self._updates.write_snapshot(path, {
+            'checkedAt': '2026-10-03T00:00:00Z', 'platform': platform,
+            'harness': harness, 'apps': [normal,
+                {'id': 'old', 'action': 'lock-mismatch', 'sourceClass': 'explicit'},
+                {'id': 'current', 'action': 'reinstall', 'sourceClass': 'shipped'}],
+        })
+        before = path.read_bytes()
+        DM.UPDATES = types.SimpleNamespace(
+            current=lambda root: self._updates.read_snapshot(path))
+        status, snapshot = self._req('GET', '/api/owner/updates')
+        self.assertEqual(status, 200)
+        self.assertEqual(snapshot['apps'], [normal])
+        self.assertEqual(snapshot['platform'], platform)
+        self.assertEqual(snapshot['harness'], harness)
+        sources = APPSTORE._sources
+        APPSTORE._sources = lambda root: {'apps': {}}
+        try:
+            rows = {row['id']: row for row in APPSTORE.store_rows(
+                self.root, snapshot, ['notes'])['rows']}
+        finally:
+            APPSTORE._sources = sources
+        self.assertEqual(rows['notes']['state'], 'update')
+        self.assertEqual(rows['platform']['state'], 'update')
+        status, payload = self._execute({'action': 'app', 'id': 'notes'})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_a_pending_app_launches_the_same_command_and_records_which_row(self):
         status, payload = self._execute({'action': 'app', 'id': 'notes'})
         self.assertEqual(status, 200, payload)
         record = UPX.read_record(self.dir)
         self.assertEqual((record['action'], record['appId']), ('app', 'notes'))
 
-    def test_a_lock_mismatch_app_cannot_be_executed(self):
-        """🔴 Owner decision LOCK_UI_V1, enforced server-side and not only by a
-        disabled button: re-approving a package lock is a terminal procedure."""
+    def test_an_app_without_an_update_cannot_be_executed(self):
         status, payload = self._execute({'action': 'app', 'id': 'orca'})
         self.assertEqual((status, payload['error']), (409, 'app_not_pending'))
         self.assertEqual(self.launched, [])
@@ -2463,286 +2410,389 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertEqual((status, payload['error']), (400, 'bad_action'), body)
         self.assertEqual(self.launched, [])
 
+    def test_the_link_route_adds_a_link_without_launching_the_installer(self):
+        """20, at the route. The gate is the same one; the installer is not touched."""
+        root = Path(HERE).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / 'airlock.toml'
+            shutil.copy2(root / 'airlock.toml.example', config)
+            home = Path(temporary) / 'home'
+            (home / '.config' / 'airlock').mkdir(parents=True)
+            links = home / '.config' / 'airlock' / 'links.toml'
+            links.write_text('[existing-link]\nname = "Existing"\n'
+                             'url = "https://existing.example.test"\n')
+            hub = Path(temporary) / 'hub'
+            hub.mkdir()
+            saved = (os.environ.get('AIRLOCK_CONFIG'), os.environ.get('AIRLOCK_WEBROOT'),
+                     os.environ.get('HOME'), DM.UPDATE_EXEC_CONFIG['root'],
+                     HOME_ORDER.default_state)
+            state = Path(temporary) / 'home-order.json'
+            os.environ['AIRLOCK_CONFIG'] = str(config)
+            os.environ['AIRLOCK_WEBROOT'] = str(hub)
+            os.environ['HOME'] = str(home)
+            DM.UPDATE_EXEC_CONFIG['root'] = root
+            HOME_ORDER.default_state = lambda: state
+            try:
+                path = '/api/owner/apps/links/add'
+                body = json.dumps({'name': 'External',
+                                   'url': 'https://external.example.test'}).encode()
+                before = links.read_bytes()
+                self.assertEqual(self._req('POST', path, body, owner=False)[0], 403)
+                self.assertEqual(self._req('POST', path, body, origin=False)[0], 403)
+                self.assertEqual(links.read_bytes(), before)
+                status, payload = self._req('POST', path, body)
+                self.assertEqual(status, 200, payload)
+                self.assertTrue(payload['changed'])
+                sid = payload['id']
+                # The projection the launcher draws from carries it as a link, and
+                # the store's GET carries it as one row with an Install state.
+                self.assertTrue(json.loads(
+                    (hub / '__airlock.json').read_text())['apps'][sid]['link'])
+                status, listed = self._req('GET', '/api/owner/apps')
+                self.assertEqual(status, 200, listed)
+                rows = {row['id']: row for row in listed['rows']}
+                self.assertEqual(rows[sid]['state'], 'installed')
+                self.assertEqual(rows[sid]['kind'], 'link')
+                # The pre-existing link was never placed on the home screen, and
+                # placement is the whole of a link's state — so it reads Install.
+                self.assertEqual(rows['existing-link']['state'], 'install')
+                # It is on the home screen, last.
+                self.assertEqual(HOME_ORDER.read_order([])[-1], sid)
+                # Nothing here runs the installer.
+                self.assertEqual(self.launched, [])
+                # A bad url is a 400 and changes no byte of anything.
+                bad = json.dumps({'name': 'Bad', 'url': 'http://insecure.test'}).encode()
+                status, payload = self._req('POST', path, bad)
+                self.assertEqual((status, payload['error']), (400, 'bad_link_url'))
+                self.assertEqual(links.read_bytes(), links.read_bytes())
+                self.assertNotIn('http://insecure.test', links.read_text())
+            finally:
+                for name, value in zip(('AIRLOCK_CONFIG', 'AIRLOCK_WEBROOT', 'HOME'),
+                                       saved[:3]):
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+                DM.UPDATE_EXEC_CONFIG['root'] = saved[3]
+                HOME_ORDER.default_state = saved[4]
+
+    def test_retired_enable_disable_routes_do_not_write_or_launch(self):
+        for action in ('enable', 'disable', 'install-company', 'reapprove'):
+            status, _ = self._req('POST', '/api/owner/apps/notes/' + action, b'{}')
+            self.assertEqual(status, 404)
+        self.assertEqual(self.launched, [])
+        self.assertFalse(UPX.run_path(self.dir).exists())
+
+    def test_the_retired_shortcut_routes_are_gone(self):
+        for path in ('/api/owner/apps/shortcuts/add',):
+            status, _ = self._req('POST', path, json.dumps({'name': 'x',
+                                                            'url': 'https://x.test'}).encode())
+            self.assertEqual(status, 404, path)
+        status, _ = self._req('POST', '/api/owner/apps/anything/remove-shortcut', b'{}')
+        self.assertEqual(status, 404)
+
     def test_app_store_get_and_mutations_share_the_owner_gate_and_install_scope(self):
-        projection = {
-            'apps': {'notes': {}},
-            'installed': [{'id': 'notes', 'canRemove': True}],
-            'public': [{'id': 'notepad', 'canRemove': True}],
-            'updates': {'apps': []},
-        }
-        saved = (DM.APPS.list_apps, DM.APPS.config_path,
-                 DM.APPS.register, DM.APPS.mutate_enabled)
-        saved_company = (DM.COMPANY_CATALOG.installed_company_ids,
-                         DM.COMPANY_CATALOG.list_catalog)
-        calls = []
-        DM.APPS.list_apps = lambda root, updates, company_ids=None: projection
-        DM.APPS.config_path = lambda root: Path('/tmp/airlock.toml')
-        DM.APPS.register = lambda config, app_id: calls.append(('register', app_id))
-        DM.APPS.mutate_enabled = lambda config, app_id, enabled: (
-            calls.append(('enabled', app_id, enabled)))
-        DM.COMPANY_CATALOG.installed_company_ids = lambda config: set()
-        DM.COMPANY_CATALOG.list_catalog = lambda config: []
+        rows = {'rows': [
+            {'id': 'notes', 'origin': 'public', 'kind': 'app', 'name': 'Notes',
+             'desc': 'vault', 'state': 'installed'},
+            {'id': 'notepad', 'origin': 'public', 'kind': 'app', 'name': 'Clip',
+             'desc': 'clipboard', 'state': 'install'}],
+            'updates': {'apps': []}}
+        saved = (DM.APPS.store_rows, DM.APPS.installed_ids)
+        DM.APPS.store_rows = lambda root, updates, installed, placed=None: rows
+        DM.APPS.installed_ids = lambda root: ['notes']
         try:
             status, payload = self._req('GET', '/api/owner/apps')
-            self.assertEqual((status, payload['apps']), (200, {'notes': {}}))
-            self.assertEqual(payload['company'], [])
+            self.assertEqual((status, payload['rows']), (200, rows['rows']))
             self.assertEqual(self._req('GET', '/api/owner/apps', owner=False)[0], 403)
 
-            status, payload = self._req('POST', '/api/owner/apps/notepad/enable', b'{}')
+            status, payload = self._req('POST', '/api/owner/apps/notepad/install', b'{}')
             self.assertEqual(status, 200, payload)
-            self.assertEqual((payload['action'], payload['execution']), ('enable', 'install'))
-            self.assertEqual(calls, [('register', 'notepad')])
+            self.assertEqual((payload['action'], payload['execution']), ('install', 'install'))
             record = UPX.read_record(self.dir)
             self.assertEqual((record['action'], record['appId']), ('install', 'notepad'))
             self.assertIn('--action', self.launched[-1][1]['exec'])
 
             UPX.run_path(self.dir).unlink()
-            status, payload = self._req('POST', '/api/owner/apps/notes/disable', b'{}')
-            self.assertEqual((status, payload['action']), (200, 'disable'))
-            self.assertEqual(calls[-1], ('enabled', 'notes', False))
-
-            UPX.run_path(self.dir).unlink()
             status, payload = self._req('POST', '/api/owner/apps/notes/remove', b'{}')
             self.assertEqual((status, payload['action']), (200, 'remove'))
-            self.assertEqual(payload['execution'], 'install')
-            self.assertEqual(calls[-1], ('enabled', 'notes', False))
+            self.assertEqual(payload['execution'], 'teardown')
         finally:
-            (DM.APPS.list_apps, DM.APPS.config_path,
-             DM.APPS.register, DM.APPS.mutate_enabled) = saved
-            (DM.COMPANY_CATALOG.installed_company_ids,
-             DM.COMPANY_CATALOG.list_catalog) = saved_company
+            (DM.APPS.store_rows, DM.APPS.installed_ids) = saved
 
-    def test_unreadable_company_catalog_keeps_only_the_installed_company_marker(self):
-        """A lost Git credential is not permission to relabel or install an app."""
-        projection = {
-            'apps': {'widget': {}},
-            'installed': [{'id': 'widget', 'source': 'explicit', 'tier': 'company', 'canRemove': True}],
-            'public': [], 'updates': {'apps': []},
-        }
-        saved = (DM.APPS.list_apps, DM.APPS.config_path,
-                 DM.COMPANY_CATALOG.installed_company_ids,
-                 DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry)
-        calls = []
-        DM.APPS.list_apps = lambda root, updates, company_ids=None: (
-            calls.append(('list_apps', company_ids)) or projection)
-        DM.APPS.config_path = lambda root: Path('/tmp/catalog-fixture.toml')
-        DM.COMPANY_CATALOG.installed_company_ids = lambda config: {'widget'}
-        DM.COMPANY_CATALOG.list_catalog = lambda config: []
-        DM.COMPANY_CATALOG.stage_entry = lambda *args: calls.append(('stage', args))
+    def test_http_buttons_reach_real_engine_and_keep_other_app_and_paseo_unchanged(self):
+        """Real HTTP -> runner wrapper -> engine -> fixture files and installation record."""
+        # This runner waits synchronously for the real engine (60s), whereas
+        # the other route tests return immediately from mocked launchers.
+        self.request_timeout = 90
+        root = Path(HERE).parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            for name in ('home', 'data', 'state', 'web', 'confd', 'site', 'bin'):
+                (fixture / name).mkdir()
+            calls = fixture / 'calls'
+            for name in ('systemctl', 'nginx', 'tailscale'):
+                tool = fixture / 'bin' / name
+                tool.write_text('#!/bin/sh\nprintf "%s %s\\n" ' + name + ' "$*" >>"$WIRE_CALLS"\nexit 0\n')
+                tool.chmod(0o755)
+            sudo = fixture / 'bin' / 'sudo'
+            sudo.write_text('#!/bin/sh\nexec "$@"\n'); sudo.chmod(0o755)
+            company = fixture / 'company'
+            company.mkdir()
+            for app_id in ('wire-alpha', 'wire-beta', 'notepad'):
+                app = company / 'apps' / app_id
+                app.mkdir(parents=True)
+                (app / 'airlock-app.toml').write_text(
+                    'contract=1\nid="%s"\n[artifacts]\nfiles=["~/.local/share/%s/owned"]\n'
+                    '[tile]\nlabel="%s"\npath="/%s/"\n' % (app_id, app_id, app_id, app_id))
+                (app / 'install.sh').write_text(
+                    '#!/bin/sh\nmkdir -p "$HOME/.local/share/$AIRLOCK_APP_ID"\n'
+                    'cat "$AIRLOCK_APP_DIR/VERSION" > "$HOME/.local/share/$AIRLOCK_APP_ID/owned"\n'
+                    'printf "%s\\n" "$AIRLOCK_APP_ID" >> "$WIRE_HOOKS"\n')
+                (app / 'VERSION').write_text('v1')
+            def git(*args):
+                return subprocess.check_output(['git', '-C', str(company), *args], text=True).strip()
+            git('init', '-q', '-b', 'main'); git('add', 'apps')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'v1')
+            remote = fixture / 'remote.git'
+            subprocess.check_call(['git', 'clone', '-q', '--bare', str(company), str(remote)])
+            config = fixture / 'airlock.toml'
+            config.write_text('[site]\ncompany_repo="%s"\n[auth]\nprovider="tailscale"\n'
+                              'owner="me@example.test"\n[apps.hub]\n' % remote)
+            env = {'HOME': str(fixture / 'home'), 'AIRLOCK_STATE_DIR': str(fixture / 'state'),
+                   'AIRLOCK_DATA_DIR': str(fixture / 'data'), 'AIRLOCK_WEBROOT': str(fixture / 'web'),
+                   'AIRLOCK_CONFD': str(fixture / 'confd'), 'AIRLOCK_NGINX_SITE': str(fixture / 'site/site.conf'),
+                   'AIRLOCK_CONFIG': str(config), 'AIRLOCK_ROOT': str(root),
+                   'AIRLOCK_FIXTURE_ROOT': str(fixture), 'AIRLOCK_TS_FQDN': 'fixture.example.test',
+                   'WIRE_CALLS': str(calls), 'WIRE_HOOKS': str(fixture / 'hooks'),
+                   'PATH': str(fixture / 'bin') + ':' + os.environ['PATH']}
+            # Publish is installed in ③, with no operator config membership.
+            # The real notepad dependency hook must consult that installed fact.
+            core_head = subprocess.check_output(
+                ['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+            publish_row = {'repo': str(root / 'apps/publish'),
+                           'commit': core_head, 'artifacts': []}
+            (fixture / 'state/installed-apps.json').write_text(
+                json.dumps({'publish': publish_row}))
+            saved_root = DM.UPDATE_EXEC_CONFIG['root']
+            DM.UPDATE_EXEC_CONFIG['root'] = root
+            DM.UPDATES = self._updates
+            def launch(run_id, plan, cfg=None, name=None):
+                result = subprocess.run(plan['exec'], stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.launched.append((run_id, plan, cfg, name))
+                return 'ok', 'fixture'
+            DM._launch_run = launch
+            try:
+                with unittest.mock.patch.dict(os.environ, env):
+                    before_config = config.read_bytes()
+                    status, catalog = self._req('GET', '/api/owner/apps')
+                    self.assertEqual(status, 200, catalog)
+                    self.assertEqual([r['id'] for r in catalog['rows'] if r['origin'] == 'company'],
+                                     ['wire-alpha', 'wire-beta'])
+                    public = next(row for row in catalog['rows'] if row['id'] == 'notepad')
+                    self.assertEqual((public['origin'], public['name']), ('public', 'Clip Bridge'))
+                    self.assertEqual(self._req('POST', '/api/owner/apps/notepad/install', b'{}')[0], 200)
+                    self.assertTrue((fixture / 'web/notepad/index.html').is_file())
+                    self.assertFalse((fixture / 'home/.local/share/notepad/owned').exists())
+                    installed_public = json.loads((fixture / 'state/installed-apps.json').read_text())['notepad']
+                    self.assertEqual(installed_public['repo'], str(root / 'apps/notepad'))
+                    for app_id in ('wire-beta', 'wire-alpha'):
+                        self.assertEqual(self._req('POST', '/api/owner/apps/' + app_id + '/install', b'{}')[0], 200)
+                        # A local Company Git path remains a repository source
+                        # after the first recorded row; the next GET/Install works.
+                        row = json.loads((fixture / 'state/installed-apps.json').read_text())[app_id]
+                        self.assertEqual(row['repo'], remote.resolve().as_uri())
+                        status, after_install = self._req('GET', '/api/owner/apps')
+                        self.assertEqual(status, 200, after_install)
+                    record = fixture / 'state/installed-apps.json'
+                    installed = json.loads(record.read_text())
+                    beta = installed['wire-beta']
+                    beta_bytes = (fixture / 'home/.local/share/wire-beta/owned').read_bytes()
+                    (company / 'apps/wire-alpha/VERSION').write_text('v2')
+                    git('add', 'apps'); git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+                                           'commit', '-qm', 'alpha v2')
+                    git('push', '-q', str(remote), 'main:main')
+                    status, updates = self._req('GET', '/api/owner/updates')
+                    self.assertEqual(status, 200, updates)
+                    self.assertEqual([row['id'] for row in updates['apps']], ['wire-alpha'])
+                    self.assertEqual(self._execute({'action': 'app', 'id': 'wire-alpha'})[0], 200)
+                    installed = json.loads(record.read_text())
+                    self.assertNotEqual(installed['wire-alpha']['commit'], beta['commit'])
+                    self.assertEqual(installed['wire-beta'], beta)
+                    self.assertEqual((fixture / 'home/.local/share/wire-beta/owned').read_bytes(), beta_bytes)
+                    data = fixture / 'home/.local/share/wire-alpha/user-data'
+                    data.write_text('keep')
+                    self.assertEqual(self._req('POST', '/api/owner/apps/wire-alpha/remove', b'{}')[0], 200)
+                    self.assertFalse((data.parent / 'owned').exists())
+                    self.assertEqual(data.read_text(), 'keep')
+                    self.assertEqual(json.loads(record.read_text())['wire-beta'], beta)
+                    self.assertEqual(json.loads(record.read_text())['publish'], publish_row)
+                    self.assertEqual(config.read_bytes(), before_config)
+                    self.assertEqual((fixture / 'hooks').read_text().splitlines(),
+                                     ['wire-beta', 'wire-alpha', 'wire-alpha'])
+                    self.assertNotIn('paseo', calls.read_text())
+
+                    # An installed source A has disappeared, while operator and
+                    # Company sources both offer the same id. Update cannot
+                    # silently choose either B; Remove needs only A's record.
+                    candidate = fixture / 'candidate-beta'
+                    candidate.mkdir()
+                    (candidate / 'airlock-app.toml').write_text(
+                        'contract=1\nid="wire-beta"\n[artifacts]\n'
+                        'files=["~/.local/share/candidate-beta/owned"]\n')
+                    (candidate / 'install.sh').write_text(
+                        '#!/bin/sh\nmkdir -p "$HOME/.local/share/candidate-beta"\n'
+                        'printf chosen-B > "$HOME/.local/share/candidate-beta/owned"\n'
+                        'printf "candidate-beta\\n" >> "$WIRE_HOOKS"\n')
+                    config.write_text(config.read_text() + '\n[packages.wire-beta]\npath=' +
+                                      json.dumps(str(candidate)) + '\n')
+                    missing_config = config.read_bytes()
+                    missing_row = {'repo': str(fixture / 'missing-source-A'), 'commit': '',
+                                   'artifacts': beta['artifacts']}
+                    installed = json.loads(record.read_text())
+                    installed['wire-beta'] = missing_row
+                    record.write_text(json.dumps(installed))
+                    before_missing = record.read_bytes()
+                    before_launches = len(self.launched)
+                    status, value = self._execute({'action': 'app', 'id': 'wire-beta'})
+                    self.assertNotEqual(status, 200, value)
+                    self.assertEqual(len(self.launched), before_launches)
+                    self.assertEqual(record.read_bytes(), before_missing)
+                    marker = fixture / 'home/.local/share/candidate-beta/owned'
+                    self.assertFalse(marker.exists())
+                    self.assertEqual((fixture / 'hooks').read_text().splitlines(),
+                                     ['wire-beta', 'wire-alpha', 'wire-alpha'])
+                    status, value = self._req('POST', '/api/owner/apps/wire-beta/remove', b'{}')
+                    self.assertEqual(status, 200, value)
+                    self.assertNotIn('wire-beta', json.loads(record.read_text()))
+                    self.assertFalse((fixture / 'home/.local/share/wire-beta/owned').exists())
+                    self.assertFalse(marker.exists())
+
+                    # Choosing B explicitly is a new Install, not a fallback.
+                    installed = json.loads(record.read_text())
+                    installed['wire-beta'] = dict(missing_row, artifacts=[])
+                    record.write_text(json.dumps(installed))
+                    status, value = self._req('POST', '/api/owner/apps/wire-beta/register',
+                                              json.dumps({'path': str(candidate)}).encode())
+                    self.assertEqual(status, 200, value)
+                    self.assertEqual(marker.read_text(), 'chosen-B')
+                    installed = json.loads(record.read_text())
+                    self.assertEqual(installed['wire-beta']['repo'], str(candidate))
+                    self.assertEqual(installed['publish'], publish_row)
+                    self.assertEqual(installed['notepad'], installed_public)
+                    self.assertEqual(config.read_bytes(), missing_config)
+                    self.assertEqual((fixture / 'hooks').read_text().splitlines(),
+                                     ['wire-beta', 'wire-alpha', 'wire-alpha', 'candidate-beta'])
+                    self.assertNotIn('paseo', calls.read_text())
+
+                    # Reproduce the pre-fix ambiguous Company row. Do not infer
+                    # Company from that local path; an explicit Install repairs it.
+                    wrong = dict(installed['wire-beta'], repo=str(remote), commit=git('rev-parse', 'main'))
+                    installed['wire-beta'] = wrong
+                    record.write_text(json.dumps(installed))
+                    self.assertEqual(self._req('GET', '/api/owner/apps')[0], 200)
+                    launch_count = len(self.launched)
+                    self.assertNotEqual(self._execute({'action': 'app', 'id': 'wire-beta'})[0], 200)
+                    self.assertEqual(len(self.launched), launch_count)
+                    self.assertEqual(json.loads(record.read_text())['wire-beta'], wrong)
+                    # The malformed source of beta does not block a normal app.
+                    self.assertEqual(self._req('POST', '/api/owner/apps/notepad/install', b'{}')[0], 200)
+                    self.assertEqual(json.loads(record.read_text())['wire-beta'], wrong)
+                    self.assertEqual(self._req('POST', '/api/owner/apps/wire-beta/install', b'{}')[0], 200)
+                    repaired = json.loads(record.read_text())
+                    self.assertEqual(repaired['wire-beta']['repo'], remote.resolve().as_uri())
+                    self.assertEqual(repaired['publish'], publish_row)
+                    self.assertEqual(repaired['notepad'], installed_public)
+                    self.assertEqual(config.read_bytes(), missing_config)
+                    self.assertEqual((fixture / 'hooks').read_text().splitlines(),
+                                     ['wire-beta', 'wire-alpha', 'wire-alpha', 'candidate-beta', 'wire-beta'])
+                    self.assertNotIn('paseo', calls.read_text())
+            finally:
+                DM.UPDATE_EXEC_CONFIG['root'] = saved_root
+
+    def test_remove_uses_installed_record_when_catalog_source_is_unavailable(self):
+        saved = DM.APPS.installed_ids, DM.APPS.store_rows
+        DM.APPS.installed_ids = lambda root: ['lost-source', 'hub']
+        DM.APPS.store_rows = lambda *args: self.fail('remove read candidate source metadata')
+        DM.UPDATES = types.SimpleNamespace(current=lambda *args: self.fail('remove read plan'))
         try:
-            status, payload = self._req('GET', '/api/owner/apps')
-            self.assertEqual((status, payload['company']), (200, []), payload)
-            self.assertEqual(payload['installed'][0]['tier'], 'company')
-            self.assertEqual(calls, [('list_apps', {'widget'})])
-            self.assertEqual(self._req('GET', '/api/owner/apps', owner=False)[0], 403)
-
-            status, payload = self._req(
-                'POST', '/api/owner/apps/widget/install-company', b'{}')
-            self.assertEqual((status, payload['error']), (404, 'app_not_found'))
-            self.assertEqual(calls, [('list_apps', {'widget'})])
-            self.assertEqual(self.launched, [])
-        finally:
-            (DM.APPS.list_apps, DM.APPS.config_path,
-             DM.COMPANY_CATALOG.installed_company_ids,
-             DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
-
-    def test_lock_mismatch_without_detector_snapshot_keeps_reapproval_visible(self):
-        """D3(a): the CLI refusal itself supplies the review row before the timer runs."""
-        DM.UPDATES = self._missing_snapshot()
-        with self._actual_lock_mismatch(installed_env=True):
-            status, payload = self._req('GET', '/api/owner/apps')
-        self.assertEqual(status, 200, payload)
-        self.assertEqual(payload['degraded'], 'lock-mismatch')
-        self.assertEqual(payload['company'], [])
-        self.assertEqual([row['id'] for row in payload['installed']], ['moved-app'])
-        self.assertEqual(payload['updates']['apps'], [{
-            'id': 'moved-app', 'action': 'lock-mismatch',
-            'sourceClass': 'explicit'}])
-
-    def test_lock_mismatch_keeps_home_order_with_or_without_detector_or_config_env(self):
-        """D3(b): GET and POST keep every app across the real four-way matrix."""
-        for installed_env in (True, False):
-            for detector_row in (True, False):
-                with self.subTest(installed_env=installed_env,
-                                  detector_row=detector_row):
-                    rows = [{'id': 'moved-app', 'action': 'lock-mismatch',
-                             'sourceClass': 'explicit'}]
-                    DM.UPDATES = (self._snapshot(rows) if detector_row
-                                  else self._missing_snapshot())
-                    with self._actual_lock_mismatch(installed_env=installed_env):
-                        status, payload = self._req('GET', '/api/owner/home/order')
-                        self.assertEqual((status, payload['order']),
-                                         (200, ['steady-app', 'moved-app']), payload)
-                        status, payload = self._req(
-                            'POST', '/api/owner/home/order',
-                            json.dumps({'order': ['moved-app']}).encode())
-                        self.assertEqual((status, payload['order']),
-                                         (200, ['moved-app', 'steady-app']), payload)
-                        status, payload = self._req('GET', '/api/owner/home/order')
-                    self.assertEqual((status, payload['order']),
-                                     (200, ['moved-app', 'steady-app']), payload)
-
-    def test_lock_mismatch_config_discovery_fallback_keeps_apps_and_reapprove(self):
-        """D3(c): no AIRLOCK_CONFIG still reaches the sheet and closed reapproval."""
-        DM.UPDATES = self._missing_snapshot()
-        with self._actual_lock_mismatch(installed_env=False) as (_, _, package, preview):
-            status, payload = self._req('GET', '/api/owner/apps')
-            self.assertEqual((status, payload['degraded']), (200, 'lock-mismatch'), payload)
-            status, payload = self._req(
-                'POST', '/api/owner/apps/moved-app/reapprove',
-                json.dumps({'path': str(package),
-                            'digest': preview['digest']}).encode())
-        self.assertEqual((status, payload['action'], payload['execution']),
-                         (200, 'reapprove', 'install'), payload)
-        self.assertIn('--reapprove', self.launched[-1][1]['exec'])
-
-    def test_config_path_lock_mismatch_rebuilds_the_degraded_apps_projection(self):
-        """The optional catalog lookup cannot dereference an unbuilt projection."""
-        saved = DM.APPS.config_path
-        DM.UPDATES = self._missing_snapshot()
-        try:
-            with self._actual_lock_mismatch(installed_env=True):
-                DM.APPS.config_path = lambda root: (_ for _ in ()).throw(
-                    DM.APPS.AppsError('config_invalid', 'package lock digest mismatch'))
-                status, payload = self._req('GET', '/api/owner/apps')
-        finally:
-            DM.APPS.config_path = saved
-        self.assertEqual((status, payload['degraded'], payload['company']),
-                         (200, 'lock-mismatch', []), payload)
-        self.assertEqual([row['id'] for row in payload['installed']], ['moved-app'])
-
-    def test_company_install_stages_then_uses_the_existing_register_and_install_path(self):
-        saved = (DM.APPS.config_path, DM.APPS.package_preview, DM.APPS.register,
-                 DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry)
-        calls = []
-        row = {"id": "widget", "repo": "example/widgets", "commit": "1" * 40,
-               "tree_digest": "2" * 64, "label": "Widget", "sub": "apps/widget",
-               "installable": True, "reason": None}
-        config = Path('/tmp/catalog-fixture.toml')
-        package = Path('/tmp/catalog-stage/widget')
-        DM.APPS.config_path = lambda root: config
-        DM.APPS.package_preview = lambda root, path: {
-            'id': 'widget', 'path': path, 'digest': row['tree_digest'],
-            'installable': True, 'registered': False, 'grants': [],
-        }
-        DM.APPS.register = lambda *args, **kwargs: calls.append((args, kwargs))
-        DM.COMPANY_CATALOG.list_catalog = lambda path: [row]
-        DM.COMPANY_CATALOG.stage_entry = lambda root, path, entry: package
-        try:
-            status, payload = self._req(
-                'POST', '/api/owner/apps/widget/install-company', b'{}')
-            self.assertEqual((status, payload['action'], payload['execution']),
-                             (200, 'install-company', 'install'))
-            self.assertEqual(calls, [((config, 'widget', {
-                'path': str(package.resolve()), 'grant': []}), {})])
-            record = UPX.read_record(self.dir)
-            self.assertEqual((record['action'], record['appId']), ('install', 'widget'))
+            status, value = self._req('POST', '/api/owner/apps/lost-source/remove', b'{}')
+            self.assertEqual((status, value['execution']), (200, 'teardown'))
             argv = self.launched[-1][1]['exec']
-            self.assertIn(row['tree_digest'], argv)
-            self.assertIn(str(package.resolve()), argv)
+            self.assertNotIn('--package-path', argv)
+            self.assertEqual(argv[argv.index('--app') + 1], 'lost-source')
+            UPX.run_path(self.dir).unlink()
+            self.assertEqual(self._req('POST', '/api/owner/apps/hub/remove', b'{}')[0], 409)
+            self.assertEqual(self._req('POST', '/api/owner/apps/absent/remove', b'{}')[0], 409)
+            self.assertEqual(len(self.launched), 1)
         finally:
-            (DM.APPS.config_path, DM.APPS.package_preview, DM.APPS.register,
-             DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
+            DM.APPS.installed_ids, DM.APPS.store_rows = saved
 
-    def test_company_stale_lock_registration_uses_the_approved_reapproval_path(self):
-        saved = (DM.APPS.config_path, DM.APPS.package_preview, DM.APPS.register,
-                 DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry)
-        calls = []
-        row = {"id": "widget", "repo": "example/widgets", "commit": "1" * 40,
-               "tree_digest": "2" * 64, "label": "Widget", "sub": "apps/widget",
-               "installable": True, "reason": None}
-        config = Path('/tmp/catalog-fixture.toml')
-        package = Path('/tmp/catalog-stage/widget')
-        DM.APPS.config_path = lambda root: config
-        DM.APPS.package_preview = lambda root, path: {
-            'id': 'widget', 'path': path, 'digest': row['tree_digest'],
-            'installable': True, 'registered': False,
-            'requires_reapproval': True, 'grants': [],
-        }
-        DM.APPS.register = lambda *args, **kwargs: calls.append((args, kwargs))
-        DM.COMPANY_CATALOG.list_catalog = lambda path: [row]
-        DM.COMPANY_CATALOG.stage_entry = lambda root, path, entry: package
+    def test_store_plan_timeout_returns_json_without_closing_http_connection(self):
+        def timeout(root):
+            raise subprocess.TimeoutExpired(['airlock-ledger', 'plan'], 60)
+        DM.UPDATES = types.SimpleNamespace(current=timeout)
+        for method, path, body in (
+                ('GET', '/api/owner/apps', None),
+                ('GET', '/api/owner/updates', None),
+                ('POST', '/api/owner/updates/execute', b'{"action":"app","id":"notes"}'),
+                ('POST', '/api/owner/apps/notepad/install', b'{}')):
+            status, value = self._req(method, path, body)
+            self.assertEqual((status, value['error']), (503, 'app_plan_unavailable'))
+        self.assertEqual(self.launched, [])
+
+    def test_company_install_uses_engine_source_without_stage_or_config_writes(self):
+        saved = (DM.APPS.store_rows, DM.APPS.installed_ids)
+        DM.APPS.store_rows = lambda *args: {'rows': [
+            {'id': 'widget', 'origin': 'company', 'kind': 'app', 'state': 'install'}]}
+        DM.APPS.installed_ids = lambda root: []
         try:
-            status, payload = self._req(
-                'POST', '/api/owner/apps/widget/install-company', b'{}')
-            self.assertEqual((status, payload['action'], payload['execution']),
-                             (200, 'install-company', 'install'))
-            self.assertEqual(calls[0][1], {'approved_digest': row['tree_digest']})
-            self.assertIn('--reapprove', self.launched[-1][1]['exec'])
+            status, payload = self._req('POST', '/api/owner/apps/widget/install', b'{}')
+            self.assertEqual(status, 200, payload)
+            argv = self.launched[-1][1]['exec']
+            self.assertEqual(argv[argv.index('--package-path') + 1], 'company')
+            self.assertNotIn('--approved-digest', argv)
         finally:
-            (DM.APPS.config_path, DM.APPS.package_preview, DM.APPS.register,
-             DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
+            (DM.APPS.store_rows, DM.APPS.installed_ids) = saved
 
-    def test_company_install_rejects_a_digest_mismatch_before_registration(self):
-        saved = (DM.APPS.config_path, DM.APPS.register,
-                 DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry)
-        registered = []
-        row = {"id": "widget", "repo": "example/widgets", "commit": "1" * 40,
-               "tree_digest": "2" * 64, "label": "Widget", "sub": "apps/widget",
-               "installable": True, "reason": None}
-        DM.APPS.config_path = lambda root: Path('/tmp/catalog-fixture.toml')
-        DM.APPS.register = lambda *args, **kwargs: registered.append((args, kwargs))
-        DM.COMPANY_CATALOG.list_catalog = lambda path: [row]
-        DM.COMPANY_CATALOG.stage_entry = lambda *args: (_ for _ in ()).throw(
-            DM.COMPANY_CATALOG.CatalogError('digest_mismatch', 'fixture mismatch'))
+    def test_current_engine_plan_replaces_daily_apps_without_rewriting_snapshot(self):
+        path = self.dir / 'daily.json'
+        original = {'checkedAt': '2020-01-01T00:00:00Z', 'platform': None,
+                    'apps': [{'id': 'old', 'action': 'upgrade', 'sourceClass': 'shipped'}],
+                    'harness': {'hooksDrift': False, 'skillsWired': 0}}
+        self._updates.write_snapshot(path, original)
+        before = path.read_bytes()
+        old_state, old_apps = self._updates.default_state, self._updates._apps
+        self._updates.default_state = lambda: path
+        plan_apps = [{'id': 'now', 'action': 'upgrade', 'sourceClass': 'explicit'}]
+        self._updates._apps = lambda root: plan_apps
+        DM.UPDATES = self._updates
         try:
-            status, payload = self._req(
-                'POST', '/api/owner/apps/widget/install-company', b'{}')
-            self.assertEqual((status, payload['error']), (409, 'digest_mismatch'))
-            self.assertEqual(registered, [])
-            self.assertEqual(self.launched, [])
+            status, value = self._req('GET', '/api/owner/updates')
+            self.assertEqual(status, 200, value)
+            self.assertEqual(value['apps'], plan_apps)
+            self.assertEqual(value['harness'], original['harness'])
+            self.assertEqual(self._execute({'action': 'app', 'id': 'old'})[0], 409)
+            self.assertEqual(self._execute({'action': 'app', 'id': 'now'})[0], 200)
+            self.assertEqual(path.read_bytes(), before)
         finally:
-            (DM.APPS.config_path, DM.APPS.register,
-             DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
+            self._updates.default_state, self._updates._apps = old_state, old_apps
 
-    def test_company_install_exposes_machine_reason_without_staging(self):
-        saved = (DM.APPS.config_path, DM.APPS.list_apps, DM.APPS.register,
-                 DM.COMPANY_CATALOG.installed_company_ids,
-                 DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry)
-        touched = []
-        row = {
-            "id": "widget", "repo": "example/widgets", "commit": "1" * 40,
-            "tree_digest": "2" * 64, "label": "Widget", "sub": "apps/widget",
-            "installable": False, "reason": "build_artifact",
-        }
-        DM.APPS.config_path = lambda root: Path('/tmp/catalog-fixture.toml')
-        DM.APPS.list_apps = lambda root, updates, company_ids=None: {
-            'installed': [], 'public': [], 'apps': {},
-        }
-        DM.APPS.register = lambda *args, **kwargs: touched.append(('register', args, kwargs))
-        DM.COMPANY_CATALOG.installed_company_ids = lambda config: set()
-        DM.COMPANY_CATALOG.list_catalog = lambda path: [row]
-        DM.COMPANY_CATALOG.stage_entry = lambda *args: touched.append(('stage', args))
-        try:
-            status, payload = self._req('GET', '/api/owner/apps')
-            self.assertEqual((status, payload['company']), (200, [row]))
-            status, payload = self._req(
-                'POST', '/api/owner/apps/widget/install-company', b'{}')
-            self.assertEqual((status, payload['error'], payload['reason']),
-                             (409, 'catalog_not_installable', 'build_artifact'))
-            self.assertEqual(touched, [])
-            self.assertEqual(self.launched, [])
-        finally:
-            (DM.APPS.config_path, DM.APPS.list_apps, DM.APPS.register,
-             DM.COMPANY_CATALOG.installed_company_ids,
-             DM.COMPANY_CATALOG.list_catalog, DM.COMPANY_CATALOG.stage_entry) = saved
-
-    def test_personal_preview_and_registration_bind_path_digest_and_grants(self):
+    def test_personal_preview_forwards_selected_source_to_engine(self):
         digest = 'a' * 64
         package = '/srv/personal/my-app'
         preview = {
             'id': 'my-app', 'path': package, 'digest': digest,
-            'installable': True, 'registered': False,
-            'requires_reapproval': False, 'grants': ['system-unit'],
+            'installable': True,
+            'grants': ['system-unit'],
             'rejected_capabilities': [], 'package': {'serve_port_values': {}},
         }
-        saved = (DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register)
+        saved = (DM.APPS.package_preview,)
         calls = []
         DM.APPS.package_preview = lambda root, path: (calls.append(('preview', path))
                                                       or dict(preview))
-        DM.APPS.config_path = lambda root: Path('/tmp/airlock.toml')
-        DM.APPS.register = lambda config, app_id, package: (
-            calls.append(('register', config, app_id, package)))
         try:
             status, payload = self._req(
                 'POST', '/api/owner/apps/package-preview',
@@ -2758,162 +2808,67 @@ class UpdateExecRouteTest(unittest.TestCase):
                 json.dumps({'path': package, 'digest': digest}).encode())
             self.assertEqual((status, payload['action'], payload['execution']),
                              (200, 'register', 'install'))
-            self.assertIn(('register', Path('/tmp/airlock.toml'), 'my-app', {
-                'path': package, 'grant': ['system-unit']}), calls)
             argv = self.launched[-1][1]['exec']
-            self.assertIn('--approved-digest', argv)
-            self.assertIn('--package-path', argv)
+            self.assertEqual(argv[argv.index('--package-path') + 1], package)
+            self.assertEqual(calls, [('preview', package), ('preview', package)])
             self.assertNotIn('--reapprove', argv)
         finally:
-            DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register = saved
+            (DM.APPS.package_preview,) = saved
 
-    def test_personal_stale_lock_registration_keeps_register_route_and_reapproves(self):
-        digest = 'e' * 64
-        package = '/srv/personal/returning'
-        saved = (DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register)
-        calls = []
-        DM.APPS.package_preview = lambda root, path: {
-            'id': 'returning', 'path': package, 'digest': digest,
-            'installable': True, 'registered': False,
-            'requires_reapproval': True, 'grants': [],
-        }
-        DM.APPS.config_path = lambda root: Path('/tmp/airlock.toml')
-        DM.APPS.register = lambda *args, **kwargs: calls.append((args, kwargs))
-        try:
-            status, payload = self._req(
-                'POST', '/api/owner/apps/returning/register',
-                json.dumps({'path': package, 'digest': digest}).encode())
-            self.assertEqual((status, payload['action'], payload['execution']),
-                             (200, 'register', 'install'))
-            self.assertEqual(calls[0][1], {'approved_digest': digest})
-            self.assertIn('--reapprove', self.launched[-1][1]['exec'])
-        finally:
-            DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register = saved
 
-    def test_personal_registration_refuses_changed_or_denied_preview(self):
+    def test_personal_install_refuses_changed_or_denied_preview(self):
         digest = 'b' * 64
         package = '/srv/personal/denied'
-        saved = (DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register)
-        registered = []
-        DM.APPS.config_path = lambda root: Path('/tmp/airlock.toml')
-        DM.APPS.register = lambda *args: registered.append(args)
+        saved = (DM.APPS.package_preview,)
         try:
             DM.APPS.package_preview = lambda root, path: {
                 'id': 'denied', 'path': package, 'digest': digest,
-                'installable': False, 'registered': False,
+                'installable': False,
                 'rejected_capabilities': ['plaintext-redirect'], 'conflict': None,
             }
             status, payload = self._req(
                 'POST', '/api/owner/apps/denied/register',
                 json.dumps({'path': package, 'digest': digest}).encode())
             self.assertEqual((status, payload['error']), (409, 'package_not_installable'))
-            self.assertEqual(payload['rejected_capabilities'], ['plaintext-redirect'])
+            self.assertEqual(self.launched, [])
 
             DM.APPS.package_preview = lambda root, path: {
                 'id': 'changed', 'path': package, 'digest': 'c' * 64,
-                'installable': True, 'registered': False, 'grants': [],
+                'installable': True, 'grants': [],
             }
             status, payload = self._req(
                 'POST', '/api/owner/apps/denied/register',
                 json.dumps({'path': package, 'digest': digest}).encode())
             self.assertEqual((status, payload['error']), (409, 'package_preview_changed'))
-            self.assertEqual(registered, [])
             self.assertEqual(self.launched, [])
         finally:
-            DM.APPS.package_preview, DM.APPS.config_path, DM.APPS.register = saved
+            (DM.APPS.package_preview,) = saved
 
-    def test_personal_reapproval_uses_the_closed_install_action_and_break_glass(self):
-        AST_REREG_SELECTED.add('registered-reapproval')
-        digest = 'd' * 64
-        package = '/srv/personal/moved'
-        preview = {
-            'id': 'moved', 'path': package, 'digest': digest,
-            'installable': True, 'registered': True,
-            'requires_reapproval': True, 'grants': [],
-        }
-        saved = (DM.APPS.package_preview, DM.APPS.config_path,
-                 DM.APPS.registered_package_path)
-        DM.APPS.package_preview = lambda root, path: dict(preview)
-        DM.APPS.config_path = lambda root: Path('/tmp/airlock.toml')
-        DM.APPS.registered_package_path = lambda config, app_id: Path(package)
-        try:
-            status, payload = self._req(
-                'POST', '/api/owner/apps/moved/reapprove',
-                json.dumps({'path': package, 'digest': digest}).encode())
-            self.assertEqual((status, payload['action'], payload['execution']),
-                             (200, 'reapprove', 'install'))
-            plan = self.launched[-1][1]
-            self.assertEqual(UPX.read_record(self.dir)['action'], 'install')
-            self.assertIn('--reapprove', plan['exec'])
-            self.assertNotIn('teardown', plan['exec'])
-            AST_REREG['registered_reapproval'] = 1
-        finally:
-            (DM.APPS.package_preview, DM.APPS.config_path,
-             DM.APPS.registered_package_path) = saved
-
-    def test_remove_without_a_deactivator_is_refused_before_config_changes(self):
-        saved = (DM.APPS.list_apps, DM.APPS.config_path, DM.APPS.mutate_enabled)
-        changed = []
-        DM.APPS.list_apps = lambda root, updates: {
-            'apps': {'legacy': {}},
-            'installed': [{'id': 'legacy', 'canRemove': False}],
-            'public': [], 'updates': {'apps': []}}
-        DM.APPS.config_path = lambda root: Path('/tmp/airlock.toml')
-        DM.APPS.mutate_enabled = lambda *args: changed.append(args)
-        try:
-            status, payload = self._req('POST', '/api/owner/apps/legacy/disable', b'{}')
-            self.assertEqual((status, payload['error']), (409, 'disable_unavailable'))
-            status, payload = self._req('POST', '/api/owner/apps/legacy/remove', b'{}')
-            self.assertEqual((status, payload['error']), (409, 'remove_unavailable'))
-            self.assertEqual(changed, [])
-            self.assertEqual(self.launched, [])
-        finally:
-            DM.APPS.list_apps, DM.APPS.config_path, DM.APPS.mutate_enabled = saved
 
     def test_already_desired_or_absent_state_relaunches_install_for_retry(self):
-        saved = (DM.APPS.list_apps, DM.APPS.config_path,
-                 DM.APPS.register, DM.APPS.mutate_enabled)
-        changed = []
-        DM.APPS.list_apps = lambda root, updates: {
-            'apps': {'hub': {}, 'notes': {}},
-            'installed': [{'id': 'notes', 'canRemove': True}],
-            'public': [{'id': 'notepad', 'canRemove': True}],
+        saved = (DM.APPS.store_rows, DM.APPS.installed_ids)
+        DM.APPS.store_rows = lambda root, updates, installed, placed=None: {
+            'rows': [{'id': 'notes', 'origin': 'public', 'kind': 'app', 'name': 'N',
+                      'desc': '', 'state': 'installed'},
+                     {'id': 'notepad', 'origin': 'public', 'kind': 'app', 'name': 'C',
+                      'desc': '', 'state': 'install'}],
             'updates': {'apps': []}}
-        DM.APPS.config_path = lambda root: changed.append(('config-path',))
-        DM.APPS.register = lambda *args: changed.append(('register', *args))
-        DM.APPS.mutate_enabled = lambda *args: changed.append(('mutate', *args))
+        DM.APPS.installed_ids = lambda root: ['notes']
         try:
-            status, payload = self._req('POST', '/api/owner/apps/notes/enable', b'{}')
+            # already installed -> no config change, the install is just relaunched
+            status, payload = self._req('POST', '/api/owner/apps/notes/install', b'{}')
             self.assertEqual((status, payload['action'], payload['execution']),
-                             (200, 'enable', 'install'))
-            UPX.run_path(self.dir).unlink()
-            status, payload = self._req('POST', '/api/owner/apps/notepad/disable', b'{}')
-            self.assertEqual((status, payload['action'], payload['execution']),
-                             (200, 'disable', 'install'))
-            UPX.run_path(self.dir).unlink()
+                             (200, 'install', 'install'))
+            # an id the store does not offer at all is app_locked, not a removal
+            UPX.run_path(self.dir).unlink(missing_ok=True)
             status, payload = self._req('POST', '/api/owner/apps/gone/remove', b'{}')
-            self.assertEqual((status, payload['action'], payload['execution']),
-                             (200, 'remove', 'install'))
-            self.assertEqual(changed, [])
+            self.assertEqual((status, payload['error']), (409, 'app_locked'))
+            status, payload = self._req('POST', '/api/owner/apps/notepad/remove', b'{}')
+            self.assertEqual((status, payload['error']), (409, 'app_locked'))
+            self.assertFalse(UPX.run_path(self.dir).exists())
         finally:
-            (DM.APPS.list_apps, DM.APPS.config_path,
-             DM.APPS.register, DM.APPS.mutate_enabled) = saved
+            (DM.APPS.store_rows, DM.APPS.installed_ids) = saved
 
-    def test_a_live_installer_refuses_before_the_config_is_mutated(self):
-        saved = DM.APPS.register
-        changed = []
-        DM.APPS.register = lambda *args: changed.append(args)
-        try:
-            with live_wrapper() as pid:
-                UPX.write_record(self.dir, dict(
-                    UPX.start_record('live-install', 'install', 'notepad'),
-                    status='running', pid=pid))
-                status, payload = self._req(
-                    'POST', '/api/owner/apps/notepad/enable', b'{}')
-            self.assertEqual((status, payload['error']), (409, 'run_active'))
-            self.assertEqual(changed, [])
-        finally:
-            DM.APPS.register = saved
 
     # ---- one at a time ------------------------------------------------------
     def test_a_live_run_refuses_a_second_launch(self):
@@ -3000,6 +2955,13 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         UPX.ensure_dirs(self.dir)
         self.counter = Path(self.tmp.name) / 'revision'
         self.counter.write_text('rev-before')
+        self.seen = Path(self.tmp.name) / 'engine-argv'
+        (self.root / 'bin' / 'airlock-ledger').write_text(
+            'import json, pathlib, sys\n'
+            'if sys.argv[1:] == ["list"]: sys.exit(0)\n'
+            'pathlib.Path(%r).write_text(json.dumps(sys.argv[1:]))\n'
+            'pathlib.Path(%r).write_text("installed")\n'
+            % (str(self.seen), str(self.counter)))
         # `airlock-status` is invoked through the interpreter, `airlock-update` through
         # bash — the same two spellings the real ones use, so the stand-ins exercise the
         # real invocation and not a friendlier one.
@@ -3017,11 +2979,11 @@ class UpdateExecEndToEndTest(unittest.TestCase):
     def _updater(self, body):
         (self.root / 'bin' / 'airlock-update').write_text('#!/usr/bin/env bash\n' + body)
 
-    def _run(self, run_id='e2e', action='platform', app_id=None, **approval):
+    def _run(self, run_id='e2e', action='platform', app_id=None, **source_options):
         UPX.write_record(self.dir, UPX.start_record(run_id, action, app_id))
         proc = subprocess.run(
             UPX.build_exec_argv(self.root, self.dir, run_id, action, app_id,
-                                **approval),
+                                **source_options),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
         return proc, UPX.read_record(self.dir)
 
@@ -3038,67 +3000,23 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         self.assertIsNone(record['recovery'])
         self.assertIsNotNone(record['endedAt'])
 
-    def test_install_action_runs_the_installer_without_putting_the_app_id_in_argv(self):
+    def test_install_action_applies_only_the_named_app_in_engine(self):
         (self.root / 'install' / 'airlock-install.sh').write_text(
-            '#!/usr/bin/env bash\nprintf installed > %r\n' % str(self.counter))
+            '#!/usr/bin/env bash\nexit 93\n')
         proc, record = self._run(action='install', app_id='notes')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(record['action'], 'install')
         self.assertEqual(self.counter.read_text(), 'installed')
+        self.assertEqual(json.loads(self.seen.read_text()), ['apply', 'notes'])
 
-    def test_personal_install_rechecks_the_approved_digest_before_running(self):
-        AST_REREG_SELECTED.add('digest-drift')
-        digest = 'e' * 64
-        package = '/srv/personal/my-app'
-        config = self.root / 'airlock.toml'
-        config.write_text('[apps.my-app]\n[packages.my-app]\npath = %r\n' % package)
-        committed_config = config.read_bytes()
-        (self.root / 'bin' / 'airlock-config').write_text(
-            'import json\nprint(json.dumps({"id":"my-app","digest":%r,'
-            '"installable":True,"registered":True,'
-            '"configured_path":%r}))\n' % (digest, package))
-        (self.root / 'install' / 'airlock-install.sh').write_text(
-            '#!/usr/bin/env bash\nprintf installed > %r\n' % str(self.counter))
-        proc, record = self._run(
-            action='install', app_id='my-app', approved_digest=digest,
-            package_path=package)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(record['status'], 'done')
-        self.assertEqual(self.counter.read_text(), 'installed')
-        AST_REREG['preinstall_digest_rechecked'] = 1
-
-        (self.root / 'bin' / 'airlock-config').write_text(
-            'import json\nprint(json.dumps({"id":"my-app","digest":"%s",'
-            '"installable":True,"registered":True,'
-            '"configured_path":%r}))\n' % (('f' * 64), package))
-        self.counter.write_text('not-run')
-        proc, record = self._run(
-            run_id='changed', action='install', app_id='my-app',
-            approved_digest=digest, package_path=package)
-        self.assertEqual(proc.returncode, 2)
-        self.assertEqual(record['status'], 'failed')
-        self.assertIn('digest', record['note'])
-        self.assertEqual(self.counter.read_text(), 'not-run')
-        self.assertEqual(config.read_bytes(), committed_config)
-        AST_REREG['drift_no_execution'] = 1
-        AST_REREG['committed_config_preserved'] = 1
-
-    def test_reapproval_passes_only_the_scoped_break_glass_flag_to_installer(self):
-        digest = '1' * 64
+    def test_personal_install_passes_exact_engine_source(self):
+        """The Personal source reaches the engine directly, with exactly one app id."""
         package = '/srv/personal/moved'
-        seen = Path(self.tmp.name) / 'installer-argv'
-        (self.root / 'bin' / 'airlock-config').write_text(
-            'import json\nprint(json.dumps({"id":"moved","digest":%r,'
-            '"installable":True,"registered":True,'
-            '"configured_path":%r}))\n' % (digest, package))
-        (self.root / 'install' / 'airlock-install.sh').write_text(
-            '#!/usr/bin/env bash\nprintf %%s "$1" > %r\n' % str(seen))
         proc, record = self._run(
-            action='install', app_id='moved', approved_digest=digest,
-            package_path=package, reapprove=True)
+            action='install', app_id='moved', package_path=package)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(record['action'], 'install')
-        self.assertEqual(seen.read_text(), '--dangerously-admit-unverified=moved')
+        self.assertEqual(json.loads(self.seen.read_text()), ['apply', 'moved', '--source', package])
 
     def test_teardown_action_passes_only_the_validated_app_id(self):
         seen = Path(self.tmp.name) / 'teardown-argv'
@@ -3108,33 +3026,40 @@ class UpdateExecEndToEndTest(unittest.TestCase):
         proc, record = self._run(action='teardown', app_id='notes')
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(record['action'], 'teardown')
-        self.assertEqual(seen.read_text(), 'notes')
+        self.assertEqual(json.loads(self.seen.read_text()), ['remove', 'notes'])
 
     def test_failed_install_has_no_unrelated_update_rollback(self):
-        AST_REREG_SELECTED.add('failed-install')
         armed = UPX.git_dir(self.root) / 'airlock-update-rollback'
         armed.mkdir(parents=True)
         (armed / 'airlock-update').write_text('#!/usr/bin/env bash\n')
         started = Path(self.tmp.name) / 'installer-started'
         (self.root / 'install' / 'airlock-install.sh').write_text(
             '#!/usr/bin/env bash\nprintf started > %r\nexit 1\n' % str(started))
+        (self.root / 'bin' / 'airlock-ledger').write_text(
+            'import pathlib, sys\npathlib.Path(%r).write_text("started")\nsys.exit(1)\n' % str(started))
         proc, record = self._run(action='install', app_id='notes')
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(started.read_text(), 'started')
         self.assertEqual((record['status'], record['exitCode']), ('failed', 1))
         self.assertIsNotNone(record['after'])
         self.assertIsNone(record['recovery'])
-        self.assertIn('전체 설치기', record['note'])
-        self.assertIn('airlock.toml.bak', record['note'])
+        self.assertIn('앱 설치', record['note'])
+        self.assertIn('복원 결과', record['note'])
         self.assertNotIn('--rollback', record['note'])
-        AST_REREG['failure_execution_started'] = 1
-        AST_REREG['failure_visible'] = 1
-        AST_REREG['unrelated_rollback_rejected'] = 1
+
+    def test_failed_app_update_reports_engine_failure_without_platform_rollback(self):
+        (self.root / 'bin' / 'airlock-ledger').write_text('import sys\nsys.exit(1)\n')
+        proc, record = self._run(action='app', app_id='notes')
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(record['status'], 'failed')
+        self.assertIsNone(record['recovery'])
+        self.assertIn('복원 결과', record['note'])
 
     def test_failed_teardown_has_no_unrelated_update_rollback(self):
         teardown = self.root / 'bin' / 'airlock-teardown'
         teardown.write_text('#!/usr/bin/env bash\nexit 1\n')
         teardown.chmod(0o755)
+        (self.root / 'bin' / 'airlock-ledger').write_text('import sys\nsys.exit(1)\n')
         proc, record = self._run(action='teardown', app_id='notes')
         self.assertEqual(proc.returncode, 1)
         self.assertIsNone(record['recovery'])
@@ -3266,8 +3191,6 @@ class UpdateExecThroughTmuxTest(unittest.TestCase):
         self.assertEqual(record['after']['revision'], 'abc')
         # action_runner's own completion signal, on the same run.
         self.assertTrue(sentinel.exists())
-
-
 
 
 class HarnessRouteTest(unittest.TestCase):
@@ -3531,7 +3454,13 @@ class HarnessWrapperTest(unittest.TestCase):
 
 
 class HomeOrderRouteTest(unittest.TestCase):
-    """The shared launcher order reaches the real owner-gated HTTP surface."""
+    """The shared launcher order reaches the real owner-gated HTTP surface.
+
+    The property under test is that the SAVED file is the authority for what the
+    owner placed. The client sends only the rows it drew, so any rule that deletes
+    an id the client could not see quietly moves a tile back to the end — and a
+    removed app, on reinstall, silently lands in a different place than before.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -3539,11 +3468,12 @@ class HomeOrderRouteTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.state = Path(cls.tmp.name) / 'home-order.json'
         cls.saved_gate = DM.UPDATES_OWNER_CONFIG
-        cls.saved_manifest = DM.HOME_ORDER.manifest_order
+        cls.saved_installed = DM.APPS.installed_ids
+        cls.saved_exec = DM.UPDATE_EXEC_CONFIG
         cls.saved_state = DM.HOME_ORDER.default_state
         DM.UPDATES_OWNER_CONFIG = {'owner': 'me@example.test', 'secret': 's3cr3t'}
-        DM.HOME_ORDER.manifest_order = lambda _root=None: [
-            'paseo', 'notes', 'dev-monitor']
+        DM.UPDATE_EXEC_CONFIG = {'root': Path(HERE).parents[1]}
+        DM.APPS.installed_ids = lambda root: ['paseo', 'notes', 'dev-monitor']
         DM.HOME_ORDER.default_state = lambda: cls.state
         cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), DM.Handler)
         cls.port = cls.server.server_address[1]
@@ -3555,7 +3485,8 @@ class HomeOrderRouteTest(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
         DM.UPDATES_OWNER_CONFIG = cls.saved_gate
-        DM.HOME_ORDER.manifest_order = cls.saved_manifest
+        DM.APPS.installed_ids = cls.saved_installed
+        DM.UPDATE_EXEC_CONFIG = cls.saved_exec
         DM.HOME_ORDER.default_state = cls.saved_state
         cls.tmp.cleanup()
 
@@ -3580,28 +3511,151 @@ class HomeOrderRouteTest(unittest.TestCase):
         conn.close()
         return response.status, payload
 
-    def test_get_defaults_to_manifest_order_and_post_is_shared(self):
+    def _write(self, order):
+        self.state.write_text(json.dumps({'order': order}))
+
+    def test_no_file_reads_as_the_install_record_and_no_lines(self):
+        """1 · a box that has never saved an order still draws every installed app."""
         status, payload = self._request('GET', '/api/owner/home/order')
-        self.assertEqual((status, payload['order']), (200, ['paseo', 'notes', 'dev-monitor']))
+        self.assertEqual((status, payload['order']),
+                         (200, ['paseo', 'notes', 'dev-monitor']))
+        self.assertEqual(payload['installed'], ['paseo', 'notes', 'dev-monitor'])
+        self.assertFalse(self.state.exists(), 'a read must not write the file')
+
+    def test_every_unreadable_saved_shape_reads_as_the_install_record(self):
+        """2 · four broken files, one answer, and never a 500.
+
+        A launcher that cannot open its own state file has to come up anyway; the
+        client falls back to the manifest order, so a refusal here would leave the
+        box with a home screen nobody can reach.
+        """
+        for raw in (json.dumps({'order': None}), '"x"', '{not json', ''):
+            with self.subTest(raw=raw):
+                self.state.write_text(raw)
+                status, payload = self._request('GET', '/api/owner/home/order')
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(payload['order'], ['paseo', 'notes', 'dev-monitor'])
+
+    def test_a_bad_payload_never_replaces_the_saved_order(self):
+        """3 · a refused write leaves the file byte-identical."""
+        self._write(['notes', {'line': 'Shared services'}])
+        before = self.state.read_bytes()
+        for body in (json.dumps({'order': 'notes'}).encode(), b'{}', b''):
+            with self.subTest(body=body):
+                status, _ = self._request('POST', '/api/owner/home/order', body)
+                self.assertEqual(status, 400)
+                self.assertEqual(self.state.read_bytes(), before)
+        # The file is still byte-identical, and reading it back adds only the ids
+        # the install record names and the saved copy lacks — nothing is lost.
+        status, payload = self._request('GET', '/api/owner/home/order')
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['order'],
+                         ['notes', {'line': 'Shared services'}, 'paseo', 'dev-monitor'])
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_an_empty_post_keeps_the_home_screen_populated(self):
+        """4 · an empty order is a request to place nothing, not to place nothing."""
+        self._write(['notes', 'paseo'])
+        status, payload = self._request(
+            'POST', '/api/owner/home/order', json.dumps({'order': []}).encode())
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['order'], ['notes', 'paseo', 'dev-monitor'])
+
+    def test_a_hidden_id_is_never_deleted(self):
+        """5 · THE regression. notes is configured but not installed, so the client
+        never draws it and never sends it — and the saved place must survive."""
+        self._write(['notes', 'paseo'])
+        current = DM.APPS.installed_ids
+        DM.APPS.installed_ids = lambda root: ['paseo']
+        self.addCleanup(setattr, DM.APPS, 'installed_ids', current)
         status, payload = self._request(
             'POST', '/api/owner/home/order',
-            json.dumps({'order': ['notes', 'gone', 'notes', 'paseo']}).encode())
-        self.assertEqual((status, payload['order']), (200, ['notes', 'paseo', 'dev-monitor']))
+            json.dumps({'order': ['paseo']}).encode())
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['order'], ['paseo', 'notes'])
+        self.assertIn('notes', json.loads(self.state.read_text())['order'])
+        # And it comes back where it was, not at the end of a fresh install.
         status, payload = self._request('GET', '/api/owner/home/order')
-        self.assertEqual((status, payload['order']), (200, ['notes', 'paseo', 'dev-monitor']))
+        self.assertEqual(payload['order'], ['paseo', 'notes'])
 
-    def test_bad_payload_never_replaces_the_saved_order(self):
-        self._request('POST', '/api/owner/home/order',
-                      json.dumps({'order': ['notes']}).encode())
-        status, _ = self._request('POST', '/api/owner/home/order', b'{"order":"notes"}')
-        self.assertEqual(status, 400)
+    def test_junk_rows_are_dropped_and_valid_rows_keep_their_shape(self):
+        """6 · the client is a browser: it can send anything."""
+        self._write(['paseo'])
+        status, payload = self._request(
+            'POST', '/api/owner/home/order',
+            json.dumps({'order': [5, None, {'line': 3}, {'x': 1}, 'a', 'a',
+                                   {'line': 'x', 'y': 1}]}).encode())
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['order'],
+                         ['a', {'line': 'x'}, 'paseo', 'notes', 'dev-monitor'])
+        # The extra key did not survive into the file either.
+        self.assertEqual(json.loads(self.state.read_text())['order'][1],
+                         {'line': 'x'})
+
+    def test_an_unnamed_line_is_still_a_line(self):
+        """7 · the name is filled in later; dropping the row would lose the place."""
+        status, payload = self._request(
+            'POST', '/api/owner/home/order',
+            json.dumps({'order': [{'line': ''}]}).encode())
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload['order'][0], {'line': ''})
+
+    def test_two_concurrent_writes_leave_one_readable_file(self):
+        """8 · no lock, and no window: the file is replaced atomically."""
+        import threading
+        bodies = [json.dumps({'order': ['paseo']}).encode(),
+                  json.dumps({'order': ['notes']}).encode()]
+        results = []
+
+        def write(body):
+            results.append(self._request('POST', '/api/owner/home/order', body))
+
+        threads = [threading.Thread(target=write, args=(body,)) for body in bodies]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual([status for status, _ in results], [200, 200])
+        # Whichever write landed last, the file is one of the two complete answers
+        # plus the ids the record names — never a half-written or merged document,
+        # and never one of them plus the other's first row.
+        stored = json.loads(self.state.read_text())['order']
+        self.assertIn(stored, [['paseo', 'notes', 'dev-monitor'],
+                               ['notes', 'paseo', 'dev-monitor']])
+        self.assertEqual(list(self.state.parent.glob('.home-order.*')), [])
+
+    def test_a_failing_install_record_is_unavailable_and_writes_nothing(self):
+        """9 · an empty list here would blank the home screen with no error."""
+        self._write(['paseo'])
+        before = self.state.read_bytes()
+
+        def broken(root):
+            raise APPSTORE.AppsError('ledger_unavailable', 'ledger broken')
+
+        current = DM.APPS.installed_ids
+        DM.APPS.installed_ids = broken
+        self.addCleanup(setattr, DM.APPS, 'installed_ids', current)
+        for method, body in (('GET', None),
+                             ('POST', json.dumps({'order': []}).encode())):
+            status, payload = self._request(method, '/api/owner/home/order', body)
+            self.assertEqual((status, payload['error']), (500, 'home order unavailable'))
+        self.assertEqual(self.state.read_bytes(), before)
+
+    def test_a_box_that_cannot_name_the_install_record_says_so_rather_than_saying_empty(self):
+        saved = DM.UPDATE_EXEC_CONFIG
+        DM.UPDATE_EXEC_CONFIG = None
+        self.addCleanup(setattr, DM, 'UPDATE_EXEC_CONFIG', saved)
         status, payload = self._request('GET', '/api/owner/home/order')
-        self.assertEqual((status, payload['order']), (200, ['notes', 'paseo', 'dev-monitor']))
+        self.assertEqual(status, 200, payload)
+        self.assertIsNone(payload['installed'],
+                          'an unreadable install record is not an empty one')
+        self.assertEqual(payload['order'], [])
 
-    def test_owner_gate_holds_for_get_and_post(self):
+    def test_the_owner_gate_holds_for_get_and_post(self):
+        """11 · unchanged, and still the first thing either route does."""
         self.assertEqual(self._request('GET', '/api/owner/home/order', owner=False)[0], 403)
-        self.assertEqual(self._request('POST', '/api/owner/home/order', b'{"order":[]}',
-                                       owner=False)[0], 403)
+        self.assertEqual(self._request(
+            'POST', '/api/owner/home/order', b'{"order":[]}', owner=False)[0], 403)
 
 
 if __name__ == '__main__':
@@ -3615,28 +3669,5 @@ if __name__ == '__main__':
               'observed: archived_filtered=%d,active_counted=%d | verdict: %s | '
               'signal: fixture | evidence: apps/dev-monitor/test-backend.py@%s'
               % (AC7['archived_filtered'], AC7['active_counted'], verdict, revision))
-    ast_focus = {'package-suite', 'registered-reapproval',
-                 'digest-drift', 'failed-install'}
-    if ast_focus <= AST_REREG_SELECTED:
-        rows = {
-            'R1': ('same_bytes', 'changed_bytes', 'disable_remove'),
-            'R2': ('registered_reapproval', 'personal_remove_reregister',
-                   'company_remove_reregister', 'company_noop_remove_rejected',
-                   'company_noop_register_rejected'),
-            'R3': ('digest_rejected_no_mutation',
-                   'capability_rejected_no_mutation', 'drift_no_execution',
-                   'committed_config_preserved'),
-            'R4-WRAPPER': ('preinstall_digest_rechecked',
-                           'failure_execution_started', 'failure_visible',
-                           'unrelated_rollback_rejected'),
-        }
-        for requirement, names in rows.items():
-            expected = ' && '.join('%s == 1' % name for name in names)
-            observed = ','.join('%s=%d' % (name, AST_REREG[name]) for name in names)
-            verdict = ('PASS' if all(AST_REREG[name] == 1 for name in names)
-                       else 'FAIL')
-            print('AC-AST-%s | expected: %s | observed: %s | verdict: %s | '
-                  'signal: fixture | evidence: apps/dev-monitor/test-backend.py@%s'
-                  % (requirement, expected, observed, verdict, revision))
     if not program.result.wasSuccessful():
         raise SystemExit(1)

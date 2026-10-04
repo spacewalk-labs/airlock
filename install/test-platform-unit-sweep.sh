@@ -123,20 +123,29 @@ else
   bad "T4: expected the timer disabled before the service (timer=$t_line service=$s_line)"
 fi
 
-# ---- T5 (the control on the controls): an empty declared set is fatal, not a wipe ----
+# ---- T5 (the control on the controls): an empty declared set skips the sweep,
+# it does not wipe every marked unit. Gate-zero (Installer refusals: five)
+# turned this from a die into a loud WARN that treats an empty call as
+# nothing to sweep — a caller bug here is not one of the five refusals, and
+# the safety property this test guards (nothing marked is ever touched) still
+# holds. ----
 seed_units "$UD"
-if ( set -euo pipefail
+sweep_out="$( ( set -euo pipefail
      # shellcheck source=/dev/null
      . "$ROOT/install/lib.sh"
      AIRLOCK_UNIT_DIR_USER="$UD" airlock_sweep_platform_units airlock-install
-   ) >/dev/null 2>&1; then
-  bad "T5: an empty declared set was accepted — a caller bug would have wiped every marked unit"
+   ) 2>&1 )"
+sweep_rc=$?
+if [ "$sweep_rc" != 0 ]; then
+  bad "T5: an empty declared set no longer succeeds as a skipped sweep (rc=$sweep_rc): $sweep_out"
 else
   survived=1
   for u in airlock-secret-sweep.service airlock-retired-thing.service; do
-    [ -e "$UD/$u" ] || { survived=0; bad "T5: $u was removed before the refusal"; }
+    [ -e "$UD/$u" ] || { survived=0; bad "T5: $u was removed despite the empty-set sweep being skipped"; }
   done
-  [ "$survived" = 1 ] && ok "T5: an empty declared set is refused and nothing is touched"
+  echo "$sweep_out" | grep -q 'empty declared set' \
+    || { survived=0; bad "T5: empty-set skip happened without its WARN diagnostic: $sweep_out"; }
+  [ "$survived" = 1 ] && ok "T5: an empty declared set skips the sweep (WARN) instead of wiping every marked unit"
 fi
 
 mark
@@ -242,7 +251,9 @@ done
 ok_if_clean "T9: all $t9_units shipped live units are in the installer's declared set"
 
 # The control on the controls: mutate only the scratch copy to simulate a caller bug.
-# Refusal must happen before any marked unit can be removed.
+# Refusal must happen before any marked unit can be removed. live/install-timer.sh is
+# deliberately standalone (its own sweep, not install/lib.sh's) and out of this
+# campaign's scope, so this refusal is unchanged.
 mark
 seed_live_install
 sed -i 's/^UNITS=(.*)$/UNITS=()/' "$LIVE_REPO/live/install-timer.sh"

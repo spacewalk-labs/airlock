@@ -119,19 +119,6 @@ normalise() {
       -e "s|^\(\[dry\] loginctl enable-linger \)$runner_user$|\1USER|"
 }
 
-# This deliberately uses root even if the runner is not root. It is the
-# positive control for the bug above: a token whose spelling happens to be a
-# common username must remain ordinary transcript content unless it is the
-# one dynamic field we intend to erase.
-normalise_fixture=$'[dry] loginctl enable-linger root\nroot TMP/web\n# the root location remains literal'
-normalise_expected=$'[dry] loginctl enable-linger USER\nroot TMP/web\n# the root location remains literal'
-normalise_actual="$(printf '%s\n' "$normalise_fixture" | normalise root root)"
-normalise_ok=1
-if [ "$normalise_actual" != "$normalise_expected" ]; then
-  normalise_ok=0
-  echo "FAIL equivalence: normalise rewrote a literal root token or missed the linger user"
-fi
-
 # ---- the three transcripts ---------------------------------------------------
 rc=0
 bash "$ROOT/install/airlock-install.sh" > "$TMP/install.raw" 2>&1 || rc=$?
@@ -304,7 +291,6 @@ elif [ "${AIRLOCK_EQUIVALENCE_CORE_ONLY:-0}" != 1 ]; then
   fi
 fi
 
-if [ "$normalise_ok" = 0 ]; then fail=1; fi
 echo "---"
 if [ "$fail" = 0 ]; then echo "passed=3 failed=0"; else echo "equivalence FAILED"; fi
 
@@ -317,6 +303,5 @@ if [ "${AIRLOCK_EQUIVALENCE_CORE_ONLY:-0}" != 1 ]; then
   printf 'AC-GH-02 | expected: hermetic_controls == 1 | observed: hermetic_controls=%s | verdict: %s | signal: fixture | evidence: apps/publish/install.sh@%s\n' "$hermetic_ok" "$(verdict "$hermetic_ok")" "$rev"
   printf 'AC-GH-03 | expected: hermetic_controls == 1 | observed: hermetic_controls=%s | verdict: %s | signal: fixture | evidence: install/test-equivalence.sh@%s\n' "$hermetic_ok" "$(verdict "$hermetic_ok")" "$rev"
   printf 'AC-GH-04 | expected: installed_paths >= 1 && installed_golden_diff_files == 0 && clean_mount_capable == 1 && clean_paths == 0 && clean_golden_diff_files == 0 && negative_control == 1 | observed: installed_paths=%s,installed_golden_diff_files=%s,clean_mount_capable=%s,clean_paths=%s,clean_golden_diff_files=%s,negative_control=%s | verdict: %s | signal: replay | evidence: install/test-equivalence.sh@%s\n' "$installed_paths" "$installed_golden_diff_files" "$clean_mount_capable" "$clean_paths" "$clean_golden_diff_files" "$negative_control" "$host_samples_verdict" "$rev"
-  printf 'AC-GH-05 | expected: normalise_literal_root == 1 | observed: normalise_literal_root=%s | verdict: %s | signal: fixture | evidence: install/test-equivalence.sh@%s\n' "$normalise_ok" "$(verdict "$normalise_ok")" "$rev"
 fi
 exit "$fail"

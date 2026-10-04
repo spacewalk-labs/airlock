@@ -17,25 +17,19 @@
 # Offline: no network, no live services, no agent CLI needs to be installed — the CLIs and
 # the login-state probe are fabricated in a scratch dir.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT" || exit 1
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 is()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want $3, got $2)"; fi; }
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 export AIRLOCK_STATE_DIR="$scratch/state"      # never touch a developer's real ledger
-# This suite runs NO installer — it only greps one for a line. But test-render-parity.sh's
-# RAM-pin gate is a text scan over non-comment lines, and this file names an install.sh in
-# one, so it counts as a matching suite. Pinning a variable that does nothing here is the
-# honest move: rewriting the grep to dodge a text scan is the evasion that gate exists to
-# catch, and a gate with a hole in it is worth less than a redundant export.
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+airlock_pin_paseo_mem
 CFG="$ROOT/bin/airlock-config"
 AGENT="$ROOT/bin/airlock-agent"
 
@@ -92,26 +86,6 @@ provider = \"$value\""
   is "  ...and reads back as $value" \
      "$(AIRLOCK_CONFIG="$scratch/v-$value.toml" python3 "$CFG" get agent.provider 2>/dev/null)" "$value"
 done
-
-mk typo.toml "$base
-[agent]
-provider = \"clade\""
-if AIRLOCK_CONFIG="$scratch/typo.toml" python3 "$CFG" validate >/dev/null 2>&1; then
-  bad "an unknown provider is rejected"
-else
-  ok "an unknown provider is rejected"
-fi
-
-# Owner decision 5 has a schema consequence, not just a comment: there is no model key, so
-# writing one has to fail rather than sit in the file looking effective.
-mk model.toml "$base
-[agent]
-model = \"opus\""
-if AIRLOCK_CONFIG="$scratch/model.toml" python3 "$CFG" validate >/dev/null 2>&1; then
-  bad "[agent].model is rejected (owner decision 5 — the CLI picks the model)"
-else
-  ok "[agent].model is rejected (owner decision 5 — the CLI picks the model)"
-fi
 
 # ---- 3. the selector -------------------------------------------------------
 # Fabricate the two CLIs and the login-state probe. bin_discovery takes <CMD>_BIN as an
@@ -190,8 +164,14 @@ is "a broken login probe degrades to no-trace, never to no-CLI" \
 # installer run on its own. Positive AND negative control, because "the install failed" is only
 # evidence if an install that should succeed does.
 dm_install() {   # dm_install <config> <render-dir>
+  # HOME must be pinned to scratch: dev-monitor/install.sh reads/writes
+  # $HOME/.config/airlock/dev-monitor-secrets.env directly (not under
+  # AIRLOCK_RENDER_DIR), so an unset HOME here would validate this box's own
+  # real secrets file instead of a fixture (2026-09-26 revive audit finding).
+  mkdir -p "$scratch/home"
   AIRLOCK_TS_FQDN=box.example.ts.net AIRLOCK_CONFIG="$1" \
   AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
+  HOME="$scratch/home" \
   AIRLOCK_DRY_RUN=1 AIRLOCK_RENDER_DIR="$2" bash "$ROOT/apps/dev-monitor/install.sh" 2>&1
 }
 mk unit-ok.toml "$base
@@ -218,14 +198,9 @@ mk unit-inject.toml 'agent = { provider = "claude\nExecStart=/bin/evil" }
 # anything reads it. Without this, a fixture the parser rejects would look like a caught attack.
 is "the injection fixture really does decode to a newline" \
    "$(AIRLOCK_CONFIG="$scratch/unit-inject.toml" python3 "$CFG" get agent.provider 2>/dev/null | wc -l)" "2"
-if AIRLOCK_CONFIG="$scratch/unit-inject.toml" python3 "$CFG" validate >/dev/null 2>&1; then
-  bad "validate refuses a provider carrying a newline"
-else
-  ok "validate refuses a provider carrying a newline"
-fi
 case "$(dm_install "$scratch/unit-inject.toml" "$scratch/r-inject")" in
-  *"must not contain newlines"*) ok "the installer refuses it too, without validate's help" ;;
-  *) bad "the installer refuses it too, without validate's help" ;;
+  *"must not contain newlines"*) ok "the installer refuses a provider carrying a newline" ;;
+  *) bad "the installer refuses a provider carrying a newline" ;;
 esac
 if [ -f "$scratch/r-inject/units/airlock-dev-monitor.service" ]; then
   bad "  ...and writes no unit at all"

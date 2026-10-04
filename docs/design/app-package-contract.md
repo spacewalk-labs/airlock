@@ -13,6 +13,15 @@
 > with the new intent until commit — the record-diff rule below already
 > required that; the old wording contradicted it.
 
+> Source/lifecycle update (P3_ENGINE, 2026-10-04): the historical `[packages.*]`
+> path/grant registration below is retired. `bin/airlock-ledger` resolves Company
+> from `[site] company_repo` at a pinned main SHA, records installed sources, and
+> supplies `app_dirs` to the config parser. Local apps enter through
+> `apply <id> --source <absolute-directory>`. Shipped manifests remain implicit;
+> installed sources can replace them. Manifest grammar still applies. See
+> [the ledger entry points](../../skills/airlock-ledger/SKILL.md) and
+> [P3_ENGINE](../tasks/active/20261003-airlock-pike-rebuild-P3_ENGINE.task.md).
+
 Airlock becomes an OS that apps are installed *onto*, not a repository that apps
 live *inside*. One packaging contract covers every app source: the in-tree apps
 this repo ships, apps maintained in separate repos, and apps a single operator adds
@@ -83,6 +92,15 @@ inputs + lockfile). The decisions cite the specific lessons.
 
 ### D1 — Packages are local paths; Airlock is not a package manager
 
+**2026-10 revision (P2_SCREEN).** What counts as installed no longer comes from
+`airlock.toml` at all. An app's installed state is read from the install record
+(③) alone, through one adapter in
+`apps/dev-monitor/backend/devmon_apps.py:installed_ids`; the operator's tables
+say which apps this box intends to run, never that they are on it. A link is not
+a package and has no install record: a link's state is whether it is on the home
+screen (④), and the links themselves live in `links.toml` beside the source repo
+(①) — there is no `[shortcuts.*]` table in `airlock.toml` any more.
+
 ```toml
 [packages.my-app]
 path = "./packages/my-app"    # relative to airlock.toml; canonicalized (symlinks resolved)
@@ -111,6 +129,11 @@ ids already conform; the legacy fallback keeps the old grammar until it retires.
 Two ids are reserved and cannot be packaged: `hub` (the platform entry point) and —
 amended in child 3 — `core`, the prerequisites pseudo-owner (F11): a package
 named core could masquerade as the immutable platform rows.
+
+The rule that `path` is the only key `[packages.X]` accepts holds until the
+Company repository is resolved by one key and a pinned main SHA — see
+`docs/tasks/active/20261003-airlock-pike-rebuild-P3_ENGINE.task.md` for that
+change. Everything else in this section is unchanged today.
 
 We deliberately reject `source = "git+…"` (a runtime installer would inherit
 auth, mutable refs, caching, and rollback — that belongs to whatever stages the
@@ -212,14 +235,15 @@ compat_https = { target = "backend_port", enabled = "compat_enabled" }
                                           # a boolean [config.defaults] key.
                                           # false omits render and ledger claim.
 
-[[serve.https_registry]]                  # variable-size, operator-owned JSON
-path = "~/.config/my-app/instances.json" # regular file confined below HOME
+[[serve.https_registry]]                  # variable-size, operator-owned rows
+table = "registry"                         # a [apps.<id>.registry] config table
+                                          # declared in [config.tables]
 entries = "instances"                    # dotted path to the entry array
 key = "id"                               # stable row identity
 enabled = "enabled"                      # disabled rows own no route
 listen = "ingress.https_port"            # dotted per-row port fields
 target = "ingress.gate_port"
-optional = false                          # true makes an absent file an empty set
+optional = false                          # true makes an unset table an empty set
 fields = { path = "path", backend_port = "backend.port" }
                                           # extra point-in-time values the installer
                                           # needs; carried in package-info rows.
@@ -228,7 +252,7 @@ fields = { path = "path", backend_port = "backend.port" }
 
 [[registry]]                              # point-in-time lifecycle data only;
 name = "sync_instances"                  # unique stable projection name
-path = "~/.config/my-app/instances.json" # shares the exact-byte cache above
+table = "registry"                         # the same table, or another one
 entries = "instances"
 key = "id"
 enabled = "sync"
@@ -258,8 +282,12 @@ Registry rows and their source digest are part of the point-in-time
 `package-info` authority used by both the ledger and lifecycle. Named
 `[[registry]]` projections are additive lifecycle inputs independent of HTTPS
 ownership; the stable name avoids binding a consumer to declaration order, and
-an optional absent source retains `{present:false, source_sha256:null, rows:[]}`.
-All declarations for one canonical source share one exact-byte cache. The
+an optional unset table retains `{present:false, source_sha256:null, rows:[]}`.
+Every declaration for one canonical source resolves the same table, so a digest
+is a statement about the operator's ⑤ and nothing else. The table must be
+declared in the manifest's `[config.tables]` with its `allowed_keys`: a
+declaration naming an undeclared table is a fatal manifest error, not an empty
+projection. The
 complete projection is capped at the platform's safe environment-transport
 size; an oversized registry is rejected before reconcile mutates installed
 state.
@@ -442,10 +470,11 @@ may label non-built-in apps (OQ2).
 **Amended in child 4 — the shipped trust boundary.** Shipped packages are
 first-party code reviewed in this repository; explicit packages are the
 operator's trust grant exactly as above. The one behavioural consequence: a
-dry run may execute a *migrated* shipped app's lifecycle scripts (they
-certify full `AIRLOCK_DRY_RUN` discipline as part of their migration), which
-is what keeps the dry integration suite meaningful across the flip; an
-explicit package's scripts are never executed on a dry run, migrated or not.
+dry run of an existing installed box may execute a *migrated* shipped app's
+lifecycle scripts (they certify full `AIRLOCK_DRY_RUN` discipline). A first
+bootstrap preview without ③ or v7 installation state validates inputs and
+shows the plan and projection without executing app hooks. An explicit
+package's scripts are never executed on a dry run, migrated or not.
 SECURITY.md carries this boundary in its package-trust section (F13 gates on
 the section existing).
 

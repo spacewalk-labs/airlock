@@ -8,11 +8,9 @@
    backend/test_devmon.py; this is the other half.
 
    It lives in install/ rather than beside the app it tests, and that is deliberate. Under
-   apps/ this repository and the public airlock-apps mirror are meant to hold the same files:
-   of the six app test files here, five are in both trees, and the single work-only one sits in
-   a batch install/apps-divergence-baseline.txt calls temporary. This test extracts markers
-   from a page and could not be run against the mirror's copy, so putting it under apps/ would
-   have meant widening that guard for a file that was never going to be mirrored.
+   apps/ this repository and the public airlock-apps mirror are meant to hold the same files.
+   This test extracts markers from a page and could not be run against the mirror's copy, and
+   it was never going to be mirrored.
    install/test-frontend-namespace.sh is the precedent: a repo-level check that reads app
    frontends and lives here.
 

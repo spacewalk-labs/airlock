@@ -119,10 +119,19 @@ def validate_payload(payload):
         raise ValidationError('reserved identity')
     if out['level'] not in ('normal', 'urgent'):
         raise ValidationError('invalid level')
+    peek = out.get('peek', False)
+    if not isinstance(peek, bool):
+        raise ValidationError('invalid peek')
     if not isinstance(out.get('title'), str) or not out['title'].strip():
         raise ValidationError('missing title')
     if not isinstance(out.get('body', ''), str):
         raise ValidationError('invalid body')
+    if 'resolves' in out and (not isinstance(out['resolves'], str)
+            or not ID_RE.fullmatch(out['resolves'])
+            or out['resolves'].startswith(RESERVED_GROUP_PREFIX)):
+        raise ValidationError('invalid resolves')
+    if 'detail' in out and not isinstance(out['detail'], str):
+        raise ValidationError('invalid detail')
     try:
         created = parse_rfc3339(out['created_at']) if 'created_at' in out else now_utc()
     except (ValueError, TypeError) as error:
@@ -139,6 +148,8 @@ def validate_payload(payload):
         if 'created_at' in out and created.date() != day.date():
             raise ValidationError('heartbeat date mismatch')
         candidate = dict(payload)
+        for optional in ('peek', 'detail', 'resolves'):
+            candidate.pop(optional, None)  # Validated optional message fields.
         for new, legacy in (('id', 'event_id'), ('group', 'group_key'), ('level', 'urgency')):
             if legacy in candidate:
                 candidate[new] = candidate.pop(legacy)
@@ -157,7 +168,8 @@ def validate_payload(payload):
         validate_link_url(link)
     return {'id': out['id'], 'group': out['group'], 'source': out['source'],
             'level': out['level'], 'title': out['title'], 'body': out.get('body', ''),
-            'link': link, 'run': run, 'created_at': created}
+            'link': link, 'run': run, 'peek': peek, 'created_at': created,
+            'detail': out.get('detail'), 'resolves': out.get('resolves')}
 
 
 def init_db(path):
@@ -179,9 +191,11 @@ def init_db(path):
             raise RuntimeError('offline messages database conversion required')
         conn.executescript(_SCHEMA)
         columns = {row[1] for row in conn.execute('PRAGMA table_info(cards)')}
-        for column in ('ran_input', 'ran_window'):
+        for column, declaration in (('ran_input', 'TEXT'), ('ran_window', 'TEXT'),
+                                    ('peek', 'INTEGER NOT NULL DEFAULT 0'), ('detail', 'TEXT'),
+                                    ('slack_ts', 'TEXT')):
             if column not in columns:
-                conn.execute('ALTER TABLE cards ADD COLUMN %s TEXT' % column)
+                conn.execute('ALTER TABLE cards ADD COLUMN %s %s' % (column, declaration))
         conn.execute('PRAGMA journal_mode=WAL')
         conn.commit()
     finally:
@@ -225,15 +239,77 @@ def has_receipt(event_id):
     return _conn().execute('SELECT 1 FROM ledger WHERE id=?', (event_id,)).fetchone() is not None
 
 
+def grace_seconds():
+    # One setting for every urgent card, including heartbeat and normal promotion.
+    return max(0, int(os.environ.get('AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS', '300')))
+
+
+SLACK_SOURCE = 'slack'
+
+
+def _notify_level(p):
+    """The level the outbound Slack notifier sees.
+
+    A card that arrived over Slack is never announced back to Slack: the notifier exists
+    to reach the owner when they are away from the console, and a Slack-sourced card
+    already reached them there. Reporting such a card as 'normal' leaves it out of the
+    send queue without touching the level the inbox and Peek read.
+    """
+    return 'normal' if p['source'] == SLACK_SOURCE else p['level']
+
+
+def _coalesced_level(p, card):
+    """Urgency rises on coalesce — except on a Slack card the owner already read.
+
+    Reading is "I have seen up to here", so the next mention starts at its own level
+    instead of inheriting urgency that was already dismissed. Machine alarms keep the
+    old behaviour on purpose: there, severity that climbs down on its own hides a fault.
+    """
+    if p['source'] == SLACK_SOURCE and card['read_at'] is not None:
+        return p['level']
+    return 'urgent' if p['level'] == 'urgent' or card['level'] == 'urgent' else 'normal'
+
+
+def _resolve(conn, p, now):
+    targets = conn.execute(
+        'SELECT * FROM cards WHERE "group"=? AND archived_at IS NULL '
+        'ORDER BY last_at DESC,card_id ASC', (p['resolves'],)).fetchall()
+    fallback = not targets
+    reason = ' '.join((p['body'] or p['title']).splitlines())
+    for card in targets:
+        in_grace = (card['sent_at'] is None and card['send_attempts'] == 0
+                    and card['send_next_at'] is not None and card['send_next_at'] > now)
+        if not card['slack_ts'] and not in_grace:
+            fallback = True
+            continue
+        # Archive closes the existing card; no extra lifecycle state. A later failure
+        # opens a fresh card with the unchanged group/run/link coalescing contract.
+        # Reuse the existing delivery queue and retry budget for chat.update.
+        # A resolution without its own source text must not erase the incident's.
+        # The card is what a person clicks to read; the moment it closes is exactly
+        # when the original text is wanted (measured on a live box, 2026-09-23).
+        conn.execute(
+            'UPDATE cards SET title=?,body=?,detail=COALESCE(?,detail),count=count+1,last_at=?,'
+            'read_at=NULL,archived_at=?,sent_at=NULL,send_attempts=0,send_next_at=? '
+            'WHERE card_id=?',
+            ('✅ ' + card['title'], reason, p['detail'], now, now,
+             now if card['slack_ts'] else None, card['card_id']))
+    return not fallback
+
+
 def ingest(payload):
     p = validate_payload(payload)
-    now = iso(now_utc())
+    at = now_utc()
+    now = iso(at)
+    due = iso(at + timedelta(seconds=grace_seconds()))
     conn = _conn()
     with conn:
         conn.execute('BEGIN IMMEDIATE')
         if has_receipt(p['id']):
             return 'duplicate'
-        candidates = conn.execute(
+        resolved = p['resolves'] is not None and _resolve(conn, p, now)
+        # An unhandled resolution follows the ordinary group/run/link path.
+        candidates = [] if resolved else conn.execute(
             'SELECT * FROM cards WHERE "group"=? AND archived_at IS NULL '
             'ORDER BY last_at DESC,card_id ASC', (p['group'],)).fetchall()
         card = None
@@ -246,23 +322,26 @@ def ingest(payload):
                     and ((p['source'] != 'heartbeat' and not candidate['card_id'].startswith('heartbeat:')) or candidate['card_id'] == p['id'])):
                 card = candidate
                 break
-        if card is None:
+        if resolved:
+            status = 'coalesced'
+        elif card is None:
             conn.execute(
-                'INSERT INTO cards(card_id,"group",level,title,body,link,run,first_at,last_at,send_next_at) '
-                'VALUES(?,?,?,?,?,?,?,?,?,?)',
+                'INSERT INTO cards(card_id,"group",level,title,body,link,run,peek,detail,first_at,last_at,send_next_at) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                 (p['id'],p['group'],p['level'],p['title'],p['body'],p['link'],
-                 json.dumps(p['run']) if p['run'] else None,now,now,now if p['level']=='urgent' else None))
+                 json.dumps(p['run']) if p['run'] else None,p['peek'],p['detail'],now,now,
+                 due if _notify_level(p)=='urgent' else None))
             status = 'inserted'
         else:
             conn.execute(
                 'UPDATE cards SET count=count+1,last_at=?,read_at=CASE '
                 'WHEN title=? AND body=? THEN read_at ELSE NULL END,send_next_at=CASE '
                 "WHEN level='normal' AND ?='urgent' AND sent_at IS NULL AND send_attempts=0 THEN ? ELSE send_next_at END,"
-                'level=?,title=?,body=? '
+                'level=?,title=?,body=?,peek=MAX(peek,?),detail=COALESCE(?,detail) '
                 'WHERE card_id=?',
-                (now,p['title'],p['body'],p['level'],now,
-                 'urgent' if p['level']=='urgent' or card['level']=='urgent' else 'normal',
-                 p['title'],p['body'],card['card_id']))
+                (now,p['title'],p['body'],_notify_level(p),due,
+                 _coalesced_level(p, card),
+                 p['title'],p['body'],p['peek'],p['detail'],card['card_id']))
             status = 'coalesced'
         conn.execute('INSERT INTO ledger(id,"group",source,received_at,payload) VALUES(?,?,?,?,?)',
                      (p['id'],p['group'],p['source'],now,json.dumps(payload,ensure_ascii=False)))
@@ -290,6 +369,7 @@ _CARD_SELECT = 'SELECT c.*,COALESCE(l.source, "") AS source FROM cards c LEFT JO
 
 def _card_to_dict(row):
     card = dict(row)
+    card['peek'] = bool(card['peek'])
     card['run'] = json.loads(card['run']) if card['run'] else None
     card['archived'] = card.pop('archived_at') is not None
     card['delivery'] = ('sent' if card['sent_at'] else
@@ -345,7 +425,7 @@ def mark_ran(card_id, ran_input, ran_window):
 def delivery_health():
     row = _conn().execute(
         "SELECT SUM(send_next_at IS NOT NULL AND sent_at IS NULL AND send_attempts<?),MAX(sent_at),"
-        "SUM(archived_at IS NULL AND sent_at IS NULL AND send_attempts>=?) FROM cards",
+        "SUM((archived_at IS NULL OR slack_ts IS NOT NULL) AND sent_at IS NULL AND send_attempts>=?) FROM cards",
         (MAX_DELIVERY_ATTEMPTS,MAX_DELIVERY_ATTEMPTS)).fetchone()
     return {'pending_count':row[0] or 0,'last_sent_at':row[1],'failed_count':row[2] or 0}
 
@@ -358,7 +438,7 @@ def next_delivery():
     return _card_to_dict(row) if row else None
 
 
-def finish_delivery(card, ok, retry_after=None):
+def finish_delivery(card, ok, retry_after=None, slack_ts=None):
     # Only the single loop writes these columns. Commit after POST, including its attempt.
     # A crash after a successful response leaves the same attempt due on restart.
     attempt = card['send_attempts'] + 1
@@ -371,8 +451,8 @@ def finish_delivery(card, ok, retry_after=None):
             delay = max(delay,retry_after)
         next_at = iso(at + timedelta(seconds=delay))
     with _conn():
-        _conn().execute('UPDATE cards SET sent_at=?,send_attempts=?,send_next_at=? WHERE card_id=?',
-                        (iso(at) if ok else None,attempt,next_at,card['card_id']))
+        _conn().execute('UPDATE cards SET sent_at=?,send_attempts=?,send_next_at=?,slack_ts=COALESCE(?,slack_ts) WHERE card_id=?',
+                        (iso(at) if ok else None,attempt,next_at,slack_ts if ok else None,card['card_id']))
 
 
 def sweep():

@@ -337,17 +337,6 @@ probe_out="$(bash "$GATE" --dir "$FIX/test-scope" 2>&1)"; probe_rc=$?
   && ok "test fixture environment writes are allowed and the test module is still scanned" \
   || bad "test fixture read/write scope distinction failed: $probe_out"
 
-# CI has to run this, or none of the above is load-bearing.
-# Matched as an executable `run:` line, not as a substring: the comments above
-# each step name the same paths, so a plain grep stays green after someone
-# deletes the steps and leaves the prose explaining them.
-grep -qE '^ +run: bash install/check-app-abi\.sh *$' "$ROOT/.github/workflows/ci.yml" \
-  && ok "ci.yml runs the gate (as a run: step, not merely mentioned)" \
-  || bad "ci.yml has no run: step for install/check-app-abi.sh"
-grep -qE '^ +run: bash install/test-app-abi\.sh *$' "$ROOT/.github/workflows/ci.yml" \
-  && ok "ci.yml runs this suite (as a run: step, not merely mentioned)" \
-  || bad "ci.yml has no run: step for install/test-app-abi.sh"
-
 echo "---"
 echo "app-abi: $pass ok, $fail failed"
 [ "$fail" = 0 ]

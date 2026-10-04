@@ -9,7 +9,7 @@
         "cat": "coding",
         "glyph": "app-devterm",
         "label": "DevTerm",
-        "sub": "web shell"
+        "sub": "\uc6f9 \ud130\ubbf8\ub110"
       }
     },
     "hub": {
@@ -24,7 +24,7 @@
         "glyph": "app-notepad",
         "label": "Clip Bridge",
         "path": "/notepad/",
-        "sub": "clipboard"
+        "sub": "\ud074\ub9bd\ubcf4\ub4dc"
       }
     },
     "publish": {
@@ -37,7 +37,7 @@
         "glyph": "app-publish",
         "label": "Publish",
         "path": "/publish/",
-        "sub": "static publish"
+        "sub": "\uc815\uc801 \uc0ac\uc774\ud2b8 \ubc1c\ud589"
       }
     }
   },

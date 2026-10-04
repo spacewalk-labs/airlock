@@ -88,29 +88,45 @@ function rtLeft(a) {   // days left (fractional) · null if unknown
   return a && a.rtExpiry ? (a.rtExpiry - Date.now()) / 86400000 : null;
 }
 function rtWarnText(d) {
-  if (d <= 0) return '⚠ 만료됨 · 다시 로그인';
-  if (d < 1) return '⚠ 오늘 만료 · 다시 로그인';
-  return '⚠ ' + Math.floor(d) + '일 뒤 만료 · 다시 로그인';
+  if (d <= 0) return '⚠ Expired · log in again';
+  if (d < 1) return '⚠ Expires today · log in again';
+  return '⚠ Expires in ' + Math.floor(d) + ' days · log in again';
+}
+function usageAgeText(u) {
+  const age = u && Number(u.age);
+  if (!Number.isFinite(age) || age < 0) return '';
+  if (age < 60) return 'just now';
+  const minutes = Math.round(age / 60);
+  if (minutes < 60) return minutes + ' min ago';
+  const hours = Math.round(minutes / 60);
+  return hours + (hours === 1 ? ' hour ago' : ' hours ago');
+}
+function usageFreshnessText(u) {
+  const bits = [];
+  const age = usageAgeText(u);
+  if (age) bits.push(age);
+  if (u && u.err) bits.push('unavailable now (' + u.err + ')');
+  return bits.join(' · ');
 }
 function acctTipText(u, a) {
   const L = [];
   if (u.use5h == null && u.use7d == null) {
-    L.push(u.err === 'no data' ? '사용량 수집 중\n(1분마다)'
-         : u.err === 'no store' ? '공유 사용량 저장소가 없어\n여기서는 사용 중인 계정만 읽힙니다.'
-         : '조회 실패\n' + (u.err || '?'));
+    L.push(u.err === 'no data' ? 'Waiting for a usage reading\n(collected every 3-40 min)'
+         : u.err === 'no store' ? 'No shared usage store\nOnly the active account can be read here.'
+         : 'Could not read usage\n' + (u.err || '?'));
   } else {
-    L.push('5시간↻ ' + (u.reset5h ? fmtReset(u.reset5h, false) : '—') +
-           '\n주간↺ ' + (u.reset7d ? fmtReset(u.reset7d, true) : '—') +
-           (u.stale ? '\n(마지막 값)' : ''));
+    L.push('5h reset ' + (u.reset5h ? fmtReset(u.reset5h, false) : '—') +
+           '\nWeekly reset ' + (u.reset7d ? fmtReset(u.reset7d, true) : '—') +
+           (usageFreshnessText(u) ? '\n' + usageFreshnessText(u) : ''));
   }
   // who holds it = the shared store's holders. Using the same account in two places burns 5h twice as fast.
   const h = (a && a.holders) || [];
-  if (h.length) L.push('사용 중\n' + h.map(function (x) { return '· ' + x.who; }).join('\n'));
+  if (h.length) L.push('In use\n' + h.map(function (x) { return '· ' + x.who; }).join('\n'));
   const d = rtLeft(a);
   if (d != null) {
     L.push(d <= rtWarnDays()
-      ? rtWarnText(d) + '\n(만료일은 로그인 뒤 약 30일로 고정 —\n써도 늘어나지 않습니다)'
-      : '로그인 만료까지 ' + Math.floor(d) + '일');
+      ? rtWarnText(d) + '\n(The expiry is fixed at about 30 days after login\nand does not extend with use)'
+      : Math.floor(d) + ' days until login expires');
   }
   return L.join('\n\n');
 }
@@ -139,7 +155,7 @@ function refreshAcctIcon() {
 function startAcctIconWatch() {
   if (_acctIconTimer) return;
   refreshAcctIcon();
-  _acctIconTimer = setInterval(refreshAcctIcon, 60000);   // matches the background collection cadence (1 min)
+  _acctIconTimer = setInterval(refreshAcctIcon, 60000);   // icon alert refresh only; Claude usage is not polled
 }
 
 // show next to the cursor immediately (native title has ~1s delay + tiny text).
@@ -175,6 +191,13 @@ function mkBtn(label, cls, fn) {
   if (fn) b.onclick = function (e) { e.stopPropagation(); fn(); };
   return b;
 }
+// Success cards close themselves — pressing 완료 to dismiss good news is busywork.
+// Failure cards keep their explicit buttons (the error must be readable).
+function autoCloseDone(st, paint, alive) {
+  setTimeout(function () {
+    if (alive() && st.flow && st.flow.step === 'done') { st.flow = null; paint(); }
+  }, 2500);
+}
 function mkBtnRow() {
   const d = mk('div', 'codex-btns');
   for (let i = 0; i < arguments.length; i++) if (arguments[i]) d.appendChild(arguments[i]);
@@ -196,74 +219,71 @@ function activeClaude(st) {
 function claudeUsageText(u) {
   u = u || {};
   if (u.use5h == null && u.use7d == null) {
-    if (u.err === 'no data') return '수집 중\n(1분 이내)';
-    if (u.err === 'no store') return '사용량 출처\n없음';
-    if (u.err) return '확인 실패\n' + u.err;
-    return '확인 중';
+    if (u.err === 'no data') return 'Waiting for data\nEvery 3-40 min';
+    if (u.err === 'no store') return 'No usage\nsource';
+    if (u.err) return 'Unavailable\n' + u.err;
+    return 'Checking';
   }
-  return '5시간 ' + (u.use5h == null ? '—' : u.use5h + '%') +
-       '\n주간 ' + (u.use7d == null ? '—' : u.use7d + '%');
+  return '5h ' + (u.use5h == null ? '—' : u.use5h + '%') +
+       '\nWeekly ' + (u.use7d == null ? '—' : u.use7d + '%');
 }
 
 // ---- one-line headers: who · how much · next reset ----
 function claudeHead(st) {
   const j = st.claude;
-  if (!j) return 'Claude · 확인 중';
-  if (j.enabled === false) return 'Claude · 이 앱에서는 전환 꺼짐';
+  if (!j) return 'Claude · Checking';
+  if (j.enabled === false) return 'Claude · Switching disabled in this app';
   const list = j.accounts || [];
   const a = activeClaude(st);
-  if (!a) return 'Claude · 계정 ' + list.length + '개 · 사용 중 없음';
+  if (!a) return 'Claude · ' + list.length + ' accounts · None active';
   const u = a.usage || {};
   const much = (u.use5h == null && u.use7d == null)
-    ? '확인 중'
-    : '5시간 ' + (u.use5h == null ? '—' : u.use5h + '%') +
-      ' · 주간 ' + (u.use7d == null ? '—' : u.use7d + '%');
-  const reset = u.reset5h ? ' · 다음 초기화 ' + fmtReset(u.reset5h, false) : '';
-  return 'Claude · 사용 중 ' + (a.email || a.name) + ' · ' + much + reset + ' · 계정 ' + list.length + '개';
+    ? 'Checking'
+    : '5h ' + (u.use5h == null ? '—' : u.use5h + '%') +
+      ' · Weekly ' + (u.use7d == null ? '—' : u.use7d + '%');
+  const reset = u.reset5h ? ' · Next reset ' + fmtReset(u.reset5h, false) : '';
+  return 'Claude · Active ' + (a.email || a.name) + ' · ' + much + reset + ' · ' + list.length + ' accounts';
 }
 function codexHead(st) {
   const cx = st.codex;
-  if (!cx) return 'Codex · 확인 중';
-  if (cx.state === 'pending') return 'Codex · 로그인 진행 중';
-  if (cx.state !== 'ok') return 'Codex · 로그인 필요';
+  if (!cx) return 'Codex · Checking';
+  if (cx.state === 'pending') return 'Codex · Login in progress';
+  if (cx.state !== 'ok') return 'Codex · Login required';
   const u = st.codexUsage || {};
-  const much = u.codexUse7d == null ? '확인 중' : '주간 ' + u.codexUse7d + '%';
-  const reset = u.codexReset7d ? ' · ' + fmtReset(u.codexReset7d, true) + ' 초기화' : '';
-  if (u.codexErr === 'auth') return 'Codex · 로그인 해제됨 · 다시 로그인';
-  return 'Codex · 로그인됨 ' + (cx.email || '') + ' · ' + much + reset;
+  const much = u.codexUse7d == null ? 'Checking' : 'Weekly ' + u.codexUse7d + '%';
+  const reset = u.codexReset7d ? ' · Resets ' + fmtReset(u.codexReset7d, true) : '';
+  if (u.codexErr === 'auth') return 'Codex · Signed out · Log in again';
+  return 'Codex · Signed in ' + (cx.email || '') + ' · ' + much + reset;
 }
 function agyHead(st) {
   const u = st.agy;
-  if (!u) return 'Gemini · 확인 중';
+  if (!u) return 'Gemini · Checking';
   const acc = u.account || '';
   const gs = u.groups || [];
   if (!acc && !gs.length) {
-    if (u.refreshing) return 'Gemini · 읽는 중…';
-    return 'Gemini · 아직 읽은 값 없음';
+    if (u.refreshing) return 'Gemini · Reading…';
+    return 'Gemini · No reading yet';
   }
-  let worst5 = null, worst7 = null;
-  gs.forEach(function (g) {
-    const w5 = Math.max(0, Math.round(100 - g.fiveHourRemaining));
-    const w7 = Math.max(0, Math.round(100 - g.weeklyRemaining));
-    worst5 = worst5 == null ? w5 : Math.max(worst5, w5);
-    worst7 = worst7 == null ? w7 : Math.max(worst7, w7);
-  });
-  const much = worst5 == null ? '확인 중' : '5시간 ' + worst5 + '% · 주간 ' + worst7 + '%';
-  return 'Gemini · 사용 중 ' + (acc || '확인 중') + ' · ' + much + ' · 계정 ' + gs.length + '개';
+  const g = agyGemini(gs);
+  const much = !g ? 'Checking'
+    : '5h ' + Math.max(0, Math.round(100 - g.fiveHourRemaining)) + '% · Weekly ' +
+      Math.max(0, Math.round(100 - g.weeklyRemaining)) + '%';
+  const n = (u.accounts || []).length;
+  return 'Gemini · Active ' + (acc || 'Checking') + ' · ' + much + (n > 1 ? ' · ' + n + ' accounts' : '');
 }
 // action-needed summary. Always rendered: calm days read 조치 필요 없음, not silence.
 function shellIssues(st) {
   const out = [];
   const cx = st.codex;
-  if (cx && cx.state === 'pending') out.push({ sec: 'codex', label: 'Codex 로그인 진행 중' });
-  else if (cx && cx.state !== 'ok' && cx.state !== 'unknown') out.push({ sec: 'codex', label: 'Codex 로그인 필요' });
+  if (cx && cx.state === 'pending') out.push({ sec: 'codex', label: 'Codex login in progress' });
+  else if (cx && cx.state !== 'ok' && cx.state !== 'unknown') out.push({ sec: 'codex', label: 'Codex login required' });
   else if (cx && cx.state === 'ok' && st.codexUsage && st.codexUsage.codexErr === 'auth')
-    out.push({ sec: 'codex', label: 'Codex 로그인 해제됨' });
+    out.push({ sec: 'codex', label: 'Codex signed out' });
   const dead = ((st.claude && st.claude.accounts) || []).filter(function (a) {
     return a.health && a.health.state === 'dead';
   });
-  if (dead.length) out.push({ sec: 'claude', label: 'Claude 로그인 만료 ' + dead.length + '건' });
-  if (st.geminiUsageBad) out.push({ sec: 'gemini', label: 'Gemini 사용량 확인 불가' });
+  if (dead.length) out.push({ sec: 'claude', label: 'Claude expired logins: ' + dead.length });
+  if (st.geminiUsageBad) out.push({ sec: 'gemini', label: 'Gemini usage unavailable' });
   return out;
 }
 
@@ -322,7 +342,7 @@ function fetchCodexUsage(st, paint, alive, reaskState, revalidate) {
     }
   }).catch(function () {
     if (!alive() || _codexIdentity !== identity) return;
-    st.codexUsage = { codexErr: '확인 실패' };
+    st.codexUsage = { codexErr: 'Could not read usage' };
     paint();
   });
 }
@@ -348,56 +368,217 @@ function fetchAgy(st, paint, alive, tries) {
     if (!st.agy) { st.agyFailed = true; paint(); }
   });
 }
+// Saved agy logins, one row each like the Claude list. A switch is confirm strip
+// -> checking -> done/fail inline; the account API proves the login before it
+// replaces the live one, so a refusal leaves agy on the account it was on.
+// Gemini is what agy is used for here, so its group drives the row numbers and
+// color — not the worst group (a spent Claude-in-agy group would paint every row red).
+function agyGemini(groups) {
+  const gs = groups || [];
+  return gs.find(function (g) { return /GEMINI/i.test(g.name || ''); }) || gs[0] || null;
+}
+function agoText(sec) {
+  if (sec == null) return '';
+  if (sec < 60) return 'just now';
+  if (sec < 3600) return Math.round(sec / 60) + ' min ago';
+  return Math.round(sec / 3600) + ' h ago';
+}
+function renderAgyAccounts(st, box, paint, alive) {
+  const u = st.agy || {};
+  const accounts = u.accounts || [];
+  const f = st.flow;
+  if (!(f && f.sec === 'agy' && f.kind === 'login')) {
+    box.appendChild(mkBtnRow(mkBtn('Add account', 'codex-btn', function () {
+      st.flow = { sec: 'agy', kind: 'login', step: 'start' }; paint();
+      postJson(API + 'agy-login-start', {}).then(function (r) {
+        if (!alive()) return;
+        if (r && r.ok && r.url) { st.flow.step = 'code'; st.flow.url = r.url; }
+        else { st.flow.step = 'fail'; st.flow.why = (r && r.error) || 'Could not start agy login'; }
+        paint();
+      }).catch(function () { if (alive()) { st.flow.step = 'fail'; st.flow.why = 'Request did not reach the server'; paint(); } });
+    })));
+  } else {
+    box.appendChild(renderAgyLoginCard(st, paint, alive));
+  }
+  if (accounts.length < 2) return;
+  accounts.slice().sort(function (a, b) { return (b.active ? 1 : 0) - (a.active ? 1 : 0); }).forEach(function (a) {
+    const b = mkBtn('', 'acctrow' + (a.active ? ' active' : ''), null);
+    const L = mk('div', 'acct-l');
+    L.appendChild(mk('span', 'nm', (a.active ? '✓ ' : '') + a.email));
+    const live = a.active && u.account === a.email;
+    const groups = live ? u.groups : a.groups;
+    const age = live ? u.age : a.age;
+    const when = agoText(age);
+    L.appendChild(mk('span', 'pl', (a.active ? 'In use' : 'Tap to switch') + (when ? ' · ' + when : '')));
+    const R = mk('div', 'acct-r');
+    const g = agyGemini(groups);
+    if (g) {
+      const w5 = Math.max(0, Math.round(100 - g.fiveHourRemaining));
+      const w7 = Math.max(0, Math.round(100 - g.weeklyRemaining));
+      R.style.color = usageColor(w5, w7);
+      R.textContent = 'Gemini 5h ' + w5 + '%\nWeekly ' + w7 + '%';
+    } else {
+      R.style.color = C_GRAY;
+      R.textContent = a.active ? '' : 'No reading yet';
+    }
+    b.appendChild(L); b.appendChild(R);
+    b.onclick = function () {
+      if (a.active) { flash('Already active: ' + a.email, 1400); return; }
+      if (st.flow && st.flow.sec === 'agy' && st.flow.step === 'run') return;
+      st.flow = { sec: 'agy', kind: 'switch', step: 'confirm', target: a.email };
+      paint();
+    };
+    box.appendChild(b);
+    if (f && f.sec === 'agy' && f.target === a.email) box.appendChild(renderAgySwitchCard(st, paint, alive));
+  });
+}
+function renderAgyLoginCard(st, paint, alive) {
+  const f = st.flow, c = mk('div', 'confirm-strip');
+  if (f.step === 'start') { c.appendChild(mk('div', '', 'Starting Google login…')); return c; }
+  if (f.step === 'fail') {
+    const e = mk('div', '', f.why || 'Login failed'); e.style.color = C_RED; c.appendChild(e);
+    c.appendChild(mkBtnRow(mkBtn('Close', '', function () { st.flow = null; paint(); }))); return c;
+  }
+  if (f.step === 'done') {
+    const d = mk('div', '', '✓ ' + f.email + ' added · active account unchanged'); d.style.color = C_GREEN; c.appendChild(d);
+    c.appendChild(mkBtnRow(mkBtn('OK', '', function () { st.flow = null; paint(); }))); return c;
+  }
+  const a = mk('a', '', 'Open Google login'); a.href = f.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; c.appendChild(a);
+  c.appendChild(mk('div', 'dots', 'After Google approves, paste the one-time code here.'));
+  const input = document.createElement('input'); input.type = 'text'; input.autocomplete = 'off'; input.placeholder = 'Google code'; c.appendChild(input);
+  c.appendChild(mkBtnRow(mkBtn(f.step === 'run' ? 'Saving…' : 'Save account', 'codex-btn p', function () {
+    if (f.step === 'run') return; const code = input.value.trim(); if (!code) return;
+    f.step = 'run'; paint();
+    postJson(API + 'agy-login-code', { code: code }).then(function (r) {
+      if (!alive()) return;
+      if (r && r.ok) { f.step = 'done'; f.email = r.email; st.agy = null; fetchAgy(st, paint, alive); }
+      else { f.step = 'fail'; f.why = (r && r.error) || 'Login failed'; }
+      paint();
+    }).catch(function () { if (alive()) { f.step = 'fail'; f.why = 'Request did not reach the server'; paint(); } });
+  }), mkBtn('Cancel', '', function () { st.flow = null; paint(); })));
+  return c;
+}
+function renderAgySwitchCard(st, paint, alive) {
+  const f = st.flow;
+  const c = mk('div', 'confirm-strip');
+  const t = mk('div', '', '');
+  const who = mk('span', '', f.target); who.style.fontWeight = '700';
+  t.appendChild(who);
+  if (f.step === 'confirm') {
+    t.appendChild(mk('span', '', ' · Switch agy to this login (checked first, about 10 s)'));
+    c.appendChild(t);
+    // Running agy seats keep the old login and write it back when they refresh.
+    // The person decides whether they restart now (idle seats just respawn, busy
+    // ones lose the turn and get one "continue") or restarts them later.
+    c.appendChild(mk('div', 'dots', 'Running agy seats keep the old login and can switch it back. Restart them now? Busy seats lose their turn, then get a "continue".'));
+    const go = function (reseat) {
+      f.step = 'run'; f.reseat = reseat; paint();
+      postJson(API + 'agy-switch', { email: f.target, reseat: reseat }).then(function (res) {
+        if (!alive()) return;
+        if (res && res.ok) {
+          f.step = 'done';
+          const r = res.reseat || {};
+          const bits = [];
+          if (r.restarted) bits.push(r.restarted + ' idle seat(s) restarted');
+          if (r.continued) bits.push(r.continued + ' busy seat(s) restarted and told to continue');
+          f.note = bits.join(' · ');
+          f.why = !res.needsRestart ? ''
+            : reseat ? (res.runningAgy + ' agy process(es) outside Paseo still hold the old login and may switch it back')
+            : (res.runningAgy + ' running agy process(es) still hold the old login — restart them (seat-recovery) before they switch it back');
+          st.agy = null; fetchAgy(st, paint, alive);
+        } else {
+          f.step = 'fail'; f.why = ((res && res.error) || 'Unknown failure') + ' · previous login unchanged';
+        }
+        paint();
+      }).catch(function () {
+        if (!alive()) return;
+        f.step = 'fail'; f.why = 'Request did not reach the server · previous login unchanged'; paint();
+      });
+    };
+    c.appendChild(mkBtnRow(
+      mkBtn('Switch + restart', 'codex-btn p', function () { go(true); }),
+      mkBtn('Switch only', 'codex-btn', function () { go(false); }),
+      mkBtn('Cancel', 'codex-btn', function () { st.flow = null; paint(); })));
+    return c;
+  }
+  if (f.step === 'run') { t.appendChild(mk('span', '', ' · Checking the login…')); c.appendChild(t); return c; }
+  if (f.step === 'done') {
+    t.appendChild(mk('span', '', ' · ✓ agy now uses this login' + (f.note ? ' · ' + f.note : '') + (f.why ? ' · ' + f.why : '')));
+    t.style.color = f.why ? C_AMBER : C_GREEN;
+    c.appendChild(t);
+    if (!f.why && !f.note) autoCloseDone(st, paint, alive);
+    else c.appendChild(mkBtnRow(mkBtn('OK', '', function () { st.flow = null; paint(); })));
+    return c;
+  }
+  t.appendChild(mk('span', '', ' · ' + f.why)); t.style.color = C_RED;
+  c.appendChild(t);
+  c.appendChild(mkBtnRow(mkBtn('Close', '', function () { st.flow = null; paint(); })));
+  return c;
+}
+
 function renderAgyBody(box, u, onReask) {
   box.textContent = '';
   const head = mk('div', 'codex-row');
-  const nm = mk('span', 'nm', u.account || (u.refreshing ? '읽는 중…' : '아직 읽은 값 없음'));
+  // With the saved-login list above, the account is already named there; this line
+  // then only heads the usage rows.
+  const listed = (u.accounts || []).length >= 2 && u.account;
+  if (listed) {
+    // The rows above already carry the account, its Gemini numbers and the age.
+    // Other model groups are side detail here: one small gray line each, so a
+    // spent Claude-in-agy group does not shout over the Gemini numbers.
+    (u.groups || []).forEach(function (g) {
+      if (g === agyGemini(u.groups)) return;
+      const name = String(g.name || '').replace(/ MODELS$/, '').toLowerCase().replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+      box.appendChild(mk('div', 'dots', name + ' (in agy) · 5h ' + Math.max(0, Math.round(100 - g.fiveHourRemaining)) +
+        '% · Weekly ' + Math.max(0, Math.round(100 - g.weeklyRemaining)) + '% · resets ' +
+        fmtReset(new Date(g.weeklyResetAt * 1000).toISOString(), true)));
+    });
+    if (u.refreshing) box.appendChild(mk('div', 'dots', 'Reading again…'));
+    if (u.lastErr) {
+      box.appendChild(mk('div', 'dots', 'Your login is valid; only usage could not be read. You do not need to log in again.'));
+      box.appendChild(mkBtnRow(mkBtn('Read usage again', '', function () { if (onReask) onReask(); })));
+    }
+    return;
+  }
+  const nm = mk('span', 'nm', u.account || (u.refreshing ? 'Reading…' : 'No reading yet'));
   if (!u.account) nm.style.color = C_GRAY;
   const pl = mk('span', 'pl');
   const bits = [];
-  if (u.age != null) bits.push(u.age < 60 ? '방금' : Math.round(u.age / 60) + '분 전');
-  if (u.refreshing) bits.push('다시 읽는 중…');
-  else if (u.lastErr) bits.push('마지막 읽기 실패: ' + u.lastErr);
+  if (u.age != null) bits.push(u.age < 60 ? 'just now' : Math.round(u.age / 60) + ' min ago');
+  if (u.refreshing) bits.push('Reading again…');
+  else if (u.lastErr) bits.push('Last read failed: ' + u.lastErr);
   pl.textContent = bits.join(' · ');
   head.appendChild(nm); head.appendChild(pl); box.appendChild(head);
-  if (!u.account && !u.refreshing) {
-    // AGY_SWAP ① RED: agy offers no login/switch path, so this section stays
-    // read-only. When there is no reading, say the one true thing: a human
-    // signs in by running agy in a terminal on this box. (Wording owned by
-    // AGY_SWAP — kept verbatim so its gate keeps passing.)
-    const hint = mk('div', 'codex-row', 'Manual login only — run agy in a terminal on this box and sign in with Google.');
-    hint.style.color = C_GRAY;
-    box.appendChild(hint);
-  }
   (u.groups || []).forEach(function (g) {
     const row = mk('div', 'codex-row');
     const gn = mk('span', 'nm'), gp = mk('span', 'pl');
     const used5 = Math.max(0, Math.round(100 - g.fiveHourRemaining));
     const used7 = Math.max(0, Math.round(100 - g.weeklyRemaining));
     const name = String(g.name || '').replace(/ MODELS$/, '').toLowerCase().replace(/\b\w/g, function (c) { return c.toUpperCase(); });
-    gn.textContent = name + ' · 5시간 ' + used5 + '% · 주간 ' + used7 + '%';
+    gn.textContent = name + ' · 5h ' + used5 + '% · Weekly ' + used7 + '%';
     gn.style.color = levelColor(Math.max(usageLevel('5h', used5), usageLevel('7d', used7)));
     gp.textContent = fmtReset(new Date(g.fiveHourResetAt * 1000).toISOString()) +
-      ' / ' + fmtReset(new Date(g.weeklyResetAt * 1000).toISOString(), true) + ' 초기화';
+      ' / ' + fmtReset(new Date(g.weeklyResetAt * 1000).toISOString(), true) + ' reset';
     row.appendChild(gn); row.appendChild(gp); box.appendChild(row);
   });
   if (u.lastErr) {
-    box.appendChild(mk('div', 'dots', '로그인은 정상입니다 — 사용량만 읽지 못했습니다. 다시 로그인할 필요 없습니다.'));
-    box.appendChild(mkBtnRow(mkBtn('사용량 다시 읽기', '', function () { if (onReask) onReask(); })));
+    box.appendChild(mk('div', 'dots', 'Your login is valid; only usage could not be read. You do not need to log in again.'));
+    box.appendChild(mkBtnRow(mkBtn('Read usage again', '', function () { if (onReask) onReask(); })));
   }
 }
 
-// Muse key status (POPUP_SHELL rework). Current key only: the row shows the
-// three usage numbers or 확인 불가, never a candidate list and never a swap
-// button. Swapping lives in the fleet app now (it owns the picker and the
-// POST /muse-swap call); this shell keeps reading GET /muse-swap-candidates
-// so the numbers stay, but offers nothing to click. A swap can therefore never
-// originate here, so there is no swapped banner and no 교체 막힘 pill.
-function fetchMuse(st, paint, alive) {
+// Muse key swap is manual. The account API decides which keys are eligible;
+// this panel only lets a person choose one and reports the commit result.
+function fetchMuse(st, paint, alive, tries) {
+  tries = tries || 0;
   fetch(API + 'muse-swap-candidates', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (m) {
     if (!alive()) return;
     st.muse = m && m.enabled === true ? m : { enabled: false };
     paint();
+    // The surface answered with its last reading and is re-reading behind it.
+    if (m && m.refreshing && tries < 8) {
+      setTimeout(function () { if (alive()) fetchMuse(st, paint, alive, tries + 1); }, 3000);
+    }
   }).catch(function () {
     if (!alive()) return;
     if (!st.muse) { st.museFailed = true; paint(); }
@@ -405,8 +586,12 @@ function fetchMuse(st, paint, alive) {
 }
 function museHead(st) {
   const m = st.muse;
-  if (!m) return 'Muse · 확인 중';
-  return 'Muse · 사용 중 ' + (m.active || '확인 불가');
+  if (!m) return 'Muse · Checking';
+  const cur = (m.candidates || []).find(function (e) { return e.account === m.active; });
+  const w = cur ? museWindows(cur) : {};
+  return 'Muse · Active ' + (m.active || 'Unavailable') +
+    (w.rolling ? ' · 5h ' + w.rolling.percent + '%' : '') +
+    (w.weekly ? ' · Weekly ' + w.weekly.percent + '%' : '');
 }
 function museLimitsText(entry) {
   const order = ['rolling', 'weekly', 'monthly'];
@@ -414,34 +599,132 @@ function museLimitsText(entry) {
   (entry.limits || []).forEach(function (w) { by[w.window] = w.percent; });
   return order.map(function (k) { return k + ' ' + by[k] + '%'; }).join(' · ');
 }
+// One key = one row, the same grammar as the Claude list: ✓ current key on top,
+// 5h/weekly/monthly on the right in usage colors, a tap opens the inline confirm
+// strip. Spent or unreadable keys stay visible but cannot be picked.
+function museLevel(entry) {
+  const by = {};
+  (entry.limits || []).forEach(function (w) { by[w.window] = w.percent; });
+  return Math.max(usageLevel('5h', by.rolling || 0), usageLevel('7d', by.weekly || 0),
+                  usageLevel('7d', by.monthly || 0));
+}
+function museWindows(entry) {
+  const by = {};
+  (entry.limits || []).forEach(function (w) { by[w.window] = w; });
+  return by;
+}
 function renderMuseBody(st, body, paint, alive) {
   body.textContent = '';
   const m = st.muse || {};
-  const head = mk('div', 'codex-row');
-  const nm = mk('span', 'nm', m.active ? ('현재 키: ' + m.active) : '현재 키 확인 불가');
-  if (!m.active) nm.style.color = C_GRAY;
-  head.appendChild(nm);
-  const ep = mk('span', 'pl');
-  const cur = (m.candidates || []).find(function (e) { return e.account === m.active; });
-  if (cur && !cur.err) {
-    ep.textContent = museLimitsText(cur);
-    const worst = Math.max.apply(null, (cur.limits || []).map(function (w) { return w.percent; }));
-    if (worst >= 100) ep.style.color = C_RED;
-  } else {
-    ep.textContent = '확인 불가';
-    ep.style.color = C_GRAY;
+  const f = st.flow && st.flow.sec === 'muse' ? st.flow : null;
+  if (m.age != null && m.age >= 60) {
+    const age = mk('div', 'dots', 'Checked ' + Math.round(m.age / 60) + ' min ago' + (m.refreshing ? ' · reading again…' : ''));
+    body.appendChild(age);
   }
-  head.appendChild(ep); body.appendChild(head);
-  body.appendChild(mk('div', 'codex-row', '키 교체는 플릿 앱에서 한다'));
+  const rows = (m.candidates || []).slice();
+  if (!rows.length) {
+    body.appendChild(mk('div', 'codex-row', m.sheet === 'ok'
+      ? 'No replacement key is available'
+      : 'Cannot switch: assignment sheet unavailable'));
+    return;
+  }
+  const rank = function (e) { return e.account === m.active ? 0 : e.eligible ? 1 : 2; };
+  rows.sort(function (a, b) { return rank(a) - rank(b); });
+  rows.forEach(function (entry) {
+    const active = entry.account === m.active;
+    const w = museWindows(entry);
+    const blocked = !active && !entry.eligible;
+    const b = mkBtn('', 'acctrow' + (active ? ' active' : '') + (blocked ? ' dead' : ''), null);
+    const L = mk('div', 'acct-l');
+    L.appendChild(mk('span', 'nm', (active ? '✓ ' : '') + entry.account));
+    let sub = active ? 'In use' : entry.err ? 'Usage unavailable' : entry.eligible ? 'Tap to switch' : 'Spent';
+    if (w.weekly && w.weekly.percent >= 100 && w.weekly.resetAt) sub += ' · weekly resets ' + fmtReset(w.weekly.resetAt, true);
+    else if (w.monthly && w.monthly.percent >= 100 && w.monthly.resetAt) sub += ' · monthly resets ' + fmtReset(w.monthly.resetAt, true);
+    else if (w.rolling && w.rolling.percent >= 100 && w.rolling.resetAt) sub += ' · 5h resets ' + fmtReset(w.rolling.resetAt, false);
+    L.appendChild(mk('span', 'pl', sub));
+    const R = mk('div', 'acct-r');
+    if (entry.err || !entry.limits || !entry.limits.length) {
+      R.style.color = C_GRAY; R.textContent = '—';
+    } else {
+      R.style.color = levelColor(museLevel(entry));
+      R.textContent = '5h ' + (w.rolling ? w.rolling.percent : '—') + '%\nWeekly ' + (w.weekly ? w.weekly.percent : '—') +
+        '%\nMonth ' + (w.monthly ? w.monthly.percent : '—') + '%';
+    }
+    b.appendChild(L); b.appendChild(R);
+    b.onclick = function () {
+      if (active) { flash('Already in use: ' + entry.account, 1400); return; }
+      if (blocked) { flash(entry.err ? 'This key cannot be read right now' : 'This key is spent', 1600); return; }
+      if (f && f.step === 'run') return;
+      st.flow = { sec: 'muse', kind: 'switch', step: 'confirm', target: entry.account, item: entry.item };
+      paint();
+    };
+    body.appendChild(b);
+    if (f && f.target === entry.account) body.appendChild(renderMuseSwitchCard(st, paint, alive));
+  });
+}
+function renderMuseSwitchCard(st, paint, alive) {
+  const f = st.flow;
+  const c = mk('div', 'confirm-strip');
+  const t = mk('div', '', '');
+  const who = mk('span', '', f.target); who.style.fontWeight = '700';
+  t.appendChild(who);
+  if (f.step === 'confirm') {
+    t.appendChild(mk('span', '', ' · Switch Muse to this key'));
+    c.appendChild(t);
+    // Running Muse seats keep the old key until their opencode server restarts.
+    // The person decides: restart them now (idle seats reload, busy ones lose the
+    // turn and get a "continue"), or restart them later.
+    c.appendChild(mk('div', 'dots', 'Running Muse sessions keep the old key until restarted. Restart them now? Busy ones lose their turn, then get a "continue".'));
+    const go = function (reseat) {
+      f.step = 'run'; paint();
+      postJson(API + 'muse-swap', { item: f.item, reseat: reseat }).then(function (r) {
+        if (!alive()) return;
+        if (r && r.ok) {
+          f.step = 'done';
+          const rs = r.reseat || {};
+          const bits = [];
+          if (rs.restarted) bits.push(rs.restarted + ' idle session(s) restarted');
+          if (rs.continued) bits.push(rs.continued + ' busy session(s) restarted and told to continue');
+          if (rs.failed) bits.push(rs.failed + ' could not be restarted');
+          f.note = bits.join(' · ');
+          f.why = r.needsRestart ? 'running sessions still use the previous key — restart them with seat-recovery' : '';
+          st.muse = null; fetchMuse(st, paint, alive);
+        } else {
+          f.step = 'fail'; f.why = ((r && r.error) || 'Switch refused') + ' · previous key unchanged';
+        }
+        paint();
+      }).catch(function () {
+        if (!alive()) return;
+        f.step = 'fail'; f.why = 'Switch request failed · previous key unchanged'; paint();
+      });
+    };
+    c.appendChild(mkBtnRow(
+      mkBtn('Switch + restart', 'codex-btn p', function () { go(true); }),
+      mkBtn('Switch only', 'codex-btn', function () { go(false); }),
+      mkBtn('Cancel', 'codex-btn', function () { st.flow = null; paint(); })));
+    return c;
+  }
+  if (f.step === 'run') { t.appendChild(mk('span', '', ' · Switching…')); c.appendChild(t); return c; }
+  if (f.step === 'done') {
+    t.appendChild(mk('span', '', ' · ✓ Muse now uses this key' + (f.note ? ' · ' + f.note : '') + (f.why ? ' · ' + f.why : '')));
+    t.style.color = f.why ? C_AMBER : C_GREEN;
+    c.appendChild(t);
+    c.appendChild(mkBtnRow(mkBtn('OK', 'codex-btn', function () { st.flow = null; paint(); })));
+    return c;
+  }
+  t.appendChild(mk('span', '', ' · ' + f.why)); t.style.color = C_RED;
+  c.appendChild(t);
+  c.appendChild(mkBtnRow(mkBtn('Close', 'codex-btn', function () { st.flow = null; paint(); })));
+  return c;
 }
 
 // ---- section bodies ----
 function renderClaudeBody(st, body, paint, alive) {
   body.textContent = '';
   const j = st.claude;
-  if (!j) { body.appendChild(mk('div', 'dots', '계정·사용량 확인 중…')); return; }
+  if (!j) { body.appendChild(mk('div', 'dots', 'Checking accounts and usage…')); return; }
   if (j.enabled === false) {
-    body.appendChild(mk('div', 'dots', '이 앱에서는 Claude 계정 전환이 꺼져 있습니다')); return;
+    body.appendChild(mk('div', 'dots', 'Claude account switching is disabled in this app')); return;
   }
   const f = st.flow;
   if (f && f.sec === 'claude' && f.kind === 'add') { renderClaudeAdd(st, body, paint, alive); return; }
@@ -452,9 +735,10 @@ function renderClaudeBody(st, body, paint, alive) {
     const L = mk('div', 'acct-l');
     const nm = mk('span', 'nm', (a.active ? '✓ ' : dead ? '❌ ' : '') + (a.email || a.name));
     const pl = mk('span', 'pl');
-    pl.textContent = dead ? (a.health.reason || '사용 불가')
+    pl.textContent = dead ? (a.health.reason || 'Unavailable')
                           : (a.kind ? a.kind + ' · ' : '') + a.sub;
-    if (!dead && u.stale && (u.use5h != null || u.use7d != null)) pl.textContent += ' · (마지막 값)';
+    const freshness = !dead ? usageFreshnessText(u) : '';
+    if (freshness) pl.textContent += ' · ' + freshness;
     if (dead) b.title = a.health.reason || '';
     const rtd = dead ? null : rtLeft(a);
     if (rtd != null && rtd <= rtWarnDays()) {
@@ -466,10 +750,10 @@ function renderClaudeBody(st, body, paint, alive) {
     const R = mk('div', 'acct-r');
     if (dead) {
       R.style.color = C_AMBER;
-      R.textContent = '다시 로그인';
+      R.textContent = 'Log in again';
     } else if (u.use5h != null || u.use7d != null) {
       R.style.color = usageColor(u.use5h, u.use7d);
-      R.textContent = '5시간 ' + (u.use5h == null ? '—' : u.use5h + '%') + '\n주간 ' + (u.use7d == null ? '—' : u.use7d + '%');
+      R.textContent = '5h ' + (u.use5h == null ? '—' : u.use5h + '%') + '\nWeekly ' + (u.use7d == null ? '—' : u.use7d + '%');
     } else {
       R.style.color = '#8a92a6';
       R.textContent = claudeUsageText(u);
@@ -482,27 +766,27 @@ function renderClaudeBody(st, body, paint, alive) {
     b.appendChild(L); b.appendChild(R);
     if (!a.active) {
       const x = mk('span', 'acct-x', '✕');
-      x.title = '풀에서 이 계정 지우기';
+      x.title = 'Remove this account from the pool';
       x.addEventListener('pointerdown', function (e) { e.preventDefault(); e.stopPropagation(); });
       x.addEventListener('click', function (e) {
         e.preventDefault(); e.stopPropagation();
         const label = a.email || a.name;
-        if (!window.confirm('계정 지우기: ' + label + '\n\n풀에서 지웁니다.\n다시 로그인하면 같은 자리가 살아납니다. 계속할까요?')) return;
+        if (!window.confirm('Remove account: ' + label + '\n\nThis removes it from the pool.\nLogging in again restores the same slot. Continue?')) return;
         hideAcctTip();
         postJson(API + 'acct-remove', { name: a.name }).then(function (res) {
           if (res && res.ok) {
-            flash('🗑 ' + label + ' 지웠습니다', 2500);
+            flash('🗑 Removed ' + label, 2500);
             st.claude = null; st.flow = null; paint(); fetchClaude(st, paint, alive);
             refreshAcctIcon();
           }
-          else flash('지우지 못했습니다' + (res && res.error ? ': ' + res.error : ''), 3500);
-        }).catch(function () { flash('지우기 요청이 닿지 않았습니다', 2000); });
+          else flash('Could not remove account' + (res && res.error ? ': ' + res.error : ''), 3500);
+        }).catch(function () { flash('Remove request did not reach the server', 2000); });
       });
       b.appendChild(x);
     }
     b.onclick = function () {
       if (dead) { startFlow(st, paint, 'claude', 'add', { relogin: a.email || a.name }); return; }
-      if (a.active) { flash('이미 사용 중입니다: ' + a.name, 1400); return; }
+      if (a.active) { flash('Already active: ' + a.name, 1400); return; }
       // A switch is confirm strip → progress → done, inline. The list is never
       // closed or redrawn away underneath it (POPUP_SHELL).
       st.flow = { sec: 'claude', kind: 'switch', step: 'confirm', target: a.name };
@@ -514,7 +798,7 @@ function renderClaudeBody(st, body, paint, alive) {
     }
   });
   const busy = !!(f && f.sec === 'claude');
-  const add = mkBtn('계정 추가', 'addacct', function () { startFlow(st, paint, 'claude', 'add', {}); });
+  const add = mkBtn('Add account', 'addacct', function () { startFlow(st, paint, 'claude', 'add', {}); });
   if (busy) add.disabled = true;
   body.appendChild(add);
 }
@@ -528,46 +812,46 @@ function renderSwitchCard(st, a, paint, alive) {
     const b = mk('span', '', ''); b.style.fontWeight = '700';
     b.textContent = (a.email || a.name);
     t.appendChild(b);
-    t.appendChild(mk('span', '', ' 로 전환 · 새 세션부터 적용 · 지금 돌아가는 세션은 그대로'));
+    t.appendChild(mk('span', '', ' · Switch for new sessions · Running sessions stay unchanged'));
     c.appendChild(t);
     c.appendChild(mkBtnRow(
-      mkBtn('전환', 'p', function () {
+      mkBtn('Switch', 'p', function () {
         f.step = 'run'; paint();
         postJson(API + 'acct-switch', { name: a.name }).then(function (res) {
           if (!alive()) return;
           if (res && res.ok) {
             (st.claude.accounts || []).forEach(function (x) { x.active = (x.name === a.name); });
-            flash('✓ ' + (a.email || a.name) + ' 사용 중 (1분 안에 적용 · 바로 쓰려면 세션을 다시 시작하세요)', 3000);
+            flash('✓ ' + (a.email || a.name) + ' is active (applies within a minute · restart a session to use it now)', 3000);
             refreshAcctIcon();
             f.step = 'done';
           } else {
-            f.step = 'fail'; f.why = (res && res.error) || '알 수 없는 실패';
+            f.step = 'fail'; f.why = (res && res.error) || 'Unknown failure';
           }
           paint();
         }).catch(function () {
           if (!alive()) return;
-          f.step = 'fail'; f.why = '요청이 닿지 않았습니다'; paint();
+          f.step = 'fail'; f.why = 'Request did not reach the server'; paint();
         });
       }),
-      mkBtn('취소', '', function () { st.flow = null; paint(); })));
+      mkBtn('Cancel', '', function () { st.flow = null; paint(); })));
     return c;
   }
-  if (f.step === 'run') return mk('div', 'prog', '⟳ ' + (a.email || a.name) + ' 로 전환 중…');
+  if (f.step === 'run') return mk('div', 'prog', '⟳ Switching to ' + (a.email || a.name) + '…');
   if (f.step === 'done') {
-    const c = mk('div', 'flow-done', '✓ ' + (a.email || a.name) + ' 사용 중 · 새 세션부터 적용');
-    c.appendChild(mkBtnRow(mkBtn('완료', 'p', function () { st.flow = null; paint(); })));
+    const c = mk('div', 'flow-done', '✓ ' + (a.email || a.name) + ' is active · Applies to new sessions');
+    autoCloseDone(st, paint, alive);
     return c;
   }
   // fail
   const c = mk('div', 'flow-fail');
-  c.appendChild(mk('div', '', '전환하지 못했습니다 — 기존 계정 그대로'));
+  c.appendChild(mk('div', '', 'Switch failed — the previous account is unchanged'));
   c.appendChild(mk('div', 'mu', f.why || ''));
   c.appendChild(mkBtnRow(
-    mkBtn('다시 로그인', 'p', function () { startFlow(st, paint, 'claude', 'add', { relogin: a.email || a.name }); }),
-    mkBtn('닫기', '', function () { st.flow = null; paint(); }),
-    mkBtn('진단 정보 복사', '', function () {
+    mkBtn('Log in again', 'p', function () { startFlow(st, paint, 'claude', 'add', { relogin: a.email || a.name }); }),
+    mkBtn('Close', '', function () { st.flow = null; paint(); }),
+    mkBtn('Copy diagnostics', '', function () {
       if (navigator.clipboard) navigator.clipboard.writeText('acct-switch ' + a.name + ': ' + (f.why || ''));
-      flash('진단 정보를 복사했습니다', 1500);
+      flash('Diagnostics copied', 1500);
     })));
   return c;
 }
@@ -577,35 +861,35 @@ function renderSwitchCard(st, a, paint, alive) {
 function renderClaudeAdd(st, body, paint, alive) {
   const f = st.flow, box = mk('div', 'flow');
   const j = st.claude, active = activeClaude(st);
-  const cancel = mkBtn('취소', '', function () { st.flow = null; paint(); });
+  const cancel = mkBtn('Cancel', '', function () { st.flow = null; paint(); });
   if (f.step === 'ready') {
-    box.appendChild(mk('div', 'step', '① 준비'));
+    box.appendChild(mk('div', 'step', '① Ready'));
     box.appendChild(mk('div', '', f.relogin
-      ? '「' + f.relogin + '」 로그인을 되살립니다. 같은 자리로 돌아옵니다.'
-      : 'Claude 계정을 이 박스 풀에 추가합니다. 현재 계정(' + (active ? (active.email || active.name) : '없음') + ')은 바뀌지 않습니다.'));
-    box.appendChild(mk('div', 'mu', '브라우저에서 한 번 승인하면 그 뒤로는 브라우저 없이 전환합니다. 로그인은 약 30일 유지됩니다.'));
+      ? 'Restore the login for “' + f.relogin + '” in the same slot.'
+      : 'Add a Claude account to this box pool. The current account (' + (active ? (active.email || active.name) : 'none') + ') will not change.'));
+    box.appendChild(mk('div', 'mu', 'Approve once in your browser, then switch without a browser. The login lasts about 30 days.'));
     box.appendChild(mkBtnRow(
-      mkBtn('Claude 승인 페이지 열기', 'p', function () {
+      mkBtn('Open Claude approval page', 'p', function () {
         postJson(API + 'acct-login-url', {}).then(function (res) {
           if (!alive()) return;
           if (res && res.ok && res.url) { f.step = 'approve'; f.url = res.url; paint(); }
-          else { f.step = 'fail'; f.why = (res && res.error) || '승인 링크를 만들지 못했습니다'; paint(); }
-        }).catch(function () { if (alive()) { f.step = 'fail'; f.why = '승인 링크 요청이 닿지 않았습니다'; paint(); } });
+          else { f.step = 'fail'; f.why = (res && res.error) || 'Could not create approval link'; paint(); }
+        }).catch(function () { if (alive()) { f.step = 'fail'; f.why = 'Approval link request did not reach the server'; paint(); } });
       }), cancel));
   } else if (f.step === 'approve') {
-    box.appendChild(mk('div', 'step', '② 승인'));
+    box.appendChild(mk('div', 'step', '② Approve'));
     const p = mk('div', '',
-      '① 새 탭에서 추가할 계정으로 로그인하고 승인하세요. ② 승인이 끝나면 Claude가 일회용 코드를 보여줍니다.');
+      '① In a new tab, sign in to the account you want to add and approve it. ② Claude will show a one-time code.');
     box.appendChild(p);
     if (f.url) {
-      const a = mk('a', 'acct-link', '🔗 브라우저에서 로그인·승인하기');
+      const a = mk('a', 'acct-link', '🔗 Sign in and approve in your browser');
       a.href = f.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
       box.appendChild(a);
     }
-    const lbl = mk('label', 'lbl', '③ 승인 페이지에서 받은 일회용 코드 → 여기에 붙여넣기');
+    const lbl = mk('label', 'lbl', '③ One-time code from the approval page → paste it here');
     box.appendChild(lbl);
     const inp = document.createElement('input');
-    inp.type = 'text'; inp.placeholder = '승인 페이지에서 받은 코드'; inp.autocomplete = 'off'; inp.spellcheck = false;
+    inp.type = 'text'; inp.placeholder = 'Code from the approval page'; inp.autocomplete = 'off'; inp.spellcheck = false;
     inp.value = f.codeText || '';
     inp.addEventListener('input', function () { f.codeText = inp.value; });
     inp.addEventListener('keydown', function (e) {
@@ -614,12 +898,12 @@ function renderClaudeAdd(st, body, paint, alive) {
     box.appendChild(inp);
     const submitCode = function () {
       const code = (f.codeText || inp.value || '').trim();
-      if (!code) { inp.focus(); flash('코드를 붙여넣으세요', 2000); return; }
+      if (!code) { inp.focus(); flash('Paste the code', 2000); return; }
       f.step = 'check'; paint();
       postJson(API + 'acct-login-code', { code: code }).then(function (r) {
         if (!alive()) return;
         if (r && r.ok) {
-          f.added = f.relogin || (r.email || '새 계정');
+          f.added = f.relogin || (r.email || 'New account');
           const list = (st.claude && st.claude.accounts) || [];
           const t = list.find(function (x) { return (x.email || x.name) === f.relogin; });
           if (t) { delete t.health; t.usage = { use5h: 0, use7d: 0 }; t.rtExpiry = Date.now() + 30 * 86400000; }
@@ -628,37 +912,37 @@ function renderClaudeAdd(st, body, paint, alive) {
               usage: { use5h: 0, use7d: 0 }, rtExpiry: Date.now() + 30 * 86400000, holders: [] });
           }
           f.step = 'done'; refreshAcctIcon();
-        } else { f.step = 'fail'; f.why = (r && r.error) || '코드를 확인할 수 없습니다'; }
+        } else { f.step = 'fail'; f.why = (r && r.error) || 'Could not verify the code'; }
         paint();
-      }).catch(function () { if (alive()) { f.step = 'fail'; f.why = '확인 요청이 닿지 않았습니다'; paint(); } });
+      }).catch(function () { if (alive()) { f.step = 'fail'; f.why = 'Verification request did not reach the server'; paint(); } });
     };
     box.appendChild(mkBtnRow(
-      mkBtn('승인 페이지 다시 열기', '', function () { flash('새 승인 링크는 위 링크를 다시 여세요', 2500); }),
-      mkBtn('코드 확인하고 추가', 'p', submitCode), cancel));
+      mkBtn('Open approval page again', '', function () { flash('Open the link above again for a new approval link', 2500); }),
+      mkBtn('Verify code and add', 'p', submitCode), cancel));
   } else if (f.step === 'check') {
-    box.appendChild(mk('div', 'step', '③ 확인 중'));
-    box.appendChild(mk('div', 'prog', '⟳ 코드 확인 중 · 풀은 아직 그대로'));
+    box.appendChild(mk('div', 'step', '③ Checking'));
+    box.appendChild(mk('div', 'prog', '⟳ Checking code · The pool is still unchanged'));
     box.appendChild(mkBtnRow(cancel));
   } else if (f.step === 'done') {
-    box.appendChild(mk('div', 'step', '④ 완료'));
-    const c = mk('div', 'flow-done', '✓ ' + f.added + (f.relogin ? ' 로그인을 되살렸습니다' : ' 을 풀에 추가했습니다') + ' · 현재 계정은 바꾸지 않았습니다');
+    box.appendChild(mk('div', 'step', '④ Done'));
+    const c = mk('div', 'flow-done', '✓ ' + f.added + (f.relogin ? ' login restored' : ' added to the pool') + ' · The current account was not changed');
     box.appendChild(c);
     box.appendChild(mkBtnRow(
-      mkBtn('이 계정으로 전환', 'p', function () {
+      mkBtn('Switch to this account', 'p', function () {
         const t = ((st.claude && st.claude.accounts) || []).find(function (x) { return (x.email || x.name) === f.added; });
         if (t && !t.active) st.flow = { sec: 'claude', kind: 'switch', step: 'confirm', target: t.name };
         else st.flow = null;
         paint();
-      }),
-      mkBtn('완료', '', function () { st.flow = null; paint(); })));
+      })));
+    autoCloseDone(st, paint, alive);
   } else {
-    box.appendChild(mk('div', 'step', '④′ 실패'));
+    box.appendChild(mk('div', 'step', '④′ Failed'));
     const c = mk('div', 'flow-fail');
-    c.appendChild(mk('div', '', '코드를 확인할 수 없습니다'));
-    c.appendChild(mk('div', 'mu', (f.why || '') + ' · 코드는 일회용이라 짧게 유지됩니다. 새 승인 링크에서 다시 받으세요.'));
+    c.appendChild(mk('div', '', 'Could not verify the code'));
+    c.appendChild(mk('div', 'mu', (f.why || '') + ' · The one-time code expires quickly. Get another from a new approval link.'));
     box.appendChild(c);
     box.appendChild(mkBtnRow(
-      mkBtn('승인 페이지 다시 열기', 'p', function () { f.step = 'approve'; f.codeText = ''; paint(); }),
+      mkBtn('Open approval page again', 'p', function () { f.step = 'approve'; f.codeText = ''; paint(); }),
       cancel));
   }
   body.appendChild(box);
@@ -669,26 +953,26 @@ function renderCodexBody(st, box, paint, alive) {
   const cx = st.codex;
   const f = st.flow;
   if (f && f.sec === 'codex') { renderCodexFlow(st, box, paint, alive); return; }
-  if (!cx) { box.appendChild(mk('div', 'dots', '확인 중…')); return; }
+  if (!cx) { box.appendChild(mk('div', 'dots', 'Checking…')); return; }
   const ok = cx.state === 'ok';
   const row = mk('div', 'codex-row');
-  const nm = mk('span', 'nm', ok ? (cx.email || '(로그인됨)')
-    : cx.state === 'none' ? '로그인 필요'
-    : cx.state === 'pending' ? '로그인 진행 중' : (cx.reason || cx.state));
+  const nm = mk('span', 'nm', ok ? (cx.email || '(Signed in)')
+    : cx.state === 'none' ? 'Login required'
+    : cx.state === 'pending' ? 'Login in progress' : (cx.reason || cx.state));
   if (!ok) nm.style.color = '#e6b34d';
   const pl = mk('span', 'pl', ok ? ((cx.plan ? cx.plan + ' · ' : '') + 'ChatGPT')
-    : cx.state === 'none' ? ' 로그인이 필요합니다' : '');
+    : cx.state === 'none' ? ' Login required' : '');
   row.appendChild(nm); row.appendChild(pl); box.appendChild(row);
   if (ok) box.appendChild(codexUsageRow(st.codexUsage));
   const busy = _codexOperationPending;
-  const relog = mkBtn(ok ? '다시 로그인' : '로그인', '', function () {
+  const relog = mkBtn(ok ? 'Log in again' : 'Log in', '', function () {
     startFlow(st, paint, 'codex', 'relogin', {});
   });
   if (busy) relog.disabled = true;
   const btns = mkBtnRow(relog);
   if (ok) {
-    const lo = mkBtn('로그아웃', 'danger', function () {
-      if (!window.confirm('Codex 로그아웃 — 이 박스의 로그인을 지웁니다. 계속할까요?')) return;
+    const lo = mkBtn('Log out', 'danger', function () {
+      if (!window.confirm('Log out of Codex — this removes the login from this box. Continue?')) return;
       lo.disabled = true; lo.textContent = '…';
       postJson(API + 'codex-logout', {}).then(function (r) {
         if (!alive()) return;
@@ -696,12 +980,12 @@ function renderCodexBody(st, box, paint, alive) {
         if (r && r.ok) {
           setCodexIdentity({ state: 'none' });
           st.codex = { state: 'none' }; st.codexUsage = null;
-          flash('Codex 로그아웃했습니다', 2000); paint();
-        } else { lo.disabled = false; lo.textContent = '로그아웃'; flash('로그아웃하지 못했습니다' + (r && r.error ? ': ' + r.error : ''), 3000); }
+          flash('Logged out of Codex', 2000); paint();
+        } else { lo.disabled = false; lo.textContent = 'Log out'; flash('Could not log out' + (r && r.error ? ': ' + r.error : ''), 3000); }
       }).catch(function () {
         if (!alive()) return;
         _codexOperationPending = false;
-        lo.disabled = false; lo.textContent = '로그아웃'; flash('로그아웃 요청이 닿지 않았습니다', 2000);
+        lo.disabled = false; lo.textContent = 'Log out'; flash('Logout request did not reach the server', 2000);
       });
     });
     if (busy) lo.disabled = true;
@@ -720,22 +1004,22 @@ function codexUsageRow(usage) {
   // behind it was revoked — the account line must say so, or the first symptom is an
   // agent dying with "please sign in again". Numbers, if any, are from before the death.
   if (usage && usage.codexErr === 'auth') {
-    nm.textContent = '로그인이 해제됨 — 다시 로그인';
+    nm.textContent = 'Signed out — log in again';
     nm.style.color = C_RED;
-    pl.textContent = '다른 곳에서 로그아웃했거나 다른 계정으로 로그인했습니다';
+    pl.textContent = 'You logged out elsewhere or signed in with another account';
     row.appendChild(nm); row.appendChild(pl);
     return row;
   }
   if (u7 == null) {
-    nm.textContent = '주간 사용량';
+    nm.textContent = 'Weekly usage';
     nm.style.color = C_GRAY;
-    pl.textContent = usage && usage.codexErr ? String(usage.codexErr) : '확인 중…';
+    pl.textContent = usage && usage.codexErr ? String(usage.codexErr) : 'Checking…';
   } else {
-    nm.textContent = '주간 ' + u7 + '%' + (usage.codexStale ? ' (마지막 값)' : '');
+    nm.textContent = 'Weekly ' + u7 + '%' + (usage.codexStale ? ' (last reading)' : '');
     nm.style.color = levelColor(usageLevel('7d', u7));
     const bits = [];
-    if (usage.codexReset7d) bits.push(fmtReset(usage.codexReset7d, true) + ' 초기화');
-    if (usage.codexCredits != null) bits.push('크레딧 ' + usage.codexCredits);
+    if (usage.codexReset7d) bits.push('Resets ' + fmtReset(usage.codexReset7d, true));
+    if (usage.codexCredits != null) bits.push('Credits ' + usage.codexCredits);
     pl.textContent = bits.join(' · ');
   }
   row.appendChild(nm); row.appendChild(pl);
@@ -749,14 +1033,14 @@ function renderCodexFlow(st, box, paint, alive) {
   const f = st.flow, cbox = mk('div', 'flow');
   const cx = st.codex || { state: 'none' };
   if (f.step === 'ready') {
-    cbox.appendChild(mk('div', 'step', '① 준비'));
-    cbox.appendChild(mk('div', '', '지금: ' + (cx.state === 'ok'
-      ? '로그인됨 ' + (cx.email || '') + ' · 주간 ' + ((st.codexUsage && st.codexUsage.codexUse7d) != null ? st.codexUsage.codexUse7d + '%' : '확인 중')
-      : '로그인 없음')));
-    cbox.appendChild(mk('div', '', '시작하면 Codex를 잠시 쓸 수 없습니다. 기존 로그인은 임시 보관되고, 취소하거나 15분이 지나면 자동 복구됩니다.'));
-    cbox.appendChild(mk('div', 'mu', '이 박스에서 Codex로 돌아가는 세션이 있으면 다음 요청에서 멈출 수 있습니다.'));
+    cbox.appendChild(mk('div', 'step', '① Ready'));
+    cbox.appendChild(mk('div', '', 'Now: ' + (cx.state === 'ok'
+      ? 'Signed in ' + (cx.email || '') + ' · Weekly ' + ((st.codexUsage && st.codexUsage.codexUse7d) != null ? st.codexUsage.codexUse7d + '%' : 'Checking')
+      : 'Not signed in')));
+    cbox.appendChild(mk('div', '', 'Codex will be unavailable briefly. The existing login is saved and restored if you cancel or after 15 minutes.'));
+    cbox.appendChild(mk('div', 'mu', 'Running Codex sessions on this box may stop on their next request.'));
     cbox.appendChild(mkBtnRow(
-      mkBtn('재로그인 시작', 'p', function () {
+      mkBtn('Start login', 'p', function () {
         f.backup = cx.state === 'ok' ? Object.assign({}, cx) : null;
         _codexOperationPending = true;
         postJson(API + 'codex-login-start', {}).then(function (r) {
@@ -766,52 +1050,52 @@ function renderCodexFlow(st, box, paint, alive) {
             f.step = 'approve'; f.code = r.code; f.url = r.url; paint();
           } else {
             _codexOperationPending = false;
-            flash('Codex 로그인을 시작하지 못했습니다' + (r && r.error ? ': ' + r.error : ''), 4500);
+            flash('Could not start Codex login' + (r && r.error ? ': ' + r.error : ''), 4500);
           }
         }).catch(function () {
           if (!alive()) return;
           _codexOperationPending = false;
-          flash('Codex 로그인 요청이 닿지 않았습니다', 2000);
+          flash('Codex login request did not reach the server', 2000);
         });
       }),
-      mkBtn('취소', '', function () { st.flow = null; paint(); })));
+      mkBtn('Cancel', '', function () { st.flow = null; paint(); })));
   } else if (f.step === 'approve') {
-    cbox.appendChild(mk('div', 'step', '② 브라우저 승인'));
-    cbox.appendChild(mk('div', '', '① 새 탭 열기 → OpenAI 승인 페이지'));
-    cbox.appendChild(mk('div', '', '② 아래 코드를 그 페이지에 입력'));
+    cbox.appendChild(mk('div', 'step', '② Browser approval'));
+    cbox.appendChild(mk('div', '', '① Open a new tab → OpenAI approval page'));
+    cbox.appendChild(mk('div', '', '② Enter the code below on that page'));
     if (f.url) {
       const a = mk('a', 'acct-link', '🔗 ' + f.url);
       a.href = f.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
       cbox.appendChild(a);
     }
     const codeEl = mk('code', 'cg-cmd', f.code || '');
-    codeEl.title = '누르면 복사';
+    codeEl.title = 'Click to copy';
     codeEl.onclick = function () {
-      if (navigator.clipboard && f.code) { navigator.clipboard.writeText(f.code); flash('복사했습니다', 1200); }
+      if (navigator.clipboard && f.code) { navigator.clipboard.writeText(f.code); flash('Copied', 1200); }
     };
     cbox.appendChild(codeEl);
-    cbox.appendChild(mk('div', 'mu', '이 코드는 Airlock이 만든 코드입니다 → 브라우저에 입력'));
-    cbox.appendChild(mk('div', 'warnln', '⏱ 15분 안에 승인 · 기존 로그인 보관됨'));
-    const chk = mkBtn('승인 확인', 'p', function () {
-      chk.disabled = true; chk.textContent = '확인 중…';
+    cbox.appendChild(mk('div', 'mu', 'Airlock generated this code → enter it in your browser'));
+    cbox.appendChild(mk('div', 'warnln', '⏱ Approve within 15 minutes · Existing login saved'));
+    const chk = mkBtn('Check approval', 'p', function () {
+      chk.disabled = true; chk.textContent = 'Checking…';
       fetch(API + 'claude-status').then(function (x) { return x.json(); }).then(function (s) {
         if (!alive()) return;
         const ncx = (s && s.codex) || {};
         if (ncx.state === 'ok') {
           _codexOperationPending = false;
-          flash('✓ Codex 로그인했습니다: ' + (ncx.email || ''), 3000);
+          flash('✓ Signed in to Codex: ' + (ncx.email || ''), 3000);
           const identity = setCodexIdentity(ncx);
           st.codex = ncx; st.codexUsage = _codexUsage;
           f.step = 'done'; paint();
           fetchCodexUsage(st, paint, alive, { scheduled: false });
         } else {
-          chk.disabled = false; chk.textContent = '승인 확인';
-          flash('아직 승인되지 않았습니다 — 코드를 입력·승인하고 다시 확인하세요', 4000);
+          chk.disabled = false; chk.textContent = 'Check approval';
+          flash('Not approved yet — enter and approve the code, then check again', 4000);
         }
-      }).catch(function () { if (alive()) { chk.disabled = false; chk.textContent = '승인 확인'; } });
+      }).catch(function () { if (alive()) { chk.disabled = false; chk.textContent = 'Check approval'; } });
     });
     cbox.appendChild(mkBtnRow(chk,
-      mkBtn('취소하고 기존 로그인 복구', 'danger', function () {
+      mkBtn('Cancel and restore previous login', 'danger', function () {
         postJson(API + 'codex-login-cancel', {}).then(function (rr) {
           if (!alive()) return;
           _codexOperationPending = false;
@@ -819,18 +1103,18 @@ function renderCodexFlow(st, box, paint, alive) {
             if (f.backup) { st.codex = Object.assign({}, f.backup); st.codex.state = 'ok'; setCodexIdentity(st.codex); }
             else st.codex = { state: 'none' };
             st.codexUsage = null;
-            flash(rr.restored ? '취소했습니다 — 기존 로그인을 복구했습니다' : '취소했습니다', 2500);
+            flash(rr.restored ? 'Cancelled — previous login restored' : 'Cancelled', 2500);
             st.flow = null; paint();
-          } else flash('취소하지 못했습니다' + (rr && rr.error ? ': ' + rr.error : ''), 3000);
+          } else flash('Could not cancel' + (rr && rr.error ? ': ' + rr.error : ''), 3000);
         }).catch(function () {});
       })));
   } else if (f.step === 'check') {
-    cbox.appendChild(mk('div', 'step', '③ 확인 중'));
-    cbox.appendChild(mk('div', 'prog', '⟳ 새 로그인 확인 중…'));
+    cbox.appendChild(mk('div', 'step', '③ Checking'));
+    cbox.appendChild(mk('div', 'prog', '⟳ Checking new login…'));
   } else {
-    cbox.appendChild(mk('div', 'step', '④ 완료'));
-    cbox.appendChild(mk('div', 'flow-done', '✓ ' + ((st.codex && st.codex.email) || '') + ' 으로 다시 로그인했습니다 · 사용량은 새 계정 것으로 다시 읽습니다'));
-    cbox.appendChild(mkBtnRow(mkBtn('완료', 'p', function () { st.flow = null; paint(); })));
+    cbox.appendChild(mk('div', 'step', '④ Done'));
+    cbox.appendChild(mk('div', 'flow-done', '✓ Signed in again as ' + ((st.codex && st.codex.email) || '') + ' · Usage will be read for the new account'));
+    autoCloseDone(st, paint, alive);
   }
   box.appendChild(cbox);
 }
@@ -840,7 +1124,7 @@ function renderCodexFlow(st, box, paint, alive) {
 // flows them. The section below used to live here; deleting it outright keeps
 // a removed section from ever reading as a passing one.
 function startFlow(st, paint, sec, kind, extra) {
-  if (st.flow) { flash('진행 중인 작업을 먼저 끝내거나 취소하세요', 2500); return; }
+  if (st.flow) { flash('Finish or cancel the current action first', 2500); return; }
   st.flow = Object.assign({ sec: sec, kind: kind, step: 'ready' }, extra || {});
   st.expand[sec] = true;
   if (sec === 'codex') _codexOperationPending = kind === 'relogin';
@@ -858,13 +1142,28 @@ function fetchClaude(st, paint, alive) {
     postJson(API + 'acct-usage-now', {}).then(function (fresh) {
       if (!alive()) return;
       if (st.flow && st.flow.sec === 'claude') return;    // a login form owns the section
-      if (!fresh || !fresh.usage || fresh.usage.err
-          || (fresh.usage.use5h == null && fresh.usage.use7d == null)) return;
+      if (!fresh || !fresh.usage) {
+        const a = activeClaude(st);
+        if (a) a.usage = Object.assign({}, a.usage || {}, { err: 'unreadable response' });
+        paint();
+        return;
+      }
       ((st.claude && st.claude.accounts) || []).forEach(function (a) {
-        if (a.email === fresh.email && a.kind === fresh.kind) a.usage = fresh.usage;
+        const matches = fresh.email ? a.email === fresh.email && a.kind === fresh.kind : a.active;
+        if (!matches) return;
+        if (fresh.usage.err || (fresh.usage.use5h == null && fresh.usage.use7d == null)) {
+          a.usage = Object.assign({}, a.usage || {}, { err: fresh.usage.err || 'unreadable' });
+        } else {
+          a.usage = fresh.usage;
+        }
       });
       paint();
-    }).catch(function () {});
+    }).catch(function () {
+      if (!alive()) return;
+      const a = activeClaude(st);
+      if (a) a.usage = Object.assign({}, a.usage || {}, { err: 'request failed' });
+      paint();
+    });
   }).catch(function () {
     if (!alive()) return;
     st.claudeFailed = true; paint();
@@ -882,7 +1181,7 @@ function fetchCodex(st, paint, alive) {
     if (cx.state === 'ok') fetchCodexUsage(st, paint, alive, { scheduled: false });
   }).catch(function () {
     if (!alive()) return;
-    st.codex = { state: 'unknown', reason: '조회 실패' }; paint();
+    st.codex = { state: 'unknown', reason: 'Could not read status' }; paint();
   });
 }
 // account popup placement — under the anchor, but flip above it if there isn't room below (bottom key bar).
@@ -909,7 +1208,7 @@ function fillAcctList(list, opts) {
   const reflow = opts.reflow, alive = opts.alive || function () { return true; };
   const st = newShellState();
   list.textContent = '';
-  const needs = mk('div', 'needs', '조치 필요 확인 중…');
+  const needs = mk('div', 'needs', 'Checking required actions…');
   list.appendChild(needs);
   // Build the section shells NOW, before any request answers. /accounts runs the
   // account CLI (up to 15 s) and then the fleet store; the Codex and agy rows do
@@ -940,11 +1239,11 @@ function fillAcctList(list, opts) {
     needs.textContent = '';
     const iss = shellIssues(st);
     if (!st.claude && !st.codex && !st.agy) {
-      needs.appendChild(mk('span', '', '조치 필요 확인 중…'));
+      needs.appendChild(mk('span', '', 'Checking required actions…'));
     } else if (!iss.length) {
-      needs.appendChild(mk('span', '', '조치 필요 없음'));
+      needs.appendChild(mk('span', '', 'No action required'));
     } else {
-      needs.appendChild(mk('span', '', '조치 필요 ' + iss.length + '건 · '));
+      needs.appendChild(mk('span', '', iss.length + ' action' + (iss.length === 1 ? '' : 's') + ' required · '));
       iss.forEach(function (it, i) {
         if (i) needs.appendChild(mk('span', '', ' · '));
         const a = mk('a', '', it.label);
@@ -969,19 +1268,24 @@ function fillAcctList(list, opts) {
       else if (key === 'codex') renderCodexBody(st, S.body, paint, alive);
       else if (key === 'agy') {
         S.body.textContent = '';
-        if (!st.agy && !st.agyFailed) S.body.appendChild(mk('div', 'dots', '확인 중…'));
-        else if (st.agyFailed) S.body.appendChild(mk('div', 'dots', '사용량을 읽지 못했습니다'));
-        else if (st.agy && st.agy.enabled === false) S.body.appendChild(mk('div', 'dots', '이 박스에 없음'));
-        else renderAgyBody(S.body, st.agy || {}, function () {
-          st.agy = null; st.agyFailed = false; paint();
-          fetchAgy(st, paint, alive);
-        });
+        if (!st.agy && !st.agyFailed) S.body.appendChild(mk('div', 'dots', 'Checking…'));
+        else if (st.agyFailed) S.body.appendChild(mk('div', 'dots', 'Could not read usage'));
+        else if (st.agy && st.agy.enabled === false) S.body.appendChild(mk('div', 'dots', 'Not available on this box'));
+        else {
+          renderAgyBody(S.body, st.agy || {}, function () {
+            st.agy = null; st.agyFailed = false; paint();
+            fetchAgy(st, paint, alive);
+          });
+          const list = mk('div', '');
+          renderAgyAccounts(st, list, paint, alive);
+          if (list.childNodes.length) S.body.insertBefore(list, S.body.firstChild);
+        }
       }
       else if (key === 'muse') {
         S.body.textContent = '';
-        if (!st.muse && !st.museFailed) S.body.appendChild(mk('div', 'dots', '확인 중…'));
-        else if (st.museFailed) S.body.appendChild(mk('div', 'dots', 'Muse 키를 읽지 못했습니다'));
-        else if (st.muse && st.muse.enabled === false) S.body.appendChild(mk('div', 'dots', '이 박스에 없음'));
+        if (!st.muse && !st.museFailed) S.body.appendChild(mk('div', 'dots', 'Checking…'));
+        else if (st.museFailed) S.body.appendChild(mk('div', 'dots', 'Could not read Muse key'));
+        else if (st.muse && st.muse.enabled === false) S.body.appendChild(mk('div', 'dots', 'Not available on this box'));
         else renderMuseBody(st, S.body, paint, alive);
       }
     });
@@ -999,7 +1303,7 @@ function openAcctMenu(anchor) {
   closeTabPops();
   const pop = document.createElement('div'); pop.className = 'tab-pop acct';
   const list = document.createElement('div');
-  list.appendChild(mk('div', 'dots', '계정·사용량 확인 중…')); pop.appendChild(list);
+  list.appendChild(mk('div', 'dots', 'Checking accounts and usage…')); pop.appendChild(list);
   const r = anchor.getBoundingClientRect();
   placePop(pop, r.right - 320, r.bottom + 6);   // append to body first so we can measure
   const reflow = function () { placeAcctMenu(pop, anchor); };

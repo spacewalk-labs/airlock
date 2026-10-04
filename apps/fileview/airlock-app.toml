@@ -72,7 +72,7 @@ files = ["~/.local/bin/filebrowser", "~/.config/airlock-fileview/"]
 # From hub/index.html's APPS table (fileview row).
 [tile]
 label = "File Viewer"
-sub = "directory viewer + editor"
+sub = "파일 탐색·편집"
 cat = "docs"
 path = "/fileview/"
 glyph = "app-fileview"

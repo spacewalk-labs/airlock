@@ -40,7 +40,7 @@ def _delivery_state(messages, card_id):
 def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds):
     """Exercise the deployed loop's no-webhook and stubbed delivery branches.
 
-    The first branch deliberately passes an empty webhook to the same consumer the
+    The first branch deliberately passes no sender to the same consumer the
     service loop uses.  The second replaces only its HTTP transport with a local
     success stub; it therefore proves the loop's selection and receipt mutation
     without sending an external message from the disposable acceptance guest.
@@ -73,13 +73,17 @@ def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds
     # deliver_once orders due cards by cards.first_at, which ingest deliberately
     # assigns at receipt time rather than from payload.created_at.  Reorder only
     # this disposable sentinel so the stub cannot consume a real pending card.
+    # Every urgent card also waits out the initial Slack grace window; this check
+    # measures the consumer, not the clock, so the sentinel alone is made due now.
+    # Real pending cards keep their own deadline.
     with messages._conn():
         messages._conn().execute(
-            "UPDATE cards SET first_at=? WHERE card_id=?", ("1970-01-01T00:00:00.000000Z", card_id))
+            "UPDATE cards SET first_at=?,send_next_at=? WHERE card_id=?",
+            ("1970-01-01T00:00:00.000000Z", "1970-01-01T00:00:00.000000Z", card_id))
 
     _at("empty-webhook-control")
     no_webhook_before = _delivery_state(messages, card_id)
-    no_webhook_return = loop.deliver_once("")
+    no_webhook_return = loop.deliver_once(None)
     no_webhook_after = _delivery_state(messages, card_id)
     if no_webhook_return is not False or no_webhook_before != no_webhook_after:
         raise RuntimeError("empty webhook changed the pending synthetic card")
@@ -88,7 +92,8 @@ def collect(db_path, backend_dir, health_url, soak_seconds, elapsed_milliseconds
     original_send = loop.slack.send
     try:
         loop.slack.send = lambda _webhook, _text: (True, 204, None)
-        configured_return = loop.deliver_once("collector-stub")
+        sender = loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': 'collector-stub'})
+        configured_return = loop.deliver_once(sender)
     finally:
         loop.slack.send = original_send
     configured_after = _delivery_state(messages, card_id)

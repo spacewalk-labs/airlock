@@ -156,7 +156,7 @@ https_port = "gate_port"
 # [plaintext_redirect] here.
 [tile]
 label = "Paseo"
-sub = "agent orchestration"
+sub = "에이전트 관리"
 cat = "coding"
 icon = "paseo.png"
 

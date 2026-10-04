@@ -137,7 +137,7 @@ default = "owner"
 
 [tile]
 label = "Learning"
-sub = "study library"
+sub = "학습 자료실"
 cat = "docs"
 path = "/learning/"
 glyph = "app-learning"

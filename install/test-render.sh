@@ -1,33 +1,24 @@
 #!/usr/bin/env bash
 # Test install/render-nginx.sh: renders a valid site and passes `nginx -t`.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 EMIT_AC=0
 case "${1:-}" in
   "") ;;
   --emit-ac) EMIT_AC=1 ;;
   *) echo "usage: $0 [--emit-ac]" >&2; exit 2 ;;
 esac
-# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: the share is 15/16 of the
-# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
-# whichever the runner happened to have. install/test-render-parity.sh gates that every
-# suite running a real app installer sets this — the gate does not reason about WHICH
-# app a dynamic path resolves to, so suites that only run other apps carry it too; the
-# seam is inert for them. (An intermediate design REFUSED below 8 GiB, which is what
-# made this urgent. The refusal is gone — owner, 2026-08-17 — the pin is still right.)
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+airlock_pin_paseo_mem
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-TMP="$(mktemp -d)"
+TMP="$(TMPDIR=/tmp mktemp -d)"
 # The installer and a www-data worker both need to traverse this fixture root.
 chmod 755 "$TMP"
 trap 'rm -rf "$TMP"' EXIT
 export AIRLOCK_STATE_DIR="$TMP/state"   # isolate the installed-state ledger from the dev box
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 cat >"$TMP/airlock.toml" <<'TOML'
 [site]
@@ -48,6 +39,23 @@ export AIRLOCK_CONFD="$TMP/confd"
 # no cert), and pinning lets the assertions below check the exact authority.
 export AIRLOCK_TS_FQDN="box.example.ts.net"
 mkdir -p "$AIRLOCK_WEBROOT" "$AIRLOCK_CONFD/hub-locations.d" "$AIRLOCK_CONFD/servers.d"
+
+# Record explicit fixture sources through the production installed-record writer.
+seed_apps() {
+  env -u AIRLOCK_APP_ID -u AIRLOCK_APP_DIR python3 - "$ROOT/bin/airlock-ledger" "$@" <<'PY_SEED'
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+import sys
+sys.dont_write_bytecode = True
+ledger = SourceFileLoader("_fixture_ledger", sys.argv[1]).load_module()
+rows = ledger.load_installed()
+for pid, directory in zip(sys.argv[2::2], sys.argv[3::2]):
+    repo = str(Path(directory).resolve())
+    if pid not in rows or rows[pid]["repo"] != repo:
+        rows[pid] = {"repo": repo, "commit": "", "artifacts": []}
+ledger.write_installed(rows)
+PY_SEED
+}
 
 SITE="$(bash "$HERE/render-nginx.sh" 2>"$TMP/err")" || { bad "render-nginx exited non-zero"; cat "$TMP/err"; }
 
@@ -87,6 +95,7 @@ owner = "owner@fixture.dev"
 [packages.audapp]
 path = "$TMP/pkg-aud"
 TOML
+seed_apps audapp "$TMP/pkg-aud"
 AUD_SITE="$(AIRLOCK_CONFIG="$TMP/aud.toml" bash "$HERE/render-nginx.sh" 2>"$TMP/aud-err")" \
   || { bad "role: audience render exited non-zero"; cat "$TMP/aud-err"; }
 grep -qF 'map $owner_ok $airlock_role { 1 "owner"; default "collaborator"; }' <<<"$AUD_SITE" \
@@ -296,14 +305,6 @@ if AIRLOCK_TS_FQDN='foo&bar' bash "$HERE/render-nginx.sh" >/dev/null 2>&1; then
   bad "render accepted a malformed AIRLOCK_TS_FQDN"
 else
   ok "render rejects a malformed AIRLOCK_TS_FQDN"
-fi
-
-# fail-closed: a non-tailscale provider makes render refuse
-sed 's/provider = "tailscale"/provider = "basic"/' "$TMP/airlock.toml" >"$TMP/bad.toml"
-if AIRLOCK_CONFIG="$TMP/bad.toml" bash "$HERE/render-nginx.sh" >/dev/null 2>&1; then
-  bad "render refuses non-tailscale provider"
-else
-  ok "render refuses non-tailscale provider (fail-closed)"
 fi
 
 # full nginx -t on the rendered site

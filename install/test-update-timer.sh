@@ -2,6 +2,7 @@
 # Hermetic contract for the daily update detector timer.  The production installer
 # must ask systemd for the next run; rendered files alone are not evidence of a job.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)" || exit 1
@@ -9,11 +10,7 @@ trap 'rm -rf "$TMP"' EXIT
 HOME_DIR="$TMP/home"
 BIN_DIR="$TMP/bin"
 LOG="$TMP/systemctl.log"
-# This suite names the real platform installer in its wiring assertion. Pin the
-# paseo sizing seam as required for every such suite, even though its fixture
-# only installs the detector timer, so a future orchestrator path remains
-# hermetic across runners with different RAM.
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+airlock_pin_paseo_mem
 mkdir -p "$HOME_DIR" "$BIN_DIR"
 
 cat > "$BIN_DIR/systemctl" <<'SH'
@@ -23,9 +20,7 @@ case "$*" in *list-timers*) printf '%s\n' 'Mon 2026-09-02 00:00:00 KST 1d left a
 SH
 chmod 0755 "$BIN_DIR/systemctl"
 
-pass=0 fail=0
-ok() { printf 'ok   update-timer: %s\n' "$1"; pass=$((pass + 1)); }
-bad() { printf 'FAIL update-timer: %s\n' "$1"; fail=$((fail + 1)); }
+airlock_test_counters_init "update-timer: "
 
 if env HOME="$HOME_DIR" PATH="$BIN_DIR:$PATH" AIRLOCK_SYSTEMCTL_LOG="$LOG" \
   bash "$ROOT/install/airlock-update-timer.sh" install >/dev/null 2>&1; then

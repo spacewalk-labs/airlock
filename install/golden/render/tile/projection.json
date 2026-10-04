@@ -1,14 +1,14 @@
 {
   "code-server": {
     "label": "code-server",
-    "sub": "browser IDE",
+    "sub": "브라우저 개발 환경",
     "cat": "coding",
     "glyph": "app-code-server",
     "brand": null
   },
   "dev-monitor": {
     "label": "Dev Monitor",
-    "sub": "system status",
+    "sub": "시스템 상태",
     "cat": "system",
     "path": "/monitor/",
     "glyph": "app-monitor",
@@ -16,14 +16,14 @@
   },
   "devterm": {
     "label": "DevTerm",
-    "sub": "web shell",
+    "sub": "웹 터미널",
     "cat": "coding",
     "glyph": "app-devterm",
     "brand": null
   },
   "fileview": {
     "label": "File Viewer",
-    "sub": "directory viewer + editor",
+    "sub": "파일 탐색·편집",
     "cat": "docs",
     "path": "/fileview/",
     "glyph": "app-fileview",
@@ -31,7 +31,7 @@
   },
   "notepad": {
     "label": "Clip Bridge",
-    "sub": "clipboard",
+    "sub": "클립보드",
     "cat": "docs",
     "path": "/notepad/",
     "glyph": "app-notepad",
@@ -39,21 +39,21 @@
   },
   "orca": {
     "label": "Orca",
-    "sub": "agent IDE",
+    "sub": "에이전트 개발 환경",
     "cat": "coding",
     "glyph": null,
     "brand": "/assets/apps/orca/orca.png"
   },
   "paseo": {
     "label": "Paseo",
-    "sub": "agent orchestration",
+    "sub": "에이전트 관리",
     "cat": "coding",
     "glyph": null,
     "brand": "/assets/apps/paseo/paseo.png"
   },
   "publish": {
     "label": "Publish",
-    "sub": "static publish",
+    "sub": "정적 사이트 발행",
     "cat": "docs",
     "path": "/publish/",
     "glyph": "app-publish",

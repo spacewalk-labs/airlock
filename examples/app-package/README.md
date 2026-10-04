@@ -4,49 +4,52 @@ This directory is a runnable, explicit Airlock package. It starts one
 loopback-only Python backend and exposes it at the hub path
 `/hello-example/`; the hub's existing identity gate protects the fragment.
 An explicit package runs arbitrary bash as the installing operator, including
-commands it invokes with `sudo`. Review a package before adding its
-`[packages.<id>]` line. Config ABI 2 records the reviewed package tree in the
-checkout's `airlock.lock` after the first successful real install. A later byte
-change is fatal and names both digests until you deliberately re-lock it;
-capability `grant` values, when needed, are a separate acknowledgement.
+commands it invokes with `sudo`. Review the package before applying it. The
+package manifest describes its settings and owned artifacts; installing a
+local package does not require registering its path in `airlock.toml`.
 
 ## Copy and install
 
 From an Airlock checkout, copy this whole directory somewhere outside the
-checkout. Change only `owner` in the copied `airlock.toml`; its relative
-package path is already correct.
+checkout. Change only `owner` in the copied `airlock.toml`.
 
 ```bash
 cp -a examples/app-package "$HOME/hello-example"
 $EDITOR "$HOME/hello-example/airlock.toml"
-AIRLOCK_CONFIG="$HOME/hello-example/airlock.toml" bash install/airlock-install.sh
+AIRLOCK_CONFIG="$HOME/hello-example/airlock.toml" \
+  python3 bin/airlock-ledger apply hello-example --source "$HOME/hello-example/package"
 ```
 
-To preview without changing anything:
+The source argument must be the absolute package directory containing
+`airlock-app.toml` and `install.sh`. The ledger runs the package install hook,
+applies its declared ingress, refreshes the nginx site and Hub manifest, and
+records the source and artifacts. Open
+`https://<your-box>/hello-example/` as the configured owner.
+
+To reinstall or update, change the copied package and run the same `apply`
+command with the same package directory. To remove it, run:
 
 ```bash
-AIRLOCK_DRY_RUN=1 AIRLOCK_CONFIG="$HOME/hello-example/airlock.toml" bash install/airlock-install.sh
+AIRLOCK_CONFIG="$HOME/hello-example/airlock.toml" \
+  python3 bin/airlock-ledger remove hello-example
 ```
 
-Explicit-package scripts deliberately do not execute in a dry run; Airlock
-prints that it *would* install this package. Run the non-dry command above on
-a box with Tailscale and nginx ready to install the unit, fragment, and
-backend. Then open `https://<your-box>/hello-example/` as the owner.
+Removal uses the artifacts recorded for the app and refreshes the projections;
+it does not run `deactivate.sh`. Keep the `[apps.hello-example]` table if you
+want to preserve its configured values for a later apply.
 
-[`acceptance.sh`](acceptance.sh) drives the full install → rerun → locked
-upgrade → remove cycle against this example and asserts each step, for use on a
-disposable box. [`ACCEPTANCE.md`](ACCEPTANCE.md) is the earlier 21-check
-transcript plus the current 26-check run, which adds exact lock recording,
-byte-stable rerun, mismatch refusal, deliberate re-lock evidence, and a
-pre-install prerequisite-declaration check.
+[`acceptance.sh`](acceptance.sh) drives the full apply → rerun → update → remove
+cycle against this example on a disposable box. [`ACCEPTANCE.md`](ACCEPTANCE.md)
+is an earlier transcript of the retired installer and digest-lock flow; its
+installer, path-registration, and lock checks are historical.
 
 ## What the manifest must say
 
 `package/airlock-app.toml` has the two required identity fields:
-`contract = 1` and an `id` that exactly matches both
-`[apps.hello-example]` and `[packages.hello-example]`. It declares
-`backend_port` before the scripts read it, and declares every file the
-installer creates outside the package: the user unit and hub fragment.
+`contract = 1` and an `id` that matches both the `[apps.hello-example]` table
+and the id passed to `airlock-ledger`. It declares `backend_port` before the
+scripts read it, and declares every file the package creates outside its
+directory: the user unit and hub fragment.
 
 Add `[config]` entries for every app setting your scripts read, and declare
 every externally-created unit, fragment, webroot path, file, served port, or
@@ -54,15 +57,14 @@ rooted artifact in `[artifacts]`. The complete schema and special cases are in
 the [app package contract](../../docs/design/app-package-contract.md); do not
 invent fields that Airlock does not validate.
 
-`install.sh` and `smoke.sh` must be regular, non-symlink files. `deactivate.sh`
-is optional, but omitting it makes config-only removal refuse: use the explicit
-teardown command Airlock reports instead. This example includes one; the
-ledger removes its declared unit and fragment after the hook runs.
+`install.sh` and `smoke.sh` must be regular, non-symlink files. The manifest
+parser also recognizes an optional `deactivate.sh`, but the ledger's `remove`
+command removes recorded artifacts without running it.
 
 ## D5 lifecycle ABI
 
-Airlock runs each lifecycle script from the canonical package directory and
-sets these variables:
+Airlock runs `install.sh` from the canonical package directory and sets these
+variables:
 
 - `AIRLOCK_ROOT`: the Airlock checkout; source `$AIRLOCK_ROOT/install/lib.sh`.
 - `AIRLOCK_APP_DIR`: the canonical package root; locate package-local files here.
@@ -72,34 +74,33 @@ Do not calculate the platform root by walking up from `$0`: an explicit
 package can live anywhere. The example locates Airlock and its own files only
 through this ABI, then uses the helpers loaded from `install/lib.sh`.
 
-## Lifecycle promises
+## Apply behavior
 
-- **Install:** Airlock validates, journals the declared ownership, runs
-  `install.sh`, reloads the gate, then runs `smoke.sh` before committing.
+- **First apply:** validates the source manifest before running `install.sh`,
+  applies the app's ingress, refreshes the nginx site and Hub manifest, then
+  records the source and artifacts.
 - **Rerun:** `install.sh` runs again, so make writes idempotent. This example
-  rewrites the unit/fragment only when changed and restarts the backend only
-  when its unit changed.
-- **Upgrade:** stage changed package bytes or a new package path, then run the
-  same install command. Because this example has `deactivate.sh`, Airlock
-  removes its recorded unit and fragment before installing the new version.
-  A package without a deactivator instead uses the record-diff path, which
-  removes only old declared artifacts the new package no longer owns.
-- **Remove:** remove both `hello-example` tables from `airlock.toml`, then run
-  the same install command. Airlock runs `deactivate.sh` when it can trust it,
-  removes ledger-recorded artifacts, and keeps app data that was never declared.
+  rewrites the unit and fragment only when changed and restarts the backend
+  only when its unit changed.
+- **Update:** edit the package in place and run the same `apply` command. If an
+  update fails, the ledger reapplies the source path recorded at the start
+  once; it reports `restored` or `residue` and returns nonzero either way. A
+  local source records its directory path, so keep a copy of the previous
+  package contents if you need to restore that version after an in-place edit.
+- **Remove:** run `airlock-ledger remove hello-example`. The ledger removes
+  recorded artifacts and refreshes projections while preserving unrecorded
+  user data.
 
-## A real manifest error
+## A malformed manifest
 
-This was produced by copying this example, changing its unit declaration to
-`units = ["../not-a-unit.service"]`, and running:
+This was produced by copying this example, appending the invalid TOML line
+`invalid = [`, and querying that directory directly:
 
 ```bash
-AIRLOCK_CONFIG="$HOME/hello-example/airlock.toml" python3 bin/airlock-config validate
+AIRLOCK_CONFIG="$HOME/broken/airlock.toml" \
+  python3 bin/airlock-config dir-package-info hello-example "$HOME/broken/package"
 ```
 
-```text
-airlock-config: package 'hello-example': artifacts.units entry '../not-a-unit.service' must be a bare unit file name ending in one of ['.service', '.socket', '.timer', '.path', '.target'] (and not option-like, and not a glob — '*', '?', '[' are fatal here) — anything else could resolve outside the unit directories or confuse systemctl
-```
-
-The error names `artifacts.units` and the bad value instead of silently
-accepting a path that could escape the unit directory.
+`dir-package-info` exits nonzero and names `airlock-app.toml` as invalid TOML.
+It uses the same manifest parser as `apply` and reports the error without
+applying the package or changing installed state.

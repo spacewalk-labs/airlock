@@ -48,12 +48,11 @@ class SecretRegressionTest(unittest.TestCase):
     def configure(self, lane):
         self.hook_name = ('AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT' if lane == 'legacy' else
                           'DEVMON_SLACK_WEBHOOK' if lane == 'shared' else 'REGRESSION_HOOK')
-        config_lane = lane if lane in ('urgent', 'routine') else 'urgent'
         selector = '' if lane == 'legacy' else self.hook_name
         self.config.write_text('[auth]\nprovider="tailscale"\nowner="owner@example.test"\n'
                                f'[apps.hub]\nnginx_port={self.hub_port}\n'
                                f'[apps.dev-monitor]\nmessages=true\nbackend_port={self.backend_port}\n'
-                               f'slack_webhook_{config_lane}_env="{selector}"\n')
+                               f'slack_webhook_urgent_env="{selector}"\n')
     def install(self, value):
         self.file.write_text(self.hook_name + '=' + value + '\n')
         self.file.chmod(0o600)
@@ -73,12 +72,12 @@ class SecretRegressionTest(unittest.TestCase):
             self.assertEqual(self.install(value).returncode, 0)
 
     def test_selector_control_collisions(self):
-        selectors = ('DEVMON_SLACK_WEBHOOK_NAME', 'DEVMON_SLACK_WEBHOOK_ROUTINE_NAME',
+        selectors = ('DEVMON_SLACK_WEBHOOK_NAME', 'DEVMON_SLACK_BOT_TOKEN_NAME', 'DEVMON_INGEST_TOKEN_NAME',
                      'DEVMON_SMTP_PASSWORD_NAME')
         targets = (*selectors, 'DEV_MONITOR_OWNER', 'DEV_MONITOR_SMTP_HOST',
                    'DEV_MONITOR_DB', 'AIRLOCK_DEV_MONITOR_BACKEND_PORT',
-                   'AIRLOCK_AGENT_BIN', 'HOME')
-        for field, selector in zip(('slack_webhook_urgent_env',), selectors):
+                   'AIRLOCK_AGENT_BIN', 'HOME', 'DEVMON_SLACK_CHANNEL')
+        for field, selector in zip(('slack_webhook_urgent_env', 'slack_bot_token_env'), selectors):
             for target in targets:
                 with self.subTest(field=field, target=target):
                     self.configure('urgent')
@@ -93,13 +92,12 @@ class SecretRegressionTest(unittest.TestCase):
                     # Direct render callers must refuse before emitting any bytes.
                     args = ['owner@example.test', 'synthetic-proxy', '/tmp/state', '/tmp',
                             'session', '', '', '', '', '', '', '', '', '']
-                    args[{'slack_webhook_urgent_env': 5, 'slack_webhook_routine_env': 6,
-                          'smtp_password_env': 13}[field]] = target
+                    args[5 if field == 'slack_webhook_urgent_env' else 8] = target
                     commands = [('render_dev_monitor_env', args)]
-                    if field == 'slack_webhook_urgent_env':
-                        commands.append(('render_dev_monitor_unit',
-                                         ['19923', 'true', 'Tailscale-User-Login', '', '/tmp/env',
-                                          'false', '24', '24', 'false', '', '', '', target]))
+                    unit_args = ['19923', 'true', 'Tailscale-User-Login', '', '/tmp/env',
+                                 'false', '24', '24', 'false', '', '', '', '', '', '']
+                    unit_args[12 if field == 'slack_webhook_urgent_env' else 14] = target
+                    commands.append(('render_dev_monitor_unit', unit_args))
                     for function, arguments in commands:
                         rendered = subprocess.run(
                             ['bash', '-c', '. "$1"; shift; "$@"', 'render', str(APP / 'render.sh'),
@@ -120,13 +118,99 @@ class SecretRegressionTest(unittest.TestCase):
                     # the startup guard cannot hide a missing resolver guard.
                     direct = subprocess.run([sys.executable, '-c',
                         'import runpy,os,sys; m=runpy.run_path(sys.argv[1]); '
-                        'os.environ[sys.argv[2]]=sys.argv[3]; m["_slack_webhooks"]()',
+                        'os.environ[sys.argv[2]]=sys.argv[3]; m["_slack_sender"]()',
                         str(APP / 'backend/airlock-dev-monitor.py'), selector, target],
                         env=self.env, capture_output=True, timeout=10)
                     if selector != 'DEVMON_SMTP_PASSWORD_NAME':
                         self.assertNotEqual(direct.returncode, 0)
                         self.assertIn(b'app control variable', direct.stderr)
-        print('COLLISION: 9 install/runtime refusals; direct env/unit render stdout=0', flush=True)
+        print('COLLISION: webhook/bot install/runtime refusals; direct env/unit render stdout=0', flush=True)
+
+    def test_ingest_assignment_name_only(self):
+        for assignment in ('', 'DEVMON_INGEST_TOKEN=\n',
+                           'DEVMON_INGEST_TOKEN=synthetic-ingest-token\n'):
+            with self.subTest(declared=bool(assignment)):
+                self.file.write_text('REGRESSION_HOOK=synthetic-hook\n' + assignment)
+                self.file.chmod(0o600)
+                result = subprocess.run(['bash', str(APP / 'install.sh')], env=self.env,
+                                        capture_output=True, timeout=45)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                generated = (self.root / 'render/files/dev-monitor.env').read_text()
+                selector = 'DEVMON_INGEST_TOKEN' if assignment else ''
+                self.assertIn('DEVMON_INGEST_TOKEN_NAME=' + selector + '\n', generated)
+                self.assertNotIn('synthetic-ingest-token', generated)
+                self.assertTrue((self.root / 'render/confd/servers.d/dev-monitor.conf').is_file())
+                package_info = subprocess.run([str(ROOT / 'bin/airlock-config'), 'package-info'],
+                                              env=self.env, capture_output=True, timeout=15)
+                self.assertEqual(package_info.returncode, 0, package_info.stderr.decode())
+                mapping = json.loads(package_info.stdout)['packages']['dev-monitor']['serve_mappings']
+                self.assertEqual(mapping['ingest_port'],
+                                 {'listen': 19926, 'mode': 'https', 'target': 19926})
+                if not assignment:
+                    self.assertIn(b'HTTP ingest disabled', result.stdout + result.stderr)
+
+    def test_bot_secret_file_and_rendered_names(self):
+        self.config.write_text(self.config.read_text() +
+                               'slack_bot_token_env="REGRESSION_BOT"\nslack_channel="C_TEST"\n')
+        self.file.write_text('REGRESSION_HOOK=synthetic-hook\nREGRESSION_BOT=synthetic-bot\n'
+                             'DEVMON_INGEST_TOKEN=synthetic-ingest\n')
+        self.file.chmod(0o600)
+        def install():
+            return subprocess.run(['bash', str(APP / 'install.sh')], env=self.env,
+                                  capture_output=True, timeout=45)
+        result = install()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        generated = (self.root / 'render/files/dev-monitor.env').read_text()
+        unit = (self.root / 'render/units/airlock-dev-monitor.service').read_text()
+        self.assertIn('DEVMON_SLACK_BOT_TOKEN_NAME=REGRESSION_BOT\n', generated)
+        self.assertIn('DEVMON_SLACK_CHANNEL="C_TEST"\n', generated)
+        self.assertIn('DEVMON_INGEST_TOKEN_NAME=DEVMON_INGEST_TOKEN\n', generated)
+        self.assertIn('Environment=DEVMON_SLACK_BOT_TOKEN_NAME=REGRESSION_BOT\n', unit)
+        self.assertIn('Environment="DEVMON_SLACK_CHANNEL=C_TEST"\n', unit)
+        for value in ('synthetic-hook', 'synthetic-bot', 'synthetic-ingest'):
+            self.assertNotIn(value, generated + unit + result.stdout.decode() + result.stderr.decode())
+        self.file.chmod(0o644)
+        self.assertNotEqual(install().returncode, 0)
+        self.file.chmod(0o600)
+        target = self.private / 'fixture.env'
+        self.file.rename(target)
+        self.file.symlink_to(target)
+        self.assertNotEqual(install().returncode, 0)
+        self.file.unlink()
+        self.file.write_text('REGRESSION_HOOK=synthetic-hook\n')
+        self.file.chmod(0o600)
+        self.assertNotEqual(install().returncode, 0)
+
+    def test_smoke_bot_settings_with_messages_on_and_off(self):
+        import io
+        from unittest.mock import patch
+        smoke = (APP / 'smoke.sh').read_text()
+        script = smoke.split("<<'DEVMON_DELIVERY_PY'\n")[1].split('\nDEVMON_DELIVERY_PY')[0]
+        self.config.write_text(self.config.read_text() +
+                               'slack_bot_token_env="CONFIG_BOT"\nslack_channel="C_CONFIG"\n')
+        # Run the real config-loading shell prelude: shell assignments alone do
+        # not reach the Python probe unless the smoke command exports them.
+        loaded = subprocess.run(['bash', '-c', smoke.split('code() {')[0] +
+                                 'python3 -c \'import os,json; print(json.dumps(dict(os.environ)))\'',
+                                 str(APP / 'smoke.sh')], env=self.env, capture_output=True, timeout=15)
+        self.assertEqual(loaded.returncode, 0, loaded.stderr.decode())
+        config_env = json.loads(loaded.stdout)
+        health = {'slack': 'configured', 'pending_count': 0, 'failed_count': 0, 'last_sent_at': None}
+        env_file = self.private / 'dev-monitor.env'
+        for content, expected_name, expected_channel in (
+                ('DEV_MONITOR_OWNER=owner@example.test\n', 'CONFIG_BOT', 'C_CONFIG'),
+                ('DEVMON_SLACK_BOT_TOKEN_NAME=INSTALLED_BOT\nDEVMON_SLACK_CHANNEL="C_INSTALLED"\n',
+                 'INSTALLED_BOT', 'C_INSTALLED')):
+            env_file.write_text(content)
+            with patch.dict(os.environ, config_env, clear=True), \
+                    patch.object(sys, 'argv', ['smoke', '19923', str(env_file),
+                                             str(APP / 'check-secrets.py'), str(self.file)]), \
+                    patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0)) as checker, \
+                    patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps(health).encode())):
+                exec(compile(script, str(APP / 'smoke.sh'), 'exec'), {})
+                command = checker.call_args.args[0]
+                self.assertEqual(command[command.index('--bot-selector') + 1], expected_name)
+                self.assertEqual(command[command.index('--channel') + 1], expected_channel)
 
     def test_control_inventory_and_shared_default(self):
         sys.path.insert(0, str(APP / 'backend'))
@@ -155,10 +239,13 @@ class SecretRegressionTest(unittest.TestCase):
         for line in (self.root / 'render/files/dev-monitor.env').read_text().splitlines():
             if line and not line.startswith('#'):
                 key, value = line.split('=', 1)
-                runtime[key] = value
+                runtime[key] = value.strip('"')
         probe = subprocess.run([sys.executable, '-c',
             'import runpy,sys; m=runpy.run_path(sys.argv[1]); '
-            'assert all(v == "https://hooks.example.test/synthetic" for v in m["_slack_webhooks"]().values()); '
+            'from unittest.mock import patch; '
+            '\nwith patch("devmon_slack.send") as send:\n'
+            ' m["_slack_sender"]()("hello"); '
+            'send.assert_called_once_with("https://hooks.example.test/synthetic", "hello")\n'
             'print("single webhook default resolved")', str(APP / 'backend/airlock-dev-monitor.py')],
             env=runtime, capture_output=True, timeout=10)
         self.assertEqual(probe.returncode, 0, probe.stderr.decode())
@@ -204,7 +291,7 @@ class SecretRegressionTest(unittest.TestCase):
                 for line in generated.read_text().splitlines():
                     if line and not line.startswith('#'):
                         key, value = line.split('=', 1)
-                        runtime[key] = value
+                        runtime[key] = value.strip('"')
                 state = self.home / '.local/state/airlock/dev-monitor'
                 for path, mode in ((state, 0o710), (state / 'spool', 0o710),
                                    *[(state / 'spool' / name, mode) for name, mode in
@@ -227,6 +314,8 @@ class SecretRegressionTest(unittest.TestCase):
                     # Run smoke even if scalar health is wrong, so both review findings reproduce.
                     nginx_config = self.root / 'nginx.conf'
                     fragment = self.root / 'render/confd/hub-locations.d/dev-monitor.conf'
+                    (self.root / 'monitor').mkdir(exist_ok=True)
+                    (self.root / 'monitor/index.html').write_text('scratch dashboard')
                     nginx_config.write_text(f'''daemon off;
 master_process off;
 pid {self.root}/nginx.pid;
@@ -238,9 +327,9 @@ http {{
  proxy_temp_path {self.root}/proxy;
  server {{
   listen 127.0.0.1:{self.hub_port};
+  root {self.root};
   if ($http_tailscale_user_login != "owner@example.test") {{ return 403; }}
   include {fragment};
-  location = /monitor/ {{ return 200 "scratch dashboard"; }}
   # Observation sampling is outside these message regressions.
   location = /monitor/api/cron/jobs {{ return 200 '{{"schemaVersion":3,"jobs":[],"counts":{{}},"sources":["scratch"]}}'; }}
  }}

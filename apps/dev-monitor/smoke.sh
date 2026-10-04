@@ -17,6 +17,8 @@ HUB="$AIRLOCK_HUB_NGINX_PORT"
 HDR="$AIRLOCK_IDENTITY_HEADER"
 OWNER="${AIRLOCK_OWNER%%,*}"
 want="${AIRLOCK_DEV_MONITOR_MESSAGES:-false}"
+# airlock_load sets shell variables; the delivery probe needs these metadata values.
+export AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT_ENV AIRLOCK_DEV_MONITOR_SLACK_BOT_TOKEN_ENV AIRLOCK_DEV_MONITOR_SLACK_CHANNEL
 
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$@"; }
 c_be=$(code                                    "http://127.0.0.1:${BACKEND}/api/overview")
@@ -158,18 +160,31 @@ fi
 # Configuration presence and the single outbox state, without credential output.
 delivery_result=$(python3 - "$BACKEND" "$HOME/.config/airlock/dev-monitor.env" "$HERE/check-secrets.py" "$HOME/.config/airlock/dev-monitor-secrets.env" 2>&1 <<'DEVMON_DELIVERY_PY'
 import json
+import os
 import sys
 import urllib.request
 import subprocess
+import shlex
 from pathlib import Path
 configured = {}
 if Path(sys.argv[2]).exists():
     for line in Path(sys.argv[2]).read_text().splitlines():
         key, separator, value = line.partition('=')
-        if separator: configured[key] = value.strip()
-selector = configured.get('DEVMON_SLACK_WEBHOOK_NAME', '')
-command = [sys.executable, sys.argv[3], '--file', sys.argv[4], '--lane', 'slack-urgent', '--selector', selector]
+        if separator:
+            parts = shlex.split(value)
+            configured[key] = parts[0] if parts else ''
+# With messages off the env file only carries the owner gate; the unit still
+# carries these settings from app config, just as health still reports presence.
+selector = configured.get('DEVMON_SLACK_WEBHOOK_NAME',
+                          os.environ.get('AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT_ENV', ''))
+bot_selector = configured.get('DEVMON_SLACK_BOT_TOKEN_NAME',
+                              os.environ.get('AIRLOCK_DEV_MONITOR_SLACK_BOT_TOKEN_ENV', ''))
+channel = configured.get('DEVMON_SLACK_CHANNEL', os.environ.get('AIRLOCK_DEV_MONITOR_SLACK_CHANNEL', ''))
+command = [sys.executable, sys.argv[3], '--file', sys.argv[4], '--allow', 'DEVMON_INGEST_TOKEN',
+           '--lane', 'slack-urgent', '--selector', selector,
+           '--bot-selector', bot_selector, '--channel', channel]
 if selector: command += ['--allow', selector]
+if bot_selector: command += ['--allow', bot_selector]
 result = subprocess.run(command, capture_output=True)
 assert result.returncode in (0, 1), 'cannot check app-only credential configuration'
 with urllib.request.urlopen('http://127.0.0.1:%s/api/health' % sys.argv[1], timeout=6) as response:

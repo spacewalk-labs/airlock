@@ -94,6 +94,80 @@ def _usage(token):
             "reset5h": fh.get("resets_at"), "reset7d": sd.get("resets_at")}
 
 
+SESSION_USAGE_CACHE = os.path.join(
+    os.environ.get("AIRLOCK_STATE_DIR") or os.path.join(HOME, ".local", "state", "airlock"),
+    "accounts", "claude-session-usage.json")
+SESSION_USAGE_TTL = 150     # s — callers poll every 60s (/acct-alert) to 180s (fleet)
+SESSION_USAGE_TIMEOUT = 15  # s — a turn measured 5s; the gate gives the whole probe 25s
+
+
+def _session_usage():
+    """The live account's 5h/7d as a Claude Code turn reports them, or None.
+
+    The usage endpoint's budget is per account and every Claude Code session on that
+    account spends it, so on a busy box the live account gets nothing but 429: 129 min
+    (2026-09-28) and 105 min (2026-09-29) of stale numbers until the account hit its
+    limit. A turn is not throttled that way and its stream-json carries the same windows
+    in `rate_limit_event.rate_limit_info.unifiedWindows`. Live only — it runs on the live
+    login, which Claude Code already refreshes; a pool slot's lineage belongs to us."""
+    try:
+        with open(SESSION_USAGE_CACHE) as f:
+            cached = json.load(f)
+        if (time.time() - cached["at"] < SESSION_USAGE_TTL
+                and cached["live_mtime"] == os.path.getmtime(LIVE)):
+            return cached["usage"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    exe = bin_discovery.find_bin("claude")[0]
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, "-p", ".", "--model", "haiku", "--no-session-persistence",
+             "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands",
+             "--output-format", "stream-json", "--verbose"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cwd="/tmp", timeout=SESSION_USAGE_TIMEOUT, check=False,
+            # An API key or token in the environment wins over the login: the turn is
+            # then billed to that key and reports no windows (a login shell with
+            # ANTHROPIC_API_KEY, measured 2026-09-29). The live login is what we report.
+            env={k: v for k, v in os.environ.items() if k not in (
+                "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    windows = None
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "rate_limit_event":
+            windows = (event.get("rate_limit_info") or {}).get("unifiedWindows")
+    if not isinstance(windows, dict):
+        return None
+
+    def window(name):
+        w = windows.get(name) or {}
+        pct = round(w["utilization"] * 100) if isinstance(w.get("utilization"), (int, float)) else None
+        at = w.get("resetsAt")
+        reset = (datetime.datetime.fromtimestamp(at, datetime.timezone.utc).isoformat()
+                 if isinstance(at, (int, float)) else None)
+        return pct, reset
+    use5h, reset5h = window("five_hour")
+    use7d, reset7d = window("seven_day")
+    if use5h is None and use7d is None:
+        return None
+    usage = {"use5h": use5h, "use7d": use7d, "reset5h": reset5h, "reset7d": reset7d}
+    try:
+        os.makedirs(os.path.dirname(SESSION_USAGE_CACHE), exist_ok=True)
+        with open(SESSION_USAGE_CACHE, "w") as f:
+            json.dump({"at": time.time(), "live_mtime": os.path.getmtime(LIVE),
+                       "usage": usage}, f)
+    except OSError:
+        pass
+    return usage
+
+
 def _oauth(d):
     return d.get("claudeAiOauth") or d
 
@@ -180,6 +254,8 @@ def _describe(path, with_usage=False, is_live=True, allow_refresh=True):
     if with_usage:
         # queried with this box's own token: only numbers leave, never the token.
         out["usage"] = _usage(tok)
+        if is_live and out["usage"].get("err") == "http-429":
+            out["usage"] = _session_usage() or out["usage"]
     return out
 
 

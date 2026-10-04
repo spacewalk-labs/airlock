@@ -16,6 +16,27 @@ the separate policy and implementation that would make `plaintext-redirect` gran
 sections below keep the reasoning as it was written and mark where the tree has since moved
 past it.
 
+**Retired 2026-09-27** (`docs/reports/2026-09-27_installer-gate-zero-base-revival.md`, family
+(a)): the digest lock itself — `airlock.lock`, TOFU recording, `--approve-json`,
+`--dangerously-admit-unverified`/break-glass, `lock-finalize`, and the ledger's
+`package-lock-override` audit event. It was admission control, not containment
+(`SECURITY.md`, Package trust), and caused more install failures in two weeks than it ever
+prevented; git already gives tree integrity for a package staged locally. `grant` and the
+`[packages.X]` ABI-2 surface and `_bundle_admission`
+were unaffected at that time — this removed only the unsigned explicit-package tree-digest lock described
+below. Every mention of the lock below is history, not current behavior.
+
+**2026-10 runtime revision (P3_ENGINE).** The `[packages.X] path/grant` ABI
+surface is now ignored. Organisation-managed release channels and their signed
+release tools have also been retired. Source selection is explicit `apply --source` or the
+installed row, as documented in
+[`skills/airlock-ledger/SKILL.md`](../../skills/airlock-ledger/SKILL.md).
+The earlier paragraphs' statement that the config grant surface is unaffected
+records the 2026-09 state. All config-grant, path-shadow and lock examples below
+are historical, not current install instructions. Manifest capability requests,
+canonical bundle identity and `_bundle_admission` remain the implementation's
+admission inputs; selecting an external source does not grant bundle certification.
+
 Supersedes nothing. It extends the app package contract
 ([`app-package-contract.md`](app-package-contract.md)) at exactly one point: what decides
 which privileged capabilities a package may use. D1 (packages are local paths), D4 (trust is
@@ -236,7 +257,9 @@ the ordering in §5 — and the two landed in the same change.
   speculative plan. #119 wrote the distinction into the code: `dry-run-exec` is a member of
   `BUNDLE_CERTIFICATIONS` in `bin/airlock-config`, a set disjoint from `GRANTABLE_CAPABILITIES`,
   and `_dry_certified` now reads the derived certification out of package-info instead of
-  re-deciding by origin.
+  re-deciding by origin. The installer uses it only for existing installed-state
+  previews; a first bootstrap dry validates inputs and displays the plan and
+  projection without executing app hooks.
 - strict config-read lint (the `AIRLOCK_STRICT_CONFIG_SCAN` gate in `cmd_validate` in
   `bin/airlock-config`) — CI on our own code. It is the other member of `BUNDLE_CERTIFICATIONS`,
   as `strict-config-scan`.
@@ -364,5 +387,5 @@ would persist into later invocations and silently make the exception ambient.
 | Adding manifest keys / bumping `contract` | The surface is operator config, not the package manifest. The config ABI bump is real and separate (§7) |
 | Caching verification results between processes | A second source of truth for a fact that is cheap to recompute |
 | Transport metadata (URLs) in the ledger "for display" | An unverifiable field produces false confidence |
-| Promoting a package to `shipped` by placing it under `apps/` | Third-party `install.sh` would then execute during dry run (the `_dry_certified` branch in `install/airlock-install.sh`). Since #119 it does not get that far: `_assert_bundle_policy_parity` refuses any directory under `apps/` with no reviewed entitlement-table entry |
+| Promoting a package to `shipped` by placing it under `apps/` | Third-party `install.sh` would then execute during an existing installed-state dry run (the `_dry_certified` branch in `install/airlock-install.sh`). Since #119 it does not get that far: `_assert_bundle_policy_parity` refuses any directory under `apps/` with no reviewed entitlement-table entry |
 | Splitting the shared goldens per app so new apps can land in parallel | Treats the symptom. Keeping new apps out of `apps/` removes the cause |

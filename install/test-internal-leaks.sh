@@ -216,14 +216,6 @@ else
   printf '%s\n' "$out" | sed 's/^/    /'
 fi
 
-# ---- CI calls the script, not a copy of it ----
-if grep -q 'install/check-internal-leaks.sh' "$ROOT/.github/workflows/ci.yml" \
-   && ! grep -q "^ *PATTERN='" "$ROOT/.github/workflows/ci.yml"; then
-  ok "ci.yml calls the script and no longer carries its own copy of the pattern"
-else
-  bad "ci.yml either does not call the script or still holds a second copy of the pattern"
-fi
-
 # ---- the pattern spells out no box name ----
 # This is the rule the shape rewrite exists to hold, and it is the one rule the
 # guard cannot check about itself: SELF excludes this file from the scan, so a

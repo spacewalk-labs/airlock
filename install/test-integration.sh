@@ -2,15 +2,8 @@
 # Integration: run the REAL orchestrator (dry) to install all enabled separate-port
 # apps, then render the full nginx site and validate with `nginx -t`. No live services.
 set -uo pipefail
-# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: the share is 15/16 of the
-# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
-# whichever the runner happened to have. install/test-render-parity.sh gates that every
-# suite running a real app installer sets this — the gate does not reason about WHICH
-# app a dynamic path resolves to, so suites that only run other apps carry it too; the
-# seam is inert for them. (An intermediate design REFUSED below 8 GiB, which is what
-# made this urgent. The refusal is gone — owner, 2026-08-17 — the pin is still right.)
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+. "$(dirname "$0")/test-lib.sh"
+airlock_pin_paseo_mem
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 TMP="$(mktemp -d /tmp/airlock-integration.XXXXXX)" || { echo "FAIL could not create test directory" >&2; exit 1; }
@@ -18,11 +11,8 @@ trap 'rm -rf "$TMP"' EXIT
 export AIRLOCK_STATE_DIR="$TMP/state"   # isolate the installed-state ledger from the dev box
 # Every real-orchestrator probe stays out of the production self-kill escape,
 # even when this suite is invoked directly by a developer.
-printf 'fixture scope\n' >"$TMP/cgroup"
-export AIRLOCK_SELFKILL_CGROUP_FILE="$TMP/cgroup"
-pass=0 fail=0
-ok(){ printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad(){ printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_neutral_selfkill_cgroup "$TMP"
+airlock_test_counters_init
 
 cat >"$TMP/airlock.toml" <<'TOML'
 [auth]

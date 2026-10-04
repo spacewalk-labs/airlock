@@ -12,13 +12,12 @@
 # CI only ever ran the tree mode, so neither was going to be caught here. This file runs
 # both, over the same tree, and asserts they say the same thing.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCAN="$ROOT/install/check-internal-leaks.sh"
 MANIFEST="$ROOT/install/public-manifest.sh"
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 export_tree() { local d; d=$(mktemp -d); git -C "$ROOT" archive HEAD | tar -x -C "$d"; printf '%s' "$d"; }
 

@@ -77,6 +77,10 @@ def main(argv):
     installer = open(os.path.join(root, "apps/publish/install.sh"), encoding="utf-8").read()
     page = open(os.path.join(root, "apps/publish/frontend/publish.html"),
                 encoding="utf-8").read()
+    listing_css = open(os.path.join(root, "hub/assets/publish-index.css"),
+                       encoding="utf-8").read()
+    listing_js = open(os.path.join(root, "hub/assets/publish-index.js"),
+                      encoding="utf-8").read()
 
     # --- 1. the hub's document surface ------------------------------------
     files = block(render, "location /publish/files/")
@@ -134,6 +138,19 @@ def main(argv):
         check("하위 문서 번들의 index.html 동작은 막지 않는다",
               ordinary_docs is not None
               and ".airlock-live-directory-index" not in ordinary_docs)
+        check("실시간 루트 목록에 Airlock 토큰과 목록 UI를 주입한다",
+              root_listing is not None
+              and 'href="/airlock-tokens.css"' in root_listing
+              and 'href="/airlock-index.css"' in root_listing
+              and 'src="/airlock-index.js"' in root_listing)
+        check("전용 포트가 목록 UI 자산을 정확한 경로에서 서빙한다",
+              "location = /airlock-tokens.css" in body
+              and "location = /airlock-index.css" in body
+              and "location = /airlock-index.js" in body)
+        check("목록 UI는 공용 디자인 토큰만 읽고 원본 autoindex를 fallback으로 둔다",
+              "var(--airlock-" in listing_css
+              and "body > pre" in listing_js
+              and "source.innerHTML" in listing_js)
 
     # --- 4. the duplicate must not come back ------------------------------
     dup = os.path.join(root, "apps/publish/frontend/doc-nav.js")

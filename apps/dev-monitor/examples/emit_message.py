@@ -72,10 +72,14 @@ def main():
     ap.add_argument('--level', '--urgency', dest='level', choices=('urgent', 'normal'), default='normal')
     ap.add_argument('--title', required=True)
     ap.add_argument('--body', default='')
+    ap.add_argument('--resolves', help='explicit group to resolve')
+    ap.add_argument('--detail', help='original source text, console only')
     ap.add_argument('--event-id', default=None)
     ap.add_argument('--cwd')
     ap.add_argument('--prompt')
     ap.add_argument('--url', help='http(s) link')
+    ap.add_argument('--peek', action='store_true',
+                    help="also show this card in Porthole's Peek bubble (default: inbox only)")
     a = ap.parse_args()
     if not a.spool:
         sys.exit('DEV_MONITOR_SPOOL is not set (or use --spool)')
@@ -88,6 +92,14 @@ def main():
         'source': a.source, 'level': a.level,
         'title': a.title, 'body': a.body,
     }
+    # Only send the key when it is asked for: an older backend rejects unknown fields,
+    # and "inbox only" is exactly what omitting it has always meant.
+    if a.resolves is not None:
+        payload['resolves'] = a.resolves
+    if a.detail is not None:
+        payload['detail'] = a.detail
+    if a.peek:
+        payload['peek'] = True
     if a.cwd or a.prompt:
         if not a.cwd or not a.prompt:
             sys.exit('run requires --cwd and --prompt')

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test-student-harness.sh — the GUI installer's pinned, user-home harness contract.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -8,9 +9,7 @@ INSTALL="$HERE/install-student-harness.py"
 HARNESS="$ROOT/docker/student-harness"
 STARTER="$ROOT/docker/project-starter"
 SCAN="$HERE/check-internal-leaks.sh"
-pass=0 fail=0
-ok() { printf 'ok   student-harness: %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL student-harness: %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init "student-harness: "
 
 scratch="$(mktemp -d)" || exit 2
 trap 'rm -rf "$scratch"' EXIT

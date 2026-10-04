@@ -10,17 +10,22 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'backend'))
 from devmon_secret_names import validate_names
 from devmon_secrets import resolve, SLACK_CONFIG
+from devmon_slack import make_sender
 from devmon_secret_file import inspect_file
 
 
-def check_loaded(names, marker, lane=None, selector=''):
+def check_loaded(names, marker, lane=None, selector='', bot_selector='', channel=''):
     if lane:
-        return bool(resolve(os.environ, selector, SLACK_CONFIG[lane][1], marker=marker))
+        env = {key: value for key, value in os.environ.items() if value != marker}
+        env.update(DEVMON_SLACK_WEBHOOK_NAME=selector,
+                   DEVMON_SLACK_BOT_TOKEN_NAME=bot_selector, DEVMON_SLACK_CHANNEL=channel)
+        return make_sender(env) is not None
     return all(resolve(os.environ, name, marker=marker) for name in names)
 
 
-def check_file(path, names, lane=None, selector='', allowed=(), static=False):
-    selected = tuple(allowed) + tuple(names) + ((selector.strip(),) if lane else ())
+def check_file(path, names, lane=None, selector='', allowed=(), static=False,
+               bot_selector='', channel=''):
+    selected = tuple(allowed) + tuple(names) + ((selector.strip(), bot_selector.strip()) if lane else ())
     validate_names(*selected)
     try:
         declared = inspect_file(path, selected)
@@ -33,6 +38,8 @@ def check_file(path, names, lane=None, selector='', allowed=(), static=False):
     if lane:
         selector = selector.strip()
         names = [selector] if selector else list(SLACK_CONFIG[lane][1])
+        if bot_selector.strip():
+            names.append(bot_selector.strip())
     unit = 'airlock-devmon-secret-check-' + secrets.token_hex(12) + '.service'
     marker = 'devmon-unset-' + secrets.token_hex(24)
     # EnvironmentFile overrides these markers. Without them an absent assignment
@@ -44,7 +51,8 @@ def check_file(path, names, lane=None, selector='', allowed=(), static=False):
         command += ['-p', 'Environment=' + name + '=' + marker]
     command += [sys.executable, str(Path(__file__).resolve()), '--loaded', '--marker', marker]
     if lane:
-        command += ['--lane', lane, '--selector', selector]
+        command += ['--lane', lane, '--selector', selector,
+                    '--bot-selector', bot_selector, '--channel', channel]
     command += names
     try:
         return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -71,13 +79,17 @@ def main():
     parser.add_argument('--marker')
     parser.add_argument('--lane', choices=tuple(SLACK_CONFIG))
     parser.add_argument('--selector', default='')
+    parser.add_argument('--bot-selector', default='')
+    parser.add_argument('--channel', default='')
     parser.add_argument('names', nargs='*')
     args = parser.parse_args()
     try:
         validate_names(*args.names)
         if args.loaded:
-            return 0 if args.marker and check_loaded(args.names, args.marker, args.lane, args.selector) else 1
-        return 0 if args.file and check_file(args.file, args.names, args.lane, args.selector, args.allow, args.static) else 1
+            return 0 if args.marker and check_loaded(args.names, args.marker, args.lane,
+                                                    args.selector, args.bot_selector, args.channel) else 1
+        return 0 if args.file and check_file(args.file, args.names, args.lane, args.selector,
+                                           args.allow, args.static, args.bot_selector, args.channel) else 1
     except ValueError:
         return 2
     except Exception:

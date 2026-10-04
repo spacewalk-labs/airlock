@@ -19,8 +19,8 @@ airlock-token-freshness-failed.service     loaded    inactive   dead          ai
 airlock-token-freshness.service            loaded    inactive   dead          airlock — check how long the provider credentials on this box have left
 claude-fleet-usage.service                 loaded    activating start   start claude-fleet 사용량 수집 — 계정별 순차(1초 스태거) → 중앙 기록
 dbus.service                               loaded    active     running       D-Bus User Message Bus
-devhub-vault-sync-failed@josh-note.service loaded    inactive   dead          vault josh-note 동기화 정지 알림
-devhub-vault-sync@josh-note.service        loaded    inactive   dead          vault josh-note 양방향 동기화 (이 박스 <-> origin)
+devhub-vault-sync-failed@example-vault.service loaded    inactive   dead          vault example-vault 동기화 정지 알림
+devhub-vault-sync@example-vault.service        loaded    inactive   dead          vault example-vault 양방향 동기화 (이 박스 <-> origin)
 dirmngr.service                            loaded    inactive   dead          GnuPG network certificate management daemon
 docker.service                             not-found inactive   dead          docker.service
 gpg-agent.service                          loaded    active     running       GnuPG cryptographic agent and passphrase cache

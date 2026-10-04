@@ -51,6 +51,8 @@ PEER = "peer-box"
 MINE = "op://example-vault/muse-spark-example-1/password"
 HELD = "op://example-vault/muse-spark-example-2/password"
 FREE = "op://example-vault/muse-spark-example-9/password"
+# A shared-pool key: no box holds it exclusively, every box may offer it.
+SHARED = "op://example-vault/muse-spark-example-7/password"
 
 
 def scenario_held_key():
@@ -80,6 +82,13 @@ def scenario_held_key():
     check("held-key: assigning an unheld key succeeds",
           ok is True and sheet.get(FREE) == WRITER, (ok, reason))
 
+    # A shared-pool key enters under "shared" and stays a valid sheet.
+    ok, reason = registry.assign(sheet, SHARED, "shared", writer=WRITER,
+                                 allowed_writer=WRITER)
+    check("held-key: assigning an unheld key to the shared pool succeeds",
+          ok is True and sheet.get(SHARED) == "shared"
+          and registry.is_valid(sheet) is True, (ok, reason, sheet))
+
     # The validator rejects anything but the mapping: values, nesting, bad names.
     # A real key value is always longer than a hostname can be (DNS label limit 63),
     # so the value slot cannot carry one; a hostname-shaped string is by shape alone
@@ -92,6 +101,11 @@ def scenario_held_key():
           registry.is_valid({MINE: {"box": WRITER}}) is False)
     check("shape: non-op:// keys are rejected",
           registry.is_valid({"muse-spark-1": WRITER}) is False)
+    check("shape: bare helper names are allowed (value-free reference shape)",
+          registry.is_valid({"OPENCODE_APPS_API_KEY": "shared"}) is True)
+    check("shape: near-miss helper names are rejected",
+          registry.is_valid({"OPENCODE_APPS_API_KEY ": "shared"}) is False
+          and registry.is_valid({"opencode_apps_api_key": "shared"}) is False)
     check("shape: bad box names are rejected",
           registry.is_valid({MINE: "not a box!"}) is False)
     check("shape: a list is not a sheet", registry.is_valid([]) is False)

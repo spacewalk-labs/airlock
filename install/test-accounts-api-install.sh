@@ -11,10 +11,9 @@
 # CI went red in two jobs for a reason that had nothing to do with the service itself.
 # T4/T5 below are that defect, turned into checks.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
 
-# Names a real app installer in its text (via the orchestrator check below), so
-# render-parity's paseo RAM pin gate counts this suite. Pinning keeps it host-independent.
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+airlock_pin_paseo_mem
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)" || exit 1
@@ -26,9 +25,7 @@ mkdir -p "$HOME_DIR" "$BIN_DIR"
 CFG="$TMP/airlock.toml"
 printf '[auth]\nprovider = "tailscale"\nowner = "owner@fixture.dev"\n[apps.hub]\n' > "$CFG"
 
-pass=0 fail=0
-ok() { printf 'ok   %s\n' "$1"; pass=$((pass + 1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail + 1)); }
+airlock_test_counters_init
 
 # The shim answers is-active with whatever the test puts in $TMP/is-active.
 mk_shim() {
@@ -275,35 +272,50 @@ grep -q 'enable --now' "$LOG" \
   && bad "T12 uninstall re-enabled the service it was removing" \
   || ok "T12 uninstall leaves no enable behind"
 
-# ---- T13: handed-in Muse readers reach the unit; absent ones stay empty ----
-# Reader paths and the brokered address arrive box-locally (vault and tool
-# names do not ship), so the helper renders exactly what it was handed — but
+# ---- T13: the handed-in Muse reader reaches the unit; an absent one stays empty ----
+# The reader path arrives box-locally (vault and tool names do not ship), so
+# the helper renders exactly what it was handed — but
 # only for readers that actually execute. A handed-in path to nothing must
 # leave the route disabled, not enabled-looking and empty.
 printf '#!/bin/sh\nexit 0\n' > "$BIN_DIR/team-reader"; chmod 0755 "$BIN_DIR/team-reader"
-printf '#!/bin/sh\nexit 0\n' > "$BIN_DIR/broker"; chmod 0755 "$BIN_DIR/broker"
 rm -f "$unit"
 if env HOME="$HOME_DIR" PATH="$BIN_DIR:$PATH" AIRLOCK_SYSTEMCTL_LOG="$LOG" \
        AIRLOCK_SHIM_STATE="$TMP" AIRLOCK_CONFIG="$TMP/broken.toml" AIRLOCK_ROOT="$ROOT" \
        AIRLOCK_HUB_ACCOUNTS_PORT=19904 \
-       AIRLOCK_MUSE_SECRET_BIN="$BIN_DIR/team-reader" AIRLOCK_MUSE_CHO_BIN="$BIN_DIR/broker" \
-       AIRLOCK_MUSE_CHO_REF='op://fixture-vault/OPENCODE_MU_B_API_KEY/password' \
+       AIRLOCK_MUSE_SECRET_BIN="$BIN_DIR/team-reader" \
        bash "$ROOT/install/airlock-accounts-api.sh" install >"$TMP/out13" 2>&1; then
   wired=1
   grep -qxF "Environment=AIRLOCK_MUSE_KEYS_BIN=$ROOT/bin/airlock-muse-keys" "$unit" || wired=0
   grep -qxF "Environment=AIRLOCK_MUSE_SECRET_BIN=$BIN_DIR/team-reader" "$unit" || wired=0
-  grep -qxF "Environment=AIRLOCK_MUSE_CHO_BIN=$BIN_DIR/broker" "$unit" || wired=0
-  grep -qxF 'Environment=AIRLOCK_MUSE_CHO_REF=op://fixture-vault/OPENCODE_MU_B_API_KEY/password' "$unit" || wired=0
-  [ "$wired" = 1 ] && ok "T13 handed-in Muse readers reach the unit verbatim" \
+  [ "$wired" = 1 ] && ok "T13 the handed-in Muse reader reaches the unit verbatim" \
     || bad "T13 Muse wiring wrong: $(grep MUSE "$unit" || echo none)"
 else
   bad "T13 install with handed-in readers failed: $(tail -2 "$TMP/out13")"
+fi
+# The same readers from the box's own [apps.hub] muse_* keys (what `airlock-config
+# env hub` hands a full install) — no AIRLOCK_MUSE_* at all. 2026-09-25: a full
+# install that was handed nothing rewrote the unit empty and the picker turned off.
+rm -f "$unit"
+if env HOME="$HOME_DIR" PATH="$BIN_DIR:$PATH" AIRLOCK_SYSTEMCTL_LOG="$LOG" \
+       AIRLOCK_SHIM_STATE="$TMP" AIRLOCK_CONFIG="$TMP/broken.toml" AIRLOCK_ROOT="$ROOT" \
+       AIRLOCK_HUB_ACCOUNTS_PORT=19904 \
+       AIRLOCK_HUB_MUSE_SECRET_BIN="$BIN_DIR/team-reader" \
+       AIRLOCK_HUB_MUSE_REGISTRY='https://sheet.example.test/fleet/registry.json' \
+       bash "$ROOT/install/airlock-accounts-api.sh" install >"$TMP/out13c" 2>&1; then
+  kept=1
+  grep -qxF "Environment=AIRLOCK_MUSE_KEYS_BIN=$ROOT/bin/airlock-muse-keys" "$unit" || kept=0
+  grep -qxF "Environment=AIRLOCK_MUSE_SECRET_BIN=$BIN_DIR/team-reader" "$unit" || kept=0
+  grep -qxF 'Environment=AIRLOCK_MUSE_REGISTRY=https://sheet.example.test/fleet/registry.json' "$unit" || kept=0
+  [ "$kept" = 1 ] && ok "T13 box config muse_* keys reach the unit when nothing is handed in" \
+    || bad "T13 box config Muse keys lost: $(grep MUSE "$unit" || echo none)"
+else
+  bad "T13 install from box config failed: $(tail -2 "$TMP/out13c")"
 fi
 rm -f "$unit"
 if env HOME="$HOME_DIR" PATH="$BIN_DIR:$PATH" AIRLOCK_SYSTEMCTL_LOG="$LOG" \
        AIRLOCK_SHIM_STATE="$TMP" AIRLOCK_CONFIG="$TMP/broken.toml" AIRLOCK_ROOT="$ROOT" \
        AIRLOCK_HUB_ACCOUNTS_PORT=19904 \
-       AIRLOCK_MUSE_SECRET_BIN=/definitely/missing AIRLOCK_MUSE_CHO_BIN=/also/missing \
+       AIRLOCK_MUSE_SECRET_BIN=/definitely/missing \
        bash "$ROOT/install/airlock-accounts-api.sh" install >"$TMP/out13b" 2>&1; then
   grep -qxF 'Environment=AIRLOCK_MUSE_KEYS_BIN=' "$unit" \
     && ok "T13 missing readers leave the route disabled, not enabled-empty" \
@@ -319,6 +331,32 @@ if run install >/dev/null 2>&1; then
 else
   bad "T13 baseline reinstall failed"
 fi
+
+# ---- T14: agy found where its installer puts it, ~/.gemini/bin included ----
+# Boxes with only ~/.gemini/bin/agy rendered it empty and
+# their agy rows stayed off (2026-09-26).
+mkdir -p "$HOME_DIR/.gemini/bin"
+printf '#!/bin/sh\nexit 0\n' > "$HOME_DIR/.gemini/bin/agy"; chmod 0755 "$HOME_DIR/.gemini/bin/agy"
+rm -f "$unit"
+if run install >/dev/null 2>&1; then
+  grep -qxF "Environment=AIRLOCK_AGY_BIN=$HOME_DIR/.gemini/bin/agy" "$unit" \
+    && ok "T14 agy in ~/.gemini/bin reaches the unit" \
+    || bad "T14 agy not found: $(grep AGY_BIN "$unit" || echo none)"
+else
+  bad "T14 install with ~/.gemini/bin/agy failed"
+fi
+rm -f "$HOME_DIR/.gemini/bin/agy"
+
+# ---- T15: the full installer hands the box's muse_* keys to this helper ----
+# It passes hub settings one by one; missing these rendered the unit empty on every
+# full or scoped install and the next restart turned the Muse picker off (2026-09-26).
+call="$(awk '/installing platform account surface/,/airlock-accounts-api.sh" install/' "$ROOT/install/airlock-install.sh")"
+missing=""
+for k in MUSE_SECRET_BIN MUSE_REGISTRY; do
+  printf '%s' "$call" | grep -q "AIRLOCK_HUB_${k}=" || missing="$missing $k"
+done
+[ -z "$missing" ] && ok "T15 the full installer passes every muse_* key" \
+  || bad "T15 the full installer drops:$missing"
 
 printf '\npassed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

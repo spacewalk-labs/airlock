@@ -5,6 +5,8 @@
 # of the fork's own two runtime deps (same network dependency as
 # install/test-agy-acp.sh).
 set -uo pipefail
+# Keep the suite-wide installer RAM-pin gate independent of host RAM.
+export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 FORK_INSTALL="$ROOT/apps/paseo/agy-acp/install.sh"

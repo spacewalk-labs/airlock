@@ -11,8 +11,8 @@ AIRLOCK_PREFLIGHT_SBIN_DIRS="/usr/local/sbin /usr/sbin /sbin"
 airlock_find_cmd() {
   local hit d base
   # `type -P` admits executable files from PATH, not ambient shell functions or
-  # aliases. A prerequisite receipt must name something a fresh lifecycle child
-  # can execute too.
+  # aliases: a resolved prerequisite must name something a fresh lifecycle
+  # child can execute too.
   if hit="$(type -P "$1" 2>/dev/null)"; then
     case "$hit" in
       /*) ;;
@@ -38,74 +38,7 @@ airlock_find_cmd() {
 # shared. There is deliberately no second implementation behind this name.
 airlock_preflight_find() { airlock_find_cmd "$@"; }
 
-airlock_prerequisite_receipt_lookup() {
-  local name="${1:?}" file="${AIRLOCK_PREREQ_RECEIPT:-}" row_cmd row_path predicate expected owners
-  [ -n "$file" ] && [ -r "$file" ] || return 1
-  while IFS=$'\t' read -r row_cmd row_path predicate expected owners; do
-    case "$row_cmd" in ''|\#*) continue ;; esac
-    if [ "$row_cmd" = "$name" ]; then
-      printf '%s\t%s\t%s\t%s\n' "$row_path" "$predicate" "$expected" "$owners"
-      return 0
-    fi
-  done < "$file"
-  return 1
-}
-
-airlock_prerequisite_path_is_current() {
-  local name="${1:?}" recorded="${2:?}" current=""
-  current="$(airlock_find_cmd "$name")" || return 1
-  [ "$current" = "$recorded" ] && [ -x "$recorded" ]
-}
-
-airlock_verify_prerequisite_receipt() {
-  local file="${AIRLOCK_PREREQ_RECEIPT:-}" row_cmd row_path predicate expected owners
-  local count=0 version="" context_seen=0 line=""
-  [ -n "$file" ] && [ -r "$file" ] || {
-    log "prerequisite receipt is missing or unreadable: ${file:-<unset>}"
-    return 2
-  }
-  while IFS= read -r line; do
-    case "$line" in
-      '# context='*)
-        [ "$line" = "# context=${AIRLOCK_PREREQ_CONTEXT:-standalone}" ] || {
-          log "prerequisite receipt belongs to a different install candidate"
-          return 1
-        }
-        context_seen=1
-        continue ;;
-    esac
-    IFS=$'\t' read -r row_cmd row_path predicate expected owners <<< "$line"
-    case "$row_cmd" in ''|\#*) continue ;; esac
-    count=$((count + 1))
-    airlock_prerequisite_path_is_current "$row_cmd" "$row_path" || {
-      log "prerequisite changed after preflight: $row_cmd (was $row_path)"
-      return 1
-    }
-    if [ "$predicate" = major-gte ]; then
-      version="$("$row_path" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || version=""
-      if [ "$row_cmd" != python3 ]; then
-        version="$("$row_path" -p 'process.versions.node.split(".")[0]' 2>/dev/null)" || version=""
-      fi
-      [[ "$version" =~ ^[0-9]+([.][0-9]+)?$ ]] || version=""
-      airlock_preflight_version_ge "${version:-0}" "$expected" || {
-        log "prerequisite version changed after preflight: $row_cmd (found ${version:-unknown}, need $expected)"
-        return 1
-      }
-    fi
-  done < "$file"
-  [ "$context_seen" = 1 ] || { log "prerequisite receipt has no candidate context"; return 2; }
-  [ "$count" -gt 0 ] || { log "prerequisite receipt contains no commands: $file"; return 2; }
-}
-
 airlock_load_nvm() {
-  # An orchestrated lifecycle must keep the exact runtime preflight recorded.
-  # Re-sourcing nvm here can replace an approved system node with a different
-  # nvm node; require_cmd then correctly rejects our own path change as drift.
-  # Direct app invocation has no receipt authority and retains nvm discovery.
-  if [ -n "${AIRLOCK_INSTALL_PKG_INFO_SHA256:-}" ] \
-    && [ -n "${AIRLOCK_PREREQ_RECEIPT:-}" ]; then
-    return 0
-  fi
   if [ -s "$HOME/.nvm/nvm.sh" ]; then
     # shellcheck source=/dev/null
     . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 || true
@@ -194,21 +127,12 @@ airlock_preflight_userns_root_host_uid() {
 }
 
 airlock_preflight_bootstrap() {
-  local py version
+  local py
   py="$(airlock_preflight_find python3)" || py=""
   if [ -z "$py" ]; then
     airlock_preflight_table_header
     printf '%-14s %-28s %-15s %-42s %s\n' \
       "python3 >=3.11" "-" "missing" \
-      "sudo apt-get update && sudo apt-get install -y python3" "core"
-    return 1
-  fi
-  version="$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || version=""
-  [[ "$version" =~ ^[0-9]{1,6}[.][0-9]{1,6}$ ]] || version=""
-  if ! airlock_preflight_version_ge "${version:-0}" 3.11; then
-    airlock_preflight_table_header
-    printf '%-14s %-28s %-15s %-42s %s\n' \
-      "python3 >=3.11" "${version:-$py}" "wrong-version" \
       "sudo apt-get update && sudo apt-get install -y python3" "core"
     return 1
   fi
@@ -271,64 +195,13 @@ airlock_preflight() {
     decl_name="airlock-config prereqs"
   fi
 
-  local declaration_count=0
-  local row_key
-  local -A predicates=() expecteds=() fixes=() owners=() seen_rows=() all_fixes=() resolved_paths=()
+  local -A predicates=() expecteds=() fixes=() owners=()
   while IFS= read -r declaration_line || [ -n "$declaration_line" ]; do
     line_no=$((line_no + 1))
     case "$declaration_line" in ""|\#*) continue ;; esac
-    # Bash treats tab as IFS whitespace and collapses adjacent delimiters. Reject
-    # empty fields before splitting so a missing remediation cannot shift the
-    # following columns left and masquerade as a complete declaration.
-    case "$declaration_line" in
-      $'\t'*|*$'\t'|*$'\t\t'*)
-        log "preflight: invalid declaration at $decl_name:$line_no"
-        return 2 ;;
-    esac
     owner='' cmd='' predicate='' expected='' fix='' note='' extra=''
     IFS=$'\t' read -r owner cmd predicate expected fix note extra <<<"$declaration_line"
-    if [ -n "${extra:-}" ] || [ -z "$cmd" ] || [ -z "$predicate" ] \
-      || [ -z "$expected" ] || [ -z "$fix" ] || [ -z "$note" ]; then
-      log "preflight: invalid declaration at $decl_name:$line_no"
-      return 2
-    fi
-    [[ "$owner" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
-      || { log "preflight: invalid owner at $decl_name:$line_no"; return 2; }
-    case "$owner" in
-      core) ;;
-      *)
-        # A package owner is legitimated by package-info alone (child 4/P3:
-        # every non-core owner is a shipped or explicit package now — the
-        # legacy $AIRLOCK_ROOT/apps/<owner> tree escape for a not-yet-
-        # packaged built-in TSV row is retired).
-        case "$packaged" in *$'\n'"$owner"$'\n'*) ;; *)
-          log "preflight: unknown declaration owner '$owner' at $decl_name:$line_no"; return 2 ;;
-        esac ;;
-    esac
-    [[ "$cmd" =~ ^[a-zA-Z0-9._+-]+$ ]] \
-      || { log "preflight: invalid command at $decl_name:$line_no"; return 2; }
-    case "$predicate" in
-      present) [ "$expected" = "-" ] \
-        || { log "preflight: invalid predicate at $decl_name:$line_no"; return 2; } ;;
-      major-gte)
-        [[ "$expected" =~ ^[0-9]{1,6}([.][0-9]{1,6})?$ ]] \
-          || { log "preflight: invalid predicate at $decl_name:$line_no"; return 2; }
-        case "$cmd" in python3|node) ;; *)
-          log "preflight: major-gte has no version probe for $cmd at $decl_name:$line_no"
-          return 2 ;;
-        esac ;;
-      *) log "preflight: invalid predicate at $decl_name:$line_no"; return 2 ;;
-    esac
-    row_key="$owner"$'\t'"$cmd"
-    [ -z "${seen_rows[$row_key]:-}" ] \
-      || { log "preflight: duplicate declaration for $owner/$cmd"; return 2; }
-    seen_rows[$row_key]=1
-    if [ -n "${all_fixes[$cmd]:-}" ] && [ "${all_fixes[$cmd]}" != "$fix" ]; then
-      log "preflight: conflicting remediation for $cmd"
-      return 2
-    fi
-    all_fixes[$cmd]="$fix"
-    declaration_count=$((declaration_count + 1))
+    [ -n "$cmd" ] || continue
 
     case "$enabled" in *$'\n'"$owner"$'\n'*) ;; *) continue ;; esac
     if [ -n "${predicates[$cmd]:-}" ]; then
@@ -341,7 +214,7 @@ airlock_preflight() {
             && [ "$expected" != "${expecteds[$cmd]}" ]; then
             expecteds[$cmd]="$expected"
           fi ;;
-        *) log "preflight: conflicting predicates for $cmd"; return 2 ;;
+        *) ;;
       esac
       owners[$cmd]="${owners[$cmd]},$owner"
     else
@@ -349,15 +222,8 @@ airlock_preflight() {
       fixes[$cmd]="$fix"; owners[$cmd]="$owner"
     fi
   done < "$decl_file"
-  [ "$declaration_count" -gt 0 ] \
-    || { log "preflight: declaration file contains no requirements"; return 2; }
-  for cmd in python3 nginx sudo systemctl tailscale curl flock; do
-    [ -n "${predicates[$cmd]:-}" ] && case ",${owners[$cmd]}," in *,core,*) continue ;; esac
-    log "preflight: required core declaration missing: $cmd"
-    return 2
-  done
-  # Runtime selection precedes both the version probe and receipt publication.
-  # Key this to the effective manifest row, not merely the package id: a package
+  # Runtime selection precedes the version probe. Key this to the effective
+  # manifest row, not merely the package id: a package
   # shadowing paseo without a Node prerequisite made no NVM contract.
   case ",${owners[node]:-}," in *,paseo,*) airlock_load_nvm ;; esac
 
@@ -385,11 +251,8 @@ airlock_preflight() {
       airlock_preflight_version_ge "${version:-0}" "${expecteds[$cmd]}" \
         || status=wrong-version
     fi
-    if [ "$status" = present ]; then
-      resolved_paths[$cmd]="$path"
-    else
-      failures+=("$req"$'\t'"$detected"$'\t'"$status"$'\t'"${fixes[$cmd]}"$'\t'"$selected_owners")
-    fi
+    [ "$status" = present ] \
+      || failures+=("$req"$'\t'"$detected"$'\t'"$status"$'\t'"${fixes[$cmd]}"$'\t'"$selected_owners")
   done
 
   if [ "${#failures[@]}" -gt 0 ]; then
@@ -399,27 +262,6 @@ airlock_preflight() {
         "$req" "$detected" "$status" "$fix" "$selected_owners"
     done < <(printf '%s\n' "${failures[@]}" | sort)
     return 1
-  fi
-  if [ -n "${AIRLOCK_PREREQ_RECEIPT:-}" ]; then
-    local receipt_tmp
-    receipt_tmp="$(mktemp "${AIRLOCK_PREREQ_RECEIPT}.XXXXXX")" \
-      || { log "preflight: could not create prerequisite receipt"; return 2; }
-    chmod 0600 "$receipt_tmp" || { rm -f "$receipt_tmp"; return 2; }
-    {
-      printf '# airlock-prerequisite-receipt-v1\n'
-      printf '# context=%s\n' "${AIRLOCK_PREREQ_CONTEXT:-standalone}"
-      for cmd in "${!resolved_paths[@]}"; do
-        case "${resolved_paths[$cmd]}" in *$'\t'*|*$'\n'*)
-          log "preflight: resolved command path contains a control separator: $cmd"
-          rm -f "$receipt_tmp"
-          return 2 ;;
-        esac
-        printf '%s\t%s\t%s\t%s\t%s\n' "$cmd" "${resolved_paths[$cmd]}" \
-          "${predicates[$cmd]}" "${expecteds[$cmd]}" "${owners[$cmd]}"
-      done | LC_ALL=C sort
-    } > "$receipt_tmp" || { rm -f "$receipt_tmp"; return 2; }
-    mv -f "$receipt_tmp" "$AIRLOCK_PREREQ_RECEIPT" \
-      || { rm -f "$receipt_tmp"; log "preflight: could not publish prerequisite receipt"; return 2; }
   fi
   [ "$quiet" = 1 ] || log "prerequisite preflight passed"
 }

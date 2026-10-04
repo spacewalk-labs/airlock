@@ -105,6 +105,13 @@
       details.appendChild(el('pre', 'dmc-prompt', card.run.prompt));
       return details;
     }
+    function appendDetail(target, card) {
+      if (typeof card.detail !== 'string' || !card.detail) return;
+      var details = el('details', 'dmc-runbox dmc-run-details');
+      details.appendChild(el('summary', '', '원천 메시지'));
+      details.appendChild(el('pre', 'dmc-prompt', card.detail));
+      target.appendChild(details);
+    }
     function openTitle(card) {
       return hasDoc(card) ? openDoc(card) : openMessage(card);
     }
@@ -133,6 +140,7 @@
         }
         modal.appendChild(body);
       }
+      appendDetail(modal, card);
       if (card.run) {
         modal.appendChild(runDetails(card));
       }
@@ -168,6 +176,7 @@
       tools.appendChild(external);
       if (card.run) tools.appendChild(action('이 보고서로 실행', 'dmc-primary', function () { openRun(card); }));
       modal.appendChild(tools);
+      appendDetail(modal, card);
       var iframe = el('iframe', 'dmc-iframe');
       iframe.src = card.link;
       iframe.title = card.title;

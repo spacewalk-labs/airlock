@@ -34,8 +34,11 @@ require_cmd python3 systemctl journalctl realpath timeout
 
 airlock_load dev-monitor
 BACKEND_PORT="${AIRLOCK_DEV_MONITOR_BACKEND_PORT:?}"
+INGEST_PORT="${AIRLOCK_DEV_MONITOR_INGEST_PORT:?}"
 MESSAGES="${AIRLOCK_DEV_MONITOR_MESSAGES:-false}"
 SLACK_WEBHOOK_URGENT_ENV="${AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT_ENV:-}"
+SLACK_BOT_TOKEN_NAME="${AIRLOCK_DEV_MONITOR_SLACK_BOT_TOKEN_ENV:-}"
+SLACK_CHANNEL="${AIRLOCK_DEV_MONITOR_SLACK_CHANNEL:-}"
 EXEC_CWD_ROOT="${AIRLOCK_DEV_MONITOR_EXEC_CWD_ROOT:-}"
 EXEC_SESSION="${AIRLOCK_DEV_MONITOR_EXEC_SESSION:-devmon-exec}"
 SPOOL_WRITER_USER="${AIRLOCK_DEV_MONITOR_SPOOL_WRITER_USER:-airlock-dev-monitor-writer}"
@@ -122,7 +125,7 @@ case "$IDENTITY_HEADER" in
 esac
 # Same reasoning one level down: these values feed a systemd EnvironmentFile,
 # where a newline would inject additional environment entries.
-for _v in "$EXEC_CWD_ROOT" "$EXEC_SESSION" "$SLACK_WEBHOOK_URGENT_ENV"; do
+for _v in "$EXEC_CWD_ROOT" "$EXEC_SESSION" "$SLACK_WEBHOOK_URGENT_ENV" "$SLACK_BOT_TOKEN_NAME" "$SLACK_CHANNEL"; do
   case "$_v" in *[$'\n\r']*) die "config values must not contain newlines" ;; esac
 done
 # Precedence treats surrounding whitespace as unset, matching the documented table.
@@ -130,13 +133,15 @@ trim_config_value() {
   python3 -c 'import sys; print(sys.argv[1].strip(), end="")' "$1"
 }
 SLACK_WEBHOOK_URGENT_ENV="$(trim_config_value "$SLACK_WEBHOOK_URGENT_ENV")"
+SLACK_BOT_TOKEN_NAME="$(trim_config_value "$SLACK_BOT_TOKEN_NAME")"
+SLACK_CHANNEL="$(trim_config_value "$SLACK_CHANNEL")"
 OWNER="${AIRLOCK_OWNER:?}"
 UNIT_DIR="$HOME/.config/systemd/user"
 DEVMON_STATE="$HOME/.local/state/airlock/dev-monitor"
 DEVMON_ENV="$HOME/.config/airlock/dev-monitor.env"
 DEVMON_SECRETS="$HOME/.config/airlock/dev-monitor-secrets.env"
 SLACK_WEBHOOK_NAME="$SLACK_WEBHOOK_URGENT_ENV"
-render_dev_monitor_check_secret_names "$SLACK_WEBHOOK_NAME" || exit 1
+render_dev_monitor_check_secret_names "$SLACK_WEBHOOK_NAME" "$SLACK_BOT_TOKEN_NAME" || exit 1
 # This optional file is loaded by the service even without selected credentials
 # or messages. Existing files always cross the same ownership/mode boundary.
 if [ -e "$DEVMON_SECRETS" ] || [ -L "$DEVMON_SECRETS" ]; then
@@ -147,13 +152,13 @@ if [ -e "$DEVMON_SECRETS" ] || [ -L "$DEVMON_SECRETS" ]; then
   [ "$(stat -c %a "$DEVMON_SECRETS")" = 600 ] \
     || die "dev-monitor-secrets.env must have mode 0600"
 fi
-secret_check_args=(--file "$DEVMON_SECRETS")
-for secret_name in "$SLACK_WEBHOOK_NAME"; do
+secret_check_args=(--file "$DEVMON_SECRETS" --allow DEVMON_INGEST_TOKEN)
+for secret_name in "$SLACK_WEBHOOK_NAME" "$SLACK_BOT_TOKEN_NAME"; do
   [ -n "$secret_name" ] || continue
   secret_check_args+=(--allow "$secret_name")
 done
 if [ "$MESSAGES" = true ]; then
-  for secret_name in "$SLACK_WEBHOOK_NAME"; do
+  for secret_name in "$SLACK_WEBHOOK_NAME" "$SLACK_BOT_TOKEN_NAME"; do
     [ -n "$secret_name" ] || continue
     [ -f "$DEVMON_SECRETS" ] \
       || die "dev-monitor-secrets.env must exist when a credential name is configured"
@@ -169,6 +174,16 @@ if [ -f "$DEVMON_SECRETS" ]; then
 fi
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
   log "[dry] secret name/owner/mode checked; systemd value semantics NOT checked"
+fi
+INGEST_TOKEN_NAME=""
+if [ "$MESSAGES" = true ]; then
+  # Inspect assignment names only; never load or evaluate the token value here.
+  if python3 "$HERE/check-secrets.py" --file "$DEVMON_SECRETS" --static \
+      --allow "$SLACK_WEBHOOK_NAME" --allow "$SLACK_BOT_TOKEN_NAME" DEVMON_INGEST_TOKEN; then
+    INGEST_TOKEN_NAME=DEVMON_INGEST_TOKEN
+  else
+    log "WARN: DEVMON_INGEST_TOKEN name absent — HTTP ingest disabled"
+  fi
 fi
 DEVMON_ENV_OUTPUT="$DEVMON_ENV"
 # AIRLOCK_RENDER_DIR: harness-only destination-root override (highest
@@ -213,32 +228,24 @@ for _devmon_traverse_dir in "${_devmon_traverse_dirs[@]}"; do
     || die "cannot make $_devmon_traverse_dir traversable for the spool writer"
 done
 
-# A legacy messages DB cannot be opened by the current backend.  Run on its own, this
-# script converts it here, before it renders or starts the replacement.  Under the
-# install orchestrator it only records the conversion and leaves the candidate stopped;
-# the orchestrator converts and starts after the transaction commits.  Either way this
-# boundary stops and verifies every in-repository DB writer and producer itself, since
-# reinstall plans do not run a deactivator.  The dedicated cross-UID publisher is fenced
-# at the spool directories while the DB snapshot is made; queued files are retained and
-# need no conversion.
+# A legacy messages DB cannot be opened by the current backend. This script converts it
+# here, before it renders or starts the replacement, whether run standalone or under the
+# install orchestrator. This boundary stops and verifies every in-repository DB writer
+# and producer itself, since reinstall plans do not run a deactivator. The dedicated
+# cross-UID publisher is fenced at the spool directories while the DB snapshot is made;
+# queued files are retained and need no conversion.
 #
-# States: idle -> quiesced -> converted -> activated (standalone), or idle -> deferred.
+# States: idle -> quiesced -> converted -> activated.
 _devmon_migration_state=idle
 _devmon_convert_before_start=0
 
 devmon_migration_finish() {
   local outcome="$1" rc="${2:-0}" recovery_ready=1
   [ "$outcome" = success ] || trap - EXIT
-  if [ "$outcome" = failure ] && [ "$_devmon_migration_state" = deferred ]; then
-    # Nothing here touched the DB. The transaction takes the activation record back
-    # and restores the previous package with its own units.
-    log "dev-monitor activation was deferred; the install transaction restores the previous package"
-    exit "$rc"
-  fi
   if [ "$outcome" = failure ]; then
     devmon_migration_quiesce || recovery_ready=0
     if [ "$recovery_ready" = 1 ] && [ "$_devmon_migration_state" = converted ]; then
-      devmon_migration_restore_db unconditional "$DEVMON_DB" \
+      devmon_migration_restore_db "$DEVMON_DB" \
         "$HERE/migrate-legacy-state.py" || recovery_ready=0
     elif [ "$_devmon_migration_state" = activated ]; then
       # The canonical writer has run, so the converted DB may hold rows the legacy
@@ -269,31 +276,15 @@ if [ "$MESSAGES" = true ] && { [ -e "$DEVMON_DB" ] || [ -L "$DEVMON_DB" ]; }; th
     canonical) log "messages database already uses the current schema" ;;
     legacy)
       if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-        log "[dry] would quiesce dev-monitor writers/producers and convert the legacy messages database (after the install commit when orchestrated)"
-      elif [ -n "${AIRLOCK_INSTALL_TRANSACTION_ID:-}" ]; then
-        # Inside an install transaction nothing may open the canonical DB before
-        # commit: a backend start alone rewrites it, after which no later failure in
-        # the transaction could restore the legacy copy without losing writes. So the
-        # candidate is installed stopped and the orchestrator converts after commit
-        # (activation-record.py). The record is written before the first mutation.
-        devmon_migration_snapshot "$DEVMON_STATE" \
-          || die "cannot inspect DB writers, producers, or spool lanes"
-        trap 'devmon_migration_finish failure $?' EXIT
-        python3 "$HERE/activation-record.py" write "$(devmon_migration_state_dir)" \
-          "$AIRLOCK_INSTALL_TRANSACTION_ID" "$DEVMON_DB" "$SPOOL_WRITER_USER" \
-          "$BACKEND_PORT" "$AIRLOCK_APP_ID" \
-          || die "cannot record the deferred dev-monitor activation"
-        _devmon_migration_state=deferred
-        devmon_migration_quiesce \
-          || die "cannot stop and verify DB writers or spool producers"
-        log "legacy messages database left untouched; conversion and start follow the install commit"
+        log "[dry] would quiesce dev-monitor writers/producers and convert the legacy messages database"
       else
-        # Run on its own there is no transaction to roll back to, so the conversion is
-        # held until the candidate's own units are in place (just before the restart
-        # below) and the two switch together. Everything up to that point can still
-        # fail with the legacy database and the old writers untouched.
+        # The conversion is held until the candidate's own units are in place (just
+        # before the restart below) and the two switch together. Everything up to
+        # that point can still fail with the legacy database and the old writers
+        # untouched.
         devmon_migration_snapshot "$DEVMON_STATE" \
           || die "cannot inspect DB writers, producers, or spool lanes"
+        devmon_activation_forget_fenced_modes
         _devmon_migration_state=quiesced
         trap 'devmon_migration_finish failure $?' EXIT
         devmon_migration_quiesce \
@@ -442,7 +433,7 @@ if [ "$MESSAGES" = true ]; then
     install -d -m 700 "$(dirname "$DEVMON_ENV_OUTPUT")"
     ( umask 077; render_dev_monitor_env \
         "$OWNER" "$DEVMON_SECRET" "$DEVMON_STATE" "${EXEC_CWD_ROOT:-$HOME}" \
-        "$EXEC_SESSION" "$SLACK_WEBHOOK_NAME" "$CONSOLE_URL" >"$DEVMON_ENV_OUTPUT" )
+        "$EXEC_SESSION" "$SLACK_WEBHOOK_NAME" "$CONSOLE_URL" "$INGEST_TOKEN_NAME" "$SLACK_BOT_TOKEN_NAME" "$SLACK_CHANNEL" >"$DEVMON_ENV_OUTPUT" )
     chmod 600 "$DEVMON_ENV_OUTPUT"
 
   fi
@@ -471,7 +462,7 @@ else
   render_dev_monitor_unit "$BACKEND_PORT" "$MESSAGES" "$IDENTITY_HEADER" "$cors_origins" "$DEVMON_ENV" \
     "$TOKEN_FRESHNESS" "$TOKEN_WARN_HOURS" "$TOKEN_STALE_HOURS" "$MESSAGES" \
     "$ACCOUNTS_STATUS_BIN" "$AGENT_PROVIDER" "$AGENT_BIN" "$SLACK_WEBHOOK_NAME" \
-    "$AIRLOCK_CONFIG_PATH" \
+    "$AIRLOCK_CONFIG_PATH" "$SLACK_BOT_TOKEN_NAME" "$SLACK_CHANNEL" "$WEBROOT" \
     >"$UNIT_DIR/airlock-dev-monitor.service"
 fi
 # The card is on; the CHECKING is not. Said once at install time, because "the feature is
@@ -538,28 +529,20 @@ else
 fi
 airlock_run systemctl --user daemon-reload
 airlock_run systemctl --user enable airlock-dev-monitor.service
-if [ "$_devmon_migration_state" = deferred ]; then
-  log "airlock-dev-monitor.service enabled but not started: activation follows the install commit"
-  [ "$MESSAGES" != true ] || airlock_run systemctl --user enable airlock-devmon-heartbeat.timer
-else
-  if [ "$_devmon_convert_before_start" = 1 ]; then
-    devmon_migration_fence "$DEVMON_STATE" "$SPOOL_WRITER_USER" true \
-      || die "cannot fence and verify cross-UID spool publishing"
-    _devmon_conversion_receipt="$(python3 "$HERE/migrate-legacy-state.py" \
-      --endstate "$DEVMON_DB" --offline)" \
-      || die "legacy messages database conversion failed; original/backup retained"
-    [ "$_devmon_conversion_receipt" = 'converted=1 backup_retained=1' ] \
-      || die "legacy messages database conversion returned no completion receipt"
-    _devmon_migration_state=converted
-    devmon_migration_restore_spool "$DEVMON_STATE" \
-      || die "cannot reopen the spool lanes after conversion"
-  fi
-  # From the first canonical writer on, a standalone failure keeps the converted DB.
-  [ "$_devmon_migration_state" != converted ] || _devmon_migration_state=activated
-  airlock_run systemctl --user restart airlock-dev-monitor.service
-  if [ "$MESSAGES" = true ]; then
-    airlock_run systemctl --user enable --now airlock-devmon-heartbeat.timer
-  fi
+if [ "$_devmon_convert_before_start" = 1 ]; then
+  devmon_migration_fence "$DEVMON_STATE" "$SPOOL_WRITER_USER" true \
+    || die "cannot fence and verify cross-UID spool publishing"
+  python3 "$HERE/migrate-legacy-state.py" --endstate "$DEVMON_DB" --offline >/dev/null \
+    || die "legacy messages database conversion failed; original/backup retained"
+  _devmon_migration_state=converted
+  devmon_migration_restore_spool "$DEVMON_STATE" \
+    || die "cannot reopen the spool lanes after conversion"
+fi
+# From the first canonical writer on, a standalone failure keeps the converted DB.
+[ "$_devmon_migration_state" != converted ] || _devmon_migration_state=activated
+airlock_run systemctl --user restart airlock-dev-monitor.service
+if [ "$MESSAGES" = true ]; then
+  airlock_run systemctl --user enable --now airlock-devmon-heartbeat.timer
 fi
 
 # --- 2. dashboard UI into the hub webroot (served by the hub's static location /) ---
@@ -623,6 +606,18 @@ fi
 install -m 600 /dev/null "$frag"
 render_dev_monitor_nginx "$BACKEND_PORT" "$updates_location" "$owner_location" >"$frag"
 log "wrote nginx fragment: $frag"
+
+# Dedicated publication listener. The platform applies [serve.https] after this
+# installer returns and the artifact ledger retires old/removed port mappings.
+# The port stays mapped without a token; the backend then returns 404.
+ingest_frag="$CONFD/servers.d/dev-monitor.conf"
+install -d "$CONFD/servers.d"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ] && [ -e "$ingest_frag" ]; then
+  log "[dry] would rewrite $ingest_frag — left as is"
+else
+  render_dev_monitor_ingest_nginx "$INGEST_PORT" "$BACKEND_PORT" >"$ingest_frag"
+  log "wrote nginx fragment: $ingest_frag"
+fi
 
 # NOTE: smoke runs from the orchestrator AFTER nginx reload (gate not live before).
 devmon_migration_finish success

@@ -9,6 +9,7 @@ The optional message/action console is imported defensively. If its modules are
 absent, or its configuration is not enabled, owner routes return 404 and the
 process continues to serve observability.
 """
+import hmac
 import json
 import os
 import re
@@ -29,7 +30,7 @@ from pathlib import Path
 # detection needs it even on a box that intentionally has no message spool.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from devmon_secret_names import validate_config
-from devmon_secrets import slack_webhooks
+from devmon_secrets import resolve
 
 # Reject selector/control collisions before parsing any overridden control values.
 validate_config(os.environ)
@@ -85,11 +86,6 @@ try:
     import devmon_apps as APPS
 except ImportError:
     APPS = None
-
-try:
-    import devmon_company_catalog as COMPANY_CATALOG
-except ImportError:
-    COMPANY_CATALOG = None
 
 # Update EXECUTION is imported separately from update DETECTION so an older tree that
 # has the collector but not the runner degrades to a read-only panel instead of 500s.
@@ -1106,7 +1102,7 @@ class Handler(BaseHTTPRequestHandler):
             # afterwards — smoke.sh included.
             self._json(200, {'ok': True, 'service': 'airlock-dev-monitor', 'port': PORT,
                              'messages': _messages_state(),
-                             'slack': ('configured' if any(_slack_webhooks().values())
+                             'slack': ('configured' if _slack_sender() is not None
                                        else 'not configured'),
                              **_message_delivery_health(),
                              'messages_requested': MESSAGES_REQUESTED,
@@ -1118,6 +1114,48 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
         path = self._strip_prefix(url.path)
+        if url.path == '/api/ingest':
+            token = resolve(os.environ, os.environ.get('DEVMON_INGEST_TOKEN_NAME'))
+            if not token or OWNER_CONFIG is None:
+                self._json(404, {'error': 'ingest not enabled'})
+                return
+            supplied = self.headers.get('X-Devmon-Ingest-Token', '')
+            if not hmac.compare_digest(supplied.encode('utf-8'), token.encode('utf-8')):
+                self._json(401, {'error': 'invalid ingest token'})
+                return
+            try:
+                size = int(self.headers.get('Content-Length', '0'))
+                if size <= 0 or size > MSG.MAX_PAYLOAD:
+                    raise ValueError('payload must be between 1 byte and 16 KiB')
+                blob = self.rfile.read(size)
+                payload = json.loads(blob.decode('utf-8'))
+                message = MSG.validate_payload(payload)
+            except (ValueError, UnicodeError) as exc:
+                self._json(400, {'error': str(exc)})
+                return
+            # Same no-clobber publication as examples/emit_message.emit. Keep the
+            # wire payload: validate_payload's normalized timestamp is not JSON.
+            spool = Path(OWNER_CONFIG['spool'])
+            try:
+                fd, tmp_path = tempfile.mkstemp(dir=spool / 'tmp')
+                try:
+                    with os.fdopen(fd, 'wb') as handle:
+                        handle.write(blob)
+                        os.fchmod(handle.fileno(), 0o644)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    try:
+                        os.link(tmp_path, spool / 'new' / (message['id'] + '.json'))
+                        status = 'queued'
+                    except FileExistsError:
+                        status = 'duplicate'
+                finally:
+                    os.unlink(tmp_path)
+            except OSError:
+                self._json(503, {'error': 'message spool unavailable'})
+                return
+            self._json(202, {'status': status})
+            return
         if path.startswith('/api/owner/'):
             self._handle_owner_post(path)
             return
@@ -1152,6 +1190,13 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return devmon_owner.require_owner(self, OWNER_CONFIG, cors=cors)
 
+    @staticmethod
+    def _installed_ids():
+        """③ for the home order, or None when this box cannot name one."""
+        if APPS is None or UPDATE_EXEC_CONFIG is None:
+            return None
+        return APPS.installed_ids(UPDATE_EXEC_CONFIG['root'])
+
     def _updates_owner_ready(self):
         """Updates keep their owner gate when messages are deliberately off."""
         if UPDATES_OWNER_CONFIG is None:
@@ -1170,36 +1215,25 @@ class Handler(BaseHTTPRequestHandler):
             if cfg is None:
                 self._json(404, {'ok': False, 'error': 'app store execution not enabled'})
                 return
-            updates = UPDATES.read_snapshot() if UPDATES is not None else None
             try:
-                try:
-                    config = APPS.config_path(cfg['root'])
-                except APPS.AppsError as exc:
-                    # list_apps intentionally has a review-only projection for this
-                    # exact failure.  A source-tree launch without AIRLOCK_CONFIG asks
-                    # package-info for the config path next, which is lock-strict too;
-                    # do not let the optional company lookup erase that projection.
-                    if (exc.code != 'config_invalid'
-                            or 'package lock digest mismatch' not in exc.detail):
-                        raise
-                    projection = APPS.list_apps(cfg['root'], updates, set())
-                    if projection.get('degraded') != 'lock-mismatch':
-                        raise
-                    projection['company'] = []
-                else:
-                    company_ids = (COMPANY_CATALOG.installed_company_ids(config)
-                                   if COMPANY_CATALOG is not None else set())
-                    projection = APPS.list_apps(cfg['root'], updates, company_ids)
-                    projection['company'] = (
-                        COMPANY_CATALOG.list_catalog(config)
-                        if COMPANY_CATALOG is not None else [])
-                self._json(200, projection)
+                updates = UPDATES.current(cfg['root']) if UPDATES is not None else None
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                self._json(503, {'ok': False, 'error': 'app_plan_unavailable'})
+                return
+            try:
+                installed = APPS.installed_ids(cfg['root'])
+                placed = set()
+                if HOME_ORDER is not None:
+                    placed = {row for row in HOME_ORDER.read_order(installed)
+                              if isinstance(row, str)}
+                self._json(200, APPS.store_rows(cfg['root'], updates, installed,
+                                                placed))
             except APPS.AppsError as exc:
-                sys.stderr.write(f'[apps] listing failed ({exc.code}): {exc.detail}\n')
+                sys.stderr.write(f'[apps] store rows failed ({exc.code}): '
+                                 f'{exc.detail}\n')
                 self._json(500, {'ok': False, 'error': exc.code})
-            except COMPANY_CATALOG.CatalogError as exc:
-                sys.stderr.write(f'[apps] company catalog failed ({exc.code}): {exc.detail}\n')
-                self._json(500, {'ok': False, 'error': exc.code})
+            except (OSError, RuntimeError):
+                self._json(500, {'ok': False, 'error': 'home order unavailable'})
             return
         if path == '/api/owner/home/order':
             if HOME_ORDER is None:
@@ -1208,28 +1242,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self._updates_owner_ready():
                 return
             try:
-                try:
-                    cfg = UPDATE_EXEC_CONFIG
-                    manifest = HOME_ORDER.manifest_order(
-                        cfg['root'] if cfg is not None else None)
-                except RuntimeError as exc:
-                    # `airlock-config apps` resolves explicit package manifests and is
-                    # therefore lock-strict.  The update snapshot still names the only
-                    # reviewable tiles; use the same narrow degraded projection as the
-                    # app sheet, never a partial inventory for another config error.
-                    if (APPS is None or cfg is None
-                            or 'package lock digest mismatch' not in str(exc)):
-                        raise
-                    updates = UPDATES.read_snapshot() if UPDATES is not None else None
-                    try:
-                        projection = APPS.list_apps(cfg['root'], updates)
-                    except APPS.AppsError as projection_error:
-                        raise RuntimeError(str(projection_error)) from projection_error
-                    if projection.get('degraded') != 'lock-mismatch':
-                        raise
-                    manifest = [row['id'] for row in projection.get('installed', [])
-                                if isinstance(row, dict) and isinstance(row.get('id'), str)]
-                self._json(200, {'order': HOME_ORDER.read_order(manifest)})
+                # null, never []: an install record this route cannot read means the
+                # order is read without one, and the launcher draws its manifest
+                # order rather than filtering everything away to an empty screen.
+                installed = self._installed_ids()
+                self._json(200, {'order': HOME_ORDER.read_order(installed or []),
+                                 'installed': installed})
+            except APPS.AppsError:
+                self._json(500, {'ok': False, 'error': 'home order unavailable'})
             except (OSError, RuntimeError):
                 self._json(500, {'ok': False, 'error': 'home order unavailable'})
             return
@@ -1242,7 +1262,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not self._updates_owner_ready():
                 return
-            snapshot = UPDATES.read_snapshot()
+            try:
+                snapshot = UPDATES.current(UPDATE_EXEC_CONFIG['root'] if UPDATE_EXEC_CONFIG else Path(__file__).resolve().parents[3])
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                self._json(503, {'ok': False, 'error': 'app_plan_unavailable'})
+                return
             if snapshot is None:
                 self._json(404, {'ok': False, 'error': 'update detection has no snapshot'})
                 return
@@ -1308,6 +1332,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._owner_harness_execute(self._read_body())
             return
+        if path == '/api/owner/apps/links/add':
+            if not self._updates_owner_ready():
+                return
+            self._owner_add_link(self._read_body())
+            return
         if path == '/api/owner/apps/package-preview':
             if APPS is None or UPDATE_EXEC_CONFIG is None:
                 self._json(404, {'ok': False, 'error': 'app store not enabled'})
@@ -1333,10 +1362,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._updates_owner_ready():
                 return
             body = self._read_body()
-            if parts[5] == 'install-company':
-                self._owner_company_install(self._seg(parts[4]))
-            else:
-                self._owner_app_action(self._seg(parts[4]), parts[5], body)
+            self._owner_app_action(self._seg(parts[4]), parts[5], body)
             return
         if path == '/api/owner/home/order':
             if HOME_ORDER is None:
@@ -1349,14 +1375,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {'ok': False, 'error': 'order must be an array'})
                 return
             try:
-                cfg = UPDATE_EXEC_CONFIG
-                manifest = HOME_ORDER.manifest_order(
-                    cfg['root'] if cfg is not None else None)
-                order = HOME_ORDER.write_order(body['order'], manifest)
+                installed = self._installed_ids()
+                order = HOME_ORDER.write_order(body['order'], installed or [])
+            except APPS.AppsError:
+                self._json(500, {'ok': False, 'error': 'home order unavailable'})
+                return
             except (OSError, RuntimeError):
                 self._json(500, {'ok': False, 'error': 'home order unavailable'})
                 return
-            self._json(200, {'order': order})
+            self._json(200, {'order': order, 'installed': installed})
             return
         if not self._owner_ready():
             return
@@ -1416,14 +1443,8 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _pending_app_ids():
-        """App ids the current snapshot says are pending a plain reinstall.
-
-        🔴 `lock-mismatch` rows are excluded, and this is the server-side half of owner
-        decision LOCK_UI_V1: an external package whose source digest moved needs its lock
-        re-approved, that is a terminal procedure, and the panel offers review only. The
-        button being absent is presentation; this is the boundary.
-        """
-        snapshot = UPDATES.read_snapshot() if UPDATES is not None else None
+        """App ids the engine currently offers as updates."""
+        snapshot = UPDATES.current(UPDATE_EXEC_CONFIG['root'] if UPDATE_EXEC_CONFIG else Path(__file__).resolve().parents[3]) if UPDATES is not None else None
         apps = (snapshot or {}).get('apps')
         if not isinstance(apps, list):
             return set()
@@ -1431,7 +1452,7 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(a, dict) and a.get('action') == 'upgrade'}
 
     def _owner_update_execute(self, body):
-        """Validate a closed enum, then launch `bin/airlock-update` in a tmux window."""
+        """Validate an action, then launch its app engine or platform updater."""
         cfg = UPDATE_EXEC_CONFIG
         if cfg is None:
             self._json(404, {'ok': False, 'error': 'update execution not enabled'})
@@ -1444,8 +1465,13 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(app_id, str) or not UPDATE_EXEC.APP_ID.match(app_id):
                 self._json(400, {'ok': False, 'error': 'bad_app_id'})
                 return
-            if app_id not in self._pending_app_ids():
-                # Either the snapshot never listed it, or it is a lock-mismatch row.
+            try:
+                pending = self._pending_app_ids()
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                self._json(503, {'ok': False, 'error': 'app_plan_unavailable'})
+                return
+            if app_id not in pending:
+                # The engine plan does not offer this app as an update.
                 self._json(409, {'ok': False, 'error': 'app_not_pending'})
                 return
         else:
@@ -1454,7 +1480,7 @@ class Handler(BaseHTTPRequestHandler):
         self._owner_update_launch(action, app_id)
 
     def _owner_update_launch(self, action, app_id, response_action=None, lock_held=False,
-                             approved_digest=None, package_path=None, reapprove=False):
+                             package_path=None):
         """Launch one already-authorized closed action through the shared scope."""
         cfg = UPDATE_EXEC_CONFIG
         if cfg is None:
@@ -1462,7 +1488,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not lock_held:
             with _UPDATE_RUN_LOCK:
-                return self._owner_update_launch(action, app_id, response_action, True)
+                return self._owner_update_launch(
+                    action, app_id, response_action, True, package_path)
         record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
         if UPDATE_EXEC.active(record):
             self._json(409, {'ok': False, 'error': 'run_active',
@@ -1488,8 +1515,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         plan = UPDATE_EXEC.build_plan(
             cfg['root'], cfg['dir'], run_id, action, app_id,
-            approved_digest=approved_digest, package_path=package_path,
-            reapprove=reapprove)
+            package_path=package_path)
         outcome, _target = _launch_run(run_id, plan, cfg, run_id)
         if outcome != 'ok':
             self._fail_update_record(cfg, run_id, outcome)
@@ -1502,21 +1528,56 @@ class Handler(BaseHTTPRequestHandler):
             payload['execution'] = action
         self._json(200, payload)
 
+    def _owner_add_link(self, body):
+        """Add one personal link and place it on the home screen.
+
+        No removal counterpart on purpose: a link is removed by editing
+        links.toml, and the home order keeps the id so a re-added file brings
+        the tile back where the owner had it.
+        """
+        if APPS is None or UPDATE_EXEC_CONFIG is None or HOME_ORDER is None:
+            self._json(404, {'ok': False, 'error': 'app store not enabled'})
+            return
+        if not isinstance(body, dict):
+            self._json(400, {'ok': False, 'error': 'bad_link_body'})
+            return
+        with _UPDATE_RUN_LOCK:
+            cfg = UPDATE_EXEC_CONFIG
+            record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
+            if UPDATE_EXEC.active(record):
+                self._json(409, {'ok': False, 'error': 'run_active'})
+                return
+            if UPDATE_EXEC.updater_busy(cfg['root']) is True:
+                self._json(409, {'ok': False, 'error': 'updater_busy'})
+                return
+            try:
+                installed = APPS.installed_ids(cfg['root'])
+                result = APPS.add_link(
+                    root=cfg['root'],
+                    webroot=Path(os.environ.get('AIRLOCK_WEBROOT', '/opt/airlock/hub')),
+                    name=body.get('name'), url=body.get('url'),
+                    order=HOME_ORDER, installed=installed)
+            except APPS.AppsError as exc:
+                sys.stderr.write(f'[apps] link add failed ({exc.code}): {exc.detail}\n')
+                status = (400 if exc.code.startswith('bad_') else
+                          409 if exc.code in ('link_id_conflict', 'config_conflict') else 500)
+                self._json(status, {'ok': False, 'error': exc.code})
+                return
+            self._json(200, {'ok': True, **result})
+
     def _owner_app_action(self, app_id, action, body=None):
-        """Mutate one app intent, then run the full installer outside this service."""
+        """Apply or remove one app outside this service."""
         if APPS is None or UPDATE_EXEC_CONFIG is None:
             self._json(404, {'ok': False, 'error': 'app store not enabled'})
             return
-        if action not in ('enable', 'disable', 'remove', 'register', 'reapprove'):
+        if action not in ('install', 'remove', 'register'):
             self._json(404, {'ok': False, 'error': 'unknown app action'})
             return
         if not isinstance(app_id, str) or APPS.APP_ID.fullmatch(app_id) is None:
             self._json(400, {'ok': False, 'error': 'bad_app_id'})
             return
         with _UPDATE_RUN_LOCK:
-            # Refuse before changing the operator's config. Otherwise a second click
-            # during a live installer would answer 409 only after leaving unapplied
-            # intent behind on disk.
+            # One external engine run owns the store buttons until it finishes.
             cfg = UPDATE_EXEC_CONFIG
             record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
             if UPDATE_EXEC.active(record):
@@ -1528,182 +1589,68 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._owner_app_action_locked(app_id, action, body)
 
-    def _owner_company_install(self, app_id):
-        """Stage one catalog pin, then reuse the canonical config writer and installer."""
-        if APPS is None or COMPANY_CATALOG is None or UPDATE_EXEC_CONFIG is None:
-            self._json(404, {'ok': False, 'error': 'company catalog not enabled'})
-            return
-        if not isinstance(app_id, str) or APPS.APP_ID.fullmatch(app_id) is None:
-            self._json(400, {'ok': False, 'error': 'bad_app_id'})
-            return
-        with _UPDATE_RUN_LOCK:
-            cfg = UPDATE_EXEC_CONFIG
-            record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
-            if UPDATE_EXEC.active(record):
-                self._json(409, {'ok': False, 'error': 'run_active',
-                                 'run_id': record.get('runId')})
-                return
-            if UPDATE_EXEC.updater_busy(cfg['root']) is True:
-                self._json(409, {'ok': False, 'error': 'updater_busy'})
-                return
-            try:
-                config = APPS.config_path(cfg['root'])
-                rows = COMPANY_CATALOG.list_catalog(config)
-                entry = next((row for row in rows if row['id'] == app_id), None)
-                if entry is None:
-                    self._json(404, {'ok': False, 'error': 'app_not_found'})
-                    return
-                if entry['installable'] is not True:
-                    self._json(409, {
-                        'ok': False, 'error': 'catalog_not_installable',
-                        'reason': entry['reason'],
-                    })
-                    return
-                package = COMPANY_CATALOG.stage_entry(cfg['root'], config, entry)
-                preview = APPS.package_preview(cfg['root'], str(package))
-                canonical_path = str(Path(preview.get('path', '')).resolve())
-                if (preview.get('id') != app_id
-                        or preview.get('digest') != entry['tree_digest']
-                        or Path(canonical_path) != package.resolve()):
-                    self._json(409, {'ok': False, 'error': 'package_preview_changed'})
-                    return
-                if preview.get('installable') is not True:
-                    self._json(409, {
-                        'ok': False, 'error': 'package_not_installable',
-                        'rejected_capabilities': preview.get('rejected_capabilities') or [],
-                        'conflict': preview.get('conflict'),
-                    })
-                    return
-                if preview.get('registered'):
-                    self._json(409, {'ok': False, 'error': 'package_already_registered'})
-                    return
-                reapprove = preview.get('requires_reapproval') is True
-                registration = {
-                    'path': canonical_path,
-                    'grant': preview.get('grants') or [],
-                }
-                if reapprove:
-                    APPS.register(config, app_id, registration,
-                                  approved_digest=entry['tree_digest'])
-                else:
-                    APPS.register(config, app_id, registration)
-            except APPS.AppsError as exc:
-                sys.stderr.write(f'[apps] company register failed for {app_id!r} '
-                                 f'({exc.code}): {exc.detail}\n')
-                status = 400 if exc.code in ('bad_app_id', 'config_invalid') else 409 \
-                    if exc.code in ('config_conflict', 'package_already_registered') else 500
-                self._json(status, {'ok': False, 'error': exc.code})
-                return
-            except COMPANY_CATALOG.CatalogError as exc:
-                sys.stderr.write(f'[apps] company stage failed for {app_id!r} '
-                                 f'({exc.code}): {exc.detail}\n')
-                status = 409 if exc.code in (
-                    'digest_mismatch', 'catalog_not_installable') else 503 \
-                    if exc.code in ('catalog_unavailable', 'stage_unavailable') else 500
-                self._json(status, {'ok': False, 'error': exc.code})
-                return
-            self._owner_update_launch(
-                'install', app_id, response_action='install-company', lock_held=True,
-                approved_digest=entry['tree_digest'], package_path=canonical_path,
-                reapprove=reapprove)
-
     def _owner_app_action_locked(self, app_id, action, body=None):
         cfg = UPDATE_EXEC_CONFIG
-        updates = UPDATES.read_snapshot() if UPDATES is not None else None
         try:
-            if action in ('register', 'reapprove'):
+            updates = UPDATES.current(cfg['root']) if action == 'install' and UPDATES is not None else None
+            # The Personal URL's 'register' action selects an explicit install
+            # source; it does not create operator config registration.
+            if action == 'register':
                 package_path = body.get('path') if isinstance(body, dict) else None
-                approved_digest = body.get('digest') if isinstance(body, dict) else None
-                if (not isinstance(package_path, str) or not package_path.strip()
-                        or not isinstance(approved_digest, str)
-                        or re.fullmatch(r'[0-9a-f]{64}', approved_digest) is None):
-                    self._json(400, {'ok': False, 'error': 'bad_package_approval'})
+                if not isinstance(package_path, str) or not package_path.strip():
+                    self._json(400, {'ok': False, 'error': 'bad_package_path'})
                     return
                 preview = APPS.package_preview(cfg['root'], package_path)
-                if preview.get('id') != app_id or preview.get('digest') != approved_digest:
+                if preview.get('id') != app_id:
                     self._json(409, {'ok': False, 'error': 'package_preview_changed'})
                     return
                 if preview.get('installable') is not True:
-                    self._json(409, {
-                        'ok': False, 'error': 'package_not_installable',
-                        'rejected_capabilities': preview.get('rejected_capabilities') or [],
-                        'conflict': preview.get('conflict'),
-                    })
+                    self._json(409, {'ok': False, 'error': 'package_not_installable'})
                     return
-                config = APPS.config_path(cfg['root'])
-                canonical_path = str(Path(preview['path']).resolve())
-                if action == 'register':
-                    if preview.get('registered'):
-                        self._json(409, {'ok': False, 'error': 'package_already_registered'})
-                        return
-                    reapprove = preview.get('requires_reapproval') is True
-                    registration = {
-                        'path': canonical_path,
-                        'grant': preview.get('grants') or [],
-                    }
-                    if reapprove:
-                        APPS.register(config, app_id, registration,
-                                      approved_digest=approved_digest)
-                    else:
-                        APPS.register(config, app_id, registration)
-                else:
-                    if APPS.registered_package_path(config, app_id) != Path(canonical_path):
-                        self._json(409, {'ok': False, 'error': 'package_path_changed'})
-                        return
-                    if preview.get('requires_reapproval') is not True:
-                        self._json(409, {'ok': False, 'error': 'reapproval_not_required'})
-                        return
-                    reapprove = True
                 self._owner_update_launch(
                     'install', app_id, response_action=action, lock_held=True,
-                    approved_digest=approved_digest, package_path=canonical_path,
-                    reapprove=reapprove)
+                    package_path=str(Path(preview['path']).resolve()))
                 return
 
-            projection = APPS.list_apps(cfg['root'], updates)
-            installed = {row['id']: row for row in projection['installed']}
-            public = {row['id']: row for row in projection['public']}
-            if action == 'enable':
-                if app_id not in installed and app_id not in public:
-                    self._json(404, {'ok': False, 'error': 'app_not_found'})
-                    return
-                if app_id not in installed:
-                    config = APPS.config_path(cfg['root'])
-                    APPS.register(config, app_id)
-            else:
-                row = installed.get(app_id)
-                if app_id == 'hub' or app_id in projection['apps'] and row is None:
+            if action == 'remove':
+                if app_id == 'hub' or app_id not in APPS.installed_ids(cfg['root']):
                     self._json(409, {'ok': False, 'error': 'app_locked'})
                     return
-                # Reconcile cannot remove a recorded package without its optional
-                # deactivator.  Refuse before changing config; the UI also disables
-                # the destructive control, but presentation is not the boundary.
-                if row is not None and not row.get('canRemove'):
-                    error = ('disable_unavailable' if action == 'disable'
-                             else 'remove_unavailable')
-                    self._json(409, {'ok': False, 'error': error})
+                self._owner_update_launch(
+                    'teardown', app_id, response_action=action, lock_held=True)
+                return
+
+            projection = APPS.store_rows(cfg['root'], updates,
+                                        APPS.installed_ids(cfg['root']))
+            rows = {row['id']: row for row in projection['rows']
+                    if row.get('kind') == 'app'}
+            row = rows.get(app_id)
+            if action == 'install':
+                if row is None:
+                    self._json(404, {'ok': False, 'error': 'app_not_found'})
                     return
-                if row is not None:
-                    config = APPS.config_path(cfg['root'])
-                    APPS.mutate_enabled(config, app_id, False)
-        except APPS.AppsError as exc:
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            if not isinstance(exc, APPS.AppsError):
+                self._json(503, {'ok': False, 'error': 'app_plan_unavailable'})
+                return
             sys.stderr.write(f'[apps] {action} failed for {app_id!r} '
                              f'({exc.code}): {exc.detail}\n')
-            if exc.code in ('bad_app_id', 'bad_package_path', 'bad_package_registration',
-                            'bad_package_grants', 'bad_package_approval',
-                            'config_invalid', 'config_unsupported'):
+            if exc.code in ('bad_app_id', 'bad_package_path', 'config_invalid', 'config_unsupported'):
                 status = 400
-            elif exc.code in ('config_conflict', 'app_already_registered',
-                              'package_already_registered', 'package_not_registered'):
-                status = 409
             else:
                 status = 500
             self._json(status, {'ok': False, 'error': exc.code})
             return
-        # Current installer reconcile removes the committed artifacts, including
-        # units, for every canRemove app.  `teardown` remains a closed runner action
-        # for an explicit future caller; remove must not run it as well and double-act.
-        self._owner_update_launch('install', app_id, response_action=action, lock_held=True)
+        source = None
+        if action == 'install':
+            if row.get('origin') == 'public':
+                source = str(cfg['root'] / 'apps' / app_id)
+            elif row.get('origin') == 'company':
+                source = 'company'
+            else:
+                source = (row.get('detail') or {}).get('Path')
+        self._owner_update_launch(
+            'install', app_id, response_action=action, lock_held=True, package_path=source)
 
     @staticmethod
     def _fail_update_record(cfg, run_id, outcome):
@@ -2299,8 +2246,8 @@ def _message_delivery_health():
     return MSG.delivery_health()
 
 
-def _slack_webhooks():
-    return slack_webhooks(os.environ)
+def _slack_sender():
+    return devmon_slack.make_sender(os.environ) if devmon_slack is not None else None
 
 
 def _start_messages():
@@ -2351,7 +2298,7 @@ def _start_messages():
             f'[airlock-dev-monitor] messages schema failed '
             f'({exc.__class__.__name__}: {exc}) — observability only\n')
         return
-    webhook = _slack_webhooks()['slack-urgent']
+    sender = _slack_sender()
     console_url = os.environ.get('AIRLOCK_DEVMON_CONSOLE_URL', '').strip()
     stop = None
     # From here on, anything that fails is a generic failure of the OPTIONAL half: an
@@ -2360,12 +2307,12 @@ def _start_messages():
     try:
         EXEC_CONFIG = _build_exec_config()
         stop = threading.Event()
-        _SLACK_WORKER_ON = bool(webhook)
+        _SLACK_WORKER_ON = bool(sender)
         # The cron card's prior-verdict file lives next to the message DB — same state
         # directory, same lifetime, no new axis to provision or clean up.
         verdicts_path = os.path.join(os.path.dirname(OWNER_CONFIG['db']), 'cron-verdicts.json')
         threading.Thread(target=devmon_loop.run,
-                         args=(OWNER_CONFIG['spool'],webhook,stop,console_url,verdicts_path),
+                         args=(OWNER_CONFIG['spool'],sender,stop,console_url,verdicts_path),
                          daemon=True,name='loop').start()
     except Exception as exc:  # noqa: BLE001 — an optional feature must not kill the monitor
         if stop is not None:

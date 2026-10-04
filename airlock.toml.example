@@ -4,14 +4,17 @@
 
 [airlock]
 config_version = 2
-# ABI 2 enables per-package grants. A local package that requests elevated
-# capabilities in its manifest must acknowledge exactly those capabilities:
-# [packages.hello]
-# path = "./packages/hello"
-# grant = ["rooted-artifact", "system-unit"]
+# ABI 2 is retained for existing box configurations. App sources are recorded
+# by airlock-ledger apply; package path/grant tables are no longer read.
 
 [site]
 name = "My Dev Hub"
+# The Company app repository. This ONE line is the only place on this box that
+# says where those apps live: a git URL, never a clone path. Airlock fetches
+# main into its own mirror and pins the SHA it got, so a half-finished clone
+# in your home directory can never decide what an install pulls. Leave it out
+# and this box simply has no Company source.
+# company_repo = "git@github.com:your-org/airlock-private-apps.git"
 # The box's public FQDN is always measured at install time from `tailscale status`.
 # To render offline (CI, a box whose tailscaled is down), set AIRLOCK_TS_FQDN in
 # the environment — there is no config key for it.
@@ -78,45 +81,31 @@ product = "Airlock"
 # hub is the platform core; every other app below is a shipped package
 # (apps/<id>/airlock-app.toml) — its defaults, prerequisites, and tile all
 # live in that manifest, not in this repo's code. A table listed below with
-# no manifest and no [packages.<id>] is a typo: unknown [apps.X] is fatal at
-# `airlock-config validate` (child 4/P3 — there is no local/custom-app
-# fallback; use [packages.<id>].path for a third-party or local package).
+# no shipped or installed manifest is a typo: unknown [apps.X] is fatal at
+# `airlock-config validate`. Install a local app with
+# `airlock-ledger apply <id> --source <absolute-directory>` first.
 
 # Airlock serves content over https ONLY. The plaintext tailnet ports below
 # (http_port / public_port) answer with a 301 to the https FQDN and nothing else.
 
-# ── shortcuts ────────────────────────────────────────────────────────────────
-# A tile that sends you somewhere else, with nothing installed here. The honest
-# shape for a service this box does not run: company chat, a GPU host's UI,
-# another box's console.
+# ── links ──────────────────────────────────────────────────────────────────
+# A link — a tile that sends you somewhere else, with nothing installed here — is
+# a table in a `links.toml`, not a table here. One file per source:
 #
-# A shortcut is NOT a way to skip packaging an app that belongs on this box.
-# It points at something that already exists somewhere — so on a fresh box it
-# points at nothing. Per-box personal apps (notes, your own dashboards) stay
-# packages for exactly that reason. Rule of thumb: shared service -> shortcut,
-# one-per-box tool -> package.
+#   Company  <company repo>/links.toml         shared — collaborators see these
+#   Personal ~/.config/airlock/links.toml        owner-only — this box alone
 #
-# `url` must be https. A shortcut leaves this origin, so plain http is blocked
-# as mixed content — and it arms HSTS on the target host, which is how a whole
-# demo went dark on 2026-08-21.
+# [team-chat]                                  # one table per link
+# name  = "Team Chat"                          # required
+# desc  = "팀 채팅"                             # optional, one line
+# url   = "https://chat.example.com/"          # required, https only
+# icon  = "https://example.com/chat.png"       # optional; falls back to:
+# glyph = "app-chat"                           # optional, a hub sprite id
 #
-# `glyph` only (no `icon`): an icon file is staged out of a package, and a
-# shortcut has no package to stage from. Symbol ids live in hub/index.html.
-#
-# `audience` defaults to "shared" here, the opposite of a package's default.
-# A package that says nothing resolves to "owner" because it serves this box and
-# silence must not widen that. A shortcut serves nothing here — it is a link to
-# an address that already exists elsewhere and is gated by whatever serves it —
-# so there is nothing for silence to widen. Set `audience = "owner"` to keep one
-# link off a collaborator's launcher.
-#
-# [shortcuts.team-chat]
-# label = "Team Chat"
-# url   = "https://chat.example.com/"
-# cat   = "comms"                 # coding · docs · files · system · comms
-# glyph = "app-chat"
-# sub   = "team chat — runs elsewhere"
-# audience = "shared"             # "shared" (default) · "owner"
+# Adding one from the store's Personal menu writes the Personal file for you and
+# places the tile on the home screen. There is no removal action: delete the
+# table. The home screen keeps the tile's place, so re-adding the table brings it
+# back where it was.
 
 [apps.hub]        # required — the entrance
 https_port    = 443
@@ -133,6 +122,10 @@ accounts_port = 19904   # loopback backend for the platform account surface. Unl
 # fleet_store_url = ""  # URL of a shared usage store (optional; no host is hardcoded)
 # xai = false           # OpenCode xAI login on the account panel (needs the `opencode`
 #                       # CLI). Falls back to apps.devterm.xai.
+# Muse key picker (optional; all empty = no Muse on this box). Kept here so every
+# later install keeps them — the installer reads these when it is handed nothing.
+# muse_secret_bin  = ""    # vault reader CLI for the shared keys
+# muse_registry    = ""    # assignment sheet URL or path (key -> box)
 
 [apps.devterm]
 # No plaintext pair here: D-DEVTERM-9900 retired devterm's public_port/
@@ -216,17 +209,6 @@ title_meta = false
 # ingest_url = "https://your-ingest.example"   # implements /ingest /list /revoke /set-expiry
 # base_url   = "https://docs.example"          # public URLs are <base_url>/<slug>/
 # token_env  = "AIRLOCK_PUBLISH_TOKEN"         # name of the env var holding the token
-
-# Outbound-only Slack Socket Mode worker for published-document title cards.
-# The domain is configuration because apps/ is public. Token VALUES belong in
-# ~/.config/airlock-slack-unfurl.env (mode 0600), under the env names below.
-# Also set title_meta=true in [apps.publish] on each publisher box. It remains
-# an explicit per-box opt-in; the central worker cannot safely alter other boxes.
-# [apps.slack-unfurl]
-# domain_suffix = "example.test"
-# dedicated_ports = "8000,19920"  # comma-separated dedicated document ports
-# bot_token_env = "SLACK_UNFURL_BOT_TOKEN"
-# app_token_env = "SLACK_UNFURL_APP_TOKEN"
 
 [apps.notepad]        # shares the publish backend (needs [apps.publish]); table = show the card
 

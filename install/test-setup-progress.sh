@@ -18,20 +18,14 @@
 #
 # Offline and inert: no OrbStack, no VM, no network, no machine state anywhere.
 set -uo pipefail
-# install/test-render-parity.sh gates that every suite whose text mentions an app
-# installer pins the RAM the paseo installer takes its memory share from. The gate is a
-# deliberately coarse text scan — it does not reason about WHICH app a path resolves to
-# — so suites that never install paseo carry the pin anyway and it sits inert. Cheaper
-# than a gate that tries to be clever about which mention counts.
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+. "$(dirname "$0")/test-lib.sh"
+airlock_pin_paseo_mem
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT" || exit 1
 
-pass=0 fail=0
-ok()  { printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad() { printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 # Setup is checked, not assumed. This file runs without `set -e` (repo convention, so
 # one failing check does not hide the rest), which means an unwritable TMPDIR would

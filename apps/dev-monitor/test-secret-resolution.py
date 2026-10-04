@@ -26,6 +26,18 @@ spec.loader.exec_module(checker)
 
 
 class Pure(unittest.TestCase):
+    def test_loaded_bot_health_uses_same_sender_precedence(self):
+        for token, channel, hook, expected in (
+                ('synthetic-bot', 'C_TEST', '', True),
+                ('synthetic-bot', '', '', False),
+                ('', 'C_TEST', 'synthetic-hook', True),
+                ('unset-marker', 'C_TEST', '', False),
+                ('synthetic-bot', 'C_TEST', 'unset-marker', True)):
+            with self.subTest(token=token, channel=channel, hook=hook), patch.dict(
+                    os.environ, {'BOT': token, 'HOOK': hook}, clear=True):
+                self.assertEqual(checker.check_loaded([], 'unset-marker', 'slack-urgent',
+                                                      'HOOK', 'BOT', channel), expected)
+
     def test_preexec_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             file = Path(tmp) / 'synthetic.env'
@@ -61,7 +73,13 @@ class Pure(unittest.TestCase):
             runtime = {'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': 'legacy', 'HOOK': 'chosen'}
             if selector is not None: runtime['DEVMON_SLACK_WEBHOOK_NAME'] = selector
             with patch.dict(os.environ, runtime, clear=True):
-                self.assertEqual(backend['_slack_webhooks'](), slack_webhooks(runtime))
+                with patch('devmon_slack.send', return_value=(True, 200, None)) as send:
+                    sender = backend['_slack_sender']()
+                    expected = slack_webhooks(runtime)['slack-urgent']
+                    self.assertEqual(sender is not None, bool(expected))
+                    if sender:
+                        sender('hello')
+                        send.assert_called_once_with(expected, 'hello')
         self.assertEqual(slack_webhooks({'AIRLOCK_DEVMON_SLACK_WEBHOOK': 'alias'})['slack-urgent'], '')
         for value in ('', ' \n\t ', 'random-marker'):
             self.assertEqual(resolve({'HOOK': value}, 'HOOK', marker='random-marker'), '')

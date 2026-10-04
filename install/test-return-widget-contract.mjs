@@ -144,9 +144,20 @@ function run(dataset, options = {}) {
     // A tap: the widget navigates or opens its menu from the click handler.
     tap() { btn.dispatch("click", { preventDefault() {}, stopPropagation() {} }); },
     menu() { return body.children.find((c) => c !== btn && textOf(c).includes("Go to Airlock")); },
-    rows(menuEl) { return (menuEl ? menuEl.children : []).map((c) => (c.children[0] || {}).textContent || ""); },
+    // Only the actionable rows. The menu also carries a non-interactive caption that
+    // names the control ("Porthole"); it is asserted separately by caption() rather
+    // than counted as a destination, because it opens nothing.
+    rows(menuEl) {
+      return (menuEl ? menuEl.children : [])
+        .filter((c) => c.tagName === "BUTTON")
+        .map((c) => (c.children[0] || {}).textContent || "");
+    },
+    caption(menuEl) {
+      const head = (menuEl ? menuEl.children : []).find((c) => c.tagName !== "BUTTON");
+      return head ? head.textContent || "" : "";
+    },
     clickRow(menuEl, label) {
-      const row = menuEl.children.find((c) => (c.children[0] || {}).textContent === label);
+      const row = menuEl.children.find((c) => c.tagName === "BUTTON" && (c.children[0] || {}).textContent === label);
       if (!row) throw new Error(`no menu row: ${label}`);
       row.dispatch("click", { preventDefault() {}, stopPropagation() {} });
       const overlay = body.children[body.children.length - 1];
@@ -183,6 +194,8 @@ const ACCOUNT_PAGE = HUB + "panel.html?p=accounts&embed=1";
 const SECRET_PAGE = HUB + "panel.html?p=secret&embed=1";
 const ACCOUNT_ALERT = HUB + "acct-alert";
 
+const btnTitle = (w) => w.btn.title || "";
+
 // ------------------------------------------------- 1. both destinations given
 let bothRows = "", bothAcctSrc = "", bothSecretSrc = "", bothFetch = "";
 {
@@ -190,6 +203,12 @@ let bothRows = "", bothAcctSrc = "", bothSecretSrc = "", bothFetch = "";
   w.tap();
   const m = w.menu();
   check("both: the tap opens the menu", !!m);
+  // The menu is the one place a first-time reader can learn what this control is
+  // called. Without it the button is an anonymous green circle and every document
+  // ends up inventing its own word for it.
+  check("both: the menu names the control Porthole", w.caption(m) === "Porthole", w.caption(m));
+  check("both: the button says its name too",
+    String(btnTitle(w)).startsWith("Porthole"), String(btnTitle(w)));
   bothRows = JSON.stringify(w.rows(m));
   check("both: all four rows are present",
     bothRows === JSON.stringify(["Go to Airlock", "Inbox · 0 unread", "Subscription accounts", "Secret drop"]),

@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
 set -uo pipefail
-# Pin the RAM the paseo installer takes its memory share from (32GiB), so nothing in
-# this suite depends on the RAM of whichever box runs it: the share is 15/16 of the
-# box, so unpinned, every runner writes a different MemoryMax and the goldens bake in
-# whichever the runner happened to have. install/test-render-parity.sh gates that every
-# suite running a real app installer sets this — the gate does not reason about WHICH
-# app a dynamic path resolves to, so suites that only run other apps carry it too; the
-# seam is inert for them. (An intermediate design REFUSED below 8 GiB, which is what
-# made this urgent. The refusal is gone — owner, 2026-08-17 — the pin is still right.)
-export AIRLOCK_PASEO_MEM_CAP_BYTES=34359738368
+. "$(dirname "$0")/test-lib.sh"
+airlock_pin_paseo_mem
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 TMP="$(mktemp -d)" || { echo "FAIL could not create test directory" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 export AIRLOCK_STATE_DIR="$TMP/state"   # isolate the installed-state ledger from the dev box
-pass=0 fail=0
-ok(){ printf 'ok   %s\n' "$1"; pass=$((pass+1)); }
-bad(){ printf 'FAIL %s\n' "$1"; fail=$((fail+1)); }
+airlock_test_counters_init
 
 make_config() {
   local path="$1"; shift
@@ -102,8 +93,9 @@ else
   bad "hub-only preflight missed core git: rc=$nogit_rc out=$nogit_out"
 fi
 
-# Python is the one honest bootstrap exception: config cannot be parsed before
-# it is present and new enough.
+# Bootstrap only refuses a genuinely missing interpreter now (Installer
+# refusals: five) — an old or oddly-versioned python3 is still python3 and is
+# left for whatever actually needs a newer feature to fail on its own.
 OLDPY="$TMP/old-python"; cp -a "$BASE" "$OLDPY"; rm -f "$OLDPY/python3"
 cat >"$OLDPY/python3" <<'STUB'
 #!/usr/bin/env bash
@@ -113,23 +105,17 @@ chmod +x "$OLDPY/python3"
 oldpy_rc=0
 oldpy_out="$(HOME="$TEST_HOME" PATH="$OLDPY" /bin/bash -c \
   ". \"$ROOT/install/lib.sh\"; airlock_preflight_bootstrap" 2>&1)" || oldpy_rc=$?
-if [ "$oldpy_rc" = 1 ] && [[ "$oldpy_out" == *"python3 >=3.11"*wrong-version* ]]; then
-  ok "Python below 3.11 fails at bootstrap"
+if [ "$oldpy_rc" = 0 ] && [ -z "$oldpy_out" ]; then
+  ok "bootstrap no longer refuses an old python3 — only a missing one"
 else
   bad "old Python bootstrap result: rc=$oldpy_rc out=$oldpy_out"
 fi
-cat >"$OLDPY/python3" <<'STUB'
-#!/usr/bin/env bash
-echo 999999999999999999999.11
-STUB
-overflow_rc=0
-overflow_out="$(HOME="$TEST_HOME" PATH="$OLDPY" /bin/bash -c \
-  ". \"$ROOT/install/lib.sh\"; airlock_preflight_bootstrap" 2>&1)" || overflow_rc=$?
-if [ "$overflow_rc" = 1 ] && [[ "$overflow_out" == *wrong-version* ]] \
-  && [[ "$overflow_out" != *"value too great"* ]]; then
-  ok "bootstrap rejects oversized versions without arithmetic overflow"
+if bash -c ". \"$ROOT/install/lib.sh\"; ! airlock_preflight_version_ge 3.9 3.11 \
+  && airlock_preflight_version_ge 3.11 3.11 \
+  && airlock_preflight_version_ge 20 3.11"; then
+  ok "major/minor versions compare component-wise"
 else
-  bad "oversized Python version result: rc=$overflow_rc out=$overflow_out"
+  bad "version comparison treated dotted versions as decimals"
 fi
 if bash -c ". \"$ROOT/install/lib.sh\"; ! airlock_preflight_version_ge 3.9 3.11 \
   && airlock_preflight_version_ge 3.11 3.11 \
@@ -229,9 +215,8 @@ else
 fi
 
 # Paseo supports an nvm runtime, so runtime selection must happen before the
-# version probe and receipt publication. The actual installer repeats the same
-# helper for direct invocation, while an orchestrated child retains the receipt's
-# selection instead of sourcing nvm again.
+# version probe. The actual installer repeats the same airlock_load_nvm call
+# at its own call site (checked below via the real apps/paseo/install.sh).
 NVM_ALL="$TMP/nvm-ambient"; mkdir -p "$NVM_ALL"
 while IFS= read -r cmd; do make_stub "$NVM_ALL" "$cmd"; done \
   < <(awk -F '\t' 'NF >= 2 {print $2}' "$ASSEMBLED_PREREQS" | sort -u)
@@ -299,9 +284,6 @@ run_paseo_install() {
     AIRLOCK_CONFIG="$NVM_INSTALL_CFG" AIRLOCK_ROOT="$ROOT" \
     AIRLOCK_APP_DIR="$ROOT/apps/paseo" AIRLOCK_APP_ID="paseo" \
     AIRLOCK_CONFD="$(mktemp -d -p "$TMP")" AIRLOCK_STATE_DIR="$state" \
-    AIRLOCK_PREREQ_RECEIPT="${AIRLOCK_PREREQ_RECEIPT:-}" \
-    AIRLOCK_PREREQ_CONTEXT="${AIRLOCK_PREREQ_CONTEXT:-}" \
-    AIRLOCK_INSTALL_PKG_INFO_SHA256="${AIRLOCK_INSTALL_PKG_INFO_SHA256:-}" \
     NVM_LOAD_COUNT_FILE="${NVM_LOAD_COUNT_FILE:-}" \
     AIRLOCK_DRY_RUN=1 /bin/bash "$script" 2>&1
 }
@@ -339,79 +321,41 @@ else
   fi
 fi
 
-# The orchestrator's receipt is the runtime selection boundary. Preflight starts
-# with the valid ambient Node 20 below, selects NVM Node 22, and records that path.
-# Paseo must not select again in its real installer; a genuinely changed PATH
-# after receipt publication must still fail at the existing drift gate.
-NVM_APPROVED="$TMP/nvm-approved"; cp -a "$NVM_ALL" "$NVM_APPROVED"
-cat >"$NVM_APPROVED/node" <<'STUB'
-#!/usr/bin/env bash
-case "$*" in *process.execPath*) echo "$0" ;; *process.versions.node*) echo 20 ;; *) echo v20.0.0 ;; esac
-STUB
-chmod +x "$NVM_APPROVED/node"
-NVM_RECEIPT="$TMP/nvm-runtime.receipt"
-NVM_CONTEXT="fixture=paseo-runtime"
-NVM_LOAD_COUNT_FILE="$TMP/nvm-load-count"
-nvm_receipt_rc=0
-HOME="$NVM_HOME" PATH="$NVM_APPROVED:/usr/bin:/bin" AIRLOCK_CONFIG="$NVM_INSTALL_CFG" \
-  AIRLOCK_PREREQ_RECEIPT="$NVM_RECEIPT" AIRLOCK_PREREQ_CONTEXT="$NVM_CONTEXT" \
-  NVM_LOAD_COUNT_FILE="$NVM_LOAD_COUNT_FILE" \
-  /bin/bash "$ROOT/bin/airlock-preflight" --quiet >/dev/null 2>&1 || nvm_receipt_rc=$?
-AIRLOCK_PREREQ_RECEIPT="$NVM_RECEIPT"
-AIRLOCK_PREREQ_CONTEXT="$NVM_CONTEXT"
-AIRLOCK_INSTALL_PKG_INFO_SHA256="$(printf 'd%.0s' {1..64})"
-nvm_orchestrated_rc=0
-nvm_orchestrated_out="$(run_paseo_install "$ROOT/apps/paseo/install.sh" "$NVM_HOME/nvm-bin:$NVM_APPROVED")" \
-  || nvm_orchestrated_rc=$?
-if [ "$nvm_receipt_rc" = 0 ] && [ "$nvm_orchestrated_rc" = 0 ] \
-  && [ "$(wc -l <"$NVM_LOAD_COUNT_FILE")" = 1 ]; then
-  ok "orchestrated Paseo selects nvm once, before its real preflight receipt"
-else
-  bad "orchestrated Paseo changed its approved node runtime: preflight_rc=$nvm_receipt_rc install_rc=$nvm_orchestrated_rc out=$nvm_orchestrated_out"
-fi
-NVM_DRIFT="$TMP/nvm-drift"; mkdir -p "$NVM_DRIFT"
-cp "$NVM_APPROVED/node" "$NVM_DRIFT/node"
-nvm_drift_rc=0
-nvm_drift_out="$(run_paseo_install "$ROOT/apps/paseo/install.sh" "$NVM_DRIFT:$NVM_HOME/nvm-bin:$NVM_APPROVED")" \
-  || nvm_drift_rc=$?
-if [ "$nvm_drift_rc" != 0 ] \
-  && [[ "$nvm_drift_out" == *"required command changed after preflight: node"* ]]; then
-  ok "an external node PATH change after receipt publication is still rejected"
-else
-  bad "external node PATH drift escaped the receipt gate: rc=$nvm_drift_rc out=$nvm_drift_out"
-fi
-unset AIRLOCK_PREREQ_RECEIPT AIRLOCK_PREREQ_CONTEXT AIRLOCK_INSTALL_PKG_INFO_SHA256 \
-  NVM_LOAD_COUNT_FILE
+unset NVM_LOAD_COUNT_FILE
 
-# Child 4/P3: an unknown app is fatal at validate now (the local/custom-app
-# escape hatch retired with the built-in registry) — bin/airlock-preflight
-# calls `airlock_config validate` before anything else, so this dies there,
-# exit 2, before preflight's own declaration-inventory logic ever runs.
+# Gate-zero (#807, bin/airlock-config): an unknown app no longer refuses at
+# validate — it is a warning (no defaults; typo?) and the config still
+# processes. Preflight has no prerequisite declarations for it either, so a
+# hub-only inventory still passes cleanly.
 make_config "$TMP/custom.toml" hub local-tool
 custom_rc=0
 custom_out="$(run_preflight "$TMP/custom.toml" "$BASE" 2>&1)" || custom_rc=$?
-if [ "$custom_rc" = 2 ] && [[ "$custom_out" == *"unknown app"* ]]; then
-  ok "unknown app is fatal at validate (built-in fallback retired)"
+if [ "$custom_rc" = 0 ]; then
+  ok "unknown app no longer refuses at validate (warning only)"
 else
   bad "unknown app behavior changed: rc=$custom_rc out=$custom_out"
 fi
 
-# Declaration errors are contract errors (2), not host failures (1).
+# Shape/schema errors in the declaration TSV no longer refuse a preflight run
+# (Installer refusals: five) — a row this box's own maintained TSV/manifest
+# assembly would never produce is treated leniently instead of aborting a
+# healthy box. What still matters is that a genuinely missing command is
+# still reported.
 printf 'core\tnginx\tunknown\t-\tfix\tnote\n' >"$TMP/bad.tsv"
 bad_decl_rc=0
 run_engine_inventory "$TMP/hub.toml" "$BASE" "$TMP/bad.tsv" \
   >/dev/null 2>&1 || bad_decl_rc=$?
-if [ "$bad_decl_rc" = 2 ]; then
-  ok "invalid declaration exits 2"
+if [ "$bad_decl_rc" = 0 ]; then
+  ok "an unrecognized predicate does not abort preflight (nginx is present)"
 else
-  bad "invalid declaration exit was $bad_decl_rc"
+  bad "unrecognized predicate exit was $bad_decl_rc"
 fi
 printf 'typo-app\tcurl\tpresent\t-\tfix\tnote\n' >"$TMP/bad-owner.tsv"
 bad_owner_rc=0
 run_engine_inventory "$TMP/hub.toml" "$BASE" "$TMP/bad-owner.tsv" \
   >/dev/null 2>&1 || bad_owner_rc=$?
-if [ "$bad_owner_rc" = 2 ]; then
-  ok "unknown declaration owner exits 2"
+if [ "$bad_owner_rc" = 0 ]; then
+  ok "a declaration for a disabled/unknown owner is simply not evaluated"
 else
   bad "unknown declaration owner exit was $bad_owner_rc"
 fi
@@ -419,8 +363,8 @@ printf 'core\tnginx\tpresent\t-\tfix\tnote\ncore\tnginx\tpresent\t-\tfix\tnote\n
 duplicate_rc=0
 run_engine_inventory "$TMP/hub.toml" "$BASE" "$TMP/duplicate.tsv" \
   >/dev/null 2>&1 || duplicate_rc=$?
-if [ "$duplicate_rc" = 2 ]; then
-  ok "duplicate declaration exits 2"
+if [ "$duplicate_rc" = 0 ]; then
+  ok "a duplicate declaration merges instead of aborting (nginx is present)"
 else
   bad "duplicate declaration exit was $duplicate_rc"
 fi
@@ -428,8 +372,8 @@ fi
 empty_rc=0
 run_engine_inventory "$TMP/hub.toml" "$BASE" "$TMP/empty.tsv" \
   >/dev/null 2>&1 || empty_rc=$?
-if [ "$empty_rc" = 2 ]; then
-  ok "empty declaration file exits 2"
+if [ "$empty_rc" = 0 ]; then
+  ok "an empty declaration file has nothing to check and passes"
 else
   bad "empty declaration file exit was $empty_rc"
 fi
@@ -438,10 +382,10 @@ printf 'core\tdefinitely-missing\tpresent\t-\t\tfix\tnote\n' >>"$TMP/empty-field
 empty_field_rc=0
 empty_field_out="$(run_engine_inventory "$TMP/hub.toml" "$BASE" \
   "$TMP/empty-field.tsv" 2>&1)" || empty_field_rc=$?
-if [ "$empty_field_rc" = 2 ] && [[ "$empty_field_out" == *"invalid declaration"* ]]; then
-  ok "empty declaration fields fail before tab splitting"
+if [ "$empty_field_rc" = 1 ] && [[ "$empty_field_out" == *definitely-missing*missing* ]]; then
+  ok "a genuinely missing command is still reported even with a blank fix field"
 else
-  bad "empty declaration field was accepted: rc=$empty_field_rc out=$empty_field_out"
+  bad "missing command with a blank fix field was not reported: rc=$empty_field_rc out=$empty_field_out"
 fi
 apps_failure_rc=0
 HOME="$TEST_HOME" PATH="$BASE" /bin/bash -c \
@@ -473,20 +417,27 @@ else
   bad "failing prereqs assembly exit was $assembly_rc"
 fi
 
+# Gate-zero (#807, bin/airlock-config): an empty/minimal config (no [auth],
+# etc.) no longer refuses as a contract error — it is accepted and preflight
+# has nothing core-only to fail on.
 invalid_config_rc=0
 run_preflight /dev/null "$BASE" --quiet >/dev/null 2>&1 || invalid_config_rc=$?
-if [ "$invalid_config_rc" = 2 ]; then
-  ok "standalone config contract errors exit 2"
+if [ "$invalid_config_rc" = 0 ]; then
+  ok "an empty config no longer refuses at validate"
 else
   bad "standalone invalid config exit was $invalid_config_rc"
 fi
+# The installer no longer runs a standalone `airlock_config validate` step
+# before anything else (Installer refusals: five removed that schema gate) —
+# an invalid config now surfaces wherever it first breaks something real
+# (here, install/lib.sh's own die(), rc=1), not at a dedicated contract exit.
 installer_config_rc=0
 HOME="$TEST_HOME" PATH="$BASE" AIRLOCK_CONFIG=/dev/null AIRLOCK_DRY_RUN=1 \
   /bin/bash "$ROOT/install/airlock-install.sh" >/dev/null 2>&1 || installer_config_rc=$?
-if [ "$installer_config_rc" = 2 ]; then
-  ok "installer config contract errors exit 2"
+if [ "$installer_config_rc" != 0 ]; then
+  ok "installer still fails on an invalid config (rc=$installer_config_rc), just not at a dedicated validate step"
 else
-  bad "installer invalid config exit was $installer_config_rc"
+  bad "installer accepted an invalid config: rc=$installer_config_rc"
 fi
 NOPY="$TMP/no-python"; cp -a "$BASE" "$NOPY"; rm -f "$NOPY/python3"
 bootstrap_first_rc=0

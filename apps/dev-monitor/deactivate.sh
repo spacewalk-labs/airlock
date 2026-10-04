@@ -2,8 +2,11 @@
 # dev-monitor deactivate — no app-specific stop step. The ledger's generic
 # "units" class already stops/disables/deletes airlock-dev-monitor.service
 # (D5 amendment), and the generic "files" class removes
-# ~/.config/airlock/dev-monitor.env. The message/action console's tmux exec
-# session is deliberately left running here for the same reason
+# ~/.config/airlock/dev-monitor.env.
+# The generic fragments/serve classes also retire the ingest nginx server and
+# its manifest-declared HTTPS mapping, using the recorded port rather than config.
+# The message/action console's tmux exec session is deliberately left running here
+# for the same reason
 # install.sh's own messages=true->false transition leaves it running
 # (apps/dev-monitor/install.sh: "does not reach into a run that is already
 # going") — and unlike that live-reconcile path, deactivate.sh runs with

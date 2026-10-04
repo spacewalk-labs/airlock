@@ -1,0 +1,45 @@
+--- a/@getpaseo/server/dist/server/server/workspace-git-service.js
++++ b/@getpaseo/server/dist/server/server/workspace-git-service.js
+@@
+-const DEGRADED_GIT_POLL_INTERVAL_MS = 5000;
++    // [paseo-watch-recovery] (see workspace-git-watch-recovery.mjs for the replacement)
+@@
+-const WATCH_RECOVERY_MAX_ATTEMPTS = 3;
++    // [paseo-watch-recovery] (see workspace-git-watch-recovery.mjs for the replacement)
+@@
+-    scheduleWorkingTreeWatchRecovery(target) {
+-        if (target.closed ||
+-            target.subscription ||
+-            target.recovery.timer ||
+-            target.recovery.attemptCount >= WATCH_RECOVERY_MAX_ATTEMPTS) {
+-            return;
+-        }
+-        target.recovery.attemptCount += 1;
+-        const delayMs = WATCH_RECOVERY_BASE_DELAY_MS * 2 ** (target.recovery.attemptCount - 1);
++    // [paseo-watch-recovery] (see workspace-git-watch-recovery.mjs for the replacement)
+@@
+-        target.fallbackPolling = true;
+-        const { cwd } = target;
+-        const poll = async () => {
+-            target.fallbackPollTimer = null;
+-            if (target.closed || this.workingTreeWatchTargets.get(target.cwd) !== target) {
+-                return;
+-            }
+-            await Promise.all(Array.from(target.workspaceKeys, async (workspaceKey) => {
+-                const workspaceTarget = this.workspaceTargets.get(workspaceKey);
+-                if (!workspaceTarget) {
+-                    return;
+-                }
+-                await this.refreshWorkspaceTarget(workspaceTarget, {
++    // [paseo-watch-recovery] (see workspace-git-watch-recovery.mjs for the replacement)
+@@
+-                if (target.repoRoot === null && workspaceTarget.latestGit?.isGit === true) {
+-                    workspaceTarget.observationSetupComplete = false;
+-                    this.scheduleWorkspaceObservationSetup(workspaceTarget);
+-                }
+-            }));
+-            this.notifyWorkingTreeConsumers(target);
+-            if (!target.closed && (target.subscription === null || target.repoRoot === null)) {
+-                target.fallbackPollTimer = setTimeout(poll, DEGRADED_GIT_POLL_INTERVAL_MS);
+-            }
++    // [paseo-watch-recovery] (see workspace-git-watch-recovery.mjs for the replacement)
