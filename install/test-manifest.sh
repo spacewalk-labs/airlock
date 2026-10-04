@@ -1494,5 +1494,24 @@ print(len(p), p["same"]["source"], p["same"]["rows"][0]["key"])
   || bad "H63 repeated projection name resolved to: $h63_duplicate"
 
 
+# C09: example-box's installed legacy perlite registries have no config table binding.
+reset_box
+pkg="$PKGROOT/legacy-perlite"; mkpkg "$pkg" perlite
+pkg_manifest "$pkg" 'contract = 1' 'id = "perlite"' \
+  '[[serve.https_registry]]' 'path = "~/.config/perlite/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "enabled"' \
+  'listen = "https_port"' 'target = "gate_port"' \
+  '[[registry]]' 'name = "vaults"' 'path = "~/.config/perlite/vaults.json"' \
+  'entries = "vaults"' 'key = "id"' 'enabled = "enabled"' 'enabled_default = true'
+cfg="$CFGROOT/legacy-perlite.toml"; make_pkg_cfg "$cfg" perlite "$pkg"
+legacy_info="$(run "$cfg" package-info 2>/dev/null)"; legacy_rc=$?
+if [ "$legacy_rc" = 0 ] && printf '%s' "$legacy_info" | python3 -c '
+import json,sys
+p=json.load(sys.stdin)["packages"]["perlite"]
+assert p["serve_registry_rows"] == [] and p["registry_projections"] == {}, p
+' && run "$cfg" install-preflight >/dev/null 2>&1; then
+  ok "C09 table-less installed legacy registries skip projection and do not block preflight"
+else bad "C09 legacy registry projection still blocks unrelated install"; fi
+
 printf 'passed=%d failed=%d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

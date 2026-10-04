@@ -773,6 +773,8 @@ def _resolve_registries(pid: str, spec: dict, app_table: dict) -> tuple[dict, li
         return source, hashlib.sha256(canonical.encode("utf-8")).hexdigest(), value
 
     for registry_index, declaration in enumerate(spec["https_registries"]):
+        if not declaration.get("table"):
+            continue
         source, source_digest, document = document_of(declaration)
         if document is None:
             continue
@@ -806,6 +808,8 @@ def _resolve_registries(pid: str, spec: dict, app_table: dict) -> tuple[dict, li
             })
 
     for declaration in spec["data_registries"]:
+        if not declaration.get("table"):
+            continue
         name = declaration["name"]
         source, source_digest, document = document_of(declaration)
         if document is None:
