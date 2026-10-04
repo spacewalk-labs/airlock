@@ -626,6 +626,63 @@ else
   fi
 fi
 
+# --- 2b. send_agent_message may keep the receiving seat's pending permissions ---
+# Upstream pins clearPendingPermissions=true, so an automatic steer message (session-delivery)
+# denies the permission request the seat was waiting on. Optional boolean on the request; absent
+# = true, so human/UI sends are unchanged. Schema (protocol), handler (server) and sender (client)
+# are one patch: schema-only strips nothing but is inert, server-only never sees the field, and a
+# client sending the field to an unpatched schema has it stripped. The server file changes -> restart.
+SENDKEEP_PATCHER="$HERE/patches/send-keep-pending-permissions.mjs"
+SENDKEEP_TEST="$HERE/patches/send-keep-pending-permissions.test.mjs"
+SENDKEEP_MESSAGES="$NPM_ROOT/@getpaseo/protocol/dist/messages.js"
+SENDKEEP_CLIENT="$NPM_ROOT/@getpaseo/client/dist/daemon-client.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply send-keep-pending-permissions patch to $SENDKEEP_MESSAGES, $SESSION_JS and $SENDKEEP_CLIENT"
+elif [ ! -f "$SENDKEEP_MESSAGES" ] || [ ! -f "$SESSION_JS" ] || [ ! -f "$SENDKEEP_CLIENT" ]; then
+  log "warning: send-keep-pending-permissions target missing — skipped"
+elif [ ! -f "$SENDKEEP_PATCHER" ] || [ ! -f "$SENDKEEP_TEST" ]; then
+  log "warning: send-keep-pending-permissions patcher or behaviour test missing under $HERE — skipped"
+else
+  sk_files=("$SENDKEEP_MESSAGES" "$SESSION_JS" "$SENDKEEP_CLIENT")
+  sk_clean() { rm -f "${sk_files[0]}.paseo-new.mjs" "${sk_files[1]}.paseo-new.mjs" "${sk_files[2]}.paseo-new.mjs"; }
+  sk_clean
+  sk_rc=0
+  sk_out="$(node "$SENDKEEP_PATCHER" "${sk_files[@]}" 2>&1)" || sk_rc=$?
+  case "$sk_rc" in
+    10) log "send-keep-pending-permissions already applied" ;;
+    20) log "warning: send-keep-pending-permissions anchor missing, duplicated or mixed (paseo drift) — skipped: $sk_out" ;;
+    0)
+      if [ ! -f "${sk_files[0]}.paseo-new.mjs" ] || [ ! -f "${sk_files[1]}.paseo-new.mjs" ] || [ ! -f "${sk_files[2]}.paseo-new.mjs" ]; then
+        sk_clean
+        log "warning: send-keep-pending-permissions did not produce all three candidates — skipped"
+      elif ! node --check "${sk_files[0]}.paseo-new.mjs" || ! node --check "${sk_files[1]}.paseo-new.mjs" \
+        || ! node --check "${sk_files[2]}.paseo-new.mjs"; then
+        sk_clean
+        log "warning: send-keep-pending-permissions candidate is invalid JS — not applied"
+      elif ! node "$SENDKEEP_TEST" "${sk_files[0]}.paseo-new.mjs" "${sk_files[1]}.paseo-new.mjs" "${sk_files[2]}.paseo-new.mjs" >/dev/null 2>&1; then
+        sk_clean
+        log "warning: send-keep-pending-permissions candidates failed their behaviour check — not applied"
+      else
+        mv "${sk_files[0]}.paseo-new.mjs" "${sk_files[0]}" || die "send-keep-pending-permissions protocol mv failed"
+        mv "${sk_files[1]}.paseo-new.mjs" "${sk_files[1]}" || die "send-keep-pending-permissions session.js mv failed"
+        mv "${sk_files[2]}.paseo-new.mjs" "${sk_files[2]}" || die "send-keep-pending-permissions client mv failed"
+        need_restart=1
+        log "send-keep-pending-permissions applied"
+      fi
+      ;;
+    *) log "warning: send-keep-pending-permissions patcher error (rc=$sk_rc): $sk_out — skipped" ;;
+  esac
+  # The sentinel is only a comment; refuse a partially applied trio before any restart.
+  sk_hits=0
+  for sk_f in "${sk_files[@]}"; do grep -qF 'paseo-send-keep-pending-permissions' "$sk_f" && sk_hits=$((sk_hits + 1)); done
+  if [ "$sk_hits" -ne 0 ]; then
+    [ "$sk_hits" -eq 3 ] || die "installed send-keep-pending-permissions is partially applied"
+    node "$SENDKEEP_TEST" "${sk_files[@]}" >/dev/null 2>&1 \
+      || die "installed send-keep-pending-permissions behavior check failed"
+    log "send-keep-pending-permissions behaviour check passed"
+  fi
+fi
+
 # Removal of a cached row must survive an empty changes-only subscription bootstrap.
 WORKSPACE_REMOVE_PATCHER="$HERE/patches/workspace-remove-delivery.mjs"
 WORKSPACE_REMOVE_TEST="$HERE/patches/workspace-remove-delivery.test.mjs"

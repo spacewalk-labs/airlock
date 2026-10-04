@@ -415,6 +415,16 @@
       ]
     },
     {
+      "id": "send-keep-pending-permissions",
+      "source": "apps/paseo/patches/send-keep-pending-permissions.mjs",
+      "anchors": [
+        "const SCHEMA_ANCHOR = lines(",
+        "const SERVER_ANCHOR = lines(",
+        "const CLIENT_ANCHOR = lines(",
+        "[paseo-send-keep-pending-permissions]"
+      ]
+    },
+    {
       "id": "patch-web-ui",
       "source": "apps/paseo/browse-host/bin/patch-web-ui.js",
       "anchors": [

@@ -262,6 +262,14 @@ Only those two tar members changed; both checksum files and reference patches
 were regenerated. This is a temporary freshness tradeoff pending a durable fix
 to observation demand and metadata fanout.
 
+`send-keep-pending-permissions` is baked into three tar members (2026-10-05):
+`@getpaseo/protocol` `dist/messages.js`, `@getpaseo/server` `session.js` and
+`@getpaseo/client` `dist/daemon-client.js`. All three are checksum-pinned, so an
+install-time-only version would mutate pinned files on every run (the hazard above).
+The installer still calls the patcher and sees `ALREADY`. Only those three members
+changed; both checksum files were regenerated. The daemon restarts once because the
+bundle identity changed.
+
 The web-ui patcher (`browse-host/bin/patch-web-ui.js`) is re-derived for
 0.8.0 — all 10 anchors updated (the bundle's persistence layer alone moved
 from `createJSONStorage` to a validated wrapper,

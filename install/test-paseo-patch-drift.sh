@@ -153,6 +153,7 @@ const expected = new Set([
   "acp-agy-shared-catalog",
   "agent-resolve-by-id",
   "archive-consistency",
+  "send-keep-pending-permissions",
   "schedule-pending-delivery-schema",
   "schedule-busy-pending-delivery",
   "schedule-stale-due-run",
@@ -970,6 +971,70 @@ if grep -qF 'ARCHIVE_CONSISTENCY_PATCHER="$HERE/patches/archive-consistency.mjs"
   ok "archive/workspace consistency: installer applies, verifies candidate, and rechecks installed bytes"
 else
   bad "archive/workspace consistency: installer wiring is absent"
+fi
+
+# ------------------------------------------------ send keeps pending permissions
+# Pristine pinned protocol/server/client files must yield three behavior-valid candidates;
+# a second pass over the patched trio is ALREADY, and a mixed trio is refused with no candidates.
+SK_DIR="$TMP/send-keep"
+mkdir -p "$SK_DIR"
+sk_extract_rc=0
+tar -xOf "$history_bundle/getpaseo-protocol-0.8.0.tgz" package/dist/messages.js >"$SK_DIR/messages.js" 2>/dev/null || sk_extract_rc=$?
+tar -xOf "$history_bundle/getpaseo-server-0.8.0.tgz" package/dist/server/server/session.js >"$SK_DIR/session.js" 2>/dev/null || sk_extract_rc=$?
+tar -xOf "$history_bundle/getpaseo-client-0.8.0.tgz" package/dist/daemon-client.js >"$SK_DIR/daemon-client.js" 2>/dev/null || sk_extract_rc=$?
+if [ "$sk_extract_rc" -ne 0 ]; then
+  bad "send-keep-pending-permissions: pinned bundle targets could not be extracted"
+elif [ "$(grep -lF 'paseo-send-keep-pending-permissions' "$SK_DIR/messages.js" "$SK_DIR/session.js" "$SK_DIR/daemon-client.js" | wc -l)" -eq 3 ]; then
+  # Baked into the vendored tarballs: the installer must see ALREADY and leave the pinned files alone.
+  sk_baked_rc=0
+  node "$PATCH_DIR/send-keep-pending-permissions.mjs" "$SK_DIR/messages.js" "$SK_DIR/session.js" "$SK_DIR/daemon-client.js" >/dev/null 2>&1 || sk_baked_rc=$?
+  if [ "$sk_baked_rc" -eq 10 ] \
+    && node --check "$SK_DIR/messages.js" >/dev/null 2>&1 \
+    && node --check "$SK_DIR/session.js" >/dev/null 2>&1 \
+    && node --check "$SK_DIR/daemon-client.js" >/dev/null 2>&1; then
+    ok "send-keep-pending-permissions: pinned bundle trio is baked, syntax-valid and idempotent"
+  else
+    bad "send-keep-pending-permissions: baked pinned trio did not report already-applied (rc=$sk_baked_rc)"
+  fi
+else
+  sk_rc=0
+  node "$PATCH_DIR/send-keep-pending-permissions.mjs" "$SK_DIR/messages.js" "$SK_DIR/session.js" "$SK_DIR/daemon-client.js" >/dev/null 2>&1 || sk_rc=$?
+  if [ "$sk_rc" -eq 0 ] \
+    && node --check "$SK_DIR/session.js.paseo-new.mjs" >/dev/null 2>&1 \
+    && node --check "$SK_DIR/daemon-client.js.paseo-new.mjs" >/dev/null 2>&1 \
+    && node --check "$SK_DIR/messages.js.paseo-new.mjs" >/dev/null 2>&1; then
+    # The behaviour test imports zod via the protocol package, which the vendored tarballs do not
+    # carry; the installer runs it against the real installed tree before any mv.
+    ok "send-keep-pending-permissions: pristine pinned bundle produces syntax-valid trio candidates"
+  else
+    bad "send-keep-pending-permissions: pristine pinned bundle trio patch failed (rc=$sk_rc)"
+  fi
+  # Mixed: only the server file patched -> exit 20 and no new candidates.
+  cp "$SK_DIR/session.js.paseo-new.mjs" "$SK_DIR/session-mixed.js"
+  rm -f "$SK_DIR"/*.paseo-new.mjs
+  sk_mixed_rc=0
+  node "$PATCH_DIR/send-keep-pending-permissions.mjs" "$SK_DIR/messages.js" "$SK_DIR/session-mixed.js" "$SK_DIR/daemon-client.js" >/dev/null 2>&1 || sk_mixed_rc=$?
+  if [ "$sk_mixed_rc" -eq 20 ] && ! ls "$SK_DIR"/*.paseo-new.mjs >/dev/null 2>&1; then
+    ok "send-keep-pending-permissions: mixed trio is refused without candidates"
+  else
+    bad "send-keep-pending-permissions: mixed trio was not refused atomically (rc=$sk_mixed_rc)"
+  fi
+  # Drift: a broken client anchor -> exit 20 and no candidates.
+  sed 's/options?\.images/options?.imagez/' "$SK_DIR/daemon-client.js" >"$SK_DIR/client-drift.js"
+  sk_drift_rc=0
+  node "$PATCH_DIR/send-keep-pending-permissions.mjs" "$SK_DIR/messages.js" "$SK_DIR/session.js" "$SK_DIR/client-drift.js" >/dev/null 2>&1 || sk_drift_rc=$?
+  if [ "$sk_drift_rc" -eq 20 ] && ! ls "$SK_DIR"/*.paseo-new.mjs >/dev/null 2>&1; then
+    ok "send-keep-pending-permissions: anchor drift is refused without candidates"
+  else
+    bad "send-keep-pending-permissions: anchor drift was not refused (rc=$sk_drift_rc)"
+  fi
+fi
+if grep -qF 'SENDKEEP_PATCHER="$HERE/patches/send-keep-pending-permissions.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'node "$SENDKEEP_TEST" "${sk_files[0]}.paseo-new.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'node "$SENDKEEP_TEST" "${sk_files[@]}"' "$ROOT/apps/paseo/install.sh"; then
+  ok "send-keep-pending-permissions: installer applies, verifies candidates, and rechecks installed bytes"
+else
+  bad "send-keep-pending-permissions: installer wiring is absent"
 fi
 
 # ------------------------------------------------------- schedule stale-due + single list

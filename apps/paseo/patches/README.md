@@ -259,6 +259,22 @@ upstream changed licence again.
   records across both paths. This server read/update patch requires a daemon restart when newly
   applied.
 
+- **`send-keep-pending-permissions.mjs`** (+ `.test.mjs`) — the daemon's `send_agent_message_request`
+  handler hard-codes `clearPendingPermissions: true`, so an automatic inter-session message
+  (session-delivery, `activeTurnBehavior: "steer"`) denies the permission request the receiving seat
+  was waiting on. The request gains an optional boolean `clearPendingPermissions`; the handler uses
+  `msg.clearPendingPermissions ?? true`, so a sender that omits it (the browser UI, a human) keeps
+  today's behaviour, and the client's `sendAgentMessage` forwards the option only when it is a
+  boolean. Three files, one patch id, all-or-nothing: `@getpaseo/protocol` `dist/messages.js` (zod
+  strips unknown keys, so the schema must learn the field), `@getpaseo/server` `session.js` and
+  `@getpaseo/client` `dist/daemon-client.js`; every anchor must be present and unique or exit 20,
+  a mixed state also exits 20, and nothing is written. The `Session.sendText` site (a human typing
+  or speaking) is untouched. The behaviour test drives the real zod schema and the shipped client and
+  server methods with stubs: absent -> `true`, `false` -> `false`. Baked into the three vendored
+  tarballs (all three files are checksum-pinned; see `../vendor/guarded-0.8.0/README.md`), so the
+  installer normally sees `ALREADY`. Server file changes, so a newly applied patch needs a daemon restart. Senders opt in by passing `clearPendingPermissions: false`
+  to `DaemonClient.sendAgentMessage`; this patch alone changes no sender.
+
 - **`anchor-manifest.json`** — records the pinned Paseo/web-ui version, the pristine
   web-ui SHA, the **shape table** (every bundle state the fleet is known to carry: the
   pinned bundle plus a named subset of the web-ui edits), every patcher's representative
