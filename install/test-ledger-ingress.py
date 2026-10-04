@@ -314,5 +314,162 @@ class IngressTests(unittest.TestCase):
         self.assert_operator()
 
 
+    def test_cut_unrelated_rows_and_metadata_do_not_block(self):
+        directory = self.local_app("alpha")
+        unrelated = {
+            "beta": {"repo": 42, "commit": "release-name", "artifacts": ["relative", None],
+                     "operator_note": {"keep": True}},
+            "../metadata": "uninterpreted",
+        }
+        self.put("state/installed-apps.json", unrelated)
+        self.ledger("list")
+        self.ledger("project")
+        self.ledger("apply", "alpha", "--source", str(directory))
+        rows = self.loaded()
+        self.assertEqual({key: rows[key] for key in unrelated}, unrelated)
+        rows["alpha"]["operator_note"] = "preserve on reapply"
+        self.put("state/installed-apps.json", rows)
+        self.ledger("apply", "alpha", "--source", str(directory))
+        self.assertEqual(self.loaded()["alpha"]["operator_note"], "preserve on reapply")
+        snapshot = self.base / "snapshot.json"
+        snapshot.write_bytes((self.base / "state/installed-apps.json").read_bytes())
+        self.ledger("remove", "alpha")
+        self.assertEqual(self.loaded(), unrelated)
+        code = ('from importlib.machinery import SourceFileLoader\n'
+                'from pathlib import Path\nimport sys\n'
+                'm=SourceFileLoader("cut_restore",sys.argv[1]).load_module()\n'
+                'sys.exit(m.restore_apps(Path(sys.argv[2]).read_bytes()))\n')
+        self.command(sys.executable, "-B", "-c", code,
+                     str(ROOT / "bin/airlock-ledger"), str(snapshot))
+        rows = self.loaded()
+        self.assertIn("alpha", rows)
+        self.assertEqual(rows["alpha"]["operator_note"], "preserve on reapply")
+        self.assertEqual({key: rows[key] for key in unrelated}, unrelated)
+        self.put("state/installed-apps.json", {})
+        self.command(sys.executable, "-B", "-c", code,
+                     str(ROOT / "bin/airlock-ledger"), str(snapshot))
+        rows = self.loaded()
+        self.assertIn("alpha", rows)
+        self.assertEqual(rows["alpha"]["operator_note"], "preserve on reapply")
+        self.assertEqual({key: rows[key] for key in unrelated}, unrelated)
+
+        incomplete = {'repo': 'https://example.invalid/team/apps.git', 'artifacts': []}
+        archived = json.loads(snapshot.read_text())
+        archived['company-missing-commit'] = incomplete
+        retry_source = self.base / 'sources/retry-source'
+        archived['retry-source'] = {'repo': str(retry_source), 'artifacts': []}
+        snapshot.write_text(json.dumps(archived))
+        snapshot_bytes = snapshot.read_bytes()
+        self.write(directory / 'install.sh',
+                   '#!/bin/sh\nprintf "alpha\\n" >>"$HOME/restore-attempts"\n')
+        self.put('state/installed-apps.json', {})
+        result = self.command(sys.executable, '-B', '-c', code,
+                              str(ROOT / 'bin/airlock-ledger'), str(snapshot), ok=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('restore company-missing-commit failed', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        rows = self.loaded()
+        self.assertIn('alpha', rows)
+        self.assertEqual(rows['alpha']['operator_note'], 'preserve on reapply')
+        self.assertNotIn('company-missing-commit', rows)
+        self.assertNotIn('retry-source', rows)
+        self.assertEqual(snapshot.read_bytes(), snapshot_bytes)
+        self.local_app('retry-source')
+        self.write(retry_source / 'install.sh',
+                   '#!/bin/sh\nprintf "retry-source\\n" >>"$HOME/restore-attempts"\n')
+        result = self.command(sys.executable, '-B', '-c', code,
+                              str(ROOT / 'bin/airlock-ledger'), str(snapshot), ok=False)
+        self.assertEqual(result.returncode, 1)  # Company commit is still absent.
+        self.assertIn('retry-source', self.loaded())
+        self.assertNotIn('company-missing-commit', self.loaded())
+        self.assertEqual(snapshot.read_bytes(), snapshot_bytes)
+        self.assertEqual((self.base / 'home/restore-attempts').read_text(),
+                         'alpha\nretry-source\n')
+
+        failed_hook = self.local_app('retry-hook')
+        self.write(failed_hook / 'install.sh', '#!/bin/sh\nexit 42\n')
+        hook_snapshot = self.base / 'hook-snapshot.json'
+        hook_snapshot.write_text(json.dumps({
+            'alpha': archived['alpha'],
+            'retry-hook': {'repo': str(failed_hook), 'artifacts': [],
+                           'operator_note': 'keep in original snapshot'}}))
+        hook_bytes = hook_snapshot.read_bytes()
+        result = self.command(sys.executable, '-B', '-c', code,
+                              str(ROOT / 'bin/airlock-ledger'), str(hook_snapshot), ok=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn('retry-hook', self.loaded())
+        self.assertEqual(hook_snapshot.read_bytes(), hook_bytes)
+        self.write(failed_hook / 'install.sh',
+                   '#!/bin/sh\nprintf "retry-hook\\n" >>"$HOME/restore-attempts"\n')
+        self.command(sys.executable, '-B', '-c', code,
+                     str(ROOT / 'bin/airlock-ledger'), str(hook_snapshot))
+        self.assertEqual(self.loaded()['retry-hook']['operator_note'],
+                         'keep in original snapshot')
+        self.assertEqual(hook_snapshot.read_bytes(), hook_bytes)
+        self.assertEqual((self.base / 'home/restore-attempts').read_text(),
+                         'alpha\nretry-source\nretry-hook\n')
+
+        self.write(directory / 'install.sh', '#!/bin/sh\nprintf "old\\n" >>"$HOME/install-order"\n')
+        self.ledger('apply', 'alpha', '--source', str(directory))
+        rows = self.loaded()
+        rows['alpha']['artifacts'] = None
+        self.put('state/installed-apps.json', rows)
+        bad = self.local_app('bad')
+        self.write(bad / 'airlock-app.toml', 'contract = 1\nid = "alpha"\n')
+        self.write(bad / 'install.sh', '#!/bin/sh\nprintf "bad\\n" >>"$HOME/install-order"\nexit 42\n')
+        result = self.ledger('apply', 'alpha', '--source', str(bad), ok=False)
+        self.assertIn('restored alpha', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertEqual((self.base / 'home/install-order').read_text(), 'old\nbad\nold\n')
+        self.assertEqual(self.loaded()['alpha']['repo'], str(directory))
+
+        rows = self.loaded()
+        rows['hub'] = {'repo': 42, 'artifacts': []}
+        self.put('state/installed-apps.json', rows)
+        installer = (ROOT / 'install/airlock-install.sh').read_text()
+        selection = installer.split("<<'PY_CORE'\n", 1)[1].split('\nPY_CORE', 1)[0]
+        result = self.command(sys.executable, '-B', '-c', selection,
+                              str(ROOT / 'bin/airlock-ledger'), str(ROOT / 'apps'),
+                              '', '', '', str(ROOT / 'bin/airlock-config'))
+        self.assertNotIn('hub', json.loads(result.stdout)['core'])
+        self.assertEqual(self.loaded(), rows)
+        previous = self.base / 'previous-core'
+        self.write(previous / 'bin/airlock-status', '#!/bin/sh\nexit 0\n')
+        self.put('runtime-snapshot.json', {
+            'broken': {'repo': 42}, '../metadata': 'uninterpreted',
+            'owned': {'repo': str(previous / 'apps/owned'), 'artifacts': []}})
+        updater = (ROOT / 'bin/airlock-update').read_text()
+        function = updater[updater.index('installed_record() {'):].split('\n}\n', 1)[0] + '\n}\n'
+        script = function + '\ninstalled_record "$1" runtime-root "$2" "$3" "$4"\n'
+        older = self.base / 'older-ledger'
+        older.write_text((ROOT / 'bin/airlock-ledger').read_text().replace(
+            'def _recorded_repo(', 'def _older_unused_recorded_repo('))
+        for engine in (ROOT / 'bin/airlock-ledger', older):
+            result = self.command('bash', '-c', script, 'record-test', str(engine),
+                                  str(self.base / 'runtime-snapshot.json'), str(previous), 'fallback')
+            self.assertEqual(result.stdout.strip(), str(previous))
+
+    def test_cut_readable_install_hook_symlink_runs(self):
+        directory = self.local_app("alpha")
+        hook = directory / "install.sh"
+        hook.unlink()
+        target = directory / "shared-install.sh"
+        self.write(target, '#!/bin/sh\nprintf installed >"$HOME/hook-ran"\n')
+        hook.symlink_to(target.name)
+        self.ledger("apply", "alpha", "--source", str(directory))
+        self.assertEqual((self.base / "home/hook-ran").read_text(), "installed")
+        self.assertIn("alpha", self.loaded())
+
+    def test_cut_absent_remove_has_no_effects(self):
+        self.put("state/installed-apps.json", {})
+        record = self.base / "state/installed-apps.json"
+        before = record.read_bytes()
+        self.write(self.base / "home/alpha.keep", "operator data")
+        self.ledger("remove", "alpha")
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual((self.base / "home/alpha.keep").read_text(), "operator data")
+        self.assertFalse((self.base / "calls.jsonl").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

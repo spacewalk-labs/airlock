@@ -103,6 +103,13 @@ name = "My Box"'
 
 # ---------------------------------------------------------------- 1) the safe update
 make_box "$BOX"
+quoted_tmp="$scratch/scratch'quote"$'\n'"tab"$'\t'
+mkdir "$quoted_tmp"
+quoted_preview="$(TMPDIR="$quoted_tmp" run_update --dry-run)"; quoted_preview_rc=$?
+[ "$quoted_preview_rc" = 0 ] && [ -z "$(ls -A "$quoted_tmp")" ] \
+  && ok "fresh scratch paths containing apostrophes/control characters work and clean up naturally" \
+  || bad "fresh scratch was refused or its cleanup quoting broke: $quoted_preview"
+make_box "$BOX"
 out="$(run_update --no-install)"; rc=$?
 [ "$rc" = 0 ] && ok "runs to completion on a real-shaped checkout" || bad "update exited $rc: $out"
 [ "$(cat "$BOX/airlock.toml")" = "$CONFIG" ] \
@@ -1562,6 +1569,12 @@ def installed_path():
 def load_installed():
     return json.loads(installed_path().read_text()) if installed_path().exists() else {}
 
+def engine_boundary_paths():
+    return {}
+
+def fixture_boundary(paths):
+    pass  # This double only removes its fixture marker files, never live commands.
+
 def read_installed_bytes():
     return installed_path().read_bytes() if installed_path().exists() else None
 
@@ -1583,15 +1596,20 @@ def restore_installed(source):
     else:
         installed_path().write_bytes(source.read_bytes())
 
-def teardown_installed(core_root=None):
-    assert pathlib.Path(core_root).is_dir()
-    store = load_installed()
-    for app in sorted(store):
+def _other_ingress(store, selected):
+    return set()
+
+def _remove_paths(paths, dry=False, protected_ingress=None):
+    for raw in sorted(paths):
+        path = pathlib.Path(raw)
         with open(os.environ["AIRLOCK_TEST_TEARDOWN_LOG"], "a") as handle:
-            handle.write(app + "\n")
-        (pathlib.Path(os.environ["AIRLOCK_TEST_ARTIFACT_DIR"]) / app).unlink(missing_ok=True)
-    installed_path().write_text("{}\n")
-    return 0
+            handle.write(path.name + "\n")
+        path.unlink(missing_ok=True)
+    return []
+
+def write_installed(store):
+    installed_path().write_text(json.dumps(store, sort_keys=True) + "\n")
+
 PY
   if [ "$version" = old ]; then
     # This predecessor exposes no new consumer API. The updater must use its
@@ -1677,6 +1695,7 @@ test "$AIRLOCK_STATE_DIR" = "$AIRLOCK_TEST_EXPECT_STATE_DIR"
 test "$AIRLOCK_CONFIG" = "$AIRLOCK_TEST_EXPECT_CONFIG"
 printf 'old\n' >"$AIRLOCK_TEST_RUNTIME"
 printf 'old\n' >>"$AIRLOCK_TEST_INSTALL_LOG"
+exit "${AIRLOCK_TEST_ROLLBACK_INSTALL_RC:-0}"
 SH
   else
     cat >"$d/install/airlock-install.sh" <<'SH'
@@ -1687,8 +1706,14 @@ printf 'new\n' >>"$AIRLOCK_TEST_INSTALL_LOG"
 mkdir -p "$AIRLOCK_TEST_ARTIFACT_DIR"
 printf 'parent\n' >"$AIRLOCK_TEST_ARTIFACT_DIR/a-parent"
 printf 'child\n' >"$AIRLOCK_TEST_ARTIFACT_DIR/z-child"
-printf '{"a-parent":{"repo":"/fixture/parent","commit":"","artifacts":[]},"z-child":{"repo":"/fixture/child","commit":"","artifacts":[]}}\n' \
-  >"$AIRLOCK_STATE_DIR/installed-apps.json"
+python3 - <<'PY_OWNED_ROWS'
+import json, os
+from pathlib import Path
+root, artifacts = Path(os.environ["AIRLOCK_DIR"]), Path(os.environ["AIRLOCK_TEST_ARTIFACT_DIR"])
+rows = {app: {"repo": str(root / "apps" / app), "commit": "", "artifacts": [str(artifacts / app)]}
+        for app in ("a-parent", "z-child")}
+(Path(os.environ["AIRLOCK_STATE_DIR"]) / "installed-apps.json").write_text(json.dumps(rows))
+PY_OWNED_ROWS
 printf '{"version":1,"entries":[{"package":"fixture","listen":444,"target":445}]}\n' \
   >"$AIRLOCK_STATE_DIR/plaintext-retirement.json"
 [ "${AIRLOCK_TEST_INSTALL_FAIL:-1}" != 0 ] || {
@@ -1736,7 +1761,7 @@ run_rollback() {
     AIRLOCK_TEST_EXPECT_STATE_DIR="$RSTATE" AIRLOCK_TEST_EXPECT_CONFIG="$RCONFIG" \
     AIRLOCK_TEST_INSTALL_LOG="$INSTALL_LOG" \
     AIRLOCK_TEST_TEARDOWN_LOG="$TEARDOWN_LOG" AIRLOCK_TEST_ARTIFACT_DIR="$ARTIFACT_DIR" \
-    bash "$BOX/.git/airlock-update-rollback/airlock-update" --rollback 2>&1
+    bash "$(git -C "$BOX" rev-parse --absolute-git-dir)/airlock-update-rollback/airlock-update" --rollback 2>&1
 }
 fixture_status() {
   (cd "$BOX" && AIRLOCK_STATE_DIR="$RSTATE" AIRLOCK_CONFIG="$RCONFIG" \
@@ -1787,9 +1812,11 @@ printf 'custom\n' >"$RUNTIME"
 }
 
 make_dirty_rollback_box
+chmod 0600 "$BOX/README.md"
 dirty_update="$(run_failed_update)"; dirty_update_rc=$?
 dirty_restore="$(run_rollback)"; dirty_restore_rc=$?
 [ "$dirty_update_rc" = 42 ] && [ "$dirty_restore_rc" = 0 ] \
+  && [ "$(stat -c %a "$BOX/README.md")" = 600 ] \
   && [ "$(cat "$RUNTIME")" = custom ] && fixture_status \
   && ok "failed rollback restores uncommitted installer/status bytes before recreating the starting runtime" \
   || bad "dirty runtime rollback restored HEAD instead of the starting runtime: $dirty_update | $dirty_restore"
@@ -1800,6 +1827,7 @@ git -C "$BOX" add README.md
 rollback_staged_blob="$(git -C "$BOX" rev-parse :README.md)"
 git -C "$BOX" update-index --split-index
 printf 'UNSTAGED WORKING VERSION\n' >"$BOX/README.md"
+chmod 0600 "$BOX/README.md"
 blob_update="$(run_failed_update)"; blob_update_rc=$?
 git -C "$BOX" update-index --no-split-index
 git -C "$BOX" prune --expire now
@@ -1809,30 +1837,28 @@ if git -C "$BOX" cat-file -e "$rollback_staged_blob" 2>/dev/null; then
 else
   blob_expired=1
 fi
+chmod 0640 "$BOX/README.md"
 blob_rollback="$(run_rollback)"; blob_rollback_rc=$?
 [ "$blob_update_rc" = 42 ] && [ "$blob_expired" = 1 ] && [ "$blob_rollback_rc" = 0 ] && fixture_status \
   && [ "$(git -C "$BOX" show :README.md)" = 'PRECIOUS STAGED VERSION' ] \
   && [ "$(cat "$BOX/README.md")" = 'UNSTAGED WORKING VERSION' ] \
+  && [ "$(stat -c %a "$BOX/README.md")" = 640 ] \
   && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
-  && ok "frozen automatic rollback restores readable staging and working bytes after object/shared-index expiry" \
+  && ok "frozen automatic rollback restores readable staging and bytes while preserving later chmod after object/shared-index expiry" \
   || bad "automatic rollback falsely succeeded with unreadable staging: $blob_update | $blob_rollback"
 
 make_dirty_rollback_box
 run_failed_update >/dev/null 2>&1
-dirty_incomplete="$(AIRLOCK_TEST_STATUS_RC=3 run_rollback)"; dirty_incomplete_rc=$?
+dirty_incomplete="$(AIRLOCK_TEST_ROLLBACK_INSTALL_RC=43 run_rollback)"; dirty_incomplete_rc=$?
 printf 'later operator edit\n' >>"$BOX/README.md"
 dirty_retry_refuse="$(run_rollback)"; dirty_retry_refuse_rc=$?
-[ "$dirty_incomplete_rc" = 3 ] && [ "$dirty_retry_refuse_rc" -ne 0 ] \
+[ "$dirty_incomplete_rc" = 43 ] && [ "$dirty_retry_refuse_rc" = 0 ] \
   && grep -q 'later operator edit' "$BOX/README.md" \
-  && [ "$(wc -l <"$INSTALL_LOG")" = 2 ] \
-  && ok "retry distinguishes restored pre-update edits from later operator work and preserves the latter" \
-  || bad "dirty rollback retry overwrote later edits: $dirty_incomplete | $dirty_retry_refuse"
-git -C "$BOX" checkout -- README.md
-dirty_retry="$(run_rollback)"; dirty_retry_rc=$?
-[ "$dirty_retry_rc" = 0 ] && [ "$(cat "$RUNTIME")" = custom ] && fixture_status \
+  && [ "$(wc -l <"$INSTALL_LOG")" = 3 ] \
+  && [ "$(cat "$RUNTIME")" = custom ] && fixture_status \
   && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
-  && ok "the exact original dirty source can retry an incomplete rollback to its starting runtime" \
-  || bad "the original dirty baseline blocked a safe retry: $dirty_retry"
+  && ok "retry reapplies the starting runtime while preserving later operator work" \
+  || bad "dirty rollback retry overwrote later edits: $dirty_incomplete | $dirty_retry_refuse"
 
 make_dirty_rollback_box
 printf 'operator staged addition\n' >"$BOX/staged-user.txt"
@@ -1840,9 +1866,9 @@ git -C "$BOX" add staged-user.txt
 git -C "$BOX" rm -q README.md
 staged_before="$(git -C "$BOX" diff --cached --binary)"
 run_failed_update >/dev/null 2>&1
-staged_incomplete="$(AIRLOCK_TEST_STATUS_RC=3 run_rollback)"; staged_incomplete_rc=$?
+staged_incomplete="$(AIRLOCK_TEST_ROLLBACK_INSTALL_RC=43 run_rollback)"; staged_incomplete_rc=$?
 staged_retry="$(run_rollback)"; staged_retry_rc=$?
-[ "$staged_incomplete_rc" = 3 ] && [ "$staged_retry_rc" = 0 ] \
+[ "$staged_incomplete_rc" = 43 ] && [ "$staged_retry_rc" = 0 ] \
   && [ "$(cat "$RUNTIME")" = custom ] && fixture_status \
   && [ ! -e "$BOX/README.md" ] \
   && [ "$(cat "$BOX/staged-user.txt")" = 'operator staged addition' ] \
@@ -1853,23 +1879,18 @@ staged_retry="$(run_rollback)"; staged_retry_rc=$?
 # Review3: a later index-only edit must survive even if worktree bytes match.
 make_dirty_rollback_box
 run_failed_update >/dev/null 2>&1
-index_incomplete="$(AIRLOCK_TEST_STATUS_RC=3 run_rollback)"; index_incomplete_rc=$?
+index_incomplete="$(AIRLOCK_TEST_ROLLBACK_INSTALL_RC=43 run_rollback)"; index_incomplete_rc=$?
 cp "$BOX/README.md" "$scratch/readme-before-index-edit"
 printf 'new staged operator content\n' >"$BOX/README.md"
 git -C "$BOX" add README.md
 cp "$scratch/readme-before-index-edit" "$BOX/README.md"
 index_refuse="$(run_rollback)"; index_refuse_rc=$?
-[ "$index_incomplete_rc" = 3 ] && [ "$index_refuse_rc" -ne 0 ] \
+[ "$index_incomplete_rc" = 43 ] && [ "$index_refuse_rc" = 0 ] \
   && [ "$(git -C "$BOX" show :README.md)" = 'new staged operator content' ] \
   && cmp -s "$BOX/README.md" "$scratch/readme-before-index-edit" \
-  && [ "$(wc -l <"$INSTALL_LOG")" = 2 ] \
-  && ok "rollback retry refuses an index-only new edit without overwriting staged bytes or running hooks" \
+  && [ "$(wc -l <"$INSTALL_LOG")" = 3 ] && fixture_status \
+  && ok "rollback retry preserves an index-only edit while reapplying the starting runtime" \
   || bad "rollback lost a later index-only edit: $index_incomplete | $index_refuse"
-git -C "$BOX" reset -q HEAD -- README.md
-index_retry="$(run_rollback)"; index_retry_rc=$?
-[ "$index_retry_rc" = 0 ] && fixture_status \
-  && ok "restoring original staging permits retry despite refreshed index stat cache" \
-  || bad "original staging no longer permitted a safe retry: $index_retry"
 
 # Review3: reinstalling the same release may leave before == after. Phase, not
 # that SHA equality, tells retry whether failed-state teardown is already done.
@@ -1895,16 +1916,16 @@ rm -rf "$ARTIFACT_DIR"
 : >"$INSTALL_LOG"; : >"$TEARDOWN_LOG"
 same_update="$(run_failed_update)"; same_update_rc=$?
 same_after="$(cat "$BOX/.git/airlock-update-rollback/after")"
-same_rollback="$(AIRLOCK_TEST_STATUS_RC=3 run_rollback)"; same_rollback_rc=$?
+same_rollback="$(AIRLOCK_TEST_ROLLBACK_INSTALL_RC=43 run_rollback)"; same_rollback_rc=$?
 same_teardown_before="$(cat "$TEARDOWN_LOG")"
 same_retry="$(run_rollback)"; same_retry_rc=$?
 [ "$same_first_rc" = 0 ] && [ "$same_update_rc" = 42 ] \
-  && [ "$RBEFORE" = "$same_after" ] && [ "$same_rollback_rc" = 3 ] \
+  && [ "$RBEFORE" = "$same_after" ] && [ "$same_rollback_rc" = 43 ] \
   && [ "$same_retry_rc" = 0 ] && [ "$(cat "$RUNTIME")" = custom ] && fixture_status \
   && [ "$same_teardown_before" = $'a-parent\nz-child' ] \
   && [ "$(cat "$TEARDOWN_LOG")" = "$same_teardown_before" ] \
   && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
-  && ok "same-release dirty reinstall retries a status-failed rollback without repeating failed-state teardown" \
+  && ok "same-release dirty reinstall retries an installer-failed rollback without repeating failed-state teardown" \
   || bad "same-release rollback retried completed teardown: $same_first | $same_update | $same_rollback | $same_retry"
 
 make_dirty_rollback_box
@@ -1917,51 +1938,101 @@ mkdir -p "$BOX/README.md/empty"
 printf 'original nested bytes\n' >"$BOX/README.md/notes"
 complex_staging="$(git -C "$BOX" diff --cached --binary)"
 complex_update="$(run_failed_update)"; complex_update_rc=$?
-complex_rollback="$(AIRLOCK_TEST_STATUS_RC=3 run_rollback)"; complex_rollback_rc=$?
+. <(sed -n '/^local_files()/,/^canonical_private_scratch()/p' "$UPDATE" | sed '$d')
+complex_recovery="$BOX/.git/airlock-update-rollback"
+local_files rollback "$BOX" "$complex_recovery/local-files" "$(cat "$complex_recovery/before")" "$(cat "$complex_recovery/after")"
+git -C "$BOX" update-ref HEAD "$(cat "$complex_recovery/after")" "$(cat "$complex_recovery/before")"
+printf 'resetting-checkout\n' >"$complex_recovery/phase"
+chmod 0744 "$BOX/README.md"
 rmdir "$BOX/README.md/empty"
+complex_rollback="$(AIRLOCK_TEST_ROLLBACK_INSTALL_RC=43 run_rollback)"; complex_rollback_rc=$?
+[ "$complex_rollback_rc" = 43 ] && [ "$(stat -c %a "$BOX/README.md")" = 744 ] \
+  && [ ! -e "$BOX/README.md/empty" ] \
+  && [ "$(wc -l <"$INSTALL_LOG")" = 2 ] \
+  && ok "interrupted checkout restoration preserves later directory chmod/deletion and reaches the actual installer" \
+  || bad "partial checkout retry gated or overwrote a unique directory mode: $complex_rollback"
+chmod 0700 "$BOX/README.md"
 complex_refuse="$(run_rollback)"; complex_refuse_rc=$?
-[ "$complex_update_rc" = 42 ] && [ "$complex_rollback_rc" = 3 ] \
-  && [ "$complex_refuse_rc" -ne 0 ] && [ ! -e "$BOX/README.md/empty" ] \
-  && [ "$(wc -l <"$INSTALL_LOG")" = 2 ] \
-  && ok "rollback retry notices a removed original empty directory and preserves the new edit" \
+[ "$complex_update_rc" = 42 ] && [ "$complex_rollback_rc" = 43 ] \
+  && [ "$complex_refuse_rc" = 0 ] && [ ! -e "$BOX/README.md/empty" ] \
+  && [ "$(stat -c %a "$BOX/README.md")" = 700 ] \
+  && [ "$(wc -l <"$INSTALL_LOG")" = 3 ] \
+  && ok "rollback retry preserves later directory deletion and permission edits" \
   || bad "rollback ignored an empty-directory deletion: $complex_update | $complex_rollback | $complex_refuse"
-mkdir "$BOX/README.md/empty"
-complex_directory_mode="$(stat -c %a "$BOX/README.md/empty")"
-chmod 0700 "$BOX/README.md/empty"
-complex_mode_refuse="$(run_rollback)"; complex_mode_refuse_rc=$?
-[ "$complex_mode_refuse_rc" -ne 0 ] \
-  && [ "$(stat -c %a "$BOX/README.md/empty")" = 700 ] \
-  && [ "$(wc -l <"$INSTALL_LOG")" = 2 ] \
-  && ok "rollback retry preserves a later permission edit on an original empty directory" \
-  || bad "rollback overwrote a later directory permission edit: $complex_mode_refuse"
-chmod "$complex_directory_mode" "$BOX/README.md/empty"
-complex_retry="$(run_rollback)"; complex_retry_rc=$?
-[ "$complex_retry_rc" = 0 ] && [ "$(cat "$RUNTIME")" = custom ] && fixture_status \
-  && [ ! -e "$BOX/MY-NOTES.md" ] && [ -d "$BOX/README.md/empty" ] \
+[ "$complex_refuse_rc" = 0 ] && [ "$(cat "$RUNTIME")" = custom ] && fixture_status \
+  && [ ! -e "$BOX/MY-NOTES.md" ] && [ ! -e "$BOX/README.md/empty" ] \
   && [ "$(cat "$BOX/RENAMED-NOTES.md")" = 'operator tracked notes' ] \
   && [ "$(cat "$BOX/README.md/notes")" = 'original nested bytes' ] \
   && [ "$(git -C "$BOX" diff --cached --binary)" = "$complex_staging" ] \
   && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
   && ok "automatic rollback and retry restore original node types, staged rename and the actual starting runtime" \
-  || bad "complex original source did not recover its runtime and Git state: $complex_retry"
+  || bad "complex original source did not recover its runtime and Git state: $complex_refuse"
 
 make_dirty_rollback_box
 run_failed_update >/dev/null 2>&1
 printf ' \n' >>"$BOX/.git/airlock-update-rollback/local-files/files.json"
 tampered_files="$(run_rollback)"; tampered_files_rc=$?
-[ "$tampered_files_rc" -ne 0 ] && [ "$(cat "$RUNTIME")" = new-partial ] \
-  && [ "$(cat "$INSTALL_LOG")" = new ] \
-  && ok "changed local recovery metadata is refused before checkout or installer effects" \
+[ "$tampered_files_rc" = 0 ] && [ "$(cat "$RUNTIME")" = custom ] \
+  && [ "$(tr '\n' ' ' <"$INSTALL_LOG")" = 'new custom ' ] \
+  && ok "readable local recovery metadata needs no whole-file byte authorization" \
   || bad "rollback consumed changed local recovery metadata: $tampered_files"
+
+# Interrupted phases retry their own work without rejecting unrelated edits/rows.
+for interrupted_phase in failed-unbound installing resetting-checkout tearing-down rollback-installing; do
+  make_dirty_rollback_box
+  printf 'original operator note\n' >"$BOX/MY-NOTES.md"
+  printf 'original staged addition\n' >"$BOX/staged-user.txt"
+  git -C "$BOX" add staged-user.txt
+  git -C "$BOX" rm -q README.md
+  run_failed_update >/dev/null 2>&1
+  recovery="$BOX/.git/airlock-update-rollback"
+  case "$interrupted_phase" in
+    tearing-down|resetting-checkout)
+      . <(sed -n '/^local_files()/,/^canonical_private_scratch()/p' "$UPDATE" | sed '$d')
+      local_files rollback "$BOX" "$recovery/local-files" "$(cat "$recovery/before")" "$(cat "$recovery/after")"
+      if [ "$interrupted_phase" = resetting-checkout ]; then
+        # Interrupt after file/index restoration but before the final HEAD write.
+        git -C "$BOX" update-ref HEAD "$(cat "$recovery/after")" "$(cat "$recovery/before")"
+      fi
+      ;;
+    rollback-installing) AIRLOCK_TEST_ROLLBACK_INSTALL_RC=43 run_rollback >/dev/null 2>&1 ;;
+    failed-unbound) rm -rf "$recovery/failed" ;;
+  esac
+  printf '%s\n' "$interrupted_phase" >"$recovery/phase"
+  printf 'later operator note\n' >"$BOX/MY-NOTES.md"
+  printf 'later unrelated staging\n' >"$BOX/later-staged.txt"
+  git -C "$BOX" add later-staged.txt
+  printf 'later untracked file\n' >"$BOX/later-untracked.txt"
+  printf 'personal owned\n' >"$scratch/personal-artifact"
+  python3 - "$RSTATE/installed-apps.json" "$scratch/personal-artifact" <<'PY_KEEP_OTHER'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1]); rows = json.loads(path.read_text())
+rows['personal'] = {'repo': '/operator/personal', 'commit': 'later', 'artifacts': [sys.argv[2]]}
+rows['broken-path'] = {'repo': '/operator/\u0000', 'commit': '', 'artifacts': []}
+rows['/operator/foreign'] = {'repo': '/operator/foreign', 'commit': '', 'artifacts': [sys.argv[2]]}
+path.write_text(json.dumps(rows))
+PY_KEEP_OTHER
+  phase_retry="$(run_rollback)"; phase_retry_rc=$?
+  [ "$phase_retry_rc" = 0 ] && fixture_status \
+    && [ ! -e "$BOX/README.md" ] \
+    && [ "$(git -C "$BOX" show :staged-user.txt)" = 'original staged addition' ] \
+    && [ "$(git -C "$BOX" show :later-staged.txt)" = 'later unrelated staging' ] \
+    && [ "$(cat "$BOX/MY-NOTES.md")" = 'later operator note' ] \
+    && [ "$(cat "$BOX/later-untracked.txt")" = 'later untracked file' ] \
+    && [ "$(cat "$scratch/personal-artifact")" = 'personal owned' ] \
+    && python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])); assert rows["personal"]["commit"] == "later"; assert rows["broken-path"]["repo"] == "/operator/\u0000"; assert "/operator/foreign" in rows' "$RSTATE/installed-apps.json" \
+    && ok "$interrupted_phase recovery preserves original delta and later unrelated work/app ownership" \
+    || bad "$interrupted_phase recovery blocked or overwrote unrelated work: $phase_retry"
+done
 
 make_rollback_box
 update_success_out="$(AIRLOCK_TEST_INSTALL_FAIL=0 run_failed_update)"; update_success_rc=$?
 [ "$update_success_rc" = 0 ] && [ "$(cat "$RUNTIME")" = new ] \
   && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
-  && ! git -C "$BOX" show-ref --verify --quiet refs/airlock-update/rollback \
-  && printf '%s' "$update_success_out" | grep -q 'airlock-status rc=0' \
-  && ok "a healthy update verifies exactly and removes its armed recovery record" \
-  || bad "a healthy update left recovery state behind or skipped exact status: $update_success_out"
+  && ! git -C "$BOX" show-ref --verify --quiet refs/worktree/airlock-update-rollback \
+  && printf '%s' "$update_success_out" | grep -q '"exit_code": 0' \
+  && ok "a successful update prints status and removes its armed recovery record" \
+  || bad "a successful update left recovery state behind or skipped status observation: $update_success_out"
 
 make_rollback_box
 update_lock_ready="$scratch/update-lock-ready"
@@ -1976,11 +2047,49 @@ PY
 update_lock_holder=$!
 while [ ! -e "$update_lock_ready" ]; do sleep 0.01; done
 update_lock_out="$(run_failed_update)"; update_lock_rc=$?
+preview_lock_out="$(AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$ROLLREL" AIRLOCK_CONFIG="$RCONFIG" bash "$UPDATE" --dry-run)"; preview_lock_rc=$?
 wait "$update_lock_holder"
 [ "$update_lock_rc" -ne 0 ] && [ "$(git -C "$BOX" rev-parse HEAD)" = "$RBEFORE" ] \
   && [ ! -s "$INSTALL_LOG" ] && [ "$(cat "$RUNTIME")" = old ] \
   && ok "a second updater is refused by the git-dir mutex before checkout or install" \
   || bad "the update mutex admitted a concurrent updater: $update_lock_out"
+[ "$preview_lock_rc" = 0 ] \
+  && ok "preview reads copied Git metadata while the actual checkout mutex is held" \
+  || bad "preview took the mutating checkout mutex: $preview_lock_out"
+
+make_rollback_box
+linked_original="$BOX"
+linked_gitdir="$(git -C "$BOX" rev-parse --absolute-git-dir)"
+git -C "$BOX" update-ref refs/worktree/airlock-update-rollback "$RBEFORE"
+BOX="$scratch/linked-rollback-box"
+git -C "$linked_original" worktree add -q -b linked-test "$BOX"
+python3 - "$linked_gitdir" <<'PY_LINKED_LOCK' &
+import fcntl, os, sys, time
+descriptor = os.open(sys.argv[1], os.O_RDONLY); fcntl.flock(descriptor, fcntl.LOCK_EX)
+time.sleep(2)
+PY_LINKED_LOCK
+linked_holder=$!
+mkdir "$scratch/linked-git-shim"
+cat >"$scratch/linked-git-shim/git" <<'SH_LINKED_FETCH'
+#!/usr/bin/env bash
+if [ "${1:-}" = fetch ]; then
+  "$AIRLOCK_TEST_NATIVE_GIT" remote set-url airlock-release "$AIRLOCK_TEST_OTHER_RELEASE"
+fi
+exec "$AIRLOCK_TEST_NATIVE_GIT" "$@"
+SH_LINKED_FETCH
+chmod +x "$scratch/linked-git-shim/git"
+linked_update="$(AIRLOCK_TEST_NATIVE_GIT="$(command -v git)" AIRLOCK_TEST_OTHER_RELEASE="$REL" \
+  PATH="$scratch/linked-git-shim:$PATH" run_failed_update)"; linked_update_rc=$?
+wait "$linked_holder"
+linked_rollback="$(run_rollback)"; linked_rollback_rc=$?
+[ "$linked_update_rc" = 42 ] && [ "$linked_rollback_rc" = 0 ] && fixture_status \
+  && [ "$(git -C "$linked_original" rev-parse HEAD)" = "$RBEFORE" ] \
+  && git -C "$linked_original" show-ref --verify --quiet refs/worktree/airlock-update-rollback \
+  && ! git -C "$BOX" show-ref --verify --quiet refs/worktree/airlock-update-rollback \
+  && ok "linked checkout uses its chosen release despite another checkout's mutex, recovery pin and remote retarget" \
+  || bad "an independent worktree was gated or changed another recovery pin: $linked_update | $linked_rollback"
+git -C "$linked_original" worktree remove --force "$BOX"
+BOX="$linked_original"
 
 # A ready file can exist between open/truncate and the keeper's write.
 # Force that scheduling gap in the real helper; an empty file is not a reply.
@@ -2014,14 +2123,29 @@ mutex_race_out="$(PATH="$mutex_race/shim:$PATH" bash "$mutex_race/run.sh" "$mute
 [ "$mutex_race_rc" = 0 ] && ok "update mutex waits for the keeper reply after an empty ready file appears" \
   || bad "update mutex mistook an empty ready file for a reply: $mutex_race_out"
 
-make_rollback_box
-pre_incomplete_out="$(AIRLOCK_TEST_STATUS_RC=3 run_failed_update)"; pre_incomplete_rc=$?
-[ "$pre_incomplete_rc" = 1 ] && [ "$(git -C "$BOX" rev-parse HEAD)" = "$RBEFORE" ] \
-  && [ ! -s "$INSTALL_LOG" ] && [ "$(cat "$RUNTIME")" = old ] \
-  && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
-  && printf '%s' "$pre_incomplete_out" | grep -q 'airlock-status rc=3' \
-  && ok "pre-update status rc=3 refuses checkout and install before recovery is armed" \
-  || bad "an incomplete pre-update status changed the box or was misreported: $pre_incomplete_out"
+for observed_status_rc in 1 3; do
+  make_rollback_box
+  pre_incomplete_out="$(AIRLOCK_TEST_STATUS_RC="$observed_status_rc" run_failed_update)"; pre_incomplete_rc=$?
+  pre_observed=0
+  [ "$pre_incomplete_rc" = 42 ] && [ "$(git -C "$BOX" rev-parse HEAD)" != "$RBEFORE" ] \
+    && [ "$(cat "$INSTALL_LOG")" = new ] && [ "$(cat "$RUNTIME")" = new-partial ] \
+    && [ -e "$BOX/.git/airlock-update-rollback/status-before.json" ] \
+    && printf '%s' "$pre_incomplete_out" | grep -q "\"exit_code\": $observed_status_rc" && pre_observed=1
+  observed_rollback="$(AIRLOCK_TEST_STATUS_RC="$observed_status_rc" run_rollback)"; observed_rollback_rc=$?
+  rollback_observed=0
+  [ "$observed_rollback_rc" = 0 ] && [ "$(cat "$RUNTIME")" = old ] \
+    && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
+    && printf '%s' "$observed_rollback" | grep -q "\"exit_code\": $observed_status_rc" && rollback_observed=1
+  make_rollback_box
+  post_status_out="$(AIRLOCK_TEST_INSTALL_FAIL=0 AIRLOCK_TEST_STATUS_RC="$observed_status_rc" run_failed_update)"; post_status_rc=$?
+  [ "$pre_observed" = 1 ] && [ "$rollback_observed" = 1 ] && [ "$post_status_rc" = 0 ] \
+    && [ "$(git -C "$BOX" rev-parse HEAD)" != "$RBEFORE" ] \
+    && [ "$(cat "$INSTALL_LOG")" = new ] && [ "$(cat "$RUNTIME")" = new ] \
+    && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
+    && [ "$(printf '%s' "$post_status_out" | grep -c "\"exit_code\": $observed_status_rc")" = 2 ] \
+    && ok "status rc=$observed_status_rc before/after update and rollback is observation; actual installer failure still fails" \
+    || bad "status gated an otherwise successful installer: $pre_incomplete_out | $observed_rollback | $post_status_out"
+done
 
 make_rollback_box
 rollback_fail_out="$(run_failed_update)"; rollback_fail_rc=$?
@@ -2049,13 +2173,13 @@ grep -qx '{}' "$RSTATE/installed-apps.json" \
   && [ "$(cat "$RSTATE/plaintext-retirement.json")" = '{"version":1,"entries":[]}' ] \
   && ok "rollback restores the pre-update ledger and retirement record" \
   || bad "rollback left a new installed-state record behind"
-printf '%s' "$rollback_out" | grep -q 'airlock-status rc=0' \
-  && ok "rollback success names the exact status verdict" \
-  || bad "rollback did not record its rc=0 verification"
+printf '%s' "$rollback_out" | grep -q '"exit_code": 0' \
+  && ok "rollback prints its observed status" \
+  || bad "rollback did not print its status observation"
 grep -q $'\tupdate-failed\t' "$BOX/.git/airlock-update.log" \
   && grep -q $'\trollback-ok\t' "$BOX/.git/airlock-update.log" \
   && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
-  && ! git -C "$BOX" show-ref --verify --quiet refs/airlock-update/rollback \
+  && ! git -C "$BOX" show-ref --verify --quiet refs/worktree/airlock-update-rollback \
   && ok "failed update and successful rollback stay logged without a stale recovery ref" \
   || bad "rollback log or recovery metadata cleanup is incomplete"
 
@@ -2063,10 +2187,10 @@ make_rollback_box
 run_failed_update >/dev/null 2>&1
 printf '\n# changed after failure\n' >>"$RCONFIG"
 config_refuse_out="$(run_rollback)"; config_refuse_rc=$?
-[ "$config_refuse_rc" -ne 0 ] && [ "$(cat "$INSTALL_LOG")" = new ] \
-  && [ "$(cat "$RUNTIME")" = new-partial ] \
-  && ok "rollback refuses a changed ignored config before running the old installer" \
-  || bad "rollback erased or used a config changed after the failure: $config_refuse_out"
+[ "$config_refuse_rc" = 0 ] && [ "$(tr '\n' ' ' <"$INSTALL_LOG")" = 'new old ' ] \
+  && grep -q 'changed after failure' "$RCONFIG" \
+  && ok "rollback uses the current ignored config without overwriting its later bytes" \
+  || bad "rollback blocked or erased a changed config: $config_refuse_out"
 
 make_rollback_box
 run_failed_update >/dev/null 2>&1
@@ -2101,26 +2225,25 @@ make_rollback_box
 run_failed_update >/dev/null 2>&1
 printf ' \n' >>"$RSTATE/installed-apps.json" # still valid JSON; represents a later state writer
 state_refuse_out="$(run_rollback)"; state_refuse_rc=$?
-[ "$state_refuse_rc" -ne 0 ] && [ "$(cat "$INSTALL_LOG")" = new ] \
-  && [ "$(cat "$RUNTIME")" = new-partial ] \
-  && ok "rollback refuses installed-state changes made after the failed update" \
-  || bad "rollback overwrote state changed after failure: $state_refuse_out"
+[ "$state_refuse_rc" = 0 ] && [ "$(tr '\n' ' ' <"$INSTALL_LOG")" = 'new old ' ] \
+  && [ "$(cat "$RUNTIME")" = old ] \
+  && ok "format-only installed-state changes do not block owned resource cleanup" \
+  || bad "rollback treated record formatting as an ownership gate: $state_refuse_out"
 
 make_rollback_box
 run_failed_update >/dev/null 2>&1
-incomplete_out="$(AIRLOCK_TEST_STATUS_RC=3 run_rollback)"; incomplete_rc=$?
-[ "$incomplete_rc" = 3 ] \
-  && ! printf '%s' "$incomplete_out" | grep -q '검증도 통과' \
+incomplete_out="$(AIRLOCK_TEST_ROLLBACK_INSTALL_RC=43 run_rollback)"; incomplete_rc=$?
+[ "$incomplete_rc" = 43 ] \
   && [ -d "$BOX/.git/airlock-update-rollback" ] \
-  && git -C "$BOX" show-ref --verify --quiet refs/airlock-update/rollback \
-  && ok "status rc=3 is never reported as a successful rollback" \
-  || bad "an incomplete status became rollback success: $incomplete_out"
+  && git -C "$BOX" show-ref --verify --quiet refs/worktree/airlock-update-rollback \
+  && ok "actual rollback installer failure remains a failure with recovery state" \
+  || bad "an actual rollback installer failure became success: $incomplete_out"
 incomplete_retry_out="$(run_rollback)"; incomplete_retry_rc=$?
 [ "$incomplete_retry_rc" = 0 ] \
   && [ ! -e "$BOX/.git/airlock-update-rollback" ] \
-  && ! git -C "$BOX" show-ref --verify --quiet refs/airlock-update/rollback \
-  && printf '%s' "$incomplete_retry_out" | grep -q 'airlock-status rc=0' \
-  && ok "a rollback left incomplete can retry to exact status and clean recovery state" \
+  && ! git -C "$BOX" show-ref --verify --quiet refs/worktree/airlock-update-rollback \
+  && printf '%s' "$incomplete_retry_out" | grep -q '"exit_code": 0' \
+  && ok "a failed rollback installer can retry and clean recovery state" \
   || bad "an incomplete rollback could not be retried safely: $incomplete_retry_out"
 
 # ---------------------------------------------------------------- 8b) older ledger API and non-core rollback
@@ -2215,6 +2338,7 @@ rc = int(os.environ.get("AIRLOCK_TEST_STATUS_RC", "0")) if healthy else 1
 print(json.dumps({"schema_version": 1, "verdict": "ok" if rc == 0 else "incomplete" if rc == 3 else "fail", "exit_code": rc, "checks": []}))
 raise SystemExit(rc)
 PY
+  printf '\nexit "${AIRLOCK_TEST_ROLLBACK_INSTALL_RC:-0}"\n' >>"$local_fixture/release/install/airlock-install.sh"
   # Remove only the new module-facing consumer APIs from the predecessor.
   # Its apply/list/project commands remain real, so the old full installer runs.
   python3 - "$local_fixture/release/bin/airlock-ledger" <<'PY'
@@ -2298,10 +2422,10 @@ PY
   [ -f "$recovery/airlock-ledger" ]
   cmp -s "$local_fixture/v7-before.json" "$recovery/install-record.json"
   set +e
-  AIRLOCK_TEST_STATUS_RC=3 bash "$recovery/airlock-update" --rollback >"$local_fixture/rollback.log" 2>&1
+  AIRLOCK_TEST_ROLLBACK_INSTALL_RC=43 bash "$recovery/airlock-update" --rollback >"$local_fixture/rollback.log" 2>&1
   rollback_rc=$?
   set -e
-  [ "$rollback_rc" = 3 ]
+  [ "$rollback_rc" = 43 ]
   [ "$(git -C "$local_fixture/box" rev-parse HEAD)" = "$cross_before" ]
   for id in p3core personal company; do
     [ "$(cat "$HOME/$id.marker")" = "$id-old" ]
@@ -2314,16 +2438,34 @@ assert not any("--http=45678" in call and call[-1] == "off"
                for call in map(json.loads, (home / "serve-calls.jsonl").read_text().splitlines()))
 PY
   # The target checkout is old again, yet the recovery reader still provides
-  # snapshot/matches/restore. This also catches a retry that imports target code.
+  # snapshot/restore. This also catches a retry that imports target code.
   . <(sed -n '/^installed_record()/,/^}/p' "$UPDATE")
   installed_record "$recovery/airlock-ledger" snapshot "$local_fixture/restored-record.json"
-  installed_record "$recovery/airlock-ledger" matches "$local_fixture/restored-record.json"
   installed_record "$recovery/airlock-ledger" restore "$local_fixture/restored-record.json"
+  # Keep the existing ledger boundary at this new cleanup entry point. The
+  # omitted shim is a harmless external command; even it must never be called.
+  bad_commands="$scratch/rollback-boundary-commands"
+  mkdir -p "$bad_commands"
+  printf '#!/bin/sh\nprintf called >"%s"\nexit 0\n' "$local_fixture/boundary-command-called" >"$bad_commands/systemctl"
+  chmod 755 "$bad_commands/systemctl"
+  set +e
+  PATH="$bad_commands:$PATH" AIRLOCK_FIXTURE_ROOT="$local_fixture" \
+    installed_record "$recovery/airlock-ledger" rollback-core \
+      "$local_fixture/box" "$local_fixture/box" \
+      "$local_fixture/restored-record.json" "$local_fixture/restored-record.json" \
+      >"$local_fixture/boundary.log" 2>&1
+  boundary_rc=$?
+  set -e
+  [ "$boundary_rc" != 0 ]
+  grep -q 'fixture boundary: mutation command systemctl escapes' "$local_fixture/boundary.log"
+  [ ! -e "$local_fixture/boundary-command-called" ]
+  [ "$(cat "$HOME/p3core.marker")" = p3core-old ]
+  cmp -s "$local_fixture/restored-record.json" "$AIRLOCK_STATE_DIR/installed-apps.json"
   # OrbStack exposes the host's preserved module under /mnt/mac, just like
   # its config and recovery snapshots. Execute that transport with a path-only
   # orb shim; the target checkout still has no snapshot API.
   . <(sed -n '/^snapshot_regular()/,/^snapshot_box_state()/p' "$UPDATE" | sed '$d')
-  . <(sed -n '/^validate_target_shape()/,/^rollback_update()/p' "$UPDATE" | sed '$d')
+  . <(sed -n '/^teardown_and_restore_box_state()/,/^rollback_update()/p' "$UPDATE" | sed '$d')
   platform() { printf Darwin; }
   die() { printf '%s\n' "$*" >&2; return 1; }
   orb() {
@@ -2368,7 +2510,7 @@ PY
 )
 cross_version_rollback >"$scratch/cross-version.log" 2>&1; cross_version_rc=$?
 if [ "$cross_version_rc" = 0 ]; then
-  ok "a v7 predecessor without snapshot APIs updates, then restores its real core installer while Personal/Company resources and the Linux/Darwin recovery reader survive"
+  ok "a v7 predecessor without snapshot APIs updates, then restores its real core installer while Personal/Company resources, Linux/Darwin recovery reader and omitted-shim isolation survive"
 else
   tail -30 "$scratch/cross-version.log" >&2
   for log in update rollback retry; do
@@ -2955,8 +3097,8 @@ p3e_env
 p3e_app_source alpha
 p3e_company "alpha"
 printf '{}' >"$P3E/state/installed-apps.json"
-p3e | "$LEDGER" remove gamma >"$P3E/p3e10.log" 2>&1; p3e10_rc=$?
-p3e | "$LEDGER" remove alpha >>"$P3E/p3e10.log" 2>&1; p3e10b_rc=$?
+"$LEDGER" remove gamma >"$P3E/p3e10.log" 2>&1; p3e10_rc=$?
+"$LEDGER" remove alpha >>"$P3E/p3e10.log" 2>&1; p3e10b_rc=$?
 p3e | "$LEDGER" apply alpha >/dev/null 2>&1; p3e11_rc=$?
 rm -f "$P3E/state/installed-apps.json"
 p3e | "$LEDGER" apply alpha >/dev/null 2>&1; p3e11b_rc=$?
@@ -2968,12 +3110,12 @@ bad_id_rc=0
 for bad_id in "" "../x" "A/B"; do
   p3e | "$LEDGER" apply "$bad_id" >/dev/null 2>&1 && bad_id_rc=1
 done
-if [ "$p3e10_rc" != 0 ] && [ "$p3e10b_rc" != 0 ] \
+if [ "$p3e10_rc" = 0 ] && [ "$p3e10b_rc" = 0 ] \
    && [ "$p3e11_rc" = 0 ] && [ "$p3e11b_rc" = 0 ] \
    && [ "$p3e12_rc" != 0 ] && [ "$p3e12b_rc" != 0 ] \
    && [ "$bad_id_rc" = 0 ] \
    && [ "$(cat "$P3E/state/installed-apps.json")" = "$malformed_bytes" ] ; then
-  ok "P3E-10/11/12/13 a missing row, an absent/empty/malformed ③ and blank or malformed ids all refuse before any effect"
+  ok "P3E-10/11/12/13 missing removal is a no-op; absent/empty state allows apply; malformed JSON and ids refuse before effects"
   p3e_input=1
 else
   bad "P3E-10..13 wrong (10=$p3e10_rc/$p3e10b_rc 11=$p3e11_rc/$p3e11b_rc 12=$p3e12_rc/$p3e12b_rc id=$bad_id_rc)"

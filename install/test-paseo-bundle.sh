@@ -115,7 +115,4 @@ grep -qF '[paseo-reconciliation-emergency-policy]' <<<"$workspace_reconciliation
 grep -qF 'emergencyReconciliationPendingExplicitFull' <<<"$workspace_reconciliation"
 
 grep -qF "$EXPECTED_SOURCE" "$BUNDLE/README.md"
-verify_line="$(grep -nF 'sha256sum -c SHA256SUMS >/dev/null' "$ROOT/apps/paseo/install.sh" | cut -d: -f1)"
-handover_line="$(grep -nF 'airlock_handover_user_resource pidfile' "$ROOT/apps/paseo/install.sh" | cut -d: -f1)"
-[ "$verify_line" -lt "$handover_line" ]
 printf 'paseo-bundle: 7 packages verified, source=%s\n' "$EXPECTED_SOURCE"

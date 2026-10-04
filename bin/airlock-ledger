@@ -25,7 +25,7 @@ from typing import Any, NoReturn
 LEDGER_VERSION = 7
 ARTIFACT_CLASSES = ("units", "fragments", "webroot", "files", "rooted", "serve_ports")
 PATH_CLASSES = ("units", "fragments", "webroot", "files", "rooted")
-_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")
+_ID_RE = re.compile(r"^(?!\.{1,2}\Z)[^/\x00]+\Z")
 _GIT_OID_RE = re.compile(r"^[0-9a-f]{40}\Z")
 
 
@@ -372,27 +372,15 @@ def _pattern_anchor(cls: str, pattern: str, root: str, roots: dict[str, str]) ->
     return os.path.realpath(head or "/")
 
 
-def _rooted_artifact(path: str, root: str | tuple[str, ...], where: str) -> str:
-    """Canonicalise a match that is supposed to live under a platform root,
-    and REFUSE it if the canonical form escapes.
-
-    glob() walks a symlinked intermediate directory ($WEBROOT/assets/apps ->
-    /elsewhere), so a match can canonicalise outside the root it was expanded
-    under. Recording that path would put an external directory in the ledger,
-    and teardown removes recorded directories — the record itself becomes the
-    weapon. Fail closed instead: the operator repairs the redirected tree,
-    and nothing outside a root is ever recorded or removed."""
+def _rooted_artifact(path: str, root: str | tuple[str, ...], where: str) -> str | None:
+    """Record only the matched resource that stays inside its platform root."""
     canonical = _canonical_artifact(path)
     roots = (root,) if isinstance(root, str) else root
     for candidate in roots:
         real = os.path.realpath(candidate)
         if canonical == real or canonical.startswith(real.rstrip("/") + os.sep):
             return canonical
-    fail(f"{where}: {path} resolves to {canonical}, outside the platform root"
-         f"{'s' if len(roots) > 1 else ''} it was expanded under "
-         f"({', '.join(os.path.realpath(r) for r in roots)}) — a symlinked "
-         "directory inside the root redirects the claim space; repair the "
-         "tree (the ledger never records or removes a path outside a root)")
+    return None
 
 
 def _redirected_ancestor(path: str) -> str | None:
@@ -490,8 +478,8 @@ def expand_declared(declared: dict[str, Any], port_values: dict[str, Any],
         _check_anchor(anchors, name, root, declared[name], roots,
                       f"artifacts_declared.{name}")
         expanded[name] = _sort_paths(
-            _rooted_artifact(m, root, f"artifacts_declared.{name}")
-            for m in matches)
+            path for m in matches
+            if (path := _rooted_artifact(m, root, f"artifacts_declared.{name}")) is not None)
     matches = []
     for pattern in declared["files"]:
         if pattern.startswith("~/"):
@@ -513,23 +501,12 @@ def expand_declared(declared: dict[str, Any], port_values: dict[str, Any],
                   "artifacts_declared.rooted")
     rooted_canon = [_canonical_artifact(m) for m in matches]
     # A3: a glob's non-final segment can walk through a symlinked directory.
-    for m in rooted_canon:
-        if not _rooted_contains(m):
-            fail(f"artifacts_declared.rooted: {m} resolved outside the rooted "
-                 "allowlist — the declaration or the environment changed since it was recorded")
-    expanded["rooted"] = _sort_paths(rooted_canon)
+    expanded["rooted"] = _sort_paths(m for m in rooted_canon if _rooted_contains(m))
     expanded["serve_ports"] = sorted(set(int(value) for value in port_values.values()))
 
     matches = []
     unit_roots = (roots["unit_user"], roots["unit_system"])
     for pattern in declared["units"]:
-        # A unit pattern is never itself a glob (systemd re-interprets '*'
-        # in an argv unit name as a live pattern over every unit on the box —
-        # see _preflight_teardown_artifacts): reject it before it is ever
-        # used to search the filesystem, not just after resolution.
-        if re.search(r"[*?\[]", os.path.basename(str(pattern))) and not _is_service_template(str(pattern)):
-            fail(f"artifacts_declared.units: {pattern!r} must be a literal unit file name "
-                 "without globs ('*', '?', '[')")
         selected = unit_roots if scopes.get(pattern, "both") == "both" else (roots[f"unit_{scopes[pattern]}"],)
         for root in selected:
             rooted = _relative_pattern(root, pattern, "artifacts_declared.units")
@@ -537,8 +514,8 @@ def expand_declared(declared: dict[str, Any], port_values: dict[str, Any],
             _check_anchor(anchors, "units", root, [pattern], roots,
                           "artifacts_declared.units")
     expanded["units"] = _sort_paths(
-        _rooted_artifact(m, unit_roots, "artifacts_declared.units")
-        for m in matches)
+        path for m in matches
+        if (path := _rooted_artifact(m, unit_roots, "artifacts_declared.units")) is not None)
     return expanded
 
 
@@ -976,44 +953,26 @@ def _serve_token(value: str) -> tuple[str, str] | None:
 
 def _require_app_id(app_id: str) -> str:
     if not app_id or not _ID_RE.match(app_id):
-        fail(f"{app_id!r} is not a valid app id "
-             "(lowercase letters, digits and '-', starting with a letter or digit)")
+        fail(f"{app_id!r} is not a single app path component")
     return app_id
 
 
-def _validate_installed(raw: Any, path: Path) -> dict[str, dict[str, Any]]:
-    """Fail closed: a row this function would refuse must never be written, and
-    a hand-made row it cannot interpret must never be acted on."""
+def _validate_installed(raw: Any, path: Path) -> dict[str, Any]:
+    """Read the record without turning unrelated rows into execution gates."""
     if not isinstance(raw, dict):
         fail(f"{path}: installed apps must be a JSON object")
-    out: dict[str, dict[str, Any]] = {}
-    for app_id, row in raw.items():
-        if not isinstance(app_id, str) or not _ID_RE.match(app_id):
-            fail(f"{path}: {app_id!r} is not a valid app id")
-        if not isinstance(row, dict):
-            fail(f"{path}: {app_id}: entry must be an object")
-        unknown = sorted(set(row) - {"repo", "commit", "artifacts"})
-        if unknown:
-            fail(f"{path}: {app_id}: unknown keys {unknown}")
-        repo = row.get("repo")
-        commit = row.get("commit", "")
-        artifacts = row.get("artifacts", [])
-        if not isinstance(repo, str) or not repo.strip():
-            fail(f"{path}: {app_id}: repo must be a non-empty string")
-        if not isinstance(commit, str) or (commit and not _GIT_OID_RE.match(commit)):
-            fail(f"{path}: {app_id}: commit must be '' or a 40-hex SHA")
-        if not isinstance(artifacts, list):
-            fail(f"{path}: {app_id}: artifacts must be a list")
-        clean: set[str] = set()
-        for item in artifacts:
-            if not isinstance(item, str) or not item:
-                fail(f"{path}: {app_id}: every artifact must be a non-empty string")
-            if _serve_token(item) is None and not os.path.isabs(item):
-                fail(f"{path}: {app_id}: artifact {item!r} is neither an absolute "
-                     "path nor <mode>:<listen>")
-            clean.add(item)
-        out[app_id] = {"repo": repo, "commit": commit, "artifacts": sorted(clean)}
-    return out
+    return raw
+
+
+def _recorded_artifacts(row: Any) -> list[str]:
+    """Readable ownership facts for observation, without rewriting the row."""
+    items = row.get("artifacts", []) if isinstance(row, dict) else []
+    return [item for item in items if isinstance(item, str)] if isinstance(items, list) else []
+
+
+def _recorded_repo(row: Any) -> str:
+    repo = row.get("repo", "") if isinstance(row, dict) else ""
+    return repo if isinstance(repo, str) else ""
 
 
 def _git_head(path: str) -> str:
@@ -1230,14 +1189,14 @@ def recorded_active_ports(installed: dict[str, dict[str, Any]] | None = None,
                           skip_id: str = "", mode: str | None = None) -> set[int]:
     store = load_installed() if installed is None else installed
     return {int(token[1]) for app_id, row in store.items() if app_id != skip_id
-            for item in row["artifacts"]
+            for item in _recorded_artifacts(row)
             if (token := _serve_token(item)) is not None and (mode is None or token[0] == mode)}
 
 
 def installed_units(store: dict[str, dict[str, Any]] | None = None) -> list[tuple[str, str]]:
     installed = load_installed() if store is None else store
     return sorted({(os.path.basename(item), _unit_scope(item)[1])
-                   for row in installed.values() for item in row["artifacts"]
+                   for row in installed.values() for item in _recorded_artifacts(row)
                    if _is_unit_path(item)})
 
 
@@ -1250,11 +1209,13 @@ def teardown_installed(core_root: str | Path | None = None) -> int:
     store = load_installed()
     fixture_boundary(engine_boundary_paths())
     selected = {app_id for app_id, row in store.items()
-                if core_root is None or (not _is_git_url(row["repo"])
-                    and os.path.realpath(row["repo"]) == os.path.realpath(
-                        Path(core_root) / "apps" / app_id))}
-    residue = _remove_paths({item for app_id in selected
-                             for item in store[app_id]["artifacts"]},
+                if isinstance(row, dict) and isinstance(row.get("artifacts"), list)
+                and (core_root is None or (_ID_RE.fullmatch(app_id)
+                    and _recorded_repo(row) and not _is_git_url(_recorded_repo(row))
+                    and os.path.realpath(_recorded_repo(row)) == os.path.realpath(
+                        Path(core_root) / "apps" / app_id)))}
+    residue = _remove_paths([item for app_id in selected
+                             for item in store[app_id]["artifacts"]],
                             protected_ingress=_other_ingress(store, selected))
     if residue:
         log("residue teardown: " + "; ".join(residue))
@@ -1272,34 +1233,55 @@ def restore_apps(snapshot: bytes) -> int:
     successful apply has already committed a record.
     """
     archived = validate_installed_bytes(snapshot)
-    load_installed()  # reject broken current state before any effects
+    current = load_installed()
     fixture_boundary(engine_boundary_paths())
-    pending = {app_id: _source_from_row(app_id, row)
-               for app_id, row in archived.items() if app_id not in load_installed()}
-    if not pending:
+    missing = {app_id: row for app_id, row in archived.items() if app_id not in current}
+    source_rows = {app_id: row for app_id, row in missing.items()
+                   if _ID_RE.fullmatch(app_id) and _recorded_repo(row)}
+    metadata = {app_id: row for app_id, row in missing.items() if app_id not in source_rows}
+    if metadata:
+        write_installed(dict(metadata, **current))
+    if not source_rows:
         return 0
     # Archive keys are sorted, not install order. Read the same manifest parser
     # as apply before replaying dependencies. Company inspection uses private
     # staging so it cannot replace an installed app directory.
     data_dir().mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="restore-apps-", dir=data_dir()) as temporary:
+        pending = {}
         deps = {}
-        for app_id, source in pending.items():
-            directory = source["dir"]
-            if source["kind"] == "company":
-                _ensure_mirror_object(source)
-                directory = str(Path(temporary) / app_id)
-                _mirror_extract(Path(source["mirror"]), source["sha"], app_id, Path(directory))
-            deps[app_id] = read_dir_package(app_id, directory)["deps"]
+        failed = False
+        for app_id, row in source_rows.items():
+            try:
+                source = _source_from_row(app_id, row)
+                directory = source["dir"]
+                if source["kind"] == "company":
+                    _ensure_mirror_object(source)
+                    directory = str(Path(temporary) / app_id)
+                    _mirror_extract(Path(source["mirror"]), source["sha"], app_id, Path(directory))
+                deps[app_id] = read_dir_package(app_id, directory)["deps"]
+                pending[app_id] = source
+            except (LedgerError, KeyError, TypeError, ValueError, OSError) as exc:
+                log(f"restore {app_id} failed: {exc}")
+                failed = True
         while pending:
             # Like config app_order, cycles fall back to the existing stable
             # order instead of inventing another installation refusal.
             app_id = next((app for app in pending
                            if not any(dep in pending for dep in deps[app])), next(iter(pending)))
             source = pending.pop(app_id)
-            if _apply_run(app_id, source, load_installed(), None, allow_restore=True) != 0:
-                return 1
-    return 0
+            try:
+                result = _apply_run(app_id, source, load_installed(), None, allow_restore=True)
+            except LedgerError as exc:
+                log(f"restore {app_id} failed: {exc}")
+                result = 1
+            if result != 0:
+                failed = True
+                continue
+            restored = load_installed()
+            restored[app_id] = dict(archived[app_id], **restored[app_id])
+            write_installed(restored)
+    return 1 if failed else 0
 
 
 def _atomic_write_json(path: Path, value: Any) -> None:
@@ -1496,8 +1478,10 @@ def app_dirs(info: dict[str, Any]) -> dict[str, str]:
     The applying process supplies the one source it explicitly chose."""
     dirs: dict[str, str] = {}
     for app_id, row in load_installed().items():
-        candidate = (str(engine_apps_root() / app_id) if _is_git_url(row["repo"])
-                     else row["repo"])
+        repo = _recorded_repo(row)
+        if not _ID_RE.fullmatch(app_id) or not repo:
+            continue
+        candidate = (str(engine_apps_root() / app_id) if _is_git_url(repo) else repo)
         dirs[app_id] = candidate
     env_id = (os.environ.get("AIRLOCK_APP_ID") or "").strip()
     env_dir = (os.environ.get("AIRLOCK_APP_DIR") or "").strip()
@@ -1560,6 +1544,7 @@ def resolve_source(app_id: str, info: dict[str, Any], explicit: str) -> dict[str
 
 def _source_from_row(app_id: str, row: dict[str, Any]) -> dict[str, Any]:
     """The source that reproduces a row exactly — which is what A4 restores."""
+    _require_app_id(app_id)
     if _is_git_url(row["repo"]):
         return {"kind": "company", "repo": row["repo"], "commit": row["commit"],
                 "sha": row["commit"], "mirror": str(company_mirror_path()),
@@ -1648,11 +1633,19 @@ def _remove_paths(items: list[str] | set[str], dry: bool = False,
     A recorded unit is recognised by where it lives (under a systemd unit root)
     AND that its name is a unit name — a stray file in the unit directory is
     removed as the plain file it is, never handed to systemctl."""
+    if not isinstance(items, (list, set)):
+        fail("artifacts must be a list")
     residue: list[str] = []
     units: list[tuple[str, str, list[str]]] = []
     tokens: list[str] = []
     plain: list[str] = []
-    for item in sorted(items):
+    for item in sorted(items, key=str):
+        if not isinstance(item, str) or not item:
+            residue.append("every artifact must be a non-empty string")
+            continue
+        if _serve_token(item) is None and not os.path.isabs(item):
+            residue.append(f"artifact {item!r} is neither an absolute path nor <mode>:<listen>")
+            continue
         if _serve_token(item) is not None:
             if item in (protected_ingress or set()):
                 continue
@@ -1673,8 +1666,6 @@ def _remove_paths(items: list[str] | set[str], dry: bool = False,
             units.append((path, scope, names))
         else:
             plain.append(path)
-    if residue:
-        return residue
     if units:
         invocations = [(os.path.join(os.path.dirname(path), name), scope)
                        for path, scope, names in units for name in names]
@@ -1839,7 +1830,7 @@ def _project_hub_ingress(env: dict[str, str]) -> set[int]:
 
 def _other_ingress(store: dict[str, dict[str, Any]], removed_ids: set[str]) -> set[str]:
     return {item for key, row in store.items() if key not in removed_ids
-            for item in row["artifacts"] if _serve_token(item) is not None}
+            for item in _recorded_artifacts(row) if _serve_token(item) is not None}
 
 
 def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, Any]],
@@ -1862,10 +1853,6 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
             shutil.rmtree(directory, ignore_errors=True)
         raise
     hook = os.path.join(directory, "install.sh")
-    if os.path.islink(hook) or not os.path.isfile(hook):
-        if unpacked and start is None:
-            shutil.rmtree(directory, ignore_errors=True)
-        fail(f"{app_id}: {hook} is missing or not a regular non-symlink file")
     before = _declared_paths(package)
     env = os.environ.copy()
     env["AIRLOCK_CONFD"] = _conf_dir()
@@ -1897,7 +1884,7 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
             return 1
         log(f"{app_id}: {exc}")
         created = (_declared_paths(package) - before
-                   | (set(ingress) - set((start or {}).get("artifacts", []))))
+                   | (set(ingress) - set(_recorded_artifacts(start))))
         residue = _remove_paths(created, protected_ingress=_other_ingress(store, {app_id}))
         if start is None:
             if source["kind"] == "company":
@@ -1916,7 +1903,7 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
                 app_id, _source_from_row(app_id, start), load_installed(),
                 start, allow_restore=False)
         except LedgerError as restore_failure:
-            log(f"residue {app_id}: restore to {start['commit'] or '(no commit)'} "
+            log(f"residue {app_id}: restore to {start.get('commit', '') or '(no commit)'} "
                 f"failed: {restore_failure}")
             return 1
         if restore_rc != 0:
@@ -1924,7 +1911,7 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
             # printed its own `residue <id>: …` line; saying `restored` on top
             # of that would be the one false success this flow is allowed to
             # never print.
-            log(f"residue {app_id}: restore to {start['commit'] or '(no commit)'} "
+            log(f"residue {app_id}: restore to {start.get('commit', '') or '(no commit)'} "
                 "did not complete")
             return 1
         if residue:
@@ -1932,7 +1919,7 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
             restored[app_id]["artifacts"] = sorted(set(restored[app_id]["artifacts"]) | created)
             write_installed(restored)
             log(f"residue {app_id}: " + "; ".join(residue))
-        log(f"restored {app_id} {start['commit']}")
+        log(f"restored {app_id} {start.get('commit', '')}")
         return 1
     # EVERY declared path that exists now, not just the ones this run created:
     # ③ has to name every path removal may later take, and a path the operator
@@ -1945,9 +1932,9 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
     if source["kind"] == "company":
         artifacts.add(directory)
     updated = dict(store)
-    updated[app_id] = {"repo": source["repo"], "commit": source["commit"],
-                       "artifacts": sorted(artifacts)}
-    stale = set((start or {}).get("artifacts", [])) - artifacts
+    updated[app_id] = dict(start or {}, repo=source["repo"], commit=source["commit"],
+                           artifacts=sorted(artifacts))
+    stale = set(_recorded_artifacts(start)) - artifacts
     # A directory and a new claim on its contents still name the same owned
     # tree. Removing the old parent would erase the hook's successful result.
     stale = {old for old in stale if not old.startswith("/") or not any(
@@ -1967,7 +1954,7 @@ def _apply_run(app_id: str, source: dict[str, Any], store: dict[str, dict[str, A
 
 def command_apply(app_id: str, info: dict[str, Any], explicit_source: str) -> int:
     _require_app_id(app_id)
-    store = load_installed()          # a malformed ③ stops us BEFORE any effect
+    store = load_installed()
     if os.environ.get("AIRLOCK_DRY_RUN") == "1":
         log(f"[dry] would apply {app_id}")
         return 0
@@ -1980,13 +1967,13 @@ def command_apply(app_id: str, info: dict[str, Any], explicit_source: str) -> in
 def command_remove(app_id: str) -> int:
     _require_app_id(app_id)
     store = load_installed()
+    row = store.get(app_id)
+    if row is None:
+        return 0
     dry = os.environ.get("AIRLOCK_DRY_RUN") == "1"
     if not dry:
         fixture_boundary(engine_boundary_paths())
-    row = store.get(app_id)
-    if row is None:
-        fail(f"no installed-apps entry for {app_id}")
-    residue = _remove_paths(row["artifacts"], dry, _other_ingress(store, {app_id}))
+    residue = _remove_paths(row.get("artifacts", []), dry, _other_ingress(store, {app_id}))
     if dry:
         return 1 if residue else 0
     if residue:
@@ -2006,12 +1993,13 @@ def command_remove(app_id: str) -> int:
 
 def _company_action(app_id: str, row: dict[str, Any], sha: str) -> str:
     mirror = company_mirror_path()
-    if not row["commit"]:
+    commit = row.get("commit", "")
+    if not isinstance(commit, str) or not commit:
         return "upgrade-diff"
-    if _git(["-C", str(mirror), "cat-file", "-e", f"{row['commit']}^{{commit}}"],
+    if _git(["-C", str(mirror), "cat-file", "-e", f"{commit}^{{commit}}"],
             "look up the recorded commit").returncode != 0:
         return "upgrade-diff"
-    diff = _git(["-C", str(mirror), "diff", "--quiet", row["commit"], sha,
+    diff = _git(["-C", str(mirror), "diff", "--quiet", commit, sha,
                  "--", f"apps/{app_id}"], f"diff apps/{app_id}")
     return "reinstall" if diff.returncode == 0 else "upgrade-diff"
 
@@ -2026,7 +2014,7 @@ def command_plan_installed(info: dict[str, Any]) -> int:
         row = store.get(app_id)
         if row is None:
             print(f"fresh\t{app_id}")
-        elif _is_git_url(row["repo"]):
+        elif _is_git_url(_recorded_repo(row)):
             sha = pin_main(dict(info, company_repo=row["repo"]))
             print(f"{_company_action(app_id, row, sha)}\t{app_id}")
         else:
@@ -2036,8 +2024,9 @@ def command_plan_installed(info: dict[str, Any]) -> int:
 
 def command_list() -> int:
     for app_id, row in sorted(load_installed().items()):
-        print(f"{app_id}\trepo={row['repo']}"
-              f"\tcommit={row['commit'] or '-'}\tartifacts={len(row['artifacts'])}")
+        commit = row.get("commit", "") if isinstance(row, dict) else ""
+        print(f"{app_id}\trepo={_recorded_repo(row)}"
+              f"\tcommit={commit or '-'}\tartifacts={len(_recorded_artifacts(row))}")
     return 0
 
 
@@ -2080,7 +2069,7 @@ def main(argv: list[str] | None = None) -> int:
     if command == "list":
         return command_list()
     if command == "project":
-        load_installed()  # refuse malformed state before any projection effects
+        load_installed()
         if os.environ.get("AIRLOCK_DRY_RUN") != "1":
             fixture_boundary(engine_boundary_paths())
         project(ids or sorted(load_installed()))

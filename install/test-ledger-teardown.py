@@ -201,6 +201,80 @@ class TeardownTests(unittest.TestCase):
         self.output = output.getvalue()
         return result
 
+    def test_split_rows_stop_all_activation_units_before_services(self):
+        paths = self.fixture(suffixes=('service', 'timer'))
+        ledger.write_installed({
+            'a-service': dict(self.store['probe'], artifacts=[paths[0]]),
+            'z-timer': dict(self.store['probe'], artifacts=[paths[1]]),
+            '../metadata': 'uninterpreted',
+            'opaque': {'operator_note': 'preserve'},
+        })
+        self.assertEqual(self.teardown(api='teardown'), 0, self.output)
+        self.assertFalse(any(Path(path).exists() for path in paths))
+        stops = [event['name'] for event in self.trace() if event['action'] == 'stop']
+        self.assertEqual(stops, ['probe.timer', 'probe.service'])
+        self.assertEqual(ledger.load_installed(), {
+            '../metadata': 'uninterpreted', 'opaque': {'operator_note': 'preserve'}})
+
+    def test_uninterpretable_artifact_keeps_row_after_safe_cleanup(self):
+        for api in ('remove', 'teardown', 'core'):
+            with self.subTest(api=api):
+                paths = self.fixture(suffixes=('service', 'timer'))
+                self.store['probe']['repo'] = str(self.root / 'apps/probe')
+                self.store['probe']['artifacts'].append(None)
+                ledger.write_installed(self.store)
+                if api == 'core':
+                    with patch.object(ledger, 'project'):
+                        result = ledger.teardown_installed(core_root=self.root)
+                else:
+                    result = self.teardown(api=api)
+                self.assertEqual(result, 1)
+                self.assertFalse(any(Path(path).exists() for path in paths))
+                self.assertFalse((self.root / 'other-artifact').exists())
+                self.assertEqual(ledger.load_installed(), self.store)
+
+    def test_shrink_id_spelling_and_unit_glob_expand_to_literal_targets(self):
+        paths = self.fixture()
+        declared = {name: [] for name in ledger.ARTIFACT_CLASSES}
+        declared['units'] = ['probe.*']
+        expanded = ledger.expand_declared(declared, {},
+                                          unit_scopes={'probe.*': 'user'})
+        self.assertEqual(expanded['units'], sorted(paths))
+        app_id = 'Alpha_' + 'x' * 40
+        ledger.write_installed({app_id: dict(self.store['probe'], artifacts=expanded['units'])})
+        with patch.object(ledger, 'project'):
+            self.assertEqual(ledger.command_remove(app_id), 0)
+        self.assertFalse(any(Path(path).exists() for path in paths))
+        self.assertEqual(ledger.load_installed(), {})
+        self.assertTrue(all('*' not in event['name'] for event in self.trace()))
+
+    def test_shrink_unsafe_resource_does_not_block_safe_cleanup(self):
+        paths = self.fixture()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        external = outside / 'operator.js'
+        external.write_text('operator data')
+        webroot = Path(self.roots['webroot'])
+        (webroot / 'redirect').symlink_to(outside, target_is_directory=True)
+        safe = webroot / 'safe.js'
+        safe.write_text('owned')
+        declared = {name: [] for name in ledger.ARTIFACT_CLASSES}
+        declared['webroot'] = ['redirect/*', 'safe.js']
+        expanded = ledger.expand_declared(declared, {})
+        self.assertEqual(expanded['webroot'], [str(safe)])
+        unsafe_unit = Path(self.roots['unit_user']) / '*.service'
+        unsafe_unit.write_text('uninterpreted')
+        self.store['probe']['artifacts'] += [str(safe), str(unsafe_unit), 'relative']
+        ledger.write_installed(self.store)
+        self.assertEqual(self.teardown(), 1, self.output)
+        self.assertTrue(unsafe_unit.exists())
+        self.assertEqual(external.read_text(), 'operator data')
+        self.assertFalse(safe.exists())
+        self.assertFalse((self.root / 'other-artifact').exists())
+        self.assertFalse(any(Path(path).exists() for path in paths))
+        self.assertIn('probe', ledger.load_installed())
+        self.assertTrue(all('*' not in event['name'] for event in self.trace()))
+
     def test_old_service_first_record_race_and_reinstall_round_trip(self):
         for cycle in range(2):
             with self.subTest(cycle=cycle):

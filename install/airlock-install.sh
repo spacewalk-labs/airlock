@@ -201,7 +201,8 @@ if existing:
     if os.path.isabs(previous_root):
         roots.append(os.path.join(previous_root, "apps"))
     ids = [app for app, row in rows.items() if app in core
-           and any(os.path.realpath(row["repo"]) == os.path.join(os.path.realpath(root), app)
+           and (repo := ledger._recorded_repo(row))
+           and any(os.path.realpath(repo) == os.path.join(os.path.realpath(root), app)
                    for root in roots)]
 else:
     ids = [app for app in configured.splitlines() if app in core]

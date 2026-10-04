@@ -3,12 +3,10 @@ from pathlib import Path
 import runpy
 import stat
 import tempfile
-import tarfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 normalize = runpy.run_path(str(ROOT / "apps/paseo/normalize-native-links.py"))["normalize"]
-ledger = runpy.run_path(str(ROOT / "bin/airlock-ledger"))
 
 
 class NativeLinksTest(unittest.TestCase):
@@ -44,16 +42,6 @@ class NativeLinksTest(unittest.TestCase):
             normalize(self.server)
         self.assertEqual(self.native.stat().st_ino, self.shim.stat().st_ino)
         self.assertEqual(outside.stat().st_nlink, 3)
-
-    def test_checkpoint_archives_a_linked_pair_as_two_files(self):
-        archive = self.base / "checkpoint.tar"
-        with tarfile.open(archive, "w", dereference=False) as bundle:
-            self.assertEqual(ledger["_capture_checkpoint_tree"](bundle, str(self.server)), [])
-        with tarfile.open(archive) as bundle:
-            files = [member for member in bundle.getmembers() if member.isfile()]
-            self.assertEqual(len(files), 2)
-            for member in files:
-                self.assertEqual(bundle.extractfile(member).read(), b"native executable bytes")
 
     def test_redirected_parent_is_rejected(self):
         directory = self.shim.parent

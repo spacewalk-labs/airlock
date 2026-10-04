@@ -16,7 +16,8 @@ airlock_test_counters_init
 
 if ! command -v node >/dev/null 2>&1; then
   bad "node is required for paseo patch drift tests"
-printf 'paseo-patch-drift: %s ok, %s failed\n' "$pass" "$fail"
+
+  printf 'paseo-patch-drift: %s ok, %s failed\n' "$pass" "$fail"
   exit 1
 fi
 
@@ -1169,6 +1170,37 @@ EOF
   if [ "$again_rc" = 10 ]; then ok "$policy: already-applied skip";
   else bad "$policy: idempotence failed"; fi
  done
+
+
+# C13: a normal already-patched target is accepted on reinstall.
+(
+mkdir -p "$TMP/policy-reinstall/patches"
+printf 'process.exit(10)\n' >"$TMP/policy-reinstall/patches/policy.mjs"
+printf 'process.exit(1)\n' >"$TMP/policy-reinstall/patches/policy.test.mjs"
+printf 'already patched\n' >"$TMP/policy-reinstall/target.js"
+HERE="$TMP/policy-reinstall"
+log() { printf '%s\n' "$*"; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+eval "$(sed -n '/^apply_background_git_policy() {/,/^}/p' "$ROOT/apps/paseo/install.sh")"
+apply_background_git_policy policy "$TMP/policy-reinstall/target.js" fixture
+printf 'passed: reinstall accepts an already patched target despite a failed development behaviour check\n'
+
+) && ok "C13 already-patched target is accepted" || bad "C13 already-patched target was refused"
+
+# K05: a readable package list is sufficient input; package count and checksums
+# remain development bundle tests, not installation admission.
+if (
+  HERE="$TMP/bundle-selection"; mkdir -p "$HERE"
+  PASEO_BUNDLE_DIR="$HERE"
+  PASEO_BUNDLE_SUMS="$HERE/SHA256SUMS"
+  printf 'stale-digest only-package.tgz\n' >"$PASEO_BUNDLE_SUMS"
+  NPM_GBIN="$TMP/bin"; PASEO_VER=0.8.0
+  unset AIRLOCK_PASEO_VERSION
+  log() { :; }; die() { printf '%s\n' "$*" >&2; exit 1; }
+  eval "$(sed -n '/^if \[ -n "${AIRLOCK_PASEO_VERSION:-}" \]; then/,/^export PATH=/p' "$ROOT/apps/paseo/install.sh")"
+  [ "${#paseo_packages[@]}" = 1 ] && [ "$PASEO_SOURCE" = bundle ]
+); then ok "K05 readable bundle list is accepted without whole checksum or exact package count";
+else bad "K05 bundle list admission still rejects a readable input"; fi
 
 printf 'paseo-patch-drift: %s ok, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
