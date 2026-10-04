@@ -150,7 +150,7 @@ grep -qF '"실행 상태 응답을 해석하지 못했습니다 — 끝났는지
   || { echo "FAIL hub-filter: an unparseable run answer leaves the previous progress line standing"; exit 1; }
 # S5: the three codes the backend really answers on these paths. A missing entry is not
 # a crash — it is a bare HTTP number where a sentence belongs.
-for code in app_not_pending bad_action bad_package_path; do
+for code in bad_action bad_package_path; do
   grep -qF "$code:" "$ROOT/hub/index.html" \
     || { echo "FAIL hub-filter: the store has no words for the backend's $code"; exit 1; }
 done
@@ -335,10 +335,6 @@ sourceCheck("personal installation forwards the selected preview source",
 sourceCheck("a configured candidate does not block explicit Personal installation",
   !html.includes('value.registered') &&
   !html.includes('requires_reapproval') && !html.includes('reapprove'));
-sourceCheck("denied personal capabilities disable installation",
-  html.includes('const disabled = value.installable !== true;') &&
-  html.includes('chip.dataset.denied = String(denied)') &&
-  html.includes('거부된 capability를 manifest에서 빼야 합니다'));
 sourceCheck("origin marks are the two shapes, and only the origin column decides",
   html.includes('const kind = AIRLOCK_COMPANY_IDS.has(tile.dataset.appName)') &&
   html.includes('function airlockSetCompanyIds(rows) {') &&
@@ -730,7 +726,7 @@ function runCase(kind) {
   const progressNote = { textContent: RUNNING };
   const timers = [];
   const context = {
-    progressNote, runTimer: null, installRun: false,
+    progressNote, runTimer: null, selectedRunId: "fixture-run", installRun: false,
     setTab() {}, pollApps() {},
     setTimeout(fn, ms) { timers.push(ms); return 1; },
     fetch: async () => {

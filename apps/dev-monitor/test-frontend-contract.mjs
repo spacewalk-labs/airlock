@@ -269,7 +269,7 @@ const storeContext = vm.createContext({
   detail: new Element('section'), detailTitle: new Element('h2'),
   detailNote: new Element('p'), detailKv: new Element('dl'),
   detailCaps: new Element('section'), detailActions: storeActions,
-  progressNote: new Element('p'), selected: null, runTimer: null,
+  progressNote: new Element('p'), selected: null, runTimer: null, selectedRunId: null, selectedRequest: 0, rows: [],
   installRun: false, kv() {}, previewPorts: () => '없음',
   setAlert() {}, pollRun() {}, clearTimeout() {}, setTimeout: () => 1,
   fetch: async (path, options) => {
@@ -306,5 +306,38 @@ deniedPersonalButton.closest = selector => selector.startsWith('button') ? denie
 storeContext.modal = {querySelectorAll: () => []};
 storeBody.events.click({target: deniedPersonalButton});
 await tick();
-assert.equal(storeRequests.length, 1);
-console.log('Personal preview: actual delegated click sends its id/path; rejected preview launches nothing');
+assert.equal(storeRequests.length, 2);
+console.log('Personal preview: actual delegated click sends its id/path; capability metadata does not block installation');
+
+// A poll for A may finish after a second click has selected B.
+let finishFirstPoll;
+const runProgress = new Element('p');
+runProgress.textContent = 'B 진행 중';
+const runContext = vm.createContext({
+  selectedRunId: 'A', progressNote: runProgress, runTimer: null, installRun: true,
+  fetch: () => new Promise(resolve => { finishFirstPoll = resolve; }),
+  setTimeout: () => { throw new Error('old poll scheduled again'); },
+  pollApps: () => { throw new Error('old poll refreshed B'); },
+  setTab: () => { throw new Error('old poll reset B'); }
+});
+vm.runInContext(shippedBlock('  async function pollRun() {',
+                            '  async function mutate(action, id, button) {'), runContext);
+const firstPoll = vm.runInContext('pollRun()', runContext);
+runContext.selectedRunId = 'B';
+finishFirstPoll({ok: true, json: async () => ({run: {runId: 'A', status: 'done'}})});
+await firstPoll;
+assert.equal(runProgress.textContent, 'B 진행 중');
+assert.equal(runContext.installRun, true);
+console.log('runId ownership: a delayed A poll cannot finish B');
+
+// A lost B launch response must not reuse the completed A run as evidence.
+storeContext.selectedRunId = 'A';
+storeContext.progressNote.textContent = 'A 완료';
+storeContext.fetch = async () => { throw new Error('POST response lost'); };
+const timersAfterLoss = [];
+storeContext.setTimeout = (_, delay) => timersAfterLoss.push(delay);
+await vm.runInContext('mutate("install", "beta", {disabled: false})', storeContext);
+assert.equal(storeContext.selectedRunId, null);
+assert.equal(storeContext.progressNote.textContent, '요청 결과를 확인하지 못했습니다.');
+assert.deepEqual(timersAfterLoss, []);
+console.log('lost launch response: result stays unknown without polling the old run');

@@ -1723,6 +1723,8 @@ if (("standalone" in navigator) && navigator.standalone) {
   let selected = null;
   let lastFocus = null;
   let runTimer = null;
+  let selectedRunId = null;
+  let selectedRequest = 0;
   let installRun = false;
 
   function updates(data) {
@@ -1936,8 +1938,6 @@ if (("standalone" in navigator) && navigator.standalone) {
           : reason === "bad_link_name" ? "이름을 확인하십시오."
           : reason === "config_conflict" ? "설정이 바뀌었습니다. 다시 읽고 추가하십시오."
           : reason === "hub_refresh_failed" ? "홈 화면을 새로 고치지 못했습니다. 잠시 후 다시 시도하십시오."
-          : reason === "run_active" || reason === "updater_busy"
-            ? "지금은 설치기가 실행 중입니다. 끝난 뒤 다시 시도하십시오."
           : "추가하지 못했습니다. 입력을 확인하고 다시 시도하십시오.", true);
         return;
       }
@@ -2011,14 +2011,10 @@ if (("standalone" in navigator) && navigator.standalone) {
     kv("신뢰", "이 코드를 운영자 권한으로 실행함 — 샌드박스 아님");
     detailCaps.textContent = "";
     const requested = Array.isArray(value.requested_capabilities) ? value.requested_capabilities : [];
-    const rejected = new Set(Array.isArray(value.rejected_capabilities) ? value.rejected_capabilities : []);
-    const granted = new Set(Array.isArray(value.grants) ? value.grants : []);
     for (const capability of requested) {
       const chip = document.createElement("span");
-      const denied = rejected.has(capability);
       chip.className = "store-cap";
-      chip.dataset.denied = String(denied);
-      chip.textContent = capability + (denied ? " · 거부" : granted.has(capability) ? " · 허용" : "");
+      chip.textContent = capability;
       detailCaps.appendChild(chip);
     }
     if (!requested.length) {
@@ -2026,29 +2022,28 @@ if (("standalone" in navigator) && navigator.standalone) {
       chip.textContent = "추가 권한 없음"; detailCaps.appendChild(chip);
     }
     detailActions.textContent = "";
-    const deniedText = rejected.size ? "거부된 capability를 manifest에서 빼야 합니다: " + Array.from(rejected).join(", ") : "";
-    const title = deniedText;
-    const disabled = value.installable !== true;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "store-action store-action-primary";
     button.textContent = "설치";
     button.dataset.storeAction = "register";
     button.dataset.appId = value.id;
-    button.disabled = disabled;
-    if (title) button.title = title;
     detailActions.appendChild(button);
     progressNote.textContent = "선택한 경로에서 이 앱만 설치합니다.";
   }
   async function pollRun() {
+    const runId = selectedRunId;
+    if (!runId) return;
     let response;
-    try { response = await fetch("/monitor/api/owner/updates/run", { cache: "no-store" }); }
+    try { response = await fetch("/monitor/api/owner/updates/run" + (runId ? "?run_id=" + encodeURIComponent(runId) : ""), { cache: "no-store" }); }
     catch (_) {
+      if (runId !== selectedRunId) return;
       // A dropped request is not a finished run.
       progressNote.textContent = "실행 상태를 읽지 못했습니다 (연결 끊김) — 끝났는지 아직 알 수 없습니다.";
       runTimer = setTimeout(pollRun, 4000);
       return;
     }
+    if (runId !== selectedRunId) return;
     if (!response.ok) {
       progressNote.textContent = "실행 상태를 읽지 못했습니다 (HTTP " + response.status +
         ") — 끝났는지 아직 알 수 없습니다.";
@@ -2058,10 +2053,12 @@ if (("standalone" in navigator) && navigator.standalone) {
     let value;
     try { value = await response.json(); }
     catch (_) {
+      if (runId !== selectedRunId) return;
       progressNote.textContent = "실행 상태 응답을 해석하지 못했습니다 — 끝났는지 아직 알 수 없습니다.";
       runTimer = setTimeout(pollRun, 4000);
       return;
     }
+    if (runId !== selectedRunId) return;
     const run = value && value.run;
     if (run && (run.status === "starting" || run.status === "running")) {
       progressNote.textContent = "앱 설치 — 진행 중입니다.";
@@ -2075,6 +2072,9 @@ if (("standalone" in navigator) && navigator.standalone) {
     pollApps();
   }
   async function mutate(action, id, button) {
+    const request = ++selectedRequest;
+    selectedRunId = null;
+    if (runTimer) clearTimeout(runTimer);
     button.disabled = true;
     setAlert("요청을 시작합니다…", false);
     const path = action === "platform" || action === "update"
@@ -2082,31 +2082,33 @@ if (("standalone" in navigator) && navigator.standalone) {
       : "/monitor/api/owner/apps/" + encodeURIComponent(id) + "/" + action;
     const personal = action === "register" && selected && selected.preview;
     const installs = personal || action === "install";
+    const candidate = rows.find(row => row.id === id) || selected;
     const payload = action === "platform" ? { action: "platform" }
       : action === "update" ? { action: "app", id }
-      : personal ? { path: selected.preview.path } : {};
+      : personal ? { path: selected.preview.path }
+      : action === "install" && candidate ? { source: candidate.origin === "public" ? "public"
+          : candidate.origin === "company" ? "company" : candidate.detail && candidate.detail.Path } : {};
     let response;
     try {
       response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     } catch (_) {
-      setAlert("응답이 끊겼습니다. 실행 기록을 다시 확인합니다.", false);
-      if (runTimer) clearTimeout(runTimer);
-      runTimer = setTimeout(pollRun, 1200);
+      if (request !== selectedRequest) return;
+      setAlert("응답이 끊겨 요청 결과를 확인하지 못했습니다.", false);
+      progressNote.textContent = "요청 결과를 확인하지 못했습니다.";
       return;
     }
     let value = null; try { value = await response.json(); } catch (_) {}
+    if (request !== selectedRequest) return;
     if (!response.ok) {
       button.disabled = false;
       const messages = { app_not_installed: "설치되지 않은 앱입니다.",
-        bad_app_id: "앱 이름을 알아보지 못했습니다.", run_active: "이미 설치기가 실행 중입니다.",
+        bad_app_id: "앱 이름을 알아보지 못했습니다.",
         // Measured against the handlers, not guessed: airlock-dev-monitor.py answers
         // these on this very path and the map had no words for any of them, so each
         // arrived as a bare HTTP number.
-        app_not_pending: "이 앱은 지금 업데이트 대상이 아닙니다. 목록을 새로 읽어 주십시오.",
         bad_action: "이 동작을 알아보지 못했습니다.",
         bad_package_path: "패키지 경로를 알아보지 못했습니다.",
         package_preview_changed: "선택한 경로의 앱 이름이 바뀌었습니다. 다시 미리보기 하십시오.",
-        package_not_installable: "앱 명세와 요청 권한의 거부 항목을 확인하십시오.",
         app_not_found: "이 박스에서 읽을 수 없는 앱입니다.",
         app_locked: "이 앱은 제거할 수 없습니다.",
         app_plan_unavailable: "현재 앱 상태를 읽지 못했습니다. 다시 시도하십시오." };
@@ -2119,6 +2121,7 @@ if (("standalone" in navigator) && navigator.standalone) {
       setAlert((messages[raw] || off || "요청이 거부됐습니다 (HTTP " + response.status + ").") + reason, true);
       return;
     }
+    selectedRunId = value && value.run_id;
     setAlert("요청을 시작했습니다. 앱 설치 상태를 확인합니다.", false);
     if (installs) { installRun = true; button.textContent = "진행 중…"; }
     if (runTimer) clearTimeout(runTimer);
@@ -2145,8 +2148,7 @@ if (("standalone" in navigator) && navigator.standalone) {
       setAlert(messages[value && value.error] || "미리보기가 거부됐습니다 (HTTP " + response.status + ").", true);
       return;
     }
-    setAlert(value.installable === true ? "아래 앱 명세와 요청 권한을 확인하고 설치하십시오."
-      : "설치할 수 없는 manifest입니다. 거부 항목을 확인하십시오.", value.installable !== true);
+    setAlert("아래 앱 명세를 확인하고 설치하십시오.", false);
     showPersonalPreview(value);
   }
 

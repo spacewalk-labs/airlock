@@ -63,6 +63,11 @@ def package_preview(root: Path, path: str) -> dict[str, Any]:
     return _command(Path(root).resolve(), ["package-preview", path], json_output=True)
 
 
+def package_info(root: Path, app_id: str, path: str) -> dict[str, Any]:
+    """Resolve the chosen directory with the engine's target-only parser."""
+    return _command(Path(root).resolve(), ["dir-package-info", app_id, path], json_output=True)
+
+
 def _update_map(updates: Any) -> dict[str, dict[str, Any]]:
     rows = updates.get("apps") if isinstance(updates, dict) else None
     if not isinstance(rows, list):

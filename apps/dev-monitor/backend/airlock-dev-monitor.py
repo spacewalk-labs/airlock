@@ -1275,7 +1275,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/owner/updates/run':
             if not self._updates_owner_ready():
                 return
-            self._owner_update_run()
+            self._owner_update_run((qs.get("run_id") or [None])[0])
             return
         if path == '/api/owner/harness/run':
             if not self._updates_owner_ready():
@@ -1424,8 +1424,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {'ok': False, 'error': f'unknown owner path: {path}'})
 
     # ---- update execution (owner gate, no message console) ----
-    def _owner_update_run(self):
-        """Report the last update run plus whether ANY updater holds the mutex.
+    def _owner_update_run(self, run_id=None):
+        """Report the requested or latest update run and the checkout mutex.
 
         `busy` is deliberately three-valued. `null` means the question could not be
         measured on this box, and answering `false` there would be the exact absence
@@ -1438,18 +1438,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {
             'ok': True,
             'busy': UPDATE_EXEC.updater_busy(cfg['root']),
-            'run': UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir'])),
+            'run': UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir'], run_id)),
         })
-
-    @staticmethod
-    def _pending_app_ids():
-        """App ids the engine currently offers as updates."""
-        snapshot = UPDATES.current(UPDATE_EXEC_CONFIG['root'] if UPDATE_EXEC_CONFIG else Path(__file__).resolve().parents[3]) if UPDATES is not None else None
-        apps = (snapshot or {}).get('apps')
-        if not isinstance(apps, list):
-            return set()
-        return {a.get('id') for a in apps
-                if isinstance(a, dict) and a.get('action') == 'upgrade'}
 
     def _owner_update_execute(self, body):
         """Validate an action, then launch its app engine or platform updater."""
@@ -1464,15 +1454,6 @@ class Handler(BaseHTTPRequestHandler):
         elif action == 'app':
             if not isinstance(app_id, str) or not UPDATE_EXEC.APP_ID.match(app_id):
                 self._json(400, {'ok': False, 'error': 'bad_app_id'})
-                return
-            try:
-                pending = self._pending_app_ids()
-            except (OSError, RuntimeError, subprocess.TimeoutExpired):
-                self._json(503, {'ok': False, 'error': 'app_plan_unavailable'})
-                return
-            if app_id not in pending:
-                # The engine plan does not offer this app as an update.
-                self._json(409, {'ok': False, 'error': 'app_not_pending'})
                 return
         else:
             self._json(400, {'ok': False, 'error': 'bad_action'})
@@ -1490,17 +1471,6 @@ class Handler(BaseHTTPRequestHandler):
             with _UPDATE_RUN_LOCK:
                 return self._owner_update_launch(
                     action, app_id, response_action, True, package_path)
-        record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
-        if UPDATE_EXEC.active(record):
-            self._json(409, {'ok': False, 'error': 'run_active',
-                             'run_id': record.get('runId')})
-            return
-        # Only a measured `True` blocks. An unmeasurable lock must not take the
-        # button away — the updater's own mutex refuses a second run regardless,
-        # and that refusal is visible in the pane and in the run's exit code.
-        if UPDATE_EXEC.updater_busy(cfg['root']) is True:
-            self._json(409, {'ok': False, 'error': 'updater_busy'})
-            return
         run_id = UPDATE_EXEC.new_run_id()
         try:
             UPDATE_EXEC.ensure_dirs(cfg['dir'])
@@ -1543,13 +1513,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         with _UPDATE_RUN_LOCK:
             cfg = UPDATE_EXEC_CONFIG
-            record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
-            if UPDATE_EXEC.active(record):
-                self._json(409, {'ok': False, 'error': 'run_active'})
-                return
-            if UPDATE_EXEC.updater_busy(cfg['root']) is True:
-                self._json(409, {'ok': False, 'error': 'updater_busy'})
-                return
             try:
                 installed = APPS.installed_ids(cfg['root'])
                 result = APPS.add_link(
@@ -1577,22 +1540,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {'ok': False, 'error': 'bad_app_id'})
             return
         with _UPDATE_RUN_LOCK:
-            # One external engine run owns the store buttons until it finishes.
-            cfg = UPDATE_EXEC_CONFIG
-            record = UPDATE_EXEC.observed(UPDATE_EXEC.read_record(cfg['dir']))
-            if UPDATE_EXEC.active(record):
-                self._json(409, {'ok': False, 'error': 'run_active',
-                                 'run_id': record.get('runId')})
-                return
-            if UPDATE_EXEC.updater_busy(cfg['root']) is True:
-                self._json(409, {'ok': False, 'error': 'updater_busy'})
-                return
             self._owner_app_action_locked(app_id, action, body)
 
     def _owner_app_action_locked(self, app_id, action, body=None):
         cfg = UPDATE_EXEC_CONFIG
         try:
-            updates = UPDATES.current(cfg['root']) if action == 'install' and UPDATES is not None else None
             # The Personal URL's 'register' action selects an explicit install
             # source; it does not create operator config registration.
             if action == 'register':
@@ -1600,35 +1552,24 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(package_path, str) or not package_path.strip():
                     self._json(400, {'ok': False, 'error': 'bad_package_path'})
                     return
-                preview = APPS.package_preview(cfg['root'], package_path)
-                if preview.get('id') != app_id:
+                info = APPS.package_info(cfg['root'], app_id, package_path)
+                preview = info['packages'].get(app_id) or {}
+                if not preview:
                     self._json(409, {'ok': False, 'error': 'package_preview_changed'})
-                    return
-                if preview.get('installable') is not True:
-                    self._json(409, {'ok': False, 'error': 'package_not_installable'})
                     return
                 self._owner_update_launch(
                     'install', app_id, response_action=action, lock_held=True,
-                    package_path=str(Path(preview['path']).resolve()))
+                    package_path=str(Path(package_path).resolve()))
                 return
 
             if action == 'remove':
-                if app_id == 'hub' or app_id not in APPS.installed_ids(cfg['root']):
+                if app_id == 'hub':
                     self._json(409, {'ok': False, 'error': 'app_locked'})
                     return
                 self._owner_update_launch(
                     'teardown', app_id, response_action=action, lock_held=True)
                 return
 
-            projection = APPS.store_rows(cfg['root'], updates,
-                                        APPS.installed_ids(cfg['root']))
-            rows = {row['id']: row for row in projection['rows']
-                    if row.get('kind') == 'app'}
-            row = rows.get(app_id)
-            if action == 'install':
-                if row is None:
-                    self._json(404, {'ok': False, 'error': 'app_not_found'})
-                    return
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             if not isinstance(exc, APPS.AppsError):
                 self._json(503, {'ok': False, 'error': 'app_plan_unavailable'})
@@ -1641,23 +1582,18 @@ class Handler(BaseHTTPRequestHandler):
                 status = 500
             self._json(status, {'ok': False, 'error': exc.code})
             return
-        source = None
-        if action == 'install':
-            if row.get('origin') == 'public':
-                source = str(cfg['root'] / 'apps' / app_id)
-            elif row.get('origin') == 'company':
-                source = 'company'
-            else:
-                source = (row.get('detail') or {}).get('Path')
+        source = body.get('source') if isinstance(body, dict) else None
+        if source == 'public':
+            source = str(cfg['root'] / 'apps' / app_id)
         self._owner_update_launch(
             'install', app_id, response_action=action, lock_held=True, package_path=source)
 
     @staticmethod
     def _fail_update_record(cfg, run_id, outcome):
         """Close out a run that never got a window, so nothing waits on the grace timer."""
-        record = UPDATE_EXEC.read_record(cfg['dir'])
+        record = UPDATE_EXEC.read_record(cfg['dir'], run_id)
         if not record or record.get('runId') != run_id:
-            return                      # superseded already; not ours to rewrite
+            return                      # no launch record to close
         record['status'] = 'failed'
         record['endedAt'] = UPDATE_EXEC.now_iso()
         record['note'] = ('실행 창을 만들지 못했습니다 (%s) — tmux 가 설치돼 있는지 '

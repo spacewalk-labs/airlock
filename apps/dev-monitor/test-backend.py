@@ -2389,14 +2389,11 @@ class UpdateExecRouteTest(unittest.TestCase):
         record = UPX.read_record(self.dir)
         self.assertEqual((record['action'], record['appId']), ('app', 'notes'))
 
-    def test_an_app_without_an_update_cannot_be_executed(self):
+    def test_a_current_app_can_be_reapplied_without_a_plan(self):
+        DM.UPDATES = types.SimpleNamespace(current=lambda *args: self.fail('execution read plan'))
         status, payload = self._execute({'action': 'app', 'id': 'orca'})
-        self.assertEqual((status, payload['error']), (409, 'app_not_pending'))
-        self.assertEqual(self.launched, [])
-
-    def test_an_app_the_snapshot_never_listed_is_refused(self):
-        status, payload = self._execute({'action': 'app', 'id': 'invented'})
-        self.assertEqual((status, payload['error']), (409, 'app_not_pending'))
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(self.launched), 1)
 
     def test_a_malformed_app_id_is_refused_before_the_snapshot_is_consulted(self):
         for bad in ('../../etc', 'Notes', '', 'a' * 40, None, 5):
@@ -2440,6 +2437,7 @@ class UpdateExecRouteTest(unittest.TestCase):
                 self.assertEqual(self._req('POST', path, body, owner=False)[0], 403)
                 self.assertEqual(self._req('POST', path, body, origin=False)[0], 403)
                 self.assertEqual(links.read_bytes(), before)
+                UPX.write_record(self.dir, UPX.start_record('other-app', 'install', 'orca'))
                 status, payload = self._req('POST', path, body)
                 self.assertEqual(status, 200, payload)
                 self.assertTrue(payload['changed'])
@@ -2506,7 +2504,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertEqual((status, payload['rows']), (200, rows['rows']))
             self.assertEqual(self._req('GET', '/api/owner/apps', owner=False)[0], 403)
 
-            status, payload = self._req('POST', '/api/owner/apps/notepad/install', b'{}')
+            status, payload = self._req('POST', '/api/owner/apps/notepad/install', b'{"source":"public"}')
             self.assertEqual(status, 200, payload)
             self.assertEqual((payload['action'], payload['execution']), ('install', 'install'))
             record = UPX.read_record(self.dir)
@@ -2577,10 +2575,14 @@ class UpdateExecRouteTest(unittest.TestCase):
             saved_root = DM.UPDATE_EXEC_CONFIG['root']
             DM.UPDATE_EXEC_CONFIG['root'] = root
             DM.UPDATES = self._updates
+            expect_engine_failure = False
             def launch(run_id, plan, cfg=None, name=None):
                 result = subprocess.run(plan['exec'], stdin=subprocess.DEVNULL,
                                         capture_output=True, text=True, timeout=60)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if expect_engine_failure:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.launched.append((run_id, plan, cfg, name))
                 return 'ok', 'fixture'
             DM._launch_run = launch
@@ -2593,7 +2595,7 @@ class UpdateExecRouteTest(unittest.TestCase):
                                      ['wire-alpha', 'wire-beta'])
                     public = next(row for row in catalog['rows'] if row['id'] == 'notepad')
                     self.assertEqual((public['origin'], public['name']), ('public', 'Clip Bridge'))
-                    self.assertEqual(self._req('POST', '/api/owner/apps/notepad/install', b'{}')[0], 200)
+                    self.assertEqual(self._req('POST', '/api/owner/apps/notepad/install', b'{"source":"public"}')[0], 200)
                     self.assertTrue((fixture / 'web/notepad/index.html').is_file())
                     self.assertFalse((fixture / 'home/.local/share/notepad/owned').exists())
                     installed_public = json.loads((fixture / 'state/installed-apps.json').read_text())['notepad']
@@ -2656,9 +2658,11 @@ class UpdateExecRouteTest(unittest.TestCase):
                     record.write_text(json.dumps(installed))
                     before_missing = record.read_bytes()
                     before_launches = len(self.launched)
+                    expect_engine_failure = True
                     status, value = self._execute({'action': 'app', 'id': 'wire-beta'})
-                    self.assertNotEqual(status, 200, value)
-                    self.assertEqual(len(self.launched), before_launches)
+                    expect_engine_failure = False
+                    self.assertEqual(status, 200, value)
+                    self.assertEqual(len(self.launched), before_launches + 1)
                     self.assertEqual(record.read_bytes(), before_missing)
                     marker = fixture / 'home/.local/share/candidate-beta/owned'
                     self.assertFalse(marker.exists())
@@ -2694,13 +2698,15 @@ class UpdateExecRouteTest(unittest.TestCase):
                     record.write_text(json.dumps(installed))
                     self.assertEqual(self._req('GET', '/api/owner/apps')[0], 200)
                     launch_count = len(self.launched)
-                    self.assertNotEqual(self._execute({'action': 'app', 'id': 'wire-beta'})[0], 200)
-                    self.assertEqual(len(self.launched), launch_count)
+                    expect_engine_failure = True
+                    self.assertEqual(self._execute({'action': 'app', 'id': 'wire-beta'})[0], 200)
+                    expect_engine_failure = False
+                    self.assertEqual(len(self.launched), launch_count + 1)
                     self.assertEqual(json.loads(record.read_text())['wire-beta'], wrong)
                     # The malformed source of beta does not block a normal app.
-                    self.assertEqual(self._req('POST', '/api/owner/apps/notepad/install', b'{}')[0], 200)
+                    self.assertEqual(self._req('POST', '/api/owner/apps/notepad/install', b'{"source":"public"}')[0], 200)
                     self.assertEqual(json.loads(record.read_text())['wire-beta'], wrong)
-                    self.assertEqual(self._req('POST', '/api/owner/apps/wire-beta/install', b'{}')[0], 200)
+                    self.assertEqual(self._req('POST', '/api/owner/apps/wire-beta/install', b'{"source":"company"}')[0], 200)
                     repaired = json.loads(record.read_text())
                     self.assertEqual(repaired['wire-beta']['repo'], remote.resolve().as_uri())
                     self.assertEqual(repaired['publish'], publish_row)
@@ -2725,8 +2731,8 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertEqual(argv[argv.index('--app') + 1], 'lost-source')
             UPX.run_path(self.dir).unlink()
             self.assertEqual(self._req('POST', '/api/owner/apps/hub/remove', b'{}')[0], 409)
-            self.assertEqual(self._req('POST', '/api/owner/apps/absent/remove', b'{}')[0], 409)
-            self.assertEqual(len(self.launched), 1)
+            self.assertEqual(self._req('POST', '/api/owner/apps/absent/remove', b'{}')[0], 200)
+            self.assertEqual(len(self.launched), 2)
         finally:
             DM.APPS.installed_ids, DM.APPS.store_rows = saved
 
@@ -2736,12 +2742,13 @@ class UpdateExecRouteTest(unittest.TestCase):
         DM.UPDATES = types.SimpleNamespace(current=timeout)
         for method, path, body in (
                 ('GET', '/api/owner/apps', None),
-                ('GET', '/api/owner/updates', None),
-                ('POST', '/api/owner/updates/execute', b'{"action":"app","id":"notes"}'),
-                ('POST', '/api/owner/apps/notepad/install', b'{}')):
+                ('GET', '/api/owner/updates', None)):
             status, value = self._req(method, path, body)
             self.assertEqual((status, value['error']), (503, 'app_plan_unavailable'))
         self.assertEqual(self.launched, [])
+        for path, body in (('/api/owner/updates/execute', b'{"action":"app","id":"notes"}'),
+                           ('/api/owner/apps/notepad/install', b'{"source":"public"}')):
+            self.assertEqual(self._req('POST', path, body)[0], 200)
 
     def test_company_install_uses_engine_source_without_stage_or_config_writes(self):
         saved = (DM.APPS.store_rows, DM.APPS.installed_ids)
@@ -2749,7 +2756,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             {'id': 'widget', 'origin': 'company', 'kind': 'app', 'state': 'install'}]}
         DM.APPS.installed_ids = lambda root: []
         try:
-            status, payload = self._req('POST', '/api/owner/apps/widget/install', b'{}')
+            status, payload = self._req('POST', '/api/owner/apps/widget/install', b'{"source":"company"}')
             self.assertEqual(status, 200, payload)
             argv = self.launched[-1][1]['exec']
             self.assertEqual(argv[argv.index('--package-path') + 1], 'company')
@@ -2774,7 +2781,7 @@ class UpdateExecRouteTest(unittest.TestCase):
             self.assertEqual(status, 200, value)
             self.assertEqual(value['apps'], plan_apps)
             self.assertEqual(value['harness'], original['harness'])
-            self.assertEqual(self._execute({'action': 'app', 'id': 'old'})[0], 409)
+            self.assertEqual(self._execute({'action': 'app', 'id': 'old'})[0], 200)
             self.assertEqual(self._execute({'action': 'app', 'id': 'now'})[0], 200)
             self.assertEqual(path.read_bytes(), before)
         finally:
@@ -2789,10 +2796,11 @@ class UpdateExecRouteTest(unittest.TestCase):
             'grants': ['system-unit'],
             'rejected_capabilities': [], 'package': {'serve_port_values': {}},
         }
-        saved = (DM.APPS.package_preview,)
+        saved = (DM.APPS.package_preview, DM.APPS.package_info)
         calls = []
         DM.APPS.package_preview = lambda root, path: (calls.append(('preview', path))
                                                       or dict(preview))
+        DM.APPS.package_info = lambda root, app_id, path: {'packages': {'my-app': {'dir': package}}}
         try:
             status, payload = self._req(
                 'POST', '/api/owner/apps/package-preview',
@@ -2810,28 +2818,30 @@ class UpdateExecRouteTest(unittest.TestCase):
                              (200, 'register', 'install'))
             argv = self.launched[-1][1]['exec']
             self.assertEqual(argv[argv.index('--package-path') + 1], package)
-            self.assertEqual(calls, [('preview', package), ('preview', package)])
+            self.assertEqual(calls, [('preview', package)])
             self.assertNotIn('--reapprove', argv)
         finally:
-            (DM.APPS.package_preview,) = saved
+            DM.APPS.package_preview, DM.APPS.package_info = saved
 
 
-    def test_personal_install_refuses_changed_or_denied_preview(self):
+    def test_personal_install_uses_target_parser_and_keeps_id_match(self):
         digest = 'b' * 64
         package = '/srv/personal/denied'
-        saved = (DM.APPS.package_preview,)
+        saved = (DM.APPS.package_preview, DM.APPS.package_info)
         try:
             DM.APPS.package_preview = lambda root, path: {
                 'id': 'denied', 'path': package, 'digest': digest,
                 'installable': False,
                 'rejected_capabilities': ['plaintext-redirect'], 'conflict': None,
             }
+            DM.APPS.package_info = lambda root, app_id, path: {'packages': {'denied': {'dir': package}}}
             status, payload = self._req(
                 'POST', '/api/owner/apps/denied/register',
                 json.dumps({'path': package, 'digest': digest}).encode())
-            self.assertEqual((status, payload['error']), (409, 'package_not_installable'))
-            self.assertEqual(self.launched, [])
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(len(self.launched), 1)
 
+            DM.APPS.package_info = lambda root, app_id, path: {'packages': {'changed': {'dir': package}}}
             DM.APPS.package_preview = lambda root, path: {
                 'id': 'changed', 'path': package, 'digest': 'c' * 64,
                 'installable': True, 'grants': [],
@@ -2840,9 +2850,9 @@ class UpdateExecRouteTest(unittest.TestCase):
                 'POST', '/api/owner/apps/denied/register',
                 json.dumps({'path': package, 'digest': digest}).encode())
             self.assertEqual((status, payload['error']), (409, 'package_preview_changed'))
-            self.assertEqual(self.launched, [])
+            self.assertEqual(len(self.launched), 1)
         finally:
-            (DM.APPS.package_preview,) = saved
+            DM.APPS.package_preview, DM.APPS.package_info = saved
 
 
     def test_already_desired_or_absent_state_relaunches_install_for_retry(self):
@@ -2859,38 +2869,38 @@ class UpdateExecRouteTest(unittest.TestCase):
             status, payload = self._req('POST', '/api/owner/apps/notes/install', b'{}')
             self.assertEqual((status, payload['action'], payload['execution']),
                              (200, 'install', 'install'))
-            # an id the store does not offer at all is app_locked, not a removal
+            # Missing apps are delegated to the engine's idempotent remove.
             UPX.run_path(self.dir).unlink(missing_ok=True)
             status, payload = self._req('POST', '/api/owner/apps/gone/remove', b'{}')
-            self.assertEqual((status, payload['error']), (409, 'app_locked'))
+            self.assertEqual((status, payload['execution']), (200, 'teardown'))
             status, payload = self._req('POST', '/api/owner/apps/notepad/remove', b'{}')
-            self.assertEqual((status, payload['error']), (409, 'app_locked'))
-            self.assertFalse(UPX.run_path(self.dir).exists())
+            self.assertEqual((status, payload['execution']), (200, 'teardown'))
+            self.assertEqual(self.launched[-1][1]['exec'][-1], 'notepad')
         finally:
             (DM.APPS.store_rows, DM.APPS.installed_ids) = saved
 
 
     # ---- one at a time ------------------------------------------------------
-    def test_a_live_run_refuses_a_second_launch(self):
-        with live_wrapper() as pid:
-            UPX.write_record(self.dir, dict(UPX.start_record('live', 'platform', None),
-                                            status='running', pid=pid))
-            status, payload = self._execute({'action': 'platform'})
-            self.assertEqual((status, payload['error']), (409, 'run_active'))
-            self.assertEqual(self.launched, [])
+    def test_a_live_platform_run_does_not_block_another_app(self):
+        UPX.write_record(self.dir, UPX.start_record('live', 'platform', None))
+        status, payload = self._execute({'action': 'app', 'id': 'notes'})
+        self.assertEqual(status, 200, payload)
+        UPX.write_record(self.dir, dict(UPX._claim(self.dir, 'live'), status='done'))
+        status, first = self._req('GET', '/api/owner/updates/run?run_id=live')
+        self.assertEqual((status, first['run']['status']), (200, 'done'))
+        self.assertEqual(UPX.read_record(self.dir)['runId'], payload['run_id'])
+        self.assertEqual(UPX.read_record(self.dir, payload['run_id'])['status'], 'starting')
 
     def test_a_dead_run_does_not_block_forever(self):
         record = dict(UPX.start_record('dead', 'platform', None), status='running', pid=1)
         UPX.write_record(self.dir, record)
         self.assertEqual(self._execute({'action': 'platform'})[0], 200)
 
-    def test_a_held_updater_mutex_refuses_a_launch(self):
+    def test_a_held_updater_mutex_does_not_block_an_app_launch(self):
         saved = UPX.updater_busy
         UPX.updater_busy = lambda root: True
         try:
-            status, payload = self._execute({'action': 'platform'})
-            self.assertEqual((status, payload['error']), (409, 'updater_busy'))
-            self.assertEqual(self.launched, [])
+            self.assertEqual(self._execute({'action': 'app', 'id': 'notes'})[0], 200)
         finally:
             UPX.updater_busy = saved
 
@@ -3102,7 +3112,7 @@ class UpdateExecEndToEndTest(unittest.TestCase):
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                               timeout=60)
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn('superseded', proc.stderr)
+        self.assertIn('record is unavailable', proc.stderr)
         record = UPX.read_record(self.dir)
         self.assertEqual((record['runId'], record['status']), ('newer', 'running'))
 

@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 SCHEMA_VERSION = 1
 
@@ -52,7 +53,9 @@ def default_dir() -> Path:
                                "~/.local/state/airlock/update-run")).expanduser()
 
 
-def run_path(directory: Path) -> Path:
+def run_path(directory: Path, run_id: str | None = None) -> Path:
+    if run_id is not None:
+        return directory / "runs" / (quote(run_id, safe="") + ".json")
     return directory / "run.json"
 
 
@@ -65,7 +68,7 @@ def sentinel_dir(directory: Path) -> Path:
 
 
 def ensure_dirs(directory: Path) -> None:
-    for path in (directory, plan_dir(directory), sentinel_dir(directory)):
+    for path in (directory, directory / "runs", plan_dir(directory), sentinel_dir(directory)):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
@@ -82,9 +85,9 @@ def new_run_id(clock: float | None = None) -> str:
 # ---------------------------------------------------------------- record I/O ----
 
 def write_record(directory: Path, record: dict[str, Any]) -> None:
-    """Atomically replace the single run record."""
+    """Write this run independently; run.json points to the latest launch."""
     ensure_dirs(directory)
-    path = run_path(directory)
+    path = run_path(directory, record["runId"])
     descriptor, temporary = tempfile.mkstemp(prefix=".run.", dir=str(directory))
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -93,6 +96,16 @@ def write_record(directory: Path, record: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        latest = run_path(directory)
+        if record.get("status") == "starting" or not latest.exists():
+            # Only a launch moves the pointer. Finishing an older run cannot hide
+            # the newest launch or overwrite its record.
+            pointer = Path(temporary + ".latest")
+            try:
+                pointer.symlink_to(path.relative_to(directory))
+                os.replace(pointer, latest)
+            finally:
+                pointer.unlink(missing_ok=True)
     except Exception:
         try:
             os.unlink(temporary)
@@ -101,9 +114,9 @@ def write_record(directory: Path, record: dict[str, Any]) -> None:
         raise
 
 
-def read_record(directory: Path) -> dict[str, Any] | None:
+def read_record(directory: Path, run_id: str | None = None) -> dict[str, Any] | None:
     try:
-        with run_path(directory).open(encoding="utf-8") as handle:
+        with run_path(directory, run_id).open(encoding="utf-8") as handle:
             value = json.load(handle)
     except (OSError, ValueError):
         return None
@@ -287,8 +300,7 @@ def build_plan(root: Path, directory: Path, run_id: str, action: str,
 def start_record(run_id: str, action: str, app_id: str | None) -> dict[str, Any]:
     """The record the BACKEND writes before launching, so a click is never invisible.
 
-    The wrapper refuses to overwrite a record whose runId is not its own, which is what
-    stops a superseded launch from reporting over a live one.
+    Each wrapper writes only its own runId record.
     """
     return {"schemaVersion": SCHEMA_VERSION, "runId": run_id, "action": action,
             "appId": app_id, "status": "starting", "pid": None,
@@ -398,10 +410,10 @@ def recovery_hint(root: Path) -> dict[str, Any]:
 
 def _claim(directory: Path, run_id: str) -> dict[str, Any]:
     """Load our own record, or refuse to write over someone else's."""
-    record = read_record(directory)
+    record = read_record(directory, run_id)
     if record is None or record.get("runId") != run_id:
         raise SystemExit("devmon_update_exec: run %s is not the recorded run — "
-                         "another launch superseded it" % run_id)
+                         "its launch record is unavailable" % run_id)
     return record
 
 

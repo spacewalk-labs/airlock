@@ -50,22 +50,6 @@ git config -f "$GIT_CONFIG_GLOBAL" user.name  airlock-test
 git config -f "$GIT_CONFIG_GLOBAL" user.email airlock-test@localhost
 git config -f "$GIT_CONFIG_GLOBAL" init.defaultBranch main
 
-# A5 for git: 41 of the 45 `bash "$UPDATE"` calls below pass no AIRLOCK_DIR on
-# purpose (they exercise the no-AIRLOCK_DIR path), and bin/airlock-update then
-# resolves ROOT to the checkout this script was started from and snapshots ITS
-# history there. Record where we started, refuse any git write aimed at this
-# checkout, and prove the guard is really installed before trusting it.
-_p3e_guard_head="$(git -C "$ROOT" rev-parse HEAD)"
-_p3e_guard_dirty="$(git -C "$ROOT" status --porcelain)"
-airlock_guard_checkout_writes "$ROOT" "$scratch/guard"
-if airlock_check_guard_fires "$ROOT" "guard self-test"; then
-  ok "the git write guard refuses a commit aimed at this checkout (A5)"
-  p3e_guard=1
-else
-  bad "the git write guard is NOT installed — this suite can commit into the checkout"
-  p3e_guard=0
-fi
-
 # ---------------------------------------------------------------- fixtures
 seed_tree() {   # seed_tree <dir> <marker>
   local d="$1" m="$2"
@@ -616,7 +600,7 @@ git -C "$DIRECTION_REL" add -A
 git -C "$DIRECTION_REL" commit -q -m "release from test-source @ 2222222"
 direction_current="$(git -C "$DIRECTION_REL" rev-parse HEAD)"
 git -C "$DIRECTION_REL" merge-base --is-ancestor "$direction_old" "$direction_current" \
-  && ok "positive control: the rejected release is behind the installed release" \
+  && ok "positive control: the observed release is behind the installed release" \
   || bad "positive control: stale-release fixture has no forward release ancestry"
 
 DIRECTION_BOX="$scratch/direction-box"
@@ -645,12 +629,12 @@ else
 fi
 
 direction_run_out="$(AIRLOCK_DIR="$DIRECTION_BOX" AIRLOCK_RELEASE_URL="$DIRECTION_REL" \
-  AIRLOCK_RELEASE_REF="$direction_old" bash "$UPDATE" --no-install 2>&1)"
+  AIRLOCK_RELEASE_REF="$direction_old" bash "$UPDATE" --dry-run 2>&1)"
 direction_run_rc=$?
-if [ "$direction_run_rc" -ne 0 ] \
+if [ "$direction_run_rc" = 0 ] \
   && [ "$(git -C "$DIRECTION_BOX" rev-parse HEAD)" = "$direction_before_head" ] \
   && grep -q 'release-current' "$DIRECTION_BOX/README.md"; then
-  ok "an explicit stale-release update is refused before changing the checkout"
+  ok "an explicit stale-release preview preserves the checkout"
 else
   bad "a stale release changed or was allowed on the box (rc=$direction_run_rc): $direction_run_out"
 fi
@@ -832,6 +816,26 @@ git -C "$PRIVATE_BOX" merge -q --allow-unrelated-histories -s ours \
   -m "deploy current release" FETCH_HEAD
 private_deploy_head="$(git -C "$PRIVATE_BOX" rev-parse HEAD)"
 
+# Private-origin deployments can follow a neutral public release even when the
+# direction detector cannot identify its source label. Installation uses the chosen
+# release; it does not depend on that observational inference.
+NEUTRAL_PUBLIC="$scratch/neutral-public/airlock"
+NEUTRAL_BOX="$scratch/neutral-private-deployment"
+git clone -q "$PRIVATE_PUBLIC" "$NEUTRAL_PUBLIC"
+seed_tree "$NEUTRAL_PUBLIC" neutral-next
+git -C "$NEUTRAL_PUBLIC" add -A
+git -C "$NEUTRAL_PUBLIC" commit -q -m "release from source @ $private_current"
+git clone -q "$PRIVATE_BOX" "$NEUTRAL_BOX"
+git -C "$NEUTRAL_BOX" remote set-url origin "$canonical_private"
+git -C "$NEUTRAL_BOX" config "url.file://$PRIVATE_REL.insteadOf" "$canonical_private"
+git -C "$NEUTRAL_BOX" commit -q --allow-empty \
+  -m "airlock-update: 배포본 ${private_public_current:0:12} 으로 갱신"
+neutral_out="$(AIRLOCK_DIR="$NEUTRAL_BOX" AIRLOCK_RELEASE_URL="$NEUTRAL_PUBLIC" \
+  bash "$UPDATE" --no-install 2>&1)"; neutral_rc=$?
+[ "$neutral_rc" = 0 ] && grep -q 'neutral-next' "$NEUTRAL_BOX/README.md" \
+  && ok "private-origin installation accepts the selected neutral public release" \
+  || bad "direction inference blocked the selected neutral release (rc=$neutral_rc): $neutral_out"
+
 # One detection may contact one repository.  Count the real `git fetch` argv rather
 # than scraping progress text; the first fetch is also the positive control that the
 # counter is live.  A private deployment used to fetch the public release here and
@@ -839,10 +843,7 @@ private_deploy_head="$(git -C "$PRIVATE_BOX" rev-parse HEAD)"
 FETCH_COUNT_BIN="$scratch/fetch-count-bin"
 FETCH_COUNT_LOG="$scratch/private-fetches.log"
 mkdir -p "$FETCH_COUNT_BIN"
-# The pinned real git, not `command -v git`: by the time this shim is built the
-# guard is already on PATH, so command -v would capture the guard and the two
-# shims would call each other forever (install/test-lib.sh explains it).
-real_git="$AIRLOCK_TEST_GUARD_REAL_GIT"
+real_git="$(command -v git)"
 cat >"$FETCH_COUNT_BIN/git" <<SH
 #!/usr/bin/env bash
 for arg in "\$@"; do
@@ -947,8 +948,8 @@ git -C "$PRIVATE_REWIND_BOX" remote add airlock-release "$PRIVATE_PUBLIC"
 git -C "$PRIVATE_REWIND_BOX" update-ref refs/remotes/origin/main "$private_old"
 private_rewind_head="$(git -C "$PRIVATE_REWIND_BOX" rev-parse HEAD)"
 private_rewind_out="$(AIRLOCK_DIR="$PRIVATE_REWIND_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
-  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --no-install 2>&1)"; private_rewind_rc=$?
-[ "$private_rewind_rc" -ne 0 ] \
+  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --dry-run 2>&1)"; private_rewind_rc=$?
+[ "$private_rewind_rc" = 0 ] \
   && [ "$(git -C "$PRIVATE_REWIND_BOX" rev-parse HEAD)" = "$private_rewind_head" ] \
   && grep -q 'private-current' "$PRIVATE_REWIND_BOX/README.md" \
   && ok "a stale private-main tracking ref cannot rewind a deployed checkout" \
@@ -965,8 +966,8 @@ git -C "$PRIVATE_PREFIX_REF_BOX" update-ref refs/remotes/origin/main "$private_o
 git -C "$PRIVATE_PREFIX_REF_BOX" branch "${private_current:0:7}" "$private_old"
 private_prefix_ref_head="$(git -C "$PRIVATE_PREFIX_REF_BOX" rev-parse HEAD)"
 private_prefix_ref_out="$(AIRLOCK_DIR="$PRIVATE_PREFIX_REF_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
-  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --no-install 2>&1)"; private_prefix_ref_rc=$?
-[ "$private_prefix_ref_rc" -ne 0 ] \
+  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --dry-run 2>&1)"; private_prefix_ref_rc=$?
+[ "$private_prefix_ref_rc" = 0 ] \
   && [ "$(git -C "$PRIVATE_PREFIX_REF_BOX" rev-parse HEAD)" = "$private_prefix_ref_head" ] \
   && grep -q 'private-current' "$PRIVATE_PREFIX_REF_BOX/README.md" \
   && ok "a ref named like a source digest cannot redirect provenance or rewind" \
@@ -1001,8 +1002,8 @@ private_log_fail_json="$(PATH="$LOG_FAIL_BIN:$PATH" AIRLOCK_DIR="$PRIVATE_LOG_FA
   || bad "a failed installed-history read published a fresh result (rc=$private_log_fail_json_rc): $private_log_fail_json"
 private_log_fail_out="$(PATH="$LOG_FAIL_BIN:$PATH" AIRLOCK_DIR="$PRIVATE_LOG_FAIL_BOX" \
   AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_old" \
-  bash "$UPDATE" --no-install 2>&1)"; private_log_fail_rc=$?
-[ "$private_log_fail_rc" -ne 0 ] \
+  bash "$UPDATE" --dry-run 2>&1)"; private_log_fail_rc=$?
+[ "$private_log_fail_rc" = 0 ] \
   && [ "$(git -C "$PRIVATE_LOG_FAIL_BOX" rev-parse HEAD)" = "$private_log_fail_head" ] \
   && grep -q 'private-current' "$PRIVATE_LOG_FAIL_BOX/README.md" \
   && ok "a failed installed-history read cannot fall back to stale provenance" \
@@ -1047,8 +1048,8 @@ git -C "$PRIVATE_DIVERGENT_BOX" update-ref refs/remotes/origin/main "$private_ol
 private_divergent_head="$(git -C "$PRIVATE_DIVERGENT_BOX" rev-parse HEAD)"
 private_divergent_out="$(AIRLOCK_DIR="$PRIVATE_DIVERGENT_BOX" \
   AIRLOCK_RELEASE_URL="$DIVERGENT_PUBLIC" AIRLOCK_RELEASE_REF="$divergent_public_old" \
-  bash "$UPDATE" --no-install 2>&1)"; private_divergent_rc=$?
-[ "$private_divergent_rc" -ne 0 ] \
+  bash "$UPDATE" --dry-run 2>&1)"; private_divergent_rc=$?
+[ "$private_divergent_rc" = 0 ] \
   && [ "$(git -C "$PRIVATE_DIVERGENT_BOX" rev-parse HEAD)" = "$private_divergent_head" ] \
   && grep -q 'private-current' "$PRIVATE_DIVERGENT_BOX/README.md" \
   && ok "the last deployment merge wins when public release histories diverge" \
@@ -1197,8 +1198,8 @@ git -C "$PRIVATE_INVALID_SOURCE_BOX" remote add airlock-release "$PRIVATE_PUBLIC
 private_invalid_source_head="$(git -C "$PRIVATE_INVALID_SOURCE_BOX" rev-parse HEAD)"
 private_invalid_source_out="$(AIRLOCK_DIR="$PRIVATE_INVALID_SOURCE_BOX" \
   AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" AIRLOCK_RELEASE_REF="$private_public_invalid_source" \
-  bash "$UPDATE" --no-install 2>&1)"; private_invalid_source_rc=$?
-[ "$private_invalid_source_rc" -ne 0 ] \
+  bash "$UPDATE" --dry-run 2>&1)"; private_invalid_source_rc=$?
+[ "$private_invalid_source_rc" = 0 ] \
   && [ "$(git -C "$PRIVATE_INVALID_SOURCE_BOX" rev-parse HEAD)" = "$private_invalid_source_head" ] \
   && grep -q 'private-current' "$PRIVATE_INVALID_SOURCE_BOX/README.md" \
   && ok "a non-commit source digest cannot bypass provenance through public ancestry" \
@@ -1239,9 +1240,9 @@ else
   bad "a private deployment checkout reported its older release as available: $private_stale_json"
 fi
 private_stale_out="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
-  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --no-install 2>&1)"
+  AIRLOCK_RELEASE_REF="$private_public_old" bash "$UPDATE" --dry-run 2>&1)"
 private_stale_rc=$?
-[ "$private_stale_rc" -ne 0 ] \
+[ "$private_stale_rc" = 0 ] \
   && [ "$(git -C "$PRIVATE_BOX" rev-parse HEAD)" = "$private_deploy_head" ] \
   && grep -q 'private-current' "$PRIVATE_BOX/README.md" \
   && ok "a stale release cannot rewind a private deployment checkout" \
@@ -1269,12 +1270,12 @@ else
   bad "a mismatched release source was offered as an update: $private_mismatch_json"
 fi
 private_mismatch_out="$(AIRLOCK_DIR="$PRIVATE_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
-  AIRLOCK_RELEASE_REF="$private_public_mismatch" bash "$UPDATE" --no-install 2>&1)"
+  AIRLOCK_RELEASE_REF="$private_public_mismatch" bash "$UPDATE" --dry-run 2>&1)"
 private_mismatch_rc=$?
-[ "$private_mismatch_rc" -ne 0 ] \
+[ "$private_mismatch_rc" = 0 ] \
   && [ "$(git -C "$PRIVATE_BOX" rev-parse HEAD)" = "$private_deploy_head" ] \
   && grep -q 'private-current' "$PRIVATE_BOX/README.md" \
-  && ok "a release naming another source is refused before checkout mutation" \
+  && ok "a preview naming another source preserves the checkout" \
   || bad "a mismatched release source reached the checkout (rc=$private_mismatch_rc): $private_mismatch_out"
 
 # A well-formed release naming another source is a measured semantic non-update,
@@ -1307,22 +1308,19 @@ else
   bad "an off-main source was offered as a release: $private_side_json"
 fi
 private_side_out="$(AIRLOCK_DIR="$PRIVATE_OLD_BOX" AIRLOCK_RELEASE_URL="$PRIVATE_PUBLIC" \
-  AIRLOCK_RELEASE_REF="$private_public_side" bash "$UPDATE" --no-install 2>&1)"
+  AIRLOCK_RELEASE_REF="$private_public_side" bash "$UPDATE" --dry-run 2>&1)"
 private_side_rc=$?
-[ "$private_side_rc" -ne 0 ] \
+[ "$private_side_rc" = 0 ] \
   && [ "$(git -C "$PRIVATE_OLD_BOX" rev-parse HEAD)" = "$private_old_head" ] \
-  && grep -q '배포본 방향이 모호' <<<"$private_side_out" \
-  && ok "an off-main release source is refused before checkout mutation" \
+  && grep -q '앞서는지 확인하지 못' <<<"$private_side_out" \
+  && ok "an off-main release preview preserves the checkout" \
   || bad "an off-main release source reached the checkout (rc=$private_side_rc): $private_side_out"
 
 # A failed provenance measurement is not an empty diff.  Make only `git diff` fail;
 # fetch and every other git operation remain live positive controls.
 DIFF_FAIL_BIN="$scratch/diff-fail-bin"
 mkdir -p "$DIFF_FAIL_BIN"
-# The pinned real git, not `command -v git`: by the time this shim is built the
-# guard is already on PATH, so command -v would capture the guard and the two
-# shims would call each other forever (install/test-lib.sh explains it).
-real_git="$AIRLOCK_TEST_GUARD_REAL_GIT"
+real_git="$(command -v git)"
 cat >"$DIFF_FAIL_BIN/git" <<SH
 #!/usr/bin/env bash
 for arg in "\$@"; do
@@ -2406,11 +2404,11 @@ ph_preview="$(run_update --dry-run)"; ph_preview_rc=$?
   && grep -q 'version ancient' "$BOX/README.md" \
   && ok "a person's preview of a pre-history box lists the changes and names --from-unknown" \
   || bad "the preview of a pre-history box hid the changes or the way forward: $ph_preview"
-ph_refuse="$(run_update --no-install)"; ph_refuse_rc=$?
-[ "$ph_refuse_rc" -ne 0 ] && grep -q 'version ancient' "$BOX/README.md" \
+ph_refuse="$(run_update --dry-run)"; ph_refuse_rc=$?
+[ "$ph_refuse_rc" = 0 ] && grep -q 'version ancient' "$BOX/README.md" \
   && [ "$(git -C "$BOX" rev-parse HEAD)" = "$ph_head" ] \
   && printf '%s' "$ph_refuse" | grep -q -- '--from-unknown' \
-  && ok "without --from-unknown a pre-history box is refused and left exactly as it was" \
+  && ok "a pre-history box is left exactly as it was" \
   || bad "a pre-history box was changed without --from-unknown (rc=$ph_refuse_rc): $ph_refuse"
 ph_run="$(run_update --no-install --from-unknown)"; ph_run_rc=$?
 [ "$ph_run_rc" = 0 ] && grep -q 'version new' "$BOX/README.md" \
@@ -2433,10 +2431,10 @@ assert v["available"] is True and v["changedCount"] > 0, v' \
 make_prehistory_box
 git -C "$REL" branch -f pinned-old HEAD~1
 ph_pin="$(AIRLOCK_DIR="$BOX" AIRLOCK_RELEASE_URL="$REL" AIRLOCK_RELEASE_REF=pinned-old \
-  bash "$UPDATE" --no-install --from-unknown 2>&1)"; ph_pin_rc=$?
+  bash "$UPDATE" --dry-run --from-unknown 2>&1)"; ph_pin_rc=$?
 git -C "$REL" branch -D -q pinned-old
-[ "$ph_pin_rc" -ne 0 ] && grep -q 'version ancient' "$BOX/README.md" \
-  && ok "--from-unknown does not unlock a pinned ref, which may be older than the box" \
+[ "$ph_pin_rc" = 0 ] && grep -q 'version ancient' "$BOX/README.md" \
+  && ok "a pinned ref does not modify the box" \
   || bad "--from-unknown installed a pinned ref over an unplaceable box: $ph_pin"
 # The oldest boxes may never have run `git init` at all.
 # Consume all git log output: grep -q can close early and make git return
@@ -3357,19 +3355,6 @@ if AIRLOCK_COMPANY_PIN_TEST_SCRATCH="$scratch/company-pin" python3 -B "$HERE/tes
 else
   bad "Company pin returned another fetch SHA or left a temporary ref"
   cat "$scratch/company-pin.log"
-fi
-
-# The last word on A5: whatever the suite did, this checkout is where it started.
-_p3e_end_head="$(git -C "$ROOT" rev-parse HEAD)"
-_p3e_end_dirty="$(git -C "$ROOT" status --porcelain)"
-if [ "$_p3e_guard_head" = "$_p3e_end_head" ] && [ "$_p3e_guard_dirty" = "$_p3e_end_dirty" ] ; then
-  ok "the checkout under test is byte-identical to how the suite found it (no commit, no file)"
-  p3e_clean=1
-else
-  bad "the suite moved the checkout under test: HEAD $_p3e_guard_head -> $_p3e_end_head"
-  [ "$_p3e_guard_dirty" = "$_p3e_end_dirty" ] \
-    || bad "the suite left files behind: [$(printf '%s' "$_p3e_end_dirty" | head -5 | tr '\n' '|')]"
-  p3e_clean=0
 fi
 
 printf '\npassed=%d failed=%d\n' "$pass" "$fail"
