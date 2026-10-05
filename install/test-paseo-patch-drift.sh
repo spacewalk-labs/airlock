@@ -153,13 +153,13 @@ const expected = new Set([
   "acp-agy-shared-catalog",
   "agent-resolve-by-id",
   "archive-consistency",
+  "send-keep-pending-permissions",
   "schedule-pending-delivery-schema",
   "schedule-busy-pending-delivery",
   "schedule-stale-due-run",
   "schedule-pending-batch",
   "workspace-git-watch-recovery",
-  "workspace-git-emergency-policy",
-  "workspace-reconciliation-emergency-policy",
+  "workspace-git-identity",
   "workspace-remove-delivery",
   "patch-web-ui",
 ]);
@@ -972,6 +972,69 @@ else
   bad "archive/workspace consistency: installer wiring is absent"
 fi
 
+# ------------------------------------------------ send keeps pending permissions
+# Pristine pinned protocol/server/client files must yield three behavior-valid candidates;
+# a second pass over the patched trio is ALREADY, and a mixed trio is refused with no candidates.
+SK_DIR="$TMP/send-keep"
+mkdir -p "$SK_DIR"
+sk_extract_rc=0
+tar -xOf "$history_bundle/getpaseo-protocol-0.8.0.tgz" package/dist/messages.js >"$SK_DIR/messages.js" 2>/dev/null || sk_extract_rc=$?
+tar -xOf "$history_bundle/getpaseo-server-0.8.0.tgz" package/dist/server/server/session.js >"$SK_DIR/session.js" 2>/dev/null || sk_extract_rc=$?
+tar -xOf "$history_bundle/getpaseo-client-0.8.0.tgz" package/dist/daemon-client.js >"$SK_DIR/daemon-client.js" 2>/dev/null || sk_extract_rc=$?
+if [ "$sk_extract_rc" -ne 0 ]; then
+  bad "send-keep-pending-permissions: pinned bundle targets could not be extracted"
+elif [ "$(grep -lF 'paseo-send-keep-pending-permissions' "$SK_DIR/messages.js" "$SK_DIR/session.js" "$SK_DIR/daemon-client.js" | wc -l)" -eq 3 ]; then
+  # Baked into the vendored tarballs: the installer must see ALREADY and leave the pinned files alone.
+  sk_baked_rc=0
+  node "$PATCH_DIR/send-keep-pending-permissions.mjs" "$SK_DIR/messages.js" "$SK_DIR/session.js" "$SK_DIR/daemon-client.js" >/dev/null 2>&1 || sk_baked_rc=$?
+  if [ "$sk_baked_rc" -eq 10 ] \
+    && node --check "$SK_DIR/messages.js" >/dev/null 2>&1 \
+    && node --check "$SK_DIR/session.js" >/dev/null 2>&1 \
+    && node --check "$SK_DIR/daemon-client.js" >/dev/null 2>&1; then
+    ok "send-keep-pending-permissions: pinned bundle trio is baked, syntax-valid and idempotent"
+  else
+    bad "send-keep-pending-permissions: baked pinned trio did not report already-applied (rc=$sk_baked_rc)"
+  fi
+else
+  sk_rc=0
+  node "$PATCH_DIR/send-keep-pending-permissions.mjs" "$SK_DIR/messages.js" "$SK_DIR/session.js" "$SK_DIR/daemon-client.js" >/dev/null 2>&1 || sk_rc=$?
+  if [ "$sk_rc" -eq 0 ] \
+    && node --check "$SK_DIR/session.js.paseo-new.mjs" >/dev/null 2>&1 \
+    && node --check "$SK_DIR/daemon-client.js.paseo-new.mjs" >/dev/null 2>&1 \
+    && node --check "$SK_DIR/messages.js.paseo-new.mjs" >/dev/null 2>&1; then
+    # The behaviour test imports zod via the protocol package, which the vendored tarballs do not
+    # carry; the installer runs it against the real installed tree before any mv.
+    ok "send-keep-pending-permissions: pristine pinned bundle produces syntax-valid trio candidates"
+  else
+    bad "send-keep-pending-permissions: pristine pinned bundle trio patch failed (rc=$sk_rc)"
+  fi
+  # Mixed: only the server file patched -> exit 20 and no new candidates.
+  cp "$SK_DIR/session.js.paseo-new.mjs" "$SK_DIR/session-mixed.js"
+  rm -f "$SK_DIR"/*.paseo-new.mjs
+  sk_mixed_rc=0
+  node "$PATCH_DIR/send-keep-pending-permissions.mjs" "$SK_DIR/messages.js" "$SK_DIR/session-mixed.js" "$SK_DIR/daemon-client.js" >/dev/null 2>&1 || sk_mixed_rc=$?
+  if [ "$sk_mixed_rc" -eq 20 ] && ! ls "$SK_DIR"/*.paseo-new.mjs >/dev/null 2>&1; then
+    ok "send-keep-pending-permissions: mixed trio is refused without candidates"
+  else
+    bad "send-keep-pending-permissions: mixed trio was not refused atomically (rc=$sk_mixed_rc)"
+  fi
+  # Drift: a broken client anchor -> exit 20 and no candidates.
+  sed 's/options?\.images/options?.imagez/' "$SK_DIR/daemon-client.js" >"$SK_DIR/client-drift.js"
+  sk_drift_rc=0
+  node "$PATCH_DIR/send-keep-pending-permissions.mjs" "$SK_DIR/messages.js" "$SK_DIR/session.js" "$SK_DIR/client-drift.js" >/dev/null 2>&1 || sk_drift_rc=$?
+  if [ "$sk_drift_rc" -eq 20 ] && ! ls "$SK_DIR"/*.paseo-new.mjs >/dev/null 2>&1; then
+    ok "send-keep-pending-permissions: anchor drift is refused without candidates"
+  else
+    bad "send-keep-pending-permissions: anchor drift was not refused (rc=$sk_drift_rc)"
+  fi
+fi
+if grep -qF 'SENDKEEP_PATCHER="$HERE/patches/send-keep-pending-permissions.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'node "$SENDKEEP_TEST" "${sk_files[0]}.paseo-new.mjs"' "$ROOT/apps/paseo/install.sh"; then
+  ok "send-keep-pending-permissions: installer applies and verifies candidates before mv"
+else
+  bad "send-keep-pending-permissions: installer wiring is absent"
+fi
+
 # ------------------------------------------------------- schedule stale-due + single list
 # The reference preimage carries the *already busy-pending-patched* tick as context, because
 # that is what this patcher anchors on. Order is the contract: without the precursor the
@@ -1133,59 +1196,76 @@ else
   bad "workspace removal: repeat patch failed"
 fi
 
-# Background policy fixtures are independent of patcher literals. Both registered
-# patchers must accept their original shape, reject drift, and remain idempotent.
-for policy in workspace-git-emergency-policy workspace-reconciliation-emergency-policy; do
-  fixture="$TMP/$policy.js"
-  if [ "$policy" = workspace-git-emergency-policy ]; then
-    cat >"$fixture" <<'EOF'
+# Identity pair: independent fixtures cover both anchors and no partial writes.
+IDENTITY_SERVICE="$TMP/identity-service.js"
+IDENTITY_CHECKOUT="$TMP/identity-checkout.js"
+cat >"$IDENTITY_SERVICE" <<'EOF'
+import { getCheckoutShortstat, getCheckoutStatus, getCheckoutWorktreeState } from "../utils/checkout-git.js";
+function deps() {
+    return {
+        getCheckoutStatus,
+        getCheckoutShortstat,
+    };
+}
 export class WorkspaceGitServiceImpl {
-    async refreshSnapshot(target, request, runRefreshGitCommand) {}
-    async runRepoFetch(target) {}
+    async getCheckout(normalizedCwd) {
+        const status = await this.deps.getCheckoutStatus(normalizedCwd, {});
+        return status;
+    }
 }
 EOF
-    anchor='async refreshSnapshot'
-  else
-    cat >"$fixture" <<'EOF'
-export class WorkspaceReconciliationService {
-    async reconcileObservedGitMetadata(mode = "metadata") {}
-    async reconcileNow() {}
+# Preserve the actual call's multiline anchor, independent of patcher literals.
+sed -i 's/(normalizedCwd, {});/(normalizedCwd, {\n        });/' "$IDENTITY_SERVICE"
+cat >"$IDENTITY_CHECKOUT" <<'EOF'
+export async function getCheckoutStatus(cwd, context) {
+    const facts = await getCheckoutSnapshotFacts(cwd, context);
+    if (!facts.isGit) return { isGit: false };
+    const worktreeRoot = facts.worktreeRoot;
+    const currentBranch = facts.currentBranch;
+    const remoteUrl = facts.remoteUrl;
+    const paseoWorktree = facts.paseoWorktree;
+    const baseRef = facts.resolvedBaseRef;
+    const mainRepoRoot = facts.mainRepoRoot;
+    if (paseoWorktree.isPaseoOwnedWorktree && baseRef) {
+        return {
+            isGit: true,
+            repoRoot: worktreeRoot,
+            mainRepoRoot: mainRepoRoot ?? worktreeRoot,
+            currentBranch,
+            remoteUrl,
+            isPaseoOwnedWorktree: true,
+        };
+    }
+    return {
+        isGit: true,
+        repoRoot: worktreeRoot,
+        mainRepoRoot: mainRepoRoot && resolve(mainRepoRoot) !== resolve(worktreeRoot) ? mainRepoRoot : null,
+        currentBranch,
+        remoteUrl,
+        isPaseoOwnedWorktree: false,
+    };
 }
+// Workspace history stays complete;
 EOF
-    anchor='async reconcileNow'
-  fi
-  if positive_js "$PATCH_DIR/$policy.mjs" "$fixture" \
-    && node --check "$fixture.paseo-new.mjs" \
-    && node "$PATCH_DIR/$policy.test.mjs" "$fixture.paseo-new.mjs"; then
-    ok "$policy: positive candidate syntax and behavior"
-  else bad "$policy: positive fixture failed"; fi
-  cp "$fixture" "$fixture.bad"
-  sed -i "s/$anchor/drifted_method/" "$fixture.bad"
-  cp "$fixture.bad" "$fixture.before"
-  if negative_js "$PATCH_DIR/$policy.mjs" "$fixture.bad" 20 "$fixture.before"; then
-    ok "$policy: missing anchor leaves bytes untouched"
-  else bad "$policy: drift not detected"; fi
-  again_rc=0
-  node "$PATCH_DIR/$policy.mjs" "$fixture.paseo-new.mjs" >/dev/null || again_rc=$?
-  if [ "$again_rc" = 10 ]; then ok "$policy: already-applied skip";
-  else bad "$policy: idempotence failed"; fi
- done
-
-
-# C13: a normal already-patched target is accepted on reinstall.
-(
-mkdir -p "$TMP/policy-reinstall/patches"
-printf 'process.exit(10)\n' >"$TMP/policy-reinstall/patches/policy.mjs"
-printf 'process.exit(1)\n' >"$TMP/policy-reinstall/patches/policy.test.mjs"
-printf 'already patched\n' >"$TMP/policy-reinstall/target.js"
-HERE="$TMP/policy-reinstall"
-log() { printf '%s\n' "$*"; }
-die() { printf '%s\n' "$*" >&2; exit 1; }
-eval "$(sed -n '/^apply_background_git_policy() {/,/^}/p' "$ROOT/apps/paseo/install.sh")"
-apply_background_git_policy policy "$TMP/policy-reinstall/target.js" fixture
-printf 'passed: reinstall accepts an already patched target despite a failed development behaviour check\n'
-
-) && ok "C13 already-patched target is accepted" || bad "C13 already-patched target was refused"
+identity_rc=0
+node "$PATCH_DIR/workspace-git-identity.mjs" "$IDENTITY_SERVICE" "$IDENTITY_CHECKOUT" > /dev/null || identity_rc=$?
+if [ "$identity_rc" = 0 ] && node --check "$IDENTITY_SERVICE.paseo-new.mjs" && node --check "$IDENTITY_CHECKOUT.paseo-new.mjs"; then
+  ok "checkout identity: both candidates have valid syntax"
+else bad "checkout identity: positive pair failed"; fi
+identity_rc=0
+node "$PATCH_DIR/workspace-git-identity.mjs" "$IDENTITY_SERVICE.paseo-new.mjs" "$IDENTITY_CHECKOUT.paseo-new.mjs" > /dev/null || identity_rc=$?
+[ "$identity_rc" = 10 ] && ok "checkout identity: idempotent pair" || bad "checkout identity: repeat not accepted"
+for target in "$IDENTITY_SERVICE" "$IDENTITY_CHECKOUT"; do
+  cp "$target" "$target.before"
+  sed -i 's/getCheckoutStatus/getDriftedStatus/g' "$target"
+  rm -f "$IDENTITY_SERVICE.paseo-new.mjs" "$IDENTITY_CHECKOUT.paseo-new.mjs"
+  identity_rc=0
+  node "$PATCH_DIR/workspace-git-identity.mjs" "$IDENTITY_SERVICE" "$IDENTITY_CHECKOUT" > /dev/null || identity_rc=$?
+  if [ "$identity_rc" = 20 ] && [ ! -e "$IDENTITY_SERVICE.paseo-new.mjs" ] && [ ! -e "$IDENTITY_CHECKOUT.paseo-new.mjs" ]; then
+    ok "checkout identity: drift on $(basename "$target") writes neither candidate"
+  else bad "checkout identity: partial write on drift"; fi
+  mv "$target.before" "$target"
+done
 
 # K05: a readable package list is sufficient input; package count and checksums
 # remain development bundle tests, not installation admission.

@@ -25,7 +25,9 @@ pass=0; fail=0
 ok()  { echo "ok   paseo-bundle-install: $1"; pass=$((pass+1)); }
 bad() { echo "FAIL paseo-bundle-install: $1"; fail=$((fail+1)); }
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+SCRATCH="${AIRLOCK_TEST_SCRATCH_DIR:-$HOME/scratch/$(date +%F)_paseo-bundle-install}"
+mkdir -p "$SCRATCH"
+TMP="$(mktemp -d "$SCRATCH/run.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
 HOME_DIR="$TMP/home"; SHIM="$TMP/shim"; EVENTS="$TMP/systemctl.log"
 mkdir -p "$HOME_DIR" "$SHIM" "$TMP/confd" "$TMP/web/assets"
 : >"$EVENTS"
@@ -119,8 +121,7 @@ for want in \
   'schedule service busy-pending patch already applied' \
   'schedule stale-due patch already applied' \
   'watch recovery patch already applied' \
-  'background Git sampling patch already applied' \
-  'automatic Git reconciliation sampling patch already applied' \
+  'checkout identity patch already applied' \
   'archive/workspace consistency already applied' \
   'archive/workspace consistency behaviour check passed' \
   'PASS workspace removal delivery' \
@@ -184,6 +185,87 @@ grep -q 'systemctl --user restart airlock-paseo.service' "$EVENTS" \
 (cd "$NPM_ROOT" && sha256sum -c "$BUNDLE/INSTALLED_SHA256SUMS" >/dev/null 2>&1) \
   && ok "INSTALLED_SHA256SUMS verifies at the prefix level" \
   || bad "INSTALLED_SHA256SUMS does not verify at $NPM_ROOT"
+
+# ALREADY is an installer fast path; exercise the new behavior on npm's actual
+# package tree as well, including the automatic reconciliation timer.
+if node "$ROOT/apps/paseo/patches/workspace-git-identity.test.mjs" \
+    "$TOP/dist/server/server/workspace-git-service.js" \
+    "$TOP/dist/server/utils/checkout-git.js" >"$TMP/checkout-identity.log" 2>&1; then
+  ok "checkout identity behavior passes on the actual installed npm tree"
+else
+  bad "checkout identity behavior failed on the actual installed npm tree"
+  tail -20 "$TMP/checkout-identity.log"
+fi
+
+# A previous same-version installation carries two prototype-wrapper tails and
+# the old bundle digest. Recreate that state inside this suite's scratch prefix;
+# only the official installer's normal npm replacement may remove it.
+node --input-type=module - "$TOP" <<'JS' || bad "previous bundle fixture setup failed"
+import fs from "node:fs";
+import path from "node:path";
+const base = process.argv[2];
+const gitFile = path.join(base, "dist/server/server/workspace-git-service.js");
+let git = fs.readFileSync(gitFile, "utf8")
+  .replace("getCheckoutShortstat, getCheckoutIdentity, getCheckoutStatus", "getCheckoutShortstat, getCheckoutStatus")
+  .replace("        getCheckoutIdentity,\n", "")
+  .replace("// [paseo-checkout-identity]\n        const status = await this.deps.getCheckoutIdentity", "const status = await this.deps.getCheckoutStatus");
+git += `
+// [paseo-emergency-git-policy]
+const previousSnapshotRefresh = WorkspaceGitServiceImpl.prototype.refreshSnapshot;
+const previousSnapshotCounts = new WeakMap();
+WorkspaceGitServiceImpl.prototype.refreshSnapshot = async function (target, request, command) {
+    const seen = (previousSnapshotCounts.get(target) ?? 0) + 1;
+    previousSnapshotCounts.set(target, seen);
+    if (!request.force && target.latestSnapshot && seen % 20 !== 0) return target.latestSnapshot;
+    return previousSnapshotRefresh.call(this, target, request, command);
+};
+`;
+fs.writeFileSync(gitFile, git);
+const reconciliationFile = path.join(base, "dist/server/server/workspace-reconciliation-service.js");
+fs.appendFileSync(reconciliationFile, `
+// [paseo-reconciliation-emergency-policy]
+const previousReconciliation = WorkspaceReconciliationService.prototype.reconcileObservedGitMetadata;
+const previousReconciliationCounts = new WeakMap();
+WorkspaceReconciliationService.prototype.reconcileObservedGitMetadata = async function (mode) {
+    const seen = (previousReconciliationCounts.get(this) ?? 0) + 1;
+    previousReconciliationCounts.set(this, seen);
+    if (seen % 20 !== 0) return;
+    return previousReconciliation.call(this, mode);
+};
+`);
+JS
+# SHA256SUMS identity shipped before this change (2026-10-05).
+printf '%s\n' 'bundle:941a5e25d3debde85327840423a667f8f6cd900f70171ffacf0355dee89bdbc1' \
+  >"$NPM_ROOT/@getpaseo/.airlock-install-id"
+git_service="$TOP/dist/server/server/workspace-git-service.js"
+reconciliation_service="$TOP/dist/server/server/workspace-reconciliation-service.js"
+if grep -qF '[paseo-emergency-git-policy]' "$git_service" \
+   && grep -qF '[paseo-reconciliation-emergency-policy]' "$reconciliation_service" \
+   && ! grep -qF '[paseo-checkout-identity]' "$git_service"; then
+  ok "previous bundle fixture has both sampling tails and the full-status checkout path"
+else
+  bad "previous bundle fixture was not established"
+fi
+: >"$EVENTS"
+out="$TMP/install-upgrade.log"
+export AIRLOCK_TEST_UNIT_STATE=active
+if run_install "$out"; then ok "previous bundle upgrade exits 0"; else bad "previous bundle upgrade failed rc=$?"; tail -20 "$out"; fi
+grep -q 'install paseo bundle:' "$out" \
+  && ok "previous identity triggers the normal same-version npm replacement" \
+  || bad "previous identity did not trigger bundle replacement"
+if ! grep -qF '[paseo-emergency-git-policy]' "$git_service" \
+   && ! grep -qF '[paseo-reconciliation-emergency-policy]' "$reconciliation_service" \
+   && grep -qF '[paseo-checkout-identity]' "$git_service" \
+   && grep -qF 'this.deps.getCheckoutIdentity(normalizedCwd' "$git_service"; then
+  ok "npm replacement removes both old sampling tails and installs checkout identity"
+else
+  bad "npm replacement left an old tail or failed to install checkout identity"
+fi
+(cd "$NPM_ROOT" && sha256sum -c "$BUNDLE/INSTALLED_SHA256SUMS" >/dev/null 2>&1) \
+  && ok "upgraded package bytes match INSTALLED_SHA256SUMS" \
+  || bad "upgraded package bytes do not match INSTALLED_SHA256SUMS"
+grep -q 'systemctl --user restart airlock-paseo.service' "$EVENTS" \
+  && ok "changed bundle requests daemon restart" || bad "changed bundle requested no restart"
 
 # ---- 2. a re-run is idempotent: no npm, no restart ----
 : >"$EVENTS"

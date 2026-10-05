@@ -106,13 +106,14 @@ grep -qF '[paseo-process-group]' <<<"$claude_agent"
 grep -qF '[paseo-process-group]' <<<"$claude_query"
 grep -qF '[paseo-process-group]' <<<"$codex_transport"
 
-# Both automatic Git envelopes are baked, so re-running install never mutates
-# checksum-pinned files and re-installs/restarts an unchanged active daemon.
+# Checkout reads use identity only; both former sampling tails are absent.
 workspace_git="$(tar -xOf "$server_archive" package/dist/server/server/workspace-git-service.js)"
 workspace_reconciliation="$(tar -xOf "$server_archive" package/dist/server/server/workspace-reconciliation-service.js)"
-grep -qF '[paseo-emergency-git-policy]' <<<"$workspace_git"
-grep -qF '[paseo-reconciliation-emergency-policy]' <<<"$workspace_reconciliation"
-grep -qF 'emergencyReconciliationPendingExplicitFull' <<<"$workspace_reconciliation"
+checkout_git="$(tar -xOf "$server_archive" package/dist/server/utils/checkout-git.js)"
+grep -qF '[paseo-checkout-identity]' <<<"$workspace_git"
+grep -qF 'getCheckoutIdentity' <<<"$checkout_git"
+! grep -qF '[paseo-emergency-git-policy]' <<<"$workspace_git"
+! grep -qF '[paseo-reconciliation-emergency-policy]' <<<"$workspace_reconciliation"
 
 grep -qF "$EXPECTED_SOURCE" "$BUNDLE/README.md"
 printf 'paseo-bundle: 7 packages verified, source=%s\n' "$EXPECTED_SOURCE"

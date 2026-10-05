@@ -26,41 +26,13 @@ upstream changed licence again.
 
 ## What is here
 
-- **`workspace-git-emergency-policy.mjs`** (+ `.test.mjs`, `.patcher.test.mjs`) —
-  temporary mitigation for the overload measured on an operator development box on 2026-10-04.
-  Its canonical default differs from the live emergency scale: cached watcher/self-heal Git
-  refreshes admit one in 20 requests per target; automatic repo fetch uses a
-  separate per-repository one-in-20 counter (first fetch runs, then 19 ticks skip).
-  Snapshot refreshes skip the first 19 background requests and admit the 20th.
-  Per-target counters prevent stable workspace order from starving other targets.
-  The gate is at `refreshSnapshot`, covering queued loop iterations as well as
-  newly requested refreshes, before they start any Git subprocesses.
-  Forced, initial, direct and external-state-change refreshes still run. This
-  trades automatic Git freshness for daemon responsiveness and does not reduce
-  filesystem watcher handles or expensive diff consumers outside that pipeline.
-  `PASEO_BACKGROUND_GIT_SAMPLE_SCALE=1` restores normal refreshes and fetch on
-  the next normal daemon start; invalid values use 20. Emergency settings are
-  `PASEO_BACKGROUND_GIT_SAMPLE_SCALE=100` and `PASEO_BACKGROUND_GIT_PAUSE_FETCH=1`
-  (the latter pauses automatic fetch entirely). The default 3-minute fetch timer
-  therefore admits fetch once an hour after its initial run. Installer writes checked
-  candidates without introducing a restart solely for this overlay. Both policies
-  are baked into the guarded bundle and checksum-pinned so installer re-runs see
-  `ALREADY` and retain an unchanged active daemon. The common scale/env/parser is
-  generated from `background-git-policy-source.mjs`. Remove the
-  overlay when observation demand and metadata fanout have a durable fix.
-
-- **`workspace-reconciliation-emergency-policy.mjs`** (+ `.test.mjs`) — the same
-  default scale of 20 at the automatic whole-inventory reconciliation envelope,
-  including queued iterations, with per-service counters. A 30-second live trace
-  on 2026-10-04 attributed 405 of 423 Git calls to this path: root `.git`/pathless
-  watcher events schedule all-project metadata reconciliation, which calls
-  `getCheckout` and bypasses the snapshot admission pipeline. The snapshot policy
-  alone therefore does not address this measured dominant producer. Explicit and
-  boot `reconcileNow`, direct `runOnce` and direct `reconcileGitMetadata` remain
-  unchanged, including explicit full work queued behind automatic metadata.
-  The immediate explicit exemption is cleared in `finally`; a queued explicit
-  full run retains a one-time exemption until it starts. Installer applies
-  checked candidates for the next normal start without a restart solely for it.
+- **`workspace-git-identity.mjs`** (+ `.test.mjs`) — `getCheckout` reads fresh
+  checkout identity with the existing checkout inspector and common-dir resolver,
+  without dirty state, comparisons, upstream tracking or pull-request lookup.
+  The six fields preserve full-status normalization, including Paseo ownership's
+  base-ref condition. The pair is baked into the guarded bundle; install fallback
+  checks both candidate modules and behavior before replacing them. Automatic
+  reconciliation and watcher/fetch cadence use their original unsampled paths.
 
 - **`schedule-busy-pending-delivery.mjs`** (+ `.patch`, `.test.mjs`) and its schema half
   **`schedule-pending-delivery-schema.mjs`** (+ `.patch`) — when an agent-target schedule fires while
@@ -258,6 +230,22 @@ upstream changed licence again.
   The behavior check verifies active, archived, null, undefined, unknown, and self-archived
   records across both paths. This server read/update patch requires a daemon restart when newly
   applied.
+
+- **`send-keep-pending-permissions.mjs`** (+ `.test.mjs`) — the daemon's `send_agent_message_request`
+  handler hard-codes `clearPendingPermissions: true`, so an automatic inter-session message
+  (session-delivery, `activeTurnBehavior: "steer"`) denies the permission request the receiving seat
+  was waiting on. The request gains an optional boolean `clearPendingPermissions`; the handler uses
+  `msg.clearPendingPermissions ?? true`, so a sender that omits it (the browser UI, a human) keeps
+  today's behaviour, and the client's `sendAgentMessage` forwards the option only when it is a
+  boolean. Three files, one patch id, all-or-nothing: `@getpaseo/protocol` `dist/messages.js` (zod
+  strips unknown keys, so the schema must learn the field), `@getpaseo/server` `session.js` and
+  `@getpaseo/client` `dist/daemon-client.js`; every anchor must be present and unique or exit 20,
+  a mixed state also exits 20, and nothing is written. The `Session.sendText` site (a human typing
+  or speaking) is untouched. The behaviour test drives the real zod schema and the shipped client and
+  server methods with stubs: absent -> `true`, `false` -> `false`. Baked into the three vendored
+  tarballs (all three files are checksum-pinned; see `../vendor/guarded-0.8.0/README.md`), so the
+  installer normally sees `ALREADY`. Server file changes, so a newly applied patch needs a daemon restart. Senders opt in by passing `clearPendingPermissions: false`
+  to `DaemonClient.sendAgentMessage`; this patch alone changes no sender.
 
 - **`anchor-manifest.json`** — records the pinned Paseo/web-ui version, the pristine
   web-ui SHA, the **shape table** (every bundle state the fleet is known to carry: the

@@ -626,6 +626,54 @@ else
   fi
 fi
 
+# --- 2b. send_agent_message may keep the receiving seat's pending permissions ---
+# Upstream pins clearPendingPermissions=true, so an automatic steer message (session-delivery)
+# denies the permission request the seat was waiting on. Optional boolean on the request; absent
+# = true, so human/UI sends are unchanged. Schema (protocol), handler (server) and sender (client)
+# are one patch: schema-only strips nothing but is inert, server-only never sees the field, and a
+# client sending the field to an unpatched schema has it stripped. The server file changes -> restart.
+SENDKEEP_PATCHER="$HERE/patches/send-keep-pending-permissions.mjs"
+SENDKEEP_TEST="$HERE/patches/send-keep-pending-permissions.test.mjs"
+SENDKEEP_MESSAGES="$NPM_ROOT/@getpaseo/protocol/dist/messages.js"
+SENDKEEP_CLIENT="$NPM_ROOT/@getpaseo/client/dist/daemon-client.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply send-keep-pending-permissions patch to $SENDKEEP_MESSAGES, $SESSION_JS and $SENDKEEP_CLIENT"
+elif [ ! -f "$SENDKEEP_MESSAGES" ] || [ ! -f "$SESSION_JS" ] || [ ! -f "$SENDKEEP_CLIENT" ]; then
+  log "warning: send-keep-pending-permissions target missing — skipped"
+elif [ ! -f "$SENDKEEP_PATCHER" ] || [ ! -f "$SENDKEEP_TEST" ]; then
+  log "warning: send-keep-pending-permissions patcher or behaviour test missing under $HERE — skipped"
+else
+  sk_files=("$SENDKEEP_MESSAGES" "$SESSION_JS" "$SENDKEEP_CLIENT")
+  sk_clean() { rm -f "${sk_files[0]}.paseo-new.mjs" "${sk_files[1]}.paseo-new.mjs" "${sk_files[2]}.paseo-new.mjs"; }
+  sk_clean
+  sk_rc=0
+  sk_out="$(node "$SENDKEEP_PATCHER" "${sk_files[@]}" 2>&1)" || sk_rc=$?
+  case "$sk_rc" in
+    10) log "send-keep-pending-permissions already applied" ;;
+    20) log "warning: send-keep-pending-permissions anchor missing, duplicated or mixed (paseo drift) — skipped: $sk_out" ;;
+    0)
+      if [ ! -f "${sk_files[0]}.paseo-new.mjs" ] || [ ! -f "${sk_files[1]}.paseo-new.mjs" ] || [ ! -f "${sk_files[2]}.paseo-new.mjs" ]; then
+        sk_clean
+        log "warning: send-keep-pending-permissions did not produce all three candidates — skipped"
+      elif ! node --check "${sk_files[0]}.paseo-new.mjs" || ! node --check "${sk_files[1]}.paseo-new.mjs" \
+        || ! node --check "${sk_files[2]}.paseo-new.mjs"; then
+        sk_clean
+        log "warning: send-keep-pending-permissions candidate is invalid JS — not applied"
+      elif ! node "$SENDKEEP_TEST" "${sk_files[0]}.paseo-new.mjs" "${sk_files[1]}.paseo-new.mjs" "${sk_files[2]}.paseo-new.mjs" >/dev/null 2>&1; then
+        sk_clean
+        log "warning: send-keep-pending-permissions candidates failed their behaviour check — not applied"
+      else
+        mv "${sk_files[0]}.paseo-new.mjs" "${sk_files[0]}" || die "send-keep-pending-permissions protocol mv failed"
+        mv "${sk_files[1]}.paseo-new.mjs" "${sk_files[1]}" || die "send-keep-pending-permissions session.js mv failed"
+        mv "${sk_files[2]}.paseo-new.mjs" "${sk_files[2]}" || die "send-keep-pending-permissions client mv failed"
+        need_restart=1
+        log "send-keep-pending-permissions applied"
+      fi
+      ;;
+    *) log "warning: send-keep-pending-permissions patcher error (rc=$sk_rc): $sk_out — skipped" ;;
+  esac
+fi
+
 # Removal of a cached row must survive an empty changes-only subscription bootstrap.
 WORKSPACE_REMOVE_PATCHER="$HERE/patches/workspace-remove-delivery.mjs"
 WORKSPACE_REMOVE_TEST="$HERE/patches/workspace-remove-delivery.test.mjs"
@@ -1033,39 +1081,36 @@ else
   esac
 fi
 
-# --- 2e-x. temporary background Git sampling (2026-10-04 overload mitigation) ---
-# Generate fewer refreshes rather than growing a slower subprocess queue. This is
-# applied to installed bytes for the next normal restart; do not restart a running
-# daemon just to activate it. Forced/cold/direct reads keep their existing path.
-apply_background_git_policy() {  # <patch id> <target> <log label>
-  local patch_id="$1" target="$2" label="$3" rc=0 out candidate
-  local patcher="$HERE/patches/$patch_id.mjs" check="$HERE/patches/$patch_id.test.mjs"
-  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-    log "[dry] apply $label to $target"; return
-  fi
-  if [ ! -f "$patcher" ] || [ ! -f "$check" ] || [ ! -f "$target" ]; then
-    log "warning: $label patcher, behaviour check or target missing — skipped"; return
-  fi
-  out="$(node "$patcher" "$target")" || rc=$?
-  case "$rc" in
-    10)
-      log "$label patch already applied" ;;
-    20) log "warning: $label anchors drifted — skipped: $out" ;;
+# --- 2e-x. fresh identity-only checkout reads for reconciliation (0.8.0 backport) ---
+IDENTITY_PATCHER="$HERE/patches/workspace-git-identity.mjs"
+IDENTITY_TEST="$HERE/patches/workspace-git-identity.test.mjs"
+CHECKOUT_GIT_JS="$PASEO_SERVER_DIR/dist/server/utils/checkout-git.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply checkout identity to $WORKSPACE_GIT_SERVICE_JS and $CHECKOUT_GIT_JS"
+elif [ ! -f "$IDENTITY_PATCHER" ] || [ ! -f "$IDENTITY_TEST" ] || [ ! -f "$WORKSPACE_GIT_SERVICE_JS" ] || [ ! -f "$CHECKOUT_GIT_JS" ]; then
+  log "warning: checkout identity patcher, behaviour check or target missing — skipped"
+else
+  identity_rc=0
+  identity_out="$(node "$IDENTITY_PATCHER" "$WORKSPACE_GIT_SERVICE_JS" "$CHECKOUT_GIT_JS")" || identity_rc=$?
+  case "$identity_rc" in
+    10) log "checkout identity patch already applied" ;;
+    20) log "warning: checkout identity anchors drifted — skipped: $identity_out" ;;
     0)
-      candidate="$target.paseo-new.mjs"
-      if ! node --check "$candidate" || ! node "$check" "$candidate"; then
-        rm -f "$candidate"; log "warning: $label candidate failed verification — skipped"; return
-      fi
-      mv "$candidate" "$target" || die "$label patch mv failed"
-      # Baked into the guarded bundle. A fallback patch never adds a restart.
-      log "$label patch applied (next normal daemon start)" ;;
-    *) log "warning: $label patcher error (rc=$rc): $out — skipped" ;;
+      identity_service="$WORKSPACE_GIT_SERVICE_JS.paseo-new.mjs"
+      identity_checkout="$CHECKOUT_GIT_JS.paseo-new.mjs"
+      if node --check "$identity_service" && node --check "$identity_checkout" && \
+          node "$IDENTITY_TEST" "$identity_service" "$identity_checkout"; then
+        mv "$identity_checkout" "$CHECKOUT_GIT_JS" || die "checkout identity utility mv failed"
+        mv "$identity_service" "$WORKSPACE_GIT_SERVICE_JS" || die "checkout identity service mv failed"
+        need_restart=1
+        log "checkout identity patch applied"
+      else
+        rm -f "$identity_service" "$identity_checkout"
+        log "warning: checkout identity candidate failed verification — skipped"
+      fi ;;
+    *) log "warning: checkout identity patcher error (rc=$identity_rc): $identity_out — skipped" ;;
   esac
-}
-apply_background_git_policy workspace-git-emergency-policy "$WORKSPACE_GIT_SERVICE_JS" "background Git sampling"
-# Automatic whole-inventory reconciliation bypasses the snapshot pipeline.
-WORKSPACE_RECONCILIATION_JS="$PASEO_SERVER_DIR/dist/server/server/workspace-reconciliation-service.js"
-apply_background_git_policy workspace-reconciliation-emergency-policy "$WORKSPACE_RECONCILIATION_JS" "automatic Git reconciliation sampling"
+fi
 
 # --- 2f. process-group sweep (idempotent; layers on 2e — order matters) ---
 # The one leak 2e deliberately left open: when the agent LEADER exits before we

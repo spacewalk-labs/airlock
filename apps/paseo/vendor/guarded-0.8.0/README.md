@@ -11,9 +11,10 @@ the modified `@getpaseo` packages as one version-consistent set.
   `../../patches/README.md` for the full reasoning.
 
 The installer verifies `SHA256SUMS` before changing the npm prefix and records
-the checksum-file digest as the installed identity. It also checks the critical
-installed files in `INSTALLED_SHA256SUMS` on every run, so replacing the bundle
-with a stock package of the same version cannot pass as idempotent. An explicit
+the checksum-file digest as the installed identity. A changed digest reinstalls
+the seven local tarballs even when their version remains `0.8.0`; npm replaces
+the installed package bytes, including removed overlays. `INSTALLED_SHA256SUMS`
+pins the overlaid files for the bundle verification suites. An explicit
 `[apps.paseo].version` override selects the ordinary npm registry path instead.
 
 ## What is overlaid, and why
@@ -248,19 +249,27 @@ capped at 300s) and doubles a quiet poll's interval up to 60s, returning to 5s a
 a refresh changes the snapshot fingerprint. Its behaviour test drives the two patched
 methods directly and reads the delays handed to `setTimeout`.
 
-`workspace-git-emergency-policy` and `workspace-reconciliation-emergency-policy`
-are baked into their two service modules (2026-10-04). Automatic cached Git
-refreshes, repo fetches and whole-inventory reconciliation admit one in 20 per
-target/service; explicit, forced and boot work remains available. Reconciliation
-accounts for 405/423 Git calls in the measured 30-second overload trace and bypasses
-the snapshot pipeline, so both envelopes are necessary. Explicit full work queued
-behind automatic metadata retains its exemption. The two patchers generate their
-scale parsing from `patches/background-git-policy-source.mjs`.
-Both installed files are checksum-pinned; installation sees `ALREADY` and does
-not alter them, preventing checksum mismatch/reinstall/restart on every re-run.
-Only those two tar members changed; both checksum files and reference patches
-were regenerated. This is a temporary freshness tradeoff pending a durable fix
-to observation demand and metadata fanout.
+`workspace-git-identity` is baked into `server/workspace-git-service.js`
+and `utils/checkout-git.js` (2026-10-05). `getCheckout` reads checkout identity
+through the existing checkout-context inspection and main-repository resolution,
+without computing dirty state, diffs, ahead/behind counts or forge status.
+Automatic reconciliation therefore retains its five-minute full scan and
+immediate event handling while avoiding unused full Git-status work.
+
+The temporary automatic Git and reconciliation sampling tails were removed from
+their service modules. The changed bundle digest takes the normal npm
+reinstallation path; the real bundle-install test models the previous identity
+and both old tails in a scratch prefix, verifies their replacement, then verifies
+that the next install is idempotent. Both services and the identity helper are
+checksum-pinned together.
+
+`send-keep-pending-permissions` is baked into three tar members (2026-10-05):
+`@getpaseo/protocol` `dist/messages.js`, `@getpaseo/server` `session.js` and
+`@getpaseo/client` `dist/daemon-client.js`. All three are checksum-pinned, so an
+install-time-only version would mutate pinned files on every run (the hazard above).
+The installer still calls the patcher and sees `ALREADY`. Only those three members
+changed; both checksum files were regenerated. The daemon restarts once because the
+bundle identity changed.
 
 The web-ui patcher (`browse-host/bin/patch-web-ui.js`) is re-derived for
 0.8.0 — all 10 anchors updated (the bundle's persistence layer alone moved

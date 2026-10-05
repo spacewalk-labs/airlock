@@ -2,6 +2,8 @@
 # Offline updater contracts: source replacement, operator bytes/history, preview,
 # installer status and retry. Recovery/provenance/mutex behavior was removed.
 set -uo pipefail
+. "$(dirname "$0")/test-lib.sh"
+airlock_pin_paseo_mem
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UPDATE="$ROOT/bin/airlock-update"
 scratch="$(mktemp -d)"

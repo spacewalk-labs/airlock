@@ -415,6 +415,16 @@
       ]
     },
     {
+      "id": "send-keep-pending-permissions",
+      "source": "apps/paseo/patches/send-keep-pending-permissions.mjs",
+      "anchors": [
+        "const SCHEMA_ANCHOR = lines(",
+        "const SERVER_ANCHOR = lines(",
+        "const CLIENT_ANCHOR = lines(",
+        "[paseo-send-keep-pending-permissions]"
+      ]
+    },
+    {
       "id": "patch-web-ui",
       "source": "apps/paseo/browse-host/bin/patch-web-ui.js",
       "anchors": [
@@ -497,21 +507,18 @@
       ]
     },
     {
-      "id": "workspace-git-emergency-policy",
-      "source": "apps/paseo/patches/workspace-git-emergency-policy.mjs",
+      "id": "workspace-git-identity",
+      "source": "apps/paseo/patches/workspace-git-identity.mjs",
       "anchors": [
-        "export class WorkspaceGitServiceImpl",
-        "    async refreshSnapshot(target, request, runRefreshGitCommand) {",
-        "    async runRepoFetch(target) {"
-      ]
-    },
-    {
-      "id": "workspace-reconciliation-emergency-policy",
-      "source": "apps/paseo/patches/workspace-reconciliation-emergency-policy.mjs",
-      "anchors": [
-        "export class WorkspaceReconciliationService",
-        "    async reconcileObservedGitMetadata(mode = \"metadata\") {",
-        "    async reconcileNow() {"
+        "getCheckoutShortstat, getCheckoutStatus, getCheckoutWorktreeState",
+        "        getCheckoutStatus,\\n        getCheckoutShortstat,",
+        "const status = await this.deps.getCheckoutStatus(normalizedCwd, {",
+        "export async function getCheckoutStatus(cwd, context) {",
+        "// Workspace history stays complete;",
+        "    const mainRepoRoot = facts.mainRepoRoot;",
+        "    if (paseoWorktree.isPaseoOwnedWorktree && baseRef) {",
+        "            mainRepoRoot: mainRepoRoot ?? worktreeRoot,",
+        "        mainRepoRoot: mainRepoRoot && resolve(mainRepoRoot) !== resolve(worktreeRoot) ? mainRepoRoot : null,"
       ]
     }
   ]
