@@ -876,7 +876,7 @@ def _emit_glyph_validation_ac(package_glyphs: int, shipped_declared: int,
 
 def _validate_tile(pid: str, raw):
     """[tile] — the hub's real tile model (label, sub, cat, optional path,
-    icon XOR glyph). Omitting the whole table means a no-tile app."""
+    icon XOR glyph, optional port). Omitting the whole table means a no-tile app."""
     if raw is None:
         return None
     label = raw.get("label")
@@ -885,8 +885,19 @@ def _validate_tile(pid: str, raw):
     icon = raw.get("icon")
     if isinstance(icon, str):
         icon = icon.strip()
-    return {"label": label, "sub": raw.get("sub", ""), "cat": raw.get("cat"),
+    port = raw.get("port")
+    if port is not None:
+        try:
+            port = int(port)
+            if not 1 <= port <= 65535:
+                port = None
+        except (ValueError, TypeError):
+            port = None
+    tile = {"label": label, "sub": raw.get("sub", ""), "cat": raw.get("cat"),
             "path": raw.get("path"), "icon": icon, "glyph": raw.get("glyph")}
+    if port is not None:
+        tile["port"] = port
+    return tile
 
 
 def _validate_icon_source(pid: str, pdir: Path, rel: str) -> dict:
@@ -2347,6 +2358,9 @@ def cmd_webjson(cfg: dict) -> "None":
                     tile["path"] = spec["tile"]["path"]
                 if spec["tile"]["glyph"] is not None:
                     tile["glyph"] = spec["tile"]["glyph"]
+                if spec["tile"].get("port") is not None:
+                    tile["port"] = spec["tile"]["port"]
+                    entry["port"] = spec["tile"]["port"]
                 if spec["icon"] is not None:
                     tile["icon"] = _app_icon_url(name, Path(spec["icon"]["dest"]).name)
                 entry["tile"] = tile

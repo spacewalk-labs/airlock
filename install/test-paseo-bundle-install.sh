@@ -125,6 +125,8 @@ for want in \
   'archive/workspace consistency already applied' \
   'archive/workspace consistency behaviour check passed' \
   'PASS workspace removal delivery' \
+  'PASS directory sync snapshot' \
+  'PASS reconcile archives agents' \
   'provider-subagent server filter already applied' \
   'provider-subagent selective delivery pair verified' \
   'orphan guard already applied (claude)' \

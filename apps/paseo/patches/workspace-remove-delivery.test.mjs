@@ -34,8 +34,10 @@ if (realSync) {
     const initial = realSync.synchronizeWorkspaces([{ id: "cached" }], {});
     cursor = { generation: initial.sync.generation, afterSeq: initial.sync.headSeq };
     const reconnect = realSync.synchronizeWorkspaces([{ id: "cached" }], cursor);
-    assert.equal(reconnect.sync.mode, "changes");
-    assert.equal(reconnect.entries.length, 0, "reconnect emits no unchanged rows to seed subscription");
+    // directory-sync-snapshot turns this read into a full list; the delivery branch below
+    // must hold either way, so it still runs against an unseeded subscription.
+    if (reconnect.sync.mode === "changes")
+        assert.equal(reconnect.entries.length, 0, "reconnect emits no unchanged rows to seed subscription");
 }
 session.directorySync = { sequenceWorkspaceUpdate(...args) {
     sequenced++;
@@ -51,6 +53,9 @@ await session.emitWorkspaceUpdateBatch(["cached"], subscription);
 assert.equal(sequenced, 1, "repeated notifications do not flood removals");
 if (realSync) {
     const afterArchive = realSync.synchronizeWorkspaces([], cursor);
-    assert.equal(afterArchive.sync.removals[0].id, "cached", "removal is persisted into the reconnect sequence");
+    if (afterArchive.sync.mode === "changes")
+        assert.equal(afterArchive.sync.removals[0].id, "cached", "removal is persisted into the reconnect sequence");
+    else
+        assert.equal(afterArchive.entries.length, 0, "a full list no longer carries the archived row");
 }
 console.log("PASS workspace removal delivery");

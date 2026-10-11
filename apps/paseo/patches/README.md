@@ -317,3 +317,27 @@ deployment that exposes Paseo are responsible for this.
   cached rows into `lastEmittedByWorkspaceId`; their archive must still emit a
   removal. Repeated removals remain deduplicated. The behavior test executes the
   installed Session delivery method. A daemon restart activates this server patch.
+- `directory-sync-snapshot.mjs` (+ `.test.mjs`) stops an archived workspace or agent from
+  staying on a device that was not watching when it was archived. A changes read returns
+  only what is newer than the device's cursor, so a cursor that has passed the removal
+  never receives it and the row survives every reload until the daemon restarts (measured
+  2026-10-10: moving a cached cursor 34 steps past a removal kept the archived row
+  through two reloads). Workspace and agent directory reads now answer with the full
+  list, which the client already uses to replace its own; project reads keep their
+  cursor. The behavior test executes the installed `DirectorySyncService`. A daemon
+  restart activates this server patch.
+- `reconcile-archives-agents.mjs` (+ `.test.mjs`) closes the path that leaves agents
+  unarchived under an archived workspace. When a worktree directory is removed outside
+  Paseo, the five-minute reconciliation archives the workspace record but not its
+  agents (measured 2026-10-11: 58 such agents, six from the last five days, all with a
+  missing directory). The reconciliation hook now calls the same `archiveWorkspaceContents`
+  a UI archive uses. A daemon restart activates this server patch.
+
+## When a patch no longer fits
+
+A patcher that cannot find its anchor exits 20. On a bundle install that stops
+the install: port the patch to the new Paseo build, or add one line to
+`skip-approved.txt` (`<patcher name> <who approved it and why>`) in the same PR
+that changes the bundle. Until 2026-10-11 the installer only logged "skipped",
+which is how the 0.8.0 upgrade lost a fix without anyone deciding to drop it.
+The registry path (`AIRLOCK_PASEO_VERSION`) still only warns.

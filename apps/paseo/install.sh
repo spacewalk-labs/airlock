@@ -324,6 +324,24 @@ else
   PASEO_SOURCE=bundle
   PASEO_INSTALL_ID="bundle:$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$PASEO_BUNDLE_SUMS")"
 fi
+
+# A patch that no longer fits the Paseo build is a decision, not a warning. On
+# 2026-09-15 the 0.8.0 upgrade dropped an archive fix nobody had listed, and every
+# drifted patcher only logged "skipped". The bundle is pinned, so on an ordinary
+# install each patch answers "already applied" and this never fires; it fires when
+# someone changes the bundle, in the scratch install test, before any live box.
+# The registry path installs whatever upstream ships and keeps the old warning.
+PATCH_SKIP_APPROVED="$HERE/patches/skip-approved.txt"
+patch_skipped() {  # <patcher name> [detail]
+  local reason=""
+  if [ "$PASEO_SOURCE" != bundle ]; then
+    log "warning: $1 does not fit this Paseo build — skipped${2:+: $2}"
+    return 0
+  fi
+  [ -f "$PATCH_SKIP_APPROVED" ] && reason="$(awk -v n="$1" '$1 == n { sub(/^[^ \t]+[ \t]+/, ""); print; exit }' "$PATCH_SKIP_APPROVED")"
+  [ -n "$reason" ] || die "$1 does not fit the bundled Paseo build${2:+ ($2)} — port it, or record the approved skip in patches/skip-approved.txt"
+  log "$1 skipped (approved: $reason)"
+}
 export PATH="$NPM_GBIN:$PATH"
 
 # Installer-side stale-pidfile guard (apps/paseo/paseo-clear-stale-pid.py). It is
@@ -486,7 +504,7 @@ else
     log "Codex model roster verified (GPT-6 Sol/Luna ready; GPT-5.5 retired)"
   elif [ "$feature_rc" -eq 20 ] || [ "$catalog_rc" -eq 20 ]; then
     rm -f "$CODEX_FEATURES.paseo-new.mjs" "$CODEX_CATALOG.paseo-new.mjs"
-    log "warning: Codex model-roster anchors not found (paseo version drift) — pair skipped: feature=$feature_out catalog=$catalog_out"
+    patch_skipped "codex-model-roster" "feature=$feature_out catalog=$catalog_out"
   else
     rm -f "$CODEX_FEATURES.paseo-new.mjs" "$CODEX_CATALOG.paseo-new.mjs"
     log "warning: Codex model-roster patcher error (feature_rc=$feature_rc catalog_rc=$catalog_rc) — pair skipped: feature=$feature_out catalog=$catalog_out"
@@ -542,7 +560,7 @@ else
           log "warning: agent-resolve-by-id $rb candidate invalid — skipped"
         fi ;;
       10) ;;
-      20) log "warning: agent-resolve-by-id $rb anchor missing/ambiguous (paseo drift) — skipped: $rb_out" ;;
+      20) patch_skipped "agent-resolve-by-id" "$rb: $rb_out" ;;
       *)  log "warning: agent-resolve-by-id $rb patcher error (rc=$rb_rc): $rb_out — skipped" ;;
     esac
   done
@@ -593,7 +611,7 @@ else
   ac_out="$(node "$ARCHIVE_CONSISTENCY_PATCHER" "$SESSION_JS" "$ARCHIVE_CONSISTENCY_UPDATES")" || ac_rc=$?
   case "$ac_rc" in
     10) log "archive/workspace consistency already applied" ;;
-    20) log "warning: archive/workspace consistency anchor missing or ambiguous (paseo version drift) — skipped: $ac_out" ;;
+    20) patch_skipped "archive-consistency" "$ac_out" ;;
     0)
       if [ ! -f "$ac_session_tmp" ] || [ ! -f "$ac_updates_tmp" ]; then
         rm -f "$ac_session_tmp" "$ac_updates_tmp"
@@ -650,7 +668,7 @@ else
   sk_out="$(node "$SENDKEEP_PATCHER" "${sk_files[@]}" 2>&1)" || sk_rc=$?
   case "$sk_rc" in
     10) log "send-keep-pending-permissions already applied" ;;
-    20) log "warning: send-keep-pending-permissions anchor missing, duplicated or mixed (paseo drift) — skipped: $sk_out" ;;
+    20) patch_skipped "send-keep-pending-permissions" "$sk_out" ;;
     0)
       if [ ! -f "${sk_files[0]}.paseo-new.mjs" ] || [ ! -f "${sk_files[1]}.paseo-new.mjs" ] || [ ! -f "${sk_files[2]}.paseo-new.mjs" ]; then
         sk_clean
@@ -691,8 +709,57 @@ else
       need_restart=1
       ;;
     10) node "$WORKSPACE_REMOVE_TEST" "$SESSION_JS" "$PASEO_SERVER_DIR/dist/server/server/directory-sync/index.js" || die "workspace removal installed behavior failed" ;;
-    20) log "warning: workspace removal anchor drift — skipped" ;;
+    20) patch_skipped "workspace-remove-delivery" ;;
     *) die "workspace removal patcher failed (rc=$wr_rc)" ;;
+  esac
+fi
+
+# A device whose cursor has passed a removal keeps the archived row until the daemon
+# restarts; workspace and agent directory reads answer with the full list instead.
+DIRECTORY_SYNC_JS="$PASEO_SERVER_DIR/dist/server/server/directory-sync/index.js"
+DIRECTORY_SYNC_PATCHER="$HERE/patches/directory-sync-snapshot.mjs"
+DIRECTORY_SYNC_TEST="$HERE/patches/directory-sync-snapshot.test.mjs"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply directory sync snapshot patch to $DIRECTORY_SYNC_JS"
+else
+  ds_rc=0
+  node "$DIRECTORY_SYNC_PATCHER" "$DIRECTORY_SYNC_JS" || ds_rc=$?
+  case "$ds_rc" in
+    0)
+      node --check "$DIRECTORY_SYNC_JS.paseo-new.mjs" \
+        && node "$DIRECTORY_SYNC_TEST" "$DIRECTORY_SYNC_JS.paseo-new.mjs" \
+        || die "directory sync snapshot candidate failed verification"
+      mv "$DIRECTORY_SYNC_JS.paseo-new.mjs" "$DIRECTORY_SYNC_JS" || die "directory sync snapshot patch install failed"
+      need_restart=1
+      ;;
+    10) node "$DIRECTORY_SYNC_TEST" "$DIRECTORY_SYNC_JS" || die "directory sync snapshot installed behavior failed" ;;
+    20) patch_skipped "directory-sync-snapshot" ;;
+    *) die "directory sync snapshot patcher failed (rc=$ds_rc)" ;;
+  esac
+fi
+
+# Reconciliation archives a workspace whose directory is gone; its agents must be
+# archived with it, or they stay listed as live under an archived workspace.
+BOOTSTRAP_JS="$PASEO_SERVER_DIR/dist/server/server/bootstrap.js"
+RECONCILE_AGENTS_PATCHER="$HERE/patches/reconcile-archives-agents.mjs"
+RECONCILE_AGENTS_TEST="$HERE/patches/reconcile-archives-agents.test.mjs"
+RECONCILE_AGENTS_SERVICE="$PASEO_SERVER_DIR/dist/server/server/workspace-archive-service.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply reconcile-archives-agents patch to $BOOTSTRAP_JS"
+else
+  ra_rc=0
+  node "$RECONCILE_AGENTS_PATCHER" "$BOOTSTRAP_JS" || ra_rc=$?
+  case "$ra_rc" in
+    0)
+      node --check "$BOOTSTRAP_JS.paseo-new.mjs" \
+        && node "$RECONCILE_AGENTS_TEST" "$BOOTSTRAP_JS.paseo-new.mjs" "$RECONCILE_AGENTS_SERVICE" \
+        || die "reconcile-archives-agents candidate failed verification"
+      mv "$BOOTSTRAP_JS.paseo-new.mjs" "$BOOTSTRAP_JS" || die "reconcile-archives-agents patch install failed"
+      need_restart=1
+      ;;
+    10) node "$RECONCILE_AGENTS_TEST" "$BOOTSTRAP_JS" "$RECONCILE_AGENTS_SERVICE" || die "reconcile-archives-agents installed behavior failed" ;;
+    20) patch_skipped "reconcile-archives-agents" ;;
+    *) die "reconcile-archives-agents patcher failed (rc=$ra_rc)" ;;
   esac
 fi
 
@@ -738,7 +805,7 @@ else
   sf_candidate=0
   case "$sf_rc" in
     10) log "provider-subagent server filter already applied" ;;
-    20) log "warning: provider-subagent server filter anchors not found (paseo version drift) — server half skipped: $sf_out" ;;
+    20) patch_skipped "provider-subagent-stream-filter" "$sf_out" ;;
     0)
       if [ ! -f "$sf_tmp" ]; then
         log "warning: provider-subagent server filter produced no candidate — server half skipped"
@@ -809,7 +876,7 @@ else
   pr_out="$(node "$PRUNE_PATCHER" "$CLAUDE_MANIFEST_JS")" || pr_rc=$?
   case "$pr_rc" in
     10) log "model prune already applied" ;;
-    20) log "model prune skipped — $pr_out" ;;
+    20) patch_skipped "claude-model-prune" "$pr_out" ;;
     0)
       PR_TMP="${CLAUDE_MANIFEST_JS}.paseo-new.mjs"
       if node --check "$PR_TMP"; then
@@ -841,7 +908,7 @@ else
   og_out="$(node "$OPENCODE_GROK_PATCHER" "$OPENCODE_AGENT_JS")" || og_rc=$?
   case "$og_rc" in
     10) log "OpenCode grok picker defaults already applied" ;;
-    20) log "OpenCode grok picker defaults skipped — $og_out" ;;
+    20) patch_skipped "opencode-grok-defaults" "$og_out" ;;
     0)
       OG_TMP="${OPENCODE_AGENT_JS}.paseo-new.mjs"
       if node --check "$OG_TMP"; then
@@ -877,7 +944,7 @@ else
   ip_out="$(node "$IMGPERSIST_PATCHER" "$CLAUDE_AGENT_JS")" || ip_rc=$?
   case "$ip_rc" in
     10) log "pasted-image persistence already applied" ;;
-    20) log "pasted-image anchors not found (paseo version drift) — skipped" ;;
+    20) patch_skipped "image-attachments-persist" ;;
     0)
       IP_TMP="${CLAUDE_AGENT_JS}.paseo-new.mjs"
       if node --check "$IP_TMP"; then
@@ -923,7 +990,7 @@ apply_orphan_guard() {  # <mode> <target-js>
   og_out="$(node "$ORPHANGUARD_PATCHER" "$mode" "$target")" || og_rc=$?
   case "$og_rc" in
     10) log "orphan guard already applied ($mode)" ;;
-    20) log "orphan guard anchors missing or ambiguous for $mode (paseo version drift) — skipped" ;;
+    20) patch_skipped "orphan-process-guard" "$mode" ;;
     0)
       og_tmp="${target}.paseo-new.mjs"
       if node --check "$og_tmp"; then
@@ -1000,7 +1067,7 @@ apply_schedpend() {  # <label> <patcher> <target-js> [behaviour-test] [phrase]
   sp_out="$(node "$patcher" "$target")" || sp_rc=$?
   case "$sp_rc" in
     10) log "schedule $label $phrase already applied" ;;
-    20) log "warning: schedule $label anchors missing or ambiguous (paseo version drift) — skipped: $sp_out" ;;
+    20) patch_skipped "$(basename "$patcher" .mjs)" "$sp_out" ;;
     0)
       sp_tmp="${target}.paseo-new.mjs"
       if ! node --check "$sp_tmp"; then
@@ -1064,7 +1131,7 @@ else
   wr_rc=0; wr_out="$(node "$WATCHREC_PATCHER" "$WORKSPACE_GIT_SERVICE_JS")" || wr_rc=$?
   case "$wr_rc" in
     10) log "watch recovery patch already applied" ;;
-    20) log "warning: watch recovery anchors missing or ambiguous (paseo version drift) — skipped: $wr_out" ;;
+    20) patch_skipped "workspace-git-watch-recovery" "$wr_out" ;;
     0)
       wr_tmp="${WORKSPACE_GIT_SERVICE_JS}.paseo-new.mjs"
       if ! node --check "$wr_tmp"; then
@@ -1094,7 +1161,7 @@ else
   identity_out="$(node "$IDENTITY_PATCHER" "$WORKSPACE_GIT_SERVICE_JS" "$CHECKOUT_GIT_JS")" || identity_rc=$?
   case "$identity_rc" in
     10) log "checkout identity patch already applied" ;;
-    20) log "warning: checkout identity anchors drifted — skipped: $identity_out" ;;
+    20) patch_skipped "workspace-git-identity" "$identity_out" ;;
     0)
       identity_service="$WORKSPACE_GIT_SERVICE_JS.paseo-new.mjs"
       identity_checkout="$CHECKOUT_GIT_JS.paseo-new.mjs"
@@ -1138,7 +1205,7 @@ apply_pgroup() {  # <mode> <target-js>
   pg_out="$(node "$PGROUP_PATCHER" "$mode" "$target")" || pg_rc=$?
   case "$pg_rc" in
     10) log "process-group sweep already applied ($mode)" ;;
-    20) log "process-group sweep anchors missing for $mode (drift, or 2e skipped) — skipped" ;;
+    20) patch_skipped "orphan-process-group" "$mode" ;;
     0)
       pg_tmp="${target}.paseo-new.mjs"
       if node --check "$pg_tmp"; then
@@ -1202,7 +1269,7 @@ apply_acp_gap() {  # <label> <patcher> <target-js> <behaviour-test>
   ag_out="$(node "$patcher" "$target")" || ag_rc=$?
   case "$ag_rc" in
     10) log "$label already applied" ;;
-    20) log "warning: $label anchors missing or ambiguous (paseo version drift) — skipped" ;;
+    20) patch_skipped "$(basename "$patcher" .mjs)" "$label" ;;
     0)
       ag_tmp="${target}.paseo-new.mjs"
       if ! node --check "$ag_tmp"; then
@@ -1278,6 +1345,21 @@ case "$agy_acp_rc" in
   0) ;;
   2) need_restart=1 ;;
   *) log "warning: agy-acp install skipped (rc=$agy_acp_rc) — agy provider unavailable (daemon unaffected). Retry: bash $HERE/agy-acp/install.sh" ;;
+esac
+
+# --- 3c. default Claude model (configure-claude-default.py) ---
+# Same placement and fold as 3b: a config.json write needs the restart below.
+claude_default_rc=0
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] claude default model: would set ${AIRLOCK_PASEO_CLAUDE_DEFAULT_MODEL:-<paseo default>} in ${PASEO_HOME:-$HOME/.paseo}/config.json"
+else
+  "$PY" "$HERE/configure-claude-default.py" --paseo-home "${PASEO_HOME:-$HOME/.paseo}" \
+    --model "${AIRLOCK_PASEO_CLAUDE_DEFAULT_MODEL:-}" || claude_default_rc=$?
+fi
+case "$claude_default_rc" in
+  0) ;;
+  2) need_restart=1 ;;
+  *) log "warning: claude default model not set (rc=$claude_default_rc) — Paseo keeps its own default" ;;
 esac
 
 # --- 4. systemd --user unit (loopback daemon; explicit PATH, HOME, XDG env) ---

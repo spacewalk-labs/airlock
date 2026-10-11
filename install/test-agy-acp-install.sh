@@ -188,7 +188,7 @@ echo
 # aborting the whole installer (C2.5 F1, 2026-09-15). Runs the parent's real
 # 3b block text, not a copy, against a stub child returning 0 / 2 / 1.
 PARENT_BLOCK="$TMP/parent-3b.sh"
-awk '/^# --- 3b\./{on=1} /^# --- 4\./{on=0} on' "$ROOT/apps/paseo/install.sh" >"$PARENT_BLOCK"
+awk '/^# --- 3b\./{on=1; print; next} /^# --- /{on=0} on' "$ROOT/apps/paseo/install.sh" >"$PARENT_BLOCK"
 if ! grep -q 'agy-acp/install.sh' "$PARENT_BLOCK"; then
   bad "parent fold: could not extract the 3b block from apps/paseo/install.sh"
 else

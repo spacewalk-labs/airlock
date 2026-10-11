@@ -507,6 +507,22 @@
       ]
     },
     {
+      "id": "directory-sync-snapshot",
+      "source": "apps/paseo/patches/directory-sync-snapshot.mjs",
+      "anchors": [
+        "const read = this.read(${collection}, cursor);",
+        "[paseo-directory-sync-snapshot]"
+      ]
+    },
+    {
+      "id": "reconcile-archives-agents",
+      "source": "apps/paseo/patches/reconcile-archives-agents.mjs",
+      "anchors": [
+        "        onWorkspaceArchived: teardownArchivedWorkspaceRuntime,",
+        "[paseo-reconcile-archives-agents]"
+      ]
+    },
+    {
       "id": "workspace-git-identity",
       "source": "apps/paseo/patches/workspace-git-identity.mjs",
       "anchors": [

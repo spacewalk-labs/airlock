@@ -34,6 +34,10 @@ agy = false
 # sidebar's project/workspace order). Proxied by this app's own gate under
 # /airlock-ui-state/, never tailscale-served, so it is not a serve_ports entry.
 uistate_port = 19954
+# Claude model a seat opens when none is named (`paseo run --provider claude`).
+# Paseo's built-in default trails the current Opus; see
+# apps/paseo/configure-claude-default.py. "" = leave Paseo's own default.
+claude_default_model = "claude-opus-5-5"
 # empty = the installer's own pinned version wins. A value here OVERRIDES
 # that pin, so it must default to "" — a real version string would silently
 # freeze every box on this release.

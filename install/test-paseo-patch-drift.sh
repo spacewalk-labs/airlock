@@ -161,6 +161,8 @@ const expected = new Set([
   "workspace-git-watch-recovery",
   "workspace-git-identity",
   "workspace-remove-delivery",
+  "directory-sync-snapshot",
+  "reconcile-archives-agents",
   "patch-web-ui",
 ]);
 const seen = new Set();
@@ -1194,6 +1196,104 @@ if [ "$remove_rc" = 10 ]; then
   ok "workspace removal: repeat patch is idempotent"
 else
   bad "workspace removal: repeat patch failed"
+fi
+
+# Directory sync: workspace and agent reads answer with the full list.
+DIRSYNC_FIXTURE="$TMP/directory-sync-index.js"
+cat > "$DIRSYNC_FIXTURE" <<'JS'
+class DirectorySyncService {
+    synchronizeWorkspaces(snapshot, cursor) {
+        const read = this.read(this.workspaces, cursor);
+        return read;
+    }
+    synchronizeAgents(snapshot, cursor) {
+        const read = this.read(this.agents, cursor);
+        return read;
+    }
+}
+JS
+if positive_js "$PATCH_DIR/directory-sync-snapshot.mjs" "$DIRSYNC_FIXTURE" \
+  && node --check "$DIRSYNC_FIXTURE.paseo-new.mjs" \
+  && [ "$(grep -c 'generation: cursor.generation' "$DIRSYNC_FIXTURE.paseo-new.mjs")" = 2 ]; then
+  ok "directory sync: workspace and agent reads drop the cursor position"
+else
+  bad "directory sync: representative target failed"
+fi
+cp "$DIRSYNC_FIXTURE" "$TMP/directory-sync-bad.js"
+sed -i '/const read = this.read(this.agents, cursor);/d' "$TMP/directory-sync-bad.js"
+cp "$TMP/directory-sync-bad.js" "$TMP/directory-sync-bad.before"
+if negative_js "$PATCH_DIR/directory-sync-snapshot.mjs" "$TMP/directory-sync-bad.js" 20 "$TMP/directory-sync-bad.before"; then
+  ok "directory sync: anchor drift leaves source untouched"
+else
+  bad "directory sync: anchor drift changed source"
+fi
+dirsync_rc=0
+node "$PATCH_DIR/directory-sync-snapshot.mjs" "$DIRSYNC_FIXTURE.paseo-new.mjs" > /dev/null || dirsync_rc=$?
+if [ "$dirsync_rc" = 10 ]; then
+  ok "directory sync: repeat patch is idempotent"
+else
+  bad "directory sync: repeat patch failed"
+fi
+
+# Reconciliation hook: a workspace archived for a missing directory archives its agents.
+RECONCILE_FIXTURE="$TMP/reconcile-bootstrap.js"
+cat > "$RECONCILE_FIXTURE" <<'JS'
+import { archiveByScope, archivePersistedWorkspaceRecord, killTerminalsForWorkspace, } from "./workspace-archive-service.js";
+export function wire(teardownArchivedWorkspaceRuntime) {
+    return {
+        onWorkspaceArchived: teardownArchivedWorkspaceRuntime,
+    };
+}
+JS
+if positive_js "$PATCH_DIR/reconcile-archives-agents.mjs" "$RECONCILE_FIXTURE" \
+  && node --check "$RECONCILE_FIXTURE.paseo-new.mjs" \
+  && grep -q 'archivePersistedWorkspaceRecord, archiveWorkspaceContents,' "$RECONCILE_FIXTURE.paseo-new.mjs"; then
+  ok "reconcile agents: hook archives workspace contents and imports the archive routine"
+else
+  bad "reconcile agents: representative target failed"
+fi
+cp "$RECONCILE_FIXTURE" "$TMP/reconcile-bad.js"
+sed -i '/onWorkspaceArchived: teardownArchivedWorkspaceRuntime,/d' "$TMP/reconcile-bad.js"
+cp "$TMP/reconcile-bad.js" "$TMP/reconcile-bad.before"
+if negative_js "$PATCH_DIR/reconcile-archives-agents.mjs" "$TMP/reconcile-bad.js" 20 "$TMP/reconcile-bad.before"; then
+  ok "reconcile agents: anchor drift leaves source untouched"
+else
+  bad "reconcile agents: anchor drift changed source"
+fi
+reconcile_rc=0
+node "$PATCH_DIR/reconcile-archives-agents.mjs" "$RECONCILE_FIXTURE.paseo-new.mjs" > /dev/null || reconcile_rc=$?
+if [ "$reconcile_rc" = 10 ]; then
+  ok "reconcile agents: repeat patch is idempotent"
+else
+  bad "reconcile agents: repeat patch failed"
+fi
+
+# A patch that no longer fits stops a bundle install unless its skip is recorded.
+SKIP_FN="$TMP/patch-skipped.sh"
+sed -n '/^patch_skipped() {/,/^}/p' "$ROOT/apps/paseo/install.sh" > "$SKIP_FN"
+skip_case() {  # <source> <approved-file-content> <name>
+  printf '%s' "$2" > "$TMP/skip-approved.txt"
+  PASEO_SOURCE="$1" PATCH_SKIP_APPROVED="$TMP/skip-approved.txt" bash -c '
+    log() { echo "$*"; }; die() { echo "DIE $*"; exit 1; }
+    . "$1"; patch_skipped "$2" detail' _ "$SKIP_FN" "$3" 2>&1
+}
+if out="$(skip_case bundle '' gone-patch)"; then
+  bad "patch skip: an unlisted drifted patch did not stop the bundle install"
+elif grep -q 'DIE gone-patch does not fit' <<<"$out"; then
+  ok "patch skip: an unlisted drifted patch stops the bundle install"
+else
+  bad "patch skip: unexpected failure output: $out"
+fi
+if out="$(skip_case bundle $'# note\ngone-patch cho 2026-10-11 upstream ships it\n' gone-patch)" \
+  && grep -q 'gone-patch skipped (approved: cho 2026-10-11 upstream ships it)' <<<"$out"; then
+  ok "patch skip: a recorded approval lets that patch be skipped"
+else
+  bad "patch skip: recorded approval was not honoured: $out"
+fi
+if out="$(skip_case registry '' gone-patch)" && grep -q 'warning: gone-patch does not fit' <<<"$out"; then
+  ok "patch skip: the registry path keeps its warning"
+else
+  bad "patch skip: registry path changed: $out"
 fi
 
 # Identity pair: independent fixtures cover both anchors and no partial writes.

@@ -1,0 +1,3 @@
+# Patches the installer may skip when they no longer fit the bundled Paseo build.
+# One line per patch: <patcher name without .mjs> <who approved it and why>
+# A patch that is not listed here stops the install instead of being skipped.

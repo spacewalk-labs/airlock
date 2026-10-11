@@ -133,6 +133,9 @@ PORT = int(env_first("AIRLOCK_LEARNING_PORT", "LEARNING_MANAGER_PORT",
 
 SNAPSHOT_LOCK = threading.Lock()
 LAST_SUCCESS = None
+BUILD_LOCK = threading.Lock()
+BUILD_SEQ = 0
+BUILT = (0, None, None)
 
 
 class IngestQueue:
@@ -860,8 +863,9 @@ def safe_relative(value, label="path", error_type=RequestError):
 
 
 def is_under(path, root):
+    root = os.path.realpath(root)
     try:
-        return os.path.commonpath([os.path.realpath(path), os.path.realpath(root)]) == os.path.realpath(root)
+        return os.path.commonpath([os.path.realpath(path), root]) == root
     except ValueError:
         return False
 
@@ -869,10 +873,8 @@ def is_under(path, root):
 def repo_path(repo, relative, *, error_type=CollectionError):
     relative = safe_relative(relative, "manifest path", error_type)
     candidate = os.path.abspath(os.path.join(repo, *relative.split("/")))
+    # safe_relative 가 `..` 를 막으므로 밖으로 나가는 길은 심링크뿐이다 — realpath 한 번으로 본다.
     if not is_under(candidate, repo):
-        raise error_type(f"manifest path가 learning 레포 밖입니다: {relative}", 500)
-    resolved = os.path.realpath(candidate)
-    if not is_under(resolved, repo):
         raise error_type(f"manifest path 심링크가 learning 레포 밖입니다: {relative}", 500)
     return candidate
 
@@ -1259,7 +1261,7 @@ def worktree_roots(repo):
 
 
 def classify_target(resolved, roots):
-    resolved = os.path.realpath(resolved)
+    """`resolved` 는 호출자가 이미 realpath 한 경로다(두 호출자 모두 그렇다)."""
     candidates = []
     for root, origin in roots:
         try:
@@ -1323,13 +1325,18 @@ def scan_links(repo, public_html, manifest):
         entries = sorted(os.scandir(public_html), key=lambda entry: entry.name)
         for entry in entries:
             full = entry.path
+            # 공유 폴더는 publish 앱 전체의 발행본이라 항목이 수천 개다 — 심링크인지는
+            # scandir 가 이미 준 d_type 으로 가린다. 항목마다 lstat 하면 첫 화면이 그만큼 느리다.
+            if not entry.is_symlink():
+                continue
             try:
-                info = os.lstat(full)
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISLNK(info.st_mode):
-                continue
-            target = os.readlink(full)
+                target = os.readlink(full)
+            except OSError as exc:
+                # d_type 은 열거 시점의 값이다. 그 뒤 publish 가 발행을 취소했거나(ENOENT)
+                # 일반 파일로 바꿨으면(EINVAL) 지금은 심링크가 아니다 — lstat 으로 봤을 때와 같이 건너뛴다.
+                if exc.errno in (errno.ENOENT, errno.EINVAL):
+                    continue
+                raise
             resolved = os.path.realpath(full)
             jurisdiction = classify_target(resolved, roots)
             associated_path = jurisdiction and html_to_path.get(jurisdiction["relative"])
@@ -1988,17 +1995,25 @@ def document_flag(repo, manifest, path, key):
     자기 `scripts/learn.py` 를 가진 경우에는 그 생산자가 이 키를 모르므로 여기서 읽는다 —
     남의 생산자에게 우리 상태 키를 요구하지 않는 것이 `auto` 를 두는 이유다.
     """
+    return document_flags(repo, manifest, path, (key,))[key]
+
+
+def document_flags(repo, manifest, path, keys):
+    """`document_flag` 여러 키를 문서를 한 번만 읽어 돌려준다."""
     item = manifest["by_path"].get(path)
     if item is None:
-        return False
-    if key in item:
-        return truthy_scalar(item.get(key))
-    try:
-        full = repo_path(repo, path, error_type=CollectionError)
-    except LearningManagerError:
-        return False
-    fields, _heading, _has_block = read_front_matter(full)
-    return truthy_scalar(fields.get(key))
+        return {key: False for key in keys}
+    flags = {key: truthy_scalar(item[key]) for key in keys if key in item}
+    missing = [key for key in keys if key not in item]
+    if missing:
+        try:
+            full = repo_path(repo, path, error_type=CollectionError)
+            fields, _heading, _has_block = read_front_matter(full)
+        except LearningManagerError:
+            fields = {}
+        for key in missing:
+            flags[key] = truthy_scalar(fields.get(key))
+    return flags
 
 
 def git_sync_warnings(state_dir):
@@ -2048,9 +2063,12 @@ def build_snapshot():
     #    이 앱은 남의 문서를 일괄로 고치지 않으므로 이관은 사용자가 그 문서를 건드릴 때
     #    한 건씩 일어난다(별표를 누르면 그때 문서에 적히고 JSON 에서 빠진다). 그 사이에
     #    빼기로 읽으면 이미 별표해 둔 170개가 화면에서 한꺼번에 사라진다.
+    flags = {
+        path: document_flags(paths["repo"], manifest, path, ("starred", "archived"))
+        for path in views
+    }
     for path, view in views.items():
-        view["starred"] = document_flag(paths["repo"], manifest, path, "starred") \
-            or path in starred
+        view["starred"] = flags[path]["starred"] or path in starred
     needs_attention = list(scan["needs_attention"])
     attention_keys = set()
 
@@ -2074,7 +2092,7 @@ def build_snapshot():
         path = item["path"]
         view = views[path]
         live = bool(view["live_aliases"])
-        if document_flag(paths["repo"], manifest, path, "archived") or state.get(path):
+        if flags[path]["archived"] or state.get(path):
             archived.append(view)
             if live:
                 add_state_attention({
@@ -2603,11 +2621,35 @@ def inject_reader_shell(body, context):
     return page.encode("utf-8")
 
 
+def fresh_snapshot():
+    """요청이 도착한 뒤에 시작한 빌드의 결과를 돌려준다.
+
+    한 번 빌드에 몇 초가 들고 빌드는 state lock 안에서 한 줄로 선다. 요청마다 빌드하면
+    폰에서 연달아 누른 탭이 그 수만큼 줄을 서고, 클라이언트가 떠난 요청도 끝까지 돈다
+    (실측: 동시 6건 → 마지막 11초, 13탭 → 20초 499). 도착 뒤 시작한 빌드는 그 요청이
+    볼 쓰기를 모두 담으므로 기다린 요청끼리 한 결과를 나눠 써도 낡지 않는다.
+    """
+    global BUILD_SEQ, BUILT
+    arrived = BUILD_SEQ
+    with BUILD_LOCK:
+        seq, snapshot, error = BUILT
+        if seq <= arrived:
+            BUILD_SEQ += 1
+            seq = BUILD_SEQ
+            try:
+                snapshot, error = build_snapshot(), None
+                remember_success(snapshot)
+            except LearningManagerError as exc:
+                snapshot, error = None, exc
+            BUILT = (seq, snapshot, error)
+    if error is not None:
+        raise error
+    return snapshot
+
+
 def snapshot_or_failure():
     try:
-        snapshot = build_snapshot()
-        remember_success(snapshot)
-        return snapshot
+        return fresh_snapshot()
     except LearningManagerError as exc:
         return stale_failure(exc)
 
@@ -2885,9 +2927,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send_json(exc.code, exc.payload())
         if path == "/api/items":
             try:
-                snapshot = build_snapshot()
-                remember_success(snapshot)
-                return self._send_json(200, snapshot)
+                return self._send_json(200, fresh_snapshot())
             except LearningManagerError as exc:
                 return self._send_json(exc.code, stale_failure(exc))
         return self._send_json(404, {"error": "not found"})

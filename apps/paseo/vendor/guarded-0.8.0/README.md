@@ -124,6 +124,18 @@ DirectorySyncService changes-only bootstrap and removal sequence. Baking this
 patch and updating both checksum manifests preserves installer idempotency;
 leaving it as an install-time mutation would reinstall and restart on every run.
 
+`directory-sync-snapshot` is baked into `server/directory-sync/index.js`
+(2026-10-10). Workspace and agent directory reads ignore the cursor position and
+return the full list, so a device whose cursor has passed an archive still drops
+the archived row on its next connect. Only that tar member differs from the
+previous server tarball; both checksum manifests are updated together, and
+`INSTALLED_SHA256SUMS` gains the file.
+
+`reconcile-archives-agents` is baked into `server/bootstrap.js` (2026-10-11).
+The reconciliation that archives a workspace whose directory is missing now
+archives that workspace's agents too. Only that tar member differs from the
+previous server tarball; `INSTALLED_SHA256SUMS` gains the file.
+
 `orphan-process-guard` (claude) and `orphan-process-group` (claude-agent,
 claude-query, codex-transport) are baked in for the same reason as
 provider-subagent-stream-filter: both have their own runtime behaviour tests
