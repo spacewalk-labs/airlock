@@ -8,7 +8,6 @@ import sqlite3
 import threading
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
-from devmon_heartbeat import heartbeat_payload
 
 ID_RE = re.compile(r'^[A-Za-z0-9._:-]{1,128}\Z')
 RESERVED_GROUP_PREFIX = 'dev-monitor:'
@@ -138,26 +137,6 @@ def validate_payload(payload):
         raise ValidationError('invalid created_at') from error
     if created > now_utc() + FUTURE_SKEW:
         raise ValidationError('created_at too far in future')
-    # A heartbeat has one complete content shape, shared with its real producer.
-    # Its reserved ID supplies the UTC day even when created_at is absent on wire.
-    if out['source'] == 'heartbeat' or out['id'].startswith('heartbeat:'):
-        try:
-            day = datetime.strptime(out['id'].removeprefix('heartbeat:'), '%Y-%m-%d').replace(tzinfo=timezone.utc)
-        except ValueError as error:
-            raise ValidationError('invalid heartbeat date') from error
-        if 'created_at' in out and created.date() != day.date():
-            raise ValidationError('heartbeat date mismatch')
-        candidate = dict(payload)
-        for optional in ('peek', 'detail', 'resolves'):
-            candidate.pop(optional, None)  # Validated optional message fields.
-        for new, legacy in (('id', 'event_id'), ('group', 'group_key'), ('level', 'urgency')):
-            if legacy in candidate:
-                candidate[new] = candidate.pop(legacy)
-        # Only the old wire wrapper is retired; title/body/urgent/day remain exact.
-        for retired in ('schema_version', 'kind', 'outcome', 'why_it_matters', 'followup', 'created_at'):
-            candidate.pop(retired, None)
-        if candidate != heartbeat_payload(day):
-            raise ValidationError('heartbeat requires the canonical daily payload')
     run = out.get('run')
     if run is not None:
         run = validate_run(run)
@@ -240,7 +219,7 @@ def has_receipt(event_id):
 
 
 def grace_seconds():
-    # One setting for every urgent card, including heartbeat and normal promotion.
+    # One setting for every urgent card, including a normal-to-urgent promotion.
     return max(0, int(os.environ.get('AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS', '300')))
 
 
@@ -318,8 +297,7 @@ def ingest(payload):
                 same = json.loads(candidate['run']) if candidate['run'] else None
             except (ValueError, TypeError):
                 continue
-            if (same == p['run'] and candidate['link'] == p['link']
-                    and ((p['source'] != 'heartbeat' and not candidate['card_id'].startswith('heartbeat:')) or candidate['card_id'] == p['id'])):
+            if (same == p['run'] and candidate['link'] == p['link']):
                 card = candidate
                 break
         if resolved:

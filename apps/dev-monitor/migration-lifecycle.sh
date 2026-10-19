@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Shared, app-specific mechanics for legacy DB conversion: the one list of
 # writers/producers, and how they are kept stopped around a DB replacement.
+# Retired heartbeat units stay on this list on purpose: quiesce stops a leftover
+# active timer before conversion, and the unmanaged resume below only restarts
+# airlock-token-freshness*, never heartbeat.
 
 DEVMON_MIGRATION_UNITS=(
   airlock-devmon-heartbeat.timer

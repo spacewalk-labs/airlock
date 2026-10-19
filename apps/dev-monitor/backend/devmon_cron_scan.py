@@ -2101,30 +2101,11 @@ def cron_message_payloads(measured: dict | None = None, verdicts_path: str | Non
             job.get("lastResult") == "success" and new_run)
         transitioned_ok = (not bad) and prior_bad and completed_ok and not job.get("serviceRunning", False)
 
-        if transitioned_bad:
-            about = _job_about(job)
-            evidence = _job_evidence(job, home)
-            payloads.append({
-                "id": "cron:%s:fail:%s" % (key, run_token),
-                "group": "cron:" + key,
-                "source": "cron",
-                "level": "urgent",
-                "title": "%s %s" % (name, "실패" if failed else "지연"),
-                "body": _cron_body(about, evidence, job.get("nextRun")),
-                "created_at": created_at,
-            })
-        elif transitioned_ok:
-            about = _job_about(job)
-            payloads.append({
-                "id": "cron:%s:ok:%s" % (key, run_token),
-                "group": "cron:" + key,
-                "source": "cron",
-                "level": "normal",
-                "resolves": "cron:" + key,
-                "title": "%s 다시 정상" % name,
-                "body": _cron_body(about, [], job.get("nextRun")),
-                "created_at": created_at,
-            })
+        # ALARM-SEND STOPPED (p1p2-drop-devmon-noise): 전이 발송 블록 삭제 — 스캔·판정·
+        # verdicts 파일 갱신은 유지, payloads 는 항상 빈 목록(호출자 publish_cron_cards
+        # ingest 0건). 되돌리기: git revert + 아래 pass 제거·원복.
+        if transitioned_bad or transitioned_ok:
+            pass
 
         if bad:
             next_verdicts[key] = {"state": "bad", "lastRun": run_token}

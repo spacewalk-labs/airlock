@@ -82,6 +82,8 @@ grep -qF '[paseo-provider-subagent-stream-filter]' <<<"$session_info"
 grep -qF '[paseo-workspace-remove-delivery]' <<<"$session_info"
 tar -xOf "$server_archive" package/dist/server/server/directory-sync/index.js | grep -qF '[paseo-directory-sync-snapshot]'
 tar -xOf "$server_archive" package/dist/server/server/bootstrap.js | grep -qF '[paseo-reconcile-archives-agents]'
+tar -xOf "$server_archive" package/dist/server/server/agent/providers/claude/query.js | grep -qF '[airlock-mcp-auth-off-argv]'
+tar -xOf "$server_archive" package/dist/server/server/agent/agent-projections.js | grep -qF '[airlock-mcp-auth-off-argv]'
 
 # schedule-busy-pending-delivery also has its own runtime behaviour test
 # (schedule-busy-pending-delivery.test.mjs). The stub agentManager it drives was

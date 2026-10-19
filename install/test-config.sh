@@ -881,12 +881,30 @@ with tempfile.TemporaryDirectory() as raw:
     webroot.mkdir()
     icon_env = {**env, 'AIRLOCK_CONFIG': str(icon_config), 'AIRLOCK_STATE_DIR': str(icon_state),
                 'AIRLOCK_SHIPPED_APPS_ROOT': str(base / 'icon-shipped'), 'AIRLOCK_WEBROOT': str(webroot)}
-    def icon_run(*args):
+    def icon_run(*args, mask=-1):
         return subprocess.run([str(ROOT / 'bin/airlock-config'), *args], env=icon_env,
-                              text=True, capture_output=True, check=True).stdout
+                              umask=mask, text=True, capture_output=True, check=True).stdout
     for name in (*public_ids, *personal_ids):
-        icon_run('icon-stage', name)
-        assert (webroot / 'assets/apps' / name / 'icon.svg').is_file()
+        # A same-UID HTTP server can read 0600 files; assert the modes needed
+        # by a separate webserver user as well as the real HTTP responses below.
+        icon_run('icon-stage', name, mask=0o077)
+        target = webroot / 'assets/apps' / name / 'icon.svg'
+        assert target.stat().st_mode & 0o777 == 0o644
+        assert all(d.stat().st_mode & 0o777 == 0o755 for d in
+                   (webroot / 'assets', webroot / 'assets/apps', target.parent))
+    target = webroot / 'assets/apps' / public_ids[0] / 'icon.svg'
+    directories = (webroot / 'assets', webroot / 'assets/apps', target.parent)
+    target.chmod(0o600)
+    staging = target.with_name('.icon.svg.staging')
+    staging.write_bytes(b'old partial icon')
+    staging.chmod(0o600)
+    for directory in directories:
+        directory.chmod(0o700)
+    # Reapply also repairs old directories and an existing private staging file.
+    icon_run('icon-stage', public_ids[0], mask=0o077)
+    assert target.stat().st_mode & 0o777 == 0o644 and not staging.exists()
+    assert all(d.stat().st_mode & 0o777 == 0o755 for d in directories)
+    print('PASS icon permissions: restrictive umask first install and private staging repair')
     launcher = json.loads(icon_run('webjson'))['apps']
     sources = json.loads(icon_run('sources'))['apps']
     class QuietHTTP(SimpleHTTPRequestHandler):

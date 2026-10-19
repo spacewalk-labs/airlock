@@ -48,7 +48,7 @@ something read, and reading does not cancel a queued delivery.
 ```text
 Producer → spool/new → loop (2 seconds) → ledger + cards → Slack
                            ↑                 ↑
-                    heartbeat timer    owner dashboard/API
+                        (retired)      owner dashboard/API
 ```
 
 The loop collects, sends one due card with a two-second HTTP timeout, and performs
@@ -90,7 +90,7 @@ decisions. Existing producers may omit it. `emit_message.py --detail` sets it.
 rule as `group`). Only this explicit field resolves an incident; titles such as
 “recovered” have no special meaning. `emit_message.py --resolves backup` sets it.
 
-Every new urgent card, including heartbeat and a normal-to-urgent promotion, waits
+Every new urgent card, including a normal-to-urgent promotion, waits
 **300 seconds** before its first Slack attempt. Set the single backend environment
 variable `AIRLOCK_DEV_MONITOR_SLACK_GRACE_SECONDS` to another number of seconds (`0` sends
 immediately), for example in a service environment override. Repeat receipts do not
@@ -148,8 +148,7 @@ skill/exec CLI options have been removed.
 
 For as long as it remains open, a card with the same group, run and link is updated:
 its count grows, title/body and last receipt time advance, and it becomes unread.
-Different runs or links get separate cards. Daily heartbeat IDs never coalesce across
-UTC days. Urgency can
+Different runs or links get separate cards. Urgency can
 rise from normal to urgent, which queues the card; another receipt for an already
 urgent card does not queue another notification. Repeating an ID never adds a
 receipt or delivery. Heartbeat IDs stay separate from ordinary same-group cards.
@@ -264,7 +263,7 @@ or separate sender thread. A crash during an update retries the same Slack times
 Startup adds nullable `detail` and `slack_ts` columns to existing canonical databases;
 existing receipts, cards and delivery schedules are preserved.
 
-### Spool and heartbeat
+### Spool
 
 ```text
 spool/tmp/          producer staging
@@ -286,18 +285,10 @@ The writer's nftables rule permits loopback and rejects external egress. A
 boot-enabled system unit restores that rule; the collector requires it to be
 active. See [SECURITY.md](../../SECURITY.md) for the publishing/execution boundary.
 
-With messages enabled, `airlock-devmon-heartbeat.timer` runs at **UTC midnight**
-(`OnCalendar=*-*-* 00:00:00 UTC`, `Persistent=true`). The producer and validator share
-[devmon_heartbeat.py](backend/devmon_heartbeat.py): daily ID `heartbeat:YYYY-MM-DD`,
-group/source `heartbeat`, level `urgent`, title `살아 있음 YYYY-MM-DD`, and the
-canonical body. Ordinary messages cannot claim a reserved heartbeat ID or replace
-its alive card through same-group coalescing.
-
-A legacy heartbeat `created_at` may reflect a retry or manual start at any time
-on that UTC day; its UTC date must match the ID. Same-day canonical republication
-is a duplicate. A new UTC day creates a new heartbeat even when less than 24 hours
-has elapsed. This is a shared content contract, not source authentication.
-The external timer demonstrates the whole spool-to-Slack path by arrival.
+The daily heartbeat producer (`heartbeat:YYYY-MM-DD`, "살아 있음") was retired on
+2026-10-16 (inbox cleanup): no timer renders it anymore and the installer removes
+leftover units. Old heartbeat cards already in a database keep working like ordinary
+cards (same group/run/link coalescing); the migration path still recognises their IDs.
 
 ## Configuration and app-specific secrets
 
@@ -441,7 +432,6 @@ python3 apps/dev-monitor/test-backend.py
 python3 apps/dev-monitor/test-run-contract.py
 python3 apps/dev-monitor/test-loop-contract.py
 python3 apps/dev-monitor/test-migrate-legacy-state.py
-python3 apps/dev-monitor/test-heartbeat.py
 node apps/dev-monitor/test-frontend-contract.mjs
 python3 apps/dev-monitor/test-secret-resolution.py --systemd
 bash install/test-monitor-spool-hardening.sh
@@ -450,7 +440,7 @@ bash install/test-monitor-spool-hardening.sh
 For V14, supply an explicit private DB **copy** and the preceding backend checkout:
 `python3 apps/dev-monitor/test-endstate-rehearsal.py --copy <copy.db> --old-backend
 <preceding-checkout>/apps/dev-monitor/backend` (one command). It checks row contents,
-local heartbeat delivery, exact backup restoration and replay by the old collector.
+local urgent delivery, exact backup restoration and replay by the old collector.
 Synthetic pending/claimed cases are tested separately from the real-data rehearsal.
 Local recorder/systemd checks do not establish a production reinstall or real Slack
 arrival. Campaign status, scope exceptions and exact PR evidence are in

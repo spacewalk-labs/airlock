@@ -75,7 +75,7 @@ command = "timeout"
 predicate = "present"
 expected = "-"
 fix = "sudo apt-get update && sudo apt-get install -y coreutils"
-note = "Bounded heartbeat shutdown and state queries"
+note = "Bounded state queries"
 
 [[prerequisites]]
 command = "curl"
@@ -135,8 +135,7 @@ note = "Writer account provisioning"
 [artifacts]
 # Stop the activation source before its oneshot and the collecting backend.
 # The platform ledger owns stop/verify/delete, including older recorded order.
-units = ["airlock-devmon-heartbeat.timer", "airlock-devmon-heartbeat.service",
-         "airlock-dev-monitor.service",
+units = ["airlock-dev-monitor.service",
          { name = "airlock-dev-monitor-spool-firewall.service", scope = "system" }]
 fragments = ["hub-locations.d/dev-monitor.conf", "servers.d/dev-monitor.conf"]
 serve_ports = ["ingest_port"]

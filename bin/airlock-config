@@ -1618,11 +1618,14 @@ def cmd_icon_stage(cfg: dict, app: str) -> "None":
     d = base
     for comp in ("assets", "apps", app):
         d = d / comp
-        if not os.path.lexists(d):
-            try:
+        try:
+            if not os.path.lexists(d):
                 os.mkdir(d)
-            except OSError as e:
-                die(f"package '{app}': cannot create {d}: {e}")
+            # These are public web assets, including dirs left private by an
+            # earlier install. mkdir's requested mode is filtered by umask.
+            os.chmod(d, 0o755)
+        except OSError as e:
+            die(f"package '{app}': cannot prepare {d}: {e}")
     name = Path(icon["dest"]).name
     target = d / name
     src_fd = os.open(icon["src"], os.O_RDONLY | os.O_NOFOLLOW)
@@ -1634,6 +1637,9 @@ def cmd_icon_stage(cfg: dict, app: str) -> "None":
                      0o644)
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
+            # open's mode is filtered by umask and ignored for an existing
+            # staging file. Set it explicitly before publishing the inode.
+            os.fchmod(fh.fileno(), 0o644)
         os.replace(tmp, target)
     except OSError as e:
         die(f"package '{app}': staging write failed: {e}")

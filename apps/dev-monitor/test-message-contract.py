@@ -103,8 +103,8 @@ def check_peek():
             assert card['peek'] is True and card['read_at'] is None and card['last_at'] > before
             messages.ingest(dict(payload, id='peek-4'))
             assert messages.get_card('peek-1')['peek'] is True
-            heartbeat = messages.heartbeat_payload(messages.now_utc())
-            assert messages.validate_payload(dict(heartbeat, peek=True))['peek'] is True
+            ordinary = dict(payload, id='peek-hb', group='peek-hb', source='peek')
+            assert messages.validate_payload(dict(ordinary, peek=True))['peek'] is True
         finally:
             messages._conn().close()
     if '--json' not in sys.argv:

@@ -282,11 +282,9 @@ APP="$ROOT/apps/dev-monitor"
 f="$(out_file)"
 render_to "$f" render_dev_monitor_ingest_nginx 19926 19923
 golden_check_file "dev-monitor/ingest/nginx.conf" "$f"
-for kind in service timer; do
-  f="$(out_file)"
-  render_to "$f" render_dev_monitor_heartbeat "$kind" "/home/example/.local/state/airlock/dev-monitor/spool"
-  golden_check_file "dev-monitor/heartbeat/airlock-devmon-heartbeat.$kind" "$f"
-done
+# (2026-10-16 inbox cleanup: the heartbeat producer is retired, so there is no
+# heartbeat renderer or golden anymore. Absence is asserted in the installer
+# cases below.)
 # Direct renderer cases do not source install/lib.sh, so hand in the same D5 value
 # explicitly. An empty golden would prove only that the line exists, not that the
 # platform path survives the package-local rename.
@@ -1828,12 +1826,12 @@ run_devmon_webhook_case() {
     AIRLOCK_ROOT="$ROOT" AIRLOCK_APP_DIR="$ROOT/apps/dev-monitor" AIRLOCK_APP_ID=dev-monitor \
     bash "$ROOT/apps/dev-monitor/install.sh" 2>&1
   )" || rc=$?
-  if [ -f "$WDIR/render/units/airlock-devmon-heartbeat.service" ] \
-      && [ -f "$WDIR/render/units/airlock-devmon-heartbeat.timer" ] \
-      && printf '%s\n' "$out" | grep -q 'enable --now airlock-devmon-heartbeat.timer'; then
-    ok "dev-monitor heartbeat $label: rendered and enable --now wired"
+  if [ ! -f "$WDIR/render/units/airlock-devmon-heartbeat.service" ] \
+      && [ ! -f "$WDIR/render/units/airlock-devmon-heartbeat.timer" ] \
+      && printf '%s\n' "$out" | grep -q 'disable --now airlock-devmon-heartbeat.timer'; then
+    ok "dev-monitor heartbeat $label: retired, no units rendered, leftovers disabled"
   else
-    bad "dev-monitor heartbeat $label: missing render or activation"
+    bad "dev-monitor heartbeat $label: heartbeat units rendered or cleanup missing"
   fi
   envf="$WDIR/render/files/dev-monitor.env"
   unit="$WDIR/render/units/airlock-dev-monitor.service"

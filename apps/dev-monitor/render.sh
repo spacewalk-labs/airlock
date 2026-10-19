@@ -307,22 +307,5 @@ server {
 EOF
 }
 
-# render_dev_monitor_heartbeat KIND SPOOL
-# Both the installer and the parity harness render these shipped templates.
-render_dev_monitor_heartbeat() {
-  local kind="$1" spool="$2"
-  local appdir="${AIRLOCK_APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-  python3 - "$appdir" "$kind" "$spool" "$(command -v python3)" <<'PY'
-from pathlib import Path
-import sys
-appdir, kind, spool, python = sys.argv[1:]
-if kind not in ('service', 'timer'):
-    raise SystemExit('invalid heartbeat unit kind')
-text = (Path(appdir) / 'systemd' / ('airlock-devmon-heartbeat.' + kind + '.in')).read_text()
-for token, value in {'APPDIR': appdir, 'SPOOL': spool, 'PYTHON': python}.items():
-    # Unit specifiers and quoted command arguments have their own escaping.
-    value = value.replace('%', '%%').replace('\\', '\\\\').replace('"', '\\"')
-    text = text.replace('@' + token + '@', value)
-sys.stdout.write(text)
-PY
-}
+# (2026-10-16 inbox cleanup: the daily heartbeat producer is retired, so there is
+# no heartbeat unit to render. install.sh removes leftover units.)

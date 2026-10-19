@@ -10,8 +10,9 @@ fb9f44a88fc7ecd493077935658b76566656fde0808cbc9ee0eb93bf82768893  @getpaseo/serv
 cc1963578f012974b779d0b10d1eeabcfb4867a015771cbabbfb9f44112320b8  @getpaseo/server/dist/server/server/session/agent-updates/agent-updates-service.js
 8457074c340eb2ff3becb082089dfba27366407d0de7894d68fbfa7683e37282  @getpaseo/server/dist/server/server/agent/agent-manager.js
 685423d7179edadfa0c0390e92d0a0123d33d29ee28f1dccd4ca3591ecff3823  @getpaseo/server/dist/server/server/agent/agent-prompt.js
+3fb160814ba90636553d751994fcf739510c7c0cc0e7ae5d8b97d86cad9ab900  @getpaseo/server/dist/server/server/agent/agent-projections.js
 8b080518b610ccff83827d1f7d592a6f7d499c44a4062d6ac07893b06037478b  @getpaseo/server/dist/server/server/agent/providers/claude/agent.js
-e68e03ebc5360645355fd333d21f7992189136c8acb4046c5c85961995783c5f  @getpaseo/server/dist/server/server/agent/providers/claude/query.js
+04f6a977e432383a71ee7d08d187a8e53dc8a1c1bb318899789d9d868b26dacd  @getpaseo/server/dist/server/server/agent/providers/claude/query.js
 18e4102145557c9dd4e813c0102c31ca419f96222265f19de23c913e91c07e6e  @getpaseo/server/dist/server/server/agent/providers/claude/model-manifest.js
 f9611707f1778df947dfdea66c8422ed5782b6e137a91b6c7629fd181c471698  @getpaseo/server/dist/server/server/agent/providers/opencode-agent.js
 0a91e05561590c87f6940c9d74e5f8d5492c9addca7214e3440515c7fb0d7981  @getpaseo/server/dist/server/server/authorization/operation-permissions.js

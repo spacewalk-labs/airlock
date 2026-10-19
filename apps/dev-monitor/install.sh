@@ -260,7 +260,8 @@ devmon_migration_finish() {
       || log "FATAL: dev-monitor database compensation degraded after installer rc=$rc; legacy backup retained"
     exit "$rc"
   fi
-  # Backend and heartbeat are reconciled by the normal install path. Token
+  # Backend units are reconciled by the normal install path (the retired heartbeat
+  # units are removed there too). Token
   # freshness is separate, so only its formerly-active units resume here.
   devmon_migration_start_saved unmanaged \
     || die "cannot restore previously-active migration units"
@@ -461,61 +462,55 @@ fi
 if [ "$TOKEN_FRESHNESS" = true ] && [ ! -f "$HOME/.config/systemd/user/airlock-token-freshness.timer" ]; then
   log "NOTE: token_freshness is on, so the dashboard card and /api/tokens are live — but nothing checks on a schedule yet. Wire the timer with: AIRLOCK_ROOT=$ROOT AIRLOCK_APP_DIR=$HERE AIRLOCK_APP_ID=$AIRLOCK_APP_ID bash $HERE/install-token-timer.sh"
 fi
-# The heartbeat is part of the message pipeline, so messages=false stops it too.
-if [ "$MESSAGES" = true ]; then
-  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
-    for kind in service timer; do
-      render_dev_monitor_heartbeat "$kind" "$DEVMON_STATE/spool" \
-        >"$UNIT_DIR/airlock-devmon-heartbeat.$kind"
-    done
-  fi
+# The daily heartbeat producer is retired (2026-10-16 inbox cleanup): no unit is
+# rendered anymore, and any leftover units from earlier installs are disabled,
+# stopped and removed. Existing heartbeat cards stay in the database until the
+# normal retention/archive path handles them.
+# Query the manager, not just fragment existence: a removed file may still
+# have an active timer or in-flight oneshot loaded. Never delete its recovery
+# files when disable/stop failed or the manager still reports it running.
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  airlock_run systemctl --user disable --now airlock-devmon-heartbeat.timer
+  airlock_run systemctl --user disable --now airlock-devmon-heartbeat.service
 else
-  # Query the manager, not just fragment existence: a removed file may still
-  # have an active timer or in-flight oneshot loaded. Never delete its recovery
-  # files when disable/stop failed or the manager still reports it running.
-  if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
-    airlock_run systemctl --user disable --now airlock-devmon-heartbeat.timer
-    airlock_run systemctl --user disable --now airlock-devmon-heartbeat.service
-  else
-    require_cmd timeout
-    heartbeat_state() {
-      local unit="$1" state key value
-      state="$(timeout 30 systemctl --user show "$unit" --property=LoadState \
-        --property=ActiveState --property=UnitFileState --property=MainPID)" \
-        || die "cannot query heartbeat unit state: $unit"
-      hb_load='' hb_active='' hb_enabled='' hb_pid=''
-      # Timer units have no MainPID property; services must report it.
-      case "$unit" in *.timer) hb_pid=0 ;; esac
-      while IFS='=' read -r key value; do
-        case "$key" in
-          LoadState) hb_load="$value" ;;
-          ActiveState) hb_active="$value" ;;
-          UnitFileState) hb_enabled="$value" ;;
-          MainPID) hb_pid="$value" ;;
-        esac
-      done <<< "$state"
-      [ -n "$hb_load" ] && [ -n "$hb_active" ] && [ -n "$hb_pid" ] \
-        || die "incomplete heartbeat unit state: $unit"
-    }
-    for heartbeat_unit in airlock-devmon-heartbeat.timer airlock-devmon-heartbeat.service; do
-      heartbeat_state "$heartbeat_unit"
-      if [ "$hb_load" = not-found ] && [ "$hb_active" = inactive ] \
-          && [ "$hb_pid" = 0 ] && [ -z "$hb_enabled" ]; then
-        continue
-      fi
-      timeout 30 systemctl --user disable --now "$heartbeat_unit" \
-        || die "cannot disable and stop heartbeat unit: $heartbeat_unit; files preserved"
-      heartbeat_state "$heartbeat_unit"
-      case "$hb_active:$hb_pid:$hb_enabled" in
-        inactive:0:disabled|inactive:0:static|inactive:0:linked|inactive:0:linked-runtime|inactive:0:|\
-        failed:0:disabled|failed:0:static|failed:0:linked|failed:0:linked-runtime|failed:0:) ;;
-        *) die "heartbeat unit is still active or enabled: $heartbeat_unit ($hb_active/$hb_pid/$hb_enabled); files preserved" ;;
+  require_cmd timeout
+  heartbeat_state() {
+    local unit="$1" state key value
+    state="$(timeout 30 systemctl --user show "$unit" --property=LoadState \
+      --property=ActiveState --property=UnitFileState --property=MainPID)" \
+      || die "cannot query heartbeat unit state: $unit"
+    hb_load='' hb_active='' hb_enabled='' hb_pid=''
+    # Timer units have no MainPID property; services must report it.
+    case "$unit" in *.timer) hb_pid=0 ;; esac
+    while IFS='=' read -r key value; do
+      case "$key" in
+        LoadState) hb_load="$value" ;;
+        ActiveState) hb_active="$value" ;;
+        UnitFileState) hb_enabled="$value" ;;
+        MainPID) hb_pid="$value" ;;
       esac
-    done
-  fi
-  if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
-    rm -f "$UNIT_DIR/airlock-devmon-heartbeat.service" "$UNIT_DIR/airlock-devmon-heartbeat.timer"
-  fi
+    done <<< "$state"
+    [ -n "$hb_load" ] && [ -n "$hb_active" ] && [ -n "$hb_pid" ] \
+      || die "incomplete heartbeat unit state: $unit"
+  }
+  for heartbeat_unit in airlock-devmon-heartbeat.timer airlock-devmon-heartbeat.service; do
+    heartbeat_state "$heartbeat_unit"
+    if [ "$hb_load" = not-found ] && [ "$hb_active" = inactive ] \
+        && [ "$hb_pid" = 0 ] && [ -z "$hb_enabled" ]; then
+      continue
+    fi
+    timeout 30 systemctl --user disable --now "$heartbeat_unit" \
+      || die "cannot disable and stop heartbeat unit: $heartbeat_unit; files preserved"
+    heartbeat_state "$heartbeat_unit"
+    case "$hb_active:$hb_pid:$hb_enabled" in
+      inactive:0:disabled|inactive:0:static|inactive:0:linked|inactive:0:linked-runtime|inactive:0:|\
+      failed:0:disabled|failed:0:static|failed:0:linked|failed:0:linked-runtime|failed:0:) ;;
+      *) die "heartbeat unit is still active or enabled: $heartbeat_unit ($hb_active/$hb_pid/$hb_enabled); files preserved" ;;
+    esac
+  done
+fi
+if [ "${AIRLOCK_DRY_RUN:-0}" != 1 ] || [ -n "${AIRLOCK_RENDER_DIR:-}" ]; then
+  rm -f "$UNIT_DIR/airlock-devmon-heartbeat.service" "$UNIT_DIR/airlock-devmon-heartbeat.timer"
 fi
 airlock_run systemctl --user daemon-reload
 airlock_run systemctl --user enable airlock-dev-monitor.service
@@ -531,9 +526,6 @@ fi
 # From the first canonical writer on, a standalone failure keeps the converted DB.
 [ "$_devmon_migration_state" != converted ] || _devmon_migration_state=activated
 airlock_run systemctl --user restart airlock-dev-monitor.service
-if [ "$MESSAGES" = true ]; then
-  airlock_run systemctl --user enable --now airlock-devmon-heartbeat.timer
-fi
 
 # --- 2. dashboard UI into the hub webroot (served by the hub's static location /) ---
 if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then

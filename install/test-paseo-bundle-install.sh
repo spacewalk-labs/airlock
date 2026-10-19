@@ -188,6 +188,16 @@ grep -q 'systemctl --user restart airlock-paseo.service' "$EVENTS" \
   && ok "INSTALLED_SHA256SUMS verifies at the prefix level" \
   || bad "INSTALLED_SHA256SUMS does not verify at $NPM_ROOT"
 
+# The daemon's MCP bearer must stay out of claude's argv and out of stored agent records.
+if node "$ROOT/apps/paseo/patches/mcp-auth-off-argv.test.mjs" \
+    "$TOP/dist/server/server/agent/providers/claude/query.js" \
+    "$TOP/dist/server/server/agent/agent-projections.js" >"$TMP/mcp-auth.log" 2>&1; then
+  ok "MCP bearer stays out of argv and stored records on the actual installed npm tree"
+else
+  bad "MCP bearer behavior failed on the actual installed npm tree"
+  tail -20 "$TMP/mcp-auth.log"
+fi
+
 # ALREADY is an installer fast path; exercise the new behavior on npm's actual
 # package tree as well, including the automatic reconciliation timer.
 if node "$ROOT/apps/paseo/patches/workspace-git-identity.test.mjs" \

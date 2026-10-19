@@ -15,7 +15,6 @@ import sys
 import tempfile
 import threading
 import uuid
-from datetime import timedelta
 from unittest.mock import patch
 
 APP=Path(__file__).resolve().parent
@@ -24,7 +23,6 @@ sys.path.insert(0,str(APP))
 import devmon_messages as M
 import devmon_loop as loop
 import devmon_spool as spool
-from devmon_heartbeat import heartbeat_payload
 from examples.emit_message import emit
 
 
@@ -73,23 +71,23 @@ def run(copy, old_backend):
         print('REAL COPY: cards=%d ledger=%d receiptless_cards=%d pending/claimed=%d integrity=ok; all card IDs/core fields/receipt tuples preserved' % (old_cards,old_receipts,missing,pending))
         print('BACKUP: '+','.join('%s=%d'%(name,len(rows)) for name,rows in sorted(original.items()))+'; exact table contents unchanged')
         queue=root/'spool';spool.ensure_dirs(str(queue))
-        heartbeat=heartbeat_payload(M.now_utc()+timedelta(days=1))
-        while M.has_receipt(heartbeat['id']):
-            day=M.parse_rfc3339(heartbeat['id'].split(':',1)[1]+'T00:00:00Z')
-            heartbeat=heartbeat_payload(day+timedelta(days=1))
+        urgent={'id':'drill-urgent-'+uuid.uuid4().hex,'group':'drill-urgent',
+                'source':'contract','level':'urgent','title':'Drill urgent','body':'Drill'}
+        while M.has_receipt(urgent['id']):
+            urgent['id'] = 'drill-urgent-'+uuid.uuid4().hex
         normal={'id':'rollback-'+uuid.uuid4().hex,'group':'rollback-'+uuid.uuid4().hex,
                 'source':'contract','level':'normal','title':'Rollback receipt','body':'Preserve'}
         server=http.server.HTTPServer(('127.0.0.1',0),Recorder)
         worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
         try:
-            for payload in (heartbeat,normal): assert emit(str(queue),payload)=='queued'
+            for payload in (urgent,normal): assert emit(str(queue),payload)=='queued'
             assert spool.scan_once(str(queue))['inserted']==2
             assert loop.deliver_once(loop.slack.make_sender({'AIRLOCK_DEV_MONITOR_SLACK_WEBHOOK_URGENT': 'http://127.0.0.1:%d/hook'%server.server_port}))
-            assert len(posts)==1 and heartbeat['title'] in posts[0]['text']
-            assert M.get_card(heartbeat['id'])['sent_at']
+            assert len(posts)==1 and urgent['title'] in posts[0]['text']
+            assert M.get_card(urgent['id'])['sent_at']
         finally:
             server.shutdown();server.server_close();worker.join()
-        print('CUTOVER HEARTBEAT: canonical alive card1 local_POST1 sent_at=1')
+        print('CUTOVER DRILL: canonical urgent card1 local_POST1 sent_at=1')
         db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close();M._local=threading.local()
         result=subprocess.run(command+['--restore-backup',str(backup),'--restore-to',str(dbpath),'--offline'],capture_output=True,text=True)
         assert result.returncode==0,result.stderr
@@ -105,7 +103,7 @@ for event_id in sys.argv[4:]:
     assert M._conn().execute('SELECT COUNT(*) FROM occurrences WHERE event_id=?',(event_id,)).fetchone()[0]==1
 print('OLD CODE: restored startup=ok retained_spool_inserted=2 missing=0')
 '''
-        result=subprocess.run([sys.executable,'-c',child,str(old_backend),str(dbpath),str(queue),heartbeat['id'],normal['id']],capture_output=True,text=True)
+        result=subprocess.run([sys.executable,'-c',child,str(old_backend),str(dbpath),str(queue),urgent['id'],normal['id']],capture_output=True,text=True)
         assert result.returncode==0,result.stderr
         print(result.stdout.strip())
         assert contents(source)==original

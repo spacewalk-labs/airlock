@@ -332,6 +332,17 @@ deployment that exposes Paseo are responsible for this.
   agents (measured 2026-10-11: 58 such agents, six from the last five days, all with a
   missing directory). The reconciliation hook now calls the same `archiveWorkspaceContents`
   a UI archive uses. A daemon restart activates this server patch.
+- `mcp-auth-off-argv.mjs` (+ `.test.mjs`) keeps the daemon's Agent MCP bearer
+  (`Authorization: Bearer <per-run capability token>`, injected into every seat's MCP
+  config) out of places anything on the box can read. The Agent SDK passed it to claude
+  as inline `--mcp-config` JSON, so it sat in argv (`ps`); claude now gets the same JSON
+  as a 0600 file in a fresh 0700 temp directory, removed when claude exits. Providers
+  also stored it in `persistence.metadata.mcpServers` of every agent record (measured
+  2026-10-15: 9,098 of 10,119 records); the daemon's own server is now dropped there —
+  it is re-injected on every launch and resume — and user MCP servers stay. Baked into
+  the bundle (both targets); the patcher re-derives it on a new Paseo build and the
+  test runs against the installed tree in `install/test-paseo-bundle-install.sh`.
+  A daemon restart activates it.
 
 ## When a patch no longer fits
 

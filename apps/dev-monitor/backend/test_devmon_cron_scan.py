@@ -1876,44 +1876,46 @@ class CronCards(unittest.TestCase):
     def verdicts_path(self, root):
         return os.path.join(root, "cron-verdicts.json")
 
-    def test_failure_start_emits_one_urgent_card_with_fail_id_and_three_columns(self):
+    def test_failure_start_records_bad_verdict_without_payload(self):
+        # 2026-10-14 알람 정리: 실패를 감지·기록하되 발송하지 않는다.
         with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
             payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [
                 self.job("user:backup/weekly@home", lastResult="failed", timeliness="late"),
                 self.job("healthy", lastResult="success", timeliness="on-time"),
-            ]), verdicts_path=self.verdicts_path(root))
-        self.assertEqual(len(payloads), 1)
-        payload = payloads[0]
+            ]), verdicts_path=path)
+            with open(path) as saved:
+                verdicts = json.load(saved)
+        self.assertEqual(payloads, [])
         key = cs.cron_job_key("user:backup/weekly@home")
-        self.assertEqual(payload["group"], "cron:" + key)
-        self.assertEqual(payload["id"], "cron:%s:fail:2023-11-14T22:13:20Z" % key)
-        self.assertRegex(key, r"^[0-9a-f]{24}$")
-        self.assertEqual(payload["source"], "cron")
-        self.assertEqual(payload["level"], "urgent")
-        self.assertEqual(payload["title"], "nightly backup 실패")
-        self.assertIn("무엇:", payload["body"])
-        self.assertIn("증거:", payload["body"])
-        self.assertIn("다음:", payload["body"])
+        self.assertEqual(verdicts[key]["state"], "bad")
 
-    def test_late_only_title_says_late_not_failed(self):
+    def test_late_only_records_bad_verdict_without_payload(self):
         with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
             payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [
                 self.job("cron/only@read", lastResult="success", timeliness="late"),
-            ]), verdicts_path=self.verdicts_path(root))
-        self.assertEqual(payloads[0]["title"], "nightly backup 지연")
+            ]), verdicts_path=path)
+            with open(path) as saved:
+                verdicts = json.load(saved)
+        self.assertEqual(payloads, [])
+        key = cs.cron_job_key("cron/only@read")
+        self.assertEqual(verdicts[key]["state"], "bad")
 
-    def test_three_consecutive_failing_scans_publish_exactly_one_card(self):
-        """청사진 결정 01 — 실패가 이어지는 동안 같은 잡에 새 쪽지가 없다."""
+    def test_three_consecutive_failing_scans_emit_no_payloads(self):
+        """청사진 결정 01 — 실패가 이어져도 쪽지가 나가지 않고 판정만 유지된다."""
         with tempfile.TemporaryDirectory() as root:
             path = self.verdicts_path(root)
             job = self.job("system:backup/weekly@host", lastResult="failed")
             all_payloads = []
             for now in (1_700_000_000, 1_700_000_900, 1_700_001_800):
                 all_payloads += cs.cron_message_payloads(self.snapshot(now, [job]), verdicts_path=path)
-        self.assertEqual(len(all_payloads), 1)
-        self.assertEqual(all_payloads[0]["level"], "urgent")
+            with open(path) as saved:
+                verdicts = json.load(saved)
+        self.assertEqual(all_payloads, [])
+        self.assertEqual(verdicts[cs.cron_job_key("system:backup/weekly@host")]["state"], "bad")
 
-    def test_recovery_emits_normal_card_once(self):
+    def test_recovery_clears_verdict_without_payload(self):
         with tempfile.TemporaryDirectory() as root:
             path = self.verdicts_path(root)
             key = cs.cron_job_key("system:backup/weekly@host")
@@ -1921,15 +1923,14 @@ class CronCards(unittest.TestCase):
             recovered = self.job("system:backup/weekly@host", lastResult="success",
                                   timeliness="on-time", lastRun=1_700_003_600)
             first = cs.cron_message_payloads(self.snapshot(1_700_000_000, [failing]), verdicts_path=path)
+            with open(path) as saved:
+                self.assertEqual(json.load(saved)[key]["state"], "bad")
             second = cs.cron_message_payloads(self.snapshot(1_700_004_000, [recovered]), verdicts_path=path)
+            with open(path) as saved:
+                self.assertNotIn(key, json.load(saved))  # 해소 판정은 파일에서 지운다
             third = cs.cron_message_payloads(self.snapshot(1_700_005_000, [recovered]), verdicts_path=path)
-        self.assertEqual(len(first), 1)
-        self.assertEqual(first[0]["level"], "urgent")
-        self.assertEqual(len(second), 1)
-        self.assertEqual(second[0]["level"], "normal")
-        self.assertEqual(second[0]["resolves"], first[0]["group"])
-        self.assertEqual(second[0]["title"], "nightly backup 다시 정상")
-        self.assertEqual(second[0]["id"], "cron:%s:ok:2023-11-14T23:13:20Z" % key)
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
         self.assertEqual(third, [])  # 회복 뒤 계속 정상 — 조용
 
     def test_running_next_invocation_does_not_resolve_prior_failure(self):
@@ -1951,9 +1952,11 @@ class CronCards(unittest.TestCase):
             with open(path) as saved:
                 self.assertEqual(json.load(saved)[cs.cron_job_key(job_id)]["state"], "bad")
             final = cs.cron_message_payloads(self.snapshot(1_700_004_000, [success]), verdicts_path=path)
-            self.assertEqual(len(first), 1)
-            self.assertEqual(len(final), 1)
-            self.assertEqual(final[0]["resolves"], first[0]["group"])
+            with open(path) as saved:
+                verdicts = json.load(saved)
+        self.assertEqual(first, [])
+        self.assertEqual(final, [])
+        self.assertNotIn(cs.cron_job_key(job_id), verdicts)  # 해소 판정은 파일에서 지운다
 
     def test_reset_result_without_new_run_does_not_resolve_failure(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1965,15 +1968,17 @@ class CronCards(unittest.TestCase):
             self.assertEqual(cs.cron_message_payloads(
                 self.snapshot(1_700_000_100, [reset]), verdicts_path=path), [])
 
-    def test_corrupted_verdicts_file_replays_one_more_transition(self):
+    def test_corrupted_verdicts_file_replays_transition_silently(self):
         with tempfile.TemporaryDirectory() as root:
             path = self.verdicts_path(root)
             with open(path, "w") as f:
                 f.write("{not json")
             job = self.job("system:backup/weekly@host", lastResult="failed")
             payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]), verdicts_path=path)
-        self.assertEqual(len(payloads), 1)
-        self.assertEqual(payloads[0]["level"], "urgent")
+            with open(path) as saved:
+                verdicts = json.load(saved)
+        self.assertEqual(payloads, [])
+        self.assertEqual(verdicts[cs.cron_job_key("system:backup/weekly@host")]["state"], "bad")
 
     def test_verdicts_file_is_written_atomically_and_readable_next_call(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1988,6 +1993,7 @@ class CronCards(unittest.TestCase):
             self.assertEqual(os.listdir(root), ["cron-verdicts.json"])  # no leftover tmp file
 
     def test_about_falls_back_to_description_when_unit_has_no_marker(self):
+        # _job_about 헬퍼 직접 검증 (발송 경로가 사라져 payload 관측은 불가).
         with tempfile.TemporaryDirectory() as root, tempfile.NamedTemporaryFile(
                 "w", suffix=".service", delete=False) as unit_file:
             unit_file.write("[Unit]\nDescription=Nightly backup unit\n")
@@ -1996,10 +2002,12 @@ class CronCards(unittest.TestCase):
                             scope="user", unit="backup.timer", service="backup.service")
             with patch.object(cs, "run_cmd", return_value=(
                     0, "FragmentPath=%s\nDescription=Nightly backup unit\n\n" % unit_file.name, "")):
+                about = cs._job_about(job)
                 payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
                                                      verdicts_path=self.verdicts_path(root))
             os.unlink(unit_file.name)
-        self.assertIn("Nightly backup unit (설명 미등록)", payloads[0]["body"])
+        self.assertIn("Nightly backup unit (설명 미등록)", about)
+        self.assertEqual(payloads, [])
 
     def test_about_uses_x_airlock_about_marker_when_present(self):
         with tempfile.TemporaryDirectory() as root, tempfile.NamedTemporaryFile(
@@ -2010,11 +2018,13 @@ class CronCards(unittest.TestCase):
                             scope="user", unit="backup.timer", service="backup.service")
             with patch.object(cs, "run_cmd", return_value=(
                     0, "FragmentPath=%s\nDescription=Nightly backup unit\n\n" % unit_file.name, "")):
+                about = cs._job_about(job)
                 payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
                                                      verdicts_path=self.verdicts_path(root))
             os.unlink(unit_file.name)
-        self.assertIn("무엇: 매일 밤 백업을 돌립니다", payloads[0]["body"])
-        self.assertNotIn("설명 미등록", payloads[0]["body"])
+        self.assertEqual(about, "매일 밤 백업을 돌립니다")
+        self.assertNotIn("설명 미등록", about)
+        self.assertEqual(payloads, [])
 
     def test_evidence_masks_home_absolute_paths(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2022,27 +2032,32 @@ class CronCards(unittest.TestCase):
             job = self.job("user:backup.timer", lastResult="failed", kind="systemd",
                             scope="user", unit="backup.timer", service="backup.service")
             with patch.object(cs, "run_cmd", side_effect=[
-                    (0, "FragmentPath=\nDescription=Nightly backup\n\n", ""),
                     (0, "%s/logs/backup.log: permission denied\n" % home, ""),
             ]):
-                payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
-                                                     verdicts_path=self.verdicts_path(root))
-        self.assertIn("~/logs/backup.log", payloads[0]["body"])
-        self.assertNotIn(home, payloads[0]["body"])
+                evidence = cs._job_evidence(job, home)
+            payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
+                                                 verdicts_path=self.verdicts_path(root))
+        self.assertTrue(any("~/logs/backup.log" in line for line in evidence))
+        self.assertNotIn(home, "\n".join(evidence))
+        self.assertEqual(payloads, [])
 
-    def test_dev_monitor_own_cron_job_publishes_even_without_about(self):
-        """규칙 5 — dev-monitor 자신의 크론 카드는 about 이 없어도 낸다(대체 표시로)."""
+    def test_dev_monitor_own_cron_job_detected_without_about(self):
+        """규칙 5 — dev-monitor 자신의 크론 실패는 about 없이도 감지되나 발송하지 않는다."""
         with tempfile.TemporaryDirectory() as root:
+            path = self.verdicts_path(root)
             job = self.job("user:airlock-dev-monitor.timer", lastResult="failed", kind="systemd",
                             scope="user", unit="airlock-dev-monitor.timer",
                             service="airlock-dev-monitor.service", description=None)
             with patch.object(cs, "run_cmd", return_value=(1, "", "no such unit")):
                 payloads = cs.cron_message_payloads(self.snapshot(1_700_000_000, [job]),
-                                                     verdicts_path=self.verdicts_path(root))
-        self.assertEqual(len(payloads), 1)
-        self.assertIn("(설명 미등록)", payloads[0]["body"])
+                                                     verdicts_path=path)
+            with open(path) as saved:
+                verdicts = json.load(saved)
+        self.assertEqual(payloads, [])
+        self.assertEqual(verdicts[cs.cron_job_key("user:airlock-dev-monitor.timer")]["state"], "bad")
 
-    def test_two_maintenance_ticks_of_same_failure_publish_only_once(self):
+    def test_two_maintenance_ticks_of_same_failure_emit_no_cards(self):
+        # 2026-10-14 알람 정리: 전이 발송 없이 스캔·판정만 돈다.
         with tempfile.TemporaryDirectory() as root:
             messages._local = threading.local()
             messages.init_db(os.path.join(root, "messages.db"))
@@ -2059,11 +2074,10 @@ class CronCards(unittest.TestCase):
                 loop.tick(os.path.join(root, "spool"), "", cleanup=True,
                           maintenance=lambda: loop.publish_cron_cards(path))
             key = cs.cron_job_key(job["id"])
-            card = messages.get_card("cron:%s:fail:2023-11-14T22:13:20Z" % key)
-            self.assertEqual(card["group"], "cron:" + key)
-            self.assertEqual(card["count"], 1)
-            self.assertEqual(messages._conn().execute("SELECT COUNT(*) FROM cards").fetchone()[0], 1)
-            self.assertEqual(messages._conn().execute("SELECT COUNT(*) FROM ledger").fetchone()[0], 1)
+            with open(path) as saved:
+                self.assertEqual(json.load(saved)[key]["state"], "bad")
+            self.assertEqual(messages._conn().execute("SELECT COUNT(*) FROM cards").fetchone()[0], 0)
+            self.assertEqual(messages._conn().execute("SELECT COUNT(*) FROM ledger").fetchone()[0], 0)
             self.assertEqual(scanned.call_count, 2)
             self.assertEqual(os.listdir(os.path.join(root, "spool", "new")), [])
             self.assertEqual(os.listdir(os.path.join(root, "spool", "processing")), [])

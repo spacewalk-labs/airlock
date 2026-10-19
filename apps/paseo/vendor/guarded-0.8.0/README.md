@@ -136,6 +136,14 @@ The reconciliation that archives a workspace whose directory is missing now
 archives that workspace's agents too. Only that tar member differs from the
 previous server tarball; `INSTALLED_SHA256SUMS` gains the file.
 
+`mcp-auth-off-argv` is baked into `server/agent/providers/claude/query.js` and
+`server/agent/agent-projections.js` (2026-10-15). The daemon's Agent MCP bearer no
+longer reaches claude's argv (the inline `--mcp-config` JSON goes to a 0600 file) or
+stored agent records (the daemon's own `/mcp/agents` server is dropped from
+`persistence.metadata.mcpServers`). Only those two tar members differ from the
+previous server tarball; `query.js` was already pinned and `INSTALLED_SHA256SUMS`
+gains `agent-projections.js`. There is no install-time step: both files are baked.
+
 `orphan-process-guard` (claude) and `orphan-process-group` (claude-agent,
 claude-query, codex-transport) are baked in for the same reason as
 provider-subagent-stream-filter: both have their own runtime behaviour tests

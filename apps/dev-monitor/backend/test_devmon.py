@@ -1139,7 +1139,7 @@ class TestCards(unittest.TestCase):
         MSG.ingest(msg(event_id='changed-body',kind='info',body='Clean up now'))
         self.assertIsNone(MSG.get_card('resource-1')['read_at'])
 
-    def test_coalescing_keeps_different_actions_links_and_heartbeats_separate(self):
+    def test_coalescing_keeps_different_actions_and_links_separate(self):
         MSG.ingest(msg())
         self.assertEqual(MSG.ingest(msg(event_id='other-action', run={
             'cwd': '/tmp/project', 'prompt': 'Different action'})), 'inserted')
@@ -1151,10 +1151,18 @@ class TestCards(unittest.TestCase):
         self.assertEqual(MSG.ingest(msg(event_id='after-malformed')), 'inserted')
         day = MSG.now_utc()
         with unittest.mock.patch.object(MSG, 'now_utc', return_value=day):
-            self.assertEqual(MSG.ingest(MSG.heartbeat_payload(day)), 'inserted')
+            self.assertEqual(MSG.ingest(msg(event_id='daily-1', group_key='daily:note',
+                                            kind='info')), 'inserted')
         with unittest.mock.patch.object(MSG, 'now_utc', return_value=day + timedelta(days=1)):
-            self.assertEqual(
-                MSG.ingest(MSG.heartbeat_payload(day + timedelta(days=1))), 'inserted')
+            self.assertEqual(MSG.ingest(msg(event_id='daily-2', group_key='daily:note',
+                                            kind='info')), 'coalesced')
+        # Legacy heartbeat IDs left in old databases coalesce like ordinary cards.
+        with unittest.mock.patch.object(MSG, 'now_utc', return_value=day):
+            self.assertEqual(MSG.ingest(msg(event_id='heartbeat:2026-09-01',
+                                            group_key='legacy:hb', kind='info')), 'inserted')
+        with unittest.mock.patch.object(MSG, 'now_utc', return_value=day + timedelta(days=1)):
+            self.assertEqual(MSG.ingest(msg(event_id='heartbeat:2026-09-02',
+                                            group_key='legacy:hb', kind='info')), 'coalesced')
         self.assertEqual(MSG.counts()['active'], 7)
         AC['3'] = 1
 
@@ -1447,13 +1455,13 @@ class TestResolve(unittest.TestCase):
             with self.assertRaises(MSG.ValidationError):
                 MSG.validate_payload(dict(ordinary, resolves=value))
 
-    def test_optional_fields_apply_to_heartbeat_and_resolution_reason_stays_one_line(self):
-        from devmon_heartbeat import heartbeat_payload
-        heartbeat = dict(heartbeat_payload(self.now), detail='original heartbeat',
-                         resolves='missing')
-        MSG.ingest(heartbeat)
-        card = MSG.get_card(heartbeat['id'])
-        self.assertEqual(card['detail'], heartbeat['detail'])
+    def test_optional_fields_apply_to_urgent_cards_and_resolution_reason_stays_one_line(self):
+        ordinary = msg(event_id='detail-1', group_key='detail:note', kind='info',
+                       urgency='urgent', detail='original detail', title='Detail card',
+                       body='Service note.')
+        MSG.ingest(ordinary)
+        card = MSG.get_card(ordinary['id'])
+        self.assertEqual(card['detail'], ordinary['detail'])
         self.assertEqual(MSG.parse_rfc3339(card['send_next_at']), self.now + timedelta(seconds=300))
         fresh_db()
         self.send_alarm()
