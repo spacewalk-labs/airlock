@@ -122,6 +122,36 @@ p = api._agy_usage_payload(); time.sleep(0.2)
 check("route: no reading yet starts a read and says so", "groups" not in p and len(runs) == 2, (p, runs))
 
 diag = load("agy_usage", os.path.join(ROOT, "bin", "airlock-agy-usage"))
+
+# A tier with only weekly limits (Antigravity Starter Quota, captured 2026-10-21): no 5-hour
+# bar at all. Read the weekly limit as the binding one, but only once the closing note is drawn.
+WEEKLY_ONLY = """
+└ Models & Quota
+  Account: someone@example.com
+GEMINI MODELS
+  Models within this group: Gemini Flash, Gemini Pro
+  Weekly Limit Remaining
+[░░░░░░░░░░░░░░░░░░░░] 0.00%
+Refreshes in 111h 58m
+CLAUDE AND GPT MODELS
+  Models within this group: Claude Opus, Claude Sonnet, GPT-OSS
+  Weekly Limit Remaining
+[████████████████████] 100.00%
+Quota available
+  │Within each group, models share a weekly limit. Quota is consumed
+"""
+w = diag.parse(WEEKLY_ONLY, now)
+check("weekly-only tier: both groups read, 5-hour = weekly, window marked absent",
+      w and len(w["groups"]) == 2
+      and w["groups"][0]["weeklyRemaining"] == 0.0 and w["groups"][0]["fiveHourRemaining"] == 0.0
+      and w["groups"][0]["fiveHourResetAt"] == w["groups"][0]["weeklyResetAt"]
+      and w["groups"][1]["fiveHourRemaining"] == 100.0
+      and w["groups"][0].get("fiveHourWindow") is False, w)
+mid = WEEKLY_ONLY.split("  │Within each group")[0]
+check("weekly-only tier: mid-render (no closing note yet) is not taken as complete",
+      diag.parse(mid, now) is None, diag.parse(mid, now))
+check("normal tier keeps its 5-hour reading and no absent-window mark",
+      r and all("fiveHourWindow" not in g for g in r["groups"]), r)
 check("diag: exact allowlist key set",
       set(diag.DIAG_FIELDS) == {"sent", "elapsedMs", "bytesRead", "sawUsageHeader",
                                 "groupHeaderCount", "weeklyCount", "fiveHourCount",

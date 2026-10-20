@@ -55,6 +55,17 @@ def parse(text, now):
                 group[key + "ResetAt"] = int(now)
                 continue
             if not m:
+                # A tier with no 5-hour window (Antigravity Starter Quota, 2026-10-21) draws
+                # only the weekly bar. The weekly limit is then the binding one; read it as
+                # both, like the "Disabled" case below, and say the window was absent.
+                # Only once the closing note is drawn: mid-render, a normal tier's 5-hour bar
+                # may simply not have arrived yet.
+                if (key == "fiveHour" and "weeklyRemaining" in group and "Five Hour" not in block
+                        and "Within each group" in text):
+                    group["fiveHourRemaining"] = group["weeklyRemaining"]
+                    group["fiveHourResetAt"] = group["weeklyResetAt"]
+                    group["fiveHourWindow"] = False
+                    continue
                 # A spent weekly limit replaces the 5-hour bar with "Disabled: ...".
                 # The group is unusable until the weekly reset, so read it as spent
                 # then, rather than failing the whole screen (which froze the reading).
@@ -170,8 +181,13 @@ def main():
                 continue
             if sent:
                 result = parse(text, time.time())
-                if result and len(result["groups"]) >= 1 and (text.count("Refreshes in") + len(_FIVE_DISABLED.findall(text)) + text.count("Quota available")
-                                                                 >= 2 * len(result["groups"])):
+                # Complete = every limit bar drawn has its value (a refresh time, "Disabled"
+                # or "Quota available"); a tier may draw one bar per group or two.
+                view = text[text.rindex("Models & Quota"):] if result else ""
+                bars = view.count("Weekly Limit Remaining") + view.count("Five Hour Limit Remaining")
+                if result and len(result["groups"]) >= 1 and bars >= len(result["groups"]) and (
+                        view.count("Refreshes in") + len(_FIVE_DISABLED.findall(view))
+                        + view.count("Quota available") >= bars):
                     exit_reason = "ok"
                     break
                 result = None
