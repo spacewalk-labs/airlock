@@ -1,0 +1,142 @@
+--- a/@getpaseo/server/dist/server/server/agent/agent-manager.js
++++ b/@getpaseo/server/dist/server/server/agent/agent-manager.js
+@@ -315,12 +315,14 @@
+             },
+         });
+         this.updateProviderRegistry({
+             providerDefinitions: options.providerDefinitions ?? {},
+             clients: options.clients ?? {},
+         });
++        // [paseo-idle-agent-unload] Idle seats leave memory; the next touch resumes them from provider history.
++        this.startIdleAgentUnload(options);
+     }
+     configurePaseoTools(options) {
+         this.paseoToolsEnabled = options.paseoToolsEnabled ?? true;
+         this.paseoToolCatalogFactory = options.paseoToolCatalogFactory ?? null;
+     }
+     registerClient(provider, client) {
+@@ -945,12 +947,15 @@
+             return existing;
+         }
+         const close = this.runLifecycleMutation(agentId, async () => {
+             // A preceding reload or archive may already have closed the durable agent.
+             if (this.agents.has(agentId))
+                 await this.closeAgentRuntime(agentId);
++            // [paseo-idle-agent-unload] An idle-unloaded seat is not in agents; close it from its snapshot.
++            else if (this.idleUnloadedAgentIds?.has(agentId))
++                await this.closeIdleUnloadedAgent(agentId);
+         });
+         this.inFlightAgentCloses.set(agentId, close);
+         const clearClose = () => {
+             if (this.inFlightAgentCloses.get(agentId) === close) {
+                 this.inFlightAgentCloses.delete(agentId);
+             }
+@@ -984,12 +989,14 @@
+             await this.persistSnapshot(closedAgent);
+         }
+         catch (error) {
+             persistError = error;
+         }
+         this.emitClosedAgent(closedAgent, { persist: false });
++        // [paseo-idle-agent-unload] Reopening resumes and re-reads provider history; nothing reads a closed timeline.
++        this.timelineStore.delete(agentId);
+         this.logger.trace({
+             agentId,
+             provider: closedAgent.provider,
+             sessionId: closedAgent.persistence?.sessionId ?? undefined,
+         }, "agent.manager.close.complete");
+         if (closeError !== undefined) {
+@@ -2569,13 +2576,93 @@
+             pendingReplacement: false,
+             foregroundTurnWaiters: new Set(),
+             finalizedForegroundTurnIds: new Set(),
+             unsubscribeSession: null,
+         };
+     }
++    // [paseo-idle-agent-unload]
++    startIdleAgentUnload(options) {
++        // Ids only: an explicit close of an unloaded seat records `closed` on the current stored record.
++        this.idleUnloadedAgentIds = new Set();
++        const minutes = Number(options?.idleAgentUnloadMinutes ?? process.env.PASEO_IDLE_UNLOAD_MINUTES ?? 30);
++        if (!Number.isFinite(minutes) || minutes <= 0) {
++            return;
++        }
++        this.idleAgentUnloadMs = minutes * 60000;
++        this.idleAgentUnloadTimer = setInterval(() => {
++            this.unloadIdleAgents().catch((error) => {
++                this.logger.warn({ err: error }, "agent.manager.idle_unload.failed");
++            });
++        }, Math.min(this.idleAgentUnloadMs, 5 * 60000));
++        this.idleAgentUnloadTimer.unref?.();
++    }
++    isIdleUnloadable(agent, nowMs) {
++        return Boolean(agent) &&
++            agent.lifecycle === "idle" &&
++            !this.hasInFlightRun(agent.id) &&
++            agent.pendingPermissions.size === 0 &&
++            nowMs - agent.updatedAt.getTime() >= this.idleAgentUnloadMs;
++    }
++    async unloadIdleAgents(nowMs = Date.now()) {
++        for (const agentId of this.idleUnloadedAgentIds) {
++            if (this.agents.has(agentId)) {
++                this.idleUnloadedAgentIds.delete(agentId);
++            }
++        }
++        const unloaded = [];
++        for (const agent of [...this.agents.values()]) {
++            if (this.isIdleUnloadable(agent, nowMs) && (await this.unloadIdleAgent(agent.id, nowMs))) {
++                unloaded.push(agent.id);
++            }
++        }
++        if (unloaded.length > 0) {
++            this.logger.info({ count: unloaded.length, agentIds: unloaded }, "agent.manager.idle_unload");
++        }
++        return unloaded;
++    }
++    unloadIdleAgent(agentId, nowMs = Date.now()) {
++        // The per-seat lifecycle queue orders it against close and load (waitForAgentClose awaits it).
++        return this.runLifecycleMutation(agentId, async () => {
++            if (!this.isIdleUnloadable(this.agents.get(agentId), nowMs)) {
++                return false;
++            }
++            await this.drainSessionEvents(agentId);
++            const agent = this.agents.get(agentId);
++            if (!this.isIdleUnloadable(agent, nowMs)) {
++                return false;
++            }
++            // No persist and no emit: the stored record stays idle, as after a daemon restart.
++            this.prepareAgentForClosure(agent, "agent unloaded while idle");
++            this.idleUnloadedAgentIds.add(agentId);
++            try {
++                await agent.session.close();
++            }
++            catch (error) {
++                this.logger.warn({ err: error, agentId }, "agent.manager.idle_unload.session_close_failed");
++            }
++            this.timelineStore.delete(agentId);
++            this.providerSubagents.deleteParent(agentId);
++            return true;
++        });
++    }
++    async closeIdleUnloadedAgent(agentId) {
++        this.idleUnloadedAgentIds.delete(agentId);
++        const stored = await this.registry?.get(agentId);
++        if (!stored || stored.archivedAt || stored.lastStatus === "closed") {
++            return;
++        }
++        // Mutate the record as it is now, so metadata written after the unload survives.
++        let closedRecord = null;
++        await this.registry.queueRecordMutation(agentId, (existing) => {
++            closedRecord = { ...(existing ?? stored), lastStatus: "closed" };
++            return closedRecord;
++        });
++        this.dispatchStoredAgentState(closedRecord);
++    }
+     discardRetainedAgentState(agentId) {
++        this.idleUnloadedAgentIds?.delete(agentId);
+         this.timelineStore.delete(agentId);
+         this.paseoToolPolicies.delete(agentId);
+         for (const event of this.providerSubagents.deleteParent(agentId)) {
+             this.dispatch({ type: "provider_subagent", event });
+         }
+     }

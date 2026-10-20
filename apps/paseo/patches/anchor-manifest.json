@@ -536,6 +536,16 @@
         "            mainRepoRoot: mainRepoRoot ?? worktreeRoot,",
         "        mainRepoRoot: mainRepoRoot && resolve(mainRepoRoot) !== resolve(worktreeRoot) ? mainRepoRoot : null,"
       ]
+    },
+    {
+      "id": "idle-agent-unload",
+      "source": "apps/paseo/patches/idle-agent-unload.mjs",
+      "anchors": [
+        "        this.updateProviderRegistry({",
+        "    discardRetainedAgentState(agentId) {",
+        "        this.emitClosedAgent(closedAgent, { persist: false });",
+        "                await this.closeAgentRuntime(agentId);"
+      ]
     }
   ]
 }

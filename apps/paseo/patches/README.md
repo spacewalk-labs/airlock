@@ -45,6 +45,22 @@ upstream changed licence again.
   Same discipline as the others: sentinel, all-or-nothing anchors, `node --check`, plus a behaviour
   check that drives the candidate with stub seats before it is installed.
 
+- **`idle-agent-unload.mjs`** (+ `.patch`, `.test.mjs`) — upstream keeps every loaded seat and
+  the full timeline of every seat it ever loaded in daemon memory: nothing unloads an idle seat,
+  and a plain close keeps the timeline (only archive drops it). On a box creating ~275 seats a day
+  the heap followed the timeline row count to the ~4GB V8 ceiling and the daemon died of "heap out
+  of memory" three times in four days (2026-10-16, 10-17, 10-20). The patch unloads a seat idle for
+  `PASEO_IDLE_UNLOAD_MINUTES` (default 30, `0` = off) — session closed, timeline dropped, stored
+  record untouched so it stays `idle`, the same state as a seat nobody touched since a restart —
+  and makes closeAgentRuntime drop the timeline too. The next send, fetch or schedule tick resumes
+  the seat through `ensureAgentLoaded` and re-reads provider history. The unload runs in Paseo's
+  per-seat lifecycle queue, so a concurrent close or load waits for it; only the seat's id is kept,
+  so an explicit close of an unloaded seat still records `closed` on the current stored record.
+  Memory then follows the seats at work, and the sweep's 24-hour close rule is not involved. The
+  behaviour test drives the real AgentManager with stub seats over the real AgentStorage, including
+  a close racing the unload and a label written after it; the two earlier designs of this patch
+  and deliberate mutants each fail it.
+
 - **`depth4-search.patch`** — caps the add-project name search to `maxDepth: 4`
   (paseo's default full-scans `$HOME` and times out on a large home). This is the
   reference / re-derivation copy of the edit; `../install.sh` applies it via an

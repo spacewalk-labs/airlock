@@ -13,7 +13,7 @@ and exits. Prints one JSON object:
 Screen text is the contract here, and screens change. Anything that does not parse is
 an error, never a guessed number. Tokens are never read: agy authenticates itself.
 """
-import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
+import fcntl, json, os, pty, re, select, shutil, signal, struct, subprocess, sys, termios, time
 
 AGY = os.environ.get("AIRLOCK_AGY_BIN") or "agy"
 # A private, empty working directory: agy asks once whether to trust it, and scans it.
@@ -97,7 +97,32 @@ def diag_snapshot(sent, elapsedMs, bytesRead, sawUsageHeader,
             "exitReason": str(exitReason)}
 
 
+# agy is a full interactive CLI (~350MB resident). Run inline, it counted against the
+# caller's MemoryMax — the account surface's — and the kernel OOM-killed that whole service
+# whenever a probe ran (2026-10-20: 11 kills in 3 days at 256M, 7 in 7 days at 512M; the
+# reading on disk was 49h stale). So the probe re-runs itself in its own transient user
+# unit: agy gets its own cgroup, and a heavy agy can no longer take the caller down.
+OWN_UNIT_MARK = "AIRLOCK_AGY_USAGE_OWN_UNIT"
+PASS_ENV = re.compile(r"^(HOME|PATH|LANG|LC_[A-Z]+|TERM|XDG_[A-Z_]+|AIRLOCK_[A-Z_]+|"
+                      r"[A-Za-z_]*_PROXY|[a-z_]*_proxy)$")
+
+
+def own_unit_argv():
+    """systemd-run argv that re-runs this probe in its own unit, or None to run inline."""
+    run = shutil.which("systemd-run")
+    bus = os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), "bus")
+    if os.environ.get(OWN_UNIT_MARK) or not run or not os.path.exists(bus):
+        return None
+    env = [f"--setenv={k}" for k in sorted(os.environ) if PASS_ENV.match(k)]
+    return [run, "--user", "--wait", "--pipe", "--collect", "--quiet",
+            f"--property=RuntimeMaxSec={int(TIMEOUT) + 30}", f"--setenv={OWN_UNIT_MARK}=1",
+            *env, "--", sys.executable, os.path.abspath(__file__)]
+
+
 def main():
+    argv = own_unit_argv()
+    if argv:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, check=False).returncode
     os.makedirs(WORKDIR, mode=0o700, exist_ok=True)
     pid, fd = pty.fork()
     if pid == 0:
@@ -127,6 +152,12 @@ def main():
             text = screen_text(buf)
             if not trusted and "Do you trust the contents of this project?" in text:
                 os.write(fd, b"\r"); trusted = True; trust_prompt_seen = True; continue
+            # agy 1.4.3 (2026-10-20) opens a first-run setup (color scheme, then Terms of
+            # Service with a pre-checked data-sharing consent) before the prompt. Accepting
+            # terms is a person's decision, so the probe says so instead of timing out.
+            if "Welcome to Antigravity CLI!" in text and "Choose your color scheme" in text:
+                result = {"ok": False, "error": "agy first-run setup pending: run agy once by hand"}
+                exit_reason = "first-run-setup"; break
             # "currently not signed in" is also printed for a moment while agy loads its
             # stored token, so it only counts once the prompt it leads to is on screen.
             if "Sign in with Google" in text or "not logged into Antigravity" in text:

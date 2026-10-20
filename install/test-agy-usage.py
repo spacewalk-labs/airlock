@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """agy quota: the screen parser and the account surface's stored-first, 20-minute rule.
 
-No agy is started. The parser gets the real /usage screen text captured on a box
+No real agy is started. The parser gets the real /usage screen text captured on a box
 (2026-09-15), and the route is exercised with a stand-in probe.
 """
 import importlib.machinery, importlib.util, json, os, sys, tempfile, time, threading
@@ -139,6 +139,72 @@ snap2 = diag.diag_snapshot(False, 0, 0, False, 0, 0, 0, 0, False,
 check("diag: failure stages stay literal",
       snap2["exitReason"] == "timeout-before-send" and snap2["sent"] is False,
       snap2)
+
+# Own unit: agy (~350MB) must not count against the caller's MemoryMax. Inline, the
+# account surface's whole unit was OOM-killed on every probe (2026-10-20).
+import shutil as _shutil, subprocess as _subprocess
+saved = dict(os.environ)
+try:
+    os.environ.pop(diag.OWN_UNIT_MARK, None)
+    rt = tempfile.mkdtemp()
+    open(os.path.join(rt, "bus"), "w").close()
+    os.environ.update(XDG_RUNTIME_DIR=rt, AIRLOCK_AGY_BIN="/x/agy", SOME_TOKEN="leak", HTTPS_PROXY="p")
+    real_which = diag.shutil.which
+    diag.shutil.which = lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else real_which(name)
+    argv = diag.own_unit_argv() or []
+    check("own unit: re-runs itself under systemd-run --user --wait --pipe",
+          argv[:4] == ["/usr/bin/systemd-run", "--user", "--wait", "--pipe"]
+          and argv[-1] == os.path.abspath(diag.__file__), argv)
+    check("own unit: bounded run time and the re-entry mark",
+          f"--property=RuntimeMaxSec={int(diag.TIMEOUT) + 30}" in argv
+          and f"--setenv={diag.OWN_UNIT_MARK}=1" in argv, argv)
+    check("own unit: passes agy/proxy env, not unrelated variables",
+          "--setenv=AIRLOCK_AGY_BIN" in argv and "--setenv=HTTPS_PROXY" in argv
+          and not any("SOME_TOKEN" in a for a in argv), argv)
+    os.environ[diag.OWN_UNIT_MARK] = "1"
+    check("own unit: inside the unit it runs inline", diag.own_unit_argv() is None)
+    os.environ.pop(diag.OWN_UNIT_MARK)
+    os.remove(os.path.join(rt, "bus"))
+    check("own unit: no user bus means inline", diag.own_unit_argv() is None)
+    diag.shutil.which = real_which
+finally:
+    os.environ.clear(); os.environ.update(saved)
+
+# First-run setup (agy 1.4.3: color scheme, then Terms with a pre-checked data-sharing
+# consent) is a person's decision: the probe names it instead of timing out or accepting.
+d = tempfile.mkdtemp()
+fake = os.path.join(d, "agy")
+with open(fake, "w") as f:
+    f.write("#!/bin/sh\nprintf 'Welcome to Antigravity CLI!\\r\\nChoose your color scheme:\\r\\n  > terminal\\r\\n'\nsleep 30\n")
+os.chmod(fake, 0o755)
+env = dict(os.environ, AIRLOCK_AGY_BIN=fake, AIRLOCK_STATE_DIR=d, AIRLOCK_AGY_USAGE_TIMEOUT="10")
+env[diag.OWN_UNIT_MARK] = "1"
+proc = _subprocess.run([sys.executable, os.path.join(ROOT, "bin", "airlock-agy-usage")],
+                       env=env, stdout=_subprocess.PIPE, timeout=40)
+first = json.loads(proc.stdout or b"{}")
+check("first run: setup screen is reported, not accepted",
+      first.get("ok") is False and "first-run setup" in str(first.get("error")), first)
+
+# The switch verify hands the probe a throwaway HOME. The probe's own unit cannot see the
+# caller's PrivateTmp, so that HOME must not live under /tmp (review of #929).
+saved = dict(os.environ)
+try:
+    st = tempfile.mkdtemp()
+    os.environ.update(AIRLOCK_STATE_DIR=st, AIRLOCK_AGY_BIN="/x/agy",
+                      AIRLOCK_AGY_USAGE_BIN=os.path.join(ROOT, "bin", "airlock-agy-usage"))
+    acc = load("airlock_accounts", os.path.join(ROOT, "bin", "airlock-accounts"))
+    seen = {}
+    def stop(**kw):
+        seen.update(kw); raise RuntimeError("stop")
+    acc.tempfile.mkdtemp = stop
+    try:
+        acc._agy_verify(b"token", "someone@example.com")
+    except RuntimeError:
+        pass
+    check("switch verify: throwaway HOME lives in the user state dir, not /tmp",
+          seen.get("dir") == os.path.join(st, "accounts"), seen)
+finally:
+    os.environ.clear(); os.environ.update(saved)
 
 print(f"---\nagy-usage: {len(failures)} failed")
 sys.exit(1 if failures else 0)

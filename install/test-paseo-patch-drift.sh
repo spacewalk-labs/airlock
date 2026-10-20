@@ -163,6 +163,7 @@ const expected = new Set([
   "workspace-remove-delivery",
   "directory-sync-snapshot",
   "reconcile-archives-agents",
+  "idle-agent-unload",
   "patch-web-ui",
 ]);
 const seen = new Set();
@@ -1035,6 +1036,46 @@ if grep -qF 'SENDKEEP_PATCHER="$HERE/patches/send-keep-pending-permissions.mjs"'
   ok "send-keep-pending-permissions: installer applies and verifies candidates before mv"
 else
   bad "send-keep-pending-permissions: installer wiring is absent"
+fi
+
+# ------------------------------------------------------- idle seats leave daemon memory
+IDLEU="$TMP/agent-manager-idle-unload.js"
+reference_preimage "$PATCH_DIR/idle-agent-unload.patch" "$IDLEU"
+if positive_js "$PATCH_DIR/idle-agent-unload.mjs" "$IDLEU"; then
+  if [ "$(grep -cF '[paseo-idle-agent-unload]' "$IDLEU.paseo-new.mjs")" -eq 4 ] \
+    && grep -qF 'this.startIdleAgentUnload(options);' "$IDLEU.paseo-new.mjs" \
+    && grep -qF 'process.env.PASEO_IDLE_UNLOAD_MINUTES ?? 30' "$IDLEU.paseo-new.mjs" \
+    && grep -qF 'return this.runLifecycleMutation(agentId, async () => {' "$IDLEU.paseo-new.mjs" \
+    && grep -qF 'await this.closeIdleUnloadedAgent(agentId);' "$IDLEU.paseo-new.mjs"; then
+    ok "idle-agent-unload: starts the sweep, unloads in the per-seat lifecycle queue, closes unloaded seats, and drops closed timelines"
+  else
+    bad "idle-agent-unload: patched result is missing an edit"
+  fi
+else
+  bad "idle-agent-unload: representative fixture was not patched"
+fi
+IDLEU_BAD="$TMP/agent-manager-idle-unload-bad.js"
+cp "$IDLEU" "$IDLEU_BAD"
+sed -i '/this.emitClosedAgent(closedAgent, { persist: false });/d' "$IDLEU_BAD"
+cp "$IDLEU_BAD" "$TMP/agent-manager-idle-unload-bad.before"
+if negative_js "$PATCH_DIR/idle-agent-unload.mjs" "$IDLEU_BAD" 20 "$TMP/agent-manager-idle-unload-bad.before"; then
+  ok "idle-agent-unload negative control: a missing close anchor is an untouched rc 20 skip"
+else
+  bad "idle-agent-unload negative control: skipped patch did not fail the positive assertion"
+fi
+cp "$IDLEU.paseo-new.mjs" "$TMP/agent-manager-idle-unload-applied.js"
+idleu_again_rc=0
+node "$PATCH_DIR/idle-agent-unload.mjs" "$TMP/agent-manager-idle-unload-applied.js" >/dev/null 2>&1 || idleu_again_rc=$?
+if [ "$idleu_again_rc" -eq 10 ] && [ ! -f "$TMP/agent-manager-idle-unload-applied.js.paseo-new.mjs" ]; then
+  ok "idle-agent-unload: re-applying an already patched file is an untouched rc 10 skip"
+else
+  bad "idle-agent-unload: re-apply was not a clean rc 10 skip (rc=$idleu_again_rc)"
+fi
+if grep -qF 'IDLE_UNLOAD_PATCHER="$HERE/patches/idle-agent-unload.mjs"' "$ROOT/apps/paseo/install.sh" \
+  && grep -qF 'node "$IDLE_UNLOAD_TEST" "$iu_tmp"' "$ROOT/apps/paseo/install.sh"; then
+  ok "idle-agent-unload: installer applies it only after its behaviour check"
+else
+  bad "idle-agent-unload: installer wiring is missing or skips the behaviour check"
 fi
 
 # ------------------------------------------------------- schedule stale-due + single list

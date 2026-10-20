@@ -2249,7 +2249,12 @@ def _agy_verify(data, email):
     agy = os.environ.get("AIRLOCK_AGY_BIN", "").strip()
     if not (probe and os.path.isfile(probe) and agy):
         return None, "agy is not installed on this box"
-    home = tempfile.mkdtemp(prefix="agy-verify-")
+    # Not /tmp: the probe runs agy in its own user unit, which cannot see the caller's
+    # PrivateTmp (the account surface has one). The user state dir is visible to both.
+    parent = os.path.join(os.environ.get("AIRLOCK_STATE_DIR")
+                          or os.path.expanduser("~/.local/state/airlock"), "accounts")
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    home = tempfile.mkdtemp(prefix="agy-verify-", dir=parent)
     try:
         cli = os.path.join(home, ".gemini", "antigravity-cli")
         os.makedirs(os.path.join(cli, "cache"), mode=0o700)

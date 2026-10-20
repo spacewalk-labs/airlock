@@ -8,7 +8,7 @@ a14274c2bd5e21b6682c85f9d9b1f2725bd1cc2a16272632cac15a072647f856  @getpaseo/clie
 fb9f44a88fc7ecd493077935658b76566656fde0808cbc9ee0eb93bf82768893  @getpaseo/server/dist/server/server/directory-sync/index.js
 47b97cd2ec6efee3adb7a673cea7ad4f5bdf3668d2def08e02d47dde290e6c44  @getpaseo/server/dist/server/server/bootstrap.js
 cc1963578f012974b779d0b10d1eeabcfb4867a015771cbabbfb9f44112320b8  @getpaseo/server/dist/server/server/session/agent-updates/agent-updates-service.js
-8457074c340eb2ff3becb082089dfba27366407d0de7894d68fbfa7683e37282  @getpaseo/server/dist/server/server/agent/agent-manager.js
+ac514b010bf08271472fd4f3fe2a50d95810c890bf8c7320041144ede8bae10a  @getpaseo/server/dist/server/server/agent/agent-manager.js
 685423d7179edadfa0c0390e92d0a0123d33d29ee28f1dccd4ca3591ecff3823  @getpaseo/server/dist/server/server/agent/agent-prompt.js
 3fb160814ba90636553d751994fcf739510c7c0cc0e7ae5d8b97d86cad9ab900  @getpaseo/server/dist/server/server/agent/agent-projections.js
 8b080518b610ccff83827d1f7d592a6f7d499c44a4062d6ac07893b06037478b  @getpaseo/server/dist/server/server/agent/providers/claude/agent.js

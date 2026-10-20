@@ -692,6 +692,47 @@ else
   esac
 fi
 
+# --- 2c. idle seats leave daemon memory ---
+# Upstream keeps every loaded seat and every timeline it ever loaded in memory; the V8 heap hit its
+# ceiling and the daemon died three times in four days on a busy box (2026-10-16..20). A seat idle
+# for PASEO_IDLE_UNLOAD_MINUTES (default 30, 0 = off) is unloaded without touching its stored
+# record, and a closed seat drops its timeline; both resume from provider history on next touch.
+IDLE_UNLOAD_PATCHER="$HERE/patches/idle-agent-unload.mjs"
+IDLE_UNLOAD_TEST="$HERE/patches/idle-agent-unload.test.mjs"
+AGENT_MANAGER_JS="$PASEO_SERVER_DIR/dist/server/server/agent/agent-manager.js"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply idle-agent-unload patch to $AGENT_MANAGER_JS"
+elif [ ! -f "$AGENT_MANAGER_JS" ]; then
+  log "warning: idle-agent-unload target missing ($AGENT_MANAGER_JS) — skipped"
+elif [ ! -f "$IDLE_UNLOAD_PATCHER" ] || [ ! -f "$IDLE_UNLOAD_TEST" ]; then
+  log "warning: idle-agent-unload patcher or behaviour test missing under $HERE — skipped"
+else
+  iu_tmp="${AGENT_MANAGER_JS}.paseo-new.mjs"
+  rm -f "$iu_tmp"
+  iu_rc=0
+  iu_out="$(node "$IDLE_UNLOAD_PATCHER" "$AGENT_MANAGER_JS" 2>&1)" || iu_rc=$?
+  case "$iu_rc" in
+    10) log "idle-agent-unload already applied" ;;
+    20) patch_skipped "idle-agent-unload" "$iu_out" ;;
+    0)
+      if [ ! -f "$iu_tmp" ]; then
+        log "warning: idle-agent-unload did not produce a candidate — skipped"
+      elif ! node --check "$iu_tmp"; then
+        rm -f "$iu_tmp"
+        log "warning: idle-agent-unload candidate is invalid JS — not applied"
+      elif ! node "$IDLE_UNLOAD_TEST" "$iu_tmp" >/dev/null 2>&1; then
+        rm -f "$iu_tmp"
+        log "warning: idle-agent-unload candidate failed its behaviour check — not applied"
+      else
+        mv "$iu_tmp" "$AGENT_MANAGER_JS" || die "idle-agent-unload agent-manager.js mv failed"
+        need_restart=1
+        log "idle-agent-unload applied"
+      fi
+      ;;
+    *) log "warning: idle-agent-unload patcher error (rc=$iu_rc): $iu_out — skipped" ;;
+  esac
+fi
+
 # Removal of a cached row must survive an empty changes-only subscription bootstrap.
 WORKSPACE_REMOVE_PATCHER="$HERE/patches/workspace-remove-delivery.mjs"
 WORKSPACE_REMOVE_TEST="$HERE/patches/workspace-remove-delivery.test.mjs"
