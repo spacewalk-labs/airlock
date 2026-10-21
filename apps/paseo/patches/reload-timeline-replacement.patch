@@ -1,0 +1,19 @@
+--- a/@getpaseo/server/dist/server/server/agent/agent-manager.js
++++ b/@getpaseo/server/dist/server/server/agent/agent-manager.js
+@@ -2152,7 +2152,16 @@
+      */
+     async hydrateTimelineFromProvider(agentId, options) {
+         const agent = this.requireSessionAgent(agentId);
++        // [paseo-reload-timeline-replacement] A first prime starts a new epoch; viewers must refetch or they drop every row.
++        const firstPrime = !agent.historyPrimed && !options?.force;
+         await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
++        if (firstPrime && this.timelineStore.has(agentId)) {
++            this.dispatch({
++                type: "timeline_replacement",
++                agentId,
++                epoch: this.timelineStore.getEpoch(agentId),
++            });
++        }
+     }
+     async rewind(agentId, messageId, mode) {
+         const agent = this.requireSessionAgent(agentId);

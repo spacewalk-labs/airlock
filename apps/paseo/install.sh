@@ -695,7 +695,7 @@ fi
 # --- 2c. idle seats leave daemon memory ---
 # Upstream keeps every loaded seat and every timeline it ever loaded in memory; the V8 heap hit its
 # ceiling and the daemon died three times in four days on a busy box (2026-10-16..20). A seat idle
-# for PASEO_IDLE_UNLOAD_MINUTES (default 30, 0 = off) is unloaded without touching its stored
+# for PASEO_IDLE_UNLOAD_MINUTES (default 30, 0 = off; render.sh sets 360) is unloaded without touching its stored
 # record, and a closed seat drops its timeline; both resume from provider history on next touch.
 IDLE_UNLOAD_PATCHER="$HERE/patches/idle-agent-unload.mjs"
 IDLE_UNLOAD_TEST="$HERE/patches/idle-agent-unload.test.mjs"
@@ -730,6 +730,46 @@ else
       fi
       ;;
     *) log "warning: idle-agent-unload patcher error (rc=$iu_rc): $iu_out — skipped" ;;
+  esac
+fi
+
+# --- 2d. a reloaded seat tells open chats to refetch ---
+# A seat loaded again rebuilds its timeline under a fresh epoch. Upstream only reloads at daemon
+# start, when clients refetch anyway; with 2c clients stay connected, keep the old epoch and drop
+# every new row, so an old seat answered but the open chat showed nothing (2026-10-21). The first
+# hydration after a load now dispatches timeline_replacement, the event rewind already uses.
+RELOAD_REPLACE_PATCHER="$HERE/patches/reload-timeline-replacement.mjs"
+RELOAD_REPLACE_TEST="$HERE/patches/reload-timeline-replacement.test.mjs"
+if [ "${AIRLOCK_DRY_RUN:-0}" = 1 ]; then
+  log "[dry] apply reload-timeline-replacement patch to $AGENT_MANAGER_JS"
+elif [ ! -f "$AGENT_MANAGER_JS" ]; then
+  log "warning: reload-timeline-replacement target missing ($AGENT_MANAGER_JS) — skipped"
+elif [ ! -f "$RELOAD_REPLACE_PATCHER" ] || [ ! -f "$RELOAD_REPLACE_TEST" ]; then
+  log "warning: reload-timeline-replacement patcher or behaviour test missing under $HERE — skipped"
+else
+  rr_tmp="${AGENT_MANAGER_JS}.paseo-new.mjs"
+  rm -f "$rr_tmp"
+  rr_rc=0
+  rr_out="$(node "$RELOAD_REPLACE_PATCHER" "$AGENT_MANAGER_JS" 2>&1)" || rr_rc=$?
+  case "$rr_rc" in
+    10) log "reload-timeline-replacement already applied" ;;
+    20) patch_skipped "reload-timeline-replacement" "$rr_out" ;;
+    0)
+      if [ ! -f "$rr_tmp" ]; then
+        log "warning: reload-timeline-replacement did not produce a candidate — skipped"
+      elif ! node --check "$rr_tmp"; then
+        rm -f "$rr_tmp"
+        log "warning: reload-timeline-replacement candidate is invalid JS — not applied"
+      elif ! node "$RELOAD_REPLACE_TEST" "$rr_tmp" >/dev/null 2>&1; then
+        rm -f "$rr_tmp"
+        log "warning: reload-timeline-replacement candidate failed its behaviour check — not applied"
+      else
+        mv "$rr_tmp" "$AGENT_MANAGER_JS" || die "reload-timeline-replacement agent-manager.js mv failed"
+        need_restart=1
+        log "reload-timeline-replacement applied"
+      fi
+      ;;
+    *) log "warning: reload-timeline-replacement patcher error (rc=$rr_rc): $rr_out — skipped" ;;
   esac
 fi
 

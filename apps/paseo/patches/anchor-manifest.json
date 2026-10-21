@@ -546,6 +546,13 @@
         "        this.emitClosedAgent(closedAgent, { persist: false });",
         "                await this.closeAgentRuntime(agentId);"
       ]
+    },
+    {
+      "id": "reload-timeline-replacement",
+      "source": "apps/paseo/patches/reload-timeline-replacement.mjs",
+      "anchors": [
+        "    async hydrateTimelineFromProvider(agentId, options) {"
+      ]
     }
   ]
 }

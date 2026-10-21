@@ -164,6 +164,7 @@ const expected = new Set([
   "directory-sync-snapshot",
   "reconcile-archives-agents",
   "idle-agent-unload",
+  "reload-timeline-replacement",
   "patch-web-ui",
 ]);
 const seen = new Set();

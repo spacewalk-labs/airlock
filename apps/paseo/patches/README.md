@@ -50,7 +50,8 @@ upstream changed licence again.
   and a plain close keeps the timeline (only archive drops it). On a box creating ~275 seats a day
   the heap followed the timeline row count to the ~4GB V8 ceiling and the daemon died of "heap out
   of memory" three times in four days (2026-10-16, 10-17, 10-20). The patch unloads a seat idle for
-  `PASEO_IDLE_UNLOAD_MINUTES` (default 30, `0` = off) — session closed, timeline dropped, stored
+  `PASEO_IDLE_UNLOAD_MINUTES` (default 30, `0` = off; the unit from `../render.sh` sets 360 since
+  2026-10-21) — session closed, timeline dropped, stored
   record untouched so it stays `idle`, the same state as a seat nobody touched since a restart —
   and makes closeAgentRuntime drop the timeline too. The next send, fetch or schedule tick resumes
   the seat through `ensureAgentLoaded` and re-reads provider history. The unload runs in Paseo's
@@ -60,6 +61,18 @@ upstream changed licence again.
   behaviour test drives the real AgentManager with stub seats over the real AgentStorage, including
   a close racing the unload and a label written after it; the two earlier designs of this patch
   and deliberate mutants each fail it.
+
+- **`reload-timeline-replacement.mjs`** (+ `.patch`, `.test.mjs`) — a seat loaded again rebuilds
+  its timeline from provider history under a fresh epoch (the durable timeline store is not wired).
+  Upstream only reloads at daemon start, when every client reconnects and refetches. With
+  `idle-agent-unload` clients stay connected through the reload, keep the old epoch, and the app's
+  sequencing gate drops every new row whose seq is not 1 (`drop_epoch`): the seat answered, the
+  open chat showed nothing (2026-10-21, "오래된 세션이 말해도 반응이 없다"; every send since #928 was
+  accepted). The patch dispatches `timeline_replacement` — the event rewind already uses — after
+  the first hydration of a load, before the caller's prompt, so viewers refetch the tail and adopt
+  the new epoch. Keyed on the first prime rather than the unload id set, so close → reopen is
+  covered and the unload sweep cannot race it. It applies alone or on top of `idle-agent-unload`;
+  a separate sentinel lets already-patched boxes take it without a reinstall.
 
 - **`depth4-search.patch`** — caps the add-project name search to `maxDepth: 4`
   (paseo's default full-scans `$HOME` and times out on a large home). This is the

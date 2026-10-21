@@ -78,6 +78,11 @@ Environment=PASEO_HOSTNAMES=${FQDN},${FQDN}:${HTTPS_PORT},localhost
 # Headless: no dictation/voice (avoids an unexpected ~600MB speech model download).
 Environment=PASEO_DICTATION_ENABLED=false
 Environment=PASEO_VOICE_MODE_ENABLED=false
+# Unload a seat from daemon memory only after 6 hours idle (patches/idle-agent-unload.mjs
+# defaults to 30). 30 minutes unloaded seats people were still coming back to; owner decision
+# 2026-10-21. Set here, not in the patch, so boxes already carrying the patch take it on the
+# next render. 0 turns the unload off.
+Environment=PASEO_IDLE_UNLOAD_MINUTES=360
 # No ExecStartPre pidfile cleanup here. PASEO_HOME and paseo.pid can be shared
 # with a legacy service; candidate-side cleanup would mutate that live service's
 # singleton state on every failed start. The installer performs one authorized
